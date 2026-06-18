@@ -2,10 +2,12 @@
 //! driver. Re-exported from `agentic_loop`'s mod.rs so existing
 //! `agentic_loop::X` and `super::X` paths keep resolving.
 
-use crate::llm::provider::{LlmResponse, ToolDefinition};
+use crate::engine::{InjectedPrompt, InjectedPromptKind};
+use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use crate::llm::{get_default_tools, get_notification_tool, get_read_notifications_tool};
 use crate::llm::{ContentBlock, Message, MessageContent};
+use std::collections::HashSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -67,6 +69,214 @@ where
         _ = cancel_token.cancelled() => Err("Error: canceled by user".to_string()),
         r = fut => r,
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum InjectedPromptGroup {
+    UserText(Vec<InjectedPrompt>),
+    WakeFromChild(InjectedPrompt),
+}
+
+/// Keep `WakeFromChild` prompts as standalone user-channel blocks, but batch
+/// contiguous user/agent/engine text prompts so one injection window becomes
+/// one LLM user message. Each original prompt still emits its own
+/// UserPromptInjected audit event at append time.
+pub(crate) fn group_injected_prompts(prompts: Vec<InjectedPrompt>) -> Vec<InjectedPromptGroup> {
+    let mut groups = Vec::new();
+    let mut user_batch = Vec::new();
+
+    for prompt in prompts {
+        match &prompt.kind {
+            InjectedPromptKind::WakeFromChild => {
+                if !user_batch.is_empty() {
+                    groups.push(InjectedPromptGroup::UserText(std::mem::take(
+                        &mut user_batch,
+                    )));
+                }
+                groups.push(InjectedPromptGroup::WakeFromChild(prompt));
+            }
+            InjectedPromptKind::UserText => user_batch.push(prompt),
+        }
+    }
+
+    if !user_batch.is_empty() {
+        groups.push(InjectedPromptGroup::UserText(user_batch));
+    }
+
+    groups
+}
+
+pub(crate) fn framed_injected_prompt(prompt: &InjectedPrompt) -> String {
+    match prompt.mode {
+        super::super::thread_events::ActorMode::Human => format!(
+            "[USER CORRECTION — the user sent this while you were working. \
+             Prioritize this over your current plan and adjust accordingly.]\n\n{}",
+            prompt.text
+        ),
+        super::super::thread_events::ActorMode::Agent
+        | super::super::thread_events::ActorMode::Engine => format!(
+            "[SYSTEM UPDATE — new information arrived while you were working. \
+             Incorporate this into your current response.]\n\n{}",
+            prompt.text
+        ),
+    }
+}
+
+pub(crate) fn coalesced_user_text_message(prompts: &[InjectedPrompt]) -> Message {
+    let has_images = prompts
+        .iter()
+        .any(|prompt| prompt.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
+
+    let content = if prompts.len() == 1 && !has_images {
+        MessageContent::Text(framed_injected_prompt(&prompts[0]))
+    } else {
+        let mut blocks = Vec::new();
+        for prompt in prompts {
+            blocks.push(ContentBlock::Text {
+                text: framed_injected_prompt(prompt),
+            });
+            if let Some(imgs) = &prompt.images {
+                for img in imgs {
+                    let fitted = img.clone().fit_for_llm();
+                    blocks.push(ContentBlock::Image {
+                        source_type: "base64".to_string(),
+                        media_type: fitted.mime_type,
+                        data: fitted.base64,
+                    });
+                }
+            }
+        }
+        MessageContent::Blocks(blocks)
+    };
+
+    Message {
+        role: "user".to_string(),
+        content,
+    }
+}
+
+pub(crate) fn coalesced_user_text_for_reprocess(prompts: &[InjectedPrompt]) -> String {
+    prompts
+        .iter()
+        .map(framed_injected_prompt)
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n")
+}
+
+pub(crate) fn coalesced_images_for_reprocess(
+    prompts: &[InjectedPrompt],
+) -> Option<Vec<crate::api::ChatImage>> {
+    let images: Vec<_> = prompts
+        .iter()
+        .filter_map(|prompt| prompt.images.as_ref())
+        .flat_map(|imgs| imgs.iter().cloned())
+        .collect();
+    (!images.is_empty()).then_some(images)
+}
+
+pub(crate) async fn filter_removed_queued_prompts(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    prompts: Vec<InjectedPrompt>,
+) -> Vec<InjectedPrompt> {
+    let ids: Vec<String> = prompts
+        .iter()
+        .filter(|prompt| matches!(prompt.kind, InjectedPromptKind::UserText))
+        .filter_map(|prompt| prompt.event_id.map(|id| id.to_string()))
+        .collect();
+    if ids.is_empty() {
+        return prompts;
+    }
+
+    let removed = match sqlx::query_scalar::<_, String>(
+        "SELECT payload->>'removed_message_id'
+           FROM events
+          WHERE aggregate = 'thread'
+            AND aggregate_id = $1
+            AND event_type = 'QueuedMessageRemoved'
+            AND payload->>'removed_message_id' = ANY($2::text[])",
+    )
+    .bind(thread_id.to_string())
+    .bind(&ids)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows.into_iter().collect::<HashSet<_>>(),
+        Err(e) => {
+            crate::log!(
+                "[Inject] queued-message removal lookup failed for thread {}: {}",
+                thread_id,
+                e
+            );
+            HashSet::new()
+        }
+    };
+    if removed.is_empty() {
+        return prompts;
+    }
+
+    let before = prompts.len();
+    let filtered: Vec<_> = prompts
+        .into_iter()
+        .filter(|prompt| {
+            if !matches!(prompt.kind, InjectedPromptKind::UserText) {
+                return true;
+            }
+            prompt
+                .event_id
+                .map(|id| !removed.contains(&id.to_string()))
+                .unwrap_or(true)
+        })
+        .collect();
+    let skipped = before.saturating_sub(filtered.len());
+    if skipped > 0 {
+        crate::log!(
+            "[Inject] Skipped {} removed queued prompt(s) for thread {}",
+            skipped,
+            thread_id
+        );
+    }
+    filtered
+}
+
+pub(crate) async fn append_injected_prompts_to_messages(
+    bus: &crate::engine::event_bus::EventBus,
+    thread_id: Uuid,
+    meta: &crate::engine::thread_events::EventMeta,
+    messages: &mut Vec<Message>,
+    prompts: Vec<InjectedPrompt>,
+) -> bool {
+    let mut appended = false;
+    for group in group_injected_prompts(prompts) {
+        match group {
+            InjectedPromptGroup::WakeFromChild(prompt) => {
+                crate::log!(
+                    "[Inject] Wake-from-child (spawning_event {:?}) into active parent {}",
+                    prompt.spawning_event_id,
+                    thread_id
+                );
+                messages.push(Message {
+                    role: "user".to_string(),
+                    content: MessageContent::Text(prompt.text),
+                });
+                appended = true;
+            }
+            InjectedPromptGroup::UserText(batch) => {
+                for prompt in &batch {
+                    crate::log!(
+                        "[Inject] Mid-flight {:?} prompt injected into thread {}: {}",
+                        prompt.mode,
+                        thread_id,
+                        &prompt.text[..prompt.text.floor_char_boundary(80)]
+                    );
+                    emit_user_prompt_injected_event(bus, thread_id, meta, prompt).await;
+                }
+                messages.push(coalesced_user_text_message(&batch));
+                appended = true;
+            }
+        }
+    }
+    appended
 }
 
 /// Cross-provider classification of a completion's finish reason. Providers
@@ -201,25 +411,27 @@ pub(crate) fn classify_empty_completion(
     }
 }
 
-/// Remove assistant prose attached to a tool-call response.
+/// Choose the assistant text to flush at the end of a turn.
 ///
-/// A response with structured tool calls is not the assistant's final answer;
-/// the visible progress is carried by `ToolCalled` / `ToolResult` events and
-/// the next model iteration decides what to do with the results. Keeping the
-/// text block made provider/tool-turn preambles part of both the user's chat
-/// transcript and the next prompt. Gemini Flash exposed the failure mode by
-/// echoing a system instruction ("Just act") before several function calls,
-/// which then fed itself back into subsequent iterations.
-pub(crate) fn suppress_tool_turn_text(response: &mut LlmResponse) -> bool {
-    if response.tool_calls.is_empty() {
-        return false;
+/// Streamed providers (Claude) fill `raw` via the token callback as tokens
+/// arrive. A non-streaming provider (Gemini) emits its whole text through the
+/// callback once, which also lands in `raw`; `content` is the defensive
+/// fallback for a provider that left `raw` empty but carried prose in the
+/// response body. `cleaned` (inline-question-repair, tag-stripped) wins when
+/// present. This flushes the assistant's preamble on a tool-call turn too — the
+/// agent explains along the way, not just in its final answer.
+pub(crate) fn effective_flush_text<'a>(
+    cleaned: Option<&'a str>,
+    raw: &'a str,
+    content: Option<&'a str>,
+) -> &'a str {
+    if let Some(c) = cleaned {
+        return c;
     }
-    let had_text = response
-        .content
-        .as_deref()
-        .is_some_and(|text| !text.trim().is_empty());
-    response.content = None;
-    had_text
+    if !raw.is_empty() {
+        return raw;
+    }
+    content.unwrap_or("")
 }
 
 /// Build the tool list for intent sub-loops.

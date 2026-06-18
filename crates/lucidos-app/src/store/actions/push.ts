@@ -3,6 +3,7 @@ import { showToast } from '../store';
 import { getDeviceId } from './devices';
 import { isTauri, isIOS, isStandalone } from '../../utils/platform';
 import { errorDetail } from '../../utils/errorDetail';
+import { withBase, SCOPE_PATH } from '../../utils/basePath';
 
 /** Convert a base64url-encoded string to a Uint8Array (for applicationServerKey) */
 function urlBase64ToUint8Array(base64String: string): Uint8Array {
@@ -119,7 +120,7 @@ export async function recoverServiceWorker(): Promise<void> {
     }
     await existing.unregister();
   }
-  await navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' });
+  await navigator.serviceWorker.register(withBase('/sw.js'), { scope: SCOPE_PATH, updateViaCache: 'none' });
   // pushManager.subscribe requires an active worker; calling pre-activation
   // rejects with InvalidStateError. `ready` resolves to the registration that
   // owns the active worker — passing the post-register registration directly
@@ -163,7 +164,7 @@ export async function initPushSubscription(): Promise<boolean> {
   }
 
   try {
-    const registration = await navigator.serviceWorker.register('/sw.js');
+    const registration = await navigator.serviceWorker.register(withBase('/sw.js'), { scope: SCOPE_PATH });
 
     const permission = await Notification.requestPermission();
     if (permission !== 'granted') {

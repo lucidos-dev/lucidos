@@ -1,8 +1,9 @@
 /**
- * The compose actor toggle (Lucidos / Claude) MUST remember the last pick
- * across page reloads. Without persistence, picking Claude → reloading →
- * sending lands the message on Lucidos despite the prior pick (and the toggle
- * displays Lucidos again, silently overriding the user's choice).
+ * The compose actor toggle (Lucidos Agent / coding agent) MUST remember the
+ * last pick across page reloads. Without persistence, picking the coding agent
+ * → reloading → sending lands the message on the Lucidos Agent despite the
+ * prior pick (and the toggle displays Lucidos again, silently overriding the
+ * user's choice).
  *
  * Restoration: `store.ts` reads 'lucidos-input-mode' from localStorage on init.
  * Persistence: `effects.ts` writes it back on every change.
@@ -27,10 +28,16 @@ describe('inputMode persistence (compose toggle remembers last choice)', () => {
     expect(inputMode.value).toEqual({ type: 'do' });
   });
 
-  it('restores { type: claude_code } from localStorage on init', async () => {
+  it('restores { type: coding_agent } from localStorage on init', async () => {
+    localStorage.setItem('lucidos-input-mode', JSON.stringify({ type: 'coding_agent' }));
+    const { inputMode } = await import('./store');
+    expect(inputMode.value).toEqual({ type: 'coding_agent' });
+  });
+
+  it('migrates the legacy { type: claude_code } payload to { type: coding_agent }', async () => {
     localStorage.setItem('lucidos-input-mode', JSON.stringify({ type: 'claude_code' }));
     const { inputMode } = await import('./store');
-    expect(inputMode.value).toEqual({ type: 'claude_code' });
+    expect(inputMode.value).toEqual({ type: 'coding_agent' });
   });
 
   it('restores { type: do } from localStorage on init', async () => {
@@ -68,15 +75,15 @@ describe('inputMode persistence (compose toggle remembers last choice)', () => {
     const { inputMode } = await import('./store');
     // effects.ts registers the persist effect; load it explicitly.
     await import('./effects');
-    inputMode.value = { type: 'claude_code' };
+    inputMode.value = { type: 'coding_agent' };
     // Preact signal effects fire synchronously, but yield a microtask in case
     // a future refactor batches the persist.
     await Promise.resolve();
-    expect(localStorage.getItem('lucidos-input-mode')).toBe(JSON.stringify({ type: 'claude_code' }));
+    expect(localStorage.getItem('lucidos-input-mode')).toBe(JSON.stringify({ type: 'coding_agent' }));
   });
 
   it('switching back to lucidos also persists', async () => {
-    localStorage.setItem('lucidos-input-mode', JSON.stringify({ type: 'claude_code' }));
+    localStorage.setItem('lucidos-input-mode', JSON.stringify({ type: 'coding_agent' }));
     const { inputMode } = await import('./store');
     await import('./effects');
     inputMode.value = { type: 'do' };

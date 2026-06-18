@@ -24,6 +24,11 @@ mod responses;
 const CHUNK_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 16384;
 
+/// Base URL for the direct-OpenAI API (`{base}/chat/completions`,
+/// `{base}/responses`). The OpenRouter and local OpenAI-compatible backends
+/// reuse [`OpenAiProvider`] with a different base via [`OpenAiProvider::new_with_base_url`].
+pub const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+
 /// Where the OpenAI API key the engine builds [`OpenAiProvider`] from came
 /// from — surfaced in the startup log so an operator can tell whether the
 /// stored credential or the env fallback is in effect.
@@ -83,6 +88,30 @@ pub fn resolve_openai_api_key(
     None
 }
 
+/// Resolve a bearer-style API key from a stored credential (Settings →
+/// Providers) with an env-var fallback, for OpenAI-compatible backends that
+/// only need the key (no key-source tracking) — e.g. OpenRouter. A usable
+/// `api_key`/`bearer` credential wins; any other `auth_type` is ignored. Blank
+/// values are treated as absent. Returns the trimmed key, or `None` when
+/// neither is configured.
+pub fn resolve_bearer_key(
+    credential: Option<(AuthType, String)>,
+    env_key: Option<String>,
+) -> Option<String> {
+    if let Some((auth_type, value)) = credential {
+        if matches!(auth_type, AuthType::ApiKey | AuthType::Bearer) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    env_key.and_then(|v| {
+        let trimmed = v.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
 /// GPT-5+ and Codex models use the Responses API, all others use Chat Completions.
 fn uses_responses_api(model: &str) -> bool {
     model.contains("codex") || model.starts_with("gpt-5")
@@ -103,26 +132,99 @@ fn openai_reasoning_effort(effort: &str) -> &str {
 pub struct OpenAiProvider {
     api_key: String,
     model: String,
+    /// Full Chat Completions endpoint (`{base}/chat/completions`). Configurable
+    /// so the same struct serves direct OpenAI, OpenRouter, and a local
+    /// OpenAI-compatible server.
+    chat_url: String,
+    /// Full Responses endpoint (`{base}/responses`). Only used when
+    /// `force_chat_completions` is false (direct OpenAI's GPT-5/codex path).
+    responses_url: String,
+    /// Extra headers sent on every request (e.g. OpenRouter's
+    /// `HTTP-Referer` / `X-Title` attribution headers). Empty for direct OpenAI.
+    extra_headers: Vec<(String, String)>,
+    /// When true, every model uses the Chat Completions path — OpenRouter and
+    /// local servers don't implement OpenAI's Responses API, so a `gpt-5`-shaped
+    /// id served by them must still go through Chat Completions.
+    force_chat_completions: bool,
     /// Client without per-request timeout, used for streaming where
     /// we apply per-chunk timeouts instead.
     streaming_client: reqwest::Client,
 }
 
 impl OpenAiProvider {
-    /// Build the provider; returns `Err` if the reqwest builder rejects the
-    /// configuration so the engine can fail at startup with a logged reason.
+    /// Build the direct-OpenAI provider (`api.openai.com`); returns `Err` if the
+    /// reqwest builder rejects the configuration so the engine can fail at
+    /// startup with a logged reason. Thin wrapper over [`new_with_base_url`] that
+    /// preserves the historical signature and behavior (GPT-5/codex → Responses).
+    ///
+    /// [`new_with_base_url`]: Self::new_with_base_url
     pub fn new(
         api_key: String,
         model: String,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::new_with_base_url(api_key, model, OPENAI_DEFAULT_BASE_URL, Vec::new(), false)
+    }
+
+    /// Build an OpenAI-compatible provider against an arbitrary `base_url`
+    /// (e.g. `https://openrouter.ai/api/v1` or `http://localhost:11434/v1`).
+    /// The chat and responses endpoints are derived as `{base}/chat/completions`
+    /// and `{base}/responses` (trailing slashes on `base_url` are trimmed).
+    /// `extra_headers` ride every request; `force_chat_completions` pins the
+    /// Chat Completions path for backends without a Responses API.
+    pub fn new_with_base_url(
+        api_key: String,
+        model: String,
+        base_url: &str,
+        extra_headers: Vec<(String, String)>,
+        force_chat_completions: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let base = base_url.trim_end_matches('/');
+        let chat_url = format!("{base}/chat/completions");
+        let responses_url = format!("{base}/responses");
         let streaming_client = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(30))
             .build()?;
         Ok(Self {
             api_key,
             model,
+            chat_url,
+            responses_url,
+            extra_headers,
+            force_chat_completions,
             streaming_client,
         })
+    }
+
+    /// Whether this request should take the Responses API path. OpenRouter /
+    /// local backends pin Chat Completions via `force_chat_completions`;
+    /// direct OpenAI keeps the GPT-5/codex → Responses split.
+    fn should_use_responses(&self, model: &str) -> bool {
+        !self.force_chat_completions && uses_responses_api(model)
+    }
+
+    /// The header pairs sent on every request: auth (omitted when keyless) +
+    /// `extra_headers` + content-type. Pure so it's unit-testable; the
+    /// `Authorization: Bearer` header is omitted when `api_key` is empty so a
+    /// keyless local server (Ollama / llama.cpp) isn't sent a bogus `Bearer `.
+    fn request_headers(&self) -> Vec<(String, String)> {
+        let mut headers = Vec::new();
+        if !self.api_key.is_empty() {
+            headers.push((
+                "Authorization".to_string(),
+                format!("Bearer {}", self.api_key),
+            ));
+        }
+        headers.extend(self.extra_headers.iter().cloned());
+        headers.push(("Content-Type".to_string(), "application/json".to_string()));
+        headers
+    }
+
+    /// Apply [`request_headers`](Self::request_headers) to a request builder.
+    fn apply_headers(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        for (name, value) in self.request_headers() {
+            req = req.header(name, value);
+        }
+        req
     }
 
     /// Build an LlmResponse from accumulated text content, tool calls, and
@@ -276,7 +378,7 @@ impl LlmProvider for OpenAiProvider {
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         let model = model_override.unwrap_or(&self.model);
 
-        if uses_responses_api(model) {
+        if self.should_use_responses(model) {
             self.chat_responses(
                 &messages,
                 &tools,
@@ -389,5 +491,116 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// `resolve_bearer_key` (used for OpenRouter) prefers a usable credential,
+    /// falls back to the env var, and treats blanks/unsupported auth as absent.
+    #[test]
+    fn resolve_bearer_key_prefers_credential_then_env() {
+        assert_eq!(
+            resolve_bearer_key(
+                Some((AuthType::ApiKey, "sk-or-cred".to_string())),
+                Some("sk-or-env".to_string())
+            ),
+            Some("sk-or-cred".to_string())
+        );
+        assert_eq!(
+            resolve_bearer_key(None, Some("sk-or-env".to_string())),
+            Some("sk-or-env".to_string())
+        );
+        assert_eq!(
+            resolve_bearer_key(Some((AuthType::Bearer, "  ".to_string())), None),
+            None
+        );
+        // A non-key auth_type is ignored; falls through to the env var.
+        assert_eq!(
+            resolve_bearer_key(
+                Some((AuthType::Password, "{}".to_string())),
+                Some("sk-or-env".to_string())
+            ),
+            Some("sk-or-env".to_string())
+        );
+        assert_eq!(resolve_bearer_key(None, None), None);
+    }
+
+    /// `new()` keeps the canonical direct-OpenAI endpoints; `new_with_base_url`
+    /// derives `{base}/chat/completions` + `{base}/responses` and trims a
+    /// trailing slash off the base.
+    #[test]
+    fn base_url_derives_chat_and_responses_endpoints() {
+        let openai = OpenAiProvider::new("k".to_string(), "gpt-4o".to_string()).unwrap();
+        assert_eq!(openai.chat_url, "https://api.openai.com/v1/chat/completions");
+        assert_eq!(openai.responses_url, "https://api.openai.com/v1/responses");
+
+        let local = OpenAiProvider::new_with_base_url(
+            String::new(),
+            "llama3.1".to_string(),
+            "http://localhost:11434/v1/", // trailing slash trimmed
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(local.chat_url, "http://localhost:11434/v1/chat/completions");
+    }
+
+    /// `force_chat_completions` pins the Chat Completions path even for a
+    /// `gpt-5`-shaped id (OpenRouter / local don't implement the Responses API);
+    /// direct OpenAI keeps the GPT-5/codex → Responses split.
+    #[test]
+    fn force_chat_completions_overrides_responses_routing() {
+        let openai = OpenAiProvider::new("k".to_string(), "gpt-4o".to_string()).unwrap();
+        assert!(openai.should_use_responses("gpt-5.5"));
+        assert!(!openai.should_use_responses("gpt-4o"));
+
+        let openrouter = OpenAiProvider::new_with_base_url(
+            "k".to_string(),
+            "z-ai/glm-5.2".to_string(),
+            "https://openrouter.ai/api/v1",
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        assert!(!openrouter.should_use_responses("gpt-5.5"));
+        assert!(!openrouter.should_use_responses("z-ai/glm-5.2"));
+    }
+
+    /// The `Authorization` header is omitted on an empty key (keyless local
+    /// server) and present otherwise; `extra_headers` (OpenRouter attribution)
+    /// always ride along.
+    #[test]
+    fn request_headers_omit_auth_when_keyless_and_include_extras() {
+        let keyless = OpenAiProvider::new_with_base_url(
+            String::new(),
+            "llama3.1".to_string(),
+            "http://localhost:11434/v1",
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        let headers = keyless.request_headers();
+        assert!(
+            !headers.iter().any(|(n, _)| n == "Authorization"),
+            "keyless local server must not be sent an Authorization header"
+        );
+
+        let openrouter = OpenAiProvider::new_with_base_url(
+            "sk-or".to_string(),
+            "z-ai/glm-5.2".to_string(),
+            "https://openrouter.ai/api/v1",
+            vec![
+                ("HTTP-Referer".to_string(), "https://lucidos.dev".to_string()),
+                ("X-Title".to_string(), "Lucidos".to_string()),
+            ],
+            true,
+        )
+        .unwrap();
+        let headers = openrouter.request_headers();
+        assert!(headers
+            .iter()
+            .any(|(n, v)| n == "Authorization" && v == "Bearer sk-or"));
+        assert!(headers
+            .iter()
+            .any(|(n, v)| n == "HTTP-Referer" && v == "https://lucidos.dev"));
+        assert!(headers.iter().any(|(n, v)| n == "X-Title" && v == "Lucidos"));
     }
 }

@@ -14,7 +14,7 @@ import { focusedThreadId, wipPreviewThreadId, threadMap, currentApp, threadsLoad
 //    rejects (the thread's recorded app doesn't match the requested app).
 //    Drop the WIP before the iframe attempts the doomed request.
 //
-// Apply / Discard / Archive cleanup happens through `clearWipForThread()`,
+// Apply / Discard / Archive cleanup happens through `clearWipIfMatches()`,
 // invoked by the thread-sync handlers for ChangeApplied / ChangeDiscarded /
 // ThreadArchived, and by `refreshAppUI` when the engine emits
 // AppUiRefreshRequested for the WIP'd app (which is exactly when Apply lands

@@ -213,7 +213,7 @@ async fn chat_stream_rejects_unknown_repo() {
     let body = serde_json::json!({
         "message": "test",
         "mode": "human",
-        "use_claude_code": true,
+        "use_coding_agent": true,
         "repo_id": "definitely-not-a-real-repo-name-for-e2e",
     });
     let resp = client
@@ -284,7 +284,7 @@ async fn chat_stream_rejects_mode_switch_on_existing_thread() {
             "message": "switch me to CC",
             "mode": "human",
             "thread_id": thread_id.to_string(),
-            "use_claude_code": true,
+            "use_coding_agent": true,
             "repo_id": Uuid::new_v4().to_string(),
         }))
         .send()
@@ -308,10 +308,10 @@ async fn chat_stream_rejects_mode_switch_on_existing_thread() {
 /// Regression: a draft can have its `source` column set to `'claude_code'`
 /// from a prior compose-mode toggle (the PUT compose CASE writes it). When
 /// the user toggles back to Lucidos and clicks Send before the debounced PUT
-/// lands, the chat request arrives with `use_claude_code=false` and the
-/// row's stale source surfaces as a 409 ("Thread is locked to Claude Code
-/// mode; cannot switch to Lucidos") — even though no message has ever been
-/// sent on the thread.
+/// lands, the chat request arrives with `use_coding_agent=false` and the
+/// row's stale source surfaces as a 409 ("Thread is locked to coding-agent
+/// mode; cannot switch to Lucidos Agent") — even though no message has ever
+/// been sent on the thread.
 ///
 /// The mode lock must only apply to threads that have actually been sent
 /// (`state='active'`). Composing threads are still drafts; the user is
@@ -339,7 +339,7 @@ async fn chat_stream_allows_mode_switch_on_composing_thread() {
             "message": "I changed my mind, send via Lucidos",
             "mode": "human",
             "thread_id": thread_id.to_string(),
-            // No use_claude_code → Lucidos, despite source='claude_code'
+            // No use_coding_agent → Lucidos, despite source='claude_code'
         }))
         .send()
         .await
@@ -389,7 +389,7 @@ async fn chat_stream_rejects_repo_switch_on_existing_cc_thread() {
             "message": "switch repo on me",
             "mode": "human",
             "thread_id": thread_id.to_string(),
-            "use_claude_code": true,
+            "use_coding_agent": true,
             "repo_id": repo_b,
         }))
         .send()

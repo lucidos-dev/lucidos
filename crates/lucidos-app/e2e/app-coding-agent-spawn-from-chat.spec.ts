@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { navigateToApp, assertHealthy } from './helpers';
 import { createIframeAppFixture } from './db-helpers';
 
@@ -52,10 +52,11 @@ test.describe('App coding-agent thread — compose destination picker', () => {
       await expect(menu.locator('.dropdown-option', { hasText: 'Lucidos source' }).first()).toBeVisible();
 
       // Picking the app writes `{kind:'app',appId}` into localStorage under
-      // the persisted scope key AND flips the channel to claude_code (one
-      // pick does both — that's the point of the destination picker). Assert
-      // the writes so a regression in the option-value encoding (repo: vs
-      // app: prefix) doesn't silently send the wrong scope on the next send.
+      // the persisted scope key AND flips the input mode to the coding-agent
+      // channel (one pick does both — that's the point of the destination
+      // picker). Assert the writes so a regression in the option-value encoding
+      // (repo: vs app: prefix) doesn't silently send the wrong scope on the
+      // next send.
       await appOption.click();
       const stored = await page.evaluate(
         () => localStorage.getItem('lucidos-coding-agent-last-scope'),
@@ -68,7 +69,7 @@ test.describe('App coding-agent thread — compose destination picker', () => {
         () => localStorage.getItem('lucidos-input-mode'),
       );
       expect(mode).toBeTruthy();
-      expect(JSON.parse(mode!).type).toBe('claude_code');
+      expect(JSON.parse(mode!).type).toBe('coding_agent');
 
       // With a coding target picked, the coding-agent chip appears with the
       // remembered backend (Claude Code by default).

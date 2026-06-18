@@ -1,4 +1,5 @@
 import { useRef, useEffect } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import type { ComponentChildren, RefObject, JSX } from 'preact';
 import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
 import { pushOverlay, removeOverlay } from '../../store/overlayStack';
@@ -93,6 +94,18 @@ export interface OverlayProps {
    *  `useAnchoredPosition` so it can measure the panel. Omit to use an internal
    *  ref (the dismiss hook still gets it either way). */
   panelRef?: RefObject<HTMLDivElement>;
+  /** Render the panel into `document.body` instead of inline. REQUIRED for an
+   *  anchored (`backdrop:false`) popover whose host lives under a `transform`ed
+   *  / `filter`ed ancestor (e.g. the floating `.app-header` regions, which use
+   *  `transform: translateY(-50%)`): a transform makes that ancestor the
+   *  containing block for `position: fixed` descendants, so the panel's
+   *  viewport coordinates would resolve against the ancestor and render
+   *  off-screen. Portaling to `<body>` restores the viewport as the containing
+   *  block. The dismiss/anchor/Escape/inert contracts are unaffected —
+   *  `panel.contains()` works across a portal, and the portaled node sits
+   *  outside `.app-shell` so it's interactive without the inert exemption.
+   *  Only honored for `backdrop:false`. Default `false`. */
+  portal?: boolean;
   children: ComponentChildren;
 }
 
@@ -128,8 +141,12 @@ export function Overlay({
   keepMounted = false,
   hiddenClass,
   panelRef: externalPanelRef,
+  portal = false,
   children,
 }: OverlayProps) {
+  // Portal only makes sense for a backdrop-less anchored panel (a backdrop
+  // modal owns the full-screen `.modal-overlay` container instead).
+  const usePortal = portal && !backdrop && typeof document !== 'undefined';
   const internalRef = useRef<HTMLDivElement>(null);
   const panelRef = externalPanelRef ?? internalRef;
 
@@ -171,7 +188,8 @@ export function Overlay({
     const cls = backdrop
       ? ['modal-overlay', overlayClass, hiddenClass].filter(Boolean).join(' ')
       : [panelClass, hiddenClass].filter(Boolean).join(' ');
-    return <div class={cls} aria-hidden="true" />;
+    const hidden = <div class={cls} aria-hidden="true" />;
+    return usePortal ? createPortal(hidden, document.body) : hidden;
   }
 
   const panel = (
@@ -191,7 +209,7 @@ export function Overlay({
     </div>
   );
 
-  if (!backdrop) return panel;
+  if (!backdrop) return usePortal ? createPortal(panel, document.body) : panel;
   const cls = ['modal-overlay', overlayClass].filter(Boolean).join(' ');
   return <div class={cls}>{panel}</div>;
 }

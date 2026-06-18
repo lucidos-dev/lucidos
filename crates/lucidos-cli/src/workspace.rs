@@ -8,6 +8,17 @@ pub(crate) struct Workspace {
     pub(crate) root: PathBuf,
     pub(crate) api_port: u16,
     pub(crate) proto: String,
+    /// Explicit engine base URL handed down by the engine (`LUCIDOS_API_BASE_URL`),
+    /// used in preference to `proto`/`api_port` when present. Under the workspace
+    /// gateway (ADR 0014) the `.lucidos/ports` file holds the user-facing gateway
+    /// port — but the gateway routes the workspace under `/<slug>/`, so a bare
+    /// `https://localhost:<port>/api/v1/...` request never reaches this engine
+    /// (the gateway resolves the first path segment as a workspace slug). The
+    /// engine therefore exports the loopback HTTP URL it is actually reachable at;
+    /// we honour it so the CLI talks to the engine directly. `None` in legacy /
+    /// Tauri / terminal use → fall back to the ports file (which resolves the
+    /// engine correctly there).
+    pub(crate) api_base_override: Option<String>,
 }
 
 impl Workspace {
@@ -16,6 +27,9 @@ impl Workspace {
     }
 
     pub(crate) fn base_url(&self) -> String {
+        if let Some(base) = &self.api_base_override {
+            return base.clone();
+        }
         format!("{}://localhost:{}", self.proto, self.api_port)
     }
 }
@@ -24,7 +38,18 @@ pub(crate) fn resolve_from_env() -> Result<Workspace, BoxError> {
     let pwd = std::env::current_dir()
         .map_err(|e| format!("Failed to read current dir: {}", e))?;
     let env_ws = std::env::var("LUCIDOS_WORKSPACE").ok().map(PathBuf::from);
-    resolve(&pwd, env_ws.as_deref())
+    let mut ws = resolve(&pwd, env_ws.as_deref())?;
+    // Prefer the engine-provided base URL when set (workspace gateway, ADR 0014
+    // — see `Workspace::api_base_override`). Read here, not in `resolve`, to keep
+    // `resolve` free of env reads so tests can drive it deterministically.
+    if let Some(base) = std::env::var("LUCIDOS_API_BASE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        ws.api_base_override = Some(base);
+    }
+    Ok(ws)
 }
 
 /// Separated from env reads so tests can drive it without racing the global
@@ -52,12 +77,18 @@ pub(crate) fn resolve(start_dir: &Path, env_workspace: Option<&Path>) -> Result<
             root: root.to_path_buf(),
             api_port,
             proto,
+            api_base_override: None,
         });
     }
 
     if let Some(root) = walk_up_for_ports(start_dir) {
         let (api_port, proto) = read_ports(&root.join(".lucidos/ports"))?;
-        return Ok(Workspace { root, api_port, proto });
+        return Ok(Workspace {
+            root,
+            api_port,
+            proto,
+            api_base_override: None,
+        });
     }
 
     Err(format!(
@@ -231,6 +262,34 @@ mod tests {
         write_ports(tmp.path(), 5177);
         let ws = resolve(tmp.path(), None).unwrap();
         assert_eq!(ws.proto, "https");
+        assert_eq!(ws.base_url(), "https://localhost:5177");
+    }
+
+    #[test]
+    fn base_url_prefers_explicit_override() {
+        // Under the workspace gateway (ADR 0013) the engine hands the CLI an
+        // explicit loopback base URL via LUCIDOS_API_BASE_URL. It must win over
+        // the ports-file port, which under the gateway is the user-facing
+        // gateway port (a bare `/api/v1` request there returns the picker's
+        // SPA HTML, not JSON — the trigger-notification bug this fixes).
+        let ws = Workspace {
+            root: PathBuf::from("/tmp/test-ws"),
+            api_port: 5173,
+            proto: "https".to_string(),
+            api_base_override: Some("http://127.0.0.1:62072".to_string()),
+        };
+        assert_eq!(ws.base_url(), "http://127.0.0.1:62072");
+    }
+
+    #[test]
+    fn base_url_falls_back_to_ports_file_without_override() {
+        // Legacy / Tauri / terminal: no override → ports-file proto + port.
+        let ws = Workspace {
+            root: PathBuf::from("/tmp/test-ws"),
+            api_port: 5177,
+            proto: "https".to_string(),
+            api_base_override: None,
+        };
         assert_eq!(ws.base_url(), "https://localhost:5177");
     }
 }

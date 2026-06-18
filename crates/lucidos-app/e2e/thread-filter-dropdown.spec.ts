@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer, clickVisibleElement, waitForVisibleElement } from './helpers';
 
 test.describe('Thread filter dropdown dismiss', () => {

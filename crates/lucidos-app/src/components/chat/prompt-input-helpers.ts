@@ -15,7 +15,7 @@ import type { BannerState } from './WaitingBanner';
 export const submittingThreadIds = signal<Set<string>>(new Set());
 
 export interface UploadSendIntent<TContext = unknown> {
-  useClaudeCode: boolean;
+  useCodingAgent: boolean;
   context: TContext | null;
 }
 

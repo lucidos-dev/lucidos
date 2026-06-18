@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { appPath, createIframeAppFixture, psql } from './db-helpers';
 import { gotoWithRetry } from './helpers';
 
@@ -219,7 +219,7 @@ waitForLucidos();
 
     // Pins the inline value separately from the iframeBg check above:
     // by query time CSS modules have hydrated, so iframeBg can pass on
-    // luck while the user still saw `var(--bg-primary, #0d1117)` fall
+    // luck while the user still saw `var(--bg-primary, #0b2342)` fall
     // back to dark for the first ~50–200ms.
     const inlinedBgPrimary = await page.evaluate(() =>
       document.documentElement.style.getPropertyValue('--bg-primary'));

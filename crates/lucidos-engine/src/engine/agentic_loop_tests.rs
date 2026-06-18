@@ -7,12 +7,14 @@
 //! client UUID was reused as the persisted `UserPromptInjected` id.
 
 use super::{
-    emit_iteration_cap_response_generated, emit_user_prompt_injected_event,
+    append_injected_prompts_to_messages, emit_iteration_cap_response_generated,
+    emit_user_prompt_injected_event, filter_removed_queued_prompts,
     ensure_terminator_emitted, MAX_ITERATIONS,
 };
 use super::super::event_bus::{BusEvent, EventBus};
 use super::super::thread_events::{ActorMode, EventMeta, ThreadEvent};
-use super::super::InjectedPrompt;
+use super::super::{InjectedPrompt, InjectedPromptKind};
+use crate::llm::{Message, MessageContent};
 use crate::test_support::{setup_test_db, teardown_test_db};
 use uuid::Uuid;
 
@@ -187,6 +189,65 @@ async fn user_prompt_injected_does_not_collide_with_optimistic_id() {
         injected_link.as_deref(),
         Some(client_event_id.to_string().as_str()),
         "injected_message_id must point at the paired MessageReceived",
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn append_injected_prompts_coalesces_messages_but_emits_each_audit_row() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let origin_id = Uuid::new_v4();
+    let meta = anchor_request(&bus, thread_id, origin_id, "original request").await;
+    let first_followup_id = Uuid::new_v4();
+    let second_followup_id = Uuid::new_v4();
+    let prompts = vec![
+        InjectedPrompt {
+            text: "first queued update".to_string(),
+            event_id: Some(first_followup_id),
+            mode: ActorMode::Human,
+            spawning_event_id: None,
+            images: None,
+            origin: None,
+            kind: crate::engine::InjectedPromptKind::UserText,
+        },
+        InjectedPrompt {
+            text: "second queued update".to_string(),
+            event_id: Some(second_followup_id),
+            mode: ActorMode::Human,
+            spawning_event_id: None,
+            images: None,
+            origin: None,
+            kind: crate::engine::InjectedPromptKind::UserText,
+        },
+    ];
+
+    let mut messages = Vec::<Message>::new();
+    assert!(
+        append_injected_prompts_to_messages(&bus, thread_id, &meta, &mut messages, prompts).await,
+        "coalescing should append one LLM message"
+    );
+    assert_eq!(messages.len(), 1);
+    let MessageContent::Blocks(blocks) = &messages[0].content else {
+        panic!("multiple injected prompts must become one block message");
+    };
+    assert_eq!(blocks.len(), 2);
+
+    let injected_links: Vec<String> = sqlx::query_scalar(
+        "SELECT payload->>'injected_message_id' FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'UserPromptInjected' \
+         ORDER BY created",
+    )
+    .bind(thread_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .expect("UserPromptInjected rows must persist");
+    assert_eq!(
+        injected_links,
+        vec![first_followup_id.to_string(), second_followup_id.to_string()]
     );
 
     teardown_test_db(&db_name).await;
@@ -459,6 +520,56 @@ async fn emit_response_canceled_lands_when_no_prior_terminator() {
     .await
     .expect("query");
     assert_eq!(canceled_count, 1, "emit must land when no prior terminator exists");
+
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn filter_removed_queued_prompts_binds_thread_aggregate_id_as_text() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let kept_id = Uuid::new_v4();
+    let removed_id = Uuid::new_v4();
+
+    anchor_request(&bus, thread_id, removed_id, "drop").await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::QueuedMessageRemoved {
+            removed_message_id: removed_id,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .expect("QueuedMessageRemoved must persist");
+
+    let prompts = vec![
+        InjectedPrompt {
+            text: "keep".into(),
+            event_id: Some(kept_id),
+            mode: ActorMode::Human,
+            spawning_event_id: None,
+            images: None,
+            origin: None,
+            kind: InjectedPromptKind::UserText,
+        },
+        InjectedPrompt {
+            text: "drop".into(),
+            event_id: Some(removed_id),
+            mode: ActorMode::Human,
+            spawning_event_id: None,
+            images: None,
+            origin: None,
+            kind: InjectedPromptKind::UserText,
+        },
+    ];
+
+    let filtered = filter_removed_queued_prompts(&pool, thread_id, prompts).await;
+    assert_eq!(
+        filtered.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(),
+        vec!["keep"],
+        "removed queued prompts must be filtered before ingestion"
+    );
 
     teardown_test_db(&db_name).await;
 }

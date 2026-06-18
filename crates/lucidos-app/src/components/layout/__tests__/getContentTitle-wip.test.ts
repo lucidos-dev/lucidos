@@ -85,6 +85,11 @@ describe('getContentTitle — menu labels', () => {
     activeMenuItem.value = 'thread-queue';
     expect(getContentTitle()).toBe('Thread Queue');
   });
+
+  it('apps renders its canonical "Apps" title (the App Store is now its Store tab)', () => {
+    activeMenuItem.value = 'apps';
+    expect(getContentTitle()).toBe('Apps');
+  });
 });
 
 describe('CHANNEL_OPTIONS', () => {

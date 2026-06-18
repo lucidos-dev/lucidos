@@ -303,7 +303,7 @@ export function CodingAgentControlMenu({ threadId, codingAgent }: Props) {
   function sendSlashCommand(cmd: string) {
     if (!isClaudeCode) return;
     close();
-    sendMessage(`/${cmd}`, undefined, { useClaudeCode: true }).catch((err) => {
+    sendMessage(`/${cmd}`, undefined, { useCodingAgent: true }).catch((err) => {
       showToast(`Failed to send /${cmd}: ${errorDetail(err)}`, 'error');
     });
   }

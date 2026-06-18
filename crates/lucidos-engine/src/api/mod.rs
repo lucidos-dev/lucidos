@@ -1,6 +1,7 @@
 pub mod actor;
 mod app_ui;
 mod apps;
+pub(crate) mod base_path;
 mod artifacts;
 pub(crate) mod backup;
 mod blobs;
@@ -11,7 +12,7 @@ mod command_checkpoint;
 mod command_permission;
 mod data_api;
 mod disk_usage;
-mod error;
+pub(crate) mod error;
 mod history;
 mod images;
 pub(crate) mod internal;
@@ -50,7 +51,7 @@ mod triggers;
 
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -69,6 +70,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -375,12 +377,17 @@ pub struct ChatRequest {
     pub image_hashes: Option<Vec<String>>,
     #[serde(default)]
     pub device_id: Option<String>,
-    #[serde(default)]
-    pub use_claude_code: Option<bool>,
+    /// True when this request spawns / continues a *coding-agent thread* (any
+    /// backend), as opposed to a chat thread answered by the Lucidos Agent.
+    /// The `coding_agent` field below picks the backend. Aliased to the legacy
+    /// `use_claude_code` key so payloads persisted before the rename (queued
+    /// `ThreadQueueRequest` rows, in-flight clients) still deserialize.
+    #[serde(default, alias = "use_claude_code")]
+    pub use_coding_agent: Option<bool>,
     #[serde(default)]
     pub cc_model: Option<String>,
     /// Which coding-agent backend a NEW coding-agent thread should run on
-    /// (`claude-code` | `codex`). Requires `use_claude_code: true`; ignored
+    /// (`claude-code` | `codex`). Requires `use_coding_agent: true`; ignored
     /// on follow-ups — the thread's stored backend wins (locked at first
     /// SessionStarted).
     #[serde(default)]
@@ -480,6 +487,10 @@ pub struct CreateCredentialRequest {
     pub auth_value: String,
     #[serde(default)]
     pub auth_header: Option<String>,
+    /// Optional custom env var name for the injected secret (e.g. `GITHUB_TOKEN`
+    /// instead of `CRED_<NAME>`). Validated like a user env var name.
+    #[serde(default)]
+    pub env_var_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -497,6 +508,10 @@ pub struct UpdateCredentialRequest {
     /// the source of truth for IMAP/SMTP, so it must be kept in sync here.
     #[serde(default)]
     pub email: Option<EmailAccountSettings>,
+    /// Optional custom env var name for the injected secret. `None`/empty clears
+    /// it back to the default `CRED_<NAME>` form. Validated like a user env var.
+    #[serde(default)]
+    pub env_var_name: Option<String>,
 }
 
 /// Email server settings carried by an `UpdateCredentialRequest` for
@@ -809,6 +824,58 @@ async fn request_logger(req: axum::extract::Request, next: Next) -> Response {
     response
 }
 
+/// Serve the built frontend (`dist/`) for an unmatched request.
+///
+/// Real bundled files (`/assets/*`, `/sw.js`, `/manifest.json`, `/favicon*`, …)
+/// stream straight from disk via `ServeDir`. The SPA shell — `/`, `/index.html`,
+/// or any navigation that doesn't resolve to a file — is served as `index.html`
+/// with `<base href>` stamped from `X-Forwarded-Prefix` (ADR 0014 §4), so the
+/// bundle's relative refs resolve under the workspace prefix behind the gateway.
+async fn serve_frontend(static_dir: PathBuf, req: axum::extract::Request) -> Response {
+    // The SPA shell and static assets are only ever served for read requests.
+    // A non-GET/HEAD request that reaches this fallback hit no API/app/data route,
+    // so the path simply doesn't exist — return 404. Without this gate the request
+    // falls through to `ServeDir`, which answers any non-GET with 405 Method Not
+    // Allowed, leaking a misleading "method not allowed" for an unknown path (e.g.
+    // a stray `POST /api/internal/...` that dropped the `/v1/`).
+    if req.method() != Method::GET && req.method() != Method::HEAD {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let prefix = base_path::forwarded_prefix(req.headers());
+    let path = req.uri().path();
+
+    if path.starts_with("/api/") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // The shell: root or an explicit index request → stamped index.html.
+    if path == "/" || path == "/index.html" {
+        return serve_shell(&static_dir, &prefix);
+    }
+
+    // Otherwise try the path as a real asset; a 404 means it's a client-side
+    // route (hash routing keeps these rare) → fall back to the stamped shell.
+    let service = ServeDir::new(&static_dir);
+    match service.oneshot(req).await {
+        Ok(resp) if resp.status() != StatusCode::NOT_FOUND => resp.map(axum::body::Body::new),
+        _ => serve_shell(&static_dir, &prefix),
+    }
+}
+
+/// Read `index.html` from `static_dir`, stamp `<base href>` for `prefix`, return
+/// it as `text/html`.
+fn serve_shell(static_dir: &std::path::Path, prefix: &str) -> Response {
+    let index = static_dir.join("index.html");
+    match std::fs::read_to_string(&index) {
+        Ok(html) => {
+            let stamped = base_path::inject_base_href(&html, prefix);
+            ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], stamped).into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "frontend not built").into_response(),
+    }
+}
+
 // Top-level wiring helper that takes every engine subsystem the router needs;
 // reducing it would force the call site to thread the same set into a holder.
 #[allow(clippy::too_many_arguments)]
@@ -904,11 +971,19 @@ pub fn create_router(
         .nest("/app", apps::ui_router().with_state(app_ui_state))
         .nest_service("/data", serve_data);
 
-    // In dev mode, reverse-proxy unmatched requests to Vite so the browser
-    // sees a single origin (engine port) for both API and frontend.
-    let router = if let Ok(vite_url) = std::env::var("LUCIDOS_DEV_PROXY") {
+    // Unmatched (non-API, non-/app, non-/data) requests resolve the frontend
+    // from the pre-built `dist/` at LUCIDOS_STATIC_DIR — the SAME serving path
+    // in dev and packaged (ADR 0014 §4/§5; the dev Vite reverse-proxy is gone).
+    // Real bundled assets stream straight from disk; the SPA shell (`/`,
+    // `/index.html`, and any non-file navigation) is served with `<base href>`
+    // stamped from the gateway's `X-Forwarded-Prefix` so the bundle's relative
+    // asset refs resolve back through the gateway to this workspace. With no
+    // header (direct hit / `LUCIDOS_NO_GATEWAY`) the base is `/`, identical to
+    // before. No LUCIDOS_STATIC_DIR → keep the default 404 (headless API-only).
+    let router = if let Some(static_dir) = std::env::var_os("LUCIDOS_STATIC_DIR") {
+        let static_dir = PathBuf::from(static_dir);
         router.fallback(move |req: axum::extract::Request| {
-            crate::dev_proxy::proxy(vite_url.clone(), req)
+            serve_frontend(static_dir.clone(), req)
         })
     } else {
         router

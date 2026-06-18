@@ -1,4 +1,4 @@
-//! Plugin LLM tools: install / update / uninstall flows.
+//! Plugin LLM tools: install / marketplace registration / update / uninstall flows.
 //!
 //! This module owns the user-confirm staging flows (install + uninstall),
 //! the `LucidosEngine` tool dispatch, and the shared pending-map plumbing.
@@ -10,16 +10,18 @@
 //! Splitting is purely structural; the public surface stays reachable at
 //! `crate::engine::tools::plugins::*` via the re-exports below.
 
-
 use std::path::{Path, PathBuf};
 
+use crate::core::plugin_marketplaces::{
+    add_marketplace, load_registry, save_registry, MARKETPLACES_DATA_PATH,
+};
 use crate::core::plugins::{
-    compare_versions, detect_conflicts, validate_tree, AUTH_MODULES_DIR, PlannedFile,
-    UpdateDecision,
+    compare_versions, detect_conflicts, validate_tree, PlannedFile, UpdateDecision,
+    AUTH_MODULES_DIR,
 };
 use crate::core::DATA_DIR;
 use crate::engine::event_bus::{BusEvent, EventBusEmitter, SystemEvent};
-use crate::engine::thread_events::MessageOrigin;
+use crate::engine::thread_events::{ActorMode, MessageOrigin, ThreadDirection};
 use crate::engine::LucidosEngine;
 
 mod registry;
@@ -33,6 +35,7 @@ use source::{copy_atomic, detect_source, fetch_source, SourceType};
 // Named by other modules via the `plugins::` path (`engine::tools::files`
 // routes plugin-owned deletes here), so it stays a re-export.
 pub(crate) use registry::find_plugin_owning_file;
+pub(crate) use registry::installed_plugin_summaries;
 
 /// Sentinel prefix on the `install_plugin` / `update_plugin` tool result. The
 /// agentic loop strips it and re-emits a transient
@@ -85,6 +88,11 @@ pub struct PendingInstall {
     pub(crate) source_string: String,
     pub(crate) plugin_id: String,
     pub(crate) plugin_version: String,
+    pub(crate) plugin_name: String,
+    /// The manifest's `setup` field, trimmed and normalized to `None` when
+    /// empty. On confirm, a non-`None` value spawns a Lucidos Agent thread to
+    /// walk the user through the author's setup instructions.
+    pub(crate) setup: Option<String>,
     pub(crate) created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -95,6 +103,7 @@ impl LucidosEngine {
         &self,
         name: &str,
         args: &serde_json::Value,
+        thread_id: uuid::Uuid,
     ) -> super::ToolOutcome {
         match name {
             crate::llm::tool_names::INSTALL_PLUGIN => {
@@ -103,6 +112,9 @@ impl LucidosEngine {
                     _ => return Err("Error: source is required".to_string()),
                 };
                 super::lift_legacy_string(self.prepare_install_request(&source_str).await)
+            }
+            crate::llm::tool_names::REGISTER_PLUGIN_MARKETPLACE => {
+                self.register_plugin_marketplace_tool(args, thread_id).await
             }
             crate::llm::tool_names::CHECK_PLUGIN_UPDATES => {
                 let single_id = args
@@ -172,6 +184,75 @@ impl LucidosEngine {
         }
     }
 
+    async fn register_plugin_marketplace_tool(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> super::ToolOutcome {
+        let source = match args.get("source").and_then(|v| v.as_str()).map(str::trim) {
+            Some(s) if !s.is_empty() => s,
+            _ => return Err("Error: source is required".to_string()),
+        };
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let response = {
+            let _repo_guard = self.lock_workspace_repo().await;
+            let mut registry = load_registry(&self.workspace_path)
+                .map_err(|e| format!("Error: read marketplace registry: {e}"))?;
+            let (marketplace, created) =
+                add_marketplace(&mut registry, source, name).map_err(|e| format!("Error: {e}"))?;
+            save_registry(&self.workspace_path, &registry)
+                .map_err(|e| format!("Error: write marketplace registry: {e}"))?;
+
+            let commit_message = if created {
+                "Register plugin marketplace"
+            } else {
+                "Update plugin marketplace"
+            };
+            let commit = self
+                .artifact_manager
+                .commit_data_path(MARKETPLACES_DATA_PATH, commit_message)
+                .await
+                .map_err(|e| format!("Error: commit marketplace registry: {e}"))?;
+
+            let actor = Some(agent_tool_actor(thread_id));
+            self.event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::DataFileWritten {
+                        path: MARKETPLACES_DATA_PATH.to_string(),
+                        commit: Some(commit.clone()),
+                        actor,
+                    }),
+                    "[Plugins] DataFileWritten",
+                )
+                .await;
+
+            serde_json::json!({
+                "marketplace": marketplace,
+                "marketplaces": registry.marketplaces,
+                "created": created,
+                "commit": commit,
+            })
+        };
+
+        let update_engine = self.clone_arc();
+        let update_pool = self.pool.clone();
+        tokio::spawn(async move {
+            crate::scheduler::plugin_updates::run_plugin_marketplace_update_check(
+                update_engine,
+                update_pool,
+            )
+            .await;
+        });
+
+        serde_json::to_string_pretty(&response)
+            .map_err(|e| format!("Error: serialize marketplace registration: {e}"))
+    }
+
     /// Stage `source_str` into a temp dir, validate the manifest + tree,
     /// register the result in `pending_installs`, and return the
     /// `[PLUGIN_INSTALL_REQUEST]` sentinel so the agentic loop intercepts it.
@@ -193,6 +274,45 @@ impl LucidosEngine {
 }
 
 type PendingInstallsMap = std::sync::Mutex<std::collections::HashMap<String, PendingInstall>>;
+
+fn agent_tool_actor(thread_id: uuid::Uuid) -> MessageOrigin {
+    MessageOrigin::ThreadLink {
+        thread_id,
+        title: None,
+        spawning_event_id: None,
+        mode: ActorMode::Agent,
+        direction: ThreadDirection::Parent,
+    }
+}
+
+pub(crate) async fn stage_install_request(engine: &LucidosEngine, source_str: &str) -> String {
+    let workspace = engine.workspace_path.clone();
+    let pending = engine.pending_installs.clone();
+    let source = source_str.to_string();
+    match tokio::task::spawn_blocking(move || {
+        prepare_install_request(&workspace, &pending, &source)
+    })
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => format!("Error: install staging task panicked: {}", e),
+    }
+}
+
+/// Stage an uninstall from the App Store UI (the uninstall counterpart of
+/// [`stage_install_request`]). Resolves `id`, builds a `PendingUninstall`, and
+/// returns the `[PLUGIN_UNINSTALL_REQUEST]` sentinel for the HTTP handler to
+/// unwrap — the same staging the `uninstall_plugin` LLM tool produces, so both
+/// paths land in the identical confirm panel.
+pub(crate) async fn stage_uninstall_request(engine: &LucidosEngine, id: &str) -> String {
+    prepare_uninstall_plugin(
+        &engine.workspace_path,
+        &engine.pool,
+        &engine.pending_uninstalls,
+        id,
+    )
+    .await
+}
 
 /// Stage `source_str` into a temp dir, validate the manifest + tree, register
 /// the result in `pending_installs`, and return the
@@ -221,6 +341,16 @@ pub(crate) fn prepare_install_request(
     let overwrites = detect_conflicts(&planned, &data_dir);
     let install_id = uuid::Uuid::new_v4().to_string();
 
+    // Normalize the author's setup instructions once: trimmed, with empty
+    // collapsed to `None`. The same value feeds the panel preview AND the
+    // pending entry that decides whether confirm spawns a setup thread.
+    let setup = manifest
+        .setup
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
     let preview = serde_json::json!({
         "install_id": install_id,
         "source": source_str,
@@ -231,11 +361,7 @@ pub(crate) fn prepare_install_request(
             .map(|p| p.data_relative.clone())
             .collect::<Vec<_>>(),
         "overwrites": overwrites,
-        "setup": manifest
-            .setup
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
+        "setup": setup,
         "plugin_id": manifest.id,
         "plugin_version": manifest.version,
         "plugin_name": manifest.name,
@@ -248,6 +374,8 @@ pub(crate) fn prepare_install_request(
         source_string: source_str.to_string(),
         plugin_id: manifest.id.clone(),
         plugin_version: manifest.version.clone(),
+        plugin_name: manifest.name.clone(),
+        setup,
         created_at: chrono::Utc::now(),
     };
 
@@ -628,6 +756,11 @@ pub(crate) async fn uninstall_with_bus(
 pub struct ConfirmedInstall {
     pub summary: String,
     pub installed_files: Vec<String>,
+    /// The Lucidos Agent thread spawned to walk the user through the plugin's
+    /// `setup` instructions, when the manifest carried any. `None` for plugins
+    /// with no setup field. The frontend navigates the user to this thread so
+    /// setup happens in front of them instead of silently in the background.
+    pub setup_thread_id: Option<uuid::Uuid>,
 }
 
 /// Pop the pending install, run the actual write step from the staged tree,
@@ -653,16 +786,102 @@ pub async fn confirm_pending_install(
             .ok_or_else(|| format!("no pending install with id '{}'", install_id))?
     };
 
-    let (summary, installed_files) = install_from_unpacked_with_bus(
-        &engine.workspace_path,
-        &engine.event_bus,
-        &pending.plugin_root,
-        pending.source_type,
-        true,
-        actor,
-    )
-    .await?;
+    // Pre-allocate the setup thread id (only when there's setup to run) so it
+    // can be recorded in the `PluginInstalled` event — that's what lets the
+    // App Store card resolve the right thread for its Setup→Open state after a
+    // reload, not just in the session that did the install.
+    let setup_thread_id = pending.setup.as_deref().map(|_| uuid::Uuid::new_v4());
 
+    let (summary, installed_files) = {
+        let _repo_guard = engine.lock_workspace_repo().await;
+        install_from_unpacked_with_bus(
+            &engine.workspace_path,
+            &engine.event_bus,
+            &pending.plugin_root,
+            pending.source_type,
+            true,
+            actor.clone(),
+            setup_thread_id,
+        )
+        .await?
+    };
+
+    reload_auth_modules_if_needed(engine, &installed_files).await;
+
+    // A plugin author's `setup` field is "ask the user / wire this up" work —
+    // inert until an agent runs it. Spawn a Lucidos Agent thread seeded with
+    // the instructions so setup actually happens; the id flows back so the
+    // frontend can navigate the user straight to it.
+    if let (Some(setup), Some(thread_id)) = (pending.setup.as_deref(), setup_thread_id) {
+        spawn_plugin_setup_thread(
+            engine,
+            thread_id,
+            &pending.plugin_name,
+            &pending.plugin_version,
+            setup,
+            actor,
+        )
+        .await;
+    }
+
+    Ok(ConfirmedInstall {
+        summary,
+        installed_files,
+        setup_thread_id,
+    })
+}
+
+/// Spawn a Lucidos Agent thread seeded with a plugin's `setup` instructions so
+/// the agent walks the user through completing them (asking questions, wiring
+/// config). Submitted through the Thread Queue like any background spawn, so it
+/// respects admission control. `actor` is the device/user who confirmed the
+/// install; it becomes the new thread's origin so the timeline attributes it.
+/// `thread_id` is pre-allocated by the caller (so the same id can be recorded
+/// in the `PluginInstalled` event). The submission never fails for this kind
+/// (overflow is per-trigger only), so the thread is always either admitted
+/// immediately or queued — never dropped.
+async fn spawn_plugin_setup_thread(
+    engine: &LucidosEngine,
+    thread_id: uuid::Uuid,
+    plugin_name: &str,
+    plugin_version: &str,
+    setup: &str,
+    actor: Option<MessageOrigin>,
+) {
+    let prompt = format!(
+        "The \"{plugin_name}\" plugin (v{plugin_version}) was just installed in this workspace. \
+The plugin author left these setup instructions:\n\n---\n{setup}\n---\n\n\
+Walk the user through completing this setup now. Carry out any wiring or \
+configuration steps you can do yourself, and ask the user directly for \
+anything the instructions need from them (credentials, choices, \
+confirmations). When setup is complete, give a short confirmation of what is \
+now ready to use."
+    );
+
+    let request = crate::engine::thread_queue::ThreadQueueRequest::AgentChat {
+        message: prompt,
+        thread_id,
+        event_id: Some(uuid::Uuid::new_v4().to_string()),
+        image_hashes: Vec::new(),
+        device_id: None,
+        model: None,
+        reasoning_effort: None,
+        use_coding_agent: None,
+        repo_id: None,
+        cc_model: None,
+        coding_agent: None,
+        title: Some(format!("Set up {plugin_name}")),
+        mode: ActorMode::Agent,
+        origin: actor.clone(),
+        parent_thread_id: None,
+        spawning_event_id: None,
+        app_id: None,
+    };
+
+    engine.thread_queue.submit(request, actor, None).await;
+}
+
+async fn reload_auth_modules_if_needed(engine: &LucidosEngine, installed_files: &[String]) {
     let auth_prefix = format!("{}/", AUTH_MODULES_DIR);
     if installed_files.iter().any(|p| p.starts_with(&auth_prefix)) {
         if let Err(e) =
@@ -674,11 +893,6 @@ pub async fn confirm_pending_install(
             );
         }
     }
-
-    Ok(ConfirmedInstall {
-        summary,
-        installed_files,
-    })
 }
 
 /// Drop the pending install, emit a `PluginInstallCanceled` audit event.
@@ -738,6 +952,11 @@ pub(crate) async fn install_from_unpacked_with_bus(
     source_type: SourceType,
     overwrite: bool,
     actor: Option<MessageOrigin>,
+    // The setup thread spawned for this install, recorded in the
+    // `PluginInstalled` payload so the App Store card's Setup→Open state
+    // survives reloads. `None` when the plugin shipped no `setup` field, or
+    // for the silent background auto-update path (no user is watching).
+    setup_thread_id: Option<uuid::Uuid>,
 ) -> Result<(String, Vec<String>), String> {
     let (manifest, planned) = validate_tree(plugin_root).map_err(|e| e.to_string())?;
     let data_dir = workspace_path.join(DATA_DIR);
@@ -783,6 +1002,9 @@ pub(crate) async fn install_from_unpacked_with_bus(
     payload.insert("files".into(), serde_json::json!(installed_files));
     payload.insert("installed_at".into(), serde_json::json!(installed_at));
     payload.insert("source_type".into(), serde_json::json!(source_type.as_str()));
+    if let Some(tid) = setup_thread_id {
+        payload.insert("setup_thread_id".into(), serde_json::json!(tid.to_string()));
+    }
 
     bus.emit(BusEvent::System(SystemEvent::PluginInstalled {
         manifest: serde_json::Value::Object(payload),

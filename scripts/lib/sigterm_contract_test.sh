@@ -43,14 +43,15 @@ fi
 
 echo "test: workspace.sh kill_stale_processes uses kill -USR1 for engine"
 WORKSPACE_SH="$SCRIPT_DIR/workspace.sh"
-# The engine-only kills sit inside `if [ -n "$BUILD" ]; then ... fi` within
-# kill_stale_processes. The same function later has a `kill "$old_pid"` for
-# the FRONTEND (Vite) — that one stays SIGTERM and must NOT be flagged. Scope
-# the grep to the BUILD block: between `if [ -n "$BUILD" ]; then` and its
-# matching `fi` at the same indentation.
+# The engine-only kills sit inside the `if [ -n "$BUILD" ] ...; then ... fi`
+# guard within kill_stale_processes. The condition also carries a
+# `&& [ -z "$skip_engine_kill" ]` clause, so match the `if [ -n "$BUILD" ]`
+# PREFIX, not the whole line. The same function later kills the FRONTEND / legacy
+# build-watch with plain SIGTERM — those sit AFTER this block's 4-space `fi`, so
+# scoping the grep to the block (until that `fi`) correctly excludes them.
 BUILD_BLOCK=$(awk '
     /^kill_stale_processes\(\)/{in_func=1}
-    in_func && /^    if \[ -n "\$BUILD" \]; then/{f=1}
+    in_func && /^    if \[ -n "\$BUILD" \]/{f=1}
     f{print}
     f && /^    fi$/{exit}
 ' "$WORKSPACE_SH")

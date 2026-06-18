@@ -263,11 +263,17 @@ pub(super) async fn update_trigger_group(
 /// `DELETE /trigger-groups?id=` — refuse with `409` when the group still has
 /// member triggers. The response body lists `member_count` and
 /// `member_trigger_ids` so the LLM can move them and retry.
+///
+/// Returns `impl IntoResponse` (not a `(StatusCode, Json)` tuple) so the success
+/// path can emit a *bodyless* `204 No Content`. A 204 carrying a JSON body is
+/// malformed HTTP — Chromium tolerates it but WebKit/iOS rejects the response
+/// with `TypeError: Load failed`, which surfaced as "Failed to delete group:
+/// Load failed" on iOS and only ever failed on the `mobile-webkit` e2e project.
 pub(super) async fn delete_trigger_group(
     State(state): State<AppState>,
     Query(query): Query<TriggerGroupIdQuery>,
     headers: HeaderMap,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> impl IntoResponse {
     let group_id = query.id;
 
     {
@@ -276,7 +282,8 @@ pub(super) async fn delete_trigger_group(
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": format!("Group '{}' not found", group_id) })),
-            );
+            )
+                .into_response();
         }
     }
 
@@ -287,7 +294,7 @@ pub(super) async fn delete_trigger_group(
             member_count: members.len(),
             member_trigger_ids: members,
         };
-        return (StatusCode::CONFLICT, Json(serde_json::to_value(body).unwrap()));
+        return (StatusCode::CONFLICT, Json(serde_json::to_value(body).unwrap())).into_response();
     }
 
     let payload = serde_json::json!({ "group_id": group_id });
@@ -306,20 +313,24 @@ pub(super) async fn delete_trigger_group(
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("Failed to emit delete: {}", e) })),
-        );
+        )
+            .into_response();
     }
 
-    (StatusCode::NO_CONTENT, Json(serde_json::Value::Null))
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// `POST /trigger-groups/reorder` — atomic batch reorder. Validates every id
 /// up front, then emits one `TriggerGroupReordered` per group whose `order`
 /// actually changes. Unknown ids reject the whole batch with `400`.
+///
+/// Returns `impl IntoResponse` so the success path is a *bodyless* `204` — see
+/// `delete_trigger_group` for why a 204-with-body breaks WebKit/iOS.
 pub(super) async fn reorder_trigger_groups(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<ReorderTriggerGroupsRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> impl IntoResponse {
     let to_change: Vec<(String, i32)> = {
         let g = state.engine.trigger_groups.read().unwrap();
         let mut acc = Vec::with_capacity(request.ordering.len());
@@ -332,7 +343,8 @@ pub(super) async fn reorder_trigger_groups(
                         Json(serde_json::json!({
                             "error": format!("Unknown group_id '{}'", entry.id)
                         })),
-                    );
+                    )
+                        .into_response();
                 }
             };
             if current.order != entry.order {
@@ -359,7 +371,8 @@ pub(super) async fn reorder_trigger_groups(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": format!("Failed to emit reorder: {}", e) })),
-            );
+            )
+                .into_response();
         }
         crate::scheduler::handle_trigger_group_event(
             "TriggerGroupReordered",
@@ -369,7 +382,7 @@ pub(super) async fn reorder_trigger_groups(
         );
     }
 
-    (StatusCode::NO_CONTENT, Json(serde_json::Value::Null))
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Routes for the `/trigger-groups*` surface — user-visible folders that

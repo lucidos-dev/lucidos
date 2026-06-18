@@ -28,8 +28,8 @@ mod call_key_unit_tests;
 mod serialize_unit_tests;
 
 #[cfg(test)]
-#[path = "../agentic_loop_unit_tests/tool_turn_text.rs"]
-mod tool_turn_text_unit_tests;
+#[path = "../agentic_loop_unit_tests/flush_text.rs"]
+mod flush_text_unit_tests;
 
 #[cfg(test)]
 #[path = "../agentic_loop_unit_tests/sentinel.rs"]
@@ -38,6 +38,10 @@ mod sentinel_unit_tests;
 #[cfg(test)]
 #[path = "../agentic_loop_unit_tests/capture.rs"]
 mod capture_unit_tests;
+
+#[cfg(test)]
+#[path = "../agentic_loop_unit_tests/injection_coalescing.rs"]
+mod injection_coalescing_unit_tests;
 
 #[cfg(test)]
 #[path = "../agentic_loop_tests.rs"]

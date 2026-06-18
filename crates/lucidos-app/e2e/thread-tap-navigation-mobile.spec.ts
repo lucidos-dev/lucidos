@@ -12,7 +12,7 @@
  * focusedThreadId on B and a different unfocused row to tap, matching what
  * real users hit when revisiting prior threads.
  */
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import {
   assertHealthy,
   navigateToApp,

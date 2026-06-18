@@ -237,6 +237,38 @@ impl LucidosEngine {
         crate::engine::git_ops::harden_marker_state(&self.pool, repo_root, branch_name).await
     }
 
+    /// Record a Planned marker (the `implementation-plan` enforcement floor).
+    /// Called by the `/api/v1/internal/mark-planned` endpoint that the
+    /// `lucidos planned mark` CLI hits.
+    pub(crate) async fn record_planned(
+        &self,
+        repo_root: &std::path::Path,
+        branch_name: &str,
+        kind: crate::engine::git_ops::PlanMarkerKind,
+        plan_path: Option<&str>,
+        reason: Option<&str>,
+        head_sha: &str,
+    ) -> Result<(), sqlx::Error> {
+        crate::engine::git_ops::record_planned(
+            &self.pool,
+            repo_root,
+            branch_name,
+            kind,
+            plan_path,
+            reason,
+            head_sha,
+        )
+        .await
+    }
+
+    pub(crate) async fn plan_marker_state(
+        &self,
+        repo_root: &std::path::Path,
+        branch_name: &str,
+    ) -> crate::engine::git_ops::PlanMarkerState {
+        crate::engine::git_ops::plan_marker_state(&self.pool, repo_root, branch_name).await
+    }
+
     /// Borrow the event store for sharing with read-only handlers.
     pub fn event_store(&self) -> &EventStore {
         &self.event_store

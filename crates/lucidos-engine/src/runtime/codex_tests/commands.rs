@@ -8,10 +8,20 @@ fn test_config(worktree: &Path) -> CodexConfig {
         model: None,
         reasoning_effort: None,
         git_common_dir: None,
-        env: vec![(
-            std::ffi::OsString::from("LUCIDOS_WORKSPACE"),
-            std::ffi::OsString::from("/ws"),
-        )],
+        env: vec![
+            (
+                std::ffi::OsString::from("LUCIDOS_WORKSPACE"),
+                std::ffi::OsString::from("/ws"),
+            ),
+            (
+                std::ffi::OsString::from("LUCIDOS_THREAD_ID"),
+                std::ffi::OsString::from("00000000-0000-0000-0000-000000000123"),
+            ),
+            (
+                std::ffi::OsString::from("LUCIDOS_API_BASE_URL"),
+                std::ffi::OsString::from("http://127.0.0.1:5173"),
+            ),
+        ],
     }
 }
 
@@ -28,12 +38,18 @@ fn fresh_turn_command_layout() {
     let cmd = build_codex_turn_command(&config, None, None, None, "do the thing", &[]);
     let args = collect_args(&cmd);
     assert_eq!(args[0], "exec");
-    assert!(args.contains(&"--json".to_string()), "JSONL output is the wire contract");
-    let sandbox_idx = args.iter().position(|a| a == "--sandbox").expect("--sandbox");
+    assert!(
+        args.contains(&"--json".to_string()),
+        "JSONL output is the wire contract"
+    );
+    let sandbox_idx = args
+        .iter()
+        .position(|a| a == "--sandbox")
+        .expect("--sandbox");
     assert_eq!(args[sandbox_idx + 1], "workspace-write");
     assert!(
-        args.windows(2).any(|w| w[0] == "-c"
-            && w[1] == "sandbox_workspace_write.network_access=true"),
+        args.windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "sandbox_workspace_write.network_access=true"),
         "coding tasks need cargo/npm network access inside the sandbox"
     );
     assert_eq!(
@@ -64,7 +80,10 @@ fn resume_turn_places_global_flags_before_subcommand() {
     let args = collect_args(&cmd);
     let resume_idx = args.iter().position(|a| a == "resume").expect("resume");
     for flag in ["--json", "--sandbox", "-m", "-c"] {
-        let idx = args.iter().position(|a| a == flag).unwrap_or_else(|| panic!("{flag} present"));
+        let idx = args
+            .iter()
+            .position(|a| a == flag)
+            .unwrap_or_else(|| panic!("{flag} present"));
         assert!(
             idx < resume_idx,
             "{flag} must precede the resume subcommand (codex rejects it after)"
@@ -75,21 +94,40 @@ fn resume_turn_places_global_flags_before_subcommand() {
 }
 
 /// Every per-turn child must wire the lucidos MCP server so the model can
-/// raise a QuestionCard via `ask_user_question`. The four overrides travel
-/// together: dropping `enabled_tools` leaks the CC-only `approve` tool to
-/// the model; dropping `tool_timeout_sec` re-introduces the "question times
-/// out while the user is thinking" failure CC fixed with MCP_TIMEOUT.
+/// raise a QuestionCard via `ask_user_question`. The config keys travel
+/// together: dropping `enabled_tools` leaks the CC-only `approve` tool to the
+/// model; dropping `tools.ask_user_question.approval_mode` makes Codex reject
+/// the MCP call before Lucidos can render the card; dropping
+/// `tool_timeout_sec` re-introduces the "question times out while the user is
+/// thinking" failure CC fixed with MCP_TIMEOUT.
 #[test]
 fn turn_command_wires_lucidos_mcp_server() {
     let config = test_config(Path::new("/tmp/wt"));
     let cmd = build_codex_turn_command(&config, None, None, None, "p", &[]);
     let args = collect_args(&cmd);
-    for expected in lucidos_mcp_server_config_overrides() {
+    for expected in lucidos_mcp_server_config_overrides(&config.env) {
         assert!(
             args.windows(2).any(|w| w[0] == "-c" && w[1] == expected),
             "missing -c {expected}; got {args:?}"
         );
     }
+    assert!(
+        args.windows(2).any(|w| w[0] == "-c"
+            && w[1].starts_with("mcp_servers.lucidos.env={")
+            && w[1].contains("LUCIDOS_WORKSPACE")
+            && w[1].contains("LUCIDOS_THREAD_ID")
+            && w[1].contains("LUCIDOS_API_BASE_URL")),
+        "the lucidos MCP child must receive explicit env; Codex does not inherit \
+         the app-server/exec process env into MCP subprocesses. got {args:?}"
+    );
+    assert!(
+        args.windows(2).any(|w| w[0] == "-c"
+            && w[1].starts_with("mcp_servers.lucidos.tools=")
+            && w[1].contains("ask_user_question")
+            && w[1].contains("approval_mode")
+            && w[1].contains("approve")),
+        "the question MCP tool must be pre-approved for non-interactive Codex. got {args:?}"
+    );
 }
 
 /// The suppression gate in the engine's run loop and the MCP wire name must
@@ -98,13 +136,14 @@ fn turn_command_wires_lucidos_mcp_server() {
 /// rename on either side without the other double-renders the question card.
 #[test]
 fn ask_user_question_tool_name_matches_server_config() {
-    let overrides = lucidos_mcp_server_config_overrides();
-    assert!(overrides
-        .iter()
-        .any(|o| o.starts_with("mcp_servers.lucidos.")));
-    assert!(overrides
-        .iter()
-        .any(|o| o.contains("ask_user_question")));
+    let config = test_config(Path::new("/tmp/wt"));
+    let overrides = lucidos_mcp_server_config_overrides(&config.env);
+    assert!(
+        overrides
+            .iter()
+            .any(|o| o.starts_with("mcp_servers.lucidos."))
+    );
+    assert!(overrides.iter().any(|o| o.contains("ask_user_question")));
     assert_eq!(
         CODEX_ASK_USER_QUESTION_TOOL,
         "mcp__lucidos__ask_user_question"
@@ -146,7 +185,10 @@ fn git_common_dir_becomes_add_dir() {
     config.git_common_dir = Some(PathBuf::from("/repo/.git"));
     let cmd = build_codex_turn_command(&config, None, None, None, "p", &[]);
     let args = collect_args(&cmd);
-    let idx = args.iter().position(|a| a == "--add-dir").expect("--add-dir");
+    let idx = args
+        .iter()
+        .position(|a| a == "--add-dir")
+        .expect("--add-dir");
     assert_eq!(args[idx + 1], "/repo/.git");
 }
 
@@ -202,10 +244,7 @@ fn compose_first_turn_prompt_prepends_instructions() {
 fn codex_command_definitions_shape() {
     let defs = codex_command_definitions();
     let arr = defs.as_array().expect("array");
-    let subtypes: Vec<&str> = arr
-        .iter()
-        .map(|d| d["subtype"].as_str().unwrap())
-        .collect();
+    let subtypes: Vec<&str> = arr.iter().map(|d| d["subtype"].as_str().unwrap()).collect();
     assert!(subtypes.contains(&"set_model"));
     assert!(subtypes.contains(&"set_reasoning_effort"));
     assert!(
@@ -213,7 +252,9 @@ fn codex_command_definitions_shape() {
         "codex has no permission protocol — the sandbox is the guard"
     );
     let model_def = &arr[0];
-    let options = model_def["params"][0]["options"].as_array().expect("options");
+    let options = model_def["params"][0]["options"]
+        .as_array()
+        .expect("options");
     assert!(
         options.iter().any(|o| o["value"] == "default"),
         "default sentinel must be offered"
@@ -248,7 +289,11 @@ fn resolve_codex_binary_falls_back_to_bare_name() {
     // host; otherwise the bare name. Either way it must be non-empty and not
     // point inside the empty temp home.
     assert!(!resolved.is_empty());
-    assert!(!resolved.to_string_lossy().starts_with(&*tmp.path().to_string_lossy()));
+    assert!(
+        !resolved
+            .to_string_lossy()
+            .starts_with(&*tmp.path().to_string_lossy())
+    );
 }
 
 #[test]

@@ -11,6 +11,10 @@ use super::ThreadQueueKind;
 use crate::engine::thread_events::{ActorMode, MessageOrigin};
 use crate::runtime::CodingAgent;
 
+fn default_coding_agent() -> CodingAgent {
+    CodingAgent::ClaudeCode
+}
+
 /// Truncation width for panel summaries.
 const SUMMARY_MAX_CHARS: usize = 120;
 
@@ -66,7 +70,7 @@ pub enum ThreadQueueRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pre_emitted_origin: Option<Uuid>,
     },
-    /// `run_claude` LLM tool — coding-agent thread spawn.
+    /// `run_coding_agent` LLM tool — coding-agent thread spawn.
     CodingAgent {
         prompt: String,
         cc_thread_id: Uuid,
@@ -84,12 +88,14 @@ pub enum ThreadQueueRequest {
         title: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         app_id: Option<String>,
+        #[serde(default = "default_coding_agent")]
+        coding_agent: CodingAgent,
     },
     /// Agent/Engine-mode `POST /api/v1/chat/submit` that starts a NEW thread —
     /// cross-workspace task POSTs and `lucidos spawn-thread` CLI calls.
     /// Executed through `process_message_with_steps` with the captured
     /// `origin`; counts as `sub-thread` or `coding-agent` depending on
-    /// `use_claude_code`.
+    /// `use_coding_agent`.
     AgentChat {
         message: String,
         thread_id: Uuid,
@@ -103,8 +109,8 @@ pub enum ThreadQueueRequest {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        use_claude_code: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "use_claude_code")]
+        use_coding_agent: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,9 +140,9 @@ impl ThreadQueueRequest {
             Self::SubThread { .. } => ThreadQueueKind::SubThread,
             Self::CodingAgent { .. } => ThreadQueueKind::CodingAgent,
             Self::AgentChat {
-                use_claude_code, ..
+                use_coding_agent, ..
             } => {
-                if *use_claude_code == Some(true) {
+                if *use_coding_agent == Some(true) {
                     ThreadQueueKind::CodingAgent
                 } else {
                     ThreadQueueKind::SubThread
@@ -196,7 +202,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn agent_chat_kind_follows_use_claude_code() {
+    fn agent_chat_kind_follows_use_coding_agent() {
         let mk = |cc: bool| ThreadQueueRequest::AgentChat {
             message: "do it".into(),
             thread_id: Uuid::new_v4(),
@@ -205,7 +211,7 @@ mod tests {
             device_id: None,
             model: None,
             reasoning_effort: None,
-            use_claude_code: Some(cc),
+            use_coding_agent: Some(cc),
             repo_id: None,
             cc_model: None,
             coding_agent: None,
@@ -255,7 +261,10 @@ mod tests {
         let req = ThreadQueueRequest::Cron {
             trigger_id: "abc".into(),
         };
-        assert_eq!(req.summary(Some("Morning news")), "Morning news (scheduled)");
+        assert_eq!(
+            req.summary(Some("Morning news")),
+            "Morning news (scheduled)"
+        );
         assert_eq!(req.summary(None), "abc (scheduled)");
 
         let long = "x".repeat(500);
@@ -270,7 +279,11 @@ mod tests {
             pre_emitted_origin: None,
         };
         let s = req.summary(None);
-        assert!(s.chars().count() <= SUMMARY_MAX_CHARS + 1, "got {}", s.len());
+        assert!(
+            s.chars().count() <= SUMMARY_MAX_CHARS + 1,
+            "got {}",
+            s.len()
+        );
         assert!(s.ends_with('…'));
     }
 }

@@ -13,7 +13,35 @@
  * `apiUrl(suffix)` for the same auto-prefixing.
  */
 
-let _baseUrl = '';
+/** Derive the workspace base path (`/<slug>`) the SDK runs under, so calls to
+ *  the engine's `/api/v1` surface carry the gateway prefix (ADR 0014). Two
+ *  contexts, both slug-agnostic:
+ *   • The main app loads the SPA shell, which the engine stamps with
+ *     `<base href="/<slug>/">` — read that (authoritative, any slug name).
+ *   • An app iframe loads at `/<slug>/app/<app_id>/…` with no `<base>` — derive
+ *     the prefix as everything before `/app/`.
+ *  Falls back to `''` (legacy root / no DOM). `configure({ baseUrl })` overrides
+ *  for embedders that set it explicitly. */
+function computeBaseUrl(): string {
+  if (typeof document !== 'undefined') {
+    const href = document.querySelector('base')?.getAttribute('href');
+    if (href) {
+      let path = href;
+      try {
+        if (/^https?:\/\//i.test(href)) path = new URL(href).pathname;
+      } catch {
+        /* keep raw */
+      }
+      return path.replace(/\/+$/, ''); // '' at root, '/<slug>' or '/~' otherwise
+    }
+  }
+  // App iframe (no <base>): the prefix is everything before `/app/`.
+  const path = (typeof window !== 'undefined' && window.location && window.location.pathname) || '';
+  const i = path.indexOf('/app/');
+  return i >= 0 ? path.slice(0, i) : '';
+}
+
+let _baseUrl = computeBaseUrl();
 let _authToken: string | undefined;
 
 /** Sole hard-coded reference to the API version. Every other file in the SDK

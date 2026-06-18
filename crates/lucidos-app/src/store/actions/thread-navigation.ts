@@ -136,6 +136,26 @@ export const canGoForwardThread = computed(() => {
   return threadNavCursor.value < threadNavStack.value.length - 1;
 });
 
+/** The full thread-nav stack + cursor — read by the long-press history menu on
+ *  the thread chevrons to list the threads back/forward walk toward. */
+export const threadNavHistory = computed(() => {
+  ensureInitialized();
+  return { stack: threadNavStack.value, cursor: threadNavCursor.value };
+});
+
+/** Jump straight to an absolute index in the thread-nav stack (the long-press
+ *  history menu). Always restores (re-focuses) the target thread — including
+ *  the unfocused case where the cursor still points at the thread just left.
+ *  Out-of-range is a no-op. */
+export function threadNavGoTo(index: number): void {
+  ensureInitialized();
+  const stack = threadNavStack.value;
+  if (index < 0 || index >= stack.length) return;
+  threadNavCursor.value = index;
+  restore(stack[index]);
+  saveThreadNavState();
+}
+
 export function pushThreadNavState(entry: ThreadNavEntry): void {
   ensureInitialized();
   if (_restoring) return;

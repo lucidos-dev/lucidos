@@ -10,6 +10,8 @@
     "core:webview:allow-set-webview-size",
     "core:webview:allow-webview-show",
     "core:webview:allow-webview-hide",
-    "core:webview:allow-set-webview-focus"
+    "core:webview:allow-set-webview-focus",
+    "dialog:default",
+    "updater:default"
   ]
 }

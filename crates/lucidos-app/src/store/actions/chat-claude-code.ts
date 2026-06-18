@@ -15,7 +15,7 @@ import { changeToastMessage } from './thread-sync';
 import { focusThread } from './threads';
 import { errorDetail } from '../../utils/errorDetail';
 
-// Safety timers per thread — cleared when a new 409 arrives to prevent stacking.
+// Safety timers per thread — cleared on re-arm (409 or 404-fallback) to prevent stacking.
 const applyingSafetyTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 /** Remove a thread from the optimistic Apply Now tracking map. */
@@ -23,6 +23,22 @@ function clearApplyingNow(threadId: string): void {
   const next = new Map(applyingNowThreadIds.value);
   next.delete(threadId);
   applyingNowThreadIds.value = next;
+}
+
+/** Arm a 60s safety timeout that clears the optimistic "applying" state if no
+ *  SSE resolution event (ChangeApplied/ChangeApplyFailed) arrives — e.g. an SSE
+ *  reconnection gap. Without it the thread is stuck in the optimistic phase
+ *  forever. Re-arming clears any prior timer so it never stacks; the timer is a
+ *  no-op if SSE already cleared the thread by the time it fires. */
+function armApplyingSafetyTimeout(threadId: string): void {
+  const prev = applyingSafetyTimers.get(threadId);
+  if (prev) clearTimeout(prev);
+  applyingSafetyTimers.set(threadId, setTimeout(() => {
+    applyingSafetyTimers.delete(threadId);
+    if (applyingNowThreadIds.value.has(threadId)) {
+      clearApplyingNow(threadId);
+    }
+  }, 60_000));
 }
 
 /** End a running Claude Code session and immediately apply its changes.
@@ -46,16 +62,8 @@ export async function endClaudeCodeAndApply(threadId: string): Promise<void> {
       // initial spinner instead of stacking a second one beside it.
       showToast('Already applying', 'info', { key: `applying-${threadId}`, spinning: true });
       // Don't clear immediately — apply is genuinely in progress on the backend.
-      // Safety timeout: if no SSE resolution event (ChangeApplied/ChangeApplyFailed)
-      // arrives within 60s (e.g., SSE reconnection gap), clear the stuck state.
-      const prev = applyingSafetyTimers.get(threadId);
-      if (prev) clearTimeout(prev);
-      applyingSafetyTimers.set(threadId, setTimeout(() => {
-        applyingSafetyTimers.delete(threadId);
-        if (applyingNowThreadIds.value.has(threadId)) {
-          clearApplyingNow(threadId);
-        }
-      }, 60_000));
+      // The safety timeout covers an SSE reconnection gap dropping the resolution.
+      armApplyingSafetyTimeout(threadId);
       return;
     }
     if (e instanceof ApiError && e.httpCode === 404) {
@@ -70,7 +78,11 @@ export async function endClaudeCodeAndApply(threadId: string): Promise<void> {
           for (const c of pending) {
             await applyChange(c.id);
           }
-          return; // SSE events will clear applyingNowThreadIds
+          // SSE ChangeApplied/ChangeApplyFailed events clear applyingNowThreadIds;
+          // arm the same 60s safety timeout the 409 path uses so an SSE
+          // reconnection gap can't strand the thread in the optimistic phase.
+          armApplyingSafetyTimeout(threadId);
+          return;
         } catch (applyErr) {
           clearApplyingNow(threadId);
           showToast(`Failed to apply changes: ${errorDetail(applyErr)}`, 'error', { key: `applying-${threadId}` });

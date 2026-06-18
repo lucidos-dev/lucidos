@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, openThreadDrawer, waitForVisibleInput, ensureOnThreadPane, userMessageBody, USER_MSG_SELECTOR, REAL_THREAD_NAV } from './helpers';
 import { clearAllThreads } from './db-helpers';
 

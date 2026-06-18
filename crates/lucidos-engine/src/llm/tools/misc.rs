@@ -18,13 +18,13 @@ pub fn get_navigate_ui_tool() -> ToolDefinition {
             "properties": {
                 "target": {
                     "type": "string",
-                    "enum": ["files", "apps", "triggers", "thread-queue", "changes", "notifications", "settings", "app", "file", "trigger", "thread", "new-app", "new-trigger", "new-chat", "url"],
-                    "description": "Navigation target. Use 'files', 'apps', 'triggers', 'thread-queue', 'changes', 'notifications', 'settings' for panels. Use 'app' to open an app by ID. Use 'file' to preview a file. Use 'trigger' to focus a trigger by ID. Use 'thread' to focus a thread by ID. Use 'new-app', 'new-trigger', or 'new-chat' to open the creation form. Use 'url' to open a URL in the internal browser panel."
+                    "enum": ["files", "apps", "app-store", "triggers", "thread-queue", "changes", "notifications", "settings", "app", "file", "trigger", "thread", "new-app", "new-trigger", "new-chat", "url"],
+                    "description": "Navigation target. Use 'files', 'apps', 'app-store', 'triggers', 'thread-queue', 'changes', 'notifications', 'settings' for panels. Use 'app' to open an app by ID. Use 'file' to preview a file. Use 'trigger' to focus a trigger by ID. Use 'thread' to focus a thread by ID. Use 'new-app', 'new-trigger', or 'new-chat' to open the creation form. Use 'url' to open a URL in the internal browser panel."
                 },
                 "settings_view": {
                     "type": "string",
-                    "enum": ["devices", "accounts", "backup", "memory", "repositories"],
-                    "description": "Settings subview to open. Only used when target is 'settings'."
+                    "enum": ["devices", "accounts", "backup", "memory", "repositories", "environment-variables"],
+                    "description": "Settings subview to open. Only used when target is 'settings'. 'environment-variables' opens Settings → System → Environment variables."
                 },
                 "app_id": {
                     "type": "string",
@@ -56,11 +56,11 @@ pub fn get_navigate_ui_tool() -> ToolDefinition {
     }
 }
 
-/// Tool for managing registered external git repositories for Claude Code sessions.
+/// Tool for managing registered external git repositories for coding-agent sessions.
 pub fn get_manage_repositories_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::MANAGE_REPOSITORIES.to_string(),
-        description: "Manage registered external git repositories for Claude Code sessions. Users can register local repos so Claude Code can work on them.".to_string(),
+        description: "Manage registered external git repositories for coding-agent sessions. Users can register local repos so Claude Code or Codex can work on them.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -154,6 +154,24 @@ pub(super) fn locale_tools() -> Vec<ToolDefinition> {
                 "required": ["timezone"]
             }),
         },
+        ToolDefinition {
+            name: tn::SET_ENVIRONMENT_VARIABLE.to_string(),
+            description: "Set a user environment variable that gets injected into every subprocess Lucidos spawns (run_bash, run_python, scheduled scripts, coding agents). Use for NON-secret config the user wants available everywhere — build flags, default model names, CLI config dirs, things like CLAUDE_CODE_USE_VERTEX or LUCIDOS_REPO. These are NOT secret (they appear in logs/events); for API keys, tokens, or passwords use request_credential instead. Takes effect on the next subprocess — no restart.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Variable name: uppercase letters, digits, and underscores; must not start with a digit (e.g. 'CLAUDE_CODE_USE_VERTEX', 'LUCIDOS_REPO'). Engine-owned names (CRED_*, OAUTH_*, PG*, PATH, and internal LUCIDOS_* like LUCIDOS_WORKSPACE) are rejected."
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "Variable value (plaintext, non-secret)."
+                    }
+                },
+                "required": ["name", "value"]
+            }),
+        },
     ]
 }
 
@@ -197,6 +215,10 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                     "scopes": {
                         "type": "string",
                         "description": "oauth_client only, optional. Default OAuth scopes (space-separated) to pre-fill the modal's scopes field."
+                    },
+                    "env_var_name": {
+                        "type": "string",
+                        "description": "Optional. Custom environment variable name to ALSO inject the secret under, in addition to the default CRED_<NAME> (e.g. 'APPLE_PASSWORD' when a script or tool expects that exact name). Pre-fills the modal's 'Env var name' field; the user can edit or clear it. Must match [A-Z_][A-Z0-9_]* and must not be an engine-owned name (CRED_*, OAUTH_*, PG*, PATH, LUCIDOS_*). Single-value auth types only — ignored for 'password' (which splits into _USERNAME/_PASSWORD)."
                     }
                 },
                 "required": ["service_name", "prompt", "base_url", "auth_type"]

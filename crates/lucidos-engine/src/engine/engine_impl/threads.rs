@@ -254,7 +254,7 @@ impl LucidosEngine {
     }
 
     /// Get list of thread IDs with a live processing task (chat loop running).
-    /// Does NOT include idle Claude Code sessions — those are tracked via thread_summaries.status.
+    /// Does NOT include idle coding-agent sessions — those are tracked via thread_summaries.status.
     pub fn processing_thread_ids(&self) -> Vec<Uuid> {
         self.active_threads
             .lock()

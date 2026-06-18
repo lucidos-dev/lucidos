@@ -2,8 +2,8 @@ use super::*;
 use crate::engine::git_ops::{
     auto_commit_safe_files_if_dirty, auto_commit_worktree, catchup_and_ff_to_main, commits_in_range,
     ff_main_to, files_have_client_update, find_branch_merge_in_main, find_worktree_for_branch,
-    has_branch_commits, is_harden_marker_present, push_main_in_background, recover_no_commits_branch,
-    worktree_add, worktrees_dir, NoCommitsRecovery, MERGE_MUTEX,
+    has_branch_commits, is_harden_marker_present, is_plan_marker_present, push_main_in_background,
+    recover_no_commits_branch, worktree_add, worktrees_dir, NoCommitsRecovery, MERGE_MUTEX,
 };
 use crate::engine::{ApplyResult, ApplyStatus};
 
@@ -167,6 +167,43 @@ impl LucidosEngine {
                     .await;
                 }
             }
+        }
+
+        // Implementation-plan floor (Lucidos-source only). A Planned marker —
+        // a real plan recorded by the `implementation-plan` skill, or an
+        // explicit `lucidos planned mark --simple` acknowledgment — MUST exist
+        // before a Lucidos-source change can apply. The Claude-Code
+        // `cc-plan-gate` PreToolUse hook and the prompt rule are meant to make
+        // a marker-less branch unreachable; this is the hard backstop (and the
+        // ONLY enforcement for Codex, which has no PreToolUse hook). App and
+        // external-repo changes are exempt — neither uses the `docs/plans/`
+        // convention or the marker. Per the resolved design decision: if the
+        // marker is somehow Missing here, refuse the apply (no auto-recovery).
+        if kind_ctx.is_lucidos_source()
+            && !is_plan_marker_present(
+                &self.pool,
+                &std::path::PathBuf::from(&change.repo_root),
+                &change.branch_name,
+            )
+            .await
+        {
+            let msg = "No implementation-plan marker on this branch. Before applying, the coding \
+                       agent must run the `implementation-plan` skill (records a plan) or \
+                       `lucidos planned mark --simple \"<reason>\"` (acknowledges a local fix). \
+                       Re-run the session to set the marker, then apply.";
+            log!(
+                "[Changes] Apply blocked — no plan marker for branch {} (change {})",
+                change.branch_name,
+                change_id
+            );
+            self.emit_apply_failed(
+                change.thread_id.unwrap_or(change_id),
+                change_id,
+                msg,
+                actor.clone(),
+            )
+            .await;
+            return Err(msg.into());
         }
 
         // App threads skip the /harden gate entirely — apps own their own
@@ -433,7 +470,7 @@ impl LucidosEngine {
                     // Auto-commit any uncommitted work before merging
                     auto_commit_worktree(
                         &session.worktree_path,
-                        "Claude Code changes (pre-merge auto-commit)",
+                        "Coding agent changes (pre-merge auto-commit)",
                     )
                     .await;
 
@@ -503,7 +540,7 @@ impl LucidosEngine {
         if let Some(thread_id) = change.thread_id {
             if let Some(wt_path) = find_worktree_for_branch(&repo_root, &change.branch_name).await {
                 // Auto-commit any uncommitted CC work before merging
-                auto_commit_worktree(&wt_path, "Claude Code changes (pre-merge auto-commit)").await;
+                auto_commit_worktree(&wt_path, "Coding agent changes (pre-merge auto-commit)").await;
 
                 // Fast path: try ff directly
                 match catchup_and_ff_to_main(&repo_root, &wt_path, &change.branch_name).await {

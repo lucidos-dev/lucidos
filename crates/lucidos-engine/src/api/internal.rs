@@ -123,6 +123,84 @@ pub(super) struct MarkHardenedRequest {
     pub head_sha: String,
 }
 
+#[derive(Deserialize)]
+pub(super) struct CodingAgentDiffRefreshRequest {
+    pub thread_id: String,
+    pub repo_root: String,
+    pub branch_name: String,
+}
+
+#[derive(Serialize)]
+struct CodingAgentDiffRefreshResponse {
+    has_diff: bool,
+    changed: bool,
+}
+
+/// POST /api/v1/internal/coding-agent-diff-refresh — invoked by the
+/// coding-agent worktree's git post-commit hook via `lucidos
+/// coding-agent-diff-hook`.
+///
+/// This is a live UI refresh only: it reconciles `coding_agent_has_diff` from
+/// git truth and broadcasts the updated aggregate when the flag changes. It
+/// does NOT emit `ChangeProposed`, create a `changes` row, or mark the turn as
+/// ready for Apply. Formal proposal still happens when the coding-agent turn
+/// idles.
+pub(super) async fn coding_agent_diff_refresh(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<CodingAgentDiffRefreshRequest>,
+) -> impl IntoResponse {
+    let thread_id = match Uuid::parse_str(&body.thread_id) {
+        Ok(id) => id,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid thread_id").into_response(),
+    };
+
+    match crate::api::actor::subprocess_origin(&headers) {
+        crate::api::actor::SubprocessOrigin::Subprocess {
+            source_thread_id: Some(source_thread_id),
+        } if source_thread_id == thread_id => {}
+        _ => return (StatusCode::FORBIDDEN, "Invalid subprocess origin").into_response(),
+    }
+
+    let branch_name = body.branch_name.trim();
+    if is_dangerous_git_ref(branch_name) {
+        return (StatusCode::BAD_REQUEST, "Invalid branch_name").into_response();
+    }
+
+    if body.repo_root.trim().is_empty()
+        || body.repo_root.contains('\0')
+        || body.repo_root.split(['/', '\\']).any(|seg| seg == "..")
+    {
+        return (StatusCode::BAD_REQUEST, "Invalid repo_root").into_response();
+    }
+    let repo_root = std::path::PathBuf::from(body.repo_root);
+    let has_diff = crate::engine::git_ops::proposal_files_for_branch(&repo_root, branch_name)
+        .await
+        .is_some();
+
+    match state
+        .engine
+        .event_bus
+        .set_coding_agent_has_diff_and_broadcast(thread_id, has_diff)
+        .await
+    {
+        Ok(changed) => Json(CodingAgentDiffRefreshResponse { has_diff, changed }).into_response(),
+        Err(e) => {
+            crate::log!(
+                "[Internal] coding-agent diff refresh failed for thread {} branch {}: {}",
+                thread_id,
+                branch_name,
+                e
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("coding-agent diff refresh: {}", e),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// POST /api/v1/internal/mark-hardened — invoked by `lucidos hardened mark` from
 /// the `mark-harden.sh` hook after Claude Code finishes `/harden`. Replaces
 /// the prior worktree-keyed file marker, which was lost when stale-session
@@ -162,6 +240,83 @@ pub(super) struct QueryHardenedQuery {
 #[derive(Serialize)]
 struct QueryHardenedResponse {
     state: &'static str,
+}
+
+/// Body for `POST /api/v1/internal/mark-planned`. `state` is `"planned"` or
+/// `"acknowledged_simple"`; `plan_path` accompanies the former, `reason` the
+/// latter (both optional and ignored for the other kind).
+#[derive(Deserialize)]
+pub(super) struct MarkPlannedRequest {
+    pub repo_root: String,
+    pub branch_name: String,
+    pub head_sha: String,
+    pub state: String,
+    #[serde(default)]
+    pub plan_path: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// POST /api/v1/internal/mark-planned — invoked by `lucidos planned mark` from
+/// inside a coding-agent subprocess (and by the `implementation-plan` skill
+/// after it writes the plan file). Records the durable Planned marker that the
+/// `cc-plan-gate` PreToolUse hook and the Apply floor read. Mirrors
+/// `mark_hardened`.
+pub(super) async fn mark_planned(
+    State(state): State<AppState>,
+    Json(body): Json<MarkPlannedRequest>,
+) -> impl IntoResponse {
+    use crate::engine::git_ops::PlanMarkerKind;
+    let repo_root = std::path::PathBuf::from(&body.repo_root);
+    let kind = PlanMarkerKind::parse(&body.state);
+    match state
+        .engine
+        .record_planned(
+            &repo_root,
+            &body.branch_name,
+            kind,
+            body.plan_path.as_deref(),
+            body.reason.as_deref(),
+            &body.head_sha,
+        )
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            crate::log!(
+                "[Internal] record_planned failed for {}: {}",
+                body.branch_name,
+                e
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("record_planned: {}", e),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// GET /api/v1/internal/planned-state?repo_root=...&branch_name=... — invoked by
+/// `lucidos planned state` (printing) and the `cc-plan-gate` hook (deciding).
+/// Returns `{ state: "PRESENT" | "MISSING", kind: "planned" | "acknowledged_simple" | null }`.
+pub(super) async fn query_planned(
+    State(state): State<AppState>,
+    Query(q): Query<QueryHardenedQuery>,
+) -> impl IntoResponse {
+    use crate::engine::git_ops::PlanMarkerState;
+    let repo_root = std::path::PathBuf::from(&q.repo_root);
+    let (label, kind) = match state.engine.plan_marker_state(&repo_root, &q.branch_name).await {
+        PlanMarkerState::Present(k) => ("PRESENT", Some(k.as_db())),
+        PlanMarkerState::Missing => ("MISSING", None),
+    };
+    Json(QueryPlannedResponse { state: label, kind }).into_response()
+}
+
+#[derive(Serialize)]
+struct QueryPlannedResponse {
+    state: &'static str,
+    kind: Option<&'static str>,
 }
 
 /// GET /api/v1/internal/hardened-state?repo_root=...&branch_name=... — invoked by
@@ -295,6 +450,12 @@ pub(super) struct SeedChangeForTestRequest {
     pub requires_restart: bool,
     #[serde(default)]
     pub hardened: bool,
+    /// Whether to also record a Planned marker for the seeded branch. Defaults
+    /// to `true` (omitted) so existing apply tests — which target the harden
+    /// gate or apply mechanics, not the plan floor — keep passing. The negative
+    /// plan-floor test passes `false` to exercise the block.
+    #[serde(default)]
+    pub planned: Option<bool>,
 }
 
 /// POST /api/v1/internal/seed-change-for-test — emit an aggregate `ChangeProposed`
@@ -349,6 +510,11 @@ pub(super) async fn seed_change_for_test(
         }
     }
 
+    // Capture the marker key before `body` fields are moved into the event.
+    let repo_root_for_marker = body.repo_root.clone();
+    let branch_for_marker = body.branch_name.clone();
+    let record_marker = body.planned != Some(false);
+
     let result = state
         .engine
         .event_bus
@@ -374,6 +540,28 @@ pub(super) async fn seed_change_for_test(
             },
         })
         .await;
+
+    // Record a Planned marker for the seeded branch unless explicitly opted
+    // out (the negative plan-floor test). Mirrors how `hardened` lets seeded
+    // changes satisfy the harden gate — seeded "ready to apply" changes would
+    // carry a marker in reality. `record_planned` canonicalizes `repo_root` the
+    // same way the Apply floor does, so the lookup matches.
+    if record_marker {
+        if let Err(e) = state
+            .engine
+            .record_planned(
+                &std::path::PathBuf::from(&repo_root_for_marker),
+                &branch_for_marker,
+                crate::engine::git_ops::PlanMarkerKind::AcknowledgedSimple,
+                None,
+                Some("seeded test change"),
+                "seeded",
+            )
+            .await
+        {
+            crate::log!("[Internal] seed-change-for-test record_planned failed: {}", e);
+        }
+    }
 
     match result {
         Ok(_) => (
@@ -516,7 +704,13 @@ pub(super) fn router() -> Router<AppState> {
             post(ask_user_question),
         )
         .route("/internal/mark-hardened", post(mark_hardened))
+        .route(
+            "/internal/coding-agent-diff-refresh",
+            post(coding_agent_diff_refresh),
+        )
         .route("/internal/hardened-state", get(query_hardened))
+        .route("/internal/mark-planned", post(mark_planned))
+        .route("/internal/planned-state", get(query_planned))
         .route(
             "/internal/cc-edit-preread",
             get(cc_edit_preread_check),

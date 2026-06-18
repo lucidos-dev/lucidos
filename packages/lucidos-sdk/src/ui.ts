@@ -73,7 +73,7 @@ export const ui = {
     if (theme === 'system') {
       theme = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
     }
-    const bg = theme === 'light' ? '#ffffff' : '#0d1117';
+    const bg = theme === 'light' ? '#ffffff' : '#0b2342';
     document.documentElement.setAttribute('data-theme', theme);
     document.documentElement.style.setProperty('--bg-primary', bg);
     // Mirrors sdk-prefs.js — keeps <html> covered before/after the iframe's

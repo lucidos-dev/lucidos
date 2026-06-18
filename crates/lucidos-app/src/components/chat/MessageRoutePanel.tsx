@@ -88,10 +88,17 @@ export function resolveThreadLinkTitle(
   return origin.thread_id;
 }
 
-/** Branch + ccSessionId come from `SessionStarted` (or `ContinuationStarted`), which fire
- *  once per CC process spawn — not per user message. A follow-up exchange within an
- *  existing Claude Code session has no SessionStarted in its own steps, so we walk the full thread
- *  up to this exchange's user event and track the most recent branch-defining event.
+/** Branch comes from `SessionStarted` (or `ContinuationStarted`), which fire once per CC
+ *  process spawn — not per user message. A follow-up exchange within an existing Claude Code
+ *  session has no SessionStarted in its own steps, so we walk the full thread up to this
+ *  exchange's user event and track the most recent branch-defining event.
+ *
+ *  The session id is NOT on `SessionStarted` — the engine emits that with an empty
+ *  `session_id` at spawn time (the real id isn't known yet). The agent reports it in its
+ *  `Init` event, which the engine persists onto `CodingAgentSettingsChanged.cc_session_id`
+ *  (and later `CodingAgentIdled.cc_session_id`) for both Claude Code and Codex. So we read
+ *  the session id from those, falling back to a non-empty `SessionStarted.session_id` only
+ *  for legacy rows. Like branch, it's session-scoped, so it rides the same full-thread walk.
  *
  *  Permission/context info is per-exchange and stays scoped to `exchange.steps`. */
 export function executorExtras(
@@ -118,6 +125,8 @@ export function executorExtras(
   for (const { seq, event } of sortEventsChronologically(threadEvents)) {
     if (event.type === 'SessionStarted') {
       if (event.branch) branch = event.branch;
+      // session_id is empty on real SessionStarted rows (see doc comment) — only
+      // legacy rows ever carry it here; the live id lands on the events below.
       if (event.session_id) ccSessionId = event.session_id;
       // Each SessionStarted snapshots its own repo bind — don't fall back to a
       // prior session's repo_id when the current SessionStarted lacks one
@@ -125,6 +134,11 @@ export function executorExtras(
       repoId = event.repo_id;
     } else if (event.type === 'ContinuationStarted' && event.branch) {
       branch = event.branch;
+    } else if (event.type === 'CodingAgentSettingsChanged' || event.type === 'CodingAgentIdled') {
+      // The agent's Init session id is persisted onto CodingAgentSettingsChanged
+      // (and CodingAgentIdled), for both Claude Code and Codex — this is the real
+      // source for the Session row.
+      if (event.cc_session_id) ccSessionId = event.cc_session_id;
     }
     if (seq === lastSeq) break;
   }

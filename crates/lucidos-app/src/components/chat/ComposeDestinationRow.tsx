@@ -12,11 +12,78 @@ import {
   parseOptionValue,
   destinationCaption,
   LUCIDOS_AGENT_BLURB,
+  LUCIDOS_SOURCE_REPO_NAME,
   REGISTER_REPO_OPTION_VALUE,
   type ComposeDestination,
 } from '../../store/composeDestination';
 import { Dropdown, type DropdownOption } from '../shared/Dropdown';
 import { CloseIcon } from '../shared/icons';
+import { focusPromptNow } from './promptFocus';
+import { isElementVisible } from './scrollState';
+
+type DestinationSelectionDeps = {
+  apply: typeof applyDestination;
+  focusPrompt: () => void;
+  focusCodingAgent: () => void;
+  switchMenuItem: typeof switchMenuItem;
+  openSettingsSubview: typeof openSettingsSubview;
+};
+
+type CodingAgentSelectionDeps = {
+  setCodingAgentDefault: typeof setCodingAgentDefault;
+  focusPrompt: () => void;
+};
+
+export function handleComposeDestinationSelection(
+  threadId: string | null,
+  value: string,
+  deps: DestinationSelectionDeps = {
+    apply: applyDestination,
+    focusPrompt: focusPromptNow,
+    focusCodingAgent: focusComposeCodingAgentPicker,
+    switchMenuItem,
+    openSettingsSubview,
+  },
+): void {
+  if (value === REGISTER_REPO_OPTION_VALUE) {
+    // Action row, not a destination: land on Settings → Repositories.
+    // openSettingsSubview only sets the subview — ContentPane renders
+    // SettingsView only when the settings menu item is active, so switch first
+    // (same pairing as SearchEverywhere).
+    deps.switchMenuItem('settings');
+    deps.openSettingsSubview('repositories');
+    return;
+  }
+  const destination = parseOptionValue(value);
+  deps.apply(threadId, destination);
+  if (destination.kind === 'coding') deps.focusCodingAgent();
+  else deps.focusPrompt();
+}
+
+export function handleComposeCodingAgentSelection(
+  value: string,
+  deps: CodingAgentSelectionDeps = {
+    setCodingAgentDefault,
+    focusPrompt: focusPromptNow,
+  },
+): void {
+  void deps.setCodingAgentDefault(value as CodingAgent);
+  deps.focusPrompt();
+}
+
+export function getVisibleComposeCodingAgentTrigger(): HTMLElement | null {
+  const els = document.querySelectorAll<HTMLElement>('.compose-coding-agent-chip .dropdown-trigger');
+  for (const el of els) {
+    if (isElementVisible(el)) return el;
+  }
+  return els.length > 0 ? els[els.length - 1] : null;
+}
+
+export function focusComposeCodingAgentPicker(): void {
+  requestAnimationFrame(() => {
+    getVisibleComposeCodingAgentTrigger()?.focus({ preventScroll: true });
+  });
+}
 
 /** The compose destination picker — its consequence caption,
  *  and the hand-off hint. Lives in its own component so the signal
@@ -42,7 +109,7 @@ export function ComposeDestinationRow({ threadId, toggleMode, fading }: {
   const repos = reposLoadable.status === 'loaded' ? reposLoadable.data : [];
   // External repos = registered repos minus the Lucidos-source row,
   // which is the implicit default and gets the 'Lucidos source' option.
-  const externalRepos = repos.filter(r => r.name !== 'Lucidos');
+  const externalRepos = repos.filter(r => r.name !== LUCIDOS_SOURCE_REPO_NAME);
   const apps = appsLoadable.status === 'loaded' ? appsLoadable.data : [];
 
   // Freeze the rendered destination during the fade-out window: the row stays
@@ -136,19 +203,10 @@ export function ComposeDestinationRow({ threadId, toggleMode, fading }: {
           // target's label can't be resolved yet.
           placeholder="…"
           onChange={(v) => {
-            if (v === REGISTER_REPO_OPTION_VALUE) {
-              // Action row, not a destination: land on Settings →
-              // Repositories. openSettingsSubview only sets the subview —
-              // ContentPane renders SettingsView only when the settings menu
-              // item is active, so switch first (same pairing as
-              // SearchEverywhere).
-              switchMenuItem('settings');
-              openSettingsSubview('repositories');
-              return;
-            }
-            applyDestination(threadId, parseOptionValue(v));
+            handleComposeDestinationSelection(threadId, v);
           }}
           class="compose-destination-picker"
+          restoreFocusOnSelect={false}
         />
         {dest.kind === 'coding' && (
           <Dropdown
@@ -157,8 +215,9 @@ export function ComposeDestinationRow({ threadId, toggleMode, fading }: {
               { value: 'codex', label: 'Codex' },
             ]}
             value={selectedCodingAgent.value}
-            onChange={(v) => { void setCodingAgentDefault(v as CodingAgent); }}
+            onChange={(v) => { handleComposeCodingAgentSelection(v); }}
             class="compose-coding-agent-chip"
+            restoreFocusOnSelect={false}
           />
         )}
       </div>

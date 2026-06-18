@@ -7,7 +7,7 @@
  *  first keystroke. Toggling later updates `draft.mode` (and the toggle UI
  *  re-renders correctly), but did NOT update `thread.meta.channel`. Then
  *  `sendMessage` decided CC-vs-chat from the stale channel and ignored the
- *  explicit `useClaudeCode` option, sending `use_claude_code: undefined`
+ *  explicit `useCodingAgent` option, sending `use_coding_agent: undefined`
  *  to the backend. Result: clicking "Claude" still started a Lucidos thread.
  *
  *  The fix locks `channel` at promotion time in `sendCompose` (alongside
@@ -162,10 +162,10 @@ describe('toggle-after-typing routes to the toggled channel (regression)', () =>
     putThread(draftId, { state: 'composing', channel: 'chat' });
     setDraft(draftId, { text: 'fix the bug', image_hashes: [], mode: 'claude_code' });
 
-    await sendCompose(draftId, { useClaudeCode: true });
+    await sendCompose(draftId, { useCodingAgent: true });
 
     const body = lastBody();
-    expect(body.use_claude_code).toBe(true);
+    expect(body.use_coding_agent).toBe(true);
   });
 
   it('Claude draft toggled to Lucidos before send routes to Lucidos', async () => {
@@ -177,10 +177,10 @@ describe('toggle-after-typing routes to the toggled channel (regression)', () =>
     putThread(draftId, { state: 'composing', channel: 'claude_code' });
     setDraft(draftId, { text: 'just a question', image_hashes: [], mode: 'lucidos' });
 
-    await sendCompose(draftId, { useClaudeCode: false });
+    await sendCompose(draftId, { useCodingAgent: false });
 
     const body = lastBody();
-    expect(body.use_claude_code).toBeUndefined();
+    expect(body.use_coding_agent).toBeUndefined();
   });
 
   it('locks thread.meta.channel to the picked mode at promotion (CC pick)', async () => {
@@ -192,7 +192,7 @@ describe('toggle-after-typing routes to the toggled channel (regression)', () =>
     putThread(draftId, { state: 'composing', channel: 'chat' });
     setDraft(draftId, { text: 'fix the bug', image_hashes: [], mode: 'claude_code' });
 
-    await sendCompose(draftId, { useClaudeCode: true });
+    await sendCompose(draftId, { useCodingAgent: true });
 
     expect(threadMap.value.get(draftId)?.meta.channel).toBe('claude_code');
     expect(threadMap.value.get(draftId)?.meta.state).toBe('active');
@@ -204,7 +204,7 @@ describe('toggle-after-typing routes to the toggled channel (regression)', () =>
     putThread(draftId, { state: 'composing', channel: 'claude_code' });
     setDraft(draftId, { text: 'just a question', image_hashes: [], mode: 'lucidos' });
 
-    await sendCompose(draftId, { useClaudeCode: false });
+    await sendCompose(draftId, { useCodingAgent: false });
 
     expect(threadMap.value.get(draftId)?.meta.channel).toBe('chat');
     expect(threadMap.value.get(draftId)?.meta.state).toBe('active');
@@ -219,7 +219,7 @@ describe('toggle-after-typing routes to the toggled channel (regression)', () =>
     putThread(draftId, { state: 'composing', channel: 'chat' });
     setDraft(draftId, { text: 'fix the bug', image_hashes: [], mode: 'claude_code' });
 
-    await sendCompose(draftId, { useClaudeCode: true });
+    await sendCompose(draftId, { useCodingAgent: true });
     await cancelCurrentExchange(draftId);
 
     expect(mockedStopClaudeCode).toHaveBeenCalledTimes(1);
@@ -232,7 +232,7 @@ describe('toggle-after-typing routes to the toggled channel (regression)', () =>
     putThread(draftId, { state: 'composing', channel: 'claude_code' });
     setDraft(draftId, { text: 'just a question', image_hashes: [], mode: 'lucidos' });
 
-    await sendCompose(draftId, { useClaudeCode: false });
+    await sendCompose(draftId, { useCodingAgent: false });
     await cancelCurrentExchange(draftId);
 
     expect(mockedCancelChat).toHaveBeenCalledTimes(1);
@@ -247,16 +247,16 @@ describe('toggle-after-typing routes to the toggled channel (regression)', () =>
     putThread(draftId, { state: 'composing', channel: 'claude_code' });
     setDraft(draftId, { text: 'fix it', image_hashes: [], mode: 'claude_code' });
 
-    await sendCompose(draftId, { useClaudeCode: true });
+    await sendCompose(draftId, { useCodingAgent: true });
 
-    expect(lastBody().use_claude_code).toBe(true);
+    expect(lastBody().use_coding_agent).toBe(true);
     expect(threadMap.value.get(draftId)?.meta.channel).toBe('claude_code');
   });
 
   it('promoting a draft with null mode and CC option still routes via CC', async () => {
     // draft.mode is null when the row arrived via SSE before the engine acked
     // the picked mode — readers fall back to currentComposeMode(). The submit
-    // path computes useClaudeCode via effectiveSendMode (which already does
+    // path computes useCodingAgent via effectiveSendMode (which already does
     // that fallback) and passes it explicitly. sendCompose must honour it
     // even though draft.mode itself says null.
     const draftId = 'null-mode-cc';
@@ -264,9 +264,9 @@ describe('toggle-after-typing routes to the toggled channel (regression)', () =>
     putThread(draftId, { state: 'composing', channel: 'chat' });
     setDraft(draftId, { text: 'fix it', image_hashes: [], mode: null });
 
-    await sendCompose(draftId, { useClaudeCode: true });
+    await sendCompose(draftId, { useCodingAgent: true });
 
-    expect(lastBody().use_claude_code).toBe(true);
+    expect(lastBody().use_coding_agent).toBe(true);
     expect(threadMap.value.get(draftId)?.meta.channel).toBe('claude_code');
   });
 });
@@ -280,10 +280,10 @@ describe('coding-agent backend binding at promotion', () => {
     putThread(draftId, { state: 'composing', channel: 'claude_code' });
     setDraft(draftId, { text: 'port the parser', image_hashes: [], mode: 'claude_code' });
 
-    await sendCompose(draftId, { useClaudeCode: true });
+    await sendCompose(draftId, { useCodingAgent: true });
 
     const body = lastBody();
-    expect(body.use_claude_code).toBe(true);
+    expect(body.use_coding_agent).toBe(true);
     expect(body.coding_agent).toBe('codex');
     // Bound at promotion (drafts-are-threads rule) so later picker drift
     // can't retarget this thread.
@@ -296,10 +296,10 @@ describe('coding-agent backend binding at promotion', () => {
     putThread(draftId, { state: 'composing', channel: 'claude_code' });
     setDraft(draftId, { text: 'fix it', image_hashes: [], mode: 'claude_code' });
 
-    await sendCompose(draftId, { useClaudeCode: true });
+    await sendCompose(draftId, { useCodingAgent: true });
 
     const body = lastBody();
-    expect(body.use_claude_code).toBe(true);
+    expect(body.use_coding_agent).toBe(true);
     expect(body.coding_agent).toBeUndefined();
   });
 
@@ -310,10 +310,10 @@ describe('coding-agent backend binding at promotion', () => {
     putThread(draftId, { state: 'composing', channel: 'chat' });
     setDraft(draftId, { text: 'just a question', image_hashes: [], mode: 'lucidos' });
 
-    await sendCompose(draftId, { useClaudeCode: false });
+    await sendCompose(draftId, { useCodingAgent: false });
 
     const body = lastBody();
-    expect(body.use_claude_code).toBeUndefined();
+    expect(body.use_coding_agent).toBeUndefined();
     expect(body.coding_agent).toBeUndefined();
   });
 });

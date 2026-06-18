@@ -53,10 +53,12 @@ export async function getWebviewContent(): Promise<{ title: string; content: str
 
 /**
  * Show a native macOS notification banner via the app's own
- * `show_native_notification` command (lib.rs). We do NOT use
- * tauri-plugin-notification: its desktop show() is fire-and-forget and never
- * reports a click, so we drive `mac-notification-sys` in Rust and capture the
- * tap there. `deepLink` is the SW-message shape (`notification_id` /
+ * `show_native_notification` command (notifications.rs). We drive Apple's modern
+ * `UserNotifications` framework (`UNUserNotificationCenter`) in Rust — not
+ * `tauri-plugin-notification` / `mac-notification-sys`, which sit on the
+ * deprecated `NSUserNotification` API that no longer delivers on recent macOS —
+ * and capture the tap via a delegate. `deepLink` is the SW-message shape
+ * (`notification_id` /
  * `thread_id` / `event_id` / `tap`); on tap the command emits
  * `native-notification-tapped` with it, which the page routes through the same
  * dispatchDeepLink the web-push tap uses. Only call when isTauri() is true.
@@ -72,6 +74,51 @@ export async function showNativeNotification(opts: {
     body: opts.body,
     link: opts.deepLink,
   });
+}
+
+// --- Mobile access (packaged desktop app; macOS) ---
+
+/** Tailscale install/login state for the host Mac (mirror of the Rust
+ *  `TailscaleInfo`). */
+export interface TailscaleInfo {
+  installed: boolean;
+  running: boolean;
+  hostname: string | null;
+  url: string | null;
+}
+
+/** localhost / LAN / Tailscale connect URLs for the engine (mirror of the Rust
+ *  `ConnectInfo`). */
+export interface ConnectInfo {
+  port: number;
+  localhost_url: string;
+  lan_ip: string | null;
+  lan_url: string | null;
+  tailscale: TailscaleInfo;
+}
+
+/** Open a URL in the system default browser (not the embedded webview). Only
+ *  call when isTauri() is true. */
+export function openExternal(url: string): Promise<void> {
+  return invoke('open_url_external', { url });
+}
+
+/** Surface the engine's connect URLs (localhost / LAN / Tailscale). Only call
+ *  when isTauri() is true. */
+export function getConnectInfo(): Promise<ConnectInfo> {
+  return invoke<ConnectInfo>('get_connect_info');
+}
+
+/** Bring the Mac onto a tailnet (`tailscale up`; interactive login). Rejects
+ *  with a string error. Only call when isTauri() is true. */
+export function tailscaleUp(authKey?: string): Promise<void> {
+  return invoke('tailscale_up', { authKey: authKey ?? null });
+}
+
+/** Expose the engine over the tailnet (`tailscale serve`), returning the
+ *  `…ts.net` URL. Rejects with a string error. Only call when isTauri() is true. */
+export function tailscaleServe(): Promise<string> {
+  return invoke<string>('tailscale_serve');
 }
 
 /** Listen for a Tauri event. Returns an unlisten function. Only call when isTauri() is true. */

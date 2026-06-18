@@ -222,6 +222,27 @@ function ensureInitialized(): void {
 export const canGoBack = computed(() => { ensureInitialized(); return navCursor.value > 0; });
 export const canGoForward = computed(() => { ensureInitialized(); return navCursor.value < navStack.value.length - 1; });
 
+/** The full panel-nav stack + cursor — read by the long-press history menu on
+ *  the content chevrons to list the destinations back/forward walk toward. */
+export const navHistory = computed(() => {
+  ensureInitialized();
+  return { stack: navStack.value, cursor: navCursor.value };
+});
+
+/** Jump straight to an absolute index in the panel-nav stack (the long-press
+ *  history menu). Out-of-range is a no-op; re-selecting the current entry just
+ *  re-reveals the content pane. */
+export function navGoTo(index: number): void {
+  ensureInitialized();
+  if (index < 0 || index >= navStack.value.length) return;
+  if (index !== navCursor.value) {
+    navCursor.value = index;
+    restoreState(navStack.value[index]);
+    saveNavState();
+  }
+  revealContentPane();
+}
+
 export function pushNavState(): void {
   ensureInitialized();
   if (_restoring) return;

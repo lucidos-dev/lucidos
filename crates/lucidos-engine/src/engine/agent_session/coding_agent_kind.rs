@@ -166,7 +166,7 @@ pub fn is_valid_app_id(id: &str) -> bool {
 /// path, applying every refusal rule in §3.2 of the design plan.
 ///
 /// `folder_in` is the raw `folder` parameter (or its `repo` alias) from
-/// `run_claude`. `workspace_root` is the target workspace's root directory.
+/// `run_coding_agent`. `workspace_root` is the target workspace's root directory.
 /// `lookup_repo_path` resolves a registered repo name or UUID to its path
 /// (typically wraps `RepositoryStore::get` + `get_by_name`).
 ///

@@ -157,6 +157,50 @@ describe('exchangeStatus — full branch coverage', () => {
     expect(exchangeStatus(exchange, '', true)).toBe('coding-agent-working');
   });
 
+  // Regression (real thread 276f5580): a parent CC thread spawned a child,
+  // idled, and never resumed to react to the child's completion (its worktree
+  // was gone). The trailing ChildThreadCompleted card has no steps of its own,
+  // so without the dedicated guard it fell through to the CC branch and showed
+  // a phantom 'pending'/'coding-agent-working' spinner forever — on a CC thread
+  // the engine already considered idle.
+  it('returns "done" for a stepless ChildThreadCompleted card once the parent is quiescent or it was superseded', () => {
+    const card = makeExchange(
+      { type: 'ChildThreadCompleted', child_thread_id: 'c1', status: 'success', summary: 'done' } as StoredEvent,
+      [],
+    );
+    // last exchange, CC thread, engine idle (wake lost / worktree gone) — terminal.
+    expect(exchangeStatus(card, '', /* isLast */ true, /* hasPriorActive */ false, /* threadIsCC */ true, /* threadIdle */ true)).toBe('done');
+    // parked on a question (waiting_for_user_answer → quiescent → threadIdle) — terminal.
+    expect(exchangeStatus(card, '', /* isLast */ true, /* hasPriorActive */ false, /* threadIsCC */ false, /* threadIdle */ true)).toBe('done');
+    // superseded by a newer boundary (not last) — terminal even while running.
+    expect(exchangeStatus(card, '', /* isLast */ false, /* hasPriorActive */ false, /* threadIsCC */ false, /* threadIdle */ false)).toBe('done');
+  });
+
+  // 4d193da8: the parent is still RUNNING when the child completes — it's about
+  // to react (the WakeFromChild summary was injected into the live loop and its
+  // continuation req-id-routes into this card). The stepless card must read as
+  // working, not "Done ✓", during the gap before the first post-completion step.
+  it('a stepless ChildThreadCompleted card on a RUNNING parent reads as working (pre-first-step gap)', () => {
+    const card = makeExchange(
+      { type: 'ChildThreadCompleted', child_thread_id: 'c1', status: 'success', summary: 'done' } as StoredEvent,
+      [],
+    );
+    // chat parent, last exchange, not idle → working spinner ('pending' → "Requesting").
+    expect(exchangeStatus(card, '', /* isLast */ true, /* hasPriorActive */ false, /* threadIsCC */ false, /* threadIdle */ false)).toBe('pending');
+    // CC parent, last exchange, not idle → working spinner too.
+    expect(exchangeStatus(card, '', /* isLast */ true, /* hasPriorActive */ false, /* threadIsCC */ true, /* threadIdle */ false)).toBe('pending');
+  });
+
+  // When the parent DOES resume, the card gains CC steps and the normal
+  // machinery must take back over — the stepless guard must not swallow it.
+  it('a ChildThreadCompleted card WITH resume work reads coding-agent-working until idle', () => {
+    const working = makeExchange(
+      { type: 'ChildThreadCompleted', child_thread_id: 'c1', status: 'success', summary: 'done' } as StoredEvent,
+      [step(1, { type: 'CodingAgentTextStreamed', text: 'reacting to child' })],
+    );
+    expect(exchangeStatus(working, '', true, false, true)).toBe('coding-agent-working');
+  });
+
   it('returns "streaming" when streamingBuffer has content', () => {
     const exchange = makeExchange(msg());
     expect(exchangeStatus(exchange, 'partial text...', true)).toBe('streaming');

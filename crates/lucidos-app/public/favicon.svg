@@ -1,39 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
-  <!-- Background circle -->
-  <circle cx="50" cy="50" r="48" fill="#1b3a4b"/>
-  <circle cx="50" cy="50" r="45" fill="#162d3a"/>
-  <!-- Circuit brain - left hemisphere -->
-  <g fill="none" stroke="#4dd9e8" stroke-width="2" stroke-linecap="round">
-    <!-- Left curves -->
-    <path d="M38 30 C28 30, 25 38, 25 45 C25 52, 28 58, 35 62"/>
-    <path d="M42 35 C35 35, 32 40, 32 47 C32 54, 35 58, 40 60"/>
-    <path d="M35 62 C30 65, 28 70, 32 74"/>
-    <!-- Right traces -->
-    <path d="M55 25 L55 32 L60 37 L60 45"/>
-    <path d="M62 28 L62 34 L67 39"/>
-    <path d="M60 45 L65 50 L65 58"/>
-    <path d="M55 50 L55 60 L58 65 L58 72"/>
-    <path d="M67 39 L72 39"/>
-    <path d="M65 58 L70 62"/>
-    <!-- Center spine -->
-    <path d="M50 22 L50 78"/>
-  </g>
-  <!-- Circuit nodes -->
-  <g fill="#4dd9e8">
-    <circle cx="50" cy="22" r="2.5"/>
-    <circle cx="55" cy="25" r="2"/>
-    <circle cx="62" cy="28" r="2"/>
-    <circle cx="38" cy="30" r="2"/>
-    <circle cx="42" cy="35" r="2"/>
-    <circle cx="60" cy="45" r="2"/>
-    <circle cx="72" cy="39" r="2"/>
-    <circle cx="50" cy="50" r="3"/>
-    <circle cx="65" cy="58" r="2"/>
-    <circle cx="70" cy="62" r="2"/>
-    <circle cx="35" cy="62" r="2"/>
-    <circle cx="40" cy="60" r="2"/>
-    <circle cx="58" cy="72" r="2"/>
-    <circle cx="32" cy="74" r="2"/>
-    <circle cx="50" cy="78" r="2.5"/>
+  <defs>
+    <radialGradient id="lucidosBrand" gradientUnits="userSpaceOnUse" cx="30" cy="22" r="125">
+      <stop offset="0" stop-color="#2d83e0"/>
+      <stop offset="1" stop-color="#0a4ea8"/>
+    </radialGradient>
+  </defs>
+  <rect x="0" y="0" width="100" height="100" rx="22" fill="url(#lucidosBrand)"/>
+  <g transform="translate(13 13) scale(0.74)" fill="#ffffff">
+    <rect x="17" y="17" width="29" height="29" rx="7"/><rect x="17" y="54" width="29" height="29" rx="7"/><rect x="54" y="54" width="29" height="29" rx="7"/>
+    <path d="M68.5 12 C71 25 74 28.5 87 31 C74 33.5 71 37 68.5 50 C66 37 63 33.5 50 31 C63 28.5 66 25 68.5 12 Z"/>
   </g>
 </svg>

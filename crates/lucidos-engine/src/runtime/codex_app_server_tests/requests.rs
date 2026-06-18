@@ -11,7 +11,20 @@ fn test_config() -> CodexConfig {
         model: None,
         reasoning_effort: None,
         git_common_dir: None,
-        env: Vec::new(),
+        env: vec![
+            (
+                std::ffi::OsString::from("LUCIDOS_WORKSPACE"),
+                std::ffi::OsString::from("/ws"),
+            ),
+            (
+                std::ffi::OsString::from("LUCIDOS_THREAD_ID"),
+                std::ffi::OsString::from("00000000-0000-0000-0000-000000000123"),
+            ),
+            (
+                std::ffi::OsString::from("LUCIDOS_API_BASE_URL"),
+                std::ffi::OsString::from("http://127.0.0.1:5173"),
+            ),
+        ],
     }
 }
 
@@ -31,9 +44,23 @@ fn fresh_thread_request_shape() {
         "coding tasks need cargo/npm network access inside the sandbox"
     );
     assert_eq!(
-        params["config"]["mcp_servers"]["lucidos"]["enabled_tools"][0],
-        "ask_user_question",
+        params["config"]["mcp_servers"]["lucidos"]["enabled_tools"][0], "ask_user_question",
         "the question tool must ride the app-server protocol too"
+    );
+    assert_eq!(
+        params["config"]["mcp_servers"]["lucidos"]["tools"]["ask_user_question"]["approval_mode"],
+        "approve",
+        "Codex otherwise rejects/cancels the MCP question call before Lucidos can render the card"
+    );
+    assert_eq!(
+        params["config"]["mcp_servers"]["lucidos"]["env"]["LUCIDOS_THREAD_ID"],
+        "00000000-0000-0000-0000-000000000123",
+        "Codex does not inherit app-server env into stdio MCP children; without \
+         explicit LUCIDOS_THREAD_ID the lucidos MCP server exits before initialize"
+    );
+    assert_eq!(
+        params["config"]["mcp_servers"]["lucidos"]["env"]["LUCIDOS_WORKSPACE"],
+        "/ws"
     );
     assert!(params.get("threadId").is_none());
     assert!(params.get("model").is_none(), "no model param when unset");
@@ -171,25 +198,46 @@ fn approval_requests_parse_into_backend_shaped_tools() {
 
 /// The exec driver's `-c` overrides are DERIVED from the app-server config
 /// JSON (one source, two encodings) — pin that every config key reaches the
-/// flag form and the values stay TOML-parseable JSON literals.
+/// flag form. Most values are JSON-compatible TOML; env is rendered as a TOML
+/// inline table because Codex rejects JSON object syntax for that key.
 #[test]
 fn mcp_server_config_overrides_derive_from_the_json() {
-    let json = crate::runtime::codex::lucidos_mcp_server_config_json();
-    let overrides = crate::runtime::codex::lucidos_mcp_server_config_overrides();
+    let config = test_config();
+    let json = crate::runtime::codex::lucidos_mcp_server_config_json(&config.env);
+    let overrides = crate::runtime::codex::lucidos_mcp_server_config_overrides(&config.env);
     let keys = json.as_object().unwrap();
     assert_eq!(overrides.len(), keys.len());
     for (key, value) in keys {
-        let expected = format!(
-            "mcp_servers.lucidos.{key}={}",
-            serde_json::to_string(value).unwrap()
-        );
-        assert!(
-            overrides.contains(&expected),
-            "missing derived override {expected}; got {overrides:?}"
-        );
+        if key == "env" {
+            let found = overrides
+                .iter()
+                .find(|o| o.starts_with("mcp_servers.lucidos.env={"))
+                .expect("env override present");
+            assert!(found.contains("LUCIDOS_WORKSPACE"));
+            assert!(found.contains("LUCIDOS_THREAD_ID"));
+            assert!(found.contains("LUCIDOS_API_BASE_URL"));
+        } else {
+            let expected = format!(
+                "mcp_servers.lucidos.{key}={}",
+                serde_json::to_string(value).unwrap()
+            );
+            assert!(
+                overrides.contains(&expected),
+                "missing derived override {expected}; got {overrides:?}"
+            );
+        }
     }
     // The load-bearing values themselves.
     assert_eq!(json["command"], "lucidos");
+    assert_eq!(json["env"]["LUCIDOS_WORKSPACE"], "/ws");
+    assert_eq!(
+        json["env"]["LUCIDOS_THREAD_ID"],
+        "00000000-0000-0000-0000-000000000123"
+    );
     assert_eq!(json["enabled_tools"][0], "ask_user_question");
+    assert_eq!(
+        json["tools"]["ask_user_question"]["approval_mode"], "approve",
+        "non-interactive Codex sessions must trust the Lucidos question tool"
+    );
     assert_eq!(json["tool_timeout_sec"], 86400);
 }

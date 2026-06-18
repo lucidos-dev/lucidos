@@ -8,6 +8,8 @@ const PROVIDERS = [
   { value: 'anthropic', label: 'Anthropic (direct)' },
   { value: 'vertex', label: 'Vertex' },
   { value: 'openai', label: 'OpenAI' },
+  { value: 'openrouter', label: 'OpenRouter' },
+  { value: 'local', label: 'Local (OpenAI-compatible)' },
 ];
 
 /** Settings → Models manager: list every registry model with a provider badge

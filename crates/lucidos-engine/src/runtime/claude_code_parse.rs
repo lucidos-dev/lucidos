@@ -256,10 +256,15 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
             }]
         }
         // CC 2.1.76+ sends streaming deltas as "type": "stream_event" wrappers.
-        // Silently ignore these — tool calls are captured from complete "assistant"
-        // messages, and text from AgentEvent::Message. Stream events are just
-        // intermediate deltas that don't need separate handling.
-        "stream_event" => Vec::new(),
+        // We persist nothing from them — tool calls are captured from complete
+        // "assistant" messages, and text from AgentEvent::Message — but each one
+        // is positive proof the subprocess is alive and actively producing
+        // output. Emit a content-free StreamActivity ping so the watchdog's
+        // inactivity clock stays fresh through a long single step (e.g. extended
+        // thinking on a hard problem). Without it the clock only ticks at step
+        // boundaries, and a step longer than WATCHDOG_INACTIVITY_LIMIT_MS is
+        // killed mid-work even while CC is streaming the whole time.
+        "stream_event" => vec![AgentEvent::StreamActivity],
         // control_response is CC's reply to a control_request (e.g. interrupt).
         // We don't need to act on it — the interrupt itself triggers a Result event.
         "control_response" => Vec::new(),

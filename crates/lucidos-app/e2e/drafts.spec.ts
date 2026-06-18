@@ -1,4 +1,4 @@
-import { test, expect, type Page, type Locator } from '@playwright/test';
+import { test, expect, type Page, type Locator } from './fixtures';
 import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer, waitForVisibleInput, ensureOnThreadPane, clickVisibleElement, isMobileViewport, REAL_THREAD_ROW } from './helpers';
 import { clearAllThreads } from './db-helpers';
 

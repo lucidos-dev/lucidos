@@ -11,6 +11,7 @@ describe('navigateTapLabel', () => {
     const targets: NavigateTarget[] = [
       'files',
       'apps',
+      'app-store',
       'triggers',
       'thread-queue',
       'changes',

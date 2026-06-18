@@ -59,6 +59,29 @@ Staleness checks run as part of `cargo test`.
 
 **When to update:** Changes to `available_thread_actions()`, `display_section()`, or their types.
 
+### ThreadEvent union coverage (TS-side drift guard)
+
+`thread_lifecycle.rs` generates the `EVENT_CLASSIFICATION` map (event name → class)
+into `src/generated/thread-lifecycle.ts`, but the **payload** shapes live in a
+hand-maintained discriminated union (`ThreadEvent` in
+`src/store/thread-events/thread-event-types.ts`) — that union is NOT generated
+(its legacy-tolerant optional fields and frontend-only doc comments deliberately
+diverge from the strict Rust types, so a serde→TS codegen would regress them).
+Two guards keep the union from silently drifting behind the generated map:
+
+- **Compile-time:** `THREAD_EVENT_TYPE_FLAGS` (`satisfies Record<ThreadEvent['type'], true>`)
+  forces the runtime `THREAD_EVENT_TYPE_NAMES` set to match the union exactly —
+  `tsc` fails if a variant is added/removed without updating the set.
+- **Runtime contract test:** `src/generated/thread-event-union.test.ts` asserts
+  every key in the generated `EVENT_CLASSIFICATION` has a matching union member.
+
+**When you add a Rust `ThreadEvent` variant:** after regenerating
+`thread-lifecycle.ts`, add the matching payload member to the `ThreadEvent` union
+AND its key to `THREAD_EVENT_TYPE_FLAGS` (both in `thread-event-types.ts`), or the
+contract test / `tsc` fails. The guard is one-way (`EVENT_CLASSIFICATION ⊆
+union`); the union may legitimately carry extra members (retired legacy events,
+the `CommandCheckpoint*` pair) that the classification map omits.
+
 ## WASM Signer E2E (Rust)
 
 Tests in `crates/lucidos-e2e/tests/wasm_signers.rs`. Exercise real `.wasm`

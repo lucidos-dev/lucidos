@@ -1,8 +1,21 @@
 use std::sync::atomic::AtomicU32;
 use std::sync::Mutex;
 use std::time::Instant;
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::webview::PageLoadEvent;
-use tauri::{Emitter, Manager, WebviewUrl};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+
+mod desktop;
+mod mobile;
+mod notifications;
+mod updater;
+
+/// Headless launchd entry point — `Lucidos --service` (see `desktop::run_service`).
+/// Boots the bundled Postgres + engine and supervises them with no window. The
+/// caller (`main`) routes the process here before any Tauri init.
+pub fn run_service() -> i32 {
+    desktop::run_service()
+}
 
 /// Build a Safari-like user-agent from the actual system Safari version.
 /// WKWebView's default UA omits the `Version/X.Y Safari/605.1.15` suffix,
@@ -61,6 +74,13 @@ struct LastHeartbeat(Mutex<Instant>);
 /// Counter for generating unique webview/window labels.
 static WEBVIEW_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Label prefix for additional top-level app windows opened via File → New
+/// Window. The first window is `main` (declared in `tauri.conf.json`); each
+/// extra window gets `window-<n>`. Panel preview webviews use the
+/// `url-preview-<n>` prefix instead, so app-window-only setup (the app-version
+/// injection in `on_page_load`) can tell the two apart.
+const APP_WINDOW_PREFIX: &str = "window-";
+
 /// Get the main window. Tries get_window first, falls back to get_webview_window.
 fn get_main_window(app: &tauri::AppHandle) -> Option<tauri::Window> {
     if let Some(w) = app.get_window("main") {
@@ -68,6 +88,50 @@ fn get_main_window(app: &tauri::AppHandle) -> Option<tauri::Window> {
     }
     app.get_webview_window("main")
         .map(|ww| ww.as_ref().window().clone())
+}
+
+/// True if `label` names a top-level Lucidos app window (the declared `main` or
+/// a New-Window child), as opposed to a `url-preview-*` panel webview.
+fn is_app_window(label: &str) -> bool {
+    label == "main" || label.starts_with(APP_WINDOW_PREFIX)
+}
+
+/// Open an additional top-level app window (File → New Window / Cmd+N). Every
+/// window is just another client of the same engine — the engine + Postgres run
+/// as a shared launchd service (see `desktop`), so all windows share one
+/// workspace stack. The WKWebView crash-recovery watchdog stays scoped to
+/// `main`.
+fn open_new_window(app: &tauri::AppHandle) -> Result<(), String> {
+    let counter = WEBVIEW_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let label = format!("{APP_WINDOW_PREFIX}{counter}");
+
+    WebviewWindowBuilder::new(app, &label, new_window_url(app))
+        .title("Lucidos")
+        .inner_size(1024.0, 768.0)
+        .build()
+        .map_err(|e| format!("{e}"))?;
+    Ok(())
+}
+
+/// The URL a freshly opened app window should load. Mirrors the main window's
+/// current URL when it has already navigated to the gateway (so the new window
+/// lands on the same workspace/route the user is viewing); falls back to the
+/// gateway on the stable packaged port, or the bundled entry
+/// in dev (the dev server is wired via `tauri.conf.json` `devUrl`).
+fn new_window_url(app: &tauri::AppHandle) -> WebviewUrl {
+    if let Some(url) = app.get_webview_window("main").and_then(|w| w.url().ok()) {
+        if url.scheme() == "http" || url.scheme() == "https" {
+            return WebviewUrl::External(url);
+        }
+    }
+    if !tauri::is_dev() {
+        if let Ok(url) =
+            format!("http://localhost:{}", desktop::engine_port()).parse::<tauri::Url>()
+        {
+            return WebviewUrl::External(url);
+        }
+    }
+    WebviewUrl::App("index.html".into())
 }
 
 /// Compute title bar gap: difference between Tauri's window logical height
@@ -348,6 +412,10 @@ async fn webview_get_content(app: tauri::AppHandle) -> Result<serde_json::Value,
     Ok(serde_json::json!({ "title": title, "content": content }))
 }
 
+/// Restart the GUI **client** (re-exec the window shell). This does NOT touch
+/// the always-on gateway service — that runs as a launchd LaunchAgent,
+/// independent of the window (see `desktop`). To restart the service itself,
+/// use `restart_service` (packaged) or `/api/v1/restart` (dev workspace stack).
 #[tauri::command]
 fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("Failed to get current exe: {e}"))?;
@@ -359,6 +427,32 @@ fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
 
     // On Unix, exec() replaces the process in-place. On other platforms, spawn + exit.
     restart_process(&exe, &args)
+}
+
+/// Open a URL in the system default browser (not the embedded webview). Used by
+/// the Mobile Access page for the Tailscale download link.
+#[tauri::command]
+fn open_url_external(url: String) {
+    open_in_default_browser(&url);
+}
+
+/// Restart the always-on gateway service via launchd (`launchctl kickstart -k`).
+/// The packaged "Restart" control routes here (the dev `/api/v1/restart` script
+/// isn't in the bundle). The supervisor catches the SIGTERM, tears the bundled
+/// gateway and its spawned workspace engines down gracefully, and launchd
+/// respawns the service.
+#[tauri::command]
+fn restart_service() -> Result<(), String> {
+    desktop::restart_service()
+}
+
+/// Fully quit Lucidos: stop the always-on gateway service (`launchctl bootout`),
+/// then exit the GUI. This is the ONLY teardown path — window close leaves the
+/// service running. The next app launch re-installs and re-bootstraps it.
+#[tauri::command]
+fn quit_lucidos(app: tauri::AppHandle) {
+    desktop::stop_service();
+    app.exit(0);
 }
 
 #[cfg(unix)]
@@ -396,81 +490,27 @@ fn __panel_content_report(
     Ok(())
 }
 
-/// Set the macOS notification "application" once. In dev the binary isn't a
-/// packaged `.app`, so `mac-notification-sys` can't deliver under our own
-/// identifier — borrow Terminal's (mirrors notify-rust's dev behaviour) so
-/// banners still show while developing. A packaged build uses our real bundle
-/// identifier, so the banner is attributed to Lucidos.
-#[cfg(target_os = "macos")]
-fn ensure_notification_app_set(app: &tauri::AppHandle) {
-    static SET: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    SET.get_or_init(|| {
-        let ident = if tauri::is_dev() {
-            "com.apple.Terminal".to_string()
-        } else {
-            app.config().identifier.clone()
-        };
-        if let Err(e) = mac_notification_sys::set_application(&ident) {
-            eprintln!("[Tauri] set_application({ident}) failed: {e}");
-        }
-    });
-}
-
 /// Show a native macOS notification and route a tap to the page.
 ///
-/// `tauri-plugin-notification`'s desktop `show()` is fire-and-forget — it never
-/// reports the click — so we drive `mac-notification-sys` directly (the crate
-/// notify-rust uses under the hood) with `wait_for_click(true)`. That call
-/// blocks until the user interacts, so it runs on a dedicated thread; on a
-/// click we focus the main window (the OS also activates the app) and emit
-/// `native-notification-tapped` carrying the deep-link target. The page routes
-/// it through the SAME `dispatchDeepLink` the web-push tap uses (see
-/// `store/actions/native-push.ts`). `link` is the SW-message shape
-/// (`notification_id` / `thread_id` / `event_id` / `tap`).
+/// Delegates to the [`notifications`] module, which drives Apple's modern
+/// `UserNotifications` framework (`UNUserNotificationCenter`). `link` is the
+/// SW-message shape (`notification_id` / `thread_id` / `event_id` / `tap`); on
+/// tap the delegate emits `native-notification-tapped` carrying it, and the
+/// page routes it through the SAME `dispatchDeepLink` the web-push tap uses (see
+/// `store/actions/native-push.ts`). No-op in `tauri dev` (unbundled binary) and
+/// on non-macOS — see `notifications.rs` and `system-knowhow/notifications.md`
+/// §4.
 #[tauri::command]
-fn show_native_notification(
-    app: tauri::AppHandle,
-    title: String,
-    body: String,
-    link: serde_json::Value,
-) {
-    #[cfg(target_os = "macos")]
-    {
-        ensure_notification_app_set(&app);
-        std::thread::spawn(move || {
-            // Blocks until the user clicks / dismisses the banner.
-            let response = mac_notification_sys::Notification::new()
-                .title(&title)
-                .message(&body)
-                .wait_for_click(true)
-                .send();
-            match response {
-                Ok(mac_notification_sys::NotificationResponse::Click)
-                | Ok(mac_notification_sys::NotificationResponse::ActionButton(_)) => {
-                    if let Some(win) = app.get_webview_window("main") {
-                        let _ = win.unminimize();
-                        let _ = win.show();
-                        let _ = win.set_focus();
-                    }
-                    let _ = app.emit("native-notification-tapped", link);
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!("[Tauri] native notification failed: {e}"),
-            }
-        });
-    }
-    // Non-macOS desktop has no native path (the engine still web-pushes browser
-    // / PWA clients); consume the args so they don't warn as unused.
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (&app, &title, &body, &link);
-    }
+fn show_native_notification(title: String, body: String, link: serde_json::Value) {
+    notifications::show(&title, &body, link);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_window_state::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(PanelWebview(Mutex::new(None)))
         .manage(PanelContentChannel(Mutex::new(None)))
         .manage(LastHeartbeat(Mutex::new(Instant::now())))
@@ -489,10 +529,29 @@ pub fn run() {
             __panel_content_report,
             heartbeat,
             restart_app,
+            restart_service,
+            quit_lucidos,
+            open_url_external,
             show_native_notification,
+            mobile::get_connect_info,
+            mobile::tailscale_up,
+            mobile::tailscale_serve,
         ])
+        .on_menu_event(|app, event| {
+            // "Quit Lucidos" stops the always-on service before exit; "New
+            // Window" opens another client window; every other menu item keeps
+            // its default behavior. Window close (red X / Cmd+W) is a window
+            // event, not a menu item, so it leaves the service running.
+            if event.id() == "quit_lucidos" {
+                quit_lucidos(app.clone());
+            } else if event.id() == "new_window" {
+                if let Err(e) = open_new_window(app) {
+                    eprintln!("[Tauri] Failed to open new window: {e}");
+                }
+            }
+        })
         .on_page_load(|webview, payload| {
-            if webview.label() == "main" && matches!(payload.event(), PageLoadEvent::Started) {
+            if is_app_window(webview.label()) && matches!(payload.event(), PageLoadEvent::Started) {
                 let version = env!("LUCIDOS_APP_VERSION");
                 if let Err(e) =
                     webview.eval(format!("window.__LUCIDOS_APP_VERSION__ = '{}';", version))
@@ -502,6 +561,16 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // Install the app menu. The standard edit/window items keep the
+            // usual shortcuts (Cmd+C/V, minimize…); the app submenu's Quit item
+            // is a CUSTOM "Quit Lucidos" (id `quit_lucidos`) so on_menu_event can
+            // stop the always-on service on an explicit quit — while window
+            // close leaves it running. Best-effort: a menu build failure must
+            // not block app startup.
+            if let Err(e) = install_app_menu(app) {
+                eprintln!("[Tauri] Failed to install app menu: {e}");
+            }
+
             // WKWebView crash recovery watchdog: if the JS heartbeat stops
             // arriving for >60s, the content process likely crashed (white screen).
             // Reload the webview to recover.
@@ -527,8 +596,80 @@ pub fn run() {
                     }
                 }
             });
+
+            // Register the UserNotifications delegate + request notification
+            // authorization. No-op in dev (unbundled binary). See notifications.rs.
+            notifications::setup(app.handle());
+
+            // Packaged build: boot the bundled Postgres + engine and point the
+            // window at it. No-op in development (tauri-dev.sh supplies both).
+            desktop::launch(app.handle());
+            // Packaged build: check GitHub Releases for an update in the
+            // background and prompt to restart if one is available.
+            updater::check_on_startup(app.handle());
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_handle, _event| {
+            // The engine + Postgres run as a launchd service, independent of the
+            // window — so GUI exit (window close, Cmd+W) intentionally tears
+            // nothing down. The only stop path is the explicit "Quit Lucidos"
+            // menu item (see `quit_lucidos` / on_menu_event).
+        });
+}
+
+/// Build and install the macOS app menu. Mirrors the default menu (so standard
+/// shortcuts keep working) but replaces the app submenu's predefined Quit with
+/// a custom "Quit Lucidos" item routed through `on_menu_event` → `quit_lucidos`.
+fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
+    let quit = MenuItem::with_id(app, "quit_lucidos", "Quit Lucidos", true, Some("Cmd+Q"))?;
+
+    let app_menu = Submenu::with_items(
+        app,
+        "Lucidos",
+        true,
+        &[
+            &PredefinedMenuItem::about(app, Some("Lucidos"), None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::hide(app, None)?,
+            &PredefinedMenuItem::hide_others(app, None)?,
+            &PredefinedMenuItem::show_all(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
+    )?;
+
+    let new_window = MenuItem::with_id(app, "new_window", "New Window", true, Some("Cmd+N"))?;
+    let file_menu = Submenu::with_items(app, "File", true, &[&new_window])?;
+
+    let edit_menu = Submenu::with_items(
+        app,
+        "Edit",
+        true,
+        &[
+            &PredefinedMenuItem::undo(app, None)?,
+            &PredefinedMenuItem::redo(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::cut(app, None)?,
+            &PredefinedMenuItem::copy(app, None)?,
+            &PredefinedMenuItem::paste(app, None)?,
+            &PredefinedMenuItem::select_all(app, None)?,
+        ],
+    )?;
+
+    let window_menu = Submenu::with_items(
+        app,
+        "Window",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::close_window(app, None)?,
+        ],
+    )?;
+
+    let menu = Menu::with_items(app, &[&app_menu, &file_menu, &edit_menu, &window_menu])?;
+    app.set_menu(menu)?;
+    Ok(())
 }

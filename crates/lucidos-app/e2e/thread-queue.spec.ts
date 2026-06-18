@@ -1,4 +1,4 @@
-import { test, expect, Page } from '@playwright/test';
+import { test, expect, Page } from './fixtures';
 import { navigateToApp, assertHealthy, clickVisibleElement, isMobileViewport } from './helpers';
 
 /** Thread Queue panel end-to-end: hold all background admission via the

@@ -351,6 +351,15 @@ export const recencyKey = (t: ThreadState): string =>
 export const byRecent = (a: ThreadState, b: ThreadState): number =>
   recencyKey(b).localeCompare(recencyKey(a));
 
+/** Sort threads by creation time descending (newest created first). The drawer's
+ *  Current section orders by this so the list stays stable: a thread holds its
+ *  position regardless of agent churn or attention state — the attention/drafts
+ *  filter icons surface those subsets instead of reshuffling the list. Falls
+ *  back to `updatedAt` only for skeleton rows that haven't received a
+ *  `createdAt` yet (the backend always sends one for real threads). */
+export const byCreated = (a: ThreadState, b: ThreadState): number =>
+  (b.meta.createdAt || b.meta.updatedAt).localeCompare(a.meta.createdAt || a.meta.updatedAt);
+
 /** Threads whose compose state hides them from every drawer section: composing
  *  drafts live in the compose pane / Drafts surface, and discarded threads
  *  are tombstones. Any code that derives "what shows in a drawer section"

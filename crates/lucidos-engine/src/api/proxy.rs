@@ -58,7 +58,7 @@ pub type ProxyConfigMap = HashMap<String, ProxyConfig>;
 const PROXY_CONFIG_REL_PATH: &str = "data/config/apis.json";
 
 /// Shared client — pooled, no proxy, accepts self-signed certs (for local
-/// HTTP backends). Mirrors `dev_proxy::CLIENT` so behavior is consistent.
+/// HTTP backends).
 ///
 /// `redirect(Policy::none())`: signed proxy requests must NOT auto-follow
 /// redirects. reqwest would replay the original Authorization header /

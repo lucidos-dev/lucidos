@@ -1,7 +1,7 @@
 import { API, postMcpConsent } from '../../api/client';
 import type { Change } from '../../api/client';
-import { threadMap, focusedThreadId, changes, appliedChanges, changesHasMore, updateAvailable, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds } from '../store';
-import { memoryRebuildProgress, backupProgress, restoreState, backupListVersion, backupStatusVersion, recoveryProgress, showConfirm, showToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
+import { threadMap, focusedThreadId, changes, appliedChanges, changesHasMore, updateAvailable, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
+import { memoryRebuildProgress, backupProgress, backupStatusVersion, recoveryProgress, showConfirm, showToast, dismissToast, toasts, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
 import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, modeToInitiator, PENDING_TITLE_PLACEHOLDER, type ActorMode, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import type { ThreadChannel } from '../store';
@@ -46,6 +46,11 @@ let eventSource: EventSource | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let repoChangesDebounce: ReturnType<typeof setTimeout> | null = null;
 
+function markEventStreamStatus(status: 'connecting' | 'connected' | 'disconnected'): void {
+  if (typeof document === 'undefined') return;
+  document.documentElement.dataset.lucidosEventStream = status;
+}
+
 /** Set when `onerror` fires; consumed by the next `onopen` so we resync only
  *  on RECONNECT, not on the initial connect (where loadAllThreads() is already
  *  driving state via useStartup.ts). */
@@ -62,6 +67,14 @@ const APPLY_NOW_CLEAR_EVENTS = new Set([
   'MergeConflictDetected', 'CodingAgentToolCalled', 'CodingAgentTextStreamed',
   'CodingAgentUserMessageSent', 'CodingAgentPromptSent', 'MessageReceived',
 ]);
+
+/** Toast key for the "merge conflict — resolving automatically" banner. Shared
+ *  by the MergeConflictDetected emitter and the terminal-event resolver so the
+ *  same toast updates in place (→ "resolved") or is dismissed when the conflict
+ *  reaches a terminal state, instead of lingering forever as a stale warning. */
+function mergeConflictToastKey(threadId: string, changeId: string | undefined): string {
+  return `merge-conflict-${threadId}-${changeId ?? 'no-change'}`;
+}
 
 // ---------------------------------------------------------------------------
 // Apply Now — deferred SessionEnded cleanup
@@ -165,6 +178,7 @@ export function connectThreadEvents(): void {
 
   const gen = ++sseGeneration;
   const url = `${API}/events`;
+  markEventStreamStatus('connecting');
   const es = new EventSource(url);
   eventSource = es;
 
@@ -196,6 +210,7 @@ export function connectThreadEvents(): void {
 
   es.onopen = () => {
     if (gen !== sseGeneration) return;
+    markEventStreamStatus('connected');
     // Only resync after a reconnect — on the initial connect, useStartup.ts
     // already loads thread state. Without the flag we'd double-fetch on every
     // page load.
@@ -223,6 +238,7 @@ export function connectThreadEvents(): void {
     // Mark for resync — events emitted during the gap won't reach this tab,
     // so the next successful connect must refetch persisted state.
     needsResyncOnOpen = true;
+    markEventStreamStatus('disconnected');
 
     es.close();
     eventSource = null;
@@ -271,6 +287,7 @@ export function disconnectThreadEvents(): void {
   }
   for (const timer of applySessionEndedTimers.values()) clearTimeout(timer);
   applySessionEndedTimers.clear();
+  markEventStreamStatus('disconnected');
   eventSource?.close();
   eventSource = null;
 }
@@ -284,7 +301,8 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   const created = typeof data.created === 'string' ? data.created : undefined;
   const eventId = typeof data.event_id === 'string' ? data.event_id : undefined;
   // Backend-computed projection snapshot. Present on every persisted thread
-  // event, absent on transient events. handleEvent overlays it onto thread.meta.
+  // event, and on transient projection refreshes such as ChildrenCountChanged
+  // or CodingAgentDiffChanged. handleEvent overlays it onto thread.meta.
   const aggregate = (data.aggregate && typeof data.aggregate === 'object')
     ? (data.aggregate as ThreadAggregate)
     : undefined;
@@ -404,6 +422,20 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
 
   const handled = handleEvent(map, threadId, effectiveSeq, event, created, eventId, aggregate);
   if (handled.metaChanged) metaChanged = true;
+  if (event.type === 'QueuedMessageRemoved') {
+    const key = queuedMessageRemovalKey(threadId, event.removed_message_id);
+    if (removingQueuedMessageIds.value.has(key)) {
+      const next = new Set(removingQueuedMessageIds.value);
+      next.delete(key);
+      removingQueuedMessageIds.value = next;
+    }
+  }
+  if (handled.clearedPendingUserMessage && threadId === focusedThreadId.value) {
+    // Server confirmation swaps the optimistic row for the persisted user
+    // event. Keep the focused transcript pinned to that replacement so the
+    // just-sent follow-up does not appear to vanish until work starts.
+    scrollToBottom();
+  }
 
   // Archive race guard. Every persisted SSE event carries the projection
   // snapshot AT EVENT EMIT TIME. When the backend processes a cascade
@@ -544,6 +576,30 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     showToast(changeToastMessage('Failed to apply', threadId, error), 'error', { key: `applying-${threadId}`, onClick: () => focusThread(threadId) });
   }
 
+  // The "merge conflict — resolving automatically" banner is a sticky warning
+  // (no auto-dismiss). Once the conflict reaches a terminal state it must not
+  // keep claiming it's still resolving — transition it in place. Guarded on the
+  // toast already existing: showToast(key) would otherwise CREATE a banner, so a
+  // plain (non-conflict) apply never spawns a spurious "resolved" toast.
+  // ChangeApplied → update to "resolved" (the visible answer to "this should
+  // update to resolved when resolved"); ChangeApplyFailed / ChangeDiscarded just
+  // dismiss it — the terminal toast above already carries that outcome.
+  if ((event.type === 'ChangeApplied' || event.type === 'ChangeApplyFailed' || event.type === 'ChangeDiscarded')
+      && event.change_id) {
+    const conflictKey = mergeConflictToastKey(threadId, event.change_id);
+    if (toasts.value.some((t) => t.key === conflictKey)) {
+      if (event.type === 'ChangeApplied') {
+        showToast(`Merge conflict in ${formatThreadLabel(threadId)} — resolved.`, 'success', {
+          key: conflictKey,
+          onClick: () => focusThread(threadId),
+          autoDismissMs: TOAST_AUTO_DISMISS_MS,
+        });
+      } else {
+        dismissToast(conflictKey);
+      }
+    }
+  }
+
   // After apply/discard/revert, scroll to bottom and reveal the app header
   // on mobile so the user sees the result with full navigation visible.
   if (event.type === 'ChangeApplied' || event.type === 'ChangeDiscarded' || event.type === 'ChangeReverted') {
@@ -586,7 +642,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     // refreshes a single toast instead of stacking two identical banners.
     const label = formatThreadLabel(threadId);
     showToast(`Merge conflict in ${label} — resolving automatically.`, 'warning', {
-      key: `merge-conflict-${threadId}-${event.change_id ?? 'no-change'}`,
+      key: mergeConflictToastKey(threadId, event.change_id),
       onClick: () => focusThread(threadId),
     });
   }
@@ -762,7 +818,6 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       const filename = String(data.filename ?? '');
       const size = formatBytes(Number(data.size_bytes ?? 0));
       showToast(`Backup created: ${filename} (${size})`, 'success');
-      backupListVersion.value++;
       backupStatusVersion.value++;
       break;
     }
@@ -774,39 +829,9 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       break;
     }
 
-    // Restore events mirror the engine's authoritative restore_state — the SAME
-    // shape getRestoreStatus() returns, so a reloaded page (which seeds from the
-    // fetch) and a live page (which gets these) render identically.
-    case 'RestoreProgress': {
-      restoreState.value = {
-        status: 'running',
-        workspace_name: String(data.workspace_name ?? ''),
-        phase: String(data.phase ?? ''),
-        progress: Number(data.progress ?? 0),
-        total: Number(data.total ?? 0),
-      };
-      break;
-    }
-
-    case 'RestoreCompleted': {
-      restoreState.value = {
-        status: 'completed',
-        workspace_name: String(data.workspace_name ?? ''),
-        workspace_path: String(data.workspace_path ?? ''),
-      };
-      showToast(`Workspace restored: ${String(data.workspace_name ?? '')}`, 'success');
-      break;
-    }
-
-    case 'RestoreFailed': {
-      restoreState.value = {
-        status: 'failed',
-        workspace_name: String(data.workspace_name ?? ''),
-        error: String(data.error ?? 'Unknown error'),
-      };
-      showToast(`Restore failed: ${String(data.error ?? 'Unknown error')}`, 'error');
-      break;
-    }
+    // Restore is no longer an engine SSE concern — it runs in the workspace
+    // picker (gateway control plane), which polls its own restore-status. The
+    // engine's `Restore*` events were removed with the Settings restore UI.
 
     case 'RecoveryProgress': {
       const completed = (data.completed as number) ?? 0;

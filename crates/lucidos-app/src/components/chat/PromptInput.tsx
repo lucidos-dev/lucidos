@@ -16,6 +16,8 @@ import {
   clearPendingAnswer,
 } from './QuestionCard';
 import { updateCompose, sendCompose, sendFollowup, ensureFocusedComposeThread } from '../../store/actions/compose';
+import { focusPane } from '../../store/actions/pane';
+import { openAppById } from '../../store/actions/apps';
 import { pushNavState } from '../../store/actions/navigation';
 import { getDraft } from '../../store/composeDrafts';
 import { ComposeDestinationRow } from './ComposeDestinationRow';
@@ -246,11 +248,11 @@ export function PromptInput() {
       if (threadId && thread?.meta.state === 'composing') {
         // Composing thread: send through compose so server transitions
         // state→active and clears compose fields atomically.
-        return sendCompose(threadId, { useClaudeCode: intent.useClaudeCode, context: intent.context, focus: shouldFocus });
+        return sendCompose(threadId, { useCodingAgent: intent.useCodingAgent, context: intent.context, focus: shouldFocus });
       } else if (threadId) {
-        return sendFollowup(threadId, msg, imageHashes, { useClaudeCode: intent.useClaudeCode || undefined, context: intent.context, focus: shouldFocus });
+        return sendFollowup(threadId, msg, imageHashes, { useCodingAgent: intent.useCodingAgent || undefined, context: intent.context, focus: shouldFocus });
       } else {
-        return sendMessage(msg, imageHashes, { useClaudeCode: intent.useClaudeCode || undefined, context: intent.context, focus: shouldFocus });
+        return sendMessage(msg, imageHashes, { useCodingAgent: intent.useCodingAgent || undefined, context: intent.context, focus: shouldFocus });
       }
     });
 
@@ -305,10 +307,10 @@ export function PromptInput() {
       return;
     }
     const thread = threadId ? threadMap.value.get(threadId) : undefined;
-    const useClaudeCode = effectiveSendMode(thread) === 'claude_code';
+    const useCodingAgent = effectiveSendMode(thread) === 'claude_code';
     const context = currentChatContext();
     if (threadId && uploadInFlight) {
-      queueUploadSend(threadId, { useClaudeCode, context });
+      queueUploadSend(threadId, { useCodingAgent, context });
       preserveAtBottom();
       return;
     }
@@ -317,7 +319,7 @@ export function PromptInput() {
     scrollToBottom();
     if (isMobile()) el.blur();
 
-    await beginSend(threadId, thread, msg, currentImages, { useClaudeCode, context });
+    await beginSend(threadId, thread, msg, currentImages, { useCodingAgent, context });
   }
 
   useSignalEffect(() => {
@@ -796,6 +798,11 @@ export function PromptInput() {
             onInput={handleInput}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
+            // Writing in the prompt means working in the chat — keep the focused
+            // pane in sync however focus arrived (click, type-to-focus, Tab,
+            // programmatic). focusPane is signal-only + no-op on mobile, so this
+            // can't loop with the pane-focus DOM-focus logic.
+            onFocus={() => focusPane('thread')}
           />
           <button
             class={`icon-btn prompt-clear${hasText ? '' : ' invisible'}`}
@@ -834,20 +841,27 @@ export function PromptInput() {
             ? <CodingAgentControlMenu threadId={codingAgentControlThreadId} codingAgent={promptCodingAgent} />
             : <><LucidosControlMenu /><TodoListIndicator /></>}
           {(() => {
-            // WIP app preview toggle: visible only when the focused thread is
-            // an app coding-agent thread AND that app is open in the
-            // panel-overlay. Clicking flips the overlay iframe between live
-            // workspace content and the worktree-served WIP via the engine's
-            // `?thread_id=<id>` route (see api/apps.rs::serve_app_ui). The
-            // toggle reverts to live when the user navigates away (cleared by
-            // the focusedThreadId effect in actions/wipPreview.ts) or when
-            // Apply removes the worktree (engine 404 → iframe onError reverts).
+            // WIP app preview toggle: visible whenever the focused thread is an
+            // app coding-agent thread that has an in-flight diff
+            // (codingAgentHasDiff — the same git-truth signal as the Diff
+            // button, cleared on Apply/Discard/Archive when the worktree is
+            // removed, so the toggle can never point at a gone worktree). It is
+            // NOT gated on the app already being open: that was a chicken-and-egg
+            // bug — the preview swaps the app's panel-overlay iframe, so a user
+            // reviewing the change with the app closed could never reach it.
+            // Clicking ON opens the target app in the panel-overlay if it isn't
+            // already, then flips that iframe to the worktree-served WIP via the
+            // engine's `?thread_id=<id>` route (see api/apps.rs::serve_app_ui).
+            // Clicking OFF reverts to live. The toggle also reverts to live when
+            // the user navigates away (cleared by the focusedThreadId effect in
+            // actions/wipPreview.ts) or when Apply/Discard removes the worktree
+            // (thread-sync SSE handlers call clearWipIfMatches).
             const ft = focusedThread;
             if (!ft || ft.meta.codingAgentKind !== 'app') return null;
+            if (!ft.meta.codingAgentHasDiff) return null;
             const folder = ft.meta.codingAgentFolder;
             const appId = folder ? folder.split('/').filter(Boolean).pop() : undefined;
-            const openApp = currentApp.value;
-            if (!appId || !openApp || openApp.id !== appId) return null;
+            if (!appId) return null;
             const wipOn = wipPreviewThreadId.value === ft.meta.id;
             return (
               <button
@@ -856,11 +870,26 @@ export function PromptInput() {
                 aria-pressed={wipOn}
                 aria-label={wipOn ? 'Stop WIP app preview' : 'Show WIP app preview'}
                 onClick={() => {
-                  // pushNavState captures wipPreviewThreadId into the new
-                  // entry — flip the signal first so the snapshot reflects
-                  // the post-click state. Back/forward walks each toggle.
-                  wipPreviewThreadId.value = wipOn ? null : ft.meta.id;
-                  pushNavState();
+                  if (wipOn) {
+                    // Revert to live. pushNavState captures wipPreviewThreadId
+                    // into the new entry, so flip the signal first.
+                    wipPreviewThreadId.value = null;
+                    pushNavState();
+                    return;
+                  }
+                  // Turning WIP on. The preview swaps the target app's
+                  // panel-overlay iframe, so open that app first if it isn't the
+                  // one currently shown. Set the WIP signal only AFTER the app
+                  // is in place — otherwise the wipPreview effect would see a
+                  // currentApp/wipApp mismatch and immediately clear it.
+                  void (async () => {
+                    if (currentApp.value?.id !== appId) {
+                      await openAppById(appId);
+                      if (currentApp.value?.id !== appId) return; // open failed — toast already shown
+                    }
+                    wipPreviewThreadId.value = ft.meta.id;
+                    pushNavState();
+                  })();
                 }}
                 data-row-item
                 data-role="wip-preview-toggle"

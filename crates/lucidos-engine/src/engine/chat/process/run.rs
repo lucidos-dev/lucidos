@@ -60,7 +60,7 @@ impl LucidosEngine {
         reasoning_effort: Option<&str>,  // unified reasoning level: none/low/medium/high/xhigh/max
         user_images: Option<&[crate::api::ChatImage]>, // base64-encoded images pasted by user
         device_id: Option<&str>,         // device that sent this message
-        use_claude_code: Option<bool>,   // bypass LLM and spawn Claude Code directly
+        use_coding_agent: Option<bool>,   // bypass LLM and spawn a coding agent directly
         event_id: Option<&str>,          // client-generated UUID for reliable matching
         thread_id: Option<Uuid>,         // None = new thread, Some = follow-up
         conflict_change_id: Option<Uuid>, // change ID for merge conflict resolution
@@ -247,7 +247,7 @@ impl LucidosEngine {
         // once CC interrupts and the in-memory waiter is gc'd. Unlike the
         // question free-form path above, this does NOT consume the message —
         // the typed text still routes to CC below as a normal follow-up.
-        if use_claude_code == Some(true) && !is_new_thread && !user_message.is_empty() {
+        if use_coding_agent == Some(true) && !is_new_thread && !user_message.is_empty() {
             crate::engine::cc_permission::resolve_pending_permissions_as_superseded(
                 self.pool(),
                 &self.event_bus,
@@ -263,7 +263,7 @@ impl LucidosEngine {
         // a new message instead of clicking resolves the card as denied (which
         // also unblocks the parked agentic loop). Chat-only — the command lane
         // never fires on a CC thread.
-        if use_claude_code != Some(true) && !is_new_thread && !user_message.is_empty() {
+        if use_coding_agent != Some(true) && !is_new_thread && !user_message.is_empty() {
             crate::engine::command_permission::resolve_pending_command_permissions_as_superseded(
                 self.pool(),
                 &self.event_bus,
@@ -281,7 +281,7 @@ impl LucidosEngine {
         //
         // This handles both idle sessions (msg picked up immediately) and busy sessions
         // (msg queued in the channel, picked up after current work finishes).
-        if use_claude_code == Some(true) && !is_new_thread {
+        if use_coding_agent == Some(true) && !is_new_thread {
             // Check if there's a live Claude Code session to route to.
             let has_session = {
                 let sessions = self.agent_sessions.lock().await;
@@ -306,6 +306,86 @@ impl LucidosEngine {
                 .await;
 
             if has_session {
+                // Codex interrupt-and-redirect: a follow-up that lands while a
+                // Codex turn is in flight can't be injected into the running
+                // turn (its app-server/exec protocols accept input only at a
+                // turn boundary), so it would otherwise queue invisibly behind
+                // a long turn. Interrupt the live turn — it ends as a resumable
+                // Canceled boundary (no spurious ResponseGenerated, no change
+                // proposed for the redirected-away work) — then fall through to
+                // route the follow-up as the next turn on the same Codex thread
+                // (full context preserved). CC steers via stdin, so this is
+                // Codex-only and never fires for a child-wake.
+                let redirect_idle_notify = {
+                    let mut sessions = self.agent_sessions.lock().await;
+                    super::super::process_helpers::arm_codex_redirect(
+                        &mut sessions,
+                        thread_id,
+                        // Genuine user follow-up, not an engine-internal
+                        // child-wake (which sets pre_emitted_origin).
+                        pre_emitted_origin.is_none(),
+                        &origin,
+                    )
+                };
+                if let Some(idle_notify) = redirect_idle_notify {
+                    // Block until the interrupted turn reaches a boundary (idle
+                    // or process exit) BEFORE emitting the follow-up's
+                    // MessageReceived, so the turn's Canceled terminal is
+                    // sequenced first (coding-agent exchanges group by sequence
+                    // order — see the MessageReceived-first note below). Unlike
+                    // apply_now's wait_for_idle, the boundary may ALREADY have
+                    // been reached by the time we get here (the graceful
+                    // interrupt can idle the turn before we register a waiter),
+                    // so re-check is_waiting each iteration instead of relying on
+                    // a future idle_notify alone. The engine's 8s interrupt
+                    // escalation hard-kills a non-idling turn (→ process_exited),
+                    // and REDIRECT_INTERRUPT_MAX_WAIT is the backstop above that.
+                    // If the session died, the msg_tx send below fails and the
+                    // existing emit_routing_failure path tells the user to retry.
+                    let redirect_deadline = std::time::Instant::now()
+                        + super::super::process_helpers::REDIRECT_INTERRUPT_MAX_WAIT;
+                    loop {
+                        // Construct the notify future before the state check.
+                        // (tokio registers the waiter on first *poll* — inside
+                        // the timeout await below, after the check — and the run
+                        // loop signals via notify_waiters() with no stored
+                        // permit, so a notification landing between the check and
+                        // the await is not retained. That's why correctness here
+                        // rests on the bounded 2s re-poll, not on registration
+                        // ordering: each iteration re-reads is_waiting, so the
+                        // notify is only a latency optimization, never the
+                        // safety net. A boundary already reached is caught by the
+                        // check on the very next iteration.)
+                        let notified = idle_notify.notified();
+                        let at_boundary = {
+                            let sessions = self.agent_sessions.lock().await;
+                            match sessions.get(&thread_id) {
+                                Some(s) => s.is_waiting || s.process_exited,
+                                None => true,
+                            }
+                        };
+                        if at_boundary {
+                            log!(
+                                "[Chat] Codex redirect: interrupted turn reached a boundary for thread {} — follow-up runs as the next turn",
+                                thread_id
+                            );
+                            break;
+                        }
+                        if std::time::Instant::now() >= redirect_deadline {
+                            log!(
+                                "[Chat] Codex redirect: timed out waiting for the interrupt on thread {} — routing the follow-up anyway",
+                                thread_id
+                            );
+                            break;
+                        }
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            notified,
+                        )
+                        .await;
+                    }
+                }
+
                 // Emit MessageReceived FIRST — guarantees it gets a lower sequence
                 // number and earlier timestamp than CodingAgentPromptSent (emitted by
                 // the CC event loop when it picks up the message). Without this
@@ -391,7 +471,7 @@ impl LucidosEngine {
                     emit_routing_failure(
                         &self.event_bus,
                         thread_id,
-                        "Claude Code session ended while routing message. Please try again.",
+                        "Coding agent session ended while routing message. Please try again.",
                     )
                     .await?;
                     log!(
@@ -418,7 +498,7 @@ impl LucidosEngine {
         // agentic loop, inject the message (with images) mid-flight instead of
         // blocking in register_thread_queued for up to 60s. This mirrors the CC
         // fast-path above but uses injection_tx instead of msg_tx.
-        if use_claude_code != Some(true) && !is_new_thread {
+        if use_coding_agent != Some(true) && !is_new_thread {
             let has_active = {
                 let threads = self.active_threads.lock().unwrap();
                 threads.contains_key(&thread_id)
@@ -468,6 +548,8 @@ impl LucidosEngine {
                     crate::engine::InjectedPromptKind::UserText
                 };
 
+                let origin_event_id =
+                    pre_emitted_origin.or_else(|| event_id.and_then(|s| Uuid::parse_str(s).ok()));
                 let images = user_images.map(|imgs| imgs.to_vec());
                 let injected = {
                     let threads = self.active_threads.lock().unwrap();
@@ -476,7 +558,7 @@ impl LucidosEngine {
                             .injection_tx
                             .send(crate::engine::InjectedPrompt {
                                 text: user_message.to_string(),
-                                event_id: event_id.and_then(|s| Uuid::parse_str(s).ok()),
+                                event_id: origin_event_id,
                                 mode,
                                 spawning_event_id,
                                 images,
@@ -564,7 +646,7 @@ impl LucidosEngine {
                     tc.go_to_review,
                 )
             } else {
-                let is_cc = use_claude_code == Some(true);
+                let is_cc = use_coding_agent == Some(true);
                 let (req_model, req_effort) = if is_cc {
                     (None, None)
                 } else {
@@ -629,7 +711,7 @@ impl LucidosEngine {
 
         // `_guard` MUST stay alive across this await so cancel_thread lands
         // on the per-thread cancel_token (see process_cc.rs module doc).
-        if use_claude_code == Some(true) {
+        if use_coding_agent == Some(true) {
             // Agent-spawned threads via a parent's tool call (run_thread →
             // spawn_agent_thread) skip the 250ms CC_SPAWN_DEBOUNCE — no
             // user keyboard in the loop, no rapid-fire to coalesce.
@@ -1056,6 +1138,8 @@ impl LucidosEngine {
         // injection_rx is dropped on function return. Attach to the result
         // so chat_submit can re-submit them as regular follow-ups.
         let orphans = Self::drain_orphaned_injections(&mut injection_rx);
+        let orphans =
+            crate::engine::filter_removed_queued_prompts(&self.pool, thread_id, orphans).await;
         if !orphans.is_empty() {
             log!("[Chat] {} orphaned injection(s) after agentic loop exit for thread {} — will re-submit as follow-ups",
                 orphans.len(), thread_id);

@@ -118,6 +118,9 @@ impl LucidosEngine {
             tn::SET_LANGUAGE | tn::SET_TIMEZONE | tn::ENABLE_PUSH_NOTIFICATIONS => {
                 to_outcome(self.execute_preferences_tool(name, args, device_id).await)
             }
+            tn::SET_ENVIRONMENT_VARIABLE => {
+                to_outcome(self.execute_environment_variable_tool(args).await)
+            }
             tn::WEB_SEARCH | tn::FETCH_NEWS => to_outcome(self.execute_web_tool(name, args).await),
             tn::REQUEST_CREDENTIAL | tn::CONNECT_OAUTH_ACCOUNT => {
                 to_outcome(self.execute_credential_tool(name, args).await)
@@ -168,9 +171,10 @@ impl LucidosEngine {
             tn::TODO_WRITE => self.execute_todo_write(args, thread_id).await,
             tn::MANAGE_REPOSITORIES => self.execute_manage_repositories(args).await,
             tn::INSTALL_PLUGIN
+            | tn::REGISTER_PLUGIN_MARKETPLACE
             | tn::CHECK_PLUGIN_UPDATES
             | tn::UPDATE_PLUGIN
-            | tn::UNINSTALL_PLUGIN => self.execute_plugin_tool(name, args).await,
+            | tn::UNINSTALL_PLUGIN => self.execute_plugin_tool(name, args, thread_id).await,
             tn::SETUP_MCP_SERVER
             | tn::LIST_MCP_SERVERS
             | tn::START_MCP_SERVER
@@ -233,6 +237,15 @@ impl LucidosEngine {
                 - The user's encryption key (needed for restore)\n\
                 Tell the user they can pick a backup from the list and restore it directly — \
                 no manual downloading or uploading needed."
+                .to_string());
+        }
+        if target == "settings" && settings_view == Some("environment-variables") {
+            return Ok("Navigated to Settings → System → Environment variables. The UI shows:\n\
+                - The user's environment variables as NAME = value rows\n\
+                - Buttons to add, edit, or delete a variable\n\
+                These are non-secret values injected into every subprocess Lucidos spawns \
+                (run_bash, run_python, scheduled scripts, coding agents). For secrets like API \
+                keys, the user should use credentials instead."
                 .to_string());
         }
 

@@ -83,7 +83,7 @@ describe('formatBinding', () => {
   it('renders arrow keys as glyphs on both platforms', () => {
     expect(formatBinding(shortcutDef('widenThreadPane').defaultBinding, true)).toBe('⌘⌥→');
     expect(formatBinding(shortcutDef('narrowThreadPane').defaultBinding, false)).toBe('Ctrl+Alt+←');
-    expect(formatBinding(shortcutDef('previousThread').defaultBinding, true)).toBe('⌘⌥↑');
+    expect(formatBinding(shortcutDef('historyBack').defaultBinding, true)).toBe('⌘⌥↑');
     expect(formatBinding(shortcutDef('narrowThreadDrawer').defaultBinding, false)).toBe('Ctrl+Alt+Shift+←');
   });
 });

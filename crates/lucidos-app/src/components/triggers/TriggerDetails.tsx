@@ -153,6 +153,10 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
   const [groupId, setGroupId] = useState<string>(existingTrigger?.group_id ?? '');
   // null = inline-create field hidden; string = visible with current draft.
   const [newGroupDraft, setNewGroupDraft] = useState<string | null>(null);
+  // Enter and blur BOTH call commitNewGroupDraft; committing hides the field,
+  // whose trailing blur would POST the same name again (409). Submit-once flag,
+  // reset when the inline-create field reopens.
+  const creatingGroupRef = useRef(false);
 
   const intentRef = useRef<HTMLTextAreaElement>(null);
   const resizeIntent = () => { if (intentRef.current) resizeTextarea(intentRef.current); };
@@ -295,6 +299,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
 
   function handleGroupChange(value: string) {
     if (value === NEW_GROUP_SENTINEL) {
+      creatingGroupRef.current = false;
       setNewGroupDraft('');
       return;
     }
@@ -303,8 +308,10 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
   }
 
   async function commitNewGroupDraft() {
+    if (creatingGroupRef.current) return;
     const trimmed = (newGroupDraft ?? '').trim();
     if (!trimmed) { setNewGroupDraft(null); return; }
+    creatingGroupRef.current = true;
     const group = await createTriggerGroup(trimmed);
     if (group) setGroupId(group.id);
     setNewGroupDraft(null);
@@ -340,6 +347,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
           <div class="form-group">
             <label>Group</label>
             <Dropdown
+              class="trigger-group-select"
               value={groupId}
               onChange={handleGroupChange}
               options={groupOptions}

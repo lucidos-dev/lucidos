@@ -1,5 +1,25 @@
 // Lucidos Service Worker — handles push notifications and PWA support
 
+// Base path this SW is scoped to (ADR 0014): "/<slug>/" behind the workspace
+// gateway, else "/". Each workspace registers its own SW under /<slug>/sw.js
+// with scope /<slug>/, so caches, the navigation shell, and push are
+// per-workspace. Every same-origin path the SW matches or builds is resolved
+// against this scope. `self.registration.scope` is the absolute scope URL;
+// fall back to "/" if it's unavailable (defensive — should always be set).
+const SCOPE_PATH = (() => {
+  try {
+    return new URL(self.registration.scope).pathname;
+  } catch {
+    return '/';
+  }
+})();
+
+/** Strip the scope prefix from an absolute pathname, yielding a scope-relative
+ *  path (always starting with "/"). `/work/api/v1/x` → `/api/v1/x`; `/` → `/`. */
+function scopeRelative(path) {
+  return path.startsWith(SCOPE_PATH) ? '/' + path.slice(SCOPE_PATH.length) : path;
+}
+
 // Activate new SW immediately and take control of all pages.
 // This triggers Chrome's "site updated" toast when sw.js changes,
 // but only during development — in production SW updates are rare.
@@ -15,8 +35,8 @@ self.addEventListener('install', (event) => {
   if (IS_BUILT) {
     event.waitUntil((async () => {
       try {
-        const shellKey = new Request(self.location.origin + '/');
-        const resp = await fetch(self.location.origin + '/', { cache: 'reload' });
+        const shellKey = new Request(self.location.origin + SCOPE_PATH);
+        const resp = await fetch(self.location.origin + SCOPE_PATH, { cache: 'reload' });
         if (resp && resp.ok && !resp.redirected) {
           const cache = await caches.open(SHELL_CACHE);
           await cache.put(shellKey, resp.clone());
@@ -114,13 +134,17 @@ self.addEventListener('fetch', (event) => {
   // iframes) are none of the SW's business.
   if (!url.startsWith(self.location.origin)) return;
   const path = url.slice(self.location.origin.length).split('?')[0];
+  // Scope-relative path so the same matching works at the root AND under
+  // /<slug>/ behind the gateway. Cache keys still use the full event.request
+  // URL (with the /<slug>/ prefix), so workspaces stay cache-isolated.
+  const rel = scopeRelative(path);
 
-  if (path.startsWith('/api/v1/')) {
+  if (rel.startsWith('/api/v1/')) {
     // SSE: Chrome keeps the SW alive for the whole streaming connection, so
     // intercepting it hangs the worker — let the browser handle it natively.
-    if (path === '/api/v1/events') return;
+    if (rel === '/api/v1/events') return;
     // Content-addressed blobs are immutable for the lifetime of the hash.
-    if (path.startsWith('/api/v1/blobs/')) {
+    if (rel.startsWith('/api/v1/blobs/')) {
       event.respondWith(cacheFirst(event.request, BLOB_CACHE));
       return;
     }
@@ -133,7 +157,7 @@ self.addEventListener('fetch', (event) => {
   // Refuse to cache an HTML response here (see isHtmlResponse): a bundle deleted
   // by a later build resolves through the server's SPA fallback to index.html,
   // and caching that under the bundle URL poisons the entry permanently.
-  if (path.startsWith('/assets/')) {
+  if (rel.startsWith('/assets/')) {
     event.respondWith(
       cacheFirst(event.request, SHELL_CACHE, (r) => !!r && r.ok && !isHtmlResponse(r)),
     );
@@ -150,7 +174,7 @@ self.addEventListener('fetch', (event) => {
   // skill UIs are ALSO `mode: 'navigate'` requests but are NOT the SPA shell —
   // they must reach their own server-rendered HTML, never index.html. Built mode
   // only (IS_BUILT) so the dev server keeps serving a network-fresh shell.
-  if (IS_BUILT && event.request.mode === 'navigate' && path === '/') {
+  if (IS_BUILT && event.request.mode === 'navigate' && rel === '/') {
     event.respondWith(networkFirstShell(event.request));
     return;
   }
@@ -211,11 +235,13 @@ async function cacheFirst(request, cacheName, isCacheable) {
 // fast. Keyed by a NORMALIZED `/` request (no query string) so every
 // `/?notification=…` deep-link variant shares one cached entry. A redirected or
 // non-2xx response is never cached (a redirected Response replayed for a
-// navigation throws; a 502 mid engine-restart must not be pinned) and falls back
-// to the last good cached shell.
+// navigation throws; a 502 mid engine-restart must not be pinned). A non-ok
+// response falls back to the last good cached shell — EXCEPT the gateway's boot
+// splash (503 marked `X-Lucidos-Boot-Splash`), which is shown as-is so the user
+// sees the "workspace starting…" page instead of a stale shell that 503-storms.
 async function networkFirstShell(request) {
   const cache = await caches.open(SHELL_CACHE);
-  const shellKey = new Request(self.location.origin + '/');
+  const shellKey = new Request(self.location.origin + SCOPE_PATH);
   let response;
   try {
     response = await fetchWithRetry(request);
@@ -229,7 +255,25 @@ async function networkFirstShell(request) {
     cache.put(shellKey, response.clone()).catch(() => {});
     return response;
   }
-  // Non-ok (e.g. 502 during a restart) — prefer a cached good shell over the error.
+  // The gateway answers a navigation to a stopped / cold-booting workspace with a
+  // 503 (ADR 0014 §11): the branded boot SPLASH (Retry-After + meta-refresh) for
+  // a document navigation it lazy-starts, or a plain "workspace stopped" body.
+  // Either way a 503 means the engine is NOT serving — so the cached app shell is
+  // exactly the wrong thing to show: it boots and 503-storms its API calls
+  // against the down engine, surfacing as a red connection dot (assets cached) or
+  // a white screen (assets evicted / different build). The splash, by contrast,
+  // is a real page the user SHOULD see — its meta-refresh transitions to the app
+  // once the engine is up. So a 503 is shown AS-IS (never cached — it's a 503),
+  // independent of the `X-Lucidos-Boot-Splash` marker: the gateway is a
+  // machine-global daemon that does NOT restart on a CC Apply, so a freshly-built
+  // gateway carrying the marker may not be the one actually running — keying on
+  // the 503 status keeps the splash working against an older gateway too.
+  if (response && (response.status === 503 || response.headers.get('x-lucidos-boot-splash'))) {
+    return response;
+  }
+  // Other non-ok (e.g. a 502 mid engine-restart, where the engine is up but a
+  // proxied request transiently failed) — prefer a cached good shell over the
+  // error page.
   const cached = await cache.match(shellKey);
   return cached || response;
 }
@@ -245,13 +289,17 @@ const DEFAULT_NOTIFICATION_TAG = 'lucidos-notification';
 // `navigate` field directly without running this SW, so it doesn't go here.
 function resolveNavigate(relativeUrl) {
   if (typeof relativeUrl !== 'string' || relativeUrl.length === 0) {
-    return self.location.origin + '/';
+    return self.location.origin + SCOPE_PATH;
   }
-  // Hash-only path starts with `/#` or `/`. URL constructor handles both.
+  // The engine builds origin-rooted deep links (`/#thread=…`, `/?notification=…`)
+  // — it doesn't know its `/<slug>` prefix. Resolve them against the SW's
+  // scope so the tap lands in THIS workspace: drop the leading slash so the path
+  // is scope-relative, then resolve against `origin + SCOPE_PATH` (trailing slash).
   try {
-    return new URL(relativeUrl, self.location.origin).toString();
+    const scopeRelativeUrl = relativeUrl.replace(/^\//, '');
+    return new URL(scopeRelativeUrl, self.location.origin + SCOPE_PATH).toString();
   } catch {
-    return self.location.origin + '/';
+    return self.location.origin + SCOPE_PATH;
   }
 }
 
@@ -322,8 +370,8 @@ self.addEventListener('push', (event) => {
   // delivering pushes entirely.
   event.waitUntil(self.registration.showNotification(title, {
     body,
-    icon: '/favicon.svg',
-    badge: '/favicon.svg',
+    icon: SCOPE_PATH + 'favicon.svg',
+    badge: SCOPE_PATH + 'favicon.svg',
     tag,
     renotify: !isWake,
     requireInteraction: true,
@@ -340,7 +388,7 @@ self.addEventListener('push', (event) => {
     // system-knowhow notifications.md §4.5.
     navigate: navigateRelative
       ? resolveNavigate(navigateRelative)
-      : self.location.origin + '/',
+      : self.location.origin + SCOPE_PATH,
     data,
   }));
 });
@@ -388,14 +436,14 @@ self.addEventListener('notificationclick', (event) => {
   // payload; fall back to opening the app at root.
   const targetUrl = data.navigate
     ? resolveNavigate(data.navigate)
-    : self.location.origin + '/';
+    : self.location.origin + SCOPE_PATH;
 
   // Mark-read runs in parallel with navigation; Promise.all's final await
   // keeps the SW alive until both finish. Without that await, iOS terminates
   // the SW the moment navigation resolves and cancels the in-flight POST
   // (unread badge stays stuck).
   const markReadPromise = notificationId
-    ? fetch(`${self.location.origin}/api/v1/notification/read?id=${encodeURIComponent(notificationId)}`, {
+    ? fetch(`${self.location.origin}${SCOPE_PATH}api/v1/notification/read?id=${encodeURIComponent(notificationId)}`, {
         method: 'POST',
       }).catch(() => {})
     : Promise.resolve();
@@ -403,16 +451,41 @@ self.addEventListener('notificationclick', (event) => {
   event.waitUntil(Promise.all([markReadPromise, routeToDeepLink(targetUrl, data)]));
 });
 
+// True if a top-level Window client belongs to THIS service worker's scope.
+// Behind the workspace gateway several workspaces share one origin
+// (`/personal/`, `/dev/`, …); a push for `/personal` is delivered to the
+// `/personal` SW, but `clients.matchAll({includeUncontrolled:true})` returns
+// EVERY same-origin tab — including an open `/dev` tab. Without this gate
+// routeToDeepLink would focus + postMessage the wrong workspace's tab, whose
+// store has no such thread/app, so the tap "goes nowhere" (the cross-workspace
+// notification-tap bug). Match only same-scope clients; tolerate a missing
+// trailing slash (`/personal` for scope `/personal/`). At the legacy root scope
+// (`/`) every same-origin client matches — correct, since there's only one
+// workspace there.
+function clientInScope(clientUrl) {
+  let pathname;
+  try {
+    pathname = new URL(clientUrl).pathname;
+  } catch {
+    return false;
+  }
+  // startsWith covers the exact-match case (SCOPE_PATH ends with '/'); the
+  // second clause adds tolerance for a client at the slug with no trailing slash.
+  return pathname.startsWith(SCOPE_PATH) || pathname + '/' === SCOPE_PATH;
+}
+
 async function routeToDeepLink(targetUrl, tapData) {
   const windowClients = await clients.matchAll({ type: 'window', includeUncontrolled: true });
   // frameType filter is the load-bearing line — same-origin app-UI iframes
   // (src=/app/<id>/) are ALSO Window clients per the SW spec. Without the
   // 'top-level' gate, find() can return the iframe; focusing/messaging it
   // moves the wrong surface, manifesting as "PWA opens to the wrong view".
+  // clientInScope keeps the tap inside THIS workspace (gateway multi-workspace).
   // URL-substring filters stay as belt-and-braces for non-iframe edge cases
   // (skill UIs in their own window).
   const appClient = windowClients.find(c =>
     c.frameType === 'top-level' &&
+    clientInScope(c.url) &&
     !c.url.includes('/sw.js') &&
     !c.url.includes('/api/v1/skill/')
   );

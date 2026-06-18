@@ -10,6 +10,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SANDBOX="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX"' EXIT
 export HOME="$SANDBOX"
+export LUCIDOS_GATEWAY_DATA="$SANDBOX/gateway"
 
 PASS=0
 FAIL=0
@@ -606,6 +607,161 @@ test_kills_shared_build_watch_when_no_workspace_serves() {
     fi
 }
 
+test_shared_pg_sql_quoting() {
+    echo "test: shared Postgres SQL quoting"
+
+    if [ "$(_shared_pg_ident lucidos_dev-project)" = '"lucidos_dev-project"' ]; then
+        pass "shared database identifier quoted"
+    else
+        fail "shared database identifier quote mismatch"
+    fi
+    if [ "$(_shared_pg_literal "a'b")" = "'a''b'" ]; then
+        pass "shared database literal escapes apostrophes"
+    else
+        fail "shared database literal quote mismatch: $(_shared_pg_literal "a'b")"
+    fi
+}
+
+test_legacy_pg_volume_layout_detects_parent_pgdata() {
+    echo "test: legacy PG volume layout detects PG18 parent PGDATA"
+
+    docker() {
+        case "$*" in
+            *"test -f /v/18/docker/PG_VERSION"*) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+
+    local layout
+    layout="$(_legacy_pg_volume_layout legacy-volume)"
+    unset -f docker
+
+    if [ "$layout" = "parent:18" ]; then
+        pass "PG18 parent-layout volume detected"
+    else
+        fail "unexpected parent-layout detection: ${layout:-<empty>}"
+    fi
+}
+
+test_legacy_pg_volume_layout_detects_root_pgdata() {
+    echo "test: legacy PG volume layout detects root PGDATA"
+
+    docker() {
+        case "$*" in
+            *"test -f /v/18/docker/PG_VERSION"*) return 1 ;;
+            *"cat /v/PG_VERSION"*) echo "17"; return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+
+    local layout
+    layout="$(_legacy_pg_volume_layout legacy-volume)"
+    unset -f docker
+
+    if [ "$layout" = "root:17" ]; then
+        pass "root-layout volume detected"
+    else
+        fail "unexpected root-layout detection: ${layout:-<empty>}"
+    fi
+}
+
+test_swap_ports_writes_shared_database_url() {
+    echo "test: swap_ports writes workspace-specific shared database URL"
+
+    local PROJECT_DIR="$SANDBOX/proj-shared-db-url"
+    local FRONTEND_DIR="$PROJECT_DIR/crates/lucidos-app"
+    mkdir -p "$FRONTEND_DIR" "$HOME/workspaces/dev-project/.lucidos"
+
+    WORKSPACE="$HOME/workspaces/dev-project"
+    VITE_PORT=5188
+    PG_PORT=5544
+    LUCIDOS_TLS_CERT=""
+    LUCIDOS_TLS_KEY=""
+
+    swap_ports >/dev/null
+
+    local ports_file="$WORKSPACE/.lucidos/ports"
+    if grep -qx "PG_DATABASE=lucidos_dev-project" "$ports_file"; then
+        pass "ports file records shared workspace database"
+    else
+        fail "ports file missing PG_DATABASE=lucidos_dev-project: $(cat "$ports_file")"
+    fi
+    if grep -qx "DATABASE_URL=postgres://lucidos:lucidos@localhost:5544/lucidos_dev-project" "$ports_file"; then
+        pass "ports file records shared DATABASE_URL"
+    else
+        fail "ports file missing shared DATABASE_URL: $(cat "$ports_file")"
+    fi
+    if [ "$DATABASE_URL" = "postgres://lucidos:lucidos@localhost:5544/lucidos_dev-project" ]; then
+        pass "DATABASE_URL exported for direct engine mode"
+    else
+        fail "unexpected DATABASE_URL export: ${DATABASE_URL:-<unset>}"
+    fi
+}
+
+test_seed_gateway_registry_removes_legacy_database_url() {
+    echo "test: seed_gateway_registry removes legacy database_url"
+
+    local PROJECT_DIR="$SANDBOX/proj-registry"
+    mkdir -p "$PROJECT_DIR" "$HOME/workspaces/dev/.lucidos" "$(gateway_data_dir)/config"
+    WORKSPACE="$HOME/workspaces/dev"
+    ENGINE_PORT=5173
+    GATEWAY_PORT=5251
+
+    cat > "$(gateway_data_dir)/config/workspaces.json" <<'JSON'
+{
+  "workspaces": [
+    {
+      "id": "dev",
+      "name": "Picker Name",
+      "dir": "/old/dev",
+      "port": 5000,
+      "database_url": "postgres://lucidos:lucidos@localhost:5439/lucidos",
+      "autostart": true
+    }
+  ]
+}
+JSON
+
+    seed_gateway_registry >/dev/null
+
+    local out
+    out="$(python3 - "$(gateway_data_dir)/config/workspaces.json" <<'PY'
+import json, sys
+w = json.load(open(sys.argv[1]))["workspaces"][0]
+print(w.get("name"))
+print(w.get("dir"))
+print(w.get("port"))
+print(w.get("autostart"))
+print("database_url" in w)
+PY
+)"
+    if echo "$out" | grep -qx "Picker Name"; then
+        pass "display name preserved"
+    else
+        fail "display name not preserved: $out"
+    fi
+    if echo "$out" | grep -qx "$WORKSPACE"; then
+        pass "workspace dir refreshed"
+    else
+        fail "workspace dir not refreshed: $out"
+    fi
+    if echo "$out" | grep -qx "5173"; then
+        pass "engine port refreshed"
+    else
+        fail "engine port not refreshed: $out"
+    fi
+    if echo "$out" | grep -qx "True"; then
+        pass "autostart preserved"
+    else
+        fail "autostart not preserved: $out"
+    fi
+    if echo "$out" | grep -qx "False"; then
+        pass "legacy database_url removed"
+    else
+        fail "database_url still present: $out"
+    fi
+}
+
 test_refuses_install_when_same_project_frontend_running
 test_engine_only_skips_install_when_frontend_running
 test_allows_install_when_other_checkout_frontend_running
@@ -620,6 +776,11 @@ test_resolves_bare_name_to_home_workspaces
 test_resolves_absolute_path_unchanged
 test_errors_on_missing_workspace
 test_does_not_create_directories
+test_shared_pg_sql_quoting
+test_legacy_pg_volume_layout_detects_parent_pgdata
+test_legacy_pg_volume_layout_detects_root_pgdata
+test_swap_ports_writes_shared_database_url
+test_seed_gateway_registry_removes_legacy_database_url
 test_keeps_shared_build_watch_when_a_workspace_still_serves
 test_kills_shared_build_watch_when_no_workspace_serves
 

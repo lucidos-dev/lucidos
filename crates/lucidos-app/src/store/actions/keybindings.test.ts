@@ -47,6 +47,17 @@ describe('bindingFor', () => {
     preferences.value = { status: 'loaded', data: { [KEYBINDINGS_PREF_KEY]: '{not json' } };
     expect(bindingFor('searchEverywhere')).toEqual({ mod: true, shift: true, alt: false, key: 's' });
   });
+
+  it('reads a renamed shortcut from its legacy persisted key', () => {
+    // previousThread → historyBack: a binding stored under the old id survives.
+    setPrefs({ previousThread: 'mod+alt+j' });
+    expect(bindingFor('historyBack')).toEqual({ mod: true, shift: false, alt: true, key: 'j' });
+  });
+
+  it('prefers the current id over the legacy key when both are present', () => {
+    setPrefs({ historyBack: 'mod+alt+k', previousThread: 'mod+alt+j' });
+    expect(bindingFor('historyBack')).toEqual({ mod: true, shift: false, alt: true, key: 'k' });
+  });
 });
 
 describe('isCustomized', () => {
@@ -138,8 +149,8 @@ describe('recordChord', () => {
 describe('tooltipWithShortcut', () => {
   it('reflects the current binding (non-Mac form in the test env)', () => {
     setPrefs({});
-    expect(tooltipWithShortcut('Search', 'searchEverywhere')).toBe('Search · Ctrl+Shift+S');
+    expect(tooltipWithShortcut('Search everywhere', 'searchEverywhere')).toBe('Search everywhere · Ctrl+Shift+S');
     setPrefs({ searchEverywhere: 'mod+shift+p' });
-    expect(tooltipWithShortcut('Search', 'searchEverywhere')).toBe('Search · Ctrl+Shift+P');
+    expect(tooltipWithShortcut('Search everywhere', 'searchEverywhere')).toBe('Search everywhere · Ctrl+Shift+P');
   });
 });

@@ -203,9 +203,13 @@ export function markReadOptimistic(id: string): void {
 export async function viewNotification(id: string): Promise<void> {
   const now = Date.now();
   if (id === _lastViewedId && now - _lastViewedAt < 10_000) return;
+  // Stamp the dedup guard synchronously, before the await, so a near-simultaneous
+  // second fire (SW postMessage + URL-param cold start, both for one tap) bails on
+  // the guard instead of racing a second fetch. Cleared on failure below so a
+  // failed fetch never blocks a re-tap — otherwise the retry silently no-ops for
+  // 10s (no modal, no second toast — the tap looks dead).
   _lastViewedId = id;
   _lastViewedAt = now;
-
   try {
     const notification = await getNotification(id);
     if (notification) {
@@ -214,6 +218,7 @@ export async function viewNotification(id: string): Promise<void> {
       markReadOptimistic(id);
     }
   } catch (error) {
+    _lastViewedId = null;
     showToast('Failed to load notification: ' + errorDetail(error), 'error');
   }
 }

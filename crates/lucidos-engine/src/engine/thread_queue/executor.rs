@@ -106,7 +106,10 @@ impl ThreadQueueExecutor for EngineThreadQueueExecutor {
         match result {
             Ok(Some(emit)) => *pre_emitted_origin = Some(emit.event_id),
             Ok(None) => log!("[ThreadQueue] sub-thread MessageReceived emit returned no result"),
-            Err(e) => log!("[ThreadQueue] sub-thread MessageReceived emit failed: {}", e),
+            Err(e) => log!(
+                "[ThreadQueue] sub-thread MessageReceived emit failed: {}",
+                e
+            ),
         }
     }
 
@@ -142,7 +145,10 @@ impl LucidosEngine {
 
     /// Run one admitted Thread Queue entry. Mirrors the pre-queue spawn
     /// sites exactly — this is dispatch, not new behavior.
-    pub(crate) async fn execute_thread_queue_entry(self: std::sync::Arc<Self>, entry: ExecutableEntry) {
+    pub(crate) async fn execute_thread_queue_entry(
+        self: std::sync::Arc<Self>,
+        entry: ExecutableEntry,
+    ) {
         use std::sync::atomic::Ordering;
 
         match entry.request {
@@ -203,7 +209,8 @@ impl LucidosEngine {
                     );
                     return;
                 }
-                let active = crate::scheduler::ACTIVE_TASK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                let active =
+                    crate::scheduler::ACTIVE_TASK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                 if active > 1 {
                     log!(
                         "[Scheduler] Concurrent execution: {} tasks now active (starting '{}')",
@@ -278,6 +285,7 @@ impl LucidosEngine {
                 repo_id,
                 title,
                 app_id,
+                coding_agent,
             } => {
                 let user_images = self.resolve_queued_image_hashes(&image_hashes);
                 let params = crate::engine::claude_code::SpawnAgentThreadParams {
@@ -289,15 +297,13 @@ impl LucidosEngine {
                     repo_id,
                     caller_title: title,
                     app_id,
+                    coding_agent,
                 };
                 // Inner spawn + watcher: monitor_cc_task owns the panic
                 // cleanup (ResponseFailed + SessionEnded + session removal);
                 // awaiting the watcher holds the capacity slot until both the
                 // session AND any panic cleanup finish.
-                let inner = tokio::spawn(
-                    self.clone()
-                        .run_agent_thread_spawn(params, cc_thread_id),
-                );
+                let inner = tokio::spawn(self.clone().run_agent_thread_spawn(params, cc_thread_id));
                 let watcher = Self::monitor_cc_task(self.clone(), cc_thread_id, inner);
                 if let Err(e) = watcher.await {
                     log!(
@@ -315,7 +321,7 @@ impl LucidosEngine {
                 device_id,
                 model,
                 reasoning_effort,
-                use_claude_code,
+                use_coding_agent,
                 repo_id,
                 cc_model,
                 coding_agent,
@@ -346,7 +352,7 @@ impl LucidosEngine {
                         reasoning_effort.as_deref(),
                         images.as_deref(),
                         device_id.as_deref(),
-                        use_claude_code,
+                        use_coding_agent,
                         event_id.as_deref(),
                         Some(thread_id),
                         None,
@@ -386,9 +392,10 @@ impl LucidosEngine {
                             .emit_or_log(
                                 crate::engine::event_bus::BusEvent::Thread {
                                     thread_id,
-                                    event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
-                                        error: e.to_string(),
-                                    },
+                                    event:
+                                        crate::engine::thread_events::ThreadEvent::ResponseFailed {
+                                            error: e.to_string(),
+                                        },
                                     meta: EventMeta::NONE,
                                 },
                                 "[ThreadQueue] ResponseFailed (agent chat)",
@@ -415,10 +422,8 @@ impl LucidosEngine {
         images
             .iter()
             .filter_map(|img| {
-                match crate::core::blobs::write_blob_from_base64(
-                    self.workspace_path(),
-                    &img.base64,
-                ) {
+                match crate::core::blobs::write_blob_from_base64(self.workspace_path(), &img.base64)
+                {
                     Ok(blob) => Some(blob.hash),
                     Err(e) => {
                         log!(
@@ -442,10 +447,9 @@ impl LucidosEngine {
         let mut resolved = Vec::with_capacity(hashes.len());
         for hash in hashes {
             match crate::core::blobs::read_blob_as_base64(self.workspace_path(), hash) {
-                Some((base64, mime_type)) => resolved.push(crate::api::ChatImage {
-                    base64,
-                    mime_type,
-                }),
+                Some((base64, mime_type)) => {
+                    resolved.push(crate::api::ChatImage { base64, mime_type })
+                }
                 None => log!(
                     "[ThreadQueue] image blob {} missing on disk, dropping from queued spawn",
                     hash

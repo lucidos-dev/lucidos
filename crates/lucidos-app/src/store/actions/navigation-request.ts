@@ -1,5 +1,5 @@
 import { switchMenuItem, openSettingsSubview, setActiveMenu } from './menu';
-import { openAppById } from './apps';
+import { openAppById, setAppsTab } from './apps';
 import { openFilePreview, openUrl, normalizeDataPath } from './artifacts';
 import { navigateToTrigger } from './triggers';
 import { focusThreadOrBootstrap, unfocusThread } from './threads';
@@ -41,10 +41,17 @@ export function handleNavigationRequest(nav: {
     case 'notifications':
       switchMenuItem(nav.target as MenuItem);
       break;
+    case 'app-store':
+      // The App Store is now the Store tab of the Apps section. Older
+      // notifications (and the still-valid `app-store` NavigateTarget) deep-link
+      // here — land on Apps with the Store tab selected.
+      setAppsTab('store');
+      switchMenuItem('apps');
+      break;
     case 'settings':
       switchMenuItem('settings');
       if (nav.settings_view) {
-        openSettingsSubview(nav.settings_view as 'devices' | 'accounts' | 'backup' | 'memory' | 'repositories');
+        openSettingsSubview(nav.settings_view as 'system' | 'devices' | 'accounts' | 'backup' | 'memory' | 'repositories' | 'marketplaces' | 'disk-usage' | 'environment-variables');
       }
       break;
     case 'app':

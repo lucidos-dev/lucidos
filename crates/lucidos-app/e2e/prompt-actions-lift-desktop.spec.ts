@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { assertHealthy, navigateToApp, ensureOnThreadPane, uniqueMessage } from './helpers';
 import { createCCThreadWithChange, cleanupCCThread } from './db-helpers';
 

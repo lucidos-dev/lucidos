@@ -1,4 +1,4 @@
-import { test, expect, request as pwRequest } from '@playwright/test';
+import { test, expect, request as pwRequest } from './fixtures';
 import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, getBaseUrl } from './helpers';
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';

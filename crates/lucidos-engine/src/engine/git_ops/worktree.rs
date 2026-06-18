@@ -1,6 +1,10 @@
 use super::*;
 use std::path::{Path, PathBuf};
 
+const LUCIDOS_HOOKS_PATH: &str = ".lucidos/git-hooks";
+const LUCIDOS_POST_COMMIT_HOOK: &str = "post-commit";
+const LUCIDOS_CHAIN_MARKER: &str = "# lucidos-chain-hook: ";
+
 /// Return the persistent directory for CC worktrees: `<workspace>/.lucidos/worktrees/`.
 /// Creates the directory if it doesn't exist.
 pub(crate) fn worktrees_dir(workspace_path: &Path) -> PathBuf {
@@ -83,20 +87,20 @@ pub(crate) async fn resolve_main_worktree(path: &Path) -> PathBuf {
         path.to_path_buf()
     } else {
         log!(
-            "[ClaudeCode] Compile-time path {} no longer exists — trying cwd fallback",
+            "[Git] Compile-time path {} no longer exists — trying cwd fallback",
             path.display()
         );
         match std::env::current_dir() {
             Ok(cwd) if cwd.join(".git").exists() => {
                 log!(
-                    "[ClaudeCode] Using cwd as fallback repo root: {}",
+                    "[Git] Using cwd as fallback repo root: {}",
                     cwd.display()
                 );
                 cwd
             }
             _ => {
                 log!(
-                    "[ClaudeCode] No fallback available for non-existent compile-time path {}",
+                    "[Git] No fallback available for non-existent compile-time path {}",
                     path.display()
                 );
                 return path.to_path_buf();
@@ -111,7 +115,7 @@ pub(crate) async fn resolve_main_worktree(path: &Path) -> PathBuf {
                 let main_wt = PathBuf::from(line.strip_prefix("worktree ").unwrap());
                 if main_wt != effective_path {
                     log!(
-                        "[ClaudeCode] Resolved compile-time path to main working tree: {} -> {}",
+                        "[Git] Resolved compile-time path to main working tree: {} -> {}",
                         effective_path.display(),
                         main_wt.display()
                     );
@@ -356,6 +360,260 @@ async fn link_git_crypt_dir(wt_path: &Path) -> Result<(), String> {
     }
 }
 
+/// True when `wt_path` is a live, linked git worktree rooted at `wt_path`
+/// itself — not a stranded directory, and not a path git resolves *upward* to an
+/// enclosing repository (e.g. the workspace data repo that physically contains
+/// `.lucidos/worktrees/`). A resumed Claude Code session must never run in such
+/// a directory: git there operates on the enclosing repo, so the session reads
+/// the wrong files and could commit into the data repo — the "worktree torn
+/// down" failure where a torn-down worktree left the session standing in the
+/// workspace's git root.
+///
+/// The spawn path uses this to decide reuse-vs-recreate instead of the weaker
+/// "directory + `.git` entry exists" test, which a stranded tree passes (its
+/// `.git` file can survive while the admin dir it points at is gone, or git
+/// simply walks up to the enclosing repo).
+pub(crate) async fn is_live_worktree_at(wt_path: &Path) -> bool {
+    if !wt_path.exists() {
+        return false;
+    }
+    let out = match git_cmd(&["rev-parse", "--show-toplevel"], wt_path).await {
+        Ok(o) if o.status.success() => o,
+        // git failed to run, or the path is in no work tree at all. Treat as
+        // not-live; the caller recreates (clearing the dead dir first).
+        _ => return false,
+    };
+    let toplevel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if toplevel.is_empty() {
+        return false;
+    }
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(Path::new(&toplevel)) == canon(wt_path)
+}
+
+/// Install the per-worktree post-commit hook that lets a coding-agent commit
+/// refresh the visible Diff button immediately, before the turn idles.
+///
+/// The hook is deliberately worktree-local (`core.hooksPath` in
+/// `config.worktree`) so it affects only Lucidos-managed agent worktrees, not
+/// the user's main checkout or sibling worktrees. If the repo already had a
+/// post-commit hook through the previous `core.hooksPath` (or the common
+/// `.git/hooks` directory), the Lucidos hook chains to it after refreshing the
+/// diff flag.
+pub(crate) async fn install_coding_agent_diff_hook(
+    repo_root: &Path,
+    wt_path: &Path,
+) -> Result<(), String> {
+    if !is_live_worktree_at(wt_path).await {
+        return Err(format!("{} is not a live git worktree", wt_path.display()));
+    }
+
+    let chain_hook = prior_post_commit_hook(wt_path).await?;
+    let hook_dir = wt_path.join(LUCIDOS_HOOKS_PATH);
+    let hook_path = hook_dir.join(LUCIDOS_POST_COMMIT_HOOK);
+    std::fs::create_dir_all(&hook_dir)
+        .map_err(|e| format!("create {}: {}", hook_dir.display(), e))?;
+
+    std::fs::write(
+        &hook_path,
+        render_coding_agent_diff_hook(&chain_hook).as_bytes(),
+    )
+    .map_err(|e| format!("write {}: {}", hook_path.display(), e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&hook_path)
+            .map_err(|e| format!("metadata {}: {}", hook_path.display(), e))?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms)
+            .map_err(|e| format!("chmod {}: {}", hook_path.display(), e))?;
+    }
+
+    let enable = git_cmd(&["config", "extensions.worktreeConfig", "true"], repo_root).await?;
+    if !enable.status.success() {
+        return Err(format!(
+            "git config extensions.worktreeConfig failed: {}",
+            String::from_utf8_lossy(&enable.stderr).trim()
+        ));
+    }
+
+    let set_hooks = git_cmd(
+        &["config", "--worktree", "core.hooksPath", LUCIDOS_HOOKS_PATH],
+        wt_path,
+    )
+    .await?;
+    if !set_hooks.status.success() {
+        return Err(format!(
+            "git config --worktree core.hooksPath failed: {}",
+            String::from_utf8_lossy(&set_hooks.stderr).trim()
+        ));
+    }
+
+    Ok(())
+}
+
+async fn prior_post_commit_hook(wt_path: &Path) -> Result<PathBuf, String> {
+    let hook_path = wt_path.join(LUCIDOS_HOOKS_PATH).join(LUCIDOS_POST_COMMIT_HOOK);
+    if let Some(current) = current_hooks_path(wt_path).await {
+        if !is_lucidos_hooks_path(&current) {
+            return Ok(resolve_hooks_path(wt_path, &current).join(LUCIDOS_POST_COMMIT_HOOK));
+        }
+        if let Some(chain) = existing_lucidos_chain_hook(&hook_path) {
+            return Ok(chain);
+        }
+    }
+    common_post_commit_hook(wt_path).await
+}
+
+async fn current_hooks_path(wt_path: &Path) -> Option<String> {
+    match git_cmd(&["config", "--get", "core.hooksPath"], wt_path).await {
+        Ok(out) if out.status.success() => {
+            let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if raw.is_empty() {
+                None
+            } else {
+                Some(raw)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn is_lucidos_hooks_path(path: &str) -> bool {
+    path.trim_end_matches('/') == LUCIDOS_HOOKS_PATH
+}
+
+fn resolve_hooks_path(wt_path: &Path, hooks_path: &str) -> PathBuf {
+    let path = Path::new(hooks_path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        wt_path.join(path)
+    }
+}
+
+fn existing_lucidos_chain_hook(hook_path: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(hook_path).ok()?;
+    contents.lines().find_map(|line| {
+        line.strip_prefix(LUCIDOS_CHAIN_MARKER)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    })
+}
+
+async fn common_post_commit_hook(wt_path: &Path) -> Result<PathBuf, String> {
+    let out = git_cmd(&["rev-parse", "--git-common-dir"], wt_path).await?;
+    if !out.status.success() {
+        return Err(format!(
+            "git rev-parse --git-common-dir failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if raw.is_empty() {
+        return Err("git rev-parse --git-common-dir returned empty path".to_string());
+    }
+    let common_dir = {
+        let p = PathBuf::from(raw);
+        if p.is_absolute() { p } else { wt_path.join(p) }
+    };
+    Ok(common_dir.join("hooks").join(LUCIDOS_POST_COMMIT_HOOK))
+}
+
+fn render_coding_agent_diff_hook(chain_hook: &Path) -> String {
+    let chain_display = chain_hook.to_string_lossy();
+    let chain_literal = shell_single_quote(&chain_display);
+    format!(
+        "#!/bin/sh\n\
+         # Installed by Lucidos. Refreshes the coding-agent Diff button as soon as a commit lands.\n\
+         {LUCIDOS_CHAIN_MARKER}{chain_display}\n\
+         if [ -n \"${{LUCIDOS_THREAD_ID:-}}\" ]; then\n\
+           lucidos coding-agent-diff-hook >/dev/null 2>&1 || true\n\
+         fi\n\
+         \n\
+         CHAIN={chain_literal}\n\
+         if [ -n \"$CHAIN\" ] && [ -x \"$CHAIN\" ] && [ \"$CHAIN\" != \"$0\" ]; then\n\
+           \"$CHAIN\" \"$@\"\n\
+           exit $?\n\
+         fi\n\
+         exit 0\n"
+    )
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// Remove a *stranded* worktree directory (present on disk but not a live linked
+/// worktree — see [`is_live_worktree_at`]) so a fresh [`worktree_add`] can
+/// recreate it at the same path.
+///
+/// BOTH destructive steps — `git worktree remove --force` (which would delete
+/// even a live, dirty tree) and `remove_dir_all` — fire ONLY after *positive*
+/// stranding evidence: git ran successfully and confirmed the path is not its
+/// own work tree (resolves to an enclosing repo, or is no git repo at all). A
+/// path that still reads as a live worktree, or that git could not be queried
+/// about (transient failure), is left untouched — deleting a possibly-live
+/// worktree's uncommitted work is the unsafe direction, and the caller instead
+/// surfaces the `git worktree add` "already exists" collision. Confine calls to
+/// the workspace worktrees dir.
+pub(crate) async fn clear_stranded_worktree_dir(repo_root: &Path, wt_path: &Path) {
+    if !wt_path.exists() {
+        return;
+    }
+
+    // Confirm the path is stranded BEFORE touching it. This gate must precede
+    // `git worktree remove --force` too, not just the `remove_dir_all` — that
+    // command silently discards a live, dirty worktree, so a transient
+    // liveness-probe failure upstream must not be able to reach it here.
+    match git_cmd(&["rev-parse", "--show-toplevel"], wt_path).await {
+        Ok(o) if o.status.success() => {
+            let top = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            if !top.is_empty() && canon(Path::new(&top)) == canon(wt_path) {
+                // Reads as a live worktree after all — never touch it.
+                log!(
+                    "[Git] refusing to clear {} — it reads as a live worktree",
+                    wt_path.display()
+                );
+                return;
+            }
+            // Resolves to an enclosing repo → stranded → safe to remove.
+        }
+        Ok(_) => { /* not a work tree at all → leftover residue → safe. */ }
+        Err(e) => {
+            log!(
+                "[Git] cannot verify {} is stranded ({}); leaving dir in place",
+                wt_path.display(),
+                e
+            );
+            return;
+        }
+    }
+
+    // Confirmed stranded. Clear any stale git registration first (so a later
+    // `worktree_add` at this path doesn't trip "already registered"), then the
+    // directory if it survives.
+    if let Some(s) = wt_path.to_str() {
+        let _ = git_cmd(&["worktree", "remove", "--force", s], repo_root).await;
+    }
+    if !wt_path.exists() {
+        log!("[Git] cleared stranded worktree {} via git", wt_path.display());
+        return;
+    }
+    match tokio::fs::remove_dir_all(wt_path).await {
+        Ok(()) => log!("[Git] cleared stranded worktree dir {}", wt_path.display()),
+        Err(e) => log!(
+            "[Git] failed to clear stranded worktree dir {}: {}",
+            wt_path.display(),
+            e
+        ),
+    }
+}
+
 /// Get the current branch of a worktree (before it is removed).
 /// Returns `None` if detached HEAD or on error.
 pub(crate) async fn worktree_current_branch(worktree_path: &Path) -> Option<String> {
@@ -567,7 +825,7 @@ pub(crate) async fn cleanup_failed_spawn(
             // worktree kept, `worktree_gone=false` suppresses the delete in
             // that combination anyway (the branch is checked out there).
             log!(
-                "[ClaudeCode] Spawn failed — keeping pre-existing worktree {} (and branch {}) for resume",
+                "[Git] Spawn failed — keeping pre-existing worktree {} (and branch {}) for resume",
                 wt.display(),
                 branch_name
             );
@@ -581,13 +839,13 @@ pub(crate) async fn cleanup_failed_spawn(
             {
                 Ok(o) if o.status.success() => {
                     log!(
-                        "[ClaudeCode] Removed worktree {} created by the failed spawn",
+                        "[Git] Removed worktree {} created by the failed spawn",
                         wt.display()
                     );
                 }
                 Ok(o) => {
                     log!(
-                        "[ClaudeCode] Failed to remove worktree {} after failed spawn: {} — \
+                        "[Git] Failed to remove worktree {} after failed spawn: {} — \
                          keeping branch {}; the worktree cleanup worker will retry",
                         wt.display(),
                         String::from_utf8_lossy(&o.stderr).trim(),
@@ -597,7 +855,7 @@ pub(crate) async fn cleanup_failed_spawn(
                 }
                 Err(e) => {
                     log!(
-                        "[ClaudeCode] git worktree remove errored for {} after failed spawn: {} — \
+                        "[Git] git worktree remove errored for {} after failed spawn: {} — \
                          keeping branch {}; the worktree cleanup worker will retry",
                         wt.display(),
                         e,
@@ -612,17 +870,17 @@ pub(crate) async fn cleanup_failed_spawn(
         match git_cmd(&["branch", "-D", branch_name], repo_root).await {
             Ok(o) if o.status.success() => {
                 log!(
-                    "[ClaudeCode] Deleted branch {} created by the failed spawn",
+                    "[Git] Deleted branch {} created by the failed spawn",
                     branch_name
                 );
             }
             Ok(o) => log!(
-                "[ClaudeCode] Failed to delete branch {} after failed spawn: {}",
+                "[Git] Failed to delete branch {} after failed spawn: {}",
                 branch_name,
                 String::from_utf8_lossy(&o.stderr).trim()
             ),
             Err(e) => log!(
-                "[ClaudeCode] git branch -D errored for {} after failed spawn: {}",
+                "[Git] git branch -D errored for {} after failed spawn: {}",
                 branch_name,
                 e
             ),

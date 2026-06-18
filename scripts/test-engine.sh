@@ -40,7 +40,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-PG_IMAGE="pgvector/pgvector:pg17"      # same image the workspaces use (has pgvector)
+PG_IMAGE="pgvector/pgvector:pg18"      # same image the workspaces use (has pgvector)
 PG_CONTAINER="lucidos-pg-test"
 PG_PORT="${LUCIDOS_TEST_PG_PORT:-5510}"  # off the 5432+ workspace range on purpose
 

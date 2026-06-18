@@ -9,7 +9,7 @@ pub(super) fn drain_lost_followups(
 ) -> Vec<AgentUserInput> {
     let lost: Vec<_> = std::iter::from_fn(|| msg_rx.try_recv().ok()).collect();
     if !lost.is_empty() {
-        log!("[ClaudeCode] Drained {} lost follow-up(s)", lost.len());
+        log!("[AgentSession] Drained {} lost follow-up(s)", lost.len());
     }
     lost
 }

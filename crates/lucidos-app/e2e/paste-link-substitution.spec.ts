@@ -1,4 +1,4 @@
-import { test, expect, Locator } from '@playwright/test';
+import { test, expect, Locator } from './fixtures';
 import { navigateToApp, waitForVisibleInput, assertHealthy } from './helpers';
 
 /** Dispatch a real paste event with the given clipboard text, mimicking the

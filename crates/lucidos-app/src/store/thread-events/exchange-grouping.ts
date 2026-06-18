@@ -17,7 +17,7 @@ import type { ThreadAggregate, ThreadState } from './thread-meta';
  *  COPY of the events map, so the cache never sees synthetic seqs). */
 export function computeExchanges(thread: ThreadState): Exchange[] {
   if (thread.pendingUserMessages.length === 0) {
-    return groupIntoExchangesCached(thread.events);
+    return filterRemovedQueuedExchanges(groupIntoExchangesCached(thread.events), thread.events);
   }
   // Merge pending messages as synthetic MessageReceived events so they act as
   // proper exchange boundaries. MAX_SAFE_INTEGER seqs sort them after all real events.
@@ -37,12 +37,33 @@ export function computeExchanges(thread: ThreadState): Exchange[] {
     augmented.set(syntheticSeq, {
       type: 'MessageReceived' as const,
       text: pending.text,
+      _eventId: pending.eventId,
       channel: thread.meta.channel,
       ...(isCC ? { created: pending.created } : { _displayCreated: pending.created }),
       ...(pending.image_hashes?.length ? { user_image_hashes: pending.image_hashes } : {}),
     } as StoredEvent);
   }
-  return groupIntoExchanges(augmented);
+  return filterRemovedQueuedExchanges(groupIntoExchanges(augmented), augmented);
+}
+
+function removedQueuedMessageIds(events: Map<number, StoredEvent>): Set<string> {
+  const removed = new Set<string>();
+  for (const event of events.values()) {
+    if (event.type === 'QueuedMessageRemoved') removed.add(event.removed_message_id);
+  }
+  return removed;
+}
+
+function filterRemovedQueuedExchanges(
+  exchanges: Exchange[],
+  events: Map<number, StoredEvent>,
+): Exchange[] {
+  const removed = removedQueuedMessageIds(events);
+  if (removed.size === 0) return exchanges;
+  return exchanges.filter(ex => {
+    const id = ex.userEvent._eventId;
+    return !(ex.userEvent.type === 'MessageReceived' && ex.steps.length === 0 && id && removed.has(id));
+  });
 }
 
 /** Event types that begin a new exchange in the timeline. Includes user-initiated
@@ -79,19 +100,48 @@ export function isExchangeStartEvent(type: string): boolean {
   return EXCHANGE_START_TYPES.has(type);
 }
 
-/** Pure thread-level metadata events that don't belong to any exchange.
- *  Without this filter, an event arriving after a follow-up MR has started a
- *  new (still-empty) exchange leaks into that exchange's steps via the
- *  `current.steps.push` fallthrough — breaking the absorbed-UPI single-step
- *  shape that exchangeStatus relies on to short-circuit to 'done'.
- *  ThreadArchived is excluded automatically: it's classified terminal in the
- *  generated contract, not metadata. Derived from EVENT_CLASSIFICATION so a
- *  new Thread* metadata event added in Rust is picked up without an edit. */
-const THREAD_LEVEL_METADATA_EVENTS: ReadonlySet<string> = new Set(
-  Object.entries(EVENT_CLASSIFICATION)
+/** Boundary userEvent types that PAUSE a chat/CC turn awaiting a user action.
+ *  A turn parked on one of these owns its own post-resolution continuation
+ *  (the answer + the agent's reply route back to the divider by id), so a
+ *  `ChildThreadCompleted` landing while the turn is parked must NOT steal the
+ *  request-id redirect away from the divider — the reply belongs with the card
+ *  the user is answering, not below an unrelated child completion. */
+const DIVIDER_USER_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'UserQuestionAsked',
+  'CodingAgentPermissionRequest',
+  'CommandPermissionRequested',
+  'CredentialRequested',
+  'McpConsentRequested',
+]);
+
+/** Pure bookkeeping metadata events that belong to no exchange. Without this
+ *  filter, such an event arriving after a boundary started a new (still-empty)
+ *  exchange leaks into that exchange's steps via the `current.steps.push`
+ *  fallthrough — breaking the absorbed-UPI single-step shape that
+ *  exchangeStatus relies on to short-circuit to 'done', and on a CC thread
+ *  flipping a trailing child-completion card to a phantom
+ *  'coding-agent-working' (real thread 276f5580: a background `WorktreeCleaned`
+ *  landed in the `ChildThreadCompleted` exchange an hour after the thread
+ *  idled, so the UI showed "Working" forever — persisting across reloads since
+ *  grouping is deterministic from the event history).
+ *
+ *  Two sources, unioned: every `Thread*` metadata event — derived from
+ *  EVENT_CLASSIFICATION so a new one added in Rust is picked up without an edit
+ *  (ThreadArchived is excluded automatically: the contract classifies it
+ *  terminal, not metadata) — plus the non-`Thread`-prefixed pure-bookkeeping
+ *  events that also render nothing and must never count as a step. Only add an
+ *  event to the explicit list if it has NO render case in exchange-render.ts;
+ *  metadata events that DO render a panel (CodingAgentSettingsChanged,
+ *  BackgroundBash*) must stay OUT of this set. */
+const NON_EXCHANGE_METADATA_EVENTS: ReadonlySet<string> = new Set([
+  ...Object.entries(EVENT_CLASSIFICATION)
     .filter(([evt, cls]) => cls === 'metadata' && evt.startsWith('Thread'))
-    .map(([evt]) => evt)
-);
+    .map(([evt]) => evt),
+  'QueuedMessageRemoved',
+  // Background worktree-cleanup bookkeeping — emitted as EventClass::Metadata
+  // by worktree_cleanup.rs, but not `Thread`-prefixed and with no render case.
+  'WorktreeCleaned',
+]);
 
 /** True if the thread contains at least one event that could contribute to
  *  rendered content. Used to distinguish a legitimately empty thread (only
@@ -573,7 +623,7 @@ function foldEvent(
   // The walk body runs as a closure so its many early exits all funnel
   // through the single `state.current = current` sync below.
   const step = (): void => {
-    if (THREAD_LEVEL_METADATA_EVENTS.has(event.type)) return;
+    if (NON_EXCHANGE_METADATA_EVENTS.has(event.type)) return;
 
     const reqId = shouldRouteByRequestId(event) ? requestEventIdOf(event) : undefined;
     const owner = reqId
@@ -732,7 +782,27 @@ function foldEvent(
       // of this turn. CC's `CodingAgentPermissionRequest` is deliberately
       // excluded: CC events are never request-id routed, so it needs no redirect
       // (its resolution + resumption route by `current` / tool_use_id instead).
-      if ((event.type === 'UserQuestionAsked' || event.type === 'CommandPermissionRequested') && previousCurrent) {
+      //
+      // `ChildThreadCompleted` is the same shape from the other direction: when
+      // a spawned sub-thread finishes WHILE the parent is mid-response, the
+      // engine injects the child's summary into the running loop as a
+      // WakeFromChild (no new req_id — the turn keeps streaming under the
+      // originating MR's id) and emits the completion card as a boundary. The
+      // post-completion continuation must group UNDER the card; without
+      // advancing the redirect it routes back to the pre-completion exchange,
+      // which sits ABOVE the card, so the continued "Thinking / Running …"
+      // renders before the card it follows (real thread 4d193da8). EXCEPTION:
+      // when the turn is parked at a question / permission divider (real thread
+      // 3e54cacb), that divider owns its own post-answer continuation — leave
+      // the redirect on it so the reply stays with the card the user is
+      // answering, not below an unrelated child completion.
+      const advancesRedirect =
+        event.type === 'UserQuestionAsked'
+        || event.type === 'CommandPermissionRequested'
+        || (event.type === 'ChildThreadCompleted'
+          && !!previousCurrent
+          && !DIVIDER_USER_EVENT_TYPES.has(previousCurrent.userEvent.type));
+      if (advancesRedirect && previousCurrent) {
         let updatedExisting = false;
         for (const [reqId, exchange] of reqIdRedirect.entries()) {
           if (exchange === previousCurrent) {
@@ -801,6 +871,10 @@ export interface HandleEventResult {
    *  arrivals (streaming tokens, tool calls) bump the per-thread signal
    *  via `bumpThreadEvents` instead. */
   metaChanged: boolean;
+  /** True when this persisted event replaced an optimistic user message.
+   *  The focused thread uses this to keep the viewport pinned across the
+   *  pending-row -> real-event swap. */
+  clearedPendingUserMessage: boolean;
 }
 
 export function handleEvent(
@@ -813,9 +887,10 @@ export function handleEvent(
   aggregate?: ThreadAggregate,
 ): HandleEventResult {
   const thread = threadMap.get(threadId);
-  if (!thread) return { applied: false, metaChanged: false };
+  if (!thread) return { applied: false, metaChanged: false, clearedPendingUserMessage: false };
 
   let metaChanged = false;
+  let clearedPendingUserMessage = false;
 
   // Backend-computed snapshot is the source of truth for thread.meta. Live
   // SSE attaches a per-event aggregate on persisted events; transient events
@@ -833,8 +908,13 @@ export function handleEvent(
   }
 
   if (seq !== null) {
-    if (thread.events.has(seq)) return { applied: false, metaChanged };
+    if (thread.events.has(seq)) return { applied: false, metaChanged, clearedPendingUserMessage: false };
     if (!created) {
+      // Best-effort diagnostic, not a user-intent action: this is an
+      // SSE-ingest path, no toast is appropriate. The event is still stored
+      // below regardless, so the UI stays correct — only drawer sort ordering
+      // for this row may be approximate. A toast would surface a backend bug
+      // the user can't act on; the warning is for the developer console.
       console.warn(`[handleEvent] persisted event ${event.type} (seq=${seq}) missing created timestamp — this indicates a backend bug`);
     }
     const stored: StoredEvent = { ...(event as ThreadEvent), created, ...(eventId ? { _eventId: eventId } : {}) };
@@ -859,11 +939,15 @@ export function handleEvent(
     if ((event.type === 'MessageReceived' || event.type === 'UserPromptInjected') && thread.pendingUserMessages.length > 0) {
       if (eventId) {
         const idx = thread.pendingUserMessages.findIndex(p => p.eventId === eventId);
-        if (idx !== -1) thread.pendingUserMessages.splice(idx, 1);
+        if (idx !== -1) {
+          thread.pendingUserMessages.splice(idx, 1);
+          clearedPendingUserMessage = true;
+        }
       } else {
         // Fallback for events without event_id (e.g. scheduled tasks, old data):
         // remove the oldest pending message (FIFO order)
         thread.pendingUserMessages.shift();
+        clearedPendingUserMessage = true;
       }
     }
     // FreeText answers don't emit a MessageReceived (the backend routes typed
@@ -874,7 +958,10 @@ export function handleEvent(
     if (event.type === 'UserQuestionAnswered' && event.answer.kind === 'FreeText' && thread.pendingUserMessages.length > 0) {
       const text = event.answer.text;
       const idx = thread.pendingUserMessages.findIndex(p => p.text === text);
-      if (idx !== -1) thread.pendingUserMessages.splice(idx, 1);
+      if (idx !== -1) {
+        thread.pendingUserMessages.splice(idx, 1);
+        clearedPendingUserMessage = true;
+      }
     }
     // Project the chat-agent Todo list into meta — replace-whole-list per call.
     // Replay re-establishes the same final state because every TodoListWritten
@@ -883,24 +970,33 @@ export function handleEvent(
       thread.meta.latestTodoList = event.items;
       metaChanged = true;
     }
+    if (event.type === 'QueuedMessageRemoved' && thread.pendingUserMessages.length > 0) {
+      const before = thread.pendingUserMessages.length;
+      thread.pendingUserMessages = thread.pendingUserMessages.filter(
+        p => p.eventId !== event.removed_message_id,
+      );
+      if (thread.pendingUserMessages.length < before) {
+        clearedPendingUserMessage = true;
+      }
+    }
   } else {
     if ('text' in event) {
       thread.streamingBuffer += event.text;
     }
     // Transient events (streaming text, tool calls) represent the thread's
     // own active work — update updatedAt so the drawer timestamp stays
-    // current during long-running Claude Code sessions. ChildrenCountChanged is
-    // excluded: it fires on a parent/ancestor about a DESCENDANT's activity,
-    // so bumping the ancestor's updatedAt to the broadcast NOW() would churn
-    // the drawer's "X ago" timestamp across the whole ancestor chain on every
-    // leaf flip. The aggregate already carries the ancestor's own unchanged
+    // current during long-running Claude Code sessions. ChildrenCountChanged
+    // and CodingAgentDiffChanged are excluded because they are out-of-band
+    // aggregate refreshes, not fresh activity by the receiving thread. Bumping
+    // updatedAt to broadcast NOW() would churn the drawer's "X ago" timestamp
+    // even though the aggregate already carries the thread's own unchanged
     // last_activity for applyAggregateToMeta to overlay.
     // Tick-only write — does not mark metaChanged.
-    if (created && event.type !== 'ChildrenCountChanged') {
+    if (created && event.type !== 'ChildrenCountChanged' && event.type !== 'CodingAgentDiffChanged') {
       thread.meta.updatedAt = created;
     }
   }
-  return { applied: true, metaChanged };
+  return { applied: true, metaChanged, clearedPendingUserMessage };
 }
 
 /** Synthesize a `MessageOrigin` for older DB rows that don't have one stamped.

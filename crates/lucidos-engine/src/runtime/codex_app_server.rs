@@ -32,10 +32,10 @@ use tokio_util::sync::CancellationToken;
 use super::agent_runtime::{AgentEvent, AgentInput, AgentPermissionRequest, ControlRequest};
 use super::claude_code::format_exit_status;
 use super::codex::{
-    lucidos_mcp_server_config_json, write_image_files, CodexConfig, CONTINUATION_PROMPT,
+    CONTINUATION_PROMPT, CodexConfig, lucidos_mcp_server_config_json, write_image_files,
 };
 use super::codex_app_server_parse::{
-    parse_app_server_line, parse_approval_request, AppServerLine, AppServerTracker,
+    AppServerLine, AppServerTracker, parse_app_server_line, parse_approval_request,
 };
 
 /// How long the handshake (initialize → thread established) may take before
@@ -111,7 +111,7 @@ fn build_thread_request(
     }
     let config_obj = serde_json::json!({
         "sandbox_workspace_write": sandbox_ww,
-        "mcp_servers": { "lucidos": lucidos_mcp_server_config_json() },
+        "mcp_servers": { "lucidos": lucidos_mcp_server_config_json(&config.env) },
     });
 
     let mut params = serde_json::Map::new();
@@ -174,9 +174,7 @@ fn build_turn_start_params(
 }
 
 /// Spawn the persistent `codex app-server` child.
-fn spawn_app_server_child(
-    config: &CodexConfig,
-) -> std::io::Result<tokio::process::Child> {
+fn spawn_app_server_child(config: &CodexConfig) -> std::io::Result<tokio::process::Child> {
     let mut cmd = tokio::process::Command::new(&config.codex_bin);
     cmd.arg("app-server")
         .current_dir(&config.worktree_path)
@@ -272,8 +270,7 @@ pub(super) async fn app_server_driver_task(
                     Ok(_) => {
                         let mut t = tail.lock().unwrap();
                         t.push_back(line.clone());
-                        while t.iter().map(String::len).sum::<usize>() > TAIL_BUDGET
-                            && t.len() > 1
+                        while t.iter().map(String::len).sum::<usize>() > TAIL_BUDGET && t.len() > 1
                         {
                             t.pop_front();
                         }
@@ -566,7 +563,11 @@ pub(super) async fn app_server_driver_task(
                     // Queue — the pre-select block above starts it as soon as
                     // the thread is ready and no turn is in flight. No
                     // mid-turn injection (parity with the exec driver; every
-                    // accepted input gets its own turn and its own Result).
+                    // accepted input gets its own turn and its own Result). A
+                    // user follow-up that should redirect a live turn is handled
+                    // engine-side: the fast-path fires `turn/interrupt` first
+                    // (ADR 0005 addendum), so by the time the queued input is
+                    // dequeued the interrupted turn has ended.
                     Some(i) => queue.push_back(i),
                     None => {
                         shutdown = true;
@@ -682,7 +683,9 @@ pub(super) async fn app_server_driver_task(
     if !child_exit_logged {
         log!(
             "[CodexAppServer] app-server child exited (pid={} status={})",
-            child_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string()),
+            child_pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "?".to_string()),
             format_exit_status(&wait_result),
         );
     }

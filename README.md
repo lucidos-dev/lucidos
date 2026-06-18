@@ -10,6 +10,58 @@ The integrated environment makes for a smooth user experience, where researching
 
 ---
 
+## One-click install
+
+On a clean macOS or Linux machine:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lucidos-dev/lucidos/main/install.sh | sh
+```
+
+This bootstraps the toolchain (Rust, Node, Docker, build deps), clones the repo
+to `~/lucidos`, starts PostgreSQL + the engine + the frontend, and prints the
+local URL to open (default <http://localhost:5173>). It is idempotent — safe to
+re-run; it reuses an existing checkout, build, and workspace.
+
+> **First run compiles from source.** Lucidos ships no prebuilt binaries or
+> container images yet, so the first launch builds the Rust engine from source —
+> typically **10–20+ minutes** on a clean machine. Subsequent runs reuse the
+> build and start in seconds.
+
+**Pick your LLM provider** (optional). With no credentials the installer boots
+in `mock` mode so the UI still comes up; configure a real provider in
+**Settings → Providers** afterwards. To wire one up at install time, pass it
+through the pipe:
+
+```bash
+# OpenAI (GPT models)
+curl -fsSL https://raw.githubusercontent.com/lucidos-dev/lucidos/main/install.sh | OPENAI_API_KEY=sk-… sh
+
+# Vertex AI (Claude / Gemini) — also run `gcloud auth application-default login`
+curl -fsSL https://raw.githubusercontent.com/lucidos-dev/lucidos/main/install.sh | VERTEX_PROJECT_ID=my-gcp-project sh
+```
+
+Other knobs (all optional environment variables): `LUCIDOS_HOME` (clone
+location, default `~/lucidos`), `LUCIDOS_WORKSPACE` (workspace dir, default
+`~/workspaces/lucidos`), `LUCIDOS_REF` (branch/tag to check out),
+`LUCIDOS_RELEASE_BUILD=1` (release engine build), `LUCIDOS_SKIP_DEPS=1` (skip
+dependency bootstrap). Once the domain lands this will also be served from
+`https://lucidos.dev/install.sh`.
+
+Prefer to drive the setup yourself? The manual path is below.
+
+### Desktop app (.dmg)
+
+A self-contained macOS app is in progress: a `.dmg` that bundles PostgreSQL +
+pgvector, the engine, and the UI — no terminal, Docker, or dev tools — and
+auto-updates from GitHub Releases ("update available → restart"). Build it
+locally with `./scripts/build-dmg.sh` (needs `cargo install tauri-cli`); see
+[`docs/desktop-app.md`](docs/desktop-app.md) for the build + signing +
+notarization + release runbook, and [ADR 0012](docs/adr/0012-self-contained-desktop-app.md)
+for the architecture.
+
+---
+
 ## Prerequisites
 
 - **Rust** (stable toolchain)
@@ -27,16 +79,16 @@ The integrated environment makes for a smooth user experience, where researching
 ./scripts/web-dev.sh -w ~/workspaces/dev -b
 
 # Other scripts
-./scripts/stop.sh              # Graceful shutdown
+./scripts/stop.sh -w ~/workspaces/dev   # Graceful shutdown
 ./scripts/restart.sh -w <ws>   # Stop and start
 ./scripts/status.sh            # Check health
 ```
 
-This starts PostgreSQL in Docker, builds/runs the Rust engine natively, and launches a Vite dev server. Each workspace gets its own ports — multiple workspaces can run concurrently.
+This starts one shared PostgreSQL Docker container, builds/runs the Rust engine natively, starts the shared workspace gateway, and runs a frontend build watcher. Each workspace gets its own engine port and its own database (`lucidos_<slug>`) inside the shared Postgres cluster, so multiple workspaces can run concurrently without one Postgres container per workspace.
 
 ### Ports
 
-The first workspace lands on `5173` (Vite / user-facing), `3000` (internal), `5432` (Postgres). Each additional workspace gets the next offset (`5174`, `5175`, …), stored in `~/.lucidos/port-registry` so the same workspace gets the same ports every run.
+The first workspace lands on `5173` for direct engine access. Each additional workspace gets the next engine-port offset (`5174`, `5175`, …), stored in `~/.lucidos/port-registry` so the same workspace gets the same engine port every run. The shared dev gateway listens on `5251` by default (`LUCIDOS_DEV_GATEWAY_PORT` overrides it) and serves workspaces at `http(s)://localhost:5251/<slug>/` — `5251` (not the packaged app's `5252`) so a dev gateway and an installed `Lucidos.app` coexist out of the box. PostgreSQL uses one shared Docker container (`lucidos-pg-shared`) with one database per workspace; the chosen PG port is written to `<workspace>/.lucidos/ports`.
 
 If the target port is already taken by something else (e.g. another Vite app on `5173`), Lucidos walks forward to the next free offset and persists the new assignment — it does **not** kill the squatter. To pin a specific port:
 
@@ -54,13 +106,14 @@ Env var beats `lucidos.toml`. Both still collision-walk forward if the chosen ba
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LUCIDOS_WORKSPACE` | — | Workspace directory |
-| `LUCIDOS_VITE_PORT` | `5173` | Base Vite (user-facing) port — overrides per-workspace offset + `lucidos.toml`. API and Postgres ports shift by the same offset. |
+| `LUCIDOS_VITE_PORT` | `5173` | Base direct engine port — overrides per-workspace offset + `lucidos.toml`. |
+| `LUCIDOS_DEV_GATEWAY_PORT` | `5251` | Shared dev gateway port for `/<slug>/` and `/~/` (`5251` keeps dev clear of the packaged app's `5252`). |
 | `LUCIDOS_MODEL` | `claude-opus-4-8@default` | LLM model name |
 | `VERTEX_PROJECT_ID` | — | GCP project (for `claude-*`/`gemini-*`) |
 | `VERTEX_REGION` | `europe-west1` | Vertex AI region |
 | `OPENAI_API_KEY` | — | OpenAI key (for `gpt-*` models) |
 
-**Per-workspace overrides:** on startup the engine loads a global `.env` from the process working directory, then — if present — `<workspace>/data/.env` with **override** semantics, so each workspace can carry its own environment (e.g. a workspace-specific GitHub auth account via `GH_CONFIG_DIR` / `GIT_SSH_COMMAND` that `gh` / `git push` from agent subprocesses pick up). These values land in the engine's process env and are inherited by every subprocess it spawns. `data/.env` is gitignored so its secrets never reach the workspace's artifacts repo.
+**Per-workspace environment variables:** beyond the global `.env` the engine loads at startup, each workspace can define its own non-secret environment variables in **Settings → System → Environment variables** (DB-backed). The engine injects them as real env vars into every subprocess it spawns — `run_bash`, `run_python`, scheduled scripts, triggers, and coding-agent sessions — alongside `CRED_*`/`OAUTH_*`. Use them for per-workspace identity (e.g. `GH_CONFIG_DIR` / `GIT_SSH_COMMAND` so `gh` / `git push` authenticate as the right account). Changes take effect on the next subprocess — no restart. They are non-secret (real secrets belong in credentials). The legacy `<workspace>/data/.env` file is migrated into this store on startup and removed.
 
 ---
 

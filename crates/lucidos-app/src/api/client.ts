@@ -12,3 +12,4 @@ export * from './client/threadQueue';
 export * from './client/threads';
 export * from './client/settings';
 export * from './client/models';
+export * from './client/pluginMarketplaces';

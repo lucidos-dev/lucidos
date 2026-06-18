@@ -1,21 +1,6 @@
 use super::*;
 
 #[test]
-fn test_validate_workspace_name() {
-    assert!(validate_workspace_name("personal").is_ok());
-    assert!(validate_workspace_name("my-workspace").is_ok());
-    assert!(validate_workspace_name("test_123").is_ok());
-
-    // Invalid
-    assert!(validate_workspace_name("").is_err());
-    assert!(validate_workspace_name("..").is_err());
-    assert!(validate_workspace_name("/etc/passwd").is_err());
-    assert!(validate_workspace_name("\\windows").is_err());
-    assert!(validate_workspace_name("has space").is_err());
-    assert!(validate_workspace_name(".hidden").is_err());
-}
-
-#[test]
 fn apply_pg_env_errors_on_malformed_url() {
     // pg_env_vars returns empty Vec on parse failure; apply_pg_env must
     // surface that as a loud Err so the subprocess never spawns with
@@ -1175,102 +1160,126 @@ async fn get_retention_count_falls_back_to_default() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-// ── RestoreState ──────────────────────────────────────────────────────────
-// The single source of truth for restore progress, serialized identically to
-// the Restore* SSE events and the GET /backup/restore-status refetch.
+// ── restore (gateway picker path) ──────────────────────────────────────────
 
+/// The default workspace name for a picker restore is parsed back out of the
+/// archive filename `create_backup` stamped. A hyphenated workspace name must
+/// round-trip, and a non-archive filename yields `None` so the picker asks.
 #[test]
-fn restore_state_try_start_claims_slot_then_rejects_concurrent() {
-    let mut st = RestoreState::Idle;
-    // First claim from Idle wins and transitions to Running.
-    assert!(st.try_start("personal"));
-    assert!(st.is_running());
-    match &st {
-        RestoreState::Running {
-            workspace_name,
-            phase,
-            progress,
-            total,
-        } => {
-            assert_eq!(workspace_name, "personal");
-            assert_eq!(phase, "starting");
-            assert_eq!(*progress, 0);
-            assert_eq!(*total, 100);
-        }
-        other => panic!("expected Running, got {other:?}"),
+fn parse_workspace_name_from_archive_roundtrips_and_rejects_non_archives() {
+    assert_eq!(
+        parse_workspace_name_from_archive("lucidos-backup-personal-20260601-040254.enc")
+            .as_deref(),
+        Some("personal")
+    );
+    // Hyphenated workspace name — the timestamp tail is stripped, not the name.
+    assert_eq!(
+        parse_workspace_name_from_archive("lucidos-backup-e2e-test-20260601-040254.enc")
+            .as_deref(),
+        Some("e2e-test")
+    );
+    // This is `parse`/`workspace_archive_name`'s inverse: a name produced by the
+    // upload path comes back unchanged.
+    let fname = format!(
+        "lucidos-backup-{}-20260601-040254.enc",
+        workspace_archive_name(Path::new("/home/u/workspaces/my-ws"))
+    );
+    assert_eq!(
+        parse_workspace_name_from_archive(&fname).as_deref(),
+        Some("my-ws")
+    );
+
+    // Not archive-shaped → None (the picker then requires a typed name).
+    assert!(parse_workspace_name_from_archive("random.txt").is_none());
+    assert!(parse_workspace_name_from_archive("lucidos-backup-personal.enc").is_none());
+    assert!(
+        parse_workspace_name_from_archive("lucidos-backup-personal-20260601.enc").is_none(),
+        "a missing HHMMSS half is not a valid timestamp tail"
+    );
+    assert!(
+        parse_workspace_name_from_archive("lucidos-backup-20260601-040254.enc").is_none(),
+        "no name segment before the timestamp"
+    );
+    assert!(parse_workspace_name_from_archive("other-backup-personal-20260601-040254.enc").is_none());
+}
+
+/// `restore_archive_into` must restore the workspace files but MUST NOT apply the
+/// archive's `user_dir/` (the source machine's `~/.lucidos`) — doing so would
+/// clobber the target's gateway registry. With no `lucidos_backup.dump` in the
+/// archive the DB phase is skipped, so this exercises the decrypt/decompress/
+/// move/user_dir-drop logic with zero Postgres dependency.
+#[tokio::test]
+async fn restore_archive_into_restores_workspace_but_drops_user_dir() {
+    // Build a source "workspace" + a user_dir, archive + encrypt it.
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(src.path().join("data/artifacts")).unwrap();
+    std::fs::write(src.path().join("data/artifacts/profile.md"), "# Profile").unwrap();
+
+    let user_tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(user_tmp.path().join("gateway/config")).unwrap();
+    std::fs::write(
+        user_tmp.path().join("gateway/config/workspaces.json"),
+        r#"{"workspaces":[{"id":"SOURCE-MACHINE"}]}"#,
+    )
+    .unwrap();
+
+    // tar+compress with the user_dir, but NO sql dump (skip the DB phase). A
+    // throwaway empty dump file is required by tar_and_compress's signature, so
+    // give it one and then strip it from the archive by restoring into a dir and
+    // checking — simpler: pass an empty dump; restore skips DB work only when the
+    // archive has no `lucidos_backup.dump`. So craft the archive WITHOUT a dump
+    // by tarring manually is overkill; instead point at a non-existent dump is
+    // not allowed. Use a real (empty) dump file but assert DB phase is a no-op by
+    // using a bogus URL that would error if reached.
+    let compressed = tempfile::NamedTempFile::new().unwrap();
+    {
+        // Build the tar WITHOUT the dump entry: reuse tar_and_compress but it
+        // always appends the dump at root. To get a dump-less archive, build it
+        // by hand here.
+        let file = std::fs::File::create(compressed.path()).unwrap();
+        let encoder = zstd::Encoder::new(file, 3).unwrap();
+        let mut builder = tar::Builder::new(encoder);
+        builder
+            .append_dir_all("data", src.path().join("data"))
+            .unwrap();
+        builder
+            .append_dir_all("user_dir", user_tmp.path())
+            .unwrap();
+        let encoder = builder.into_inner().unwrap();
+        encoder.finish().unwrap();
     }
-    // A second claim while Running must fail AND leave the state untouched so a
-    // stray concurrent request can't reset live progress to "starting".
-    let before = st.clone();
-    assert!(!st.try_start("other"));
-    assert_eq!(st, before);
-}
 
-#[test]
-fn restore_state_try_start_allowed_after_terminal() {
-    // A finished restore (Completed/Failed) is not "running", so a new restore
-    // is allowed to claim the slot.
-    let mut done = RestoreState::Completed {
-        workspace_name: "old".into(),
-        workspace_path: "/ws/old".into(),
-    };
-    assert!(!done.is_running());
-    assert!(done.try_start("new"));
-    assert!(done.is_running());
+    let key = crypto::generate_key();
+    let encrypted = tempfile::NamedTempFile::new().unwrap();
+    {
+        let input = std::fs::File::open(compressed.path()).unwrap();
+        let mut output = std::fs::File::create(encrypted.path()).unwrap();
+        crypto::encrypt(&key, input, &mut output).unwrap();
+    }
 
-    let mut failed = RestoreState::Failed {
-        workspace_name: "old".into(),
-        error: "boom".into(),
-    };
-    assert!(failed.try_start("new"));
-    assert!(failed.is_running());
-}
+    // Restore into a fresh workspace dir. A bogus DB URL would error if the DB
+    // phase ran — but with no dump in the archive it must be skipped.
+    let ws = tempfile::tempdir().unwrap();
+    let ws_dir = ws.path().join("restored");
+    restore_archive_into(
+        &ws_dir,
+        "postgres://unused@nowhere/none-should-not-be-touched",
+        &key,
+        encrypted.path(),
+        |_phase, _cur, _total| {},
+    )
+    .await
+    .expect("restore should succeed without a dump");
 
-#[test]
-fn restore_state_serializes_with_snake_case_status_tag() {
-    // The wire shape the frontend's RestoreState union depends on.
+    // Workspace files restored.
     assert_eq!(
-        serde_json::to_value(RestoreState::Idle).unwrap(),
-        serde_json::json!({ "status": "idle" })
+        std::fs::read_to_string(ws_dir.join("data/artifacts/profile.md")).unwrap(),
+        "# Profile"
     );
-    assert_eq!(
-        serde_json::to_value(RestoreState::Running {
-            workspace_name: "personal".into(),
-            phase: "downloading".into(),
-            progress: 12,
-            total: 100,
-        })
-        .unwrap(),
-        serde_json::json!({
-            "status": "running",
-            "workspace_name": "personal",
-            "phase": "downloading",
-            "progress": 12,
-            "total": 100
-        })
-    );
-    assert_eq!(
-        serde_json::to_value(RestoreState::Completed {
-            workspace_name: "personal".into(),
-            workspace_path: "/ws/personal".into(),
-        })
-        .unwrap(),
-        serde_json::json!({
-            "status": "completed",
-            "workspace_name": "personal",
-            "workspace_path": "/ws/personal"
-        })
-    );
-    assert_eq!(
-        serde_json::to_value(RestoreState::Failed {
-            workspace_name: "personal".into(),
-            error: "nope".into(),
-        })
-        .unwrap(),
-        serde_json::json!({
-            "status": "failed",
-            "workspace_name": "personal",
-            "error": "nope"
-        })
+    // user_dir/ MUST NOT be present in the restored workspace (Invariant 1: it is
+    // dropped, never applied to ~/.lucidos nor littered into the workspace).
+    assert!(
+        !ws_dir.join("user_dir").exists(),
+        "the archive's user_dir/ must be dropped, not restored"
     );
 }

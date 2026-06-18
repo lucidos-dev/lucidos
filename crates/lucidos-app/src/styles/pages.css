@@ -361,6 +361,199 @@
     margin-top: 0.5rem;
 }
 
+/* ===== Apps (Installed + Store tabs) ===== */
+
+.apps-tabs {
+    margin: 0.75rem 0.75rem 0.5rem;
+}
+
+.apps-search-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    margin: 0 0.75rem 0.5rem;
+    padding: 0.25rem 0.5rem;
+    background: var(--bg-tertiary);
+    border-radius: 0.375rem;
+}
+
+.apps-search-icon {
+    flex: 0 0 auto;
+    width: 0.875rem;
+    height: 0.875rem;
+    color: var(--text-muted);
+}
+
+.apps-search-input {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text-primary);
+    font-size: 0.8125rem;
+    font-family: inherit;
+    padding: 0.125rem 0;
+}
+
+/* Installed-app marketplace + update labels */
+.app-row-title-line {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+    min-width: 0;
+}
+
+.app-row-title-line .list-row-name {
+    min-width: 0;
+}
+
+.app-marketplace-chip {
+    flex: 0 0 auto;
+    padding: 0.0625rem 0.375rem;
+    border-radius: 999px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: 0.6875rem;
+    font-weight: 600;
+}
+
+.app-update-chip {
+    flex: 0 0 auto;
+    padding: 0.0625rem 0.375rem;
+    border-radius: 999px;
+    color: var(--accent);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border-color));
+    font-size: 0.6875rem;
+    font-weight: 700;
+}
+
+/* ===== Store tab (plugin catalog) + Marketplaces settings ===== */
+
+.app-store-marketplace-form {
+    display: grid;
+    grid-template-columns: minmax(14rem, 1fr) minmax(8rem, 14rem) auto;
+    gap: 0.5rem;
+    min-width: 0;
+    margin-bottom: 0.625rem;
+}
+
+.app-store-marketplace-form .settings-text-input {
+    min-width: 0;
+    width: 100%;
+}
+
+.app-store-empty {
+    padding: 0.75rem;
+    color: var(--text-muted);
+}
+
+.app-store-empty p {
+    margin: 0;
+}
+
+.app-store-muted-row {
+    padding: 0.625rem 0.75rem;
+    color: var(--text-muted);
+    font-size: 0.8125rem;
+}
+
+.app-store-source-value {
+    display: block;
+    max-width: min(42rem, 100%);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    background: transparent;
+}
+
+/* Store cards stack as a column with the action buttons pinned to the
+   bottom-right — the same bottom placement the installed-app rows use — instead
+   of floating beside the (tall) title block at the top-right. The base
+   .list-row keeps justify-content: space-between, so in column direction the
+   info block sits at the top and the actions settle at the bottom. */
+.app-store-plugin-row {
+    flex-direction: column;
+    align-items: stretch;
+}
+
+.app-store-plugin-row .list-row-actions {
+    align-self: flex-end;
+}
+
+.app-store-plugin-title-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    min-width: 0;
+}
+
+.app-store-plugin-title-row .list-row-name {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.app-store-status {
+    flex: 0 0 auto;
+    padding: 0.125rem 0.375rem;
+    border-radius: 999px;
+    border: 1px solid var(--border-color);
+    color: var(--text-muted);
+    font-size: 0.68rem;
+    font-weight: 700;
+    line-height: 1.2;
+}
+
+.app-store-status-update_available {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 35%, var(--border-color));
+}
+
+.app-store-status-installed {
+    color: var(--accent-green);
+    border-color: color-mix(in srgb, var(--accent-green) 35%, var(--border-color));
+}
+
+.app-store-plugin-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+    margin-top: 0.375rem;
+    color: var(--text-muted);
+    font-size: 0.72rem;
+}
+
+.app-store-content-chip {
+    padding: 0.0625rem 0.3125rem;
+    border-radius: 0.25rem;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+}
+
+.app-store-error-row {
+    border-left: 0.1875rem solid var(--accent-red);
+}
+
+.app-store-marketplaces + .app-store-errors,
+.app-store-muted-row + .app-store-errors {
+    margin-top: 0.625rem;
+}
+
+@media (max-width: 760px) {
+    .app-store-marketplace-form {
+        grid-template-columns: 1fr;
+    }
+
+    .app-store-plugin-title-row {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 0.25rem;
+    }
+}
+
 .form-group {
     margin-bottom: 1rem;
 }
@@ -520,7 +713,9 @@
 }
 
 .form-actions .btn-save {
-    background: var(--accent);
+    /* Shared action-button blue (see .action-btn) so every filled blue CTA
+       tracks one token across themes. */
+    background: var(--accent-action);
     border: none;
     border-radius: 0.25rem;
     padding: 0.375rem 0.75rem;
@@ -534,6 +729,6 @@
 
 @media (hover: hover) {
     .form-actions .btn-save:hover {
-        background: var(--accent-light);
+        background: color-mix(in srgb, var(--accent-action) 80%, #fff);
     }
 }

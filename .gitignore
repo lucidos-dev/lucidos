@@ -70,3 +70,6 @@ playwright-report/
 VERSION
 crates/*/VERSION
 crates/*/.version_stamp
+
+# Desktop bundle staging (build-dmg.sh)
+crates/lucidos-app/bundle-resources/

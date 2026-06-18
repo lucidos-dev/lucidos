@@ -9,7 +9,7 @@
  * the focused thread ID was lost and compose view showed instead.
  * Fix: sendMessage() now persists the thread ID to localStorage.
  */
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import {
   assertHealthy,
   navigateToApp,

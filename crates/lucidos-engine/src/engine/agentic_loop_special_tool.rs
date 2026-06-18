@@ -1,6 +1,6 @@
 //! Engine-side tool dispatch: `handle_special_tool` covers tools that need
 //! more than `execute_tool()` can give them (capture/refresh app UI,
-//! run_thread, resume_thread, run_claude, …) and `run_intent_loop` runs
+//! run_thread, resume_thread, run_coding_agent, …) and `run_intent_loop` runs
 //! the intent sub-loop for the open-ended verbs.
 
 use tokio_util::sync::CancellationToken;
@@ -15,7 +15,7 @@ use crate::engine::LucidosEngine;
 use crate::llm::tool_names as tn;
 use crate::llm::{ContentBlock, Message, MessageContent};
 
-/// How a thread spawned by `run_thread` / `run_claude` relates to the
+/// How a thread spawned by `run_thread` / `run_coding_agent` relates to the
 /// thread that issued the spawn. Drives both the spawn linkage (parent /
 /// spawning event ids) and the result-text branch.
 ///
@@ -34,6 +34,16 @@ use crate::llm::{ContentBlock, Message, MessageContent};
 pub(crate) enum Relation {
     Child,
     Top,
+}
+
+/// The originating tool call's coordinates for a spawn: the thread that issued
+/// it and the `ToolCalled` event id (when known). Bundled because the two
+/// always travel together into the cross-workspace `WorkspaceCallCtx` as
+/// `source_thread_id` / `source_event_id`.
+#[derive(Debug, Clone, Copy)]
+struct SpawnSource {
+    thread_id: Uuid,
+    tool_called_event_id: Option<Uuid>,
 }
 
 /// Parse the optional `relation` argument from a tool call. Defaults to
@@ -57,6 +67,37 @@ pub(crate) fn parse_relation(args: &serde_json::Value) -> Result<Relation, Strin
             "relation must be \"child\" or \"top\", got {}",
             other
         )),
+    }
+}
+
+/// Parse the optional `coding_agent` argument from `run_coding_agent`.
+/// Defaults to Claude Code for existing callers. Accepts the canonical
+/// kebab-case values plus the common underscore alias for Claude Code; returns
+/// an explicit error for typos so a request for Codex never silently starts CC.
+pub(crate) fn parse_coding_agent(
+    args: &serde_json::Value,
+) -> Result<crate::runtime::CodingAgent, String> {
+    match args.get("coding_agent") {
+        None | Some(serde_json::Value::Null) => Ok(crate::runtime::CodingAgent::ClaudeCode),
+        Some(serde_json::Value::String(s)) => match s.as_str() {
+            "claude-code" | "claude_code" => Ok(crate::runtime::CodingAgent::ClaudeCode),
+            "codex" => Ok(crate::runtime::CodingAgent::Codex),
+            other => Err(format!(
+                "coding_agent must be \"claude-code\" or \"codex\", got {:?}",
+                other
+            )),
+        },
+        Some(other) => Err(format!(
+            "coding_agent must be \"claude-code\" or \"codex\", got {}",
+            other
+        )),
+    }
+}
+
+fn coding_agent_label(agent: crate::runtime::CodingAgent) -> &'static str {
+    match agent {
+        crate::runtime::CodingAgent::ClaudeCode => "Claude Code",
+        crate::runtime::CodingAgent::Codex => "Codex",
     }
 }
 
@@ -110,12 +151,7 @@ impl Relation {
     /// session"). The callback contract per relation is unchanged — it just
     /// starts later — so each branch restates it, mirroring the success
     /// texts.
-    pub(crate) fn queued_spawn_text(
-        self,
-        label: &str,
-        thread_id: Uuid,
-        position: usize,
-    ) -> String {
+    pub(crate) fn queued_spawn_text(self, label: &str, thread_id: Uuid, position: usize) -> String {
         let base = format!(
             "{label} queued at position {position} in the Thread Queue — Lucidos is at \
              background capacity. It starts automatically when a slot frees; its \
@@ -133,25 +169,28 @@ impl Relation {
         }
     }
 
-    /// Tool-result text returned for `run_claude`. Mirrors the
-    /// callback-contract guarantee of `run_thread_success_text` so the LLM
-    /// sees both spawn tools as a uniform pair. Stamps `workspace` into the
-    /// body and link prefix so the LLM's narration cannot drift from where
-    /// the session actually landed.
-    pub(crate) fn run_claude_success_text(self, cc_thread_id: Uuid, workspace: &str) -> String {
+    pub(crate) fn run_coding_agent_success_text(
+        self,
+        cc_thread_id: Uuid,
+        workspace: &str,
+        coding_agent: crate::runtime::CodingAgent,
+    ) -> String {
+        let label = coding_agent_label(coding_agent);
         match self {
             Self::Child => format!(
-                "Claude Code session started in workspace '{ws}' (thread_id: {tid}). \
-                 Tell the user you've started a new Claude Code thread in the {ws} \
+                "{label} session started in workspace '{ws}' (thread_id: {tid}). \
+                 Tell the user you've started a new {label} thread in the {ws} \
                  workspace and include this link: [Open thread](thread:{ws}/{tid})",
+                label = label,
                 ws = workspace,
                 tid = cc_thread_id
             ),
             Self::Top => format!(
-                "Top-level Claude Code session started in workspace '{ws}' (thread_id: \
+                "Top-level {label} session started in workspace '{ws}' (thread_id: \
                  {tid}). It runs independently and will NOT report back to this \
                  conversation. Include the link in your reply so the user can follow it: \
                  [Open thread](thread:{ws}/{tid})",
+                label = label,
                 ws = workspace,
                 tid = cc_thread_id
             ),
@@ -174,7 +213,8 @@ impl LucidosEngine {
         user_images: Option<&[crate::api::ChatImage]>,
         device_id: Option<&str>,
         // Event_id of the just-emitted ToolCalled event. Forwarded as
-        // `spawning_event_id` for spawn-style tools (run_thread, run_claude)
+        // `spawning_event_id` for spawn-style tools (run_thread,
+        // run_coding_agent)
         // so the new thread can be traced back to the exact tool call that
         // started it.
         tool_called_event_id: Option<Uuid>,
@@ -183,7 +223,10 @@ impl LucidosEngine {
         tool_use_id: &str,
     ) -> Option<String> {
         if tool_name == tn::ASK_USER_QUESTION {
-            return Some(self.handle_chat_ask_user_question(thread_id, tool_use_id, tool_args).await);
+            return Some(
+                self.handle_chat_ask_user_question(thread_id, tool_use_id, tool_args)
+                    .await,
+            );
         }
         if tool_name == tn::REFRESH_FILE {
             let path = tool_args["path"].as_str().unwrap_or("");
@@ -271,13 +314,17 @@ impl LucidosEngine {
                     },
                 )
             }
-        } else if tool_name == tn::RUN_CLAUDE {
+        } else if tool_name == tn::RUN_CODING_AGENT || tool_name == tn::RUN_CLAUDE_LEGACY {
             let prompt = tool_args["prompt"].as_str().unwrap_or("");
             if prompt.is_empty() {
                 Some("Error: prompt is required".to_string())
             } else {
                 let relation = match parse_relation(tool_args) {
                     Ok(r) => r,
+                    Err(e) => return Some(format!("Error: {}", e)),
+                };
+                let coding_agent = match parse_coding_agent(tool_args) {
+                    Ok(agent) => agent,
                     Err(e) => return Some(format!("Error: {}", e)),
                 };
                 let workspace_arg = tool_args
@@ -293,17 +340,19 @@ impl LucidosEngine {
                 } else {
                     None
                 };
-                if let Some(target_ws) =
-                    workspace_arg.filter(|w| Some(*w) != current_ws.as_deref())
+                if let Some(target_ws) = workspace_arg.filter(|w| Some(*w) != current_ws.as_deref())
                 {
                     return Some(
-                        self.cross_workspace_run_claude(
+                        self.cross_workspace_run_coding_agent(
                             prompt,
                             target_ws,
                             relation,
+                            coding_agent,
                             tool_args,
-                            thread_id,
-                            tool_called_event_id,
+                            SpawnSource {
+                                thread_id,
+                                tool_called_event_id,
+                            },
                         )
                         .await,
                     );
@@ -326,7 +375,10 @@ impl LucidosEngine {
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
                 if folder_param.is_some() && repo_param.is_some() {
-                    return Some("Error: pass `folder` (preferred) or `repo` (deprecated alias), not both.".to_string());
+                    return Some(
+                        "Error: pass `folder` (preferred) or `repo` (deprecated alias), not both."
+                            .to_string(),
+                    );
                 }
                 let folder_input = folder_param.or(repo_param);
                 // Resolve the folder against the §3.2 classification table.
@@ -338,8 +390,7 @@ impl LucidosEngine {
                 let mut spawn_app_id: Option<String> = None;
                 if let Some(folder_in) = folder_input {
                     use crate::engine::agent_session::{
-                        classify_resolved_folder, resolve_folder_input,
-                        FolderClassification,
+                        classify_resolved_folder, resolve_folder_input, FolderClassification,
                     };
                     let ws_root = self.workspace_path().to_path_buf();
                     let pool = self.pool.clone();
@@ -349,16 +400,13 @@ impl LucidosEngine {
                     // snapshot it would have to await, and a no-op closure
                     // would mean External never matches and every registered
                     // external repo would fall through to UnrecognisedPath.
-                    let registered_repos = match crate::core::repositories::RepositoryStore::list(
-                        &pool,
-                    )
-                    .await
-                    {
-                        Ok(list) => list,
-                        Err(e) => {
-                            return Some(format!("Error: Failed to list repositories: {e}"));
-                        }
-                    };
+                    let registered_repos =
+                        match crate::core::repositories::RepositoryStore::list(&pool).await {
+                            Ok(list) => list,
+                            Err(e) => {
+                                return Some(format!("Error: Failed to list repositories: {e}"));
+                            }
+                        };
                     let resolved = resolve_folder_input(&folder_in_owned, &ws_root, |name| {
                         Ok(registered_repos
                             .iter()
@@ -366,7 +414,8 @@ impl LucidosEngine {
                             .map(|r| std::path::PathBuf::from(&r.path)))
                     });
                     let canonical = match crate::core::repositories::RepositoryStore::resolve(
-                        &pool, &folder_in_owned,
+                        &pool,
+                        &folder_in_owned,
                     )
                     .await
                     {
@@ -385,17 +434,13 @@ impl LucidosEngine {
                         .find(|r| r.name == "Lucidos")
                         .map(|r| std::path::PathBuf::from(&r.path))
                         .unwrap_or_else(|| self.repo_root().to_path_buf());
-                    let class = classify_resolved_folder(
-                        &folder_abs,
-                        &ws_root,
-                        &lucidos_root,
-                        |p| {
+                    let class =
+                        classify_resolved_folder(&folder_abs, &ws_root, &lucidos_root, |p| {
                             registered_repos
                                 .iter()
                                 .find(|r| std::path::Path::new(&r.path) == p)
                                 .map(|r| std::path::PathBuf::from(&r.path))
-                        },
-                    );
+                        });
                     match class {
                         Ok(FolderClassification::Lucidos { .. }) => {
                             // Existing flow — no repo_id, default folder.
@@ -449,8 +494,11 @@ impl LucidosEngine {
                                 return Some(format!("Error: Failed to load thread events: {}", e))
                             }
                         };
-                        match crate::engine::tools::image::resolve_thread_image_refs(&self.workspace_path, &events, &refs)
-                        {
+                        match crate::engine::tools::image::resolve_thread_image_refs(
+                            &self.workspace_path,
+                            &events,
+                            &refs,
+                        ) {
                             Ok(imgs) => Some(imgs),
                             Err(e) => return Some(format!("Error: {}", e)),
                         }
@@ -478,14 +526,15 @@ impl LucidosEngine {
                     repo_id,
                     title: caller_title.map(str::to_string),
                     app_id: spawn_app_id,
+                    coding_agent,
                 };
                 let outcome = self.thread_queue.submit(request, None, None).await;
                 Some(if outcome.admitted {
                     let ws = current_ws.unwrap_or_else(|| self.workspace_name());
-                    relation.run_claude_success_text(cc_thread_id, &ws)
+                    relation.run_coding_agent_success_text(cc_thread_id, &ws, coding_agent)
                 } else {
                     relation.queued_spawn_text(
-                        "Claude Code session",
+                        &format!("{} session", coding_agent_label(coding_agent)),
                         cc_thread_id,
                         outcome.position,
                     )
@@ -630,8 +679,8 @@ impl LucidosEngine {
         }
     }
 
-    /// Cross-workspace `run_claude`: POST a CC spawn request to another
-    /// workspace's engine. Returns the formatted tool-result string (success
+    /// Cross-workspace `run_coding_agent`: POST a coding-agent spawn request
+    /// to another workspace's engine. Returns the formatted tool-result string (success
     /// text on 2xx, error string otherwise) so the caller can pass it through
     /// to the LLM unchanged.
     ///
@@ -644,18 +693,18 @@ impl LucidosEngine {
     /// Image forwarding is not supported across workspaces yet — the images
     /// live in this workspace's blob store and the receiver wouldn't be able
     /// to resolve them. The `images` arg is ignored for cross-workspace.
-    async fn cross_workspace_run_claude(
+    async fn cross_workspace_run_coding_agent(
         &self,
         prompt: &str,
         target_ws: &str,
         relation: Relation,
+        coding_agent: crate::runtime::CodingAgent,
         tool_args: &serde_json::Value,
-        thread_id: Uuid,
-        tool_called_event_id: Option<Uuid>,
+        source: SpawnSource,
     ) -> String {
         if matches!(relation, Relation::Child) {
             return format!(
-                "Error: cross-workspace run_claude (workspace=\"{}\") requires \
+                "Error: cross-workspace run_coding_agent (workspace=\"{}\") requires \
                  relation=\"top\" — child-thread auto-resume callbacks across \
                  workspaces are unsupported. Set relation=\"top\" if the spawn \
                  should run independently in {0}, or omit the workspace \
@@ -663,14 +712,11 @@ impl LucidosEngine {
                 target_ws
             );
         }
-        let target = match crate::engine::http::workspace_resolver::resolve_workspace(
-            target_ws, None,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                return format!("Error: cannot resolve workspace '{}': {}", target_ws, e)
-            }
-        };
+        let target =
+            match crate::engine::http::workspace_resolver::resolve_workspace(target_ws, None) {
+                Ok(t) => t,
+                Err(e) => return format!("Error: cannot resolve workspace '{}': {}", target_ws, e),
+            };
         let title = tool_args
             .get("title")
             .and_then(|v| v.as_str())
@@ -679,24 +725,39 @@ impl LucidosEngine {
             .get("repo")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
+        let folder = tool_args
+            .get("folder")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        if folder.is_some() && repo.is_some() {
+            return "Error: pass `folder` (preferred) or `repo` (deprecated alias), not both."
+                .to_string();
+        }
         let ctx = crate::engine::http::workspace_client::WorkspaceCallCtx {
             self_workspace: self.workspace_name(),
-            source_thread_id: Some(thread_id),
-            source_event_id: tool_called_event_id,
+            source_thread_id: Some(source.thread_id),
+            source_event_id: source.tool_called_event_id,
             mode: ActorMode::Agent,
         };
-        match crate::engine::http::workspace_client::spawn_claude_in_workspace(
-            cross_workspace_http_client(),
-            &target,
+        let spawn = crate::engine::http::workspace_client::CrossWorkspaceSpawn {
             prompt,
             title,
             repo,
+            folder,
+            coding_agent: Some(coding_agent),
+        };
+        match crate::engine::http::workspace_client::spawn_coding_agent_in_workspace(
+            cross_workspace_http_client(),
+            &target,
+            &spawn,
             &ctx,
             &target.proto,
         )
         .await
         {
-            Ok(cc_thread_id) => relation.run_claude_success_text(cc_thread_id, target_ws),
+            Ok(cc_thread_id) => {
+                relation.run_coding_agent_success_text(cc_thread_id, target_ws, coding_agent)
+            }
             Err(e) => format!("Error: {}", e),
         }
     }
@@ -746,8 +807,7 @@ impl LucidosEngine {
             return "Error: `questions` array was empty — pass at least one question".to_string();
         }
 
-        let answers =
-            crate::engine::agent_question::build_hook_answers(&answer_kinds, &questions);
+        let answers = crate::engine::agent_question::build_hook_answers(&answer_kinds, &questions);
         serde_json::to_string(&answers).unwrap_or_else(|_| answers.to_string())
     }
 
@@ -950,5 +1010,48 @@ impl LucidosEngine {
                 content: MessageContent::Blocks(result_blocks),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_coding_agent_defaults_to_claude_code() {
+        assert_eq!(
+            parse_coding_agent(&json!({})).unwrap(),
+            crate::runtime::CodingAgent::ClaudeCode
+        );
+    }
+
+    #[test]
+    fn parse_coding_agent_accepts_codex() {
+        assert_eq!(
+            parse_coding_agent(&json!({"coding_agent": "codex"})).unwrap(),
+            crate::runtime::CodingAgent::Codex
+        );
+    }
+
+    #[test]
+    fn parse_coding_agent_rejects_unknown_backend() {
+        let err = parse_coding_agent(&json!({"coding_agent": "cc"})).unwrap_err();
+        assert!(
+            err.contains("coding_agent"),
+            "error should name the invalid field: {err}"
+        );
+    }
+
+    #[test]
+    fn codex_success_text_names_codex() {
+        let tid = Uuid::nil();
+        let text = Relation::Top.run_coding_agent_success_text(
+            tid,
+            "dev",
+            crate::runtime::CodingAgent::Codex,
+        );
+        assert!(text.contains("Codex session"), "{text}");
+        assert!(!text.contains("Claude Code"), "{text}");
     }
 }

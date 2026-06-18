@@ -9,7 +9,7 @@
  * This has regressed multiple times — see commits 7eb8c4b4, 12f56528,
  * fe4ab2f7, 9d50d02a, 5b6d9e5f, fe082117.
  */
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { assertHealthy, navigateToApp, sendMessage, uniqueMessage, waitForResponse, ensureOnThreadPane } from './helpers';
 
 test.describe('Mobile header gap regression', () => {

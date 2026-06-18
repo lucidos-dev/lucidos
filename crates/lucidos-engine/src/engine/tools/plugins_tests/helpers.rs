@@ -27,6 +27,7 @@ pub(super) async fn install_from_source_with_bus(
         source_type,
         overwrite,
         None,
+        None,
     )
     .await?;
     Ok(summary)

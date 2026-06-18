@@ -8,6 +8,7 @@ pub mod credentials;
 pub mod device_presence;
 pub mod devices;
 pub mod email;
+pub mod environment_variables;
 pub mod events;
 pub mod image_described_backfill;
 pub mod image_migration;
@@ -17,6 +18,7 @@ pub mod mcp_servers;
 pub mod models;
 pub mod oauth;
 pub mod pinned_apps;
+pub mod plugin_marketplaces;
 pub mod plugins;
 pub mod preferences;
 pub mod repositories;
@@ -44,7 +46,7 @@ pub fn pg_env_vars_cached() -> &'static [(String, String)] {
 /// libpq env-var bundle (`PGUSER`/`PGPASSWORD`/`PGHOST`/`PGPORT`/`PGDATABASE`).
 ///
 /// The point is to inject these into every subprocess we spawn (engine bash
-/// tool, Python tool, scheduled scripts, Claude Code) so callers can run
+/// tool, Python tool, scheduled scripts, coding-agent sessions) so callers can run
 /// `psql -c '…'` bare without ever putting the password in argv. argv is what
 /// gets persisted into `CodingAgentToolCalled`/`ToolCalled` event payloads and
 /// rendered in the steps UI; env vars are not, so the password never leaks
@@ -54,17 +56,23 @@ pub fn pg_env_vars_cached() -> &'static [(String, String)] {
 /// rather skip the injection than emit a half-broken bundle that confuses
 /// libpq.
 pub(crate) fn pg_env_vars(database_url: &str) -> Vec<(String, String)> {
+    // The `:password` segment is OPTIONAL: the gateway's embedded (packaged)
+    // Postgres backend uses trust auth on loopback and hands the engine a
+    // passwordless URL (`postgres://lucidos@127.0.0.1:<port>/lucidos`). Without
+    // the optional group the regex wouldn't match and `apply_pg_env` would reject
+    // the URL, breaking `pg_restore`/`psql` for a picker restore on a packaged
+    // build. An `@` is still required, so a malformed `postgres://no-at-sign/db`
+    // remains empty.
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"^postgres(?:ql)?://([^:@/?]+):([^@/?]*)@([^:/?]+)(?::(\d+))?/([^?]+)")
-            .expect("postgres URL regex must compile")
+        regex::Regex::new(
+            r"^postgres(?:ql)?://([^:@/?]+)(?::([^@/?]*))?@([^:/?]+)(?::(\d+))?/([^?]+)",
+        )
+        .expect("postgres URL regex must compile")
     });
     let Some(caps) = RE.captures(database_url) else {
         return Vec::new();
     };
     let user = urlencoding::decode(&caps[1])
-        .unwrap_or_default()
-        .into_owned();
-    let password = urlencoding::decode(&caps[2])
         .unwrap_or_default()
         .into_owned();
     let host = caps[3].to_string();
@@ -75,13 +83,21 @@ pub(crate) fn pg_env_vars(database_url: &str) -> Vec<(String, String)> {
     let dbname = urlencoding::decode(&caps[5])
         .unwrap_or_default()
         .into_owned();
-    vec![
-        ("PGUSER".to_string(), user),
-        ("PGPASSWORD".to_string(), password),
-        ("PGHOST".to_string(), host),
-        ("PGPORT".to_string(), port),
-        ("PGDATABASE".to_string(), dbname),
-    ]
+    let mut vars = vec![("PGUSER".to_string(), user)];
+    // Only emit PGPASSWORD when the URL carried a password segment. A
+    // passwordless (trust-auth) URL omits it so libpq doesn't try to send one;
+    // an explicit empty password (`user:@host`) still emits an empty PGPASSWORD,
+    // preserving prior behavior.
+    if let Some(pw) = caps.get(2) {
+        let password = urlencoding::decode(pw.as_str())
+            .unwrap_or_default()
+            .into_owned();
+        vars.push(("PGPASSWORD".to_string(), password));
+    }
+    vars.push(("PGHOST".to_string(), host));
+    vars.push(("PGPORT".to_string(), port));
+    vars.push(("PGDATABASE".to_string(), dbname));
+    vars
 }
 
 /// Mask the password segment of any `postgres(ql)://user:password@host…` URL
@@ -143,6 +159,7 @@ pub use artifacts::{list_searchable_data_files, ArtifactChange, ArtifactManager}
 pub use credentials::{AuthType, Credential, CredentialInfo, CredentialStore};
 pub use devices::DeviceStore;
 pub use email::{EmailAccount, EmailAccountInfo, EmailStore};
+pub use environment_variables::{EnvironmentVariable, EnvironmentVariableStore};
 pub use intents::{Intent, IntentStore};
 pub use knowhow::{Knowhow, KnowhowDirs, KnowhowStore, KnowhowSummary};
 pub use oauth::{OAuthAccount, OAuthAccountInfo, OAuthStore};
@@ -250,9 +267,11 @@ pub fn migrate_prompts_to_intents(workspace: &std::path::Path) {
 ///
 /// Order matters for diff stability: kept in the same order as historical
 /// values so existing files don't get rewritten on startup — new entries are
-/// appended at the end. `data/.env` is the per-workspace env file loaded by
-/// `load_workspace_env`; it typically carries secrets (auth tokens, SSH command
-/// overrides) and must never land in the workspace's git-tracked artifacts repo.
+/// appended at the end. `data/.env` is a legacy per-workspace env file: its
+/// contents are migrated into the `environment_variables` table at startup and
+/// the file is removed (see `environment_variables::migrate_env_file_to_db`).
+/// The gitignore entry stays as a safety backstop so any stray `.env` a user
+/// drops can never land in the workspace's git-tracked artifacts repo.
 const WORKSPACE_GITIGNORE_ENTRIES: &[&str] =
     &[".lucidos/", "data/postgres/", "data/blobs/", "data/.env"];
 
@@ -289,40 +308,14 @@ pub fn ensure_workspace_gitignore_entries(workspace: &std::path::Path) -> std::i
     Ok(true)
 }
 
-/// Load a per-workspace `.env` from `<workspace>/data/.env`, applying it with
-/// **override** semantics so per-workspace values win over both the global
-/// `.env` (loaded earlier via `dotenvy::dotenv()`) and the inherited process
-/// env. Returns the path that was loaded (`Some`) or `None` when no file exists.
-///
-/// The motivating use case is a per-workspace auth identity: a `data/.env` that
-/// sets `GH_CONFIG_DIR` / `GIT_SSH_COMMAND` so `gh` / `git push` run from agent
-/// subprocesses authenticate as that workspace's own GitHub account. The values
-/// land in the engine's own process env, so every subprocess the engine spawns
-/// (`run_bash`, `run_python`, Claude Code, scheduled scripts) inherits them —
-/// none of those spawn paths call `env_clear()`, they only layer extra vars on
-/// top (see `build_script_env_vars`).
-///
-/// `data/.env` is gitignored (see `WORKSPACE_GITIGNORE_ENTRIES`) so the secrets
-/// it typically carries never reach the workspace's artifacts repo.
-///
-/// Read/parse errors are swallowed — same tolerance as the global startup load;
-/// a malformed per-workspace `.env` must never stop the engine from booting.
-pub fn load_workspace_env(workspace: &std::path::Path) -> Option<std::path::PathBuf> {
-    let env_path = workspace.join(DATA_DIR).join(".env");
-    if !env_path.exists() {
-        return None;
-    }
-    let _ = dotenvy::from_path_override(&env_path);
-    Some(env_path)
-}
-
 pub use events::EventRow;
 pub use mcp_servers::{McpServer, McpServerStore};
 pub use models::{Model, ModelStore};
 pub use preferences::{
-    PreferenceStore, DEFAULT_CHAT_MODEL, DEFAULT_COMMAND_JUDGE_MODEL, PREF_CHAT_MODEL,
-    PREF_CHAT_REASONING_EFFORT, PREF_IMAGE_MODEL, PREF_MODEL_COMMAND_JUDGE,
-    PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY, PREF_MODEL_TITLE, PREF_VERTEX_REGION,
+    PreferenceStore, DEFAULT_CHAT_MODEL, DEFAULT_COMMAND_JUDGE_MODEL, DEFAULT_LOCAL_BASE_URL,
+    PREF_CHAT_MODEL, PREF_CHAT_REASONING_EFFORT, PREF_IMAGE_MODEL, PREF_LOCAL_BASE_URL,
+    PREF_MODEL_COMMAND_JUDGE, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY, PREF_MODEL_TITLE,
+    PREF_VERTEX_REGION,
 };
 pub use store::{
     ConversationMessage, ConversationSnapshot, EventStore, ResponseEvent, SessionMessage, Step,
@@ -731,6 +724,10 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             "Setting timezone to {}...",
             args["timezone"].as_str().unwrap_or("timezone")
         ),
+        "set_environment_variable" => format!(
+            "Setting environment variable {}...",
+            args["name"].as_str().unwrap_or("variable")
+        ),
         "fetch_news" => format!(
             "Fetching news about '{}'...",
             args["topic"].as_str().unwrap_or("topic")
@@ -801,7 +798,12 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
                 .and_then(|v| v.as_str())
                 .unwrap_or("app")
         ),
-        "run_claude" => "Executing Claude Code...".to_string(),
+        "run_coding_agent" | "run_claude" => {
+            match args.get("coding_agent").and_then(|v| v.as_str()) {
+                Some("codex") => "Executing Codex...".to_string(),
+                _ => "Executing Claude Code...".to_string(),
+            }
+        }
         "configure_email" => format!(
             "Configuring email account '{}'...",
             args["name"].as_str().unwrap_or("email")

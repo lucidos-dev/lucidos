@@ -35,6 +35,14 @@
     margin-bottom: 0.5rem;
 }
 
+/* The uppercase eyebrow at --text-muted (the lightest grey) washes out in both
+   themes, reading as disabled. Step it up to secondary — still muted relative to
+   the (primary) setting labels below, but legible. Scoped off the left-nav rows
+   (which reuse this class but keep their own muted→hover treatment). */
+.settings-section-title:not(.settings-nav-row) {
+    color: var(--text-secondary);
+}
+
 .settings-section-desc {
     font-size: 0.75rem;
     color: var(--text-secondary);
@@ -71,9 +79,11 @@
     padding: 0.5rem 0;
 }
 
+/* The setting name is the legible anchor of the row in both themes — the old
+   secondary grey made it read as greyed-out next to its control. */
 .settings-row-label {
     font-size: 0.8125rem;
-    color: var(--text-secondary);
+    color: var(--text-primary);
     padding-top: 0.375rem;
 }
 
@@ -89,6 +99,13 @@
     gap: 0.25rem;
     flex-wrap: wrap;
     justify-content: flex-end;
+}
+
+.mobile-access-url-button {
+    background: none;
+    border: none;
+    font: inherit;
+    padding: 0;
 }
 
 .settings-option {

@@ -11,7 +11,7 @@ import { buildFolderTree } from '../../store/actions/artifacts';
 import type { FolderNode } from '../../store/actions/artifacts';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { loadedOr } from '../../store/types';
-import { getEmojiForFile } from '../../utils/fileIcons';
+import { FileTypeIcon } from '../../utils/fileIcons';
 import { TreeNode } from './FolderTree';
 import { changeBadgeLabel } from './changeBadge';
 import { diffStats } from './diffStats';
@@ -138,7 +138,7 @@ export function ChangesFileList({ files, activePath }: { files: DiffFile[]; acti
           class={`file-item repo-changed-file${f.path === activePath ? ' active' : ''}`}
           onClick={() => openRepoFilePreview(f.path, 'diff')}
         >
-          <span class="file-icon">{getEmojiForFile(f.path)}</span>
+          <FileTypeIcon path={f.path} className="file-icon" />
           <span class="file-name">{f.path}</span>
           <DiffStatsInline additions={fileStats[i].additions} deletions={fileStats[i].deletions} />
           <span class={`change-badge change-badge-${f.status}`}>

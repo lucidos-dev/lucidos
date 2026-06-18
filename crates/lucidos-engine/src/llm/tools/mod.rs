@@ -15,12 +15,12 @@
 //! - `triggers` — create/list/update/delete/pause/resume + trigger_group ops
 //! - `email` — configure/send/read/save attachment
 //! - `apps` — create/list/refresh/capture + load_knowhow
-//! - `plugins` — install/check/update/uninstall
+//! - `plugins` — install/marketplaces/check/update/uninstall
 //! - `mcp` — setup/list/start/stop/remove server
 //! - `notifications` — send/read + enable push
 //! - `memory` — correct, dismiss-from-context
 //! - `events` — emit/query/count
-//! - `threads` — run_thread, run_claude, list/count threads
+//! - `threads` — run_thread, run_coding_agent, list/count threads
 //! - `changes` — list_changes, apply_change
 //! - `thread_queue` — list_thread_queue, update_thread_queue_policy
 //! - `web` — web_search, fetch_news
@@ -94,14 +94,14 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
     tools.extend(email::email_tools()); // configure/send/read emails + save attachment
     tools.extend(apps::app_tools()); // create_app, list_apps, load_knowhow, refresh_file, refresh_app, capture_app
     tools.extend(misc::connect_oauth_tools()); // connect_oauth_account
-    tools.extend(threads::spawn_tools()); // run_thread, run_claude
+    tools.extend(threads::spawn_tools()); // run_thread, run_coding_agent
     tools.extend(memory::correct_memory_tools()); // correct_memory
     tools.extend(misc::execute_intent_tools()); // execute_intent
     tools.extend(events::event_tools()); // emit_event, query_events, count_events
     tools.extend(threads::list_tools()); // list_threads, count_threads
     tools.extend(changes::changes_tools()); // list_changes, apply_change
     tools.extend(thread_queue::thread_queue_tools()); // list_thread_queue, update_thread_queue_policy
-    tools.extend(plugins::plugin_tools()); // install/check/update/uninstall plugin
+    tools.extend(plugins::plugin_tools()); // install/marketplaces/check/update/uninstall plugin
     tools.extend(misc::ask_user_question_tools()); // ask_user_question
     tools.extend(memory::dismiss_from_context_tools()); // dismiss_from_context
     tools.extend(misc::todo_write_tools()); // todo_write

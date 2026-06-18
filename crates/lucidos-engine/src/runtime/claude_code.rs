@@ -344,9 +344,16 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .env_remove("CLAUDECODE");
-    if args.resume_session_id.is_none() {
-        cmd.arg("--include-partial-messages");
-    }
+    // Always request partial-message streaming — fresh AND resumed sessions.
+    // The `stream_event` deltas it produces are turned into
+    // `AgentEvent::StreamActivity` liveness pings that keep the watchdog's
+    // inactivity clock fresh through a long single step (extended thinking on a
+    // hard problem). Omitting it on `--resume` (the old fresh-only gate, a fossil
+    // from when resume was a separate spawn path) left the heartbeat ticking only
+    // at step boundaries, so the watchdog killed long unattended steps mid-work —
+    // follow-ups, engine-restart recovery, merge-conflict resolution, hardening.
+    // The flag is a streaming-output option, orthogonal to `--resume`.
+    cmd.arg("--include-partial-messages");
 
     if let Some(tools) = args.allowed_tools {
         cmd.arg("--allowedTools").arg(tools);

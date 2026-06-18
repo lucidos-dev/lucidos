@@ -1,4 +1,4 @@
-//! `lucidos` — CLI for Claude Code subprocesses to talk back to the parent
+//! `lucidos` — CLI for coding-agent subprocesses to talk back to the parent
 //! Lucidos workspace.
 //!
 //! ## Workspace resolution
@@ -19,9 +19,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 mod ask_user_question_hook;
 mod cc_bash_guard;
 mod cc_edit_preread;
+mod cc_plan_gate;
 mod cc_read_coerce;
 mod cc_stop_reminder;
 mod changes;
+mod coding_agent_diff_hook;
 mod data;
 mod data_store;
 mod events;
@@ -30,6 +32,7 @@ mod http;
 mod knowhow;
 mod mcp_permission_server;
 mod notify;
+mod planned;
 mod proxy;
 mod spawn_thread;
 mod threads;
@@ -42,7 +45,7 @@ use workspace::resolve_from_env;
 #[command(
     name = "lucidos",
     version,
-    about = "Talk back to the parent Lucidos workspace from a Claude Code subprocess.",
+    about = "Talk back to the parent Lucidos workspace from a coding-agent subprocess.",
     long_about = "Resolves the parent workspace from $LUCIDOS_WORKSPACE if set, \
                   else walks up from $PWD for the first .lucidos/ports file."
 )]
@@ -76,6 +79,16 @@ enum Command {
     Hardened {
         #[command(subcommand)]
         action: HardenedCmd,
+    },
+    /// Record/query the durable Planned marker that enforces the
+    /// `implementation-plan` skill. `mark --plan <docs/plans/file>` records a
+    /// real plan (the skill calls this); `mark --simple "<reason>"`
+    /// acknowledges a local fix that needs no plan; `state` prints
+    /// `PRESENT`/`MISSING`. Both marked states satisfy the pre-edit gate and
+    /// the Apply floor.
+    Planned {
+        #[command(subcommand)]
+        action: PlannedCmd,
     },
     /// MCP stdio server invoked by Claude Code as `--permission-prompt-tool`.
     /// Forwards each permission request to the parent engine and blocks on the
@@ -116,15 +129,29 @@ enum Command {
     /// invocation.
     #[command(name = "cc-edit-preread", hide = true)]
     CcEditPreread,
-    /// POST a new chat or Claude Code thread to another (or this same) Lucidos
+    /// PreToolUse hook subcommand invoked by Claude Code via .lucidos/cc-settings.json
+    /// for every Edit/Write tool call. Asks the engine whether this branch has a
+    /// Planned marker; if not (and the worktree ships the implementation-plan
+    /// skill), returns `permissionDecision: "deny"` instructing the model to run
+    /// the skill or acknowledge a local fix. Exempts `docs/plans/` writes and is
+    /// a silent no-op in repos without the skill. Hidden; not for direct invocation.
+    #[command(name = "cc-plan-gate", hide = true)]
+    CcPlanGate,
+    /// Git post-commit hook subcommand installed in coding-agent worktrees.
+    /// Refreshes the parent engine's `coding_agent_has_diff` projection so the
+    /// Diff button appears as soon as committed work exists. Hidden; not for
+    /// direct invocation.
+    #[command(name = "coding-agent-diff-hook", hide = true)]
+    CodingAgentDiffHook,
+    /// POST a new chat or coding-agent thread to another (or this same) Lucidos
     /// workspace. Defaults caller_* fields from $LUCIDOS_WORKSPACE,
     /// $LUCIDOS_THREAD_ID, $LUCIDOS_EVENT_ID. With `--parent`, emits
     /// parent_thread_id/spawning_event_id instead (same-workspace callback).
-    /// `--repo <name>` defaults from $LUCIDOS_REPO so a CC subprocess inherits
-    /// the calling thread's repo without callers passing it explicitly.
+    /// `--repo <name>` defaults from $LUCIDOS_REPO so a coding-agent subprocess
+    /// inherits the calling thread's repo without callers passing it explicitly.
     /// `--folder <path>` instead targets an app folder (`data/apps/<id>`),
-    /// spawning an app coding-agent thread (mutually exclusive with `--repo`,
-    /// requires `--cc`).
+    /// spawning an app coding-agent thread (mutually exclusive with `--repo`;
+    /// requires `--cc`, `--codex`, or `--coding-agent`).
     #[command(name = "spawn-thread")]
     SpawnThread(SpawnThreadArgs),
     /// Call a backend configured in `data/config/apis.json` through the
@@ -329,6 +356,22 @@ pub(crate) enum CliRelation {
     Top,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum CliCodingAgent {
+    #[value(alias = "claude_code")]
+    ClaudeCode,
+    Codex,
+}
+
+impl CliCodingAgent {
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+        }
+    }
+}
+
 #[derive(Args)]
 pub(crate) struct SpawnThreadArgs {
     /// Target workspace name (e.g. "dev", "personal"). Resolved relative to
@@ -342,9 +385,16 @@ pub(crate) struct SpawnThreadArgs {
     /// Optional thread title (shown in the target workspace's UI).
     #[arg(long)]
     pub(crate) title: Option<String>,
-    /// Spawn a Claude Code session instead of a chat thread.
+    /// Spawn a Claude Code coding-agent session instead of a chat thread.
     #[arg(long)]
     pub(crate) cc: bool,
+    /// Spawn a Codex coding-agent session. Shortcut for
+    /// `--coding-agent codex`; implies coding-agent mode.
+    #[arg(long, conflicts_with = "coding_agent")]
+    pub(crate) codex: bool,
+    /// Coding-agent backend to launch. Implies coding-agent mode.
+    #[arg(long, value_enum)]
+    pub(crate) coding_agent: Option<CliCodingAgent>,
     /// CC model override (e.g. "sonnet", "opus", "haiku").
     #[arg(long)]
     pub(crate) cc_model: Option<String>,
@@ -352,24 +402,25 @@ pub(crate) struct SpawnThreadArgs {
     #[arg(long)]
     pub(crate) model: Option<String>,
     /// Repo name (or UUID) the spawned worktree should be created from.
-    /// Defaults to `$LUCIDOS_REPO` (the engine sets it on every CC subprocess
-    /// to the calling thread's repo name) so a CC sidequest stays in the same
-    /// repo as its caller. Omit (and unset the env var) to fall back to the
-    /// target workspace's default repo. Pass an empty string to force the
-    /// workspace default even when the env var is set.
+    /// Defaults to `$LUCIDOS_REPO` (the engine sets it on every coding-agent
+    /// subprocess to the calling thread's repo name) so a coding-agent sidequest
+    /// stays in the same repo as its caller. Omit (and unset the env var) to
+    /// fall back to the target workspace's default repo. Pass an empty string
+    /// to force the workspace default even when the env var is set.
     #[arg(long)]
     pub(crate) repo: Option<String>,
     /// Target a folder instead of a repo — creates an *app coding-agent
     /// thread*. Accepts a workspace-relative path (`data/apps/momentum`), an
     /// absolute path, or a registered repo name; resolved on the TARGET
-    /// workspace (`--to`). With `--cc`, a `data/apps/<id>` value spawns a
-    /// sparse-checkout worktree narrowed to that app folder whose Apply
-    /// ff-merges into the workspace's main (no `/harden`, no engine restart) —
-    /// exactly what the `run_claude` tool's `folder` argument produces. Only
+    /// workspace (`--to`). With `--cc`, `--codex`, or `--coding-agent`, a
+    /// `data/apps/<id>` value spawns a sparse-checkout worktree narrowed to
+    /// that app folder whose Apply ff-merges into the workspace's main (no
+    /// `/harden`, no engine restart) —
+    /// exactly what the `run_coding_agent` tool's `folder` argument produces. Only
     /// whole app folders are valid; the engine rejects other `data/` paths,
     /// app subpaths, and non-existent folders. Mutually exclusive with
-    /// `--repo`; requires `--cc`. When set, the `$LUCIDOS_REPO` default is
-    /// suppressed so the request never carries both a repo and a folder.
+    /// `--repo`; requires a coding-agent flag. When set, the `$LUCIDOS_REPO`
+    /// default is suppressed so the request never carries both a repo and a folder.
     #[arg(long, conflicts_with = "repo")]
     pub(crate) folder: Option<String>,
     /// Override the upstream actor mode. Defaults to "agent".
@@ -406,6 +457,32 @@ enum HardenedCmd {
     /// the `harden.md` skill (skip `/harden` iff `FRESH`) and the
     /// `pre-push.sh` hook (allow push iff `FRESH`).
     Query,
+}
+
+#[derive(Subcommand)]
+enum PlannedCmd {
+    /// Record a Planned marker for the current branch (in $PWD). Pass exactly
+    /// one of `--plan <docs/plans/file>` (a real implementation plan was
+    /// written — the `implementation-plan` skill calls this) or
+    /// `--simple "<reason>"` (this change is a local fix needing no plan).
+    /// POSTs to the parent engine's `/api/v1/internal/mark-planned`.
+    Mark(PlannedMarkArgs),
+    /// Print the Planned-marker state of the current branch (in $PWD):
+    /// `PRESENT` or `MISSING`. GETs `/api/v1/internal/planned-state`. Used by
+    /// the `cc-plan-gate` hook (allow edits iff `PRESENT`).
+    State,
+}
+
+#[derive(Args)]
+pub(crate) struct PlannedMarkArgs {
+    /// Relative path of the implementation plan that was written
+    /// (e.g. `docs/plans/2026-06-18-my-change.md`). Records state `planned`.
+    #[arg(long, conflicts_with = "simple")]
+    pub(crate) plan: Option<String>,
+    /// One-line reason this change is a local fix needing no plan. Records
+    /// state `acknowledged_simple`.
+    #[arg(long, conflicts_with = "plan")]
+    pub(crate) simple: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -588,6 +665,25 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             }
             Ok(0)
         }
+        Command::Planned { action } => {
+            let ws = resolve_from_env()?;
+            match action {
+                PlannedCmd::Mark(args) => {
+                    let kind = match (args.plan.as_deref(), args.simple.as_deref()) {
+                        (Some(p), None) => planned::MarkKind::Plan(p),
+                        (None, Some(r)) => planned::MarkKind::Simple(r),
+                        (None, None) => {
+                            return Err("`lucidos planned mark` requires either --plan <path> or --simple \"<reason>\"".into());
+                        }
+                        // clap's conflicts_with prevents both being set.
+                        (Some(_), Some(_)) => unreachable!("clap conflicts_with(plan, simple)"),
+                    };
+                    planned::cmd_mark(&ws, kind)?;
+                }
+                PlannedCmd::State => planned::cmd_state(&ws)?,
+            }
+            Ok(0)
+        }
         Command::McpPermissionServer => {
             mcp_permission_server::run()?;
             Ok(0)
@@ -607,6 +703,14 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         }
         Command::CcEditPreread => {
             cc_edit_preread::run()?;
+            Ok(0)
+        }
+        Command::CcPlanGate => {
+            cc_plan_gate::run()?;
+            Ok(0)
+        }
+        Command::CodingAgentDiffHook => {
+            coding_agent_diff_hook::run()?;
             Ok(0)
         }
         Command::SpawnThread(args) => {

@@ -99,11 +99,13 @@ const DATA_NAV_TARGET_ATTR = /\sdata-nav-target\s*=\s*(?:"[^"]*"|'[^']*')/i;
 
 /** UI panels reachable from a markdown link like `[Notifications](notifications)`.
  *  Mirrors the side-drawer menu items — the same names the `navigate_ui` LLM
- *  tool accepts for the panel targets and that `handleNavigationRequest` routes
- *  via `switchMenuItem`. Kept in sync by hand: the set is short and stable. */
+ *  tool accepts for the panel targets and that `handleNavigationRequest` routes.
+ *  Most route via `switchMenuItem`; `app-store` is a retained alias that lands
+ *  on the Apps section's Store tab. Kept in sync by hand: short and stable. */
 const NAV_TARGETS: ReadonlySet<string> = new Set([
   'notifications',
   'apps',
+  'app-store',
   'triggers',
   'changes',
   'files',
@@ -260,6 +262,54 @@ function rewriteAppAnchor(tag: string, appIds: Set<string>): string | null {
   return stripped.replace(/^<a/i, `<a href="#" class="app-link" data-app-id="${escapedId}"`);
 }
 
+/** Bare "open the app" hrefs the LLM emits when it knows the app name should be
+ *  a link but supplies no id — `[Site Publisher](app)`, `(app/)`, `(app:)`.
+ *  These match neither the `app:<id>` / `apps/<id>` shapes (no id) nor a nav
+ *  panel (`app` singular isn't one — `apps` plural is), so without recovery they
+ *  render as a raw relative `<a href="app">` that the browser resolves against
+ *  the gateway base (`/<slug>/`) to `/<slug>/app`, a dead end. */
+const BARE_APP_HREF = /^app:?\/?$/i;
+
+/** Plain-text content between an opening `<a>` tag at `openTagIndex` and its
+ *  matching `</a>` in the alternating tag/text `segments`. Nested tags are
+ *  skipped so `<a href="app"><strong>Site Publisher</strong></a>` still yields
+ *  "Site Publisher". */
+function anchorText(segments: string[], openTagIndex: number): string {
+  let text = '';
+  for (let j = openTagIndex + 1; j < segments.length; j++) {
+    if (j % 2 === 1) {
+      if (segments[j].toLowerCase() === '</a>') break;
+      continue; // nested tag — skip, keep gathering text
+    }
+    text += segments[j];
+  }
+  return text;
+}
+
+/** Last-resort app-anchor rewriter for bare `app` hrefs (see `BARE_APP_HREF`):
+ *  resolve the app from the anchor's visible TEXT instead of its href, since the
+ *  href carries no id. Runs only after the strict href-based rewriters decline,
+ *  so a real `apps/<id>` / nav / artifact link is never hijacked. Returns null
+ *  when the href isn't a bare-app shape or the text names no known app. */
+function rewriteBareAppAnchorByText(
+  tag: string,
+  linkText: string,
+  appTextToId: Map<string, string>,
+): string | null {
+  const m = tag.match(HREF_ATTR);
+  if (!m) return null;
+  const href = m[1] ?? m[2];
+  if (!href || !BARE_APP_HREF.test(href.trim())) return null;
+  const id = appTextToId.get(linkText.trim());
+  if (!id) return null;
+  const escapedId = id.replace(/"/g, '&quot;');
+  const stripped = tag
+    .replace(HREF_ATTR, '')
+    .replace(CLASS_ATTR, '')
+    .replace(DATA_APP_ID_ATTR, '');
+  return stripped.replace(/^<a/i, `<a href="#" class="app-link" data-app-id="${escapedId}"`);
+}
+
 export function linkifyPaths(
   html: string,
   paths: string[],
@@ -339,6 +389,13 @@ export function linkifyPaths(
         if (appIds) rewritten = rewriteAppAnchor(segments[i], appIds);
         if (!rewritten) rewritten = rewriteNavAnchor(segments[i]);
         if (!rewritten && pathLookup) rewritten = rewriteArtifactAnchor(segments[i], pathLookup);
+        // Last resort: a bare `app` href (no id) that the strict rewriters
+        // declined and that isn't the `apps` nav panel — resolve from the
+        // anchor's visible text. Covers `[Site Publisher](app)`, which would
+        // otherwise dead-end at `/<slug>/app`.
+        if (!rewritten && appTextToId) {
+          rewritten = rewriteBareAppAnchorByText(segments[i], anchorText(segments, i), appTextToId);
+        }
         if (rewritten) segments[i] = rewritten;
       }
       else if (tag === '</a>') insideAnchor = Math.max(0, insideAnchor - 1);

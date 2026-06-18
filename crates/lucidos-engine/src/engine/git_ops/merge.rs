@@ -26,7 +26,7 @@ pub(crate) async fn catchup_with_main(
 }
 
 /// Serialized merge queue: only one merge-to-main operation at a time.
-/// Prevents race conditions when multiple Claude Code sessions try to apply changes
+/// Prevents race conditions when multiple coding-agent sessions try to apply changes
 /// simultaneously. Each merge acquires this lock, catches up with main
 /// (which may have moved from a previous merge), and fast-forwards.
 pub(crate) static MERGE_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
@@ -322,7 +322,7 @@ pub(crate) async fn ensure_head_on_main(repo_root: &Path) {
 /// or `None` when there is no `origin` remote (so the worktree will branch from HEAD).
 pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<String> {
     if !has_origin_remote(repo_root).await {
-        log!("[ClaudeCode] No 'origin' remote found -- will branch from HEAD");
+        log!("[Changes] No 'origin' remote found -- will branch from HEAD");
         return None;
     }
 
@@ -330,16 +330,16 @@ pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<Str
     match git_cmd(&["fetch", "origin"], repo_root).await {
         Ok(o) if o.status.success() => {}
         Ok(o) => log!(
-            "[ClaudeCode] git fetch origin warning: {}",
+            "[Changes] git fetch origin warning: {}",
             String::from_utf8_lossy(&o.stderr).trim()
         ),
-        Err(e) => log!("[ClaudeCode] Failed to run git fetch: {}", e),
+        Err(e) => log!("[Changes] Failed to run git fetch: {}", e),
     }
 
     let remote_ref = match read_origin_head_ref(repo_root).await {
         Some(branch) => format!("origin/{}", branch),
         None => {
-            log!("[ClaudeCode] Could not detect default branch, falling back to origin/main");
+            log!("[Changes] Could not detect default branch, falling back to origin/main");
             "origin/main".to_string()
         }
     };
@@ -357,17 +357,17 @@ pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<Str
         // We're on the default branch -- merge ff-only to update it in place
         match git_cmd(&["merge", "--ff-only", &remote_ref], repo_root).await {
             Ok(o) if o.status.success() => log!(
-                "[ClaudeCode] Fast-forwarded local {} to {}",
+                "[Changes] Fast-forwarded local {} to {}",
                 local_branch,
                 remote_ref
             ),
             Ok(_) => log!(
-                "[ClaudeCode] Could not fast-forward {} (diverged) -- worktree will branch from {}",
+                "[Changes] Could not fast-forward {} (diverged) -- worktree will branch from {}",
                 local_branch,
                 remote_ref
             ),
             Err(e) => log!(
-                "[ClaudeCode] Failed to fast-forward {}: {}",
+                "[Changes] Failed to fast-forward {}: {}",
                 local_branch,
                 e
             ),
@@ -377,17 +377,17 @@ pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<Str
         let local_ref = format!("refs/heads/{}", local_branch);
         match git_cmd(&["update-ref", &local_ref, &remote_ref], repo_root).await {
             Ok(o) if o.status.success() => log!(
-                "[ClaudeCode] Updated local {} to match {}",
+                "[Changes] Updated local {} to match {}",
                 local_branch,
                 remote_ref
             ),
             Ok(_) => log!(
-                "[ClaudeCode] Could not update local {} -- worktree will branch from {}",
+                "[Changes] Could not update local {} -- worktree will branch from {}",
                 local_branch,
                 remote_ref
             ),
             Err(e) => log!(
-                "[ClaudeCode] Failed to update local {}: {}",
+                "[Changes] Failed to update local {}: {}",
                 local_branch,
                 e
             ),
@@ -600,4 +600,3 @@ async fn origin_head_branch(repo_root: &Path) -> Option<String> {
         .ok()?;
     verify.status.success().then_some(branch)
 }
-

@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { groupIntoExchanges, exchangeResponseEvents, exchangeSteps, exchangeStatus, type StoredEvent, type ThreadEvent } from '../thread-events';
 
+const ANSWER_FIRST = "You need light + dark: light for the macOS dock, dark for the PWA splash.";
+
 function ev(seq: number, e: ThreadEvent, created = `2026-05-03T12:00:${String(seq).padStart(2, '0')}Z`) {
   return [seq, { ...e, created }] as const;
 }
@@ -35,6 +37,39 @@ describe('groupIntoExchanges — ActionRequired events as exchange boundaries', 
     const exchanges = groupIntoExchanges(events);
     expect(exchanges).toHaveLength(2);
     expect(exchanges[1].userEvent.type).toBe('CodingAgentPermissionRequest');
+  });
+
+  it('chat agent PRE-question text lands above the question card and keeps the card answerable', () => {
+    // The "answer first, then offer choices" turn: the agent streams its
+    // explanation, THEN calls ask_user_question in the SAME turn. The engine
+    // emits the explanation as TextStreamed BEFORE the ToolCalled /
+    // UserQuestionAsked (lower sequence), so it groups into the MR exchange and
+    // renders ABOVE the card. This is the rendering side of the engine streaming
+    // the agent's explanation alongside the question instead of dropping it —
+    // the root cause of "agent asks a question without explaining". The
+    // pre-question text must NOT mark the divider overtaken (it precedes the
+    // question, so the buttons stay live).
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'Do I need light and dark ones, and for what?', _eventId: 'msg-1', created: '2026-06-16T12:00:01Z' } as StoredEvent],
+      [2, { type: 'ThoughtStreamed', text: 'Context: 1 tokens, 1 messages', request_event_id: 'msg-1', created: '2026-06-16T12:00:02Z' } as StoredEvent],
+      [3, { type: 'TextStreamed', text: ANSWER_FIRST, request_event_id: 'msg-1', created: '2026-06-16T12:00:03Z' } as StoredEvent],
+      [4, { type: 'ToolCalled', name: 'ask_user_question', args: {}, _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-06-16T12:00:04Z' } as StoredEvent],
+      [5, { type: 'UserQuestionAsked', tool_use_id: 'tu-outer-0', cc_session_id: '', question: 'So — which assets should I generate?', options: [{ id: 'a', label: 'Both' }], created: '2026-06-16T12:00:05Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map(e => e.userEvent.type)).toEqual(['MessageReceived', 'UserQuestionAsked']);
+
+    // The explanation renders in the MR exchange (above the card), not the divider.
+    const mrEx = exchanges[0];
+    expect(mrEx.steps.map(s => s.event.type)).toContain('TextStreamed');
+    const mrResponse = exchangeResponseEvents(mrEx);
+    expect(mrResponse.find(e => e.type === 'text' && e.md === ANSWER_FIRST)).toBeDefined();
+
+    // The divider holds only the question; the pre-question text did not leak
+    // into it, so the card is not marked overtaken and its buttons stay live.
+    const divider = exchanges[1];
+    expect(divider.steps.map(s => s.event.type)).not.toContain('TextStreamed');
+    expect(divider.questionOvertaken).toBe(false);
   });
 
   it('chat agent post-answer text/response routes to the question exchange (rendered below the answer)', () => {
@@ -424,6 +459,96 @@ describe('groupIntoExchanges — answer/resolution routing across an intervening
     const exchanges = groupIntoExchanges(events);
     expect(exchanges).toHaveLength(1);
     expect(exchanges[0].steps.map(s => s.event.type)).toContain('UserQuestionAnswered');
+  });
+});
+
+describe('groupIntoExchanges — response continuation after a mid-flight ChildThreadCompleted', () => {
+  // Real thread 4d193da8: the parent is mid-response when a spawned sub-thread
+  // finishes. The engine injects the child summary into the running loop as a
+  // WakeFromChild (no new request_event_id — the turn keeps the originating
+  // MR's id) and emits ChildThreadCompleted as a timeline boundary. Every step
+  // AFTER the boundary still carries the turn's req_id, so without moving the
+  // redirect they group back into the pre-completion exchange — which sits
+  // ABOVE the child-completion card. The user then sees the continued "Thinking
+  // / Running Python" rendered BEFORE the card it logically follows. The
+  // continuation must group UNDER the card (chronological order).
+
+  it('post-completion steps group under the ChildThreadCompleted card, not the pre-completion exchange', () => {
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'make a gif', _eventId: 'msg-1', created: '2026-06-16T12:00:00Z' } as StoredEvent],
+      [2, { type: 'ThoughtStreamed', text: 'thinking', request_event_id: 'msg-1', created: '2026-06-16T12:00:01Z' } as StoredEvent],
+      [3, { type: 'ChildThreadCompleted', child_thread_id: 'child-1', child_thread_title: 'icons', status: 'success', summary: 'icons landed', _eventId: 'ctc-1', created: '2026-06-16T12:00:02Z' } as StoredEvent],
+      [4, { type: 'ToolCalled', name: 'run_python', args: {}, _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-06-16T12:00:03Z' } as StoredEvent],
+      [5, { type: 'TextStreamed', text: 'rendered', request_event_id: 'msg-1', created: '2026-06-16T12:00:04Z' } as StoredEvent],
+      [6, { type: 'ResponseGenerated', text: 'rendered', request_event_id: 'msg-1', created: '2026-06-16T12:00:05Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map(e => e.userEvent.type)).toEqual(['MessageReceived', 'ChildThreadCompleted']);
+
+    const mr = exchanges[0];
+    const ctc = exchanges[1];
+    // Pre-completion thinking stays above the card.
+    expect(mr.steps.map(s => s.event.type)).toContain('ThoughtStreamed');
+    // The post-completion continuation groups under the card.
+    const ctcTypes = ctc.steps.map(s => s.event.type);
+    expect(ctcTypes).toContain('ToolCalled');
+    expect(ctcTypes).toContain('TextStreamed');
+    expect(ctcTypes).toContain('ResponseGenerated');
+    // …and NOT back in the pre-completion exchange (which would render above).
+    expect(mr.steps.map(s => s.event.type)).not.toContain('ResponseGenerated');
+    expect(mr.steps.map(s => s.event.type)).not.toContain('TextStreamed');
+  });
+
+  it('continuation moves below the card even when an injected user message redirected the turn first', () => {
+    // The exact 4d193da8 shape: a buffered second message is absorbed mid-flight
+    // (setting reqIdRedirect → the injected MR exchange) BEFORE the child
+    // completes. The redirect must then advance to the card so the post-
+    // completion work lands under it, not in the injected-message exchange.
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'make a gif', _eventId: 'msg-1', created: '2026-06-16T12:00:00Z' } as StoredEvent],
+      [2, { type: 'ThoughtStreamed', text: 'thinking', request_event_id: 'msg-1', created: '2026-06-16T12:00:01Z' } as StoredEvent],
+      [3, { type: 'MessageReceived', text: 'or any way', _eventId: 'msg-2', created: '2026-06-16T12:00:02Z' } as StoredEvent],
+      [4, { type: 'UserPromptInjected', text: 'or any way', mode: 'human', injected_message_id: 'msg-2', request_event_id: 'msg-1', created: '2026-06-16T12:00:03Z' } as StoredEvent],
+      [5, { type: 'ThoughtStreamed', text: 'thinking more', request_event_id: 'msg-1', created: '2026-06-16T12:00:04Z' } as StoredEvent],
+      [6, { type: 'ChildThreadCompleted', child_thread_id: 'child-1', child_thread_title: 'icons', status: 'success', summary: 'icons landed', _eventId: 'ctc-1', created: '2026-06-16T12:00:05Z' } as StoredEvent],
+      [7, { type: 'ToolCalled', name: 'run_python', args: {}, _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-06-16T12:00:06Z' } as StoredEvent],
+      [8, { type: 'ResponseGenerated', text: 'rendered', request_event_id: 'msg-1', created: '2026-06-16T12:00:07Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map(e => e.userEvent.type)).toEqual(['MessageReceived', 'MessageReceived', 'ChildThreadCompleted']);
+
+    const injected = exchanges[1]; // the "or any way" exchange
+    const ctc = exchanges[2];
+    // The injected-message exchange keeps only its pre-completion steps.
+    expect(injected.steps.map(s => s.event.type)).not.toContain('ResponseGenerated');
+    expect(injected.steps.map(s => s.event.type)).not.toContain('ToolCalled');
+    // The continuation lands under the card.
+    expect(ctc.steps.map(s => s.event.type)).toContain('ToolCalled');
+    expect(ctc.steps.map(s => s.event.type)).toContain('ResponseGenerated');
+  });
+
+  it('does NOT move the continuation when the turn is paused at a question divider (3e54cacb is preserved)', () => {
+    // Counterpart to the answer-routing test above: when the turn paused on a
+    // question BEFORE the child completed, the post-answer reply belongs with
+    // the question card (which itself sits above the card), not below an
+    // unrelated child-completion card. The redirect must NOT advance to the
+    // card in this case.
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'check backups', _eventId: 'msg-1', created: '2026-06-16T12:00:00Z' } as StoredEvent],
+      [2, { type: 'ToolCalled', name: 'ask_user_question', args: {}, _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-06-16T12:00:01Z' } as StoredEvent],
+      [3, { type: 'UserQuestionAsked', tool_use_id: 'tu-1', cc_session_id: '', question: 'How surfaced?', options: [{ id: 'a', label: 'Toast' }], created: '2026-06-16T12:00:02Z' } as StoredEvent],
+      [4, { type: 'ChildThreadCompleted', child_thread_id: 'child-1', status: 'success', summary: 'fix landed', _eventId: 'ctc-1', created: '2026-06-16T12:00:03Z' } as StoredEvent],
+      [5, { type: 'UserQuestionAnswered', tool_use_id: 'tu-1', answer: { kind: 'FreeText', text: 'toast' }, created: '2026-06-16T12:00:04Z' } as StoredEvent],
+      [6, { type: 'TextStreamed', text: 'reply', request_event_id: 'msg-1', created: '2026-06-16T12:00:05Z' } as StoredEvent],
+      [7, { type: 'ResponseGenerated', text: 'reply', request_event_id: 'msg-1', created: '2026-06-16T12:00:06Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    const ctc = exchanges.find(e => e.userEvent.type === 'ChildThreadCompleted')!;
+    // The reply stays with the answered question, not the child-completion card.
+    expect(divider.steps.map(s => s.event.type)).toContain('ResponseGenerated');
+    expect(ctc.steps.map(s => s.event.type)).not.toContain('ResponseGenerated');
+    expect(exchangeStatus(divider, '', false, false, false)).toBe('done');
   });
 });
 

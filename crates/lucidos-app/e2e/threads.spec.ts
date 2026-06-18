@@ -1,5 +1,5 @@
-import { test, expect } from '@playwright/test';
-import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer, ensureOnThreadPane, countVisibleThreadRows, userMessageBody, REAL_THREAD_ROW } from './helpers';
+import { test, expect } from './fixtures';
+import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer, ensureOnThreadPane, countVisibleThreadRows, userMessageBody, waitForVisibleInput, REAL_THREAD_ROW } from './helpers';
 
 test.describe('Thread management', () => {
   test.beforeEach(async ({ page }) => {
@@ -62,20 +62,31 @@ test.describe('Thread management', () => {
     await sendMessage(page, `Say exactly: "loaded ${msg}"`);
     await waitForResponse(page);
 
+    // Capture the id of the thread we just created so we click IT specifically.
+    // Clicking the drawer's FIRST real row is wrong: specs in a project share
+    // one DB (no per-spec reset), and an earlier spec (save-archive-buttons)
+    // leaves a SAVED thread behind. Saved threads sort into the Saved section
+    // ABOVE Current, so `${REAL_THREAD_ROW}:visible` first() is that saved
+    // thread — not ours — on the mobile layouts (it happened to resolve to ours
+    // on desktop, which is why this only failed on mobile/mobile-webkit). Target
+    // our own thread by id instead of assuming a drawer position.
+    const threadId = await (await waitForVisibleInput(page)).getAttribute('data-thread-id');
+    expect(threadId, 'focused thread id missing after send').toBeTruthy();
+
     // Navigate away
     await newThread(page);
 
-    // Open the drawer and click the most recent REAL thread (skip drafts), then
-    // confirm its messages render. Under full-suite host contention the row
-    // click can be absorbed by a concurrent drawer re-render (compose/SSE
-    // fan-out): focus never changes and the thread pane keeps showing the empty
-    // compose draft. Retry the open→click→navigate until the thread's user
-    // message actually appears — the same absorbed-click guard ensureMobileView
-    // applies by re-clicking the pane dot in a loop. The assertion is unchanged,
-    // so a genuinely empty or wrong thread still fails.
+    // Open the drawer and click OUR thread, then confirm its messages render.
+    // Under full-suite host contention the row click can be absorbed by a
+    // concurrent drawer re-render (compose/SSE fan-out): focus never changes and
+    // the thread pane keeps showing the empty compose draft. Retry the
+    // open→click→navigate until the thread's user message actually appears — the
+    // same absorbed-click guard ensureMobileView applies by re-clicking the pane
+    // dot in a loop. The assertion is unchanged, so a genuinely empty or wrong
+    // thread still fails.
     await expect(async () => {
       await openThreadDrawer(page);
-      await page.locator(`${REAL_THREAD_ROW}:visible`).first().click();
+      await page.locator(`[data-thread-nav="${threadId}"]:visible`).first().click();
       await ensureOnThreadPane(page);
       await expect(userMessageBody(page)).toContainText(msg, { timeout: 5_000 });
     }).toPass({ timeout: 30_000, intervals: [1_000, 2_000] });

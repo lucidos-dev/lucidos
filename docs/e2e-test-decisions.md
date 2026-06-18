@@ -58,8 +58,8 @@ Both `e2e-browser.sh` and `e2e-api.sh` acquire `~/workspaces/e2e-test/.lucidos/e
 
 ### mobile-webkit navigation wedge — system-proxy (PAC/WPAD) discovery (fixed at source) + a residual cold-start stall
 **Symptom.** On the `mobile-webkit` project, a navigation hangs: the FIRST
-`page.goto('/')` in a fresh context times out (30 s), DOMContentLoaded never
-fires, and a (random) test fails — observed victims rotate over runs
+app-root navigation in a fresh context times out (30 s), the test never reaches
+its app-specific readiness gate, and a (random) test fails — observed victims rotate over runs
 (drawer-divider-thickness, sdk-confirm, drafts, threads, message-route-panel,
 file-search, thread-search, and most recently `file-edit.spec.ts:55` +
 `streaming.spec.ts:49`). It passes on Playwright's fresh-context retry. The flake
@@ -112,7 +112,7 @@ on WebKit/macOS.
 cold-start / document-load stall under heavy host contention.* This one occurs
 **even with no system proxy configured** — directly observed: a clean full
 `mobile-webkit` run on a dev host whose `scutil --proxy` is empty still wedged
-once on its 220th-ish test (`page.goto('/')` DCL-timed-out at 30 s, recovered on
+once on its 220th-ish test (the old DCL-gated `page.goto('/')` timed out at 30 s, recovered on
 the fresh-context retry), at the run's peak contention (after ~220 tests + dozens
 of `claude` subprocess spawns + 20 worktrees). An `about:blank` warmup was tried
 to pre-spawn the render process off the timeout-critical clock and did **not**
@@ -143,9 +143,16 @@ and lossless.
 
 **Safety nets for variant 2 (kept — recovery, not prevention):**
 
-- `gotoWithRetry` (`e2e/helpers.ts`) bounds the hang to 2×30 s (vs. the full 120 s
-  test budget) and re-navigates once; callers assert real readiness explicitly
-  afterwards. No warmup (tried, ineffective — see above).
+- The mobile-webkit `context` fixture (`e2e/fixtures.ts`) now preflights every
+  fresh browser context with a cheap same-origin `/api/v1/health` navigation
+  before the test's `page` fixture is created. If that first navigation cannot
+  commit promptly, the fixture discards the cold context and creates a clean
+  one. This makes "context can reach localhost" a setup invariant instead of
+  letting a random spec be the first consumer of a wedged WebKit context.
+- `gotoWithRetry` (`e2e/helpers.ts`) waits only for the main-document response
+  commit, bounds any pre-commit hang to 2×30 s (vs. the full 120 s test budget),
+  and re-navigates once; callers assert real readiness explicitly afterwards.
+  No warmup (tried, ineffective — see above).
 - The whole-test `retries: 1` stays — a fresh context is what actually clears
   variant 2 (it also absorbs unrelated Chromium context-init flakes).
 - The WebKit RSS reaper (below) stays as the host-memory safety net.
@@ -178,6 +185,28 @@ already excluded; no marker is needed or effective.
   (`c86c2adec`) made an anchor/backdrop target `pointer-events: none` while the
   popover is open and these specs `.click()` it without `force: true`. Separate
   subsystem; tracked separately, not fixed here.
+
+**Follow-up verification (2026-06-16, flaky-recovered nightly).**
+
+- Nightly recovered three first-attempt failures: `mobile-webkit`
+  `paste-link-substitution.spec.ts:124`, `mobile-webkit` `drafts.spec.ts:65`,
+  and `chromium` `coding-agent-stuck-waiting.spec.ts:98`.
+- Focused repeats with `--retries=0` did not reproduce the three reported tests,
+  but a full `mobile-webkit --retries=0` run did reproduce the residual as
+  pre-commit `page.goto('/')` timeouts in unrelated random victims
+  (`drafts.spec.ts:436`, then `repo-files.spec.ts:218`). That proved the old
+  DCL-gated helper was only part of the issue: the remaining wedge can happen
+  before the main response commits.
+- After adding the mobile-webkit context preflight, full `mobile-webkit
+  --retries=0` passed 228/228. Final-source focused reruns also passed the
+  reported/victim set (`paste-link-substitution.spec.ts:124`,
+  `drafts.spec.ts:65`, `drafts.spec.ts:436`, `repo-files.spec.ts:218`) and the
+  mobile navigation suite with retries disabled.
+- The chromium recovered test was independent: its nightly 0 ms failure shape
+  matched setup/worker noise, and it passed focused, repeated, and inside full
+  chromium with `--retries=0`. A separate full-chromium sync failure in
+  `settings-backup-navigation-desktop.spec.ts` was fixed by waiting for the
+  page's SSE stream before emitting the transient `/api/v1/ui/navigate` event.
 
 **What this proves and doesn't.** Variant 1's wedge only reproduces where a system
 proxy/PAC is configured (the managed nightly host on the corp network), so a local

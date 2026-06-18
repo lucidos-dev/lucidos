@@ -208,11 +208,10 @@ function visibleThreadsAndGraph(): { visible: ThreadState[]; graph: FamilyGraph 
 /** Ordered list of visible Current-section thread ids to consider as the next
  *  focus when the user archives `aroundId` — closest below first, then closest
  *  above. Walks the drawer's exact render order (`orderedCurrentForReview`:
- *  family-review sorted, then nested by parent) so "next in queue" is the next
- *  *visible row* — the next family's parent, not a sub-thread that merely sorts
- *  high by its own per-thread review tier. Snapshotted BEFORE the optimistic
- *  flip so the position anchor survives the cascade dropping `aroundId` (and its
- *  descendants) out of Current. */
+ *  creation-time sorted, then nested by parent) so "next in queue" is the next
+ *  *visible row* in the same order the user sees. Snapshotted BEFORE the
+ *  optimistic flip so the position anchor survives the cascade dropping
+ *  `aroundId` (and its descendants) out of Current. */
 function currentCandidatesAround(aroundId: string): string[] {
   const { visible, graph } = visibleThreadsAndGraph();
   const ordered = orderedCurrentForReview(visible, graph);

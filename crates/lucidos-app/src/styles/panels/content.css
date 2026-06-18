@@ -714,8 +714,16 @@
 }
 
 .file-search-result-icon {
-    font-size: 0.875rem;
+    width: 1.25rem;
+    height: 1.25rem;
     flex-shrink: 0;
+    color: var(--text-secondary);
+}
+
+@media (hover: hover) {
+    .file-search-result:hover .file-search-result-icon {
+        color: var(--text-primary);
+    }
 }
 
 .file-search-result-info {
@@ -760,4 +768,3 @@
     flex-shrink: 0;
     margin-top: auto;
 }
-

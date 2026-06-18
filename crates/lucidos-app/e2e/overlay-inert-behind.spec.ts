@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { navigateToApp, assertHealthy } from './helpers';
 
 // While ANY overlay is open, the UI behind it is made inert — no hover

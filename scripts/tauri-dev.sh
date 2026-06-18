@@ -18,6 +18,7 @@ cd "$PROJECT_DIR"
 
 parse_dev_args "$@"
 check_prereqs
+check_tauri_cli
 resolve_workspace
 allocate_ports "$WORKSPACE"
 detect_tls
@@ -32,6 +33,13 @@ ensure_frontend_deps
 build_sdk
 
 start_engine
+
+# ADR 0014: the engine serves the built dist/ directly (LUCIDOS_STATIC_DIR, set
+# by swap_ports) — there is no live Vite dev server in the serving path. Start
+# the shared `vite build --watch` so dist/ exists + rebuilds on change; the
+# window (devUrl below) loads it from the engine. (tauri.conf's beforeDevCommand
+# is now empty — the build-watch is managed here, not by Tauri.)
+start_vite
 show_banner "tauri"
 
 # Kill old Tauri process before launching a new one
@@ -41,17 +49,12 @@ while IFS= read -r tauri_pid; do
     kill "$tauri_pid" 2>/dev/null || true
 done < <(pgrep -f "cargo tauri dev" 2>/dev/null || true)
 
-# Don't call start_vite — cargo tauri dev runs its own beforeDevCommand (npm run dev)
-# which starts Vite. Just export the port env vars Vite needs.
-export VITE_PORT="$INTERNAL_VITE_PORT"
-export API_PORT="$ENGINE_PORT"
-
 trap 'cleanup_processes; exit 0' SIGINT SIGTERM
 
 echo "Launching Tauri desktop app..."
 
 # Run Tauri in foreground — when user closes the window, cleanup trap fires.
-# --config: override devUrl to point at the engine's port (which reverse-proxies to Vite)
+# --config: override devUrl to the engine's port, which serves the built dist/.
 cd "$FRONTEND_DIR"
 cargo tauri dev \
     --no-watch \

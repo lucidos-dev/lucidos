@@ -30,6 +30,58 @@ pub(super) fn rewrite_for_thread_id(html: &str, thread_id: &str) -> String {
     append_query_to_relative_paths(html, &suffix)
 }
 
+/// Re-scope an app UI page's **absolute** engine/asset references with the
+/// workspace path prefix (ADR 0014 §4). Behind the gateway an app iframe loads
+/// at `/<slug>/app/<id>/`, and its absolute refs (`<script src="/api/v1/sdk.js">`
+/// — the documented SDK contract) must route back to this workspace's engine as
+/// `/<slug>/api/v1/sdk.js`. The gateway no longer rewrites bodies, so the engine
+/// does this one adjustment itself from the forwarded prefix.
+///
+/// A `prefix` of `/` (direct access, no gateway) is a no-op. Only root-absolute
+/// refs to engine routes / bundled assets are rewritten; the app's own relative
+/// refs (`./style.css`) already resolve against the iframe URL and are left
+/// alone, and `<script>` BODIES are skipped so inline-JS string literals aren't
+/// corrupted. Idempotent in practice (already-prefixed paths don't re-match).
+pub(super) fn rescope_app_html(html: &str, prefix: &str) -> String {
+    if prefix == "/" {
+        return html.to_string();
+    }
+    // `prefix` is `/<slug>/`; the rewrite inserts `/<slug>` before the matched
+    // root-absolute path (which keeps its own leading `/`).
+    let slug = prefix.trim_end_matches('/');
+
+    static SCRIPT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?si)(<script[\s][^>]*>|<script>)(.*?</script>)")
+            .expect("app rescope script regex must compile")
+    });
+    static ATTR_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?i)((?:src|href)\s*=\s*")(/(?:api/v1/|app/|data/|assets/|icons/|splash/|favicon|manifest\.json|sw\.js)[^"]*)"#,
+        )
+        .expect("app rescope attr regex must compile")
+    });
+
+    let rescope_attrs = |fragment: &str| -> String {
+        ATTR_RE
+            .replace_all(fragment, |caps: &regex::Captures| {
+                format!("{}{}{}", &caps[1], slug, &caps[2])
+            })
+            .into_owned()
+    };
+
+    let mut out = String::with_capacity(html.len() + 16);
+    let mut last_end = 0;
+    for caps in SCRIPT_RE.captures_iter(html) {
+        let full = caps.get(0).unwrap();
+        out.push_str(&rescope_attrs(&html[last_end..full.start()]));
+        out.push_str(&rescope_attrs(&caps[1])); // opening <script ...> attrs
+        out.push_str(&caps[2]); // body + </script> left verbatim
+        last_end = full.end();
+    }
+    out.push_str(&rescope_attrs(&html[last_end..]));
+    out
+}
+
 /// Append a query string (e.g. `?commit=abc123`) to relative src/href attributes in HTML.
 /// Only rewrites in markup — skips `<script>` block *bodies* where template literals like
 /// `src="${var}"` would be incorrectly rewritten. The opening `<script>` tag's own attributes
@@ -109,6 +161,32 @@ mod tests {
             "absolute / anchor / root-path URLs must not be rewritten: {}",
             result
         );
+    }
+
+    #[test]
+    fn rescope_app_html_prefixes_absolute_engine_refs() {
+        let html = r#"<script src="/api/v1/sdk.js"></script><link href="/assets/x.css"><img src="/data/a.png">"#;
+        let out = rescope_app_html(html, "/dev/");
+        assert!(out.contains(r#"<script src="/dev/api/v1/sdk.js">"#));
+        assert!(out.contains(r#"<link href="/dev/assets/x.css">"#));
+        assert!(out.contains(r#"<img src="/dev/data/a.png">"#));
+    }
+
+    #[test]
+    fn rescope_app_html_root_prefix_is_noop() {
+        let html = r#"<script src="/api/v1/sdk.js"></script><link href="style.css">"#;
+        assert_eq!(rescope_app_html(html, "/"), html);
+    }
+
+    #[test]
+    fn rescope_app_html_leaves_relative_and_script_bodies_alone() {
+        // App's own relative refs resolve against the iframe URL — untouched.
+        // Inline-JS string literals containing src="/api/v1/…" must NOT change.
+        let html = r#"<script src="/api/v1/sdk.js">var x='<img src="/api/v1/foo">';</script><link href="./style.css">"#;
+        let out = rescope_app_html(html, "/work/");
+        assert!(out.contains(r#"<script src="/work/api/v1/sdk.js">"#)); // opening tag rewritten
+        assert!(out.contains(r#"var x='<img src="/api/v1/foo">';"#)); // body verbatim
+        assert!(out.contains(r#"href="./style.css""#)); // relative untouched
     }
 
     #[test]

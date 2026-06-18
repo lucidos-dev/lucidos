@@ -1,10 +1,16 @@
+// MUST be first: installs per-workspace localStorage namespacing before any
+// module-init localStorage read (e.g. store/store.ts) — see the module's docs.
+import './utils/workspaceStorage.install';
 import { render } from 'preact';
 import { App } from './App';
+import { WorkspacePicker } from './components/picker/WorkspacePicker';
+import { IS_PICKER } from './utils/basePath';
 import { updateAvailable } from './store/store';
 import { installActionBtnBlurListener } from './components/chat/promptFocus';
 import { isTouchDevice } from './utils/viewport';
 import { openAppById } from './store/actions/apps';
 import './styles/global.css';
+import './styles/picker.css';
 import './styles/header.css';
 import './styles/panels.css';
 import './styles/chat.css';
@@ -27,17 +33,32 @@ installActionBtnBlurListener();
 
 // E2E test hook — Playwright opens an app by id from `page.evaluate`. The
 // real `openApp(app: App)` requires an `App` object that the test doesn't
-// hold, and the production `openAppById` lives behind an ES import the
-// browser can't reach from `page.evaluate`. Gated on non-production builds
-// so the hook ships only in dev/test bundles — Lucidos's e2e runs against
-// the Vite dev server (`MODE === 'development'`) while the desktop release
-// build is `'production'`.
-if (import.meta.env.MODE !== 'production') {
-  (window as unknown as { __openApp?: (id: string) => Promise<void> }).__openApp =
-    openAppById;
-}
+// hold, and `openAppById` lives behind an ES import the browser can't reach
+// from `page.evaluate`. There is no `#app=<id>` hash route to fall back on
+// (the hash router only handles `#thread=` / `#notification=`), so this
+// window hook is the ONLY way the e2e suite can open an app from outside the
+// bundle.
+//
+// Installed unconditionally. The hook MUST be in the e2e bundle, which since
+// ADR 0014 is a production `vite build` (the engine serves a fixed `dist/`;
+// there is no Vite dev server) — the previous `MODE !== 'production'` gate
+// silently stripped it from every e2e build, leaving app-open specs to time
+// out waiting for an iframe that never mounted. e2e also reuses a
+// checkout-shared `dist/` that may have been built by any path, so no
+// build-time flag reliably scopes the hook to e2e. Shipping it everywhere is
+// safe: `openAppById` only opens an already-installed app in the panel
+// overlay — a normal user action that carries no extra privilege.
+(window as unknown as { __openApp?: (id: string) => Promise<void> }).__openApp =
+  openAppById;
 
-render(<App />, document.getElementById('app')!);
+// Decide the root component from the server-stamped `<base href>` (ADR 0014).
+// The gateway serves the picker context with `<base href="/~/">`; a workspace
+// (proxied) or a legacy direct engine gets `/<slug>/` or `/`. So `IS_PICKER`
+// decides synchronously — no probe of the control plane is needed, and the
+// old root-path ambiguity (gateway picker vs. legacy engine, both at `/`) is
+// gone because they now carry different base hrefs.
+const appRoot = document.getElementById('app')!;
+render(IS_PICKER ? <WorkspacePicker /> : <App />, appRoot);
 
 if (import.meta.hot) {
   import.meta.hot.accept();

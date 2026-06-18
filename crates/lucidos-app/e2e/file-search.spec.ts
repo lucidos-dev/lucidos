@@ -1,4 +1,4 @@
-import { test, expect, Page } from '@playwright/test';
+import { test, expect, Page } from './fixtures';
 import { assertHealthy, waitForVisibleInput, isMobileViewport, blurActiveElement, ensureOnThreadPane, openFilesPanel, gotoWithRetry } from './helpers';
 
 /** Open file search — tap on mobile, click on desktop. Waits for the

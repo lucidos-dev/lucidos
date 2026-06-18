@@ -10,6 +10,8 @@ import {
   threadMap,
   isRenderedThreadIdle,
   cancelingThreadIds,
+  removingQueuedMessageIds,
+  queuedMessageRemovalKey,
 } from '../../store/store';
 import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
 import { scrolledUp, awayFromBottom, notAtTop, scrollToBottom, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, hasPendingEventScroll } from './scrollState';
@@ -17,7 +19,7 @@ import { ChatExchange } from './ChatExchange';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
 import type { Exchange } from '../../store/thread-events';
-import { exchangeStatus as getExchangeStatus, exchangeImageCount, exchangeResponseModel, exchangeReasoningEffort, unresumedAbortIndex, activeExchangeIndex, isPendingFollowup } from '../../store/thread-events';
+import { exchangeStatus as getExchangeStatus, exchangeImageCount, exchangeResponseModel, exchangeReasoningEffort, exchangeKey, unresumedAbortIndex, queuedFollowupRun } from '../../store/thread-events';
 import { isActive as isStatusActive } from '../../store/exchange-status';
 import { forceIOSRepaint } from '../../utils/iosRepaint';
 
@@ -46,27 +48,50 @@ export function renderExchanges(
   // Quiescent by raw status, but false while an optimistic resume is in flight
   // (just-answered question / un-ingested follow-up) — see isRenderedThreadIdle.
   const threadIdle = isRenderedThreadIdle(thread);
+  // Backend says the thread is parked on / resuming from a question or
+  // permission card. A just-answered divider whose resume `running` aggregate
+  // hasn't reached the client yet must NOT flash "Aborted" — see exchangeStatus.
+  const threadAwaitingAnswer = threadMeta?.status === 'waiting_for_user_answer';
   const threadCanceling = cancelingThreadIds.value.has(threadId);
   // When the agent is busy (running, or paused on a question), chat follow-ups
-  // typed meanwhile are queued and sort to the end — so the exchange the agent
-  // is actually working on (and that owns the live stream) is the last
-  // NON-pending one, not the literal last. `activeIdx` finds it; the trailing
-  // pending exchanges render as 'Queued' rather than stealing the stream and
-  // the active 'last' role (which would mislabel them 'Working'/'Done').
+  // typed meanwhile are queued. The queue window includes optimistic messages
+  // AND persisted-but-not-yet-injected MessageReceived events, so derive the
+  // active exchange and queued set once at the thread level. Queued exchanges
+  // then render immediately after the active turn as user bubbles only instead
+  // of stealing the live stream or the active 'last' role.
   const threadBusy = threadMeta?.status === 'running' || threadMeta?.status === 'waiting_for_user_answer';
-  const activeIdx = activeExchangeIndex(exchanges, threadBusy);
-  return exchanges.reduce<{ nodes: VNode[]; imgOffset: number; lastModel?: string; lastEffort?: string }>((acc, ex, i) => {
+  const queuedRun = queuedFollowupRun(exchanges, threadBusy, threadIsCC);
+  const activeIdx = queuedRun.activeIndex;
+  const removingQueued = removingQueuedMessageIds.value;
+  const removedQueuedIndices = new Set(queuedRun.queuedOrder.filter((i) => {
+    const messageId = exchanges[i]?.userEvent._eventId;
+    return !!messageId && removingQueued.has(queuedMessageRemovalKey(threadId, messageId));
+  }));
+  const queuedOrder = queuedRun.queuedOrder.filter(i => !removedQueuedIndices.has(i));
+  const queuedIndices = new Set<number>(queuedOrder);
+  const queuedCount = queuedOrder.length;
+  const nodes: VNode[] = [];
+  let imgOffset = 0;
+  let lastModel: string | undefined;
+  let lastEffort: string | undefined;
+
+  const renderOne = (ex: Exchange, i: number): VNode => {
     // The active exchange plays the 'last' role (gets the stream, reads
     // 'streaming'/'working'); queued follow-ups after it are explicitly flagged.
     const isLast = i === activeIdx;
-    const isQueued = threadBusy && i !== activeIdx && isPendingFollowup(ex);
-    // Pass isLast=false for the prior exchange (it's at i-1, never the last
-    // here): a mid-flight chat parent must read as 'streaming' so this
-    // exchange's gate flips to 'queued', not slip through to 'done'.
-    const priorActive = i > 0 && isStatusActive(getExchangeStatus(exchanges[i - 1], '', /* isLast */ false, /* hasPriorActive */ false, threadIsCC, threadIdle));
-    acc.nodes.push(
+    const isQueued = queuedIndices.has(i);
+    // Keep the legacy status fallback for non-queued exchanges; queued display
+    // is driven by queuedRun so persisted follow-ups don't depend on
+    // exchangeStatus' single-last queued branch.
+    const priorActive = i > 0 && isStatusActive(getExchangeStatus(exchanges[i - 1], '', /* isLast */ false, /* hasPriorActive */ false, threadIsCC, threadIdle, threadAwaitingAnswer));
+    return (
       <ChatExchange
-        key={'ex-' + ex.userSeq}
+        // Key by the stable event id (not userSeq) so an optimistic pending
+        // message reconciles IN PLACE when its persisted event arrives — a
+        // userSeq key changes on that swap (MAX_SAFE_INTEGER → real DB seq),
+        // remounting the node and making the just-sent follow-up flicker away
+        // then reappear. See exchangeKey.
+        key={exchangeKey(ex)}
         exchange={ex}
         // Captured as a primitive at render time: the incremental grouping
         // cache mutates Exchange objects in place, so the memo can't see a
@@ -77,21 +102,72 @@ export function renderExchanges(
         isQueued={isQueued}
         threadId={threadId}
         hasPriorActive={priorActive}
-        imageOffset={acc.imgOffset}
-        priorModel={acc.lastModel}
-        priorEffort={acc.lastEffort}
+        imageOffset={imgOffset}
+        priorModel={lastModel}
+        priorEffort={lastEffort}
         isUnresumedAbort={i === unresumedIdx}
         threadIsCC={threadIsCC}
         threadCodingAgent={threadCodingAgent}
         threadIdle={threadIdle}
+        threadAwaitingAnswer={threadAwaitingAnswer}
         threadCanceling={threadCanceling}
       />
     );
-    acc.imgOffset += exchangeImageCount(ex);
-    acc.lastModel = exchangeResponseModel(ex) ?? acc.lastModel;
-    acc.lastEffort = exchangeReasoningEffort(ex) ?? acc.lastEffort;
-    return acc;
-  }, { nodes: [], imgOffset: 0 }).nodes;
+  };
+
+  const advance = (ex: Exchange): void => {
+    imgOffset += exchangeImageCount(ex);
+    lastModel = exchangeResponseModel(ex) ?? lastModel;
+    lastEffort = exchangeReasoningEffort(ex) ?? lastEffort;
+  };
+
+  const renderQueued = (): void => {
+    if (queuedCount === 0) return;
+    if (queuedCount === 1) {
+      const i = queuedOrder[0];
+      const ex = exchanges[i];
+      nodes.push(renderOne(ex, i));
+      advance(ex);
+      return;
+    }
+
+    const queuedNodes: VNode[] = [];
+    for (const j of queuedOrder) {
+      const ex = exchanges[j];
+      queuedNodes.push(renderOne(ex, j));
+      advance(ex);
+    }
+    nodes.push(
+      <details class="queued-message-group" key={`queued-${queuedOrder.join('-')}`}>
+        <summary class="queued-message-group-summary">
+          <span class="queued-message-group-label">{`Queued (${queuedCount})`}</span>
+          <span class="exchange-status-queued">{'○'}</span>
+        </summary>
+        <div class="queued-message-group-body">
+          {queuedNodes}
+        </div>
+      </details>
+    );
+  };
+
+  for (let i = 0; i < exchanges.length;) {
+    if (queuedRun.queuedIndices.has(i)) {
+      i++;
+      continue;
+    }
+
+    const ex = exchanges[i];
+    nodes.push(renderOne(ex, i));
+    advance(ex);
+
+    if (i === activeIdx) {
+      renderQueued();
+    }
+
+    i++;
+  }
+
+  return nodes;
 }
 
 // --- Scroll anchoring for toggle changes (More/Less, Show/Hide Steps) ---

@@ -4,6 +4,10 @@ Working agreement for AI coding agents (Claude Code, Codex) and human contributo
 
 **Decision log.** Non-obvious decisions — especially deliberate *no*s and approaches we backed out of after thinking them through — are recorded in [`docs/adr/`](docs/adr/README.md). Before re-opening a settled design question (or proposing something the codebase pointedly doesn't do), check there for the *why*; when a design dialogue lands on a decision worth not re-litigating, add an entry in the same change.
 
+**Implementation planning.** Complex implementation work must produce an *implementation plan* before the first code edit. "Complex" means ADR-backed or design-thread-backed work, cross-layer changes, routing/topology/storage/security/migration/process changes, or any change where the user intent is more than a local bug fix. Use the repo-owned `implementation-plan` skill (`.claude/skills/implementation-plan/SKILL.md`) to turn the user prompt, any grill/design thread, ADRs/plans, and relevant code reconnaissance into an actionable plan. If decisions are still unsettled, use the `grill` skill first; `implementation-plan` consumes settled decisions and makes them executable. The plan is not actionable until it lists load-bearing implementation invariants, explicit non-goals/deferred work, phase ordering, and a verification strategy for each invariant. Keep those invariants top of mind while editing; do not defer their first appearance to `/harden`.
+
+This is **enforced by a durable *plan marker***, not just convention (see `docs/glossary.md` § plan marker). On a Lucidos-source branch, a marker must exist before the first source edit and before Apply: either run the `implementation-plan` skill (which records it via `lucidos planned mark --plan <docs/plans/file>`), or — for a genuinely local fix — acknowledge that with `lucidos planned mark --simple "<one-line reason>"`. Claude Code's first source edit is blocked by the `cc-plan-gate` PreToolUse hook until a marker exists; Codex (which has no hooks) is reached by the system-prompt rule plus the hard Apply-time floor, which refuses a marker-less Lucidos-source change. App coding-agent threads and external repos are exempt.
+
 Detailed conventions live in `.claude/rules/` files (each has glob frontmatter — Claude reads them when working on matching files).
 
 - `glossary.md` — canonical-terms rule + active-use-and-sharpen rule for design dialogue. Use the word from `system-knowhow/glossary.md` or `docs/glossary.md`, not a synonym; new concept → add an entry in the same change. Loads on any markdown / Rust / TS edit.
@@ -17,7 +21,7 @@ Detailed conventions live in `.claude/rules/` files (each has glob frontmatter �
 
 ## Working in a Workspace
 
-A **workspace** is a directory holding a user's live data — the Postgres event store plus git-tracked artifacts. For development, run your own dedicated dev workspace (`./scripts/web-dev.sh -w ~/workspaces/<name> -b`; see [`README.md`](README.md) § Dev Setup). Multiple workspaces can run concurrently, each on its own ports.
+A **workspace** is a user's live Lucidos instance: a workspace directory with git-tracked artifacts plus one database in the shared Lucidos Postgres cluster. For development, run your own dedicated dev workspace (`./scripts/web-dev.sh -w ~/workspaces/<name> -b`; see [`README.md`](README.md) § Dev Setup). Multiple workspaces can run concurrently, each on its own engine port and database.
 
 - **Reads are always fine; mutations need ownership + confirmation.** Reading a workspace — `psql` SELECT, file/log reads, GET API calls — is safe and often necessary for debugging. Mutating one — restart, rebuild, kill the engine, write/delete files, state-changing API requests (POST/PUT/DELETE) — requires that the workspace is yours *and* that the action is part of an agreed plan (otherwise confirm first). **Never mutate a workspace you don't own.**
 - **Browser testing.** Point a headed browser at your dev workspace's user-facing URL. Each workspace records its assigned ports in `<workspace>/.lucidos/ports`; open `https://localhost:<vite-port>` (plain `http://` if you haven't set up local certs — see README § HTTPS for Local Development).
@@ -88,7 +92,9 @@ Lucidos is a cognitive OS: prompt as primary interface, events as single source 
 - `DATABASE_URL` — Postgres connection string for the engine. **Never hardcode the URL or password into a `psql`/Python invocation** — the engine sets `PGUSER`/`PGPASSWORD`/`PGHOST`/`PGPORT`/`PGDATABASE` in every spawned subprocess (CC sessions, bash + python tools, scheduled scripts), so just run `psql -c '…'` bare. Putting the URL in argv leaks the password into the persisted `Bash` tool-call payload that the steps UI renders.
 - `LUCIDOS_MODEL` — LLM model (default `claude-opus-4-8@default`). `[1m]` = 1M context. `gpt-*` = OpenAI.
 - `VERTEX_PROJECT_ID` / `VERTEX_REGION` — GCP (default region `europe-west1`)
-- `OPENAI_API_KEY` — for `gpt-*` models
+- `OPENAI_API_KEY` — for `gpt-*` models (fallback for the `openai` provider when no `openai` credential is set)
+- `LUCIDOS_OPENROUTER_API_KEY` — fallback for the `openrouter` provider (e.g. GLM 5.2 `z-ai/glm-5.2`) when no `openrouter` credential is set
+- `LUCIDOS_LOCAL_BASE_URL` / `LUCIDOS_LOCAL_API_KEY` — base URL + optional key for the `local` OpenAI-compatible provider (Ollama / LM Studio / vLLM / llama.cpp). Base URL defaults to Ollama `http://localhost:11434/v1`; also settable via the `local_base_url` preference (Settings → Providers). The local provider is built only when a base URL or key is configured.
 - `LUCIDOS_EMBEDDING_MODEL` — embedding model (`bge-small-en-v1.5` or `multilingual-e5-small`, default `multilingual-e5-small`)
 - `LUCIDOS_EXTRACTION_MODEL` — default model the memory extractor falls back to when no per-call override is passed and the `model_memory` preference is also empty (default `gemini-3-flash-preview`)
 - `LUCIDOS_CODEX_PROTOCOL` — which protocol drives Codex sessions: `app-server` (default — persistent JSON-RPC child; permission cards, streaming, graceful interrupt) or `exec` (per-turn `codex exec` escape hatch, sandbox-only guard). See ADR 0005.
@@ -99,7 +105,7 @@ See `docs/taxonomy.md` for the full content taxonomy. Key points:
 
 - `.lucidos/` — gitignored, ephemeral runtime/cache; can be rebuilt.
 - `data/artifacts/` — git-tracked, NEVER auto-delete.
-- `data/postgres/` — gitignored event store.
+- `data/postgres/` — legacy per-workspace Postgres data, kept only on old workspaces until verified shared-Postgres migration + decommission.
 - **Intent** = what the user wants (stable). **Knowhow** = how to achieve it (evolves). **Script** = code invoked by either.
 - **Ownership**: everything lives with its consumer (inside `apps/`, `triggers/`, `knowhow/`).
 - **Survivability test**: "Does this survive if I delete the app?" → top-level. "Only makes sense for this app?" → inside the app.

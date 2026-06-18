@@ -9,6 +9,44 @@ cd "$PROJECT_DIR"
 
 source "$SCRIPT_DIR/lib/workspace.sh"
 
+_workspace_db_for_path() {
+    local ws="$1" saved="${WORKSPACE:-}" db
+    WORKSPACE="$ws"
+    db="$(workspace_database_name)"
+    WORKSPACE="$saved"
+    echo "$db"
+}
+
+_shared_pg_port() {
+    docker inspect --format='{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "$(shared_pg_container)" 2>/dev/null || echo ""
+}
+
+_iter_workspace_dirs() {
+    local reg
+    reg="$(gateway_data_dir)/config/workspaces.json"
+    if [ -f "$reg" ]; then
+        python3 - "$reg" "$(gateway_data_dir)" <<'PY'
+import json, os, sys
+reg, base = sys.argv[1:3]
+try:
+    data = json.load(open(reg))
+except Exception:
+    data = {}
+for w in data.get("workspaces", []):
+    d = w.get("dir")
+    if not d:
+        continue
+    if not os.path.isabs(d):
+        d = os.path.join(base, d)
+    print(d)
+PY
+        return
+    fi
+    for d in "$HOME"/workspaces/*; do
+        [ -d "$d/.lucidos" ] && echo "$d"
+    done
+}
+
 # Resolve a container's workspace directory.
 # Prefers the `lucidos.workspace` label (set by docker-compose.dev.yml).
 # Falls back to the bind-mount source for legacy pre-named-volume containers
@@ -82,18 +120,17 @@ show_workspace_status() {
 
     echo "  Workspace: $ws"
 
-    # Load ports (API + Vite from file, PG from Docker container)
-    local api_port="" vite_port="" pg_port=""
+    # Load ports (API + Vite + shared PG from file when available).
+    local api_port="" vite_port="" pg_port="" pg_database=""
     if [ -f "$ports_file" ]; then
         source "$ports_file"
         api_port="$API_PORT"
         vite_port="$VITE_PORT"
+        pg_port="${PG_PORT:-}"
+        pg_database="${PG_DATABASE:-}"
     fi
-
-    # Read PG port from container
-    local pg_name
-    pg_name=$(printf '%s' "$ws" | cksum | awk '{print $1}')
-    pg_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "lucidos-pg-$pg_name" 2>/dev/null || echo "")
+    [ -n "$pg_port" ] || pg_port="$(_shared_pg_port)"
+    [ -n "$pg_database" ] || pg_database="$(_workspace_db_for_path "$ws")"
 
     if [ -n "$api_port" ]; then
         echo "  Ports:     API=$api_port  Vite=$vite_port  PG=${pg_port:-?}"
@@ -169,13 +206,22 @@ show_workspace_status() {
         echo "  Tauri:     STOPPED"
     fi
 
-    # PostgreSQL status
-    if docker inspect "lucidos-pg-$pg_name" >/dev/null 2>&1; then
+    # PostgreSQL status. Steady state is one shared container + one database per
+    # workspace. A legacy per-workspace container may still exist as rollback
+    # until explicitly decommissioned.
+    if docker inspect "$(shared_pg_container)" >/dev/null 2>&1; then
         local container_status
-        container_status=$(docker inspect --format='{{.State.Status}}' "lucidos-pg-$pg_name" 2>/dev/null || echo "unknown")
-        echo "  PostgreSQL: $container_status (container lucidos-pg-$pg_name, port ${pg_port:-?})"
+        container_status=$(docker inspect --format='{{.State.Status}}' "$(shared_pg_container)" 2>/dev/null || echo "unknown")
+        echo "  PostgreSQL: $container_status shared (container $(shared_pg_container), port ${pg_port:-?}, database ${pg_database:-?})"
     else
-        echo "  PostgreSQL: no container"
+        echo "  PostgreSQL: shared container not found"
+    fi
+    local pg_name
+    pg_name=$(printf '%s' "$ws" | cksum | awk '{print $1}')
+    if docker inspect "lucidos-pg-$pg_name" >/dev/null 2>&1; then
+        local legacy_status
+        legacy_status=$(docker inspect --format='{{.State.Status}}' "lucidos-pg-$pg_name" 2>/dev/null || echo "unknown")
+        echo "  Legacy PG:  $legacy_status (container lucidos-pg-$pg_name; kept for rollback)"
     fi
 
     # API health — reuse the single probe from the top of this function.
@@ -220,11 +266,6 @@ json_workspace_status() {
         api_port="$API_PORT"
         vite_port="$VITE_PORT"
     fi
-
-    # PG port from container
-    local pg_name
-    pg_name=$(printf '%s' "$ws" | cksum | awk '{print $1}')
-    pg_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "lucidos-pg-$pg_name" 2>/dev/null || echo "")
 
     # Engine running? Pidfile liveness OR a responding /health. Consumers of
     # this field (cross-workspace open, the control-panel status dot) hit the
@@ -273,9 +314,8 @@ if [ -n "$JSON_MODE" ]; then
         EXCLUDE_WS="$WORKSPACE"
     fi
 
-    while IFS= read -r container; do
-        [ -z "$container" ] && continue
-        ws_dir=$(_inspect_workspace_dir "$container")
+    while IFS= read -r ws_dir; do
+        [ -z "$ws_dir" ] && continue
         if [ -n "$ws_dir" ]; then
             if [ -d "$ws_dir/.lucidos" ]; then
                 # Skip the requesting workspace
@@ -288,7 +328,7 @@ if [ -n "$JSON_MODE" ]; then
                 ENTRIES="$ENTRIES$(json_workspace_status "$ws_dir")"
             fi
         fi
-    done < <(docker ps --filter "name=lucidos-pg-" --format '{{.Names}}' 2>/dev/null || true)
+    done < <(_iter_workspace_dirs)
 
     printf '{"workspaces":[%s]}\n' "$ENTRIES"
     exit 0
@@ -301,11 +341,11 @@ if [ -n "$WORKSPACE" ]; then
     resolve_workspace_path
     show_workspace_status "$WORKSPACE"
 else
-    # Find workspaces by inspecting running lucidos PG containers
+    # Find workspaces from the shared gateway registry / workspace dirs. A
+    # shared Postgres container no longer identifies individual workspaces.
     FOUND=""
-    while IFS= read -r container; do
-        [ -z "$container" ] && continue
-        ws_dir=$(_inspect_workspace_dir "$container")
+    while IFS= read -r ws_dir; do
+        [ -z "$ws_dir" ] && continue
         if [ -n "$ws_dir" ]; then
             if [ -d "$ws_dir/.lucidos" ]; then
                 if [ -n "$FOUND" ]; then
@@ -316,7 +356,7 @@ else
                 echo ""
             fi
         fi
-    done < <(docker ps --filter "name=lucidos-pg-" --format '{{.Names}}' 2>/dev/null || true)
+    done < <(_iter_workspace_dirs)
 
     if [ -z "$FOUND" ]; then
         echo "No Lucidos workspaces found."

@@ -20,7 +20,13 @@ export type EngineReason =
   | { kind: 'harden_retrigger' }
   | { kind: 'stale_session' }
   | { kind: 'merge_conflict' }
-  | { kind: 'missing_hardening' };
+  | { kind: 'missing_hardening' }
+  | {
+      kind: 'plugin_auto_update';
+      plugin_id: string;
+      marketplace_id: string;
+      marketplace_name: string;
+    };
 
 /** Direction of a `thread_link` origin: which end of the parent⇄child
  *  relationship the linked thread sits on relative to the receiving thread. */
@@ -83,11 +89,6 @@ export const SYSTEM_ICON = '⚙';
  *  it literally raises on its own (recovery, hardening, scheduler, …). */
 export const LUCIDOS_AGENT_LABEL = 'Lucidos Agent';
 
-/** Icon paired with `LUCIDOS_AGENT_LABEL` — used by both the initiator chip
- *  (who started the work) and the executor chip (who produced the response).
- *  Single source so the two panels stay in sync. */
-export const LUCIDOS_AGENT_ICON = '✨';
-
 /** Display label for an external HTTP caller that did NOT self-identify as a
  *  known actor (no device id, no agent-origin token, no cross-workspace
  *  caller). The popover surfaces the User-Agent for forensics; the chip just
@@ -113,28 +114,6 @@ export function originMode(origin: MessageOrigin | undefined): ActorMode {
     case 'thread_link': return origin.mode ?? 'agent';
     case 'engine':      return 'engine';
     case 'system':      return 'engine';
-  }
-}
-
-/** Map a `MessageOrigin` to its display icon + label. The chip answers "who
- *  decided this" with one of the closed set of known actors: **You** (a real
- *  browser device), **Lucidos Agent** (LLM acting on behalf of the user),
- *  **Lucidos Engine** (deterministic engine work), **System** (host killed the
- *  process), or **API caller** (external HTTP caller that did NOT self-identify
- *  as one of the above).
- *
- *  "You" is reserved for `kind: device` — a browser session bound to a known
- *  device row. Any other human-mode origin (anonymous API client, cross-workspace
- *  human, …) renders as "API caller" so an unauthenticated POST can never
- *  impersonate the user in the timeline. The popover still discloses the
- *  origin kind, user-agent, and workspace name underneath. */
-export function actorInitiator(actor: MessageOrigin | undefined): { icon: string; label: string } {
-  if (actor?.kind === 'system') return { icon: SYSTEM_ICON, label: SYSTEM_LABEL };
-  if (actor?.kind === 'device') return { icon: '\u{1F464}', label: 'You' };
-  switch (originMode(actor)) {
-    case 'human':  return { icon: API_CALLER_ICON, label: API_CALLER_LABEL };
-    case 'agent':  return { icon: LUCIDOS_AGENT_ICON, label: LUCIDOS_AGENT_LABEL };
-    case 'engine': return { icon: ENGINE_ICON, label: ENGINE_LABEL };
   }
 }
 
@@ -177,6 +156,28 @@ export function responseAbortedSummary(
  *  cancel cause is surfaced in the Initiator info popover instead. */
 export const RESPONSE_CANCELED_SUMMARY = 'Response canceled';
 
+/** ContinuationStarted.reason emitted when the engine auto-resumes a coding
+ *  agent after its subprocess died WITHOUT an engine restart — a hung-API
+ *  watchdog fire OR a stray signal-kill (e.g. another workspace's `cargo check`
+ *  broad-kill landing on this CC subprocess). Distinct from a user clicking
+ *  "continue" after a real restart, which DOES warrant the restart wording. */
+export const CONTINUATION_AUTO_RECOVERY_REASON = 'auto_recovery_after_hang';
+
+/** Header label / preview text for a `ContinuationStarted` turn. The reason
+ *  takes precedence: an `auto_recovery_after_hang` resume is a LOCAL
+ *  interruption (hang or stray signal-kill), never an engine restart, so it
+ *  must not claim "Resumed after engine restart" (which once made a user think
+ *  restarting an unrelated workspace had restarted theirs). A human actor means
+ *  the user clicked Continue; anything else on a restart-recovery continuation
+ *  is the engine resuming after a real restart. */
+export function continuationStartedSummary(
+  reason: string | undefined,
+  actor: MessageOrigin | undefined,
+): string {
+  if (reason === CONTINUATION_AUTO_RECOVERY_REASON) return 'Resumed after an interruption';
+  return originMode(actor) === 'human' ? 'Continued the response' : 'Resumed after engine restart';
+}
+
 // Persisted thread events — stored in DB, appear in snapshots.
 // Optional fields (`?`) allow older DB rows (before the field was added) to deserialize safely.
 /** Mirrors the Rust `ChildCompletionStatus` (serde rename_all = "snake_case").
@@ -192,6 +193,7 @@ export type PersistScope = 'narrow' | 'broad' | 'session';
 
 export type ThreadEvent =
   | { type: 'MessageReceived'; text: string; channel?: EventChannel; user_image_hashes?: string[]; device_id?: string; device?: string; image_description?: string; mode?: ActorMode; model?: string; reasoning_effort?: string; parent_thread_id?: string; spawning_event_id?: string; origin?: MessageOrigin }
+  | { type: 'QueuedMessageRemoved'; removed_message_id: string; actor?: MessageOrigin; channel?: EventChannel }
   | { type: 'TextStreamed'; text: string }
   | { type: 'ThoughtStreamed'; text: string; context_tokens?: number; context_messages?: number; trimmed?: boolean }
   // ContextTokensMeasured / ContextAssembled are legacy event types — old DB
@@ -237,7 +239,12 @@ export type ThreadEvent =
   | { type: 'ResponseAborted'; text?: string; images?: string[]; model?: string; reasoning_effort?: string; request_event_id?: string; actor?: MessageOrigin; channel?: EventChannel; cause?: AbortCause }
   | { type: 'ResponseFailed'; error: string; request_event_id?: string; channel?: EventChannel }
   | { type: 'SessionStarted'; session_id: string; branch?: string; repo_id?: string; coding_agent?: CodingAgent }
-  | { type: 'ContinuationStarted'; branch?: string; origin?: MessageOrigin; actor?: MessageOrigin }
+  // `reason` mirrors the originating ContinuationRequested.reason. It lets the
+  // timeline label the resume honestly: 'user_clicked_continue' is a genuine
+  // resume after an engine restart, but 'auto_recovery_after_hang' fires for a
+  // hung subprocess OR a stray signal-kill (e.g. a cross-workspace `cargo check`
+  // broad-kill) where nothing restarted. Absent on legacy rows + the chat rerun.
+  | { type: 'ContinuationStarted'; branch?: string; origin?: MessageOrigin; actor?: MessageOrigin; reason?: string }
   // SessionEnded.reason is loosely typed to tolerate legacy DB rows whose
   // payloads carry removed values like 'completed' / 'changes_proposed' /
   // 'auto_ended' / 'user_ended' / 'stale_resume' / 'discarded'. The current
@@ -252,6 +259,12 @@ export type ThreadEvent =
   | { type: 'CodingAgentPromptSent'; text: string; origin?: MessageOrigin; coding_agent?: CodingAgent }
   | { type: 'MissingHardeningDetected'; origin?: MessageOrigin }
   | { type: 'CodingAgentIdled'; has_changes?: boolean; requires_restart?: boolean; is_external_repo?: boolean; cc_session_id?: string; coding_agent?: CodingAgent }
+  // Continuation requested — emitted when an interrupted CC turn (engine restart
+  // mid-turn, watchdog, missing-hardening sweep) needs to resume without a new
+  // user message. The spawn dispatcher picks it up and re-spawns via --resume.
+  // Past name `ContinueSignal` (serde alias on the Rust side). `reason` is a
+  // short informational tag (e.g. "engine_restart_interrupt").
+  | { type: 'ContinuationRequested'; reason?: string }
   | { type: 'ThreadTitleGenerated'; title: string }
   | { type: 'ThreadTitleRenamed'; title: string; actor?: MessageOrigin }
   | { type: 'ThreadSaved'; actor?: MessageOrigin }
@@ -259,6 +272,10 @@ export type ThreadEvent =
   | { type: 'ThreadArchived'; actor?: MessageOrigin }
   | { type: 'ThreadStarted'; mode: string; actor?: MessageOrigin }
   | { type: 'ThreadDiscarded'; actor?: MessageOrigin; discarded_at?: string }
+  // A user attached an image to a compose draft (POST /threads/:id/blobs).
+  // `hash` (sha256) is the sole identity downstream consumers use; `mime` /
+  // `byte_size` are convenience fields for rendering the upload entry.
+  | { type: 'ImageUploaded'; hash: string; mime: string; byte_size: number; actor?: MessageOrigin }
   | { type: 'TriggerStarted'; trigger_id: string; trigger_name?: string; prompt?: string; invocation?: TriggerInvocation; origin?: MessageOrigin }
   | { type: 'TriggerCompleted'; trigger_id: string; trigger_name?: string; result_summary?: string }
   | { type: 'ChangeProposed'; change_id?: string; description?: string; files?: string[]; requires_restart?: boolean; path?: string; diff?: string; origin?: MessageOrigin; commit_sha?: string; incomplete?: boolean }
@@ -266,7 +283,16 @@ export type ThreadEvent =
   | { type: 'ChangeDiscarded'; change_id?: string; actor?: MessageOrigin; path?: string }
   | { type: 'ChangeReverted'; change_id?: string; actor?: MessageOrigin; path?: string }
   | { type: 'ChangeApplyFailed'; change_id?: string; error?: string; actor?: MessageOrigin }
+  // A change's working tree was hardened (`/harden` marker stamped on HEAD).
+  // Passive change-lifecycle bookkeeping — projection tracks only the latest
+  // event per change_id.
+  | { type: 'ChangeHardened'; change_id?: string; actor?: MessageOrigin }
   | { type: 'MergeConflictDetected'; change_id?: string; files?: string[]; origin?: MessageOrigin }
+  // Merge-resolution worktree lifecycle. Started sets the change's
+  // merge_worktree_path / merge_temp_branch until Cleared tears it down.
+  // Both survive restart so startup cleanup can find dangling worktrees.
+  | { type: 'MergeResolutionStarted'; change_id?: string; worktree_path?: string; temp_branch?: string }
+  | { type: 'MergeResolutionCleared'; change_id?: string }
   | { type: 'UserPromptInjected'; text: string; mode?: ActorMode; origin?: MessageOrigin; injected_message_id?: string }
   | { type: 'CredentialRequested'; provider: string }
   | { type: 'McpConsentRequested'; tool: string; args: unknown }
@@ -284,6 +310,24 @@ export type ThreadEvent =
   | { type: 'CommandCheckpointed'; checkpoint_id: string; command: string; summary: string }
   | { type: 'CommandCheckpointReverted'; checkpoint_id: string; actor?: MessageOrigin }
   | { type: 'ChildThreadCompleted'; child_thread_id: string; child_thread_title?: string; status: ChildCompletionStatus; summary: string; pending_change_ids?: string[] }
+  // ── Passive / bookkeeping events ──────────────────────────────────────
+  // None of these render in the timeline (EventClass::Metadata in Rust, no
+  // exchange-render case, excluded from EXCHANGE_START_TYPES). They belong on
+  // the union so projections / SSE handlers can pattern-match on `event.type`
+  // without `as` casts, and so the union-coverage contract test stays green.
+  //
+  // Background worktree cleanup (Phase 10.2). tier=1 stripped build artifacts;
+  // tier=2 removed the whole worktree; freed_bytes is best-effort;
+  // branch_deleted is true when Tier 2 also dropped a fully-merged branch.
+  | { type: 'WorktreeCleaned'; tier: number; freed_bytes: number; branch_deleted?: boolean }
+  // The agent dropped a prior ToolCalled/ToolResult/ChildThreadCompleted from
+  // future resume context via the `dismiss_from_context` tool.
+  | { type: 'ContextDismissed'; dismissed_event_id: string }
+  // Background task lifecycle (run_bash_background / run_python_background). The
+  // durable audit trail behind the bash_output / bash_kill tools; `command` is
+  // the exact shell invocation. Started is paired with a later Completed.
+  | { type: 'BackgroundBashStarted'; task_id: string; command: string; timeout_secs: number; started_at: string }
+  | { type: 'BackgroundBashCompleted'; task_id: string; command: string; exit_code: number | null; stdout: string; stderr: string; started_at: string; finished_at: string; timed_out?: boolean; killed?: boolean }
   // Background Flash enrichment of a prior MessageReceived's attached images
   // (one event per attached hash, all carrying the same description text).
   // Replaces the deprecated `image_description` field on MessageReceived; new
@@ -292,6 +336,89 @@ export type ThreadEvent =
   // title-generation paths — but the type belongs on the union so projections
   // can pattern-match without `as` casts when the SSE stream delivers one.
   | { type: 'ImageDescribed'; source_event_id: string; hash: string; description: string; model: string };
+
+/** Every `ThreadEvent['type']` discriminant, as a compile-time-checked object.
+ *  The `satisfies Record<ThreadEvent['type'], true>` annotation forces this map
+ *  to stay in EXACT lockstep with the union above: add a variant and `tsc`
+ *  fails until you add its key here; remove one and the excess key fails. This
+ *  is the only runtime-enumerable view of the union (TS types are erased), so
+ *  the union-coverage contract test (`src/generated/thread-event-union.test.ts`)
+ *  reads `THREAD_EVENT_TYPE_NAMES` to assert every generated
+ *  `EVENT_CLASSIFICATION` entry has a matching payload member here — the guard
+ *  that turns Rust→TS event drift from silent into a failing test. */
+const THREAD_EVENT_TYPE_FLAGS = {
+  MessageReceived: true,
+  QueuedMessageRemoved: true,
+  TextStreamed: true,
+  ThoughtStreamed: true,
+  ContextTokensMeasured: true,
+  ContextAssembled: true,
+  ContextCaptured: true,
+  MemorySearched: true,
+  ToolCalled: true,
+  ToolResult: true,
+  TodoListWritten: true,
+  ResponseGenerated: true,
+  ResponseCanceled: true,
+  ResponseAborted: true,
+  ResponseFailed: true,
+  SessionStarted: true,
+  ContinuationStarted: true,
+  SessionEnded: true,
+  CodingAgentTextStreamed: true,
+  CodingAgentToolCalled: true,
+  CodingAgentToolResult: true,
+  CodingAgentUserMessageSent: true,
+  CodingAgentPromptSent: true,
+  MissingHardeningDetected: true,
+  CodingAgentIdled: true,
+  ContinuationRequested: true,
+  ThreadTitleGenerated: true,
+  ThreadTitleRenamed: true,
+  ThreadSaved: true,
+  ThreadUnsaved: true,
+  ThreadArchived: true,
+  ThreadStarted: true,
+  ThreadDiscarded: true,
+  ImageUploaded: true,
+  TriggerStarted: true,
+  TriggerCompleted: true,
+  ChangeProposed: true,
+  ChangeApplied: true,
+  ChangeDiscarded: true,
+  ChangeReverted: true,
+  ChangeApplyFailed: true,
+  ChangeHardened: true,
+  MergeConflictDetected: true,
+  MergeResolutionStarted: true,
+  MergeResolutionCleared: true,
+  UserPromptInjected: true,
+  CredentialRequested: true,
+  McpConsentRequested: true,
+  CodingAgentSettingsChanged: true,
+  UserQuestionAsked: true,
+  UserQuestionAnswered: true,
+  CodingAgentPermissionRequest: true,
+  CodingAgentPermissionResolved: true,
+  CommandPermissionRequested: true,
+  CommandPermissionResolved: true,
+  CommandCheckpointed: true,
+  CommandCheckpointReverted: true,
+  ChildThreadCompleted: true,
+  WorktreeCleaned: true,
+  ContextDismissed: true,
+  BackgroundBashStarted: true,
+  BackgroundBashCompleted: true,
+  ImageDescribed: true,
+} satisfies Record<ThreadEvent['type'], true>;
+
+/** Runtime-enumerable set of every `ThreadEvent['type']` discriminant. Derived
+ *  from `THREAD_EVENT_TYPE_FLAGS`, so it inherits that map's compile-time
+ *  exhaustiveness against the union. Consumed by the union-coverage contract
+ *  test. */
+export const THREAD_EVENT_TYPE_NAMES: ReadonlySet<ThreadEvent['type']> = new Set(
+  Object.keys(THREAD_EVENT_TYPE_FLAGS) as ThreadEvent['type'][],
+);
 
 /** See `system-knowhow/glossary.md` § Todo item. `abandoned` is engine-only:
  *  the engine flips any pending/in_progress item to `abandoned` at response
@@ -354,6 +481,7 @@ export type TransientEvent =
   | { type: 'AppUiCaptureRequested'; app_id: string; request_id: string }
   | { type: 'NavigationRequested'; payload: string }
   | { type: 'CodingAgentThreadSpawned'; cc_thread_id: string; title: string; coding_agent?: CodingAgent }
+  | { type: 'CodingAgentDiffChanged'; has_diff: boolean }
   | { type: 'ChildrenCountChanged'; active: number; total: number };
 
 export type StoredEvent = ThreadEvent & { created?: string; _displayCreated?: string; _eventId?: string };

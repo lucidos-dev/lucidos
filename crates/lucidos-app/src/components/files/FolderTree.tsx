@@ -2,7 +2,7 @@ import type { ComponentChildren } from 'preact';
 import { artifacts, expandedFolders } from '../../store/store';
 import { toggleFolder, buildFolderTree, openFilePreview } from '../../store/actions/artifacts';
 import type { FolderNode } from '../../store/actions/artifacts';
-import { getEmojiForFile } from '../../utils/fileIcons';
+import { FileTypeIcon, FolderIcon } from '../../utils/fileIcons';
 import { loadedOr } from '../../store/types';
 
 type FileEntry = { name: string; path: string };
@@ -59,7 +59,7 @@ export function TreeNode({
           <div key={folderPath} class="folder-item" style={{ paddingLeft: `${indent}rem` }}>
             <div class="folder-header" onClick={() => onToggle(folderPath)}>
               <span class="folder-arrow">{expanded ? '\u25BC' : '\u25B6'}</span>
-              <span class="folder-icon">📁</span>
+              <FolderIcon className="folder-icon" />
               <span class="folder-name">{folderName}</span>
               <span class="folder-count">({childCount})</span>
               {folderExtra?.(folder)}
@@ -82,21 +82,18 @@ export function TreeNode({
         );
       })}
 
-      {files.map((file) => {
-        const emoji = getEmojiForFile(file.path);
-        return (
-          <div
-            key={file.path}
-            class={`file-item ${fileClass?.(file) ?? ''}`}
-            style={{ paddingLeft: `${indent + 1.25}rem` }}
-            onClick={() => onFileClick(file.path)}
-          >
-            <span class="file-icon">{emoji}</span>
-            <span class="file-name">{file.name}</span>
-            {fileExtra?.(file)}
-          </div>
-        );
-      })}
+      {files.map((file) => (
+        <div
+          key={file.path}
+          class={`file-item ${fileClass?.(file) ?? ''}`}
+          style={{ paddingLeft: `${indent + 1.25}rem` }}
+          onClick={() => onFileClick(file.path)}
+        >
+          <FileTypeIcon path={file.path} className="file-icon" />
+          <span class="file-name">{file.name}</span>
+          {fileExtra?.(file)}
+        </div>
+      ))}
     </>
   );
 }

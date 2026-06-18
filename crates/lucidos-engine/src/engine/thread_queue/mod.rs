@@ -2,7 +2,7 @@
 //!
 //! One shared capacity pool gates every path that creates running work:
 //! event-trigger fires, cron fires, agent-driven sub-thread spawns
-//! (`run_thread`), coding-agent spawns (`run_claude`), agent-mode chat POSTs
+//! (`run_thread`), coding-agent spawns (`run_coding_agent`), agent-mode chat POSTs
 //! (cross-workspace tasks / `lucidos spawn-thread`), AND user-initiated chat /
 //! user-typed coding-agent threads.
 //!

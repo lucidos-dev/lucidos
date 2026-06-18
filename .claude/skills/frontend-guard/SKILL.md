@@ -11,10 +11,10 @@ Use these — never hardcode the raw values:
 
 | Token | Value | Use for |
 |-------|-------|---------|
-| `--bg-primary` | `#0d1117` | Page/app background |
-| `--bg-secondary` | `#161b22` | Cards, elevated surfaces |
-| `--bg-tertiary` | `#21262d` | Inputs, hover states, code blocks |
-| `--border-color` | `#30363d` | All borders |
+| `--bg-primary` | `#0b2342` | Page/app background |
+| `--bg-secondary` | `#122c50` | Cards, elevated surfaces |
+| `--bg-tertiary` | `#1b3a60` | Inputs, hover states, code blocks |
+| `--border-color` | `#324f76` | All borders |
 | `--text-primary` | `#e6edf3` | Headings, important text |
 | `--text-secondary` | `#8b949e` | Supporting text |
 | `--text-muted` | `#6e7681` | Timestamps, hints |

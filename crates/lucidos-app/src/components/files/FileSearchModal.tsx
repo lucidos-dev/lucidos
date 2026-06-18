@@ -5,7 +5,7 @@ import {
 } from '../../store/store';
 import { openFilePreview } from '../../store/actions/artifacts';
 import { openRepoFilePreview } from '../../store/actions/repositories';
-import { getEmojiForFile } from '../../utils/fileIcons';
+import { FileTypeIcon } from '../../utils/fileIcons';
 import {
   collectSearchResults, filterSearchResults, type FileSearchResult,
 } from './fileSearch';
@@ -148,7 +148,6 @@ function FileSearchPanel() {
           filtered.map((result, index) => {
             const name = result.path.split('/').pop() || result.path;
             const dir = result.path.includes('/') ? result.path.substring(0, result.path.lastIndexOf('/')) : '';
-            const emoji = getEmojiForFile(result.path);
             return (
               <button
                 key={`${result.source}:${result.path}`}
@@ -156,7 +155,7 @@ function FileSearchPanel() {
                 onMouseEnter={() => setSelectedIndex(index)}
                 onClick={() => selectResult(result)}
               >
-                <span class="file-search-result-icon">{emoji}</span>
+                <FileTypeIcon path={result.path} className="file-search-result-icon" />
                 <span class="file-search-result-info">
                   <span class="file-search-result-name">{name}</span>
                   {dir && <span class="file-search-result-path">{dir}</span>}

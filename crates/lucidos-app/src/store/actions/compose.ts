@@ -48,9 +48,9 @@ function scopeEquals(a: Scope, b: Scope): boolean {
  *  and the picker is hidden anyway. */
 export function applyDestination(threadId: string | null, d: ComposeDestination): void {
   const mode: ComposeMode = d.kind === 'coding' ? 'claude_code' : 'lucidos';
-  const modeType = mode === 'claude_code' ? 'claude_code' : 'do';
+  const modeType = mode === 'claude_code' ? 'coding_agent' : 'do';
   if (inputMode.value.type !== modeType) {
-    inputMode.value = mode === 'claude_code' ? { type: 'claude_code' } : { type: 'do' };
+    inputMode.value = mode === 'claude_code' ? { type: 'coding_agent' } : { type: 'do' };
   }
   if (d.kind === 'coding' && !scopeEquals(selectedScope.value, d.scope)) {
     selectedScope.value = d.scope;
@@ -71,7 +71,7 @@ interface ComposePatch {
 }
 
 export function currentComposeMode(): ComposeMode {
-  return inputMode.value.type === 'claude_code' ? 'claude_code' : 'lucidos';
+  return inputMode.value.type === 'coding_agent' ? 'claude_code' : 'lucidos';
 }
 
 /** Debounce window between keystrokes and the server PUT. Short enough that a
@@ -374,7 +374,7 @@ function isAlreadyGone(err: unknown): boolean {
  *  the typed text — losing it would be the worst possible UX. */
 export async function sendCompose(
   threadId: string,
-  opts: { useClaudeCode?: boolean; context?: ChatContext | null; focus?: boolean },
+  opts: { useCodingAgent?: boolean; context?: ChatContext | null; focus?: boolean },
 ): Promise<void> {
   const thread = threadMap.value.get(threadId);
   if (!thread) return;
@@ -387,20 +387,20 @@ export async function sendCompose(
   cancelPendingPush(threadId);
   // Bind here so sendMessage doesn't have to detect first-send vs follow-up
   // (see frontend.md "Drafts Are Threads"). selectedScope may drift afterward.
-  // Channel is locked from `opts.useClaudeCode` (which the caller resolved
+  // Channel is locked from `opts.useCodingAgent` (which the caller resolved
   // via effectiveSendMode) rather than the existing meta.channel: the latter
   // was stamped at first-keystroke time from `currentComposeMode()` and goes
   // stale the moment the user toggles. Without this lock, sendMessage reads
-  // the stale channel, ignores the explicit useClaudeCode option, and routes
-  // a "Claude" send through Lucidos (or vice versa).
+  // the stale channel, ignores the explicit useCodingAgent option, and routes
+  // a coding-agent send through the Lucidos Agent (or vice versa).
   const scope = selectedScope.value;
-  const boundRepoId = opts.useClaudeCode && scope.kind === 'external' ? scope.repoId : undefined;
-  const boundCodingAgentKind = opts.useClaudeCode ? scope.kind : undefined;
-  const boundCodingAgentFolder = opts.useClaudeCode && scope.kind === 'app'
+  const boundRepoId = opts.useCodingAgent && scope.kind === 'external' ? scope.repoId : undefined;
+  const boundCodingAgentKind = opts.useCodingAgent ? scope.kind : undefined;
+  const boundCodingAgentFolder = opts.useCodingAgent && scope.kind === 'app'
     ? `data/apps/${scope.appId}`
     : undefined;
-  const boundChannel: ThreadMeta['channel'] = opts.useClaudeCode ? 'claude_code' : 'chat';
-  const boundCodingAgent = opts.useClaudeCode ? selectedCodingAgent.value : undefined;
+  const boundChannel: ThreadMeta['channel'] = opts.useCodingAgent ? 'claude_code' : 'chat';
+  const boundCodingAgent = opts.useCodingAgent ? selectedCodingAgent.value : undefined;
   mutateThreadMeta(threadId, {
     state: 'active',
     channel: boundChannel,
@@ -417,7 +417,7 @@ export async function sendCompose(
   if (shouldFocus) setFocusedThread(threadId);
   try {
     await sendMessage(text, wireHashes.length > 0 ? wireHashes : undefined, {
-      useClaudeCode: opts.useClaudeCode,
+      useCodingAgent: opts.useCodingAgent,
       context: opts.context,
       threadId,
       focus: shouldFocus,
@@ -436,7 +436,7 @@ export async function sendCompose(
     // hand-off's explicit sibling on their own. Idempotence lives inside the
     // helper; savePreference surfaces a failed write via toast, so
     // fire-and-forget is safe here.
-    if (opts.useClaudeCode) {
+    if (opts.useCodingAgent) {
       void dismissComposeHandoffHint();
     }
   } catch (err) {
@@ -464,7 +464,7 @@ export async function sendFollowup(
   threadId: string,
   text: string,
   imageHashes?: string[],
-  opts?: { useClaudeCode?: boolean; context?: ChatContext | null; focus?: boolean },
+  opts?: { useCodingAgent?: boolean; context?: ChatContext | null; focus?: boolean },
 ): Promise<void> {
   // Must run before the draft clear — see `markHashesAsSent`.
   if (imageHashes?.length) markHashesAsSent(imageHashes);

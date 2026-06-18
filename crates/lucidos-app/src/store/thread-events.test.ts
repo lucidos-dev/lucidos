@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { actorInitiator, originMode } from './thread-events';
+import { originMode } from './thread-events';
 import type { MessageOrigin, ActorMode, EngineReason, ThreadEvent } from './thread-events';
 
 describe('MessageOrigin type', () => {
@@ -108,61 +108,5 @@ describe('originMode', () => {
   });
   it('undefined → engine', () => {
     expect(originMode(undefined)).toBe('engine');
-  });
-});
-
-describe('actorInitiator (closed set: You / Lucidos Agent / Lucidos Engine / System / API caller)', () => {
-  it('device → You (the only origin that is unambiguously the user)', () => {
-    expect(actorInitiator({ kind: 'device', device_id: 'd', label: 'L' }))
-      .toEqual({ icon: '\u{1F464}', label: 'You' });
-  });
-  it('api with default mode → API caller (anonymous HTTP, never impersonates the user)', () => {
-    // Regression: a Lucidos agent that POSTed via raw urllib without forwarding
-    // x-lucidos-agent-origin-token used to land as Api{Human} and the chip
-    // rendered "You". The chip now refuses to call any non-device origin
-    // "You"; the popover still discloses the User-Agent.
-    expect(actorInitiator({ kind: 'api' })).toEqual({ icon: '🔌', label: 'API caller' });
-  });
-  it('api with explicit mode=human → API caller', () => {
-    expect(actorInitiator({ kind: 'api', mode: 'human', user_agent: 'curl/8' }))
-      .toEqual({ icon: '🔌', label: 'API caller' });
-  });
-  it('api with mode=agent → Lucidos Agent', () => {
-    expect(actorInitiator({ kind: 'api', mode: 'agent' }))
-      .toEqual({ icon: '✨', label: 'Lucidos Agent' });
-  });
-  it('api with mode=engine → Lucidos Engine', () => {
-    expect(actorInitiator({ kind: 'api', mode: 'engine' }))
-      .toEqual({ icon: '⬡', label: 'Lucidos Engine' });
-  });
-  it('workspace with mode=human → API caller (a human in another workspace is not "You" here)', () => {
-    expect(actorInitiator({ kind: 'workspace', workspace: 'p', mode: 'human' }))
-      .toEqual({ icon: '🔌', label: 'API caller' });
-  });
-  it('workspace with mode=agent → Lucidos Agent', () => {
-    expect(actorInitiator({ kind: 'workspace', workspace: 'p', mode: 'agent' }))
-      .toEqual({ icon: '✨', label: 'Lucidos Agent' });
-  });
-  it('workspace with mode=engine → Lucidos Engine', () => {
-    expect(actorInitiator({ kind: 'workspace', workspace: 'p', mode: 'engine' }))
-      .toEqual({ icon: '⬡', label: 'Lucidos Engine' });
-  });
-  it('parent_thread (default mode=agent) → Lucidos Agent', () => {
-    expect(actorInitiator({ kind: 'thread_link', thread_id: 't' }))
-      .toEqual({ icon: '✨', label: 'Lucidos Agent' });
-  });
-  it('parent_thread with mode=engine → Lucidos Engine', () => {
-    expect(actorInitiator({ kind: 'thread_link', thread_id: 't', mode: 'engine' }))
-      .toEqual({ icon: '⬡', label: 'Lucidos Engine' });
-  });
-  it('engine origin → Lucidos Engine', () => {
-    expect(actorInitiator({ kind: 'engine', reason: { kind: 'session_recovered' } }))
-      .toEqual({ icon: '⬡', label: 'Lucidos Engine' });
-  });
-  it('system origin → System (distinct from engine — process killed by host, not engine-deliberate)', () => {
-    expect(actorInitiator({ kind: 'system' })).toEqual({ icon: '⚙', label: 'System' });
-  });
-  it('undefined origin → Lucidos Engine', () => {
-    expect(actorInitiator(undefined)).toEqual({ icon: '⬡', label: 'Lucidos Engine' });
   });
 });

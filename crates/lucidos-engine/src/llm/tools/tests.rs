@@ -74,6 +74,44 @@ fn load_knowhow_schema_example_resolves_to_shipped_knowhow() {
     );
 }
 
+#[test]
+fn register_plugin_marketplace_is_in_chat_agent_default_tools() {
+    let tools = get_default_tools();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == tn::REGISTER_PLUGIN_MARKETPLACE)
+        .expect("register_plugin_marketplace must be in the default chat tool set");
+
+    let props = tool
+        .parameters
+        .get("properties")
+        .expect("register_plugin_marketplace must declare properties");
+    let source = props
+        .get("source")
+        .expect("register_plugin_marketplace must accept source");
+    assert_eq!(
+        source.get("type").and_then(|v| v.as_str()),
+        Some("string"),
+        "source must be a string"
+    );
+    assert!(
+        props.get("name").is_some(),
+        "register_plugin_marketplace must accept optional display name"
+    );
+
+    let required = tool
+        .parameters
+        .get("required")
+        .and_then(|v| v.as_array())
+        .expect("register_plugin_marketplace schema must declare required fields");
+    let required_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+    assert!(
+        required_names.contains(&"source"),
+        "`source` must be required, got: {:?}",
+        required_names,
+    );
+}
+
 /// The chat agent's `ask_user_question` MUST expose the same schema CC's
 /// `AskUserQuestion` does, because the same engine-side parser
 /// (`parse_ask_user_question_inputs`) consumes both. Drift here would make

@@ -52,7 +52,7 @@ impl LucidosEngine {
         // scripts hit the API mid-restart and fail.
         self.mark_shutting_down();
 
-        // `all_cc_thread_ids` covers idle Claude Code sessions too — their run loop
+        // `all_cc_thread_ids` covers idle coding-agent sessions too — their run loop
         // stays registered in `active_threads` between turns, so they show up
         // in `processing_thread_ids()` and must be excluded from the chat
         // bucket. `cc_thread_ids` (in-flight only) and `external_emitted_flags`
@@ -235,7 +235,7 @@ impl LucidosEngine {
         }
     }
 
-    /// Gracefully stop all running Claude Code sessions.
+    /// Gracefully stop all running coding-agent sessions.
     /// Sends interrupt to active sessions, waits for them to produce
     /// a Result event and go idle (persisting cc_session_id in CodingAgentIdled),
     /// then cancels remaining sessions.
@@ -303,7 +303,7 @@ impl LucidosEngine {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
-        log!("[Shutdown] Claude Code sessions stopped.");
+        log!("[Shutdown] Coding-agent sessions stopped.");
     }
 
 }

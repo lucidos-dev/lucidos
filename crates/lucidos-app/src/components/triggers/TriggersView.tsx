@@ -1,4 +1,4 @@
-import { useState } from 'preact/hooks';
+import { useState, useRef } from 'preact/hooks';
 import { triggers, triggerGroups, collapsedTriggerGroupIds, showToast } from '../../store/store';
 import { openAddTrigger } from '../../store/actions/triggers';
 import { createTriggerGroup } from '../../store/actions/triggerGroups';
@@ -25,10 +25,17 @@ export function TriggersView() {
   const groupsLoadable = triggerGroups.value;
   const showTriggersLoading = useDelayedLoading(triggersLoadable);
   const [newGroupName, setNewGroupName] = useState<string | null>(null);
+  // Enter and blur BOTH call commitNewGroup; committing unmounts the field,
+  // which fires a trailing blur that would POST the same name again (409
+  // "already exists", a sticky error toast). Guard with a submit-once flag,
+  // reset when the field is reopened.
+  const creatingGroupRef = useRef(false);
 
   async function commitNewGroup() {
+    if (creatingGroupRef.current) return;
     const trimmed = (newGroupName ?? '').trim();
     if (!trimmed) { setNewGroupName(null); return; }
+    creatingGroupRef.current = true;
     const group = await createTriggerGroup(trimmed);
     if (group) showToast(`Group "${group.name}" created`, 'info');
     setNewGroupName(null);
@@ -128,7 +135,7 @@ export function TriggersView() {
             <div class="list-row-add-icon">+</div>
             <div class="list-row-add-label">Add Trigger</div>
           </div>
-          <div class="list-row-add-card" onClick={() => setNewGroupName('')}>
+          <div class="list-row-add-card" onClick={() => { creatingGroupRef.current = false; setNewGroupName(''); }}>
             <div class="list-row-add-icon">+</div>
             <div class="list-row-add-label">New Group</div>
           </div>

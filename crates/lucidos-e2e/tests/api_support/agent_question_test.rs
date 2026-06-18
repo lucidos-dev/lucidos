@@ -350,7 +350,7 @@ async fn answer_question_idempotent_409_on_duplicate() {
 /// and the thread sits stuck in "Requesting" forever.
 ///
 /// The original gate in `chat::process` only routed when
-/// `use_claude_code == Some(true)`; chat threads (`None`/`Some(false)`) fell
+/// `use_coding_agent == Some(true)`; chat threads (`None`/`Some(false)`) fell
 /// through the gate, created a fresh exchange, and deadlocked. This test
 /// pins the chat-channel path.
 #[tokio::test]

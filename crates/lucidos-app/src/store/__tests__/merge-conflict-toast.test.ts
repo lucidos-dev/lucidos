@@ -133,3 +133,116 @@ describe('MergeConflictDetected SSE toast', () => {
     expect(matches).toHaveLength(2);
   });
 });
+
+describe('MergeConflictDetected toast resolution', () => {
+  beforeEach(() => {
+    toasts.value = [];
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    vi.clearAllMocks();
+  });
+
+  function raiseConflict(threadId: string, changeId: string): void {
+    handleThreadEvent({
+      thread_id: threadId,
+      seq: 1,
+      event: { type: 'MergeConflictDetected', change_id: changeId, files: ['x.rs'] },
+      created: '2026-01-01T00:00:00Z',
+    });
+  }
+
+  it('updates the same toast to "resolved" when the conflict change is applied', () => {
+    seedThread('thread-A', 'Explaining Git Worktree Tear-Downs');
+    raiseConflict('thread-A', 'c-1');
+
+    const before = toasts.value.find(t => t.message.toLowerCase().includes('merge conflict'));
+    expect(before!.message).toContain('resolving automatically');
+    expect(before!.type).toBe('warning');
+
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 2,
+      event: { type: 'ChangeApplied', change_id: 'c-1' },
+      created: '2026-01-01T00:00:10Z',
+    });
+
+    // Same toast (same key → same id), now success + "resolved".
+    const after = toasts.value.find(t => t.key === 'merge-conflict-thread-A-c-1');
+    expect(after).toBeTruthy();
+    expect(after!.id).toBe(before!.id);
+    expect(after!.message).toContain('resolved');
+    expect(after!.message).not.toContain('resolving automatically');
+    expect(after!.type).toBe('success');
+  });
+
+  it('dismisses the conflict toast when the change apply fails', () => {
+    seedThread('thread-A', 'Some Thread');
+    raiseConflict('thread-A', 'c-1');
+    expect(toasts.value.some(t => t.key === 'merge-conflict-thread-A-c-1')).toBe(true);
+
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 2,
+      event: { type: 'ChangeApplyFailed', change_id: 'c-1', error: 'boom' },
+      created: '2026-01-01T00:00:10Z',
+    });
+
+    expect(toasts.value.some(t => t.key === 'merge-conflict-thread-A-c-1')).toBe(false);
+  });
+
+  it('dismisses the conflict toast when the change is discarded', () => {
+    seedThread('thread-A', 'Some Thread');
+    raiseConflict('thread-A', 'c-1');
+    expect(toasts.value.some(t => t.key === 'merge-conflict-thread-A-c-1')).toBe(true);
+
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 2,
+      event: { type: 'ChangeDiscarded', change_id: 'c-1' },
+      created: '2026-01-01T00:00:10Z',
+    });
+
+    expect(toasts.value.some(t => t.key === 'merge-conflict-thread-A-c-1')).toBe(false);
+  });
+
+  it('does NOT spawn a spurious "resolved" toast when there was no conflict', () => {
+    // A plain apply (no prior MergeConflictDetected) must not create a
+    // merge-conflict banner — showToast(key) only updates an existing toast,
+    // and the resolver is guarded on the toast already being present.
+    seedThread('thread-A', 'Some Thread');
+
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 1,
+      event: { type: 'ChangeApplied', change_id: 'c-9' },
+      created: '2026-01-01T00:00:00Z',
+    });
+
+    expect(toasts.value.some(t => t.message.toLowerCase().includes('merge conflict'))).toBe(false);
+  });
+
+  it('resolves only the matching change, leaving a sibling conflict toast intact', () => {
+    seedThread('thread-A', 'Some Thread');
+    raiseConflict('thread-A', 'c-1');
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 2,
+      event: { type: 'MergeConflictDetected', change_id: 'c-2', files: ['y.rs'] },
+      created: '2026-01-01T00:00:05Z',
+    });
+
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 3,
+      event: { type: 'ChangeApplied', change_id: 'c-1' },
+      created: '2026-01-01T00:00:10Z',
+    });
+
+    const resolved = toasts.value.find(t => t.key === 'merge-conflict-thread-A-c-1');
+    const stillPending = toasts.value.find(t => t.key === 'merge-conflict-thread-A-c-2');
+    expect(resolved!.message).toContain('resolved');
+    expect(resolved!.type).toBe('success');
+    expect(stillPending!.message).toContain('resolving automatically');
+    expect(stillPending!.type).toBe('warning');
+  });
+});

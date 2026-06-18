@@ -441,6 +441,46 @@ fn should_auto_commit_on_cleanup_table() {
     }
 }
 
+#[test]
+fn conflict_resolution_cleanup_only_applies_clean_generated_turns() {
+    use crate::engine::thread_events::{AbortCause, CancelCause};
+
+    assert_eq!(
+        conflict_resolution_cleanup_action(false, &Some(TerminalKind::Generated)),
+        ConflictResolutionCleanupAction::Apply,
+        "a clean generated merge-fix turn is the only path that may land the apply"
+    );
+    assert_eq!(
+        conflict_resolution_cleanup_action(true, &Some(TerminalKind::Generated)),
+        ConflictResolutionCleanupAction::Abort {
+            message: "Conflict resolution incomplete — merge aborted. The change is still pending; try applying again.",
+        },
+        "unmerged paths must keep the original change pending even after a generated turn"
+    );
+    assert_eq!(
+        conflict_resolution_cleanup_action(false, &Some(TerminalKind::Canceled(CancelCause::UserStop))),
+        ConflictResolutionCleanupAction::Abort {
+            message: "Conflict resolution canceled — merge aborted. The change is still pending; try applying again.",
+        },
+        "canceling the merge-fix session must not allow cleanup to fast-forward main"
+    );
+    for terminal in [
+        Some(TerminalKind::Failed {
+            error: "api dropped".to_string(),
+        }),
+        Some(TerminalKind::Aborted(AbortCause::EngineShutdown)),
+        None,
+    ] {
+        assert_eq!(
+            conflict_resolution_cleanup_action(false, &terminal),
+            ConflictResolutionCleanupAction::Abort {
+                message: "Conflict resolution did not finish cleanly — merge aborted. The change is still pending; try applying again.",
+            },
+            "non-generated terminal {terminal:?} must keep the original change pending"
+        );
+    }
+}
+
 /// Only "no text AND no images" counts as silent — image-only turns are
 /// real user content. Skipping the image check here freezes the thread row
 /// at `running` after CC delivers an answer, because `classify_result`
@@ -455,7 +495,7 @@ fn image_only_message_is_not_silent_resume() {
 
 /// Pin every input combination of `classify_session_end_action`. The
 /// invariants this guards:
-///   - `(has_commits=true, files_empty=true, external=false)` → `CleanupBranches`,
+///   - `(has_commits=true, files_empty=true, external=false)` → `KeepEmptyBranch`,
 ///     not `Propose`. This is the phantom-Change regression — observed
 ///     when CC's auto-commit on cleanup advances the branch ref while
 ///     the user concurrently clicked Apply Now, leaving the post-Apply
@@ -466,13 +506,16 @@ fn image_only_message_is_not_silent_resume() {
 ///   - External repos with commits keep their branch regardless of
 ///     `files_empty` — the user owns push/PR there; deleting the ref
 ///     because the net diff happens to be zero would lose work.
-///   - No commits on the branch always cleans up, regardless of the
-///     other inputs (the diff signal is moot).
+///   - No commits on the branch always routes to `KeepEmptyBranch`,
+///     regardless of the other inputs (the diff signal is moot). The branch
+///     is KEPT (the session is resumable) — `KeepEmptyBranch` no longer
+///     deletes (the thread-9e37697e data-loss fix); only the explicit
+///     Discard / conflict paths `git branch -D`.
 ///   - A user cancel (`user_canceled=true`) keeps the branch
 ///     (`KeepCanceledBranch`) so the session stays resumable — even with no
-///     commits, where it would otherwise `CleanupBranches` → `git branch -D`.
-///     It never proposes (a cancelled turn is half-finished work), and it
-///     ranks below the external/crash keep-branch arms.
+///     commits. It carries the cancel-specific "half-finished, don't propose"
+///     semantics distinct from the ordinary `KeepEmptyBranch`, ranking below
+///     the external/crash keep-branch arms.
 #[test]
 fn classify_session_end_action_table() {
     use SessionEndAction::*;
@@ -481,13 +524,13 @@ fn classify_session_end_action_table() {
         //
         // Healthy turn (safety_net_fired=false, user_canceled=false) — same as before:
         ((true, false, false, false, false), Propose),
-        ((true, true, false, false, false), CleanupBranches), // phantom-Change regression
+        ((true, true, false, false, false), KeepEmptyBranch), // phantom-Change regression
         ((true, false, true, false, false), KeepExternalBranch),
         ((true, true, true, false, false), KeepExternalBranch),
-        ((false, false, false, false, false), CleanupBranches),
-        ((false, true, false, false, false), CleanupBranches),
-        ((false, false, true, false, false), CleanupBranches),
-        ((false, true, true, false, false), CleanupBranches),
+        ((false, false, false, false, false), KeepEmptyBranch),
+        ((false, true, false, false, false), KeepEmptyBranch),
+        ((false, false, true, false, false), KeepEmptyBranch),
+        ((false, true, true, false, false), KeepEmptyBranch),
         //
         // Safety-net fired — CC died mid-stream:
         //   - In our own repo with commits: CrashedKeepBranch (keep work,
@@ -495,19 +538,19 @@ fn classify_session_end_action_table() {
         //     empty-diff commit is partial work.
         //   - External repo with commits: still KeepExternalBranch — user
         //     owns the ref regardless of how the session ended.
-        //   - No commits: CleanupBranches — nothing to keep.
+        //   - No commits: KeepEmptyBranch — nothing to propose (branch still kept, resumable).
         ((true, false, false, true, false), CrashedKeepBranch),
         ((true, true, false, true, false), CrashedKeepBranch),
         ((true, false, true, true, false), KeepExternalBranch),
         ((true, true, true, true, false), KeepExternalBranch),
-        ((false, false, false, true, false), CleanupBranches),
-        ((false, true, false, true, false), CleanupBranches),
-        ((false, false, true, true, false), CleanupBranches),
-        ((false, true, true, true, false), CleanupBranches),
+        ((false, false, false, true, false), KeepEmptyBranch),
+        ((false, true, false, true, false), KeepEmptyBranch),
+        ((false, false, true, true, false), KeepEmptyBranch),
+        ((false, true, true, true, false), KeepEmptyBranch),
         //
         // User cancel (Stop = Esc, user_canceled=true) — keep the branch so the
         // session stays resumable; never propose. The grilling-cancel bug is the
-        // no-commits row: it MUST be KeepCanceledBranch, not CleanupBranches.
+        // no-commits row: it MUST be KeepCanceledBranch, not KeepEmptyBranch.
         ((false, true, false, false, true), KeepCanceledBranch), // grilling cancel (the bug)
         ((false, false, false, false, true), KeepCanceledBranch),
         ((true, false, false, false, true), KeepCanceledBranch), // commits but cancelled → keep, don't propose

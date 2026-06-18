@@ -171,8 +171,18 @@ pub fn subprocess_origin_env_vars(thread_id: Option<Uuid>) -> Vec<(&'static str,
 ///   * `LUCIDOS_API_PORT`     — re-exported when the engine itself was given
 ///     one, so the pre-kill hook can block `lsof -ti :<port> | xargs kill`
 ///     patterns targeting the engine port.
+///   * `LUCIDOS_API_BASE_URL` — set only under the workspace gateway (ADR 0014),
+///     where the engine binds a LOOPBACK port and serves plain HTTP while the
+///     gateway terminates TLS and routes the workspace under `/<slug>/`. A
+///     subprocess that built its URL from `.lucidos/ports` (the gateway port,
+///     no `/<slug>/` prefix) would never reach this engine (the gateway resolves
+///     the first path segment as a workspace slug), so we hand it the exact
+///     loopback base URL to reach the engine directly.
+///     Absent in legacy / Tauri / production (engine on the user-facing port —
+///     the ports file resolves it), keyed off `LUCIDOS_BIND_LOOPBACK`, which
+///     only the gateway sets.
 pub fn host_protection_env_vars(workspace_path: &std::path::Path) -> Vec<(&'static str, String)> {
-    let mut vars: Vec<(&'static str, String)> = Vec::with_capacity(3);
+    let mut vars: Vec<(&'static str, String)> = Vec::with_capacity(4);
     vars.push(("LUCIDOS_HOST_PID", std::process::id().to_string()));
     let frontend_pid_path = workspace_path.join(".lucidos/frontend.pid");
     if let Ok(contents) = std::fs::read_to_string(&frontend_pid_path) {
@@ -185,6 +195,20 @@ pub fn host_protection_env_vars(workspace_path: &std::path::Path) -> Vec<(&'stat
     }
     if let Ok(api_port) = std::env::var("LUCIDOS_API_PORT") {
         if !api_port.is_empty() {
+            // Under the gateway the engine is reachable by same-host
+            // subprocesses only on its loopback port over plain HTTP — see the
+            // doc comment above. `LUCIDOS_BIND_LOOPBACK` is set solely by the
+            // gateway when it spawns the engine, so this override never fires in
+            // the legacy / Tauri / production single-engine model.
+            let behind_gateway = std::env::var("LUCIDOS_BIND_LOOPBACK")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false);
+            if behind_gateway {
+                vars.push((
+                    "LUCIDOS_API_BASE_URL",
+                    format!("http://127.0.0.1:{api_port}"),
+                ));
+            }
             vars.push(("LUCIDOS_API_PORT", api_port));
         }
     }

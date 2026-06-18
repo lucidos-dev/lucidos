@@ -11,7 +11,11 @@ import {
   appRefreshKey,
   wipPreviewThreadId,
   threadMap,
+  appsTab,
+  appSearchOpen,
+  appSearchQuery,
 } from '../store';
+import type { AppsTab } from '../store';
 import { clearWipIfMatches } from './wipPreview';
 import { toFailed, setLoadingIfFresh } from '../types';
 import type { App } from '../types';
@@ -123,6 +127,10 @@ export async function openAppById(appId: string): Promise<void> {
 export function openEditApp(appId: string): void {
   panelOverlay.value = { type: 'form', form: { type: 'app-edit', appId } };
   pushNavState();
+  // Lands the edit form in the content pane: mobile swipe + desktop split
+  // expand. Mirrors openApp (same view, same overlay surface) — without it a
+  // click on a collapsed-split desktop silently looks like a no-op.
+  revealContentPane();
 }
 
 export function closeAppForm(): void {
@@ -229,9 +237,36 @@ export async function refreshAppUI(appId?: string, options: RefreshAppUiOptions 
   }, REFRESH_DEBOUNCE_MS);
 }
 
+/** Switch the Apps section tab (Installed ↔ Store) and remember it for reload. */
+export function setAppsTab(tab: AppsTab): void {
+  appsTab.value = tab;
+  localStorage.setItem('lucidos-apps-tab', tab);
+}
+
+/** Open the inline apps search bar. The bar focuses itself on mount. */
+export function openAppSearch(): void {
+  appSearchOpen.value = true;
+}
+
+/** Close the inline apps search bar and clear its query so the active tab
+ *  shows its full list again. */
+export function closeAppSearch(): void {
+  appSearchOpen.value = false;
+  appSearchQuery.value = '';
+}
+
+export function toggleAppSearch(): void {
+  if (appSearchOpen.value) closeAppSearch();
+  else openAppSearch();
+}
+
 export function createNewApp(): void {
   panelOverlay.value = { type: 'form', form: { type: 'new-app' } };
   pushNavState();
+  // Lands the new-app form in the content pane: mobile swipe + desktop split
+  // expand. Mirrors openApp (same view, same overlay surface) — without it a
+  // click on a collapsed-split desktop silently looks like a no-op.
+  revealContentPane();
 }
 
 export function submitNewApp(name: string, description: string): void {

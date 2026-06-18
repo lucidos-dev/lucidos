@@ -57,7 +57,7 @@ async fn install_app_fixture(scratch: &Path, bus: &dyn EventBusEmitter) {
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archive = build_app_fixture_archive(&archive_dir);
     let unpacked = extract_to(&archive_dir, &archive);
-    install_from_unpacked_with_bus(scratch, bus, &unpacked, SourceType::Archive, false, None)
+    install_from_unpacked_with_bus(scratch, bus, &unpacked, SourceType::Archive, false, None, None)
         .await
         .expect("install app fixture must succeed");
 }
@@ -173,6 +173,7 @@ async fn resolve_plugin_query_ambiguous_lists_candidates() {
             &unpacked,
             SourceType::Archive,
             false,
+            None,
             None,
         )
         .await
@@ -544,4 +545,114 @@ async fn check_plugin_updates_skips_plugin_when_files_are_all_missing_from_disk(
 
     let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
+}
+
+/// The install-time `setup_thread_id` must round-trip through the
+/// `PluginInstalled` payload into the installed-plugin summary (it drives the
+/// App Store card's Setup→Open button), and `app_id` must surface the app the
+/// "Open" button launches.
+#[tokio::test]
+async fn installed_summary_surfaces_setup_thread_and_app_id() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let scratch = fresh_workspace();
+
+    let archive_dir = scratch.join("archive");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    let archive = build_app_fixture_archive(&archive_dir);
+    let unpacked = extract_to(&archive_dir, &archive);
+    let setup_tid = uuid::Uuid::new_v4();
+    install_from_unpacked_with_bus(
+        &scratch,
+        &bus,
+        &unpacked,
+        SourceType::Archive,
+        false,
+        None,
+        Some(setup_tid),
+    )
+    .await
+    .expect("install with a setup thread must succeed");
+
+    let summaries = super::installed_plugin_summaries(&pool)
+        .await
+        .expect("read installed summaries");
+    let plugin = summaries
+        .iter()
+        .find(|p| p.id == "no-role-playing")
+        .expect("installed plugin present in summaries");
+    assert_eq!(
+        plugin.setup_thread_id.as_deref(),
+        Some(setup_tid.to_string().as_str()),
+        "setup_thread_id must round-trip from the PluginInstalled payload"
+    );
+    // The fixture's app folder differs from the plugin id, so primary_app_id
+    // falls back to the first (only) app directory.
+    assert_eq!(plugin.app_id.as_deref(), Some("anti-sycophancy-critique"));
+
+    let _ = std::fs::remove_dir_all(&scratch);
+    teardown_test_db(&db_name).await;
+}
+
+/// An install with no setup thread (the common case) leaves `setup_thread_id`
+/// absent, and a plugin that ships no app leaves `app_id` absent.
+#[tokio::test]
+async fn installed_summary_omits_setup_and_app_when_absent() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let scratch = fresh_workspace();
+    let archive_dir = scratch.join("archive");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    // A knowhow-only fixture: no app dir, installed with no setup thread.
+    let archive = build_fixture_archive(&archive_dir, "v1");
+    install_from_source_with_bus(&scratch, &bus, archive.to_str().unwrap(), false)
+        .await
+        .expect("install must succeed");
+
+    let summaries = super::installed_plugin_summaries(&pool)
+        .await
+        .expect("read installed summaries");
+    let plugin = summaries
+        .iter()
+        .find(|p| p.id == "fixture-plugin")
+        .expect("installed plugin present");
+    assert_eq!(plugin.setup_thread_id, None);
+    assert_eq!(plugin.app_id, None, "knowhow-only plugin has no app to open");
+
+    let _ = std::fs::remove_dir_all(&scratch);
+    teardown_test_db(&db_name).await;
+}
+
+#[test]
+fn primary_app_id_prefers_plugin_id_then_first_app() {
+    use super::registry::primary_app_id as p;
+    // No app files → nothing to open.
+    assert_eq!(p(&["knowhow/x.md".into(), "triggers/t/run.md".into()], "plug"), None);
+    // Single app, folder name differs from plugin id → that app.
+    assert_eq!(
+        p(&["apps/dashboard/index.html".into()], "plug"),
+        Some("dashboard".to_string())
+    );
+    // Multiple apps, one matching the plugin id → prefer the matching one.
+    assert_eq!(
+        p(
+            &[
+                "apps/zeta/index.html".into(),
+                "apps/plug/index.html".into(),
+            ],
+            "plug"
+        ),
+        Some("plug".to_string())
+    );
+    // Multiple apps, none matching → first alphabetically (deterministic).
+    assert_eq!(
+        p(
+            &[
+                "apps/zeta/index.html".into(),
+                "apps/alpha/index.html".into(),
+            ],
+            "plug"
+        ),
+        Some("alpha".to_string())
+    );
 }

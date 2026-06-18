@@ -1,4 +1,4 @@
-import { test, expect, Page } from '@playwright/test';
+import { test, expect, Page } from './fixtures';
 import { navigateToApp, assertHealthy, openFilesPanel, clickVisibleElement } from './helpers';
 import { WORKSPACE, psql, git, getDbPort } from './db-helpers';
 import { randomUUID } from 'crypto';

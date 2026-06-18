@@ -14,8 +14,6 @@ use super::{
     DEFAULT_MAX_COMPLETION_TOKENS,
 };
 
-const OPENAI_CHAT_URL: &str = "https://api.openai.com/v1/chat/completions";
-
 impl OpenAiProvider {
     /// Convert internal messages to OpenAI Chat Completions format.
     fn convert_messages_chat(messages: &[Message]) -> Vec<serde_json::Value> {
@@ -347,10 +345,7 @@ impl OpenAiProvider {
             attempt += 1;
 
             let resp = match self
-                .streaming_client
-                .post(OPENAI_CHAT_URL)
-                .header("Authorization", format!("Bearer {}", self.api_key))
-                .header("Content-Type", "application/json")
+                .apply_headers(self.streaming_client.post(&self.chat_url))
                 .json(&body)
                 .send()
                 .await

@@ -119,6 +119,15 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
     });
   }
 
+  // A composing draft only exists in the frontend (no persisted thread), and
+  // `isExcludedFromSections` keeps it out of every drawer section — including
+  // Saved. Saving it would set `is_saved` but the row would still render in the
+  // compose/Drafts surface, never moving to the Saved section. Suppress the
+  // save toggle so the action isn't offered for something it can't accomplish.
+  if (thread.meta.state === 'composing') {
+    kinds = kinds.filter((a) => a !== 'save' && a !== 'unsave');
+  }
+
   const requiresRestart =
     !isExternalRepo &&
     threadType === 'claude_code' &&

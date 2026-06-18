@@ -124,7 +124,7 @@ function resolveTheme(theme: Theme): 'light' | 'dark' {
 
 export function applyTheme(theme: Theme): void {
   const resolved = resolveTheme(theme);
-  const bg = resolved === 'light' ? '#ffffff' : '#0d1117';
+  const bg = resolved === 'light' ? '#ffffff' : '#0b2342';
   // Theme-flash telemetry — index.html installs __themeLogEvt as a fetch shim
   // that POSTs to /api/v1/internal/client-log (engine.log breadcrumbs).
   type ThemeLogEvt = (label: string, info: unknown) => void;
@@ -299,6 +299,21 @@ export function currentVertexRegion(): string {
 
 export function setVertexRegion(region: string): Promise<void> {
   return savePreference('vertex_region', region);
+}
+
+// --- Local OpenAI-compatible provider base URL ---
+
+// Ollama's OpenAI-compatible endpoint. Mirrors DEFAULT_LOCAL_BASE_URL in
+// crates/lucidos-engine/src/core/preferences.rs.
+export const DEFAULT_LOCAL_BASE_URL = 'http://localhost:11434/v1';
+
+export function currentLocalBaseUrl(): string {
+  if (preferences.value.status !== 'loaded') return '';
+  return preferences.value.data['local_base_url'] || '';
+}
+
+export function setLocalBaseUrl(url: string): Promise<void> {
+  return savePreference('local_base_url', url.trim());
 }
 
 // --- Capture context ---

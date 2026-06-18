@@ -101,6 +101,23 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Frontend
 
+- **`dispatchForwardedChord` setting `focusedPane = 'content'` for ALL
+  forwarded chords — including `toggleThreadDrawer` (⌘⇧1) — does NOT violate
+  "the drawer toggle never sets focus" (commit 585274dc3).** That rule governs
+  what `toggleThreads` *itself* does (unchanged: plain show/hide, signal-only
+  fallback only when closing a drawer that holds focus). The reconciliation is
+  a separate fact: a chord forwarded from an app iframe proves the user is in
+  the content pane (iframe keydowns only fire when the iframe has focus), and
+  iframe pointer events never reach the host's `focusPane('content')` handler,
+  so `focusedPane` is otherwise stale. Setting it for *every* forwarded chord
+  (not just the three-state toggles that read it) is the more correct design,
+  not over-reach: it also fixes `toggleThreads`' close-case housekeeping —
+  with a stale `focusedPane === 'drawer'`, closing the drawer from inside the
+  app would wrongly bounce focus to `'thread'` (pane.ts line 95); reconciling
+  to `'content'` first skips that. Narrowing the set to only the toggles that
+  read `focusedPane` would re-introduce the staleness. Re-flagging needs
+  evidence that a forwarded chord can originate from an iframe NOT in the
+  content pane.
 - **`<Overlay>`'s `data-overlay-anchor` marking uses an absolute
   `removeAttribute`, NOT ref-counting like `openOverlayCount`** — and that's
   fine. The asymmetry looks like a leak-in-reverse (two concurrently-open
@@ -172,6 +189,19 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `hooks/useDelayedLoading.ts` even though `useDelayedFlag` is its only
   non-test consumer — it's the fake-timer-testable kernel of the spinner
   delay (this repo has no DOM test rig for hooks). Don't inline it back.
+- **The snapshot-staleness guards in `thread-loading.ts` (`upsertThread`
+  status, `applyEventRows` overlay) keyed on `last_activity` do NOT miss
+  status changes whose event omits `last_activity`** (e.g. `ChangeProposed`,
+  absent from `LAST_ACTIVITY_EVENTS`). The guard only *suppresses* a snapshot
+  that is provably OLDER than already-applied live state
+  (`snapshot.lastActivity < meta.updatedAt`); it never has to be the channel
+  that delivers a status flip. Live SSE applies every status change via its
+  per-event aggregate in `handleEvent` regardless of `last_activity`, and any
+  genuinely-later event that makes a refresh "stale" means SSE already holds
+  the more-current view. `info.last_activity`, `currentAggregate.lastActivity`
+  and `meta.updatedAt` are the SAME monotonic `thread_summaries.last_activity`
+  column, so the lexicographic `<` is a valid causal-freshness test — not a
+  cross-clock compare.
 
 ## Scripts (bash)
 
@@ -184,6 +214,18 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   NOT try to exec a command literally named `"$BIN/pg_ctl"`. Verified
   empirically: the trap invokes the real binary with correctly expanded,
   space-safe argv. (`scripts/prototype/desktop-pg-pgvector-spike.sh`.)
+
+- **`curl … | sh` pipes only STDIN; STDOUT stays the terminal.** In a
+  `curl -fsSL …/install.sh | sh` invocation the pipe connects curl's stdout to
+  the shell's stdin (fd 0); the shell's stdout (fd 1) and stderr are inherited
+  from the controlling terminal. So a child script's `[ -t 1 ]` (stdout-is-a-tty)
+  test is TRUE under the documented one-liner — e.g. `install.sh` runs
+  `scripts/web-dev.sh`, whose `elif [ -t 1 ]` branch prints the listening line
+  and returns (it does NOT take the blocking `wait`-on-supervisor branch), so
+  the installer's success banner is reached. A reviewer reasoning "piped, so no
+  tty → it hangs" has conflated stdin with stdout. The only invocation that
+  makes fd 1 a non-tty is an explicit redirect (`curl … | sh > file`), which is
+  not the documented path. (`install.sh`, `scripts/web-dev.sh` tail.)
 
 ## Settled architecture questions
 

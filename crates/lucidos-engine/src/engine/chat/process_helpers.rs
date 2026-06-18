@@ -264,6 +264,93 @@ pub(super) async fn wait_for_cc_session_alive(
     }
 }
 
+/// Backstop on how long the follow-up fast-path blocks waiting for an
+/// interrupted Codex turn to reach a boundary before routing the follow-up
+/// anyway. The graceful `turn/interrupt` normally idles the turn in ~1-2s; the
+/// engine's 8s interrupt-escalation hard-kill guarantees `process_exited` well
+/// under this cap, so this only fires in a pathological non-idling case.
+pub(super) const REDIRECT_INTERRUPT_MAX_WAIT: Duration = Duration::from_secs(30);
+
+/// Whether a follow-up routed to a live coding-agent session should first
+/// interrupt the in-flight turn (Codex "interrupt-and-redirect") instead of
+/// being forwarded as-is.
+///
+/// Claude Code accepts a follow-up mid-turn — its driver writes it to the CC
+/// process's stdin immediately and CC steers the live turn — so a CC follow-up
+/// is always forwarded as-is (`false`). Codex's app-server / exec protocols
+/// accept input only at a turn boundary (`turn/start` needs no turn in flight),
+/// so a Codex follow-up that lands mid-turn would otherwise sit invisibly in
+/// the driver's queue behind a long turn. For Codex we interrupt the running
+/// turn first; the queued follow-up then runs as the next turn on the same
+/// thread (full context preserved). Pure so the routing rule is unit-tested
+/// without standing up a session.
+///
+/// - `is_in_flight`: the session is alive and NOT at a turn boundary
+///   (`AgentSession::is_in_flight`). A follow-up to an idle-but-alive Codex
+///   session routes via `turn/start` immediately — no interrupt needed.
+/// - `is_user_message`: the input is a genuine user follow-up, not an
+///   engine-internal child-wake (`AgentInputKind::WakeFromChild`). Child-wakes
+///   never redirect — they resume a thread that is waiting on a child.
+pub(super) fn should_redirect_codex_followup(
+    coding_agent: crate::runtime::CodingAgent,
+    is_in_flight: bool,
+    is_user_message: bool,
+) -> bool {
+    coding_agent == crate::runtime::CodingAgent::Codex && is_in_flight && is_user_message
+}
+
+/// Arm the Codex interrupt-and-redirect for a follow-up, operating on the
+/// already-locked `agent_sessions` map. When `thread_id`'s session is a Codex
+/// turn in flight (per `should_redirect_codex_followup`), this:
+///   1. **Pre-counts the follow-up** (`pending_followups += 1`) so the
+///      interrupted turn's idle reads `> 1` and `terminate_decision` keeps the
+///      subprocess alive (`pending_followups` starts at 1 for the initial
+///      turn). The caller's normal `msg_tx` send increments again for the
+///      follow-up's own expected `Result`.
+///   2. **Stamps the redirecting device** onto `cancel_actor` — the same slot
+///      `interrupt_agent` uses for the Stop button; the run_session interrupt
+///      arm drains it onto `ResponseCanceled.actor`.
+///   3. **Fires the interrupt** so the live turn ends as a resumable `Canceled`
+///      boundary.
+/// Returns the session's `idle_notify` so the caller can wait for the turn to
+/// wind down before emitting the follow-up's `MessageReceived` (correct event
+/// ordering). Returns `None` when no redirect applies (CC, idle Codex,
+/// child-wake, or no live session) — the caller routes the follow-up normally.
+///
+/// Pure over the map (no engine, no async) so the arming behavior is unit-tested
+/// with a fake session, like `wait_for_cc_session_alive`.
+pub(super) fn arm_codex_redirect(
+    sessions: &mut HashMap<Uuid, AgentSession>,
+    thread_id: Uuid,
+    is_user_message: bool,
+    origin: &Option<MessageOrigin>,
+) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+    let s = sessions.get_mut(&thread_id)?;
+    if !should_redirect_codex_followup(s.coding_agent, s.is_in_flight(), is_user_message) {
+        return None;
+    }
+    // Keep the interrupted turn's idle from terminating the subprocess:
+    // `terminate_decision` keeps it alive only when the pre-swap count is `> 1`.
+    // A normal turn pre-counts its own Result as 1 at session creation, so a
+    // single `+1` reaches 2; a silent-resume / warm-up turn starts at 0, so a
+    // lone `+1` would land at 1 → `Terminate`, killing the queued follow-up.
+    // Bump to at least 2 in that case. The follow-up's own expected Result is
+    // counted separately by the caller's `msg_tx` send. Race-free w.r.t. the
+    // idle handler's lock-free `swap`: the run loop flips `is_waiting` under the
+    // same `agent_sessions` lock we hold here, and `is_in_flight()` was just
+    // observed true, so its `swap` happens strictly after we release.
+    if s.pending_followups
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        == 0
+    {
+        s.pending_followups
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    s.cancel_actor = origin.clone();
+    s.interrupt.notify_one();
+    Some(s.idle_notify.clone())
+}
+
 #[cfg(test)]
 #[path = "process_helpers_tests.rs"]
 mod process_helpers_tests;

@@ -1,6 +1,6 @@
 ---
 name: Building a Plugin
-description: Use when the user wants to author, package, publish, share, install, update, or uninstall a Lucidos plugin -- phrases like "build a plugin", "publish a plugin", "share this app as a plugin", "package this for other workspaces", "ship a knowhow bundle", "install the X plugin", "update plugins", "make a .lucidos-plugin". Covers the manifest schema, plugin layout, the four LLM tools, distribution shapes, and the v1 guide-only uninstall semantics.
+description: Use when the user wants to author, package, publish, share, install, update, or uninstall a Lucidos plugin -- phrases like "build a plugin", "publish a plugin", "share this app as a plugin", "package this for other workspaces", "ship a knowhow bundle", "install the X plugin", "update plugins", "make a .lucidos-plugin". Covers the manifest schema, plugin layout, the five LLM tools, distribution shapes, and the v1 guide-only uninstall semantics.
 ---
 
 # Building a Plugin
@@ -99,12 +99,42 @@ The `source` may be the GitHub tree URL the user copied from the address bar -- 
 
 The user clicks **Confirm** (writes files, emits `PluginInstalled`, auto-reloads WASM signers if any `auth-modules/` files were touched) or **Cancel** (drops staging, emits `PluginInstallCanceled`). Until they click, no bytes hit `data/`.
 
+**Setup runs on confirm.** If the manifest carried a non-empty `setup` field, confirming the install spawns a **Lucidos Agent setup thread** seeded with the setup instructions and the user is navigated straight into it, so the author's "ask the user / wire this up" steps actually happen instead of sitting inert as panel text. This fires for **both** the App Store button and the agent's `install_plugin` tool (they share the confirm endpoint). The spawned thread's id is recorded in the `PluginInstalled` event (`manifest.setup_thread_id`) so the App Store card can resolve it later. The engine's background marketplace **update check** only notifies — it never installs — so it never spawns a setup thread.
+
 What this means for plugin authors:
 
 - **Lead with `name` and `description`.** They render at the top of the panel. A vague description ("Self-healing site knowhow for browser automation. Agents emit observations during tasks…") gives the user enough to decide; a single word ("browser-skills") doesn't.
-- **Use `setup` for wiring instructions the LLM should run after install.** It renders as markdown in the panel so the user sees the steps before confirming, and the same text comes back to the LLM as the install tool result so the agent can offer to chain through them.
+- **Use `setup` for wiring instructions the agent should run after install.** It renders as markdown in the panel so the user sees the steps before confirming, and on confirm a Lucidos Agent setup thread is spawned with the same text — the agent walks the user through the steps, asking for anything it needs (credentials, choices) and doing the wiring it can (e.g. pasting the `apis.json` snippet for a signer plugin). Write `setup` as instructions *to the agent about what to do with the user*, not as a static checklist.
 - **Updates inherit the same panel.** `update_plugin` re-fetches the source and routes through the same staging path -- the user reviews the new version's file list (added/changed/removed -- well, "would overwrite" for changed) before any bytes are written.
 - **Staged installs expire after 1 hour.** A panel left open longer is silently discarded; the user has to re-call `install_plugin`. Engine restarts also drop in-flight stagings (the staged temp dir is gone). Don't author flows that expect the panel to sit open for a full day.
+
+## App Store and marketplaces
+
+The App Store is the **Store** tab of the Apps section — the browser UI for plugin discovery (the Installed tab beside it lists the workspace's apps). A **marketplace** is a git repository (or GitHub tree URL) registered in the workspace at `data/config/plugin-marketplaces.json`, added/removed under **Settings → Marketplaces**. The Store clones each registered marketplace on refresh (the catalog re-scans whenever the Store tab opens), scans for valid `manifest.toml` plugin roots, compares each manifest version against currently installed `PluginInstalled` events, and shows each plugin as a card. Clicking `Install`/`Update` stages the exact same install confirmation panel described above; the Store never writes plugin files directly.
+
+Each card has a primary button that progresses **Install → Setup → Open**, plus an **Uninstall** button once the plugin is on disk:
+
+- **Install** (or **Update** for an out-of-date install) — stages the confirmation panel.
+- **Setup** — shown after install while the plugin's setup thread is still running or waiting on the user; clicking opens that thread. Driven by `setup_thread_id` + `setup_complete` on the catalog row (`setup_complete` is computed from the setup thread's lifecycle state — done once it's neither `running` nor `waiting_for_user_answer`). Plugins with no `setup` field skip straight past this.
+- **Open** — shown once setup is finished (or the plugin had none); launches the plugin's primary app (`data/apps/<id>/`). Plugins that ship no app show a disabled **Installed** instead.
+- **Uninstall** — stages the uninstall confirmation panel (the same one the `uninstall_plugin` LLM tool produces). The card re-fetches the catalog on every mount, so the Setup→Open transition shows up when the user returns from finishing setup.
+
+Installed marketplace plugins are **not** auto-updated — the engine notifies, the user decides. Registered marketplaces are scanned at startup, after a marketplace is registered or renamed, and every five minutes. When a scanned marketplace has a newer version of an already-installed plugin, the engine emits a single deduplicated `NotificationCreated` ("Plugin update(s) available") whose tap deep-links to the Apps section; it does NOT install anything. The user applies the update from the Store card (or the installed app's **Update** button on the Installed tab), which stages the same confirmation panel as any install. Dedup is tracked in a `.lucidos/plugin-update-notice.json` marker so the five-minute re-scan only re-notifies when a *new* update appears (a fresh plugin or a bumped version), not every cycle.
+
+Marketplace HTTP surface:
+
+- `GET /api/v1/plugins/marketplaces` -> registered marketplace list.
+- `POST /api/v1/plugins/marketplaces` with `{ "source": "...", "name"?: "..." }` -> register or rename a marketplace.
+- `DELETE /api/v1/plugins/marketplaces/{id}` -> unregister a marketplace.
+- `GET /api/v1/plugins/catalog` -> live scan result `{ marketplaces, plugins, errors }`. Each installed plugin row also carries `setup_thread_id`, `setup_complete`, and `app_id` to drive the card's Install→Setup→Open button.
+- `POST /api/v1/plugins/install-request` with `{ "source": "..." }` -> stage an install request payload for the existing confirmation panel.
+- `POST /api/v1/plugins/uninstall-request` with `{ "id": "..." }` -> stage an uninstall request payload (resolves the plugin id, partitions its files into present/missing) for the uninstall confirmation panel. The button counterpart of the `uninstall_plugin` LLM tool.
+
+Marketplace LLM surface:
+
+- `register_plugin_marketplace(source, name?)` registers or renames the same App Store marketplace registry, commits `data/config/plugin-marketplaces.json`, and kicks off the marketplace scan / update-check pass (which notifies the user of any available plugin updates rather than applying them). Use it when a user asks conversationally to add a plugin repo, marketplace, plugin marketplace, or App Store source.
+
+For GitHub monorepo marketplaces, register either the repo URL (`https://github.com/lucidos-dev/plugins`) or a tree URL (`https://github.com/lucidos-dev/plugins/tree/main/community`). The scanner turns discovered subdirectory plugins into installable GitHub tree URLs. For non-GitHub monorepos, use one repo per plugin or provide a GitHub tree URL equivalent; the install tool only knows how to install a subdirectory when it has a GitHub tree URL.
 
 ## What doesn't belong in a plugin
 

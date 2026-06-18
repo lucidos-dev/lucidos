@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { appPath, createIframeAppFixture } from './db-helpers';
 import { gotoWithRetry } from './helpers';
 

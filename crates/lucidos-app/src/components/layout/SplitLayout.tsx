@@ -1,5 +1,6 @@
 import { useRef, useCallback } from 'preact/hooks';
-import { splitRatio, threadDrawerOpen, threadDrawerWidth, SPLIT_RATIO_KEY } from '../../store/store';
+import { splitRatio, threadDrawerOpen, threadDrawerWidth, focusedPane, SPLIT_RATIO_KEY } from '../../store/store';
+import { focusPane } from '../../store/actions/pane';
 import { setSplitRatio, computeSnapRatio, beginPaneResize, endPaneResize, DEFAULT_SPLIT_RATIO } from './splitHelpers';
 import { createDblClickGate } from '../../utils/dblClickGate';
 import type { ComponentChildren } from 'preact';
@@ -81,6 +82,8 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
   document.documentElement.toggleAttribute('data-thread-collapsed', threadCollapsed);
   document.documentElement.toggleAttribute('data-content-collapsed', contentCollapsed);
   document.documentElement.toggleAttribute('data-thread-drawer-open', drawerVisible);
+  // Drives the accent line under the focused pane's header region (shell.css).
+  document.documentElement.setAttribute('data-focused-pane', focusedPane.value);
 
   return (
     <div
@@ -90,9 +93,16 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
       <div
         class={`pane pane-thread${threadCollapsed ? ' pane-collapsed' : ''}`}
         style={{ flex: threadCollapsed ? '0 0 0%' : contentCollapsed ? 1 : `0 0 ${ratio * 100}%` }}
+        onPointerDown={() => focusPane('thread')}
+        tabIndex={-1}
       >
         {threadPane}
       </div>
+      {/* The divider spans the full pane height — anchoring its tooltip to the
+          element border would fling it to the far end of the pane, so it opts into
+          pointer-tracking via data-tooltip-follow-cursor. It's the only element
+          that does; every other element keeps the border anchor so its tooltip
+          always sits fully outside it. */}
       <div
         class={`split-divider ${threadCollapsed || contentCollapsed ? 'collapsed' : ''}`}
         role="separator"
@@ -105,11 +115,13 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
             : undefined}
         onPointerDown={onDividerDown}
         onDblClick={onDividerDblClick}
-        {...(threadCollapsed || contentCollapsed ? { 'data-tooltip': 'Double-click to expand' } : {})}
+        {...(threadCollapsed || contentCollapsed ? { 'data-tooltip': 'Double-click to expand', 'data-tooltip-follow-cursor': '' } : {})}
       />
       <div
         class={`pane pane-content${contentCollapsed ? ' pane-collapsed' : ''}`}
         style={{ flex: contentCollapsed ? '0 0 0%' : 1 }}
+        onPointerDown={() => focusPane('content')}
+        tabIndex={-1}
       >
         {contentPane}
       </div>

@@ -15,6 +15,10 @@ export interface HealthInfo {
   engine_version?: string;
   latest_engine_version?: string;
   latest_tauri_app_version?: string;
+  /** True in a packaged desktop build (engine serves the bundled frontend and
+   *  runs as the launchd service). Routes the "Restart" control: packaged →
+   *  restart the LaunchAgent; dev → the /restart rebuild script. */
+  packaged?: boolean;
 }
 
 /** Probe `/api/v1/health`. Failed without `httpCode` = transport unreachable;
@@ -43,6 +47,15 @@ export async function submitChat(body: ChatRequestBody): Promise<{ event_id: str
 export async function cancelChat(threadId?: string): Promise<void> {
   const params = threadId ? `?thread_id=${encodeURIComponent(threadId)}` : '';
   const res = await mutatingFetchIdempotent(`${API}/chat/cancel${params}`, { method: 'POST' });
+  await throwIfNotOk(res);
+}
+
+export async function removeQueuedMessage(threadId: string, messageId: string): Promise<void> {
+  const res = await mutatingFetch(`${API}/chat/queued-message/remove`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ thread_id: threadId, message_id: messageId }),
+  });
   await throwIfNotOk(res);
 }
 

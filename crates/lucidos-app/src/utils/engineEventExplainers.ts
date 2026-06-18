@@ -57,6 +57,8 @@ export function describeEngineReason(reason: EngineReason): string | null {
       return 'The engine detected a conflict when merging changes from main into your branch. We need to resolve it before applying.';
     case 'missing_hardening':
       return 'Hardening (`/harden`) must run before changes are applied. The engine queues it automatically when the marker is missing.';
+    case 'plugin_auto_update':
+      return `The engine found a newer version of ${reason.plugin_id} in ${reason.marketplace_name} and updated the installed plugin.`;
     case 'scheduler':
       return null;
   }

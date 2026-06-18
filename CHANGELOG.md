@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.11.0 — 2026-06-18
+
+**Added**
+- **Multi-workspace gateway** — standalone `lucidos-gateway` crate plus `lucidos-engine --gateway` mode, `/<slug>/` + `/~/` routing, engine-served frontend with base-path awareness, one shared dev gateway with per-workspace auto-start, and a brand-blue card-less workspace picker with animated mark, in-app switcher, and management UI (ADR 0013/0014).
+- **Self-contained macOS desktop app** — single `.app` bundling PostgreSQL 18 + engine + JS SDK, `build-dmg.sh` packaging, signed + notarized DMG + updater artifacts, auto-update from GitHub Releases, always-on LaunchAgent service + Tailscale mobile access, `File → New Window` (Cmd+N), one-click `curl | sh` installer.
+- **DB-backed environment variables** — store, API, injection, and `request_credential` LLM tool with custom env-var-name pre-fill; Settings subview, nav router, and live SSE updates.
+- **Restore-from-backup in the workspace picker** + `restore-archive` engine subcommand (old Settings restore surface removed).
+- **App Store folded into Apps** — Installed/Store tabs, marketplaces, and auto-update for marketplace installs.
+- **Per-workspace localStorage namespacing** behind the gateway.
+- **Brand identity** — Lucidos mark as a brand component, regenerated native Tauri icon set, boot splash + workspace-starting splash, dark-blue (logo-hue) theme, logo-reveal animation, favicon on the boot splash.
+- **OpenRouter (GLM 5.2) + local OpenAI-compatible LLM backends.**
+- **Pane/keyboard focus system** — focus panel on header click, prompt-focus drives thread pane, per-pane Tab trap, focused-pane Back/Forward nav.
+- **Nav-history dropdowns** — history list on long-press / right-click of the Back/Forward chevrons, with thread-type and content-category icons.
+- **Event-driven release pipeline** — `build-dmg.sh` emits its own `ReleaseStep*` events stage by stage (consumed read-only by the Release Cockpit), with a version-stamp guard and errtrace/ERR trap so failed stages always report.
+
+**Changed**
+- Codex mid-turn follow-ups interrupt-and-redirect the live turn.
+- Tighter coding-agent commit cadence + post-commit diff display.
+- Thread drawer toggle is now a plain show/hide (not a focus stage); Current threads sorted by creation time.
+- Bundled PostgreSQL 17 → 18 with automatic data migration; shared Postgres `max_connections` raised to 500.
+- Brand-blue header bar with light foreground inversion; dark theme retinted to very dark blue.
+- Markdown parsing cached so a re-render doesn't re-parse the whole thread.
+
+**Fixed**
+- macOS notarization — sign loose bundled PostgreSQL Mach-O binaries inside-out so the notary accepts the DMG.
+- PWA shows the gateway boot/stopped (503) splash instead of the stale cached shell.
+- Queued-message trash icon rendered inline within the status label.
+- Stored env vars applied to the engine process at startup; credential custom env-name is additive.
+- Large hardening wave — 130+ fixes across the gateway, desktop packaging, auto-update, notifications, drawer/mobile layout, focus handling, changes/apply, and engine recovery.
 ## v0.10.0 — 2026-06-15
 
 ### Added

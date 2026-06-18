@@ -1,6 +1,6 @@
 import { computed } from '@preact/signals';
 import { effectiveThreadStatus, getThreadDisplaySection, threadMap, threadNeedsAttention } from '../../store/store';
-import { byRecent, recencyKey, reviewTier, isExcludedFromSections } from '../../store/thread-events';
+import { byRecent, byCreated, recencyKey, reviewTier, isExcludedFromSections } from '../../store/thread-events';
 import type { ThreadState } from '../../store/thread-events';
 import type { DisplaySection } from '../../generated/thread-lifecycle';
 import type { ThreadStatus } from '../../store/thread-events';
@@ -235,60 +235,40 @@ export function categorizeThreads(
     return out;
 }
 
-/** Per-thread sort keys computed over the whole family — the parent inherits
- *  the freshest / highest-priority signal from any descendant, so the family
- *  rises together. Every member of one family resolves to the same record. */
+/** Per-thread sort key computed over the whole family — the parent inherits the
+ *  freshest user action from any descendant, so the family rises together. Every
+ *  member of one family resolves to the same record. */
 export type FamilyKeys = {
     /** Max last-user-action across the family (see `recencyKey`). Drives
-     *  Current / Saved / Archive recency — the family rises to its freshest
-     *  USER touch, not the agent's last churn. */
+     *  Saved / Archive recency — the family rises to its freshest USER touch,
+     *  not the agent's last churn. (Current sorts by creation time instead, so
+     *  it doesn't consult this.) */
     recentKey: string;
-    /** Min review-tier across the family (see `reviewTier`): 0 if any member is
-     *  awaiting a user answer/permission, else 1 if any member has another CTA
-     *  (codingAgentProposed / failed), else 2. */
-    reviewTier: 0 | 1 | 2;
 };
 
-/** Family-aware review comparator: order by the family's review tier (its most
- *  urgent member), then by the family's most-recent user action — every member
- *  of a family resolves to the same `FamilyKeys` record, so families sort as a
- *  unit. Shared by the drawer's Current sort and the post-archive focus picker
- *  so the two orderings can never drift (the divergence between this and an
- *  earlier per-thread review order is what let archiving a parent jump focus
- *  into an unrelated family's sub-thread). */
-export function makeByFamilyReview(
-    familyKeys: ReadonlyMap<string, FamilyKeys>,
-): (a: ThreadState, b: ThreadState) => number {
-    return (a, b) => {
-        const ka = familyKeys.get(a.meta.id)!;
-        const kb = familyKeys.get(b.meta.id)!;
-        if (ka.reviewTier !== kb.reviewTier) return ka.reviewTier - kb.reviewTier;
-        return kb.recentKey.localeCompare(ka.recentKey);
-    };
-}
-
 /** The Current-section rows in the exact order the thread drawer renders them:
- *  family-review sorted (see `makeByFamilyReview`), then nested so each
+ *  creation-time sorted (newest first, see `byCreated`), then nested so each
  *  sub-thread follows its parent (see `nestByParent`). The post-archive focus
- *  picker walks THIS order so "next in queue" is the next *visible row* —
- *  landing on the next family's parent rather than a sub-thread that merely
- *  sorts high by its own per-thread review tier. `visible` must already be
- *  top-thread filtered; `graph` is built over the full thread set so the parent
- *  walks resolve. */
+ *  picker walks THIS order so "next in queue" is the next *visible row*, in the
+ *  same order the user sees — sharing the comparator with the drawer's Current
+ *  sort keeps the two from drifting (the divergence between drawer order and
+ *  focus order is what let archiving a parent jump focus into an unrelated
+ *  family's sub-thread). `visible` must already be top-thread filtered; `graph`
+ *  is built over the full thread set so the parent walks resolve. */
 export function orderedCurrentForReview(
     visible: ThreadState[],
     graph: FamilyGraph,
 ): ThreadState[] {
     const current = categorizeThreads(visible, graph).current;
-    current.sort(makeByFamilyReview(computeFamilyKeys(visible, graph)));
+    current.sort(byCreated);
     return nestByParent(current).map(n => n.thread);
 }
 
-/** Compute family-aware sort keys for every non-composing/non-discarded thread.
- *  Returns a Map keyed by thread id; every member of the same family maps to
- *  the same record. Sites pass the relevant key (recentKey / reviewTier) to their existing comparator. Accepts an optional pre-built
- *  graph (see `computeFamilyGraph`) to share the parent walk with
- *  `categorizeThreads`. */
+/** Compute family-aware recency keys for every non-composing/non-discarded
+ *  thread. Returns a Map keyed by thread id; every member of the same family
+ *  maps to the same record (the family's freshest `recentKey`), so Saved /
+ *  Archive sort families as a unit. Accepts an optional pre-built graph (see
+ *  `computeFamilyGraph`) to share the parent walk with `categorizeThreads`. */
 export function computeFamilyKeys(
     threads: ThreadState[],
     graph?: FamilyGraph,
@@ -298,15 +278,12 @@ export function computeFamilyKeys(
     for (const t of threads) {
         const root = rootByThread.get(t.meta.id);
         if (root === undefined) continue;
-        const status = effectiveThreadStatus(t);
         const recent = recencyKey(t);
-        const tier = reviewTier(t, status);
         const cur = perRoot.get(root);
         if (!cur) {
-            perRoot.set(root, { recentKey: recent, reviewTier: tier });
+            perRoot.set(root, { recentKey: recent });
         } else {
             if (recent > cur.recentKey) cur.recentKey = recent;
-            if (tier < cur.reviewTier) cur.reviewTier = tier;
         }
     }
 

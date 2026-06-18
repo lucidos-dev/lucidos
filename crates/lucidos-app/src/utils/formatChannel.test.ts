@@ -31,9 +31,17 @@ describe('formatThreadChannelLabel', () => {
     expect(formatThreadChannelLabel('claude_code', null)).toBe('Claude Code');
   });
 
+  it('renders no tag for plain chat / Lucidos threads', () => {
+    // A regular Lucidos thread carries no channel chip — the absence IS the
+    // signal. `formatChannel` still names the channel for the filter dropdown.
+    expect(formatThreadChannelLabel('chat')).toBe('');
+    expect(formatThreadChannelLabel('lucidos')).toBe('');
+  });
+
   it('ignores codingAgent for non-coding channels', () => {
-    // A stray backend on a non-CC channel must never relabel it.
-    expect(formatThreadChannelLabel('chat', 'codex')).toBe('Lucidos');
+    // A stray backend on a non-CC channel must never relabel it: chat stays
+    // tag-less, trigger stays "Trigger".
+    expect(formatThreadChannelLabel('chat', 'codex')).toBe('');
     expect(formatThreadChannelLabel('trigger', 'codex')).toBe('Trigger');
   });
 });

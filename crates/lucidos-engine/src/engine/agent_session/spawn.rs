@@ -23,7 +23,7 @@ pub(super) async fn spawn_or_resume(
             Ok(rt) => return Ok(rt),
             Err(e) => {
                 log!(
-                    "[ClaudeCode] Resume failed ({}), falling back to fresh spawn",
+                    "[AgentSession] Resume failed ({}), falling back to fresh spawn",
                     e
                 );
             }
@@ -74,7 +74,7 @@ pub(super) async fn resolve_branch_for_resume(
         .unwrap_or(false);
     if exists {
         log!(
-            "[ClaudeCode] Reusing existing branch {} for resumed session",
+            "[AgentSession] Reusing existing branch {} for resumed session",
             rb
         );
         BranchResolution {
@@ -84,7 +84,7 @@ pub(super) async fn resolve_branch_for_resume(
         }
     } else {
         log!(
-            "[ClaudeCode] Resume branch {} no longer exists — creating fresh branch (dropping stale session id)",
+            "[AgentSession] Resume branch {} no longer exists — creating fresh branch (dropping stale session id)",
             rb
         );
         BranchResolution {

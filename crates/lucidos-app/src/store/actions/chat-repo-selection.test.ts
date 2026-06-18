@@ -134,10 +134,10 @@ describe('sendMessage scope selection (regression: dropdown ignored)', () => {
   it('new CC thread (no draft, no focus) sends folder from external scope', async () => {
     selectedScope.value = { kind: 'external', repoId: 'external-repo-uuid' };
 
-    await sendMessage('fix the merge conflict', undefined, { useClaudeCode: true });
+    await sendMessage('fix the merge conflict', undefined, { useCodingAgent: true });
 
     const body = lastBody();
-    expect(body.use_claude_code).toBe(true);
+    expect(body.use_coding_agent).toBe(true);
     expect(body.folder).toBe('external-repo-uuid');
     expect(body.repo_id).toBeUndefined();
   });
@@ -145,10 +145,10 @@ describe('sendMessage scope selection (regression: dropdown ignored)', () => {
   it('new CC thread with Lucidos scope omits folder (default Lucidos)', async () => {
     selectedScope.value = { kind: 'lucidos' };
 
-    await sendMessage('hello', undefined, { useClaudeCode: true });
+    await sendMessage('hello', undefined, { useCodingAgent: true });
 
     const body = lastBody();
-    expect(body.use_claude_code).toBe(true);
+    expect(body.use_coding_agent).toBe(true);
     expect(body.folder).toBeUndefined();
     expect(body.repo_id).toBeUndefined();
   });
@@ -156,10 +156,10 @@ describe('sendMessage scope selection (regression: dropdown ignored)', () => {
   it('new CC thread with app scope sends folder=data/apps/<id>', async () => {
     selectedScope.value = { kind: 'app', appId: 'momentum' };
 
-    await sendMessage('fix the chart bug', undefined, { useClaudeCode: true });
+    await sendMessage('fix the chart bug', undefined, { useCodingAgent: true });
 
     const body = lastBody();
-    expect(body.use_claude_code).toBe(true);
+    expect(body.use_coding_agent).toBe(true);
     expect(body.folder).toBe('data/apps/momentum');
     expect(body.repo_id).toBeUndefined();
   });
@@ -170,10 +170,10 @@ describe('sendMessage scope selection (regression: dropdown ignored)', () => {
     putThread(tid, { state: 'active', channel: 'claude_code', messageCount: 1, repoId: 'repo-A-uuid' });
     selectedScope.value = { kind: 'external', repoId: 'repo-B-uuid' };
 
-    await sendMessage('follow up', undefined, { useClaudeCode: true });
+    await sendMessage('follow up', undefined, { useCodingAgent: true });
 
     const body = lastBody();
-    expect(body.use_claude_code).toBe(true);
+    expect(body.use_coding_agent).toBe(true);
     expect(body.repo_id).toBe('repo-A-uuid');
     expect(body.folder).toBeUndefined();
   });
@@ -184,10 +184,10 @@ describe('sendMessage scope selection (regression: dropdown ignored)', () => {
     putThread(tid, { state: 'active', channel: 'claude_code', messageCount: 1 });
     selectedScope.value = { kind: 'external', repoId: 'repo-B-uuid' };
 
-    await sendMessage('follow up', undefined, { useClaudeCode: true });
+    await sendMessage('follow up', undefined, { useCodingAgent: true });
 
     const body = lastBody();
-    expect(body.use_claude_code).toBe(true);
+    expect(body.use_coding_agent).toBe(true);
     expect(body.repo_id).toBeUndefined();
     expect(body.folder).toBeUndefined();
   });
@@ -204,10 +204,10 @@ describe('sendMessage scope selection (regression: dropdown ignored)', () => {
     });
     selectedScope.value = { kind: 'lucidos' };
 
-    await sendMessage('keep going', undefined, { useClaudeCode: true });
+    await sendMessage('keep going', undefined, { useCodingAgent: true });
 
     const body = lastBody();
-    expect(body.use_claude_code).toBe(true);
+    expect(body.use_coding_agent).toBe(true);
     expect(body.folder).toBe('data/apps/momentum');
     expect(body.repo_id).toBeUndefined();
   });
@@ -221,10 +221,10 @@ describe('sendCompose carries dropdown scope through to chat body (real flow)', 
     setDraft(draftId, { text: 'fix it', image_hashes: [], mode: 'claude_code' });
     selectedScope.value = { kind: 'external', repoId: 'external-repo-uuid' };
 
-    await sendCompose(draftId, { useClaudeCode: true });
+    await sendCompose(draftId, { useCodingAgent: true });
 
     const body = lastBody();
-    expect(body.use_claude_code).toBe(true);
+    expect(body.use_coding_agent).toBe(true);
     // sendCompose flips composing→active BEFORE delegating, so the chat path
     // now treats this as a follow-up and reads meta.repoId — which compose
     // bound from the external scope.
@@ -238,10 +238,10 @@ describe('sendCompose carries dropdown scope through to chat body (real flow)', 
     setDraft(draftId, { text: 'fix it', image_hashes: [], mode: 'claude_code' });
     selectedScope.value = { kind: 'app', appId: 'momentum' };
 
-    await sendCompose(draftId, { useClaudeCode: true });
+    await sendCompose(draftId, { useCodingAgent: true });
 
     const body = lastBody();
-    expect(body.use_claude_code).toBe(true);
+    expect(body.use_coding_agent).toBe(true);
     expect(body.folder).toBe('data/apps/momentum');
     expect(body.repo_id).toBeUndefined();
   });
@@ -254,10 +254,10 @@ describe('sendCompose carries dropdown scope through to chat body (real flow)', 
     selectedScope.value = { kind: 'lucidos' };
     selectedCodingAgent.value = 'codex';
 
-    await sendCompose(draftId, { useClaudeCode: true });
+    await sendCompose(draftId, { useCodingAgent: true });
 
     const body = lastBody();
-    expect(body.use_claude_code).toBe(true);
+    expect(body.use_coding_agent).toBe(true);
     expect(body.coding_agent).toBe('codex');
     expect(body.folder).toBeUndefined();
     expect(body.repo_id).toBeUndefined();
@@ -270,10 +270,10 @@ describe('sendCompose carries dropdown scope through to chat body (real flow)', 
     setDraft(draftId, { text: 'hi', image_hashes: [], mode: null });
     selectedScope.value = { kind: 'external', repoId: 'external-repo-uuid' };
 
-    await sendCompose(draftId, { useClaudeCode: false });
+    await sendCompose(draftId, { useCodingAgent: false });
 
     const body = lastBody();
-    expect(body.use_claude_code).toBeUndefined();
+    expect(body.use_coding_agent).toBeUndefined();
     expect(body.repo_id).toBeUndefined();
     expect(body.folder).toBeUndefined();
   });
@@ -289,10 +289,10 @@ describe('sendCompose carries dropdown scope through to chat body (real flow)', 
     setDraft(draftId, { text: 'retry', image_hashes: [], mode: 'claude_code' });
     selectedScope.value = { kind: 'lucidos' };
 
-    await sendCompose(draftId, { useClaudeCode: true });
+    await sendCompose(draftId, { useCodingAgent: true });
 
     const body = lastBody();
-    expect(body.use_claude_code).toBe(true);
+    expect(body.use_coding_agent).toBe(true);
     expect(body.repo_id).toBeUndefined();
     expect(body.folder).toBeUndefined();
   });

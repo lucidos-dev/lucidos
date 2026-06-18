@@ -1,32 +1,121 @@
-import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
+import { useState, useEffect, useRef } from 'preact/hooks';
 import { signal } from '@preact/signals';
-import { connectionStatus, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, restartRequired, updateAvailable, serviceWorkerBuildId, restartGroups, showConfirm, showToast } from '../../store/store';
-import { isNewerVersion } from '../../utils/version';
-import { refreshClient, requestServiceWorkerBuildId } from '../../hooks/sw-update';
-import { initiateEngineRestart } from '../../store/actions/chat-changes';
+import { connectionStatus, restartRequired, updateAvailable, workspaceName } from '../../store/store';
 import { fetchWorkspaces } from '../../api/client';
 import type { WorkspaceInfo } from '../../api/client';
-import { formatShortTime } from '../../utils/formatTime';
-import { isTauri } from '../../utils/platform';
-import { invoke } from '../../utils/tauri';
+import { listWorkspaces, openWorkspace, type WorkspaceStatus } from '../../api/client/control';
+import { WORKSPACE_ID } from '../../utils/basePath';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
-import { CloseIcon } from '../shared/icons';
 import { Overlay } from '../shared/Overlay';
 import { viewportIsMobile } from '../../utils/viewport';
-import { ENGINE_VERSION } from 'virtual:engine-version';
 
 export const controlPanelOpen = signal(false);
-/** Anchor element of the toggle that opened the panel, so dismiss-on-outside
- *  treats re-clicking the same toggle as "inside" (toggle's own onClick
- *  handles the close). Set by the brand-label `data-role="control-panel-toggle"`
- *  in AppHeader / MobileAppHeader at open time. */
+/** Anchor element of the toggle that opened the panel. Used for fixed-position
+ *  fallback placement and for Overlay's anchor exemption. Set by the brand-label
+ *  `data-role="control-panel-toggle"` in AppHeader / MobileAppHeader at open
+ *  time. */
 export const controlPanelAnchor = signal<HTMLElement | null>(null);
+export const controlPanelClickPoint = signal<{ x: number; y: number } | null>(null);
 
-/** The SPA origin, read lazily (at call time, not module load) so importing
- *  this module never touches the DOM. Origin is fixed for the page lifetime. */
-function getApiUrl(): string {
-  return typeof window !== 'undefined' && window.location ? window.location.origin : '';
+function clampPanelAxis(value: number, size: number, viewportSize: number, margin = 8): number {
+  const min = margin;
+  const max = Math.max(min, viewportSize - size - margin);
+  return Math.max(min, Math.min(value, max));
+}
+
+function computePanelPosition(point: { x: number; y: number }, panel: HTMLElement): { top: number; left: number } {
+  const width = panel.offsetWidth || panel.getBoundingClientRect().width;
+  const height = panel.offsetHeight || panel.getBoundingClientRect().height;
+  const gap = 8;
+  // Center the popup on the click horizontally; vertically it behaves like a
+  // compact dropdown, opening below the pointer unless the viewport needs it above.
+  const left = clampPanelAxis(point.x - width / 2, width, window.innerWidth);
+  const belowTop = point.y + gap;
+  const top = belowTop + height <= window.innerHeight - gap
+    ? belowTop
+    : point.y - height - gap;
+  return {
+    top: clampPanelAxis(top, height, window.innerHeight),
+    left,
+  };
+}
+
+function fallbackPointForAnchor(anchor: HTMLElement | null): { x: number; y: number } | null {
+  if (!anchor) return null;
+  const rect = anchor.getBoundingClientRect();
+  return { x: rect.left + rect.width / 2, y: rect.bottom };
+}
+
+function samePanelPosition(a: { top: number; left: number } | null, b: { top: number; left: number }): boolean {
+  return !!a && a.top === b.top && a.left === b.left;
+}
+
+function useMouseAlignedPosition(
+  open: boolean,
+  point: { x: number; y: number } | null,
+  panelRef: { current: HTMLElement | null },
+): { top: number; left: number } | null {
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+
+  useEffect(() => {
+    if (!open || !point) {
+      setPos(null);
+      return;
+    }
+    const panel = panelRef.current;
+    if (!panel) return;
+    const next = computePanelPosition(point, panel);
+    setPos(prev => samePanelPosition(prev, next) ? prev : next);
+  });
+
+  useEffect(() => {
+    if (!open || !point) return;
+    let rafId: number | null = null;
+    const recompute = () => {
+      rafId = null;
+      const panel = panelRef.current;
+      if (!panel) return;
+      const next = computePanelPosition(point, panel);
+      setPos(prev => samePanelPosition(prev, next) ? prev : next);
+    };
+    const schedule = () => {
+      if (rafId !== null) return;
+      rafId = requestAnimationFrame(recompute);
+    };
+    schedule();
+    window.addEventListener('scroll', schedule, { capture: true, passive: true });
+    window.addEventListener('resize', schedule);
+    const vv = window.visualViewport;
+    if (vv) {
+      vv.addEventListener('resize', schedule);
+      vv.addEventListener('scroll', schedule);
+    }
+    return () => {
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      window.removeEventListener('scroll', schedule, true);
+      window.removeEventListener('resize', schedule);
+      if (vv) {
+        vv.removeEventListener('resize', schedule);
+        vv.removeEventListener('scroll', schedule);
+      }
+    };
+  }, [open, point?.x, point?.y, panelRef]);
+
+  return pos;
+}
+
+export function toggleControlPanelAtClick(e: MouseEvent & { currentTarget: EventTarget | null }): void {
+  const anchor = e.currentTarget instanceof HTMLElement ? e.currentTarget : null;
+  if (!anchor) return;
+  const rect = anchor.getBoundingClientRect();
+  const hasPointerPosition = e.clientX !== 0 || e.clientY !== 0;
+  controlPanelAnchor.value = anchor;
+  controlPanelClickPoint.value = hasPointerPosition
+    ? { x: e.clientX, y: e.clientY }
+    : { x: rect.left + rect.width / 2, y: rect.bottom };
+  controlPanelOpen.value = !controlPanelOpen.value;
 }
 
 export function controlPanelBadgeCount(): number {
@@ -42,248 +131,172 @@ export function controlPanelBadgeTooltip(): string | undefined {
   return undefined;
 }
 
+function isGatewayRunning(ws: WorkspaceStatus): boolean {
+  return ws.health === 'healthy' || ws.health === 'booting';
+}
+
+function gatewayDotClass(ws: WorkspaceStatus): string {
+  return ws.health === 'booting' ? 'ws-picker-dot-booting' : 'ws-picker-dot-healthy';
+}
+
+function closeControlPanel(): void {
+  controlPanelOpen.value = false;
+  controlPanelClickPoint.value = null;
+}
+
+function ManageWorkspacesItem() {
+  return (
+    <a class="control-panel-workspace-row control-panel-manage-row accent-link" href="/~/">
+        <span class="control-panel-ws-name">Manage workspaces</span>
+    </a>
+  );
+}
+
+function LoadingItem() {
+  return <div class="control-panel-empty">Loading...</div>;
+}
+
+function EmptyItem({ children }: { children: string }) {
+  return <div class="control-panel-empty">{children}</div>;
+}
+
 export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
   const ref = useRef<HTMLDivElement>(null);
   const [wsLoadable, setWsLoadable] = useState<Loadable<WorkspaceInfo[]>>({ status: 'not-loaded' });
+  // Gateway switcher (ADR 0014): when a workspace gateway fronts this origin, the
+  // control API lists peers addressable as /<slug>/ (same origin). Falls back to
+  // the legacy per-port list when the control API isn't reachable (no gateway).
+  const [gatewayWs, setGatewayWs] = useState<Loadable<WorkspaceStatus[]>>({ status: 'not-loaded' });
   const open = controlPanelOpen.value;
   // Both AppHeader and MobileAppHeader render simultaneously (dual-layout) and
   // each mounts a ControlPanel. Without this gate, the hidden copy's dismiss
   // hook treats clicks on the visible panel's buttons as "outside" and
-  // swallows them — Restart/Refresh/X would never fire.
+  // swallows them.
   const isActiveLayout = layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
   const effectiveOpen = open && isActiveLayout;
+  const anchor = controlPanelAnchor.value;
+  const clickPoint = controlPanelClickPoint.value ?? fallbackPointForAnchor(anchor);
+  const pos = useMouseAlignedPosition(effectiveOpen, clickPoint, ref);
 
   const status = connectionStatus.value;
   const connected = status === 'connected';
-  const name = workspaceName.value;
-  const path = workspacePath.value;
-  const startedAt = engineStartedAt.value;
-  const release = lucidosRelease.value;
-  const releaseDirty = lucidosReleaseDirty.value;
-  const engineVer = engineVersion.value;
-  const latestEngineVer = latestEngineVersion.value;
-  const latestTauriVer = latestTauriAppVersion.value;
-  // Set only by the Tauri shell (lib.rs), so its presence selects the app-shell
-  // version; undefined on web falls through to the bundled ENGINE_VERSION.
-  const tauriClientVersion = window.__LUCIDOS_APP_VERSION__;
-  const restart = restartRequired.value;
-  const update = updateAvailable.value;
-  const swBuildId = serviceWorkerBuildId.value;
-  // Un-stamped sw.js (live dev server) reports the literal placeholder — show it
-  // as "dev" rather than the raw `__LUCIDOS_BUILD_ID__` token.
-  const buildLabel = swBuildId
-    ? (swBuildId.startsWith('__') ? 'dev' : swBuildId)
-    : null;
-
-  // Refresh the SW build id each time the panel opens so the shown value is the
-  // live worker's (it's also queried at startup and kept fresh on
-  // controllerchange — this just guarantees freshness when the user looks).
-  useEffect(() => {
-    if (effectiveOpen) requestServiceWorkerBuildId();
-  }, [effectiveOpen]);
 
   // Fetch other workspaces on open. Gated to the active layout so the dual-
-  // mount doesn't double-fetch on every open.
+  // mount doesn't double-fetch on every open. Try the gateway control API first
+  // (gateway model); only fall back to the legacy per-port list if there's no
+  // gateway (control API unreachable).
   useEffect(() => {
-    if (!effectiveOpen || !connected) return;
-    setWsLoadable({ status: 'loading' });
-    fetchWorkspaces()
-      .then(res => setWsLoadable({ status: 'loaded', data: res.workspaces }))
-      .catch(e => setWsLoadable(toFailed(e)));
+    if (!effectiveOpen) return;
+    setGatewayWs({ status: 'loading' });
+    listWorkspaces()
+      .then(list => setGatewayWs({ status: 'loaded', data: list }))
+      .catch(() => {
+        setGatewayWs({ status: 'failed', error: 'no gateway' });
+        if (!connected) {
+          setWsLoadable({ status: 'failed', error: 'disconnected' });
+          return;
+        }
+        setWsLoadable({ status: 'loading' });
+        fetchWorkspaces()
+          .then(res => setWsLoadable({ status: 'loaded', data: res.workspaces }))
+          .catch(e => setWsLoadable(toFailed(e)));
+      });
   }, [effectiveOpen, connected]);
 
-  const handleRefresh = useCallback(() => {
-    controlPanelOpen.value = false;
-    // SW-aware: a bare reload keeps the current service worker, so it can't pick
-    // up a newer build the SW hasn't swapped to (the /assets/* graph is
-    // cache-first). refreshClient() checks for a new sw.js first, then reloads
-    // once the new worker controls the page (timeout fallback if there's nothing new).
-    refreshClient();
-  }, []);
-
-  const handleRestart = useCallback(async () => {
-    controlPanelOpen.value = false;
-    const extraAction = isTauri()
-      ? { label: 'Restart App', onClick: () => {
-          invoke('restart_app').catch((e: unknown) => {
-            showToast(`Failed to restart app: ${e}`, 'error');
-          });
-        } }
-      : undefined;
-    const groups = restartGroups.value;
-    const details = groups.length > 0
-      ? {
-          intro: 'These changes will be applied:',
-          groups: groups.map(g => ({ header: g.threadTitle, items: g.commits })),
-        }
-      : undefined;
-    if (await showConfirm('Restart engine?', 'Restart', { extraAction, variant: 'default', details })) {
-      await initiateEngineRestart();
-    }
-  }, []);
-
-  const copyApiUrl = useCallback(() => {
-    navigator.clipboard.writeText(getApiUrl()).then(
-      () => showToast('Copied to clipboard', 'success'),
-      () => showToast('Failed to copy', 'error')
-    );
-  }, []);
+  const gatewayPeers =
+    gatewayWs.status === 'loaded'
+      ? gatewayWs.data.filter(w => isGatewayRunning(w))
+      : [];
+  const legacyPeers =
+    wsLoadable.status === 'loaded'
+      ? wsLoadable.data.filter(w => w.engine_running)
+      : [];
 
   if (!effectiveOpen) return null;
 
-  const hasEngineUpdate = engineVer && latestEngineVer && isNewerVersion(latestEngineVer, engineVer);
-  const clientVersion = tauriClientVersion ?? ENGINE_VERSION;
-  // "Client behind" signal. Tauri: the shell updates as a versioned unit, so the
-  // app-version comparison is exact and we can show the target version. Web: the
-  // bundled JS version legitimately lags the engine on engine-only bumps, so we
-  // do NOT compare against the engine version (that nagged with nothing to
-  // refresh to). Instead `updateAvailable` reflects the service-worker BUILD_ID
-  // check — true only when a newer frontend build actually exists.
-  const tauriHasUpdate = !!(tauriClientVersion && latestTauriVer && isNewerVersion(latestTauriVer, tauriClientVersion));
-  const clientBehind = tauriClientVersion ? tauriHasUpdate : update;
-  const clientBehindLabel = tauriClientVersion ? ` (latest: ${latestTauriVer})` : ' (update available)';
-
   return (
-    // Anchor is the brand-label that opened the panel — re-clicking it routes
-    // through its own onClick toggle. backdrop={false}: positioned via CSS,
-    // re-using its container. Escape + dismiss + swallow come from <Overlay>.
-    <Overlay
-      open
-      onClose={() => { controlPanelOpen.value = false; }}
-      anchor={controlPanelAnchor.value}
-      backdrop={false}
-      panelClass="control-panel"
-      panelRef={ref}
-    >
-      <div class="control-panel-section">
-        <div class="control-panel-status-row">
-          <span class={`status-dot ${status}`} />
-          <span class="control-panel-status-text">
-            {connected ? 'Connected' : 'Disconnected'}
-          </span>
-          <button
-            class="icon-btn control-panel-close"
-            aria-label="Close control panel"
-            onClick={() => { controlPanelOpen.value = false; }}
-          >
-            <CloseIcon />
-          </button>
-        </div>
-        {restart && (
-          <div class="control-panel-notice">
-            {hasEngineUpdate
-              ? 'New engine version available — restart to activate'
-              : 'Engine changes applied — restart to activate'}
-          </div>
-        )}
-        {/* Restart subsumes refresh — no need to show both */}
-        {update && !restart && (
-          <div class="control-panel-notice">
-            Client update available — refresh to activate
-          </div>
-        )}
-        <div class="control-panel-info">
-          <div class="control-panel-info-row">
-            <span class="control-panel-label">Workspace</span>
-            <span class="control-panel-value">{name || path || 'unknown'}</span>
-          </div>
-          {path && name && (
-            <div class="control-panel-info-row">
-              <span class="control-panel-label">Path</span>
-              <span class="control-panel-value control-panel-path">{path}</span>
-            </div>
-          )}
-          {release && (
-            <div class="control-panel-info-row">
-              <span class="control-panel-label">Lucidos</span>
-              <span class="control-panel-value">
-                {release}
-                {releaseDirty && <span class="control-panel-update">*</span>}
-              </span>
-            </div>
-          )}
-          {engineVer && (
-            <div class="control-panel-info-row">
-              <span class="control-panel-label">Engine</span>
-              <span class="control-panel-value">
-                {engineVer}
-                {hasEngineUpdate && (
-                  <span class="control-panel-update"> (latest: {latestEngineVer})</span>
-                )}
-              </span>
-            </div>
-          )}
-          {clientVersion && (
-            <div class="control-panel-info-row">
-              <span class="control-panel-label">Client</span>
-              <span class="control-panel-value">
-                {clientVersion}
-                {clientBehind && (
-                  <span class="control-panel-update">{clientBehindLabel}</span>
-                )}
-              </span>
-            </div>
-          )}
-          {buildLabel && (
-            <div class="control-panel-info-row">
-              <span class="control-panel-label">Build</span>
-              <span class="control-panel-value">{buildLabel}</span>
-            </div>
-          )}
-          {startedAt && (
-            <div class="control-panel-info-row">
-              <span class="control-panel-label">Uptime</span>
-              <span class="control-panel-value">since {formatShortTime(new Date(startedAt))}</span>
-            </div>
-          )}
-          <div class="control-panel-info-row">
-            <span class="control-panel-label">API</span>
-            <button class="control-panel-value control-panel-api-url accent-link" onClick={copyApiUrl}>
-              {getApiUrl()}
-            </button>
-          </div>
-          {release && releaseDirty && (
-            <div class="control-panel-footnote">
-              <span class="control-panel-update">*</span> code has changed since the {release} release
-            </div>
-          )}
-        </div>
-      </div>
+    <>
+      {typeof document !== 'undefined' && createPortal(<div class="control-panel-scrim" aria-hidden="true" />, document.body)}
+      <Overlay
+        open
+        onClose={closeControlPanel}
+        anchor={anchor}
+        backdrop={false}
+        portal
+        panelClass="control-panel"
+        panelRef={ref}
+        panelStyle={pos
+          ? {
+              position: 'fixed',
+              top: `${pos.top}px`,
+              left: `${pos.left}px`,
+            }
+          : { position: 'fixed', visibility: 'hidden' }}
+      >
+        <div class="control-panel-workspace-list">
+          {gatewayWs.status === 'loading' && <LoadingItem />}
 
-      <div class="control-panel-section control-panel-actions">
-        <button class="action-btn" onClick={handleRefresh}>
-          Refresh Client
-        </button>
-        <button class="action-btn" onClick={handleRestart}>
-          Rebuild &amp; Restart
-        </button>
-      </div>
+          {gatewayWs.status === 'loaded' && (
+            <>
+              {gatewayPeers.length === 0 && <EmptyItem>No workspaces running</EmptyItem>}
+              {gatewayPeers.map(ws => {
+                const active = ws.id === WORKSPACE_ID;
+                return (
+                  <button
+                    class={`control-panel-workspace-row${active ? ' is-active' : ''}`}
+                    key={ws.id}
+                    aria-current={active ? 'page' : undefined}
+                    onClick={() => active ? closeControlPanel() : openWorkspace(ws.id)}
+                  >
+                    <span class={`ws-picker-dot ${gatewayDotClass(ws)}`} />
+                    <span class="control-panel-ws-name">{ws.name}</span>
+                    {active && <span class="control-panel-ws-current">Current</span>}
+                  </button>
+                );
+              })}
+              <ManageWorkspacesItem />
+            </>
+          )}
 
-      {connected && (
-        <div class="control-panel-section control-panel-workspaces">
-          <div class="control-panel-section-title">Other Workspaces</div>
-          {wsLoadable.status === 'loading' && <div class="control-panel-empty">Loading...</div>}
-          {wsLoadable.status === 'failed' && (
-            <div class="control-panel-empty error-text">Failed to load workspaces</div>
+          {gatewayWs.status === 'failed' && (
+            <>
+              {wsLoadable.status === 'loading' && <LoadingItem />}
+              {wsLoadable.status === 'failed' && (
+                <div class="control-panel-empty error-text">
+                  {connected ? 'Failed to load workspaces' : 'Workspaces unavailable while disconnected'}
+                </div>
+              )}
+              {wsLoadable.status === 'loaded' && legacyPeers.length === 0 && (
+                <EmptyItem>No workspaces running</EmptyItem>
+              )}
+              {legacyPeers.map(ws => {
+                const active = !!workspaceName.value && ws.name === workspaceName.value;
+                return (
+                  <a
+                    class={`control-panel-workspace-row${active ? ' is-active' : ''}`}
+                    key={ws.path}
+                    aria-current={active ? 'page' : undefined}
+                    href={active ? undefined : ws.port ? `https://localhost:${ws.port}` : undefined}
+                    target={active ? undefined : '_blank'}
+                    rel={active ? undefined : 'noopener'}
+                    onClick={(e) => {
+                      if (active) {
+                        e.preventDefault();
+                        closeControlPanel();
+                      }
+                    }}
+                  >
+                    <span class="ws-picker-dot ws-picker-dot-healthy" />
+                    <span class="control-panel-ws-name">{ws.name}</span>
+                    {active ? <span class="control-panel-ws-current">Current</span> : ws.port && <span class="control-panel-ws-port">:{ws.port}</span>}
+                  </a>
+                );
+              })}
+              <ManageWorkspacesItem />
+            </>
           )}
-          {wsLoadable.status === 'loaded' && wsLoadable.data.length === 0 && (
-            <div class="control-panel-empty">No other workspaces running</div>
-          )}
-          {wsLoadable.status === 'loaded' && wsLoadable.data.map(ws => (
-            <a
-              key={ws.path}
-              class="control-panel-workspace-row"
-              href={ws.port ? `https://localhost:${ws.port}` : undefined}
-              target="_blank"
-              rel="noopener"
-            >
-              <span class={`status-dot ${ws.engine_running ? 'connected' : 'disconnected'}`} />
-              <span class="control-panel-ws-name">{ws.name}</span>
-              {ws.port && <span class="control-panel-ws-port">:{ws.port}</span>}
-            </a>
-          ))}
         </div>
-      )}
-    </Overlay>
+      </Overlay>
+    </>
   );
 }

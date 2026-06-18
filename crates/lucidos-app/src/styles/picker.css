@@ -1,0 +1,445 @@
+/* Workspace picker (ADR 0014) — the gateway root surface. Standalone screen.
+   The page wears the Lucidos brand blue (the same gradient the app mark uses),
+   the mark is the animated hero, and the workspace list is flat — no card chrome.
+   Everything is white-on-blue with translucent affordances. */
+
+.ws-picker {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 4rem 1rem 3rem;
+  overflow-y: auto;
+  color: #fff;
+  /* The mark's own radial gradient, scaled to fill the viewport — a lighter
+     take on the brand blue, with a soft highlight for depth. */
+  background:
+    radial-gradient(60% 50% at 80% 0%, rgba(150, 200, 255, 0.45), transparent 70%),
+    radial-gradient(130% 120% at 28% 12%, #4a97ee 0%, #1f6fce 50%, #0c52ad 100%);
+  background-attachment: fixed;
+}
+
+.ws-picker-shell {
+  width: 100%;
+  max-width: 30rem;
+}
+
+/* ── Header / animated mark ───────────────────────────────────────────────── */
+
+/* Header is centered (brand lockup + "Choose a workspace"), with a tight gap to
+   the list below. */
+.ws-picker-header {
+  text-align: center;
+  margin-bottom: 1rem;
+}
+
+/* Brand lockup: the animated mark with the wordmark vertically centered to it,
+   the pair centered horizontally in the header. */
+.ws-picker-brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.ws-picker-mark {
+  flex: 0 0 auto;
+  width: 3rem;
+  height: 3rem;
+  display: block;
+  /* Corner radius + shadow are kept proportional to the mark size (the original
+     5rem mark used 1.375rem / 0.75rem / 1.75rem) so the squircle shape and depth
+     read the same at this smaller size instead of over-rounding. */
+  border-radius: 0.825rem;
+  filter: drop-shadow(0 0.45rem 1.05rem rgba(3, 33, 80, 0.55));
+}
+
+/* Logo reveal (Logo Studio): a sparkle flashes at each tile in turn, drops a
+   square behind it, and rests as the spark at the top-right — TL → BL → BR → TR.
+   Each element shares keyframes; the per-tile order comes from inline delays. */
+.ws-rv-sq,
+.ws-rv-flash,
+.ws-rv-final {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+/* Squares settle in (base state visible, so reduced-motion shows the mark). */
+.ws-rv-sq {
+  animation: ws-rv-pop 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+/* Transient sparkles burst then vanish as their square lands (base hidden). */
+.ws-rv-flash {
+  opacity: 0;
+  animation: ws-rv-flash 0.5s ease-out both;
+}
+
+/* The top-right spark lands last with one clean spring pop, then idles with a
+   subtle scale-only pulse. Pulsing scale (not opacity) keeps it full-brightness
+   so it never dims below the squares, and the pulse's 0% IS the landed state
+   (scale 1, opacity untouched) so the hand-off is seamless — no jump. */
+.ws-rv-final {
+  animation:
+    ws-rv-final-in 0.55s cubic-bezier(0.34, 1.56, 0.64, 1) 1.5s both,
+    ws-rv-pulse 3.4s ease-in-out 2.05s infinite;
+}
+
+@keyframes ws-rv-pop {
+  0% { opacity: 0; transform: scale(0); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes ws-rv-flash {
+  0% { opacity: 0; transform: scale(0) rotate(0deg); }
+  35% { opacity: 1; transform: scale(1) rotate(45deg); }
+  70% { opacity: 0.9; transform: scale(0.95) rotate(80deg); }
+  100% { opacity: 0; transform: scale(0.4) rotate(110deg); }
+}
+@keyframes ws-rv-final-in {
+  0% { opacity: 0; transform: scale(0) rotate(-30deg); }
+  100% { opacity: 1; transform: scale(1) rotate(0deg); }
+}
+@keyframes ws-rv-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.08); }
+}
+
+.ws-picker-header h1 {
+  margin: 0;
+  /* line-height 1 trims the wordmark's line box to the glyphs so it centers
+     cleanly against the logo without the font's leading offsetting it. */
+  line-height: 1;
+  color: #fff;
+  font-size: 2.25rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.ws-picker-header p {
+  margin: 0.25rem 0 0;
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 0.9375rem;
+}
+
+/* ── States ──────────────────────────────────────────────────────────────── */
+
+.ws-picker-error {
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(255, 138, 128, 0.6);
+  color: #ffd9d4;
+  border-radius: 0.625rem;
+  padding: 0.625rem 0.875rem;
+  margin-bottom: 1rem;
+  font-size: 0.875rem;
+}
+
+.ws-picker-empty {
+  color: rgba(255, 255, 255, 0.7);
+  padding: 1.5rem 0;
+  text-align: center;
+}
+
+/* ── List / rows (flat, no card) ─────────────────────────────────────────── */
+
+.ws-picker-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.ws-picker-row {
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+}
+.ws-picker-row:last-child {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+/* The whole row opens the workspace. Fixed three-cell layout (dot · name ·
+   actions): the name grows and ellipsizes, so its length can never reshape the
+   row — every workspace renders identically regardless of name. */
+.ws-picker-open {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.625rem 0.625rem 0.625rem 0.75rem;
+  border-radius: 0.625rem;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.ws-picker-open:hover,
+.ws-picker-open:focus-visible {
+  background: rgba(255, 255, 255, 0.1);
+  outline: none;
+}
+
+.ws-picker-dot {
+  flex: 0 0 auto;
+  width: 0.625rem;
+  height: 0.625rem;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.45);
+}
+.ws-picker-dot-healthy { background: #56d364; box-shadow: 0 0 0.5rem rgba(86, 211, 100, 0.7); }
+.ws-picker-dot-booting { background: #e3b341; animation: ws-dot-pulse 1.2s ease-in-out infinite; }
+.ws-picker-dot-stopped { background: rgba(255, 255, 255, 0.4); }
+.ws-picker-dot-unhealthy { background: #ff7b72; box-shadow: 0 0 0.5rem rgba(255, 123, 114, 0.7); }
+
+@keyframes ws-dot-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.ws-picker-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+  font-size: 1rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-picker-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 0.125rem;
+}
+
+/* ── Icon action buttons ─────────────────────────────────────────────────── */
+
+.ws-picker-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: none;
+  border-radius: 0.5rem;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.8);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+}
+.ws-picker-icon svg {
+  width: 1.125rem;
+  height: 1.125rem;
+}
+.ws-picker-icon:hover {
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+}
+.ws-picker-icon:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* Play/pause is the prominent inline control — filled white pill. */
+.ws-picker-icon-play {
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+}
+.ws-picker-icon-play:hover {
+  background: rgba(255, 255, 255, 0.32);
+}
+
+/* Auto-start toggle: dim when off, warm gold when on. */
+.ws-picker-icon-toggle { color: rgba(255, 255, 255, 0.5); }
+.ws-picker-icon-toggle.is-on { color: #ffd45e; }
+.ws-picker-icon-toggle.is-on:hover { color: #ffdf7e; }
+
+.ws-picker-icon-danger:hover {
+  background: rgba(248, 81, 73, 0.28);
+  color: #ffd9d4;
+}
+
+/* Secondary actions (rename / delete) stay hidden until the row is hovered on
+   pointer devices; on touch (no hover) they're always shown so they're tappable. */
+.ws-picker-icon-secondary { opacity: 1; }
+@media (hover: hover) {
+  .ws-picker-icon-secondary {
+    opacity: 0;
+    pointer-events: none;
+  }
+  .ws-picker-open:hover .ws-picker-icon-secondary,
+  .ws-picker-open:focus-within .ws-picker-icon-secondary,
+  .ws-picker-row:focus-within .ws-picker-icon-secondary {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+/* ── Inline forms (rename / delete / create) ─────────────────────────────── */
+
+.ws-picker-inline {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  flex-wrap: wrap;
+  width: 100%;
+  padding: 0.5rem 0.25rem;
+}
+
+.ws-picker-delete {
+  font-size: 0.875rem;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.ws-picker-input {
+  flex: 1;
+  min-width: 8rem;
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 0.5rem;
+  color: #fff;
+  padding: 0.4375rem 0.625rem;
+  font-size: 0.9375rem;
+}
+.ws-picker-input::placeholder { color: rgba(255, 255, 255, 0.55); }
+.ws-picker-input:focus {
+  outline: none;
+  border-color: rgba(255, 255, 255, 0.6);
+}
+
+.ws-picker-btn {
+  flex: 0 0 auto;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+  border-radius: 0.5rem;
+  padding: 0.4375rem 0.875rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.ws-picker-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.24); }
+.ws-picker-btn:disabled { opacity: 0.45; cursor: default; }
+.ws-picker-btn-confirm { background: #2ea043; border-color: transparent; }
+.ws-picker-btn-confirm:hover:not(:disabled) { background: #3fb950; }
+.ws-picker-btn-danger { background: #da3633; border-color: transparent; }
+.ws-picker-btn-danger:hover:not(:disabled) { background: #f85149; }
+
+/* ── Footer ──────────────────────────────────────────────────────────────── */
+
+.ws-picker-footer {
+  margin-top: 1.5rem;
+  text-align: center;
+}
+
+.ws-picker-new {
+  border: 1px dashed rgba(255, 255, 255, 0.4);
+  background: transparent;
+  color: #fff;
+  border-radius: 0.625rem;
+  padding: 0.625rem 1.125rem;
+  font-size: 0.9375rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.ws-picker-new:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.7);
+}
+.ws-picker-new:disabled { opacity: 0.45; cursor: default; }
+
+/* The two footer entry points (New / Restore) sit side by side. */
+.ws-picker-footer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+/* ── Restore from backup ─────────────────────────────────────────────────── */
+
+.ws-picker-restore-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: 100%;
+  text-align: left;
+  padding: 0.5rem 0.25rem;
+}
+
+/* Drop-or-click target for the .enc file. Dashed like the New button so it
+   reads as the same family of affordance. */
+.ws-picker-restore-drop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 3rem;
+  padding: 0.75rem 1rem;
+  border: 1px dashed rgba(255, 255, 255, 0.45);
+  border-radius: 0.625rem;
+  color: rgba(255, 255, 255, 0.8);
+  font-size: 0.875rem;
+  text-align: center;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.ws-picker-restore-drop:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.7);
+}
+
+.ws-picker-restore-warn {
+  font-size: 0.8125rem;
+  color: #ffd9d4;
+}
+
+/* Status banner above the footer (running / completed / failed). */
+.ws-picker-restore-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  flex-wrap: wrap;
+  margin-top: 1.25rem;
+  padding: 0.625rem 0.875rem;
+  border-radius: 0.625rem;
+  font-size: 0.875rem;
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+}
+.ws-picker-restore-banner[data-state="completed"] {
+  border-color: rgba(86, 211, 100, 0.6);
+}
+.ws-picker-restore-banner[data-state="failed"] {
+  border-color: rgba(255, 138, 128, 0.6);
+  color: #ffd9d4;
+}
+.ws-picker-restore-banner > span:first-of-type { flex: 1 1 auto; min-width: 0; }
+
+.ws-picker-restore-spinner {
+  flex: 0 0 auto;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-top-color: #fff;
+  animation: ws-restore-spin 0.8s linear infinite;
+}
+@keyframes ws-restore-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── Reduced motion ──────────────────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  /* No reveal — squares/final spark are visible at rest, transient sparks stay
+     hidden, so the static mark shows immediately. */
+  .ws-rv-sq,
+  .ws-rv-flash,
+  .ws-rv-final,
+  .ws-picker-dot-booting,
+  .ws-picker-restore-spinner {
+    animation: none;
+  }
+}

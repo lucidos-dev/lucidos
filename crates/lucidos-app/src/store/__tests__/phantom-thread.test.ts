@@ -91,6 +91,18 @@ describe('Phantom thread prevention', () => {
     expect(threadMap.value.has(threadId)).toBe(false);
   });
 
+  it('CodingAgentDiffChanged for unknown thread must NOT create a skeleton', () => {
+    const threadId = 'not-loaded-diff-thread';
+
+    handleThreadEvent({
+      thread_id: threadId,
+      event: { type: 'CodingAgentDiffChanged', has_diff: true },
+      created: '2026-04-16T12:00:00Z',
+    });
+
+    expect(threadMap.value.has(threadId)).toBe(false);
+  });
+
   it('persisted event for unknown thread DOES create a skeleton', () => {
     // Scenario: new thread starts, SessionStarted arrives via SSE.
     // This should still create a skeleton (it has a DB row).
@@ -184,6 +196,54 @@ describe('Phantom thread prevention', () => {
     const ancestor = threadMap.value.get(ancestorId)!;
     expect(ancestor.meta.blockingDescendantCount).toBe(2);
     expect(ancestor.meta.updatedAt).toBe(ancestorOwnLastActivity); // NOT bumped
+  });
+
+  it('CodingAgentDiffChanged applies aggregate diff flag without bumping updatedAt', () => {
+    const threadId = 'coding-agent-thread';
+    const ownLastActivity = '2026-04-01T00:00:00Z';
+    const map = threadMap.value;
+    map.set(threadId, makeThread(threadId, {
+      channel: 'claude_code',
+      updatedAt: ownLastActivity,
+      codingAgentHasDiff: false,
+    }));
+    threadMap.value = new Map(map);
+
+    handleThreadEvent({
+      thread_id: threadId,
+      event: { type: 'CodingAgentDiffChanged', has_diff: true },
+      created: '2026-04-16T12:00:00Z',
+      aggregate: {
+        threadId,
+        title: 'Test Thread',
+        channel: 'claude_code',
+        initiator: 'user',
+        createdAt: '2026-01-01T00:00:00Z',
+        lastActivity: ownLastActivity,
+        messageCount: 1,
+        section: 'archived',
+        activeChildrenCount: 0,
+        totalChildrenCount: 0,
+        blockingDescendantCount: 0, attentionDescendantCount: 0,
+        status: 'idle',
+        codingAgentHasDiff: true,
+        codingAgentProposed: false,
+        codingAgentRequiresRestart: false,
+        codingAgentIsExternalRepo: false,
+        codingAgentApplying: false,
+        lastRevivedAt: null,
+        isSaved: false,
+        hasResponse: true,
+        parentThreadId: null,
+        parentThreadTitle: null,
+        state: 'active',
+        latestTodoList: null,
+      } as unknown as Parameters<typeof handleThreadEvent>[0]['aggregate'],
+    });
+
+    const thread = threadMap.value.get(threadId)!;
+    expect(thread.meta.codingAgentHasDiff).toBe(true);
+    expect(thread.meta.updatedAt).toBe(ownLastActivity);
   });
 
   it('ChildrenCountChanged with section flip applies the section change', () => {

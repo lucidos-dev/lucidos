@@ -448,17 +448,17 @@ mod tests {
     }
 
     #[test]
-    fn run_claude_tool_has_optional_images_parameter() {
+    fn run_coding_agent_tool_has_optional_images_parameter() {
         let tools = get_default_tools();
         let tool = tools
             .iter()
-            .find(|t| t.name == tn::RUN_CLAUDE)
-            .expect("run_claude tool must be registered");
+            .find(|t| t.name == tn::RUN_CODING_AGENT)
+            .expect("run_coding_agent tool must be registered");
 
         let props = tool.parameters.get("properties").unwrap();
         let images = props
             .get("images")
-            .expect("run_claude must declare an `images` parameter");
+            .expect("run_coding_agent must declare an `images` parameter");
 
         assert_eq!(
             images.get("type").and_then(|v| v.as_str()),

@@ -27,6 +27,15 @@ describe('describeEngineReason', () => {
     expect(describeEngineReason({ kind: 'missing_hardening' }))
       .toMatch(/harden/i);
   });
+  it('returns explainer for plugin_auto_update', () => {
+    expect(describeEngineReason({
+      kind: 'plugin_auto_update',
+      plugin_id: 'browser-learning',
+      marketplace_id: 'core',
+      marketplace_name: 'Core',
+    }))
+      .toMatch(/browser-learning.*Core/i);
+  });
   it('returns null for scheduler (handled by trigger renderer)', () => {
     expect(describeEngineReason({ kind: 'scheduler', trigger_id: 't' }))
       .toBeNull();

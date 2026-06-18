@@ -1,9 +1,12 @@
 #!/bin/bash
-# Start Lucidos in browser-based development mode:
+# Start Lucidos in browser-based development mode (ADR 0014):
 #   - PostgreSQL with pgvector in Docker
-#   - Rust engine runs natively on macOS (fast iteration)
-#   - Frontend served as a built bundle by default (vite build --watch + vite
-#     preview); pass --hmr for the live Vite dev server
+#   - Rust engine runs natively on macOS (fast iteration), serving the built
+#     frontend (dist/) DIRECTLY via LUCIDOS_STATIC_DIR — no Vite in the serving
+#     path. `vite build --watch` (a checkout-level singleton) just rebuilds dist/
+#     on source change; the engine serves it.
+#   - The standalone `lucidos-gateway` binary fronts the workspace at /<slug>/
+#     and spawns + supervises the loopback engine.
 #   - Supports multiple workspaces running concurrently
 set -e
 
@@ -29,10 +32,21 @@ build_or_find_engine
 build_sdk
 swap_ports
 
-start_engine
+# Gateway model by default (ADR 0014): the standalone lucidos-gateway binary
+# fronts the workspace at /<slug>/ and spawns + supervises the engine.
+# LUCIDOS_NO_GATEWAY=1 falls back to the legacy direct-engine model (engine on
+# the user-facing port, app served at /).
+if [ -n "${LUCIDOS_NO_GATEWAY:-}" ]; then
+    start_engine
+else
+    seed_gateway_registry
+    start_gateway
+fi
 
-# In --engine-only mode, skip Vite and exit after engine starts (used by restart API
-# when running under Tauri — Tauri manages its own Vite, we just need a fresh engine)
+# In --engine-only mode, skip Vite and exit after the engine/gateway starts
+# (used by the restart API). In gateway mode start_gateway already reused the
+# running gateway and asked it to respawn this workspace's stack onto the
+# rebuilt binary, so there's nothing more to do.
 if [ -n "$ENGINE_ONLY" ]; then
     show_banner "engine-only"
     exit 0

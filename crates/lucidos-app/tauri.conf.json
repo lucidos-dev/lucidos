@@ -5,7 +5,7 @@
   "identifier": "com.lucidos.app",
   "build": {
     "frontendDist": "./dist",
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "",
     "beforeBuildCommand": "npm run build",
     "devUrl": "http://localhost:5173"
   },
@@ -19,8 +19,30 @@
     ]
   },
   "bundle": {
-    "active": false,
-    "targets": "all",
-    "icon": []
+    "active": true,
+    "targets": ["app", "dmg"],
+    "createUpdaterArtifacts": true,
+    "category": "Productivity",
+    "copyright": "© 2026 Kenneth Tiller",
+    "shortDescription": "Your AI-native workspace",
+    "longDescription": "Lucidos is a local, event-driven, AI-native operating system. Talk, build, run, automate, and remember together in one place.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/lucidos-dev/lucidos/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY0NDFCOUJEMTk1NzRCNUUKUldSZVMxY1p2YmxCOU5WcTYzV0o5elF1MERmZjY0d2FvbUNvTWRITVFueTRQd2lNNzRPRWVOMWkK"
+    }
   }
 }

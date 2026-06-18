@@ -1,4 +1,4 @@
-import { test, expect, Page } from '@playwright/test';
+import { test, expect, Page } from './fixtures';
 import { randomUUID } from 'crypto';
 import { assertHealthy, clickVisibleElement, ensureMobileView, expectPushSent, navigateToApp, waitForVisibleInput, waitForVisibleElement, waitForExchangeCount, gotoWithRetry } from './helpers';
 import { clearNotifications, psql } from './db-helpers';

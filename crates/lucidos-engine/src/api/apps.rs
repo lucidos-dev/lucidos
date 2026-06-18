@@ -1,4 +1,4 @@
-use super::app_ui::{rewrite_for_commit, rewrite_for_thread_id};
+use super::app_ui::{rescope_app_html, rewrite_for_commit, rewrite_for_thread_id};
 use super::*;
 
 use crate::engine::event_bus::SystemEvent;
@@ -297,12 +297,19 @@ pub(super) async fn write_app_source(
 /// opt-in via tags in the app's HTML (see `knowhow/js-sdk.md`).
 pub(super) async fn serve_app_ui(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(app_id): Path<String>,
     Query(query): Query<AppUiPreviewQuery>,
 ) -> Response {
     if !is_valid_id(&app_id) {
         return (StatusCode::BAD_REQUEST, "Invalid ID").into_response();
     }
+
+    // Behind the gateway this iframe loads at `/<slug>/app/<id>/`; re-scope the
+    // app's absolute engine refs (e.g. `<script src="/api/v1/sdk.js">`) with the
+    // forwarded prefix so they route back to this workspace (ADR 0014 §4). A
+    // direct hit has no prefix → `/` → no-op.
+    let prefix = crate::api::base_path::forwarded_prefix(&headers);
 
     let commit = query.commit.as_deref();
     if commit.is_some() && query.thread_id.is_some() {
@@ -319,6 +326,7 @@ pub(super) async fn serve_app_ui(
         return match artifacts::read_file_at_commit(&state.workspace_path, &ui_path, commit_hash) {
             Ok(content) => {
                 let rewritten = rewrite_for_commit(&String::from_utf8_lossy(&content), commit);
+                let rewritten = rescope_app_html(&rewritten, &prefix);
                 (
                     [
                         (header::CONTENT_TYPE, "text/html"),
@@ -365,6 +373,7 @@ pub(super) async fn serve_app_ui(
                 Some(tid) => rewrite_for_thread_id(&content, tid),
                 None => content,
             };
+            let html = rescope_app_html(&html, &prefix);
             (
                 [
                     (header::CONTENT_TYPE, "text/html"),

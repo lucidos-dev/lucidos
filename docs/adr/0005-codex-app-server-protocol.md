@@ -92,3 +92,43 @@ env var rolls a workspace back to the shipped-and-stable model.
   rejected: codex has no `--permission-prompt-tool` designation; its
   approvals are first-class JSON-RPC requests on the app-server protocol,
   so the bridge is the natural seam and reuses the engine machinery anyway.
+
+## Addendum (2026-06-18): mid-turn follow-ups interrupt-and-redirect
+
+**Context.** The Codex drivers accept input only at a turn boundary
+(`turn/start` requires no turn in flight; the exec driver is per-turn), so the
+app-server driver queues any `AgentInput` that arrives mid-turn ("No mid-turn
+injection … every accepted input gets its own turn"). A user follow-up sent
+during a long autonomous turn therefore sat invisibly in the driver's queue
+until the turn finished — observed as "Codex isn't getting my follow-ups at all"
+on a turn that ran 18+ minutes without idling. Claude Code differs: its driver
+writes follow-ups to the CC process's stdin immediately, so the live turn is
+steered.
+
+**Decision.** A genuine **user** follow-up that lands while a **Codex** turn is
+in flight now **interrupts the live turn and runs the follow-up as the next
+turn** on the same Codex thread. The interrupt is the graceful `turn/interrupt`
+from §4, so partial work survives and the thread keeps full context; the
+interrupted turn ends as a resumable `Canceled` boundary (no spurious
+`ResponseGenerated`, no change proposed for the redirected-away work). This is
+**Codex-only** — CC keeps its stdin steering — and **mid-turn-only** (a follow-up
+to an idle-but-alive Codex session still routes via `turn/start` immediately).
+
+**Mechanism (no driver change).** The seam is the engine's follow-up fast-path
+(`engine/chat/process/run.rs`), which reuses the existing Stop-button machinery
+(`interrupt_agent`'s `cancel_actor` + `interrupt` notify) and the existing
+"interrupt superseded by inflight follow-ups" accounting
+(`pending_followups` / `terminate_decision::KeepAliveForFollowup`): the fast-path
+pre-counts the follow-up so the interrupted turn's idle keeps the subprocess
+alive, fires the interrupt, waits for idle (so the `Canceled` terminal is
+sequenced before the follow-up's `MessageReceived`), then routes the follow-up
+normally. The app-server driver is unchanged — it still queues the input and
+runs it the instant the interrupted turn ends. Gated on
+`AgentSession::coding_agent == Codex` and `is_in_flight()`; never fires for an
+engine-internal child-wake. Decision + arming are pure functions
+(`should_redirect_codex_followup` / `arm_codex_redirect` in
+`engine/chat/process_helpers.rs`) with unit tests.
+
+**Deferred.** The interrupted turn reuses `CancelCause::UserStop`; a dedicated
+`SupersededByFollowup` cause (for a clearer "Redirected" label) was deferred to
+avoid a `ThreadEvent`/frontend-union surface change the core fix doesn't need.

@@ -1,6 +1,5 @@
-//! LLM-facing schemas for plugin tools (install/check/update/uninstall).
+//! LLM-facing schemas for plugin tools (install/marketplaces/check/update/uninstall).
 //! Handlers live in `engine::tools::plugins`.
-
 
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
@@ -17,6 +16,24 @@ pub(super) fn plugin_tools() -> Vec<ToolDefinition> {
                     "source": {
                         "type": "string",
                         "description": "GitHub tree URL (e.g., 'https://github.com/lucidos-dev/plugins/tree/main/browser-learning'), a plain git URL, or an absolute path to a .lucidos-plugin file."
+                    }
+                },
+                "required": ["source"]
+            }),
+        },
+        ToolDefinition {
+            name: tn::REGISTER_PLUGIN_MARKETPLACE.to_string(),
+            description: "Register or rename an App Store marketplace. A marketplace is a git repository or GitHub tree URL that the App Store scans for plugin manifests. Registration writes data/config/plugin-marketplaces.json, commits it, and kicks off a marketplace scan/auto-update pass. Use this when the user asks to add a plugin repo, marketplace, plugin marketplace, or app-store source. Do not use this to install a specific plugin; after registering, either navigate to the App Store or use install_plugin with a specific plugin source.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Git repository URL or GitHub tree URL to register as a marketplace."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Optional display name. Omit to derive a name from the repository."
                     }
                 },
                 "required": ["source"]

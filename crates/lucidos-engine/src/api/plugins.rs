@@ -11,18 +11,24 @@
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, State},
     http::{HeaderMap, StatusCode},
-    routing::post,
+    routing::{delete, get, post},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 use crate::api::AppState;
+use crate::core::plugin_marketplaces::{
+    add_marketplace, load_registry, remove_marketplace, save_registry, scan_catalog,
+    MarketplaceCatalog, PluginMarketplace, MARKETPLACES_DATA_PATH,
+};
 use crate::core::plugins::PLUGIN_ARCHIVE_EXT;
+use crate::core::ArtifactManager;
 use crate::engine::tools::plugins::{
     cancel_pending_install, cancel_pending_uninstall, confirm_pending_install,
-    confirm_pending_uninstall,
+    confirm_pending_uninstall, installed_plugin_summaries, stage_install_request,
+    stage_uninstall_request, PLUGIN_INSTALL_REQUEST_PREFIX, PLUGIN_UNINSTALL_REQUEST_PREFIX,
 };
 
 /// Plugin archives are mostly text bundles; cap well below the router-wide
@@ -40,6 +46,305 @@ pub(super) struct UploadArchiveResponse {
 
 fn err(code: StatusCode, msg: &str) -> (StatusCode, Json<JsonValue>) {
     (code, Json(serde_json::json!({ "error": msg })))
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct MarketplacesResponse {
+    pub marketplaces: Vec<PluginMarketplace>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AddMarketplaceRequest {
+    pub source: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct AddMarketplaceResponse {
+    pub marketplace: PluginMarketplace,
+    pub marketplaces: Vec<PluginMarketplace>,
+    pub created: bool,
+    pub commit: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct RemoveMarketplaceResponse {
+    pub marketplaces: Vec<PluginMarketplace>,
+    pub removed: bool,
+    pub commit: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct StageInstallRequest {
+    pub source: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct StageUninstallRequest {
+    pub id: String,
+}
+
+async fn commit_marketplaces_registry(
+    state: &AppState,
+    headers: &HeaderMap,
+    message: &str,
+) -> Result<String, (StatusCode, Json<JsonValue>)> {
+    let am = ArtifactManager::new(state.workspace_path.clone()).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("open workspace git repo: {e}"),
+        )
+    })?;
+    let commit = am
+        .commit_data_path(MARKETPLACES_DATA_PATH, message)
+        .await
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("commit marketplace registry: {e}"),
+            )
+        })?;
+
+    state
+        .engine
+        .event_bus
+        .emit_user_system(headers, &state.pool, "[Plugins] DataFileWritten", |actor| {
+            crate::engine::event_bus::SystemEvent::DataFileWritten {
+                path: MARKETPLACES_DATA_PATH.to_string(),
+                commit: Some(commit.clone()),
+                actor,
+            }
+        })
+        .await;
+
+    Ok(commit)
+}
+
+pub(super) async fn list_marketplaces(
+    State(state): State<AppState>,
+) -> Result<Json<MarketplacesResponse>, (StatusCode, Json<JsonValue>)> {
+    let registry = load_registry(&state.workspace_path).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("read marketplace registry: {e}"),
+        )
+    })?;
+    Ok(Json(MarketplacesResponse {
+        marketplaces: registry.marketplaces,
+    }))
+}
+
+pub(super) async fn add_marketplace_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AddMarketplaceRequest>,
+) -> Result<Json<AddMarketplaceResponse>, (StatusCode, Json<JsonValue>)> {
+    let _repo_guard = state.engine.lock_workspace_repo().await;
+    let mut registry = load_registry(&state.workspace_path).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("read marketplace registry: {e}"),
+        )
+    })?;
+    let (marketplace, created) = add_marketplace(&mut registry, &body.source, body.name.as_deref())
+        .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+    save_registry(&state.workspace_path, &registry).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("write marketplace registry: {e}"),
+        )
+    })?;
+    let commit = commit_marketplaces_registry(
+        &state,
+        &headers,
+        if created {
+            "Register plugin marketplace"
+        } else {
+            "Update plugin marketplace"
+        },
+    )
+    .await?;
+
+    let update_engine = state.engine.clone();
+    let update_pool = state.pool.clone();
+    tokio::spawn(async move {
+        crate::scheduler::plugin_updates::run_plugin_marketplace_update_check(
+            update_engine,
+            update_pool,
+        )
+        .await;
+    });
+
+    Ok(Json(AddMarketplaceResponse {
+        marketplace,
+        marketplaces: registry.marketplaces,
+        created,
+        commit,
+    }))
+}
+
+pub(super) async fn remove_marketplace_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<RemoveMarketplaceResponse>, (StatusCode, Json<JsonValue>)> {
+    let _repo_guard = state.engine.lock_workspace_repo().await;
+    let mut registry = load_registry(&state.workspace_path).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("read marketplace registry: {e}"),
+        )
+    })?;
+    let removed = remove_marketplace(&mut registry, &id);
+    if !removed {
+        return Err(err(StatusCode::NOT_FOUND, "marketplace not found"));
+    }
+    save_registry(&state.workspace_path, &registry).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("write marketplace registry: {e}"),
+        )
+    })?;
+    let commit =
+        commit_marketplaces_registry(&state, &headers, "Remove plugin marketplace").await?;
+    Ok(Json(RemoveMarketplaceResponse {
+        marketplaces: registry.marketplaces,
+        removed,
+        commit,
+    }))
+}
+
+pub(super) async fn catalog(
+    State(state): State<AppState>,
+) -> Result<Json<MarketplaceCatalog>, (StatusCode, Json<JsonValue>)> {
+    let registry = load_registry(&state.workspace_path).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("read marketplace registry: {e}"),
+        )
+    })?;
+    let installed = installed_plugin_summaries(&state.pool).await.map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("read installed plugins: {e}"),
+        )
+    })?;
+    let workspace_path = state.workspace_path.clone();
+    let mut catalog =
+        tokio::task::spawn_blocking(move || scan_catalog(&workspace_path, &registry, &installed))
+            .await
+            .map_err(|e| {
+                err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("scan marketplaces: {e}"),
+                )
+            })?;
+    mark_setup_complete(&state.pool, &mut catalog).await;
+    Ok(Json(catalog))
+}
+
+/// Setup counts as "complete" once its thread is no longer actively working or
+/// waiting on the user — any `thread_summaries.status` other than `running` /
+/// `waiting_for_user_answer` (the two `ThreadStatus` values that mean the setup
+/// agent is still mid-turn or blocked on the user). Pure, so the boundary is
+/// unit-testable.
+fn setup_status_is_complete(status: &str) -> bool {
+    !matches!(status, "running" | "waiting_for_user_answer")
+}
+
+/// Fill `MarketplacePlugin::setup_complete` from each setup thread's current
+/// `thread_summaries.status`. The pure `scan_catalog` can't reach the DB, so it
+/// leaves the flag `false`; this enriches the scanned catalog before it ships.
+/// An unknown thread id (projection lag right after spawn, or a deleted thread)
+/// stays `false` so the card shows "Setup" rather than flicker to "Open" before
+/// the agent has run. A lookup failure is logged, not fatal — the catalog still
+/// renders, just pinned to "Setup".
+async fn mark_setup_complete(pool: &sqlx::PgPool, catalog: &mut MarketplaceCatalog) {
+    let ids: Vec<Uuid> = catalog
+        .plugins
+        .iter()
+        .filter_map(|p| p.setup_thread_id.as_deref())
+        .filter_map(|s| Uuid::parse_str(s).ok())
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let rows: Vec<(Uuid, String)> = match sqlx::query_as(
+        "SELECT thread_id, status FROM thread_summaries WHERE thread_id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            log!(@Plugins, "setup-complete lookup failed (leaving cards on Setup): {}", e);
+            return;
+        }
+    };
+    let status_by_id: std::collections::HashMap<Uuid, String> = rows.into_iter().collect();
+    for plugin in &mut catalog.plugins {
+        if let Some(tid) = plugin
+            .setup_thread_id
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok())
+        {
+            plugin.setup_complete = status_by_id
+                .get(&tid)
+                .map(|s| setup_status_is_complete(s))
+                .unwrap_or(false);
+        }
+    }
+}
+
+pub(super) async fn stage_install(
+    State(state): State<AppState>,
+    Json(body): Json<StageInstallRequest>,
+) -> Result<Json<JsonValue>, (StatusCode, Json<JsonValue>)> {
+    let source = body.source.trim();
+    if source.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "source is required"));
+    }
+    let result = stage_install_request(&state.engine, source).await;
+    if let Some(payload) = result.strip_prefix(PLUGIN_INSTALL_REQUEST_PREFIX) {
+        let value: JsonValue = serde_json::from_str(payload).map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("parse staged install payload: {e}"),
+            )
+        })?;
+        return Ok(Json(value));
+    }
+    let msg = result.strip_prefix("Error: ").unwrap_or(&result);
+    Err(err(StatusCode::BAD_REQUEST, msg))
+}
+
+/// `POST /api/v1/plugins/uninstall-request` — stage an uninstall from the App
+/// Store UI. Mirrors `stage_install`: resolves the plugin id, partitions its
+/// recorded files into present/missing, and returns the staged
+/// `PluginUninstallRequest` JSON for the confirm panel. The same staging the
+/// `uninstall_plugin` LLM tool produces, just initiated from a button.
+pub(super) async fn stage_uninstall(
+    State(state): State<AppState>,
+    Json(body): Json<StageUninstallRequest>,
+) -> Result<Json<JsonValue>, (StatusCode, Json<JsonValue>)> {
+    let id = body.id.trim();
+    if id.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "id is required"));
+    }
+    let result = stage_uninstall_request(&state.engine, id).await;
+    if let Some(payload) = result.strip_prefix(PLUGIN_UNINSTALL_REQUEST_PREFIX) {
+        let value: JsonValue = serde_json::from_str(payload).map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("parse staged uninstall payload: {e}"),
+            )
+        })?;
+        return Ok(Json(value));
+    }
+    let msg = result.strip_prefix("Error: ").unwrap_or(&result);
+    Err(err(StatusCode::BAD_REQUEST, msg))
 }
 
 pub(super) async fn upload_archive(
@@ -108,6 +413,11 @@ pub(super) async fn upload_archive(
 pub(super) struct ConfirmInstallResponse {
     pub summary: String,
     pub installed_files: Vec<String>,
+    /// Set when the installed plugin shipped `setup` instructions: the id of
+    /// the Lucidos Agent thread spawned to walk the user through them. The
+    /// frontend navigates the user to this thread after a successful install.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup_thread_id: Option<uuid::Uuid>,
 }
 
 /// 404 when the pending entry is gone (already consumed, expired, or wrong
@@ -136,6 +446,7 @@ pub(super) async fn confirm_install(
         Ok(outcome) => Ok(Json(ConfirmInstallResponse {
             summary: outcome.summary,
             installed_files: outcome.installed_files,
+            setup_thread_id: outcome.setup_thread_id,
         })),
         Err(e) => Err(err(pending_status(&e), &e)),
     }
@@ -201,10 +512,20 @@ pub(super) async fn cancel_uninstall(
     }
 }
 
-
 /// Routes for the `/plugins/*` surface.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
+        .route(
+            "/plugins/marketplaces",
+            get(list_marketplaces).post(add_marketplace_handler),
+        )
+        .route(
+            "/plugins/marketplaces/:id",
+            delete(remove_marketplace_handler),
+        )
+        .route("/plugins/catalog", get(catalog))
+        .route("/plugins/install-request", post(stage_install))
+        .route("/plugins/uninstall-request", post(stage_uninstall))
         .route(
             "/plugins/upload-archive",
             post(upload_archive).layer(DefaultBodyLimit::max(MAX_ARCHIVE_BYTES)),
@@ -213,10 +534,7 @@ pub(super) fn router() -> Router<AppState> {
             "/plugins/install/:install_id/confirm",
             post(confirm_install),
         )
-        .route(
-            "/plugins/install/:install_id/cancel",
-            post(cancel_install),
-        )
+        .route("/plugins/install/:install_id/cancel", post(cancel_install))
         .route(
             "/plugins/uninstall/:uninstall_id/confirm",
             post(confirm_uninstall),
@@ -225,4 +543,108 @@ pub(super) fn router() -> Router<AppState> {
             "/plugins/uninstall/:uninstall_id/cancel",
             post(cancel_uninstall),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mark_setup_complete, setup_status_is_complete};
+    use crate::core::plugin_marketplaces::{
+        MarketplaceCatalog, MarketplacePlugin, MarketplacePluginStatus,
+    };
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    use uuid::Uuid;
+
+    #[test]
+    fn setup_complete_only_when_not_running_or_waiting() {
+        // The two `ThreadStatus` strings that mean the setup agent is still
+        // mid-turn or blocked on the user → not done.
+        assert!(!setup_status_is_complete("running"));
+        assert!(!setup_status_is_complete("waiting_for_user_answer"));
+        // The settled `ThreadStatus` values → done (button flips to Open).
+        assert!(setup_status_is_complete("idle"));
+        assert!(setup_status_is_complete("failed"));
+    }
+
+    fn installed_plugin_with_setup_thread(tid: Uuid) -> MarketplacePlugin {
+        MarketplacePlugin {
+            marketplace_id: "m".into(),
+            marketplace_name: "M".into(),
+            id: "p".into(),
+            name: "P".into(),
+            description: "d".into(),
+            version: "0.1.0".into(),
+            source: "https://example.invalid/p".into(),
+            manifest: serde_json::json!({}),
+            content: vec![],
+            files_count: 0,
+            status: MarketplacePluginStatus::Installed,
+            installed_version: Some("0.1.0".into()),
+            setup_thread_id: Some(tid.to_string()),
+            setup_complete: false,
+            app_id: None,
+        }
+    }
+
+    fn empty_catalog(plugin: MarketplacePlugin) -> MarketplaceCatalog {
+        MarketplaceCatalog {
+            marketplaces: vec![],
+            plugins: vec![plugin],
+            errors: vec![],
+        }
+    }
+
+    /// Regression guard: `mark_setup_complete` must read the lifecycle column
+    /// (`status`), not the compose-state column (`state`). A running setup
+    /// thread must keep the card on "Setup"; once it settles, "Open". Reading
+    /// the wrong column made `setup_complete` always true (the `state` column
+    /// holds `active`, never `running`), so the "Setup" button never showed.
+    #[tokio::test]
+    async fn mark_setup_complete_reads_status_not_state() {
+        let (pool, db_name) = setup_test_db().await;
+        let tid = Uuid::new_v4();
+        sqlx::query("INSERT INTO thread_summaries (thread_id) VALUES ($1)")
+            .bind(tid)
+            .execute(&pool)
+            .await
+            .expect("seed thread row");
+
+        // Running setup thread → not complete (card shows "Setup").
+        sqlx::query("UPDATE thread_summaries SET status = 'running' WHERE thread_id = $1")
+            .bind(tid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut catalog = empty_catalog(installed_plugin_with_setup_thread(tid));
+        mark_setup_complete(&pool, &mut catalog).await;
+        assert!(
+            !catalog.plugins[0].setup_complete,
+            "a running setup thread must leave setup_complete=false"
+        );
+
+        // Settled (idle) → complete (card shows "Open").
+        sqlx::query("UPDATE thread_summaries SET status = 'idle' WHERE thread_id = $1")
+            .bind(tid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut catalog = empty_catalog(installed_plugin_with_setup_thread(tid));
+        mark_setup_complete(&pool, &mut catalog).await;
+        assert!(
+            catalog.plugins[0].setup_complete,
+            "an idle setup thread must set setup_complete=true"
+        );
+
+        teardown_test_db(&db_name).await;
+    }
+
+    /// An unknown setup thread id (projection lag right after spawn, or a
+    /// deleted thread) must leave the card on "Setup", not flip to "Open".
+    #[tokio::test]
+    async fn mark_setup_complete_unknown_thread_stays_incomplete() {
+        let (pool, db_name) = setup_test_db().await;
+        let mut catalog = empty_catalog(installed_plugin_with_setup_thread(Uuid::new_v4()));
+        mark_setup_complete(&pool, &mut catalog).await;
+        assert!(!catalog.plugins[0].setup_complete);
+        teardown_test_db(&db_name).await;
+    }
 }

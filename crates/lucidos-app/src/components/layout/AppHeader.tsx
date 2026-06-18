@@ -9,12 +9,12 @@ import { ThreadNav } from '../shared/ThreadNav';
 import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
 import { unfocusThread } from '../../store/actions/threads';
 import { openUrl } from '../../store/actions/artifacts';
-import { navigateToPane, resolveSwipePane } from '../../store/actions/pane';
+import { navigateToPane, resolveSwipePane, focusPane } from '../../store/actions/pane';
 import { MobileAppHeader } from './MobileAppHeader';
 import { SwipeTouch } from '../../utils/swipe';
 import { PanelNav } from './PanelNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
-import { ControlPanel, controlPanelOpen, controlPanelAnchor, controlPanelBadgeCount, controlPanelBadgeTooltip } from './ControlPanel';
+import { ControlPanel, controlPanelBadgeCount, controlPanelBadgeTooltip, toggleControlPanelAtClick } from './ControlPanel';
 import { ThreadFilterDropdown } from './ThreadFilterDropdown';
 import { getContentTitle, getDiffDescription } from './headerHelpers';
 import { resolveHeaderDblClick } from './headerDblClick';
@@ -33,8 +33,8 @@ function ThreadsHeader() {
   const altViewActive = draftsViewActive.value || attentionViewActive.value;
 
   return (
-    <div class={`threads-header${searchOpen ? ' search-active' : ''}`}>
-      <ThreadToggleButton />
+    <div class={`threads-header${searchOpen ? ' search-active' : ''}`}
+         onPointerDown={() => focusPane('drawer')}>
       <div class="thread-search-bar">
         <SearchIcon className="thread-search-bar-icon" />
         <input
@@ -210,6 +210,12 @@ export function AppHeader() {
   return (
     <>
       <header ref={headerRef} class="pane-header app-header" data-mobile-view={mobileView.value} onClick={onHeaderClick} onDblClick={onHeaderDblClick}>
+        {/* Subtle background wash behind the focused pane's header region.
+            First child so DOM order keeps it under every header control (which
+            carry positive or later-in-DOM z-index) while still sitting above
+            the header's own background. Positioned + revealed entirely from CSS
+            via :root[data-focused-pane] (shell.css); desktop-only. */}
+        <div class="header-focus-bg" aria-hidden="true" />
         <MobileAppHeader />
 
         {/* ─── Desktop: full header ─── */}
@@ -220,7 +226,7 @@ export function AppHeader() {
               transition). */}
           <div class="thread-header-elements">
             <ThreadsHeader />
-            <div class="collapsed-thread-actions">
+            <div class="collapsed-thread-actions" onPointerDown={() => focusPane('thread')}>
               <ThreadToggleButton />
               <ThreadNav showTooltip />
               <button
@@ -232,8 +238,9 @@ export function AppHeader() {
                 <ComposeIcon />
               </button>
             </div>
-            <span class="pane-header-brand">
+            <span class="pane-header-brand" onPointerDown={() => focusPane('thread')}>
               <div class="thread-nav-group">
+                <ThreadToggleButton />
                 <ThreadNav showTooltip />
                 <button
                   class="icon-btn header-icon brand-compose-btn"
@@ -251,8 +258,7 @@ export function AppHeader() {
                   // brand-label stretches with flex:1 to center its content;
                   // ignore clicks on the empty space around the visible children.
                   if (e.target === e.currentTarget) return;
-                  controlPanelAnchor.value = e.currentTarget as HTMLElement;
-                  controlPanelOpen.value = !controlPanelOpen.value;
+                  toggleControlPanelAtClick(e);
                 }}
               >
                 <span class="pane-header-title">Lucidos</span>
@@ -273,7 +279,7 @@ export function AppHeader() {
               )}
             </span>
           </div>
-          <div class="content-header-elements">
+          <div class="content-header-elements" onPointerDown={() => focusPane('content')}>
             <PanelNav />
             <span class="pane-header-content-title">
               {showContentTitle && (

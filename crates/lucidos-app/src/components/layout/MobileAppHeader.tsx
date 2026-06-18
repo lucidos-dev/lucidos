@@ -11,7 +11,7 @@ import { ThreadNav } from '../shared/ThreadNav';
 import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './PanelNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
-import { ControlPanel, controlPanelOpen, controlPanelAnchor, controlPanelBadgeCount, controlPanelBadgeTooltip } from './ControlPanel';
+import { ControlPanel, controlPanelBadgeCount, controlPanelBadgeTooltip, toggleControlPanelAtClick } from './ControlPanel';
 import { ThreadFilterDropdown } from './ThreadFilterDropdown';
 import { getContentTitle, getDiffDescription } from './headerHelpers';
 import { threadSearchQuery, mobileView, MOBILE_VIEWS, focusedThreadId, threadMap, draftsViewActive, attentionViewActive, type MobileView } from '../../store/store';
@@ -117,6 +117,7 @@ function MobileThreadHeader() {
   return (
     <div class="mobile-thread-header">
       <div class="mobile-header-row">
+        <HamburgerButton />
         <div class="mobile-nav-slot"><ThreadNav /></div>
         <span class="pane-header-brand mobile-header-title">
           <span
@@ -124,8 +125,7 @@ function MobileThreadHeader() {
             data-role="control-panel-toggle"
             onClick={(e) => {
               if (e.target === e.currentTarget) return;
-              controlPanelAnchor.value = e.currentTarget as HTMLElement;
-              controlPanelOpen.value = !controlPanelOpen.value;
+              toggleControlPanelAtClick(e);
             }}
           >
             <span class="pane-header-title">Lucidos</span>

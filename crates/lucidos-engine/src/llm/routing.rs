@@ -14,15 +14,23 @@ pub struct RoutingProvider {
     vertex: Option<Arc<VertexProvider>>,
     openai: Option<Arc<OpenAiProvider>>,
     anthropic: Option<Arc<AnthropicProvider>>,
+    /// OpenRouter — an [`OpenAiProvider`] pointed at `openrouter.ai/api/v1`.
+    openrouter: Option<Arc<OpenAiProvider>>,
+    /// A generic OpenAI-compatible local server — an [`OpenAiProvider`] pointed
+    /// at the configured local base URL (default Ollama).
+    local: Option<Arc<OpenAiProvider>>,
     registry: ModelRegistry,
     default_model: String,
 }
 
 impl RoutingProvider {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         vertex: Option<VertexProvider>,
         openai: Option<OpenAiProvider>,
         anthropic: Option<AnthropicProvider>,
+        openrouter: Option<OpenAiProvider>,
+        local: Option<OpenAiProvider>,
         registry: ModelRegistry,
         default_model: String,
     ) -> Self {
@@ -30,6 +38,8 @@ impl RoutingProvider {
             vertex: vertex.map(Arc::new),
             openai: openai.map(Arc::new),
             anthropic: anthropic.map(Arc::new),
+            openrouter: openrouter.map(Arc::new),
+            local: local.map(Arc::new),
             registry,
             default_model,
         }
@@ -45,6 +55,12 @@ impl RoutingProvider {
             }),
             ProviderKind::Anthropic => self.anthropic.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
                 "Anthropic model requested but no Anthropic credential is configured (Settings → Providers)".into()
+            }),
+            ProviderKind::OpenRouter => self.openrouter.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
+                "OpenRouter model requested but no OpenRouter credential is configured (Settings → Providers) and LUCIDOS_OPENROUTER_API_KEY is not set — add it and restart".into()
+            }),
+            ProviderKind::Local => self.local.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
+                "Local model requested but the local OpenAI-compatible provider is not configured (Settings → Providers)".into()
             }),
             ProviderKind::Vertex => self
                 .vertex

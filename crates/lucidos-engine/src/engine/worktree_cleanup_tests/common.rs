@@ -222,14 +222,29 @@ pub(crate) async fn insert_change(
     .expect("insert change row");
 }
 
-/// Insert a thread_summaries row matching the deterministic id, optionally saved.
+/// Insert a thread_summaries row matching the deterministic id, optionally
+/// saved. Archive state defaults to `'inbox'` (a non-archived thread the user
+/// might still return to).
 pub(crate) async fn insert_thread_summary(pool: &PgPool, thread_id: Uuid, is_saved: bool) {
+    insert_thread_summary_with_archive(pool, thread_id, is_saved, "inbox").await;
+}
+
+/// Insert a thread_summaries row with an explicit `archive_state` — used by the
+/// retention tests, where `'archived'` is the signal that lets the cleanup
+/// worker reclaim a worktree even while free disk is comfortable.
+pub(crate) async fn insert_thread_summary_with_archive(
+    pool: &PgPool,
+    thread_id: Uuid,
+    is_saved: bool,
+    archive_state: &str,
+) {
     sqlx::query(
-        "INSERT INTO thread_summaries (thread_id, title, source, message_count, last_activity, has_response, is_saved) \
-         VALUES ($1, 'cleanup test', 'claude_code', 1, NOW(), false, $2)",
+        "INSERT INTO thread_summaries (thread_id, title, source, message_count, last_activity, has_response, is_saved, archive_state) \
+         VALUES ($1, 'cleanup test', 'claude_code', 1, NOW(), false, $2, $3)",
     )
     .bind(thread_id)
     .bind(is_saved)
+    .bind(archive_state)
     .execute(pool)
     .await
     .expect("insert thread_summary");
@@ -250,6 +265,46 @@ pub(crate) async fn insert_old_event(pool: &PgPool, thread_id: Uuid, age_secs: i
     .execute(pool)
     .await
     .expect("insert old event");
+}
+
+/// Insert a backdated `ChildThreadCompleted` event on `parent_id` referencing
+/// `child_id`. Used by the fan-in retention tests (ADR 0011, B2): when this is
+/// the parent's latest event, the parent still owes a resume and its worktree
+/// must be kept. `sequence` is bigserial, so inserting this after the parent's
+/// other events makes it the latest by sequence; `age_secs` keeps `created`
+/// backdated so the thread still reads as idle.
+pub(crate) async fn insert_child_completed_event(
+    pool: &PgPool,
+    parent_id: Uuid,
+    child_id: Uuid,
+    age_secs: i64,
+) {
+    sqlx::query(
+        "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+         VALUES ($1, 'thread', $2::text, 'ChildThreadCompleted', $3, NOW() - make_interval(secs => $4), $2::uuid)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(parent_id)
+    .bind(json!({
+        "child_thread_id": child_id.to_string(),
+        "status": "success",
+        "summary": "done",
+    }))
+    .bind(age_secs as f64)
+    .execute(pool)
+    .await
+    .expect("insert ChildThreadCompleted event");
+}
+
+/// Set a thread's `active_children_count` directly — the fan-in retention tests
+/// use this to simulate a parent with a direct child still running.
+pub(crate) async fn set_active_children_count(pool: &PgPool, thread_id: Uuid, count: i32) {
+    sqlx::query("UPDATE thread_summaries SET active_children_count = $2 WHERE thread_id = $1")
+        .bind(thread_id)
+        .bind(count)
+        .execute(pool)
+        .await
+        .expect("set active_children_count");
 }
 
 /// Build a worker pre-configured for tests: short interval + zero free-disk

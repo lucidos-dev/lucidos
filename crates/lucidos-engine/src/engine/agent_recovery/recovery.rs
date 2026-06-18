@@ -137,7 +137,7 @@ impl LucidosEngine {
         };
 
         log!(
-            "[ClaudeCode] Ending stale waiting session for thread {} (branch {})",
+            "[Recovery] Ending stale waiting session for thread {} (branch {})",
             thread_id,
             branch_name
         );
@@ -149,7 +149,7 @@ impl LucidosEngine {
         // If worktree exists, commit uncommitted changes (unless discarding) and remove it
         if let Some(ref wt) = wt_path {
             if !discard {
-                auto_commit_worktree(wt, "Claude Code changes (auto-committed)").await;
+                auto_commit_worktree(wt, "Coding agent changes (auto-committed)").await;
             }
             if let Some(wt_str) = wt.to_str() {
                 let _ =
@@ -174,13 +174,13 @@ impl LucidosEngine {
             // resulting ChangeDiscarded events so the chat chip reads "You"
             // instead of falling back to the engine label.
             log!(
-                "[ClaudeCode] Discarding stale session changes (branch {})",
+                "[Recovery] Discarding stale session changes (branch {})",
                 branch_name
             );
             self.discard_pending_for_thread(thread_id, actor.clone()).await;
             if let Err(e) = git_cmd(&["branch", "-D", &branch_name], &repo_root).await {
                 log!(
-                    "[ClaudeCode] Failed to delete branch {}: {}",
+                    "[Recovery] Failed to delete branch {}: {}",
                     branch_name,
                     e
                 );
@@ -190,7 +190,7 @@ impl LucidosEngine {
                 Ok(v) => v,
                 Err(e) => {
                     log!(
-                        "[ClaudeCode] Failed to check external repo status for thread {}: {}",
+                        "[Recovery] Failed to check external repo status for thread {}: {}",
                         thread_id,
                         e
                     );
@@ -200,7 +200,7 @@ impl LucidosEngine {
 
             if is_external {
                 log!(
-                    "[ClaudeCode] External repo branch {} — keeping branch, no change proposed",
+                    "[Recovery] External repo branch {} — keeping branch, no change proposed",
                     branch_name
                 );
             } else {
@@ -217,12 +217,12 @@ impl LucidosEngine {
                     Ok(_) => {
                         proposed_change = true;
                         log!(
-                            "[ClaudeCode] Proposed change from stale session (branch {})",
+                            "[Recovery] Proposed change from stale session (branch {})",
                             branch_name
                         );
                     }
                     Err(e) => log!(
-                        "[ClaudeCode] Failed to propose change from stale session: {}",
+                        "[Recovery] Failed to propose change from stale session: {}",
                         e
                     ),
                 }
@@ -249,7 +249,7 @@ impl LucidosEngine {
             // branches, and engine startup recovery re-attaches any branch
             // that still has work to be done.
             log!(
-                "[ClaudeCode] recovery: branch {} has no proposable diff — keeping branch (discard=false)",
+                "[Recovery] recovery: branch {} has no proposable diff — keeping branch (discard=false)",
                 branch_name
             );
         }
@@ -299,8 +299,8 @@ impl LucidosEngine {
         Ok(())
     }
 
-    /// Detect orphaned Claude Code worktrees from a previous engine run and
-    /// start new Claude Code sessions on them instead of proposing pending changes.
+    /// Detect orphaned coding-agent worktrees from a previous engine run and
+    /// start new coding-agent sessions on them instead of proposing pending changes.
     pub async fn recover_orphaned_worktrees(self: &Arc<Self>) -> Vec<uuid::Uuid> {
         #[derive(sqlx::FromRow)]
         struct BranchThread {
@@ -752,8 +752,35 @@ impl LucidosEngine {
                 }
                 None => {
                     if let Some(&thread_id) = branch_to_thread.get(branch) {
-                        log!("[Recovery] Ending stuck session for thread {} — branch {} not found in any repo", thread_id, branch);
-                        end_stuck_session(self, thread_id).await;
+                        // The branch ref vanished from every repo. Before giving up on
+                        // the session, try to recreate the branch from a surviving
+                        // worktree's HEAD so the recorded `cc_session_id` can still
+                        // `--resume` on the original branch (the thread-9e37697e
+                        // recovery-resilience goal). Ending the session — which drops
+                        // the session id and forces a fresh branch from main, discarding
+                        // the conversation — is the genuine last resort, not the first.
+                        match recover_branch_ref_from_worktree(
+                            self.workspace_path(),
+                            thread_id,
+                            branch,
+                        )
+                        .await
+                        {
+                            Some((repo_root, wt_path)) => {
+                                log!(
+                                    "[Recovery] Recovered branch {} for thread {} from surviving worktree — routing into resume instead of ending session",
+                                    branch,
+                                    thread_id
+                                );
+                                // `marker_repo_id: None` — purely cosmetic in the resume
+                                // loop (it logs the id; repo selection uses `repo_root`).
+                                to_recover.push((wt_path, branch.clone(), None, repo_root));
+                            }
+                            None => {
+                                log!("[Recovery] Ending stuck session for thread {} — branch {} not found in any repo and no recoverable worktree", thread_id, branch);
+                                end_stuck_session(self, thread_id).await;
+                            }
+                        }
                     }
                 }
             }

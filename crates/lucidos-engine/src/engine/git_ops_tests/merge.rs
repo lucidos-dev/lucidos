@@ -240,7 +240,7 @@ async fn commits_in_range_filters_auto_commit_subjects() {
     tokio::fs::write(repo.join("a.txt"), "a").await.unwrap();
     let _ = git_cmd(&["add", "."], &repo).await;
     let _ = git_cmd(
-        &["commit", "-m", "Claude Code changes (auto-committed)"],
+        &["commit", "-m", "Coding agent changes (auto-committed)"],
         &repo,
     )
     .await;

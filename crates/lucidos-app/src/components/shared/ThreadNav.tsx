@@ -1,32 +1,68 @@
-import { canGoBackThread, canGoForwardThread, threadNavBack, threadNavForward } from '../../store/actions/thread-navigation';
+import {
+  canGoBackThread, canGoForwardThread, threadNavBack, threadNavForward,
+  threadNavHistory, threadNavGoTo,
+} from '../../store/actions/thread-navigation';
+import { focusedThreadId, threadMap } from '../../store/store';
+import { threadDisplayTitle } from '../../utils/threadTitle';
 import { tooltipWithShortcut } from '../../store/actions/keybindings';
-import { BackIcon, ForwardIcon } from './icons';
+import { NavChevron, type NavHistoryItem } from './NavChevron';
+import { ThreadTypeIcon } from './ThreadTypeIcon';
 
 interface Props {
   showTooltip?: boolean;
 }
 
+/** A history row for one remembered thread — its title + a type glyph
+ *  (Lucidos / Claude / Codex / trigger), derived from the live thread meta. */
+function threadNavItem(index: number, id: string): NavHistoryItem {
+  const thread = threadMap.value.get(id);
+  return {
+    key: `${index}:${id}`,
+    label: thread ? threadDisplayTitle(thread) : 'Untitled Thread',
+    icon: <ThreadTypeIcon channel={thread?.meta.channel ?? 'chat'} codingAgent={thread?.meta.codingAgent} />,
+    onSelect: () => threadNavGoTo(index),
+  };
+}
+
+function threadBackItems(): NavHistoryItem[] {
+  const { stack, cursor } = threadNavHistory.value;
+  // Unfocused (Compose / Esc): the cursor still points at the thread the user
+  // left and the first Back restores it — so include the cursor entry at the
+  // top. Focused: the cursor IS the current thread, so Back starts one earlier.
+  const top = focusedThreadId.value === null ? cursor : cursor - 1;
+  const items: NavHistoryItem[] = [];
+  for (let i = top; i >= 0; i--) items.push(threadNavItem(i, stack[i].id));
+  return items;
+}
+
+function threadForwardItems(): NavHistoryItem[] {
+  const { stack, cursor } = threadNavHistory.value;
+  const items: NavHistoryItem[] = [];
+  for (let i = cursor + 1; i < stack.length; i++) items.push(threadNavItem(i, stack[i].id));
+  return items;
+}
+
 export function ThreadNav({ showTooltip }: Props) {
   return (
     <>
-      <button
-        class="icon-btn header-icon thread-nav-btn"
+      <NavChevron
+        direction="back"
+        buttonClass="thread-nav-btn"
         disabled={!canGoBackThread.value}
-        onClick={() => threadNavBack()}
-        aria-label="Previous thread"
-        {...(showTooltip ? { 'data-tooltip': tooltipWithShortcut('Previous thread', 'previousThread') } : {})}
-      >
-        <BackIcon />
-      </button>
-      <button
-        class="icon-btn header-icon thread-nav-btn"
+        onStep={() => threadNavBack()}
+        getItems={threadBackItems}
+        ariaLabel="Previous thread"
+        tooltip={showTooltip ? tooltipWithShortcut('Previous thread', 'historyBack') : undefined}
+      />
+      <NavChevron
+        direction="forward"
+        buttonClass="thread-nav-btn"
         disabled={!canGoForwardThread.value}
-        onClick={() => threadNavForward()}
-        aria-label="Next thread"
-        {...(showTooltip ? { 'data-tooltip': tooltipWithShortcut('Next thread', 'nextThread') } : {})}
-      >
-        <ForwardIcon />
-      </button>
+        onStep={() => threadNavForward()}
+        getItems={threadForwardItems}
+        ariaLabel="Next thread"
+        tooltip={showTooltip ? tooltipWithShortcut('Next thread', 'historyForward') : undefined}
+      />
     </>
   );
 }

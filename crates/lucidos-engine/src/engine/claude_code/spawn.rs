@@ -277,9 +277,9 @@ impl LucidosEngine {
         Ok(())
     }
 
-    /// Run a Claude Code sub-thread spawn (the `run_claude` LLM tool's work,
+    /// Run a coding-agent sub-thread spawn (the `run_coding_agent` LLM tool's work,
     /// executed by the Thread Queue once the entry is admitted). Routes the
-    /// actual CC work through `process_message_with_steps` (the unified
+    /// actual coding-agent work through `process_message_with_steps` (the unified
     /// router), mirroring the chat parallel `spawn_thread`. The future
     /// resolves when the session's turn finishes — the queue executor awaits
     /// it (wrapped in `monitor_cc_task` for panic cleanup) so the spawn's
@@ -301,6 +301,7 @@ impl LucidosEngine {
             repo_id,
             caller_title,
             app_id,
+            coding_agent,
         } = params;
 
         // Stash the app id for run_direct_agent to pick up. Cleared by the
@@ -318,8 +319,8 @@ impl LucidosEngine {
             .filter(|t| !t.is_empty())
             .map(str::to_string);
         let has_explicit_title = explicit_title.is_some();
-        let initial_title = explicit_title
-            .unwrap_or_else(|| prompt.chars().take(60).collect::<String>());
+        let initial_title =
+            explicit_title.unwrap_or_else(|| prompt.chars().take(60).collect::<String>());
 
         let engine = self;
         let prompt_owned = prompt;
@@ -396,14 +397,12 @@ impl LucidosEngine {
                 .emit_or_log(
                     crate::engine::event_bus::BusEvent::Thread {
                         thread_id: cc_thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::CodingAgentThreadSpawned {
-                            cc_thread_id: cc_thread_id.to_string(),
-                            title: initial_title,
-                            // spawn_agent_thread is CC-only today (it passes
-                            // no backend to the router); revisit when the
-                            // tool grows a coding_agent arg.
-                            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
-                        },
+                        event:
+                            crate::engine::thread_events::ThreadEvent::CodingAgentThreadSpawned {
+                                cc_thread_id: cc_thread_id.to_string(),
+                                title: initial_title,
+                                coding_agent,
+                            },
                         meta: crate::engine::thread_events::EventMeta::NONE,
                     },
                     "[ClaudeCode] CodingAgentThreadSpawned",
@@ -436,7 +435,7 @@ impl LucidosEngine {
                     spawning_event_id,
                     ActorMode::Agent,
                     None,
-                    None, // coding_agent — spawn_agent_thread is CC-only today
+                    Some(coding_agent),
                     None, // pre_emitted_origin — router emits MR itself
                     None, // title — already emitted placeholder above
                     None,

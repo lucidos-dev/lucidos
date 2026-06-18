@@ -6,6 +6,7 @@ import { assertPlainObject } from './_validate';
 export type NavigateTarget =
   | 'files'
   | 'apps'
+  | 'app-store'
   | 'triggers'
   | 'thread-queue'
   | 'changes'

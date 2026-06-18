@@ -44,7 +44,7 @@
 # * CROSS-PLATFORM (not exercised here — this spike is macOS):
 #     - Linux:   theseus asset `...-<arch>-unknown-linux-gnu.tar.gz`; build
 #                pgvector with system gcc, no sysroot dance. (Docker already
-#                does this via the `postgresql-17-pgvector` apt package.)
+#                does this via the `postgresql-18-pgvector` apt package.)
 #     - Windows: theseus asset `...-x86_64-pc-windows-msvc.zip`; pgvector builds
 #                with MSVC `nmake /F Makefile.win`, or ship a prebuilt DLL.
 #
@@ -56,7 +56,7 @@
 
 set -euo pipefail
 
-PG_VERSION="${PG_VERSION:-17.10.0}"          # match production (Dockerfile ships PG 17)
+PG_VERSION="${PG_VERSION:-18.4.0}"           # match production (Dockerfile ships PG 18)
 PGVECTOR_VERSION="${PGVECTOR_VERSION:-0.8.2}"
 PORT="${PORT:-54329}"
 WORKDIR="${WORKDIR:-/tmp/lucidos-pg-pgvector-spike}"

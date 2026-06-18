@@ -87,7 +87,7 @@ async fn install_without_source_succeeds_and_omits_from_in_summary() {
 
     let bus = MockEventBus::new();
     let (msg, _files) =
-        install_from_unpacked_with_bus(&scratch, &bus, &unpacked, SourceType::Archive, false, None)
+        install_from_unpacked_with_bus(&scratch, &bus, &unpacked, SourceType::Archive, false, None, None)
             .await
             .expect("install must succeed even with no source field");
     assert_eq!(msg, "Installed Sourceless Plugin v0.1.0 (1 files).");
@@ -311,7 +311,7 @@ setup = "Create a daily trigger that loads `knowhow/with-setup/run.md`. Suggeste
 
     let bus = MockEventBus::new();
     let (msg, _files) =
-        install_from_unpacked_with_bus(&scratch, &bus, &unpacked, SourceType::Archive, false, None)
+        install_from_unpacked_with_bus(&scratch, &bus, &unpacked, SourceType::Archive, false, None, None)
             .await
             .expect("install must succeed");
 
@@ -344,7 +344,7 @@ async fn install_omits_setup_section_when_manifest_has_no_setup() {
 
     let bus = MockEventBus::new();
     let (msg, _files) =
-        install_from_unpacked_with_bus(&scratch, &bus, &unpacked, SourceType::Archive, false, None)
+        install_from_unpacked_with_bus(&scratch, &bus, &unpacked, SourceType::Archive, false, None, None)
             .await
             .expect("install must succeed");
 
@@ -469,7 +469,7 @@ async fn latest_install_round_trips_id_version_source_and_files() {
     let archive = build_fixture_archive(&archive_dir, "v1");
     let unpacked = extract_to(&archive_dir, &archive);
 
-    install_from_unpacked_with_bus(&scratch, &bus, &unpacked, SourceType::Archive, false, None)
+    install_from_unpacked_with_bus(&scratch, &bus, &unpacked, SourceType::Archive, false, None, None)
         .await
         .expect("install must succeed");
 

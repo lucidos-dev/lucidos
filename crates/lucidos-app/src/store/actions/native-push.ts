@@ -5,8 +5,9 @@
 // in-app toast). A Tauri desktop app embeds a WKWebView that can't subscribe to
 // Web Push, so the engine reaches it over the already-open SSE stream and the
 // page renders a native macOS banner via the `show_native_notification` command
-// (mac-notification-sys in lib.rs). Tapping the banner routes through the SAME
-// dispatchDeepLink the web-push service-worker tap uses.
+// (Apple's UserNotifications framework / UNUserNotificationCenter, in
+// notifications.rs). Tapping the banner routes through the SAME dispatchDeepLink
+// the web-push service-worker tap uses.
 
 import type { Tap } from '@lucidos/sdk';
 import { isTauri } from '../../utils/platform';

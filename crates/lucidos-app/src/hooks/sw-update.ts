@@ -1,5 +1,6 @@
 import { signal } from '@preact/signals';
 import { CLIENT_BUILD_ID } from 'virtual:build-id';
+import { withBase } from '../utils/basePath';
 
 /** Whether a client refresh is in flight (blocks all user interaction until the
  *  page reloads). Drives the same UiBlockingOverlay as `engineRestarting`, so a
@@ -260,7 +261,7 @@ const SW_BUILD_ID_RE = /BUILD_ID\s*=\s*['"]([^'"]+)['"]/;
 export async function getServedBuildId(): Promise<string | null> {
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return null;
   try {
-    const resp = await fetch('/sw.js', { cache: 'no-store' });
+    const resp = await fetch(withBase('/sw.js'), { cache: 'no-store' });
     if (!resp.ok) return null;
     const id = SW_BUILD_ID_RE.exec(await resp.text())?.[1];
     if (!id || id.startsWith('__')) return null;

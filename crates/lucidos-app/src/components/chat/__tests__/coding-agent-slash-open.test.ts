@@ -64,13 +64,13 @@ describe('slash prefix detection in handleInput', () => {
   });
 
   it('detects "/" in compose view with Claude mode toggled', () => {
-    inputMode.value = { type: 'claude_code' };
+    inputMode.value = { type: 'coding_agent' };
     expect(detectSlashPrefix('/', undefined)).toBe('');
     expect(detectSlashPrefix('/commit', undefined)).toBe('commit');
   });
 
   it('does not trigger in compose view when Codex is selected', () => {
-    inputMode.value = { type: 'claude_code' };
+    inputMode.value = { type: 'coding_agent' };
     expect(detectSlashPrefix('/', undefined, 'codex')).toBeNull();
   });
 

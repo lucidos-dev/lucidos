@@ -3,7 +3,7 @@
  * as the "Lucidos" title in MobileThreadHeader, and must not ellipsis-truncate
  * within the constrained mobile header row.
  */
-import { test, expect, Page } from '@playwright/test';
+import { test, expect, Page } from './fixtures';
 import { assertHealthy, navigateToApp, openThreadDrawer } from './helpers';
 
 interface TitleMetrics { left: number; clientWidth: number; scrollWidth: number }

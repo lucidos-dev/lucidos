@@ -37,7 +37,7 @@ const SDK_PREFS_JS: &str = r##"(function() {
     ? (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark")
     : theme;
   d.setAttribute("data-theme", resolved);
-  var bg = resolved === "light" ? "#ffffff" : "#0d1117";
+  var bg = resolved === "light" ? "#ffffff" : "#0b2342";
   d.style.setProperty("--bg-primary", bg);
   // iOS PWA: covers the WKWebView-white gap before sdk-iframe.css loads
   // (mirrors the parent's inline FOUC IIFE in index.html).

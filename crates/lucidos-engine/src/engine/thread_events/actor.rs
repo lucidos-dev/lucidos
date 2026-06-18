@@ -54,6 +54,17 @@ pub enum EngineReason {
     MergeConflict,
     /// Engine detected the harden marker is missing or stale before apply.
     MissingHardening,
+    /// Historical: the engine used to silently apply marketplace plugin updates
+    /// in the background and stamped the resulting `PluginInstalled` event with
+    /// this reason. That behavior was retired — the engine now checks for
+    /// updates and notifies the user, who applies them from the Apps section.
+    /// Retained (not constructed by new code) so old `PluginInstalled` events
+    /// carrying this actor still deserialize.
+    PluginAutoUpdate {
+        plugin_id: String,
+        marketplace_id: String,
+        marketplace_name: String,
+    },
 }
 
 /// Direction of a `ThreadLink` origin: which end of the parent⇄child

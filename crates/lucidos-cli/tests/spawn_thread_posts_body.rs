@@ -115,12 +115,60 @@ async fn spawn_thread_with_parent_posts_parent_fields_in_body() {
     assert_eq!(body["message"], "spawn cc subtask");
     assert_eq!(body["title"], "Sub");
     assert_eq!(body["mode"], "agent");
-    assert_eq!(body["use_claude_code"], true);
+    assert_eq!(body["use_coding_agent"], true);
     assert_eq!(body["parent_thread_id"], thread_id);
     assert_eq!(body["spawning_event_id"], event_id);
     assert!(body.get("caller_workspace").is_none());
     assert!(body.get("caller_thread_id").is_none());
     assert!(body.get("caller_event_id").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_thread_codex_shortcut_posts_coding_agent_body() {
+    let (port, captured) = start_capture_server().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("dev");
+    write_ports_file(&caller, port);
+
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let status = std::process::Command::new(bin)
+        .args(["spawn-thread", "--to", "dev", "--codex", "--message", "spawn codex subtask", "--title", "Codex", "--insecure-http"])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
+        .env_remove("LUCIDOS_REPO")
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .status().expect("spawn cli");
+    assert!(status.success());
+
+    let body = captured.lock().unwrap().clone().expect("server received body");
+    assert_eq!(body["use_coding_agent"], true);
+    assert_eq!(body["coding_agent"], "codex");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_thread_coding_agent_flag_posts_codex_body() {
+    let (port, captured) = start_capture_server().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("caller");
+    let target = tmp.path().join("dev");
+    write_ports_file(&caller, 1);
+    write_ports_file(&target, port);
+
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let status = std::process::Command::new(bin)
+        .args(["spawn-thread", "--to", "dev", "--coding-agent", "codex", "--message", "spawn codex top", "--title", "Codex Top", "--insecure-http"])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
+        .env_remove("LUCIDOS_REPO")
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .status().expect("spawn cli");
+    assert!(status.success());
+
+    let body = captured.lock().unwrap().clone().expect("server received body");
+    assert_eq!(body["use_coding_agent"], true);
+    assert_eq!(body["coding_agent"], "codex");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -344,8 +392,8 @@ async fn parent_flag_still_works_with_deprecation_warning() {
 }
 
 /// `--folder data/apps/<id> --cc` must POST a `folder` field plus
-/// `use_claude_code` so the engine spawns an *app coding-agent thread* (the
-/// same kind `run_claude(folder=…)` produces). Critically, `--folder` must
+/// `use_coding_agent` so the engine spawns an *app coding-agent thread* (the
+/// same kind `run_coding_agent(folder=…)` produces). Critically, `--folder` must
 /// SUPPRESS the `$LUCIDOS_REPO` `repo_id` default: the engine sets that env
 /// var on every CC subprocess, and it rejects a request carrying both
 /// `repo_id` and `folder`. The original bug was every spawn landing in the
@@ -377,7 +425,7 @@ async fn spawn_thread_with_folder_posts_folder_and_omits_repo() {
 
     let body = captured.lock().unwrap().clone().expect("server received body");
     assert_eq!(body["folder"], "data/apps/momentum-autoresearch");
-    assert_eq!(body["use_claude_code"], true);
+    assert_eq!(body["use_coding_agent"], true);
     assert!(
         body.get("repo_id").is_none(),
         "--folder must suppress the $LUCIDOS_REPO repo_id default (engine 400s on both)"
@@ -417,7 +465,7 @@ async fn spawn_thread_folder_and_repo_are_mutually_exclusive() {
 /// `--folder` targets an app coding-agent thread, which only exists for CC
 /// sessions. `--folder` without `--cc` must error with a clear message before
 /// sending anything — the engine would 400 anyway (it rejects `folder`
-/// without `use_claude_code`), but a client-side check is clearer.
+/// without `use_coding_agent`), but a client-side check is clearer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_thread_folder_requires_cc() {
     let tmp = tempfile::tempdir().unwrap();

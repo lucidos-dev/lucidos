@@ -50,7 +50,6 @@ pub fn module_label(path: &str) -> &str {
         "memory" | "extractor" | "pgvector" | "fastembed" | "provider" => "Memory",
         "vertex" | "openai" => "LLM",
         "mcp" | "mcp_servers" | "client" => "MCP",
-        "dev_proxy" => "DevProxy",
         "browser" | "browser_consent" => "Browser",
         "chat" | "agentic_loop" => "Engine",
         "context" | "document" | "types" => "Engine",
@@ -65,7 +64,6 @@ pub fn module_label(path: &str) -> &str {
 
 pub mod api;
 pub mod core;
-pub mod dev_proxy;
 pub mod engine;
 pub mod llm;
 pub mod mcp;

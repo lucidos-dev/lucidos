@@ -6,9 +6,33 @@
 //! Cargo `target/` directory persists, and disk usage grows monotonically.
 //!
 //! Cleanup runs on a long timer (default 1 hour) and applies two tiers per
-//! thread, plus one global threshold alert:
+//! thread, plus one global threshold alert.
 //!
-//! - **Tier 1 — auto, always safe.** When a thread has been idle longer than
+//! **Retention gate (the load-bearing policy).** A worktree is the user's warm
+//! working copy of a thread — reopening a thread with its worktree still on disk
+//! is instant, while reclaiming it forces a cold ~15 GB rebuild and (if it races
+//! a resume) can strand the tree so the next session lands in the workspace data
+//! repo. So all reclamation tiers are **gated**: a thread's worktree is touched
+//! only when the user has **archived** the thread (the explicit "I'm done"
+//! signal) OR free disk has dropped below [`FREE_DISK_SOFT_BYTES`]. While disk is
+//! comfortable and the thread is non-archived, the worktree is kept fully warm
+//! regardless of idle age — no stripping, no removal. The gate is applied in
+//! `run_once`; the tier descriptions below state the additional per-tier
+//! conditions that apply *once the gate opens*. Always-exempt regardless of the
+//! gate: live sessions and *stranded* worktrees (broken git admin dir — removed
+//! immediately because they hold nothing recoverable).
+//!
+//! **Fan-in retention (ADR 0011, B2).** The two *full-removal* tiers (Tier 0 and
+//! Tier 2) additionally skip any thread with an outstanding parent↔child fan-in
+//! obligation — a direct child still running (`active_children_count > 0`) or a
+//! `ChildThreadCompleted` as its latest persisted event (a child completed but
+//! the parent hasn't processed it yet). Reclaiming such a worktree would leave
+//! the parent with nothing to resume into when it reacts to the completion (the
+//! `276f5580` incident). See [`WorktreeCleanup::has_pending_fan_in`]. Tier 1 is
+//! exempt — it strips only regenerable build artifacts, leaving the worktree and
+//! the parent's ability to resume intact.
+//!
+//! - **Tier 1 — strip regenerable build artifacts.** When a thread has been idle longer than
 //!   [`TIER_1_IDLE`] AND its worktree contains a `target/`, `node_modules/`,
 //!   or `.lucidos/cache/` directory, those directories are stripped. The
 //!   worktree itself stays so the next CC turn re-installs only the missing
@@ -363,7 +387,9 @@ impl WorktreeCleanup {
 
                     if let Some(age) = last_activity_age(&self.pool, thread_id).await {
                         // Stranded worktree (git admin dir gone): git-based tier
-                        // checks all fail, so remove directly before the ladder.
+                        // checks all fail, and a stranded tree is broken whether
+                        // or not disk is tight — remove it before the ladder and
+                        // outside the retention gate below.
                         if let Some(freed) = self
                             .try_stranded(thread_id, &dir, &path, pre_size, age)
                             .await
@@ -374,30 +400,42 @@ impl WorktreeCleanup {
                             }
                             continue;
                         }
-                        if age >= zero_info_grace {
-                            if let Some(freed) =
-                                self.try_tier_0(thread_id, &path, pre_size).await
-                            {
-                                if under_hard {
-                                    total_freed_under_hard =
-                                        total_freed_under_hard.saturating_add(freed);
+
+                        // Retention gate: keep a non-archived thread's worktree
+                        // fully warm while free disk is comfortable, so reopening
+                        // the thread reuses the worktree instead of paying a cold
+                        // ~15 GB rebuild (and never races a resume into a torn-down
+                        // tree). Reclaim — Tier 0/1/2 — only once the user has
+                        // ARCHIVED the thread (the explicit "done" signal) or free
+                        // disk drops below the soft threshold. `||` short-circuits,
+                        // so the archive lookup is skipped entirely under pressure.
+                        let may_reclaim = under_soft || self.is_archived(thread_id).await;
+                        if may_reclaim {
+                            if age >= zero_info_grace {
+                                if let Some(freed) =
+                                    self.try_tier_0(thread_id, &path, pre_size).await
+                                {
+                                    if under_hard {
+                                        total_freed_under_hard =
+                                            total_freed_under_hard.saturating_add(freed);
+                                    }
+                                    continue;
                                 }
+                            }
+                            if age >= TIER_2_IDLE
+                                && self
+                                    .try_tier_2(thread_id, &path, pre_size)
+                                    .await
+                                    .is_some()
+                            {
                                 continue;
                             }
-                        }
-                        if age >= TIER_2_IDLE
-                            && self
-                                .try_tier_2(thread_id, &path, pre_size)
-                                .await
-                                .is_some()
-                        {
-                            continue;
-                        }
-                        if age >= tier1_idle {
-                            if let Some(freed) = self.try_tier_1(thread_id, &path).await {
-                                if under_hard {
-                                    total_freed_under_hard =
-                                        total_freed_under_hard.saturating_add(freed);
+                            if age >= tier1_idle {
+                                if let Some(freed) = self.try_tier_1(thread_id, &path).await {
+                                    if under_hard {
+                                        total_freed_under_hard =
+                                            total_freed_under_hard.saturating_add(freed);
+                                    }
                                 }
                             }
                         }
@@ -453,6 +491,15 @@ impl WorktreeCleanup {
         worktree: &Path,
         pre_size: u64,
     ) -> Option<u64> {
+        // Don't reclaim a parent that still owes a child fan-in resume — it would
+        // have nothing to resume into (ADR 0011, B2).
+        if self.has_pending_fan_in(thread_id).await {
+            log!(
+                "[WorktreeCleanup] tier-0 skipped for thread {} — outstanding child fan-in obligation",
+                thread_id
+            );
+            return None;
+        }
         // On DB error, treat as if pending changes exist — skipping tier-0 cleanup
         // is safer than deleting a worktree whose pending-state we can't verify.
         match self.changes.pending_for_thread(thread_id).await {
@@ -670,6 +717,15 @@ impl WorktreeCleanup {
     /// passing it through avoids walking the same tree twice (worktrees can
     /// be tens of GB).
     async fn try_tier_2(&self, thread_id: Uuid, worktree: &Path, pre_size: u64) -> Option<u64> {
+        // Don't reclaim a parent that still owes a child fan-in resume — it would
+        // have nothing to resume into (ADR 0011, B2).
+        if self.has_pending_fan_in(thread_id).await {
+            log!(
+                "[WorktreeCleanup] tier-2 skipped for thread {} — outstanding child fan-in obligation",
+                thread_id
+            );
+            return None;
+        }
         // Pinned threads are exempt — the user has indicated they care about
         // this thread and may come back to it.
         match self.is_saved(thread_id).await {
@@ -723,6 +779,93 @@ impl WorktreeCleanup {
         Ok(row.map(|(p,)| p).unwrap_or(false))
     }
 
+    /// Whether the user has archived this thread (`archive_state = 'archived'`).
+    /// Archiving is the explicit "I'm done with this" signal that lets the
+    /// retention gate reclaim the worktree even while free disk is comfortable.
+    /// On a DB error (or unknown thread) returns `false` — keep the worktree, as
+    /// reclaiming on uncertain state is the unsafe direction.
+    async fn is_archived(&self, thread_id: Uuid) -> bool {
+        let row: Result<Option<(String,)>, sqlx::Error> = sqlx::query_as(
+            "SELECT archive_state FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_optional(&self.pool)
+        .await;
+        match row {
+            Ok(Some((state,))) => state == "archived",
+            Ok(None) => false,
+            Err(e) => {
+                log!(
+                    "[WorktreeCleanup] is_archived lookup failed for thread {}: {} — keeping worktree",
+                    thread_id,
+                    e
+                );
+                false
+            }
+        }
+    }
+
+    /// True iff `thread_id` has an outstanding parent↔child fan-in obligation
+    /// that requires keeping its worktree alive (ADR 0011, weakness B2):
+    ///   (a) `active_children_count > 0` — a direct child is still running; the
+    ///       parent will resume when it finishes, so it needs its worktree.
+    ///   (b) the thread's latest persisted event is a `ChildThreadCompleted` —
+    ///       a child has completed but the parent hasn't processed it yet (the
+    ///       exact incident window); this is the same predicate B1's boot sweep
+    ///       (`refire_unprocessed_child_completions`) selects on.
+    ///
+    /// Removing the worktree in either window would leave the parent with nothing
+    /// to resume into. The count guards the "children still running" window; the
+    /// card guards the "completed-but-not-processed" window — both are needed
+    /// because the child's terminal event decrements `active_children_count` in
+    /// the same transaction that persists `ChildThreadCompleted`, so the count is
+    /// already 0 by the time the parent owes a resume. On a DB error returns
+    /// `true` (keep the worktree) — reclaiming on unverifiable state is the
+    /// unsafe direction, matching `try_tier_0`'s pending-change stance.
+    async fn has_pending_fan_in(&self, thread_id: Uuid) -> bool {
+        // (a) direct children still running.
+        match sqlx::query_scalar::<_, i64>(
+            "SELECT active_children_count::bigint FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(Some(count)) if count > 0 => return true,
+            Ok(_) => {}
+            Err(e) => {
+                log!(
+                    "[WorktreeCleanup] active_children_count lookup failed for thread {}: {} — keeping worktree",
+                    thread_id,
+                    e
+                );
+                return true;
+            }
+        }
+        // (b) a completed-but-unprocessed child completion is the thread's last
+        // persisted word (no resume emitted a later event).
+        match sqlx::query_scalar::<_, String>(
+            "SELECT event_type FROM events \
+             WHERE aggregate = 'thread' AND aggregate_id = $1::text \
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(thread_id)
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(Some(event_type)) => event_type == "ChildThreadCompleted",
+            Ok(None) => false,
+            Err(e) => {
+                log!(
+                    "[WorktreeCleanup] latest-event lookup failed for thread {}: {} — keeping worktree",
+                    thread_id,
+                    e
+                );
+                true
+            }
+        }
+    }
+
     async fn emit_cleaned(
         &self,
         thread_id: Uuid,
@@ -763,14 +906,14 @@ impl WorktreeCleanup {
             format!(
                 "Only {:.1} GB free on the volume hosting your Lucidos workspace. \
                  Lucidos worktrees use {:.1} GB — clean idle ones from Settings → Disk Usage to reclaim space. \
-                 New Claude Code sessions may fail to spawn until disk is freed.",
+                 New coding-agent sessions may fail to spawn until disk is freed.",
                 free_gb, lucidos_gb,
             )
         } else {
             format!(
                 "Only {:.1} GB free on the volume hosting your Lucidos workspace. \
                  Lucidos itself uses just {:.1} GB — most of the pressure is from other apps on your machine. \
-                 New Claude Code sessions may fail to spawn until you free space elsewhere.",
+                 New coding-agent sessions may fail to spawn until you free space elsewhere.",
                 free_gb, lucidos_gb,
             )
         };

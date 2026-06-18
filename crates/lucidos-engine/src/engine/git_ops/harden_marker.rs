@@ -39,7 +39,7 @@ pub(crate) async fn harden_marker_state(
     {
         Ok(v) => v,
         Err(e) => {
-            log!("[ClaudeCode] Failed to read hardened_branches: {}", e);
+            log!("[Harden] Failed to read hardened_branches: {}", e);
             return HardenMarkerState::Missing;
         }
     };
@@ -49,12 +49,12 @@ pub(crate) async fn harden_marker_state(
     };
     if let Some(current) = branch_head_sha(repo_root, branch_name).await {
         if stored == current {
-            log!("[ClaudeCode] Harden marker is fresh (HEAD SHA matches)");
+            log!("[Harden] Harden marker is fresh (HEAD SHA matches)");
             return HardenMarkerState::Fresh;
         }
     }
     log!(
-        "[ClaudeCode] Harden marker is STALE (stored={}…)",
+        "[Harden] Harden marker is STALE (stored={}…)",
         &stored[..stored.floor_char_boundary(12)]
     );
     HardenMarkerState::Stale
@@ -117,7 +117,7 @@ pub(crate) async fn consume_harden_marker(
     .await
     {
         log!(
-            "[ClaudeCode] Failed to delete hardened_branches row for {}: {}",
+            "[Harden] Failed to delete hardened_branches row for {}: {}",
             branch_name,
             e
         );

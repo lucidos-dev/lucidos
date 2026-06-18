@@ -35,11 +35,13 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(bytes);
-    h.finalize().iter().fold(String::with_capacity(64), |mut acc, b| {
-        use std::fmt::Write as _;
-        let _ = write!(acc, "{:02x}", b);
-        acc
-    })
+    h.finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{:02x}", b);
+            acc
+        })
 }
 
 fn read_ports() -> (u16, String) {
@@ -77,17 +79,31 @@ pub fn workspace_path() -> PathBuf {
 /// Read the postgres port for the E2E workspace from its docker container.
 pub fn db_url() -> String {
     let ws = workspace_path();
-    let ws_str = ws.to_str().expect("workspace path not valid UTF-8");
-    // Container name uses cksum of workspace path
-    let output = std::process::Command::new("bash")
-        .args([
-            "-c",
-            &format!("echo -n '{}' | cksum | cut -d' ' -f1", ws_str),
-        ])
-        .output()
-        .expect("Failed to run cksum");
-    let cksum = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let container = format!("lucidos-pg-{}", cksum);
+    let container =
+        std::env::var("LUCIDOS_SHARED_PG_CONTAINER").unwrap_or_else(|_| "lucidos-pg-shared".into());
+    let db_slug = ws
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("workspace")
+        .chars()
+        .fold(String::new(), |mut out, ch| {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch.to_ascii_lowercase());
+            } else if !out.ends_with('-') && !out.is_empty() {
+                out.push('-');
+            }
+            out
+        })
+        .trim_matches('-')
+        .to_string();
+    let db = format!(
+        "lucidos_{}",
+        if db_slug.is_empty() {
+            "workspace"
+        } else {
+            &db_slug
+        }
+    );
 
     // Get the host port from docker
     let port_output = std::process::Command::new("docker")
@@ -103,7 +119,7 @@ pub fn db_url() -> String {
         .next()
         .and_then(|l| l.rsplit(':').next())
         .expect("Could not parse docker port");
-    format!("postgres://lucidos:lucidos@localhost:{}/lucidos", port)
+    format!("postgres://lucidos:lucidos@localhost:{}/{}", port, db)
 }
 
 pub fn base_url() -> String {
@@ -171,11 +187,7 @@ pub fn unique_marker(prefix: &str) -> String {
 /// emitting CC-only `ThreadEvent`s (`ChangeProposed`,
 /// `CodingAgentPermissionRequest`, …) — the lifecycle classifier rejects them
 /// when the thread isn't classified as CC.
-pub async fn seed_cc_thread_summary(
-    pool: &sqlx::PgPool,
-    thread_id: uuid::Uuid,
-    status: &str,
-) {
+pub async fn seed_cc_thread_summary(pool: &sqlx::PgPool, thread_id: uuid::Uuid, status: &str) {
     sqlx::query(
         "INSERT INTO thread_summaries (thread_id, source, is_coding_agent, created_at, last_activity, message_count, status) \
          VALUES ($1, 'claude_code', TRUE, NOW(), NOW(), 0, $2) \
@@ -227,11 +239,7 @@ pub async fn seed_app_cc_thread_summary(
 /// validator accepts the variant on chat threads now that the chat agent's
 /// `ask_user_question` tool also raises it, but the row must exist with
 /// `source = 'chat'` so the classifier resolves to `ThreadType::Chat`.
-pub async fn seed_chat_thread_summary(
-    pool: &sqlx::PgPool,
-    thread_id: uuid::Uuid,
-    status: &str,
-) {
+pub async fn seed_chat_thread_summary(pool: &sqlx::PgPool, thread_id: uuid::Uuid, status: &str) {
     sqlx::query(
         "INSERT INTO thread_summaries (thread_id, source, is_coding_agent, created_at, last_activity, message_count, status) \
          VALUES ($1, 'chat', FALSE, NOW(), NOW(), 0, $2) \
@@ -320,7 +328,11 @@ pub async fn poll_thread_summary_by_marker(
         .await
         .expect("DB query failed");
         if let Some((thread_id, parent_thread_id, initiator)) = row {
-            return ThreadSummaryRow { thread_id, parent_thread_id, initiator };
+            return ThreadSummaryRow {
+                thread_id,
+                parent_thread_id,
+                initiator,
+            };
         }
         assert!(
             std::time::Instant::now() < deadline,

@@ -61,3 +61,22 @@ describe('settings search — Permissions section', () => {
     expect(findSettingsEntry('permissions:claude-code')?.anchor).toBe('permissions:claude-code');
   });
 });
+
+describe('settings search — System section', () => {
+  it('finds the System page and its connection details', () => {
+    expect(getSettingsSearchResults('system', 20).some((r) => r.id === 'system')).toBe(true);
+    expect(getSettingsSearchResults('api url', 20).some((r) => r.id === 'system:connection')).toBe(true);
+  });
+
+  it('places Backup, Memory, and Disk Usage under the System breadcrumb', () => {
+    expect(findSettingsEntry('backup')?.path).toBe('Settings → System');
+    expect(findSettingsEntry('memory')?.path).toBe('Settings → System');
+    expect(findSettingsEntry('disk-usage')?.path).toBe('Settings → System');
+  });
+
+  it('resolves maintenance to the System subview', () => {
+    const entry = findSettingsEntry('system:maintenance');
+    expect(entry?.subview).toBe('system');
+    expect(entry?.anchor).toBe('system:maintenance');
+  });
+});

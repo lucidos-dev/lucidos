@@ -154,6 +154,9 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // Metadata
         "ThreadTitleGenerated" | "ThreadTitleRenamed" => EventClass::Metadata,
         "ThreadSaved" | "ThreadUnsaved" => EventClass::Metadata,
+        // Queued-message removal is a pure marker over a prior MessageReceived.
+        // It must not bump recency, status, section, or message count.
+        "QueuedMessageRemoved" => EventClass::Metadata,
         // Compose lifecycle — orthogonal to the section/status machinery.
         "ThreadStarted" | "ThreadDiscarded" => EventClass::Metadata,
         // ImageUploaded — passive bookkeeping for content-addressed blob
@@ -247,6 +250,7 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
 pub fn all_persisted_event_types() -> Vec<&'static str> {
     vec![
         "MessageReceived",
+        "QueuedMessageRemoved",
         "TextStreamed",
         "ThoughtStreamed",
         "ContextCaptured",
@@ -402,20 +406,20 @@ pub fn resolve_transition(
         | "CodingAgentSettingsChanged"
         | "ContinuationRequested" => match thread_type {
             ThreadType::CodingAgent => no_change,
-            ThreadType::Chat => violation("CC-specific event on Chat thread"),
+            ThreadType::Chat => violation("coding-agent-specific event on Chat thread"),
         },
         // User-attended terminals surface the thread in REVIEW so the user can
         // save or archive it. Without this, a cancel/abort on an already-
         // archived thread leaves it actionless: `available_thread_actions`
         // returns no close actions when stored_section != Inbox.
         "ResponseAborted" | "ResponseFailed" | "ResponseCanceled" => to_inbox,
-        // ChangeProposed surfaces CC threads to inbox — proposed changes require
+        // ChangeProposed surfaces coding-agent threads to inbox — proposed changes require
         // user action (apply/discard) and must surface in REVIEW. Without this,
-        // Claude Code sessions that finish without an intermediate CodingAgentIdled (or where
+        // coding-agent sessions that finish without an intermediate CodingAgentIdled (or where
         // the thread is already archived) would go straight to ARCHIVE.
         "ChangeProposed" => match thread_type {
             ThreadType::CodingAgent => to_inbox,
-            ThreadType::Chat => violation("ChangeProposed is CC-only"),
+            ThreadType::Chat => violation("ChangeProposed is coding-agent-only"),
         },
         // UserQuestionAsked surfaces the thread in REVIEW so the user sees the
         // question card and the action buttons. Raised by CC's
@@ -454,6 +458,7 @@ pub fn resolve_transition(
         },
         // Events legal for both, no section change
         "MessageReceived"
+        | "QueuedMessageRemoved"
         | "TextStreamed"
         | "ThoughtStreamed"
         | "ContextCaptured"

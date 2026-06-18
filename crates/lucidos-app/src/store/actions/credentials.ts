@@ -72,7 +72,8 @@ export async function submitNewCredential(
   service: string,
   baseUrl: string,
   authType: AuthType,
-  authValue: string
+  authValue: string,
+  envVarName?: string
 ): Promise<boolean> {
   if (!service || !baseUrl) {
     showToast('Service name and base URL are required', 'error');
@@ -89,6 +90,7 @@ export async function submitNewCredential(
         base_url: baseUrl,
         auth_type: authType,
         auth_value: authValue,
+        env_var_name: envVarName?.trim() || undefined,
       }),
     'Failed to save credential'
   );

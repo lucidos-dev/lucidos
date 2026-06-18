@@ -2,9 +2,10 @@ import type { ComponentChildren } from 'preact';
 import { useRef, useEffect, useCallback } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { signal } from '@preact/signals';
-import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, draftsViewActive, attentionViewActive, selectedCodingAgent } from '../../store/store';
+import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, draftsViewActive, attentionViewActive, selectedCodingAgent, selectedScope, repositories } from '../../store/store';
+import { composeDraftContextName } from '../../store/composeDestination';
 import { threadPassesChannelFilter } from '../../store/threadFilter';
-import { navigateToPane } from '../../store/actions/pane';
+import { navigateToPane, focusPane } from '../../store/actions/pane';
 import { focusThread } from '../../store/actions/threads';
 import { loadOlderThreads, reloadAfterFilterChange, ensureThreadInMap } from '../../store/actions/thread-loading';
 import { ThreadStatusIcon, resolveVisualStatus, type VisualStatus } from '../shared/ThreadStatusIcon';
@@ -26,6 +27,26 @@ import type { ThreadSearchResult } from '../../api/threads';
 // infinite-scroll cursor in `thread-loading.ts`); re-exported here so existing
 // importers (and tests) keep their path.
 export { threadPassesChannelFilter };
+
+export const THREAD_DRAWER_SECTION_ORDER: readonly DisplaySection[] = ['saved', 'current', 'archive'];
+
+/** True when an event target lies within a thread row (`[data-thread-nav]`).
+ *  Tolerates non-Element / null targets — a missing `closest` reads as
+ *  "not a thread row". */
+export function isThreadRowTarget(target: EventTarget | null): boolean {
+    return !!(target as Element | null)?.closest?.('[data-thread-nav]');
+}
+
+/** Pointer-down handler for the drawer pane. Focuses the drawer pane on a click
+ *  on its chrome (section headers, empty space, scrollbar). A click on a thread
+ *  row is exempt: that click focuses a *thread*, which focuses the thread pane
+ *  (the prompt input's `onFocus` → `focusPane('thread')`). Pre-focusing the
+ *  drawer here would glide the header focus wash to the drawer and then straight
+ *  back to the thread on the same click. */
+export function handleDrawerPointerDown(target: EventTarget | null): void {
+    if (isThreadRowTarget(target)) return;
+    focusPane('drawer');
+}
 
 /** Currently keyboard-highlighted thread ID in the drawer. */
 const highlightedThreadId = signal<string | null>(null);
@@ -124,6 +145,7 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
         <div class={`thread-drawer${visible ? '' : ' thread-drawer-collapsed'}`}
              style={visible ? { width: `${threadDrawerWidth.value}px` } : undefined}
              onKeyDown={handleKeyDown}
+             onPointerDown={(e) => handleDrawerPointerDown(e.target)}
              tabIndex={-1}>
             <div class="thread-drawer-list" ref={listRef}>
                 {renderContent && (
@@ -138,7 +160,8 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
 }
 
 
-import { attentionThreads, categorizeThreads, composingThreads, computeFamilyDecorations, computeFamilyGraph, computeFamilyKeys, computeFamilySections, depthStyle, draftThreads, filterByTopThread, hasCollapsedAncestor, makeByFamilyReview, nestByParent, threadHasUnsentDraft } from './family-graph';
+import { attentionThreads, categorizeThreads, composingThreads, computeFamilyDecorations, computeFamilyGraph, computeFamilyKeys, computeFamilySections, depthStyle, draftThreads, filterByTopThread, hasCollapsedAncestor, nestByParent, threadHasUnsentDraft } from './family-graph';
+import { byCreated } from '../../store/thread-events';
 import type { FamilyDecorations, FamilyGraph, NestedThread, ThreadSections } from './family-graph';
 export * from './family-graph';
 function ThreadList() {
@@ -185,7 +208,11 @@ function ThreadList() {
         const familyKeys = computeFamilyKeys(allThreads, familyGraph);
         const byFamilyRecent = (a: ThreadState, b: ThreadState) =>
             familyKeys.get(b.meta.id)!.recentKey.localeCompare(familyKeys.get(a.meta.id)!.recentKey);
-        categorized.current.sort(makeByFamilyReview(familyKeys));
+        // Current sorts by creation time (newest first) — a stable order that
+        // doesn't reshuffle as agents churn or threads gain a CTA. Attention and
+        // drafts are surfaced by the header filter icons, not by bubbling. Saved
+        // / Archive still sort by the family's freshest user action.
+        categorized.current.sort(byCreated);
         categorized.saved.sort(byFamilyRecent);
         categorized.archive.sort(byFamilyRecent);
     } else {
@@ -211,15 +238,16 @@ function ThreadList() {
     const archiveCount = archiveThreadCount.value;
     // Composing drafts ride at the top of Current (most-recent-first, already
     // sorted by `composingThreads`), ahead of the family-sorted current rows.
-    const sections: { name: DisplaySection; count: number; threads: NestedThread[] }[] = [
-        {
+    const sectionByName: Record<DisplaySection, { name: DisplaySection; count: number; threads: NestedThread[] }> = {
+        saved: { name: 'saved', count: saved.length, threads: filterCollapsed(nestByParent(saved)) },
+        current: {
             name: 'current',
             count: composingList.length + current.length,
             threads: [...nestByParent(composingList), ...filterCollapsed(nestByParent(current))],
         },
-        { name: 'saved', count: saved.length, threads: filterCollapsed(nestByParent(saved)) },
-        { name: 'archive', count: archiveCount, threads: filterCollapsed(nestByParent(archive)) },
-    ];
+        archive: { name: 'archive', count: archiveCount, threads: filterCollapsed(nestByParent(archive)) },
+    };
+    const sections = THREAD_DRAWER_SECTION_ORDER.map(name => sectionByName[name]);
 
     const sectionDefs = sections
         .filter(s => s.threads.length > 0)
@@ -467,7 +495,7 @@ function DrawerSection({ sectionKey, title, count, children }: { sectionKey: str
     };
 
     return (
-        <div class="drawer-section">
+        <div class={`drawer-section${collapsed ? ' drawer-section-collapsed' : ''}`}>
             <div class={`list-section-title list-section-title-collapsible${collapsed ? ' collapsed' : ''}`}
                  data-flip-id={`__section_${sectionKey}`}
                  onClick={toggle}
@@ -492,9 +520,21 @@ export function ComposingThreadRow({ thread, depth = 0, onAfterClick }: { thread
     // A coding draft hasn't bound a backend yet — it spawns with the device's
     // current `selectedCodingAgent` at send time (see sendCompose), so the tag
     // reflects that pick (Codex vs Claude Code) rather than always "Claude Code".
-    const modeLabel = getDraft(thread.meta.id).mode === 'claude_code'
+    // A plain chat draft is a Lucidos thread, which carries no channel tag —
+    // `formatThreadChannelLabel('chat')` returns '' and the chip is skipped.
+    const draftMode = getDraft(thread.meta.id).mode;
+    const modeLabel = draftMode === 'claude_code'
         ? formatThreadChannelLabel('claude_code', selectedCodingAgent.value)
-        : 'Lucidos';
+        : formatThreadChannelLabel('chat');
+    // The repo/app chip mirrors started threads. A coding draft hasn't bound its
+    // meta yet, so it reads the device-global `selectedScope` (the same value
+    // `sendCompose` would bind) rather than `meta.repoName`/`codingAgentKind`.
+    const reposLoadable = repositories.value;
+    const contextName = composeDraftContextName(
+        draftMode,
+        selectedScope.value,
+        reposLoadable.status === 'loaded' ? reposLoadable.data : [],
+    );
 
     return (
         <div data-flip-id={thread.meta.id} style={depthStyle(depth)} class={depth > 0 ? 'thread-row-wrap is-nested' : 'thread-row-wrap'}>
@@ -515,7 +555,8 @@ export function ComposingThreadRow({ thread, depth = 0, onAfterClick }: { thread
                     </span>
                 </div>
                 <div class="thread-row-right">
-                    <span class="label message-channel-tag">{modeLabel}</span>
+                    {modeLabel && <span class="label message-channel-tag">{modeLabel}</span>}
+                    {contextName && <span class="label thread-row-context">{contextName}</span>}
                 </div>
             </div>
         </div>
@@ -540,12 +581,14 @@ interface ThreadRowContentProps {
      *  header uses) — so every drawer row's dot is built in one pass and stays
      *  in lockstep with the list, instead of being re-read live per row. */
     visualStatus: VisualStatus;
-    /** Multi-line hover/long-press tooltip (You / Agent / Context / Status /
-     *  exchanges / Started). Empty string → no tooltip (e.g. an unhydrated
-     *  search hit). */
+    /** Structured hover/long-press tooltip (Status / You / Agent / Context /
+     *  Exchanges / Started), pre-serialized to a JSON `TooltipRow[]` so the memo
+     *  equality check can compare it as a plain string. Empty string → no
+     *  tooltip (e.g. an unhydrated search hit). */
     tooltip: string;
     /** Repo / app / trigger name chip shown next to the channel tag. Undefined
-     *  for plain chat (the "Chat" tag already says it). */
+     *  for plain chat — a Lucidos thread carries no channel tag and no context
+     *  name; the bare row (no chips) is itself the signal it's a regular chat. */
     contextName?: string;
     totalChildren: number;
     needsReview: boolean;
@@ -595,6 +638,20 @@ function ThreadRowContentImpl(props: ThreadRowContentProps) {
     // in a badge shown only while the family is collapsed (expanded families
     // show their children inline, so the number would be redundant).
     const a11yCount = `${props.totalChildren} sub-thread${props.totalChildren === 1 ? '' : 's'}`;
+    // The disclosure control carries its OWN tooltip + aria-label so hovering the
+    // badge/chevron shows what the control does — not the row's general thread
+    // tooltip. The global tooltip system walks up to the nearest `data-tooltip`
+    // ancestor (useTooltip `findTarget`), so without this the badge/chevron
+    // inherited the row's `data-tooltip` and showed the thread blurb. Collapsed
+    // names the hidden count ("Show N sub-threads"); expanded is just "Hide
+    // sub-threads" — the children are listed inline, so repeating the count
+    // would be redundant (same reason the count badge is collapsed-only).
+    const disclosureLabel = props.isCollapsed ? `Show ${a11yCount}` : 'Hide sub-threads';
+
+    // Plain chat / Lucidos threads have no channel tag (empty label) — render the
+    // chip only when there's a label, so the row doesn't paint an empty bordered
+    // chip for a regular Lucidos thread.
+    const channelLabel = formatThreadChannelLabel(props.channel, props.codingAgent);
 
     // The status dot is the wrapper's child, not the row's, so it stays in a
     // fixed left column at every depth — anchored to the un-indented wrapper
@@ -606,14 +663,16 @@ function ThreadRowContentImpl(props: ThreadRowContentProps) {
             <ThreadStatusIcon status={props.visualStatus} />
             <div class={classes.join(' ')}
                  data-thread-nav={props.id}
-                 {...(props.tooltip ? { 'data-tooltip': props.tooltip, 'data-tooltip-title': props.title, 'data-tooltip-longpress': '' } : {})}
+                 {...(props.tooltip ? { 'data-tooltip-rows': props.tooltip, 'data-tooltip-title': props.title, 'data-tooltip-longpress': '' } : {})}
                  onClick={props.onClick}>
                 {hasFamily && (
                     <button
                         type="button"
                         class="family-disclosure"
                         onClick={(e) => { e.stopPropagation(); props.onToggleFamily?.(); }}
-                        aria-label={props.isCollapsed ? `Show ${a11yCount}` : `Hide ${a11yCount}`}
+                        data-tooltip={disclosureLabel}
+                        data-tooltip-longpress=""
+                        aria-label={disclosureLabel}
                         aria-expanded={!props.isCollapsed}>
                         {/* Collapsed → the count badge alone signals hidden
                             sub-threads (no chevron); clicking it expands. Expanded →
@@ -634,7 +693,7 @@ function ThreadRowContentImpl(props: ThreadRowContentProps) {
                     </span>
                 </div>
                 <div class="thread-row-right">
-                    <span class={`label message-channel-tag${props.channel === 'error_unknown_channel' ? ' channel-error' : ''}`}>{formatThreadChannelLabel(props.channel, props.codingAgent)}</span>
+                    {channelLabel && <span class={`label message-channel-tag${props.channel === 'error_unknown_channel' ? ' channel-error' : ''}`}>{channelLabel}</span>}
                     {props.contextName && <span class="label thread-row-context">{props.contextName}</span>}
                     <span class="thread-row-actions">
                         <CopyThreadRefButton threadId={props.id} title={props.title} stopPropagation extraClass="thread-row-action" />
@@ -724,7 +783,7 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
             channel={meta.channel}
             codingAgent={meta.codingAgent}
             visualStatus={visualStatus}
-            tooltip={threadRowTooltip(meta, status)}
+            tooltip={JSON.stringify(threadRowTooltip(meta, status))}
             contextName={threadContextName(meta)}
             totalChildren={meta.totalChildrenCount}
             needsReview={meta.section === 'inbox' && status !== 'running'}
@@ -861,7 +920,7 @@ function SearchResultRow({ result }: { result: ThreadSearchResult }) {
             channel={result.channel}
             codingAgent={liveThread?.meta.codingAgent ?? result.coding_agent ?? undefined}
             visualStatus={visualStatus}
-            tooltip={liveThread ? threadRowTooltip(liveThread.meta, status) : ''}
+            tooltip={liveThread ? JSON.stringify(threadRowTooltip(liveThread.meta, status)) : ''}
             contextName={threadContextName(ctxFields)}
             totalChildren={liveThread?.meta.totalChildrenCount ?? 0}
             needsReview={section === 'inbox' && status !== 'running'}

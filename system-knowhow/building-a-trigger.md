@@ -90,8 +90,8 @@ Three independent fields control the notification:
 | Trigger says | `app_id` | `tap` | `event_id` |
 |---|---|---|---|
 | 8:00 habit-tracker "Check in for today" — direct CTA inside an app | habit-tracker | `{ kind: 'navigate', to: { target: 'app', app_id: 'habit-tracker' } }` | — |
-| Claude is asking the user a question — needs them back in the conversation, on that question | omit | `{ kind: 'navigate', to: { target: 'thread', id: '<thread_id>', event_id: '<event_id>' } }` | source event id |
-| CC asking for permission — same idea, different event | omit | `{ kind: 'navigate', to: { target: 'thread', id: '<thread_id>', event_id: '<event_id>' } }` | source event id |
+| Coding agent is asking the user a question — needs them back in the conversation, on that question | omit | `{ kind: 'navigate', to: { target: 'thread', id: '<thread_id>', event_id: '<event_id>' } }` | source event id |
+| Coding agent is asking for permission — same idea, different event | omit | `{ kind: 'navigate', to: { target: 'thread', id: '<thread_id>', event_id: '<event_id>' } }` | source event id |
 | "5 changes ready to apply" — multi-item panel destination | omit | `{ kind: 'navigate', to: { target: 'changes' } }` | — |
 | Daily summary "you completed 5 tasks today" — informational, no CTA | omit | `{ kind: 'modal' }` (default) | — |
 | 22:00 bedtime nudge — informational | omit | `{ kind: 'modal' }` (default) | — |

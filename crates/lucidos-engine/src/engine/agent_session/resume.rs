@@ -80,7 +80,7 @@ pub(crate) async fn lookup_latest_worktree_head_sha(
     .await
     .map_err(|e| {
         log!(
-            "[ClaudeCode] Failed to look up latest worktree_head_sha for {}: {}",
+            "[AgentSession] Failed to look up latest worktree_head_sha for {}: {}",
             thread_id,
             e
         );
@@ -112,7 +112,7 @@ pub(crate) async fn lookup_latest_worktree_path(
     .await
     .map_err(|e| {
         log!(
-            "[ClaudeCode] Failed to look up latest worktree_path for {}: {}",
+            "[AgentSession] Failed to look up latest worktree_path for {}: {}",
             thread_id,
             e
         );
@@ -151,7 +151,7 @@ pub(crate) async fn resolve_worktree_path(
 ) -> PathBuf {
     if let Some(path) = lookup_latest_worktree_path(pool, thread_id).await {
         log!(
-            "[ClaudeCode] Resolved worktree path from CodingAgentIdled event for thread {}: {}",
+            "[AgentSession] Resolved worktree path from CodingAgentIdled event for thread {}: {}",
             thread_id,
             path.display()
         );
@@ -161,7 +161,7 @@ pub(crate) async fn resolve_worktree_path(
     if let Some(branch) = branch_hint {
         if let Some(path) = find_worktree_for_branch(repo_root, branch).await {
             log!(
-                "[ClaudeCode] Resolved worktree path via git worktree list for thread {} branch {}: {}",
+                "[AgentSession] Resolved worktree path via git worktree list for thread {} branch {}: {}",
                 thread_id,
                 branch,
                 path.display()
@@ -172,7 +172,7 @@ pub(crate) async fn resolve_worktree_path(
 
     let path = deterministic_worktree_path(workspace_path, thread_id);
     log!(
-        "[ClaudeCode] Generated new deterministic worktree path for thread {}: {}",
+        "[AgentSession] Generated new deterministic worktree path for thread {}: {}",
         thread_id,
         path.display()
     );
@@ -194,7 +194,7 @@ pub(super) async fn resolve_resume_context(
         .await
         .unwrap_or_else(|e| {
             log!(
-                "[ClaudeCode] resume: pending_for_thread({}): {} — \
+                "[AgentSession] resume: pending_for_thread({}): {} — \
                  skipping pending-branch resume path",
                 thread_id,
                 e
@@ -210,7 +210,7 @@ pub(super) async fn resolve_resume_context(
             None => lookup_latest_cc_session_id(pool, thread_id).await,
         };
         log!(
-            "[ClaudeCode] Resuming on pending-change branch {} for thread {} (sid={:?})",
+            "[AgentSession] Resuming on pending-change branch {} for thread {} (sid={:?})",
             branch,
             thread_id,
             resume_sid
@@ -235,7 +235,7 @@ pub(super) async fn resolve_resume_context(
         .await
         .unwrap_or_else(|e| {
             log!(
-                "[ClaudeCode] Failed to look up last lifecycle event for resume: {}",
+                "[AgentSession] Failed to look up last lifecycle event for resume: {}",
                 e
             );
             None
@@ -269,7 +269,7 @@ async fn lookup_session_branch_for_thread(
     .await
     .map_err(|e| {
         log!(
-            "[ClaudeCode] Failed to look up session branch for {}: {}",
+            "[AgentSession] Failed to look up session branch for {}: {}",
             thread_id,
             e
         );
@@ -299,7 +299,7 @@ pub(crate) async fn lookup_latest_session_repo_and_branch(
     .await
     .map_err(|e| {
         log!(
-            "[ClaudeCode] Failed to look up session repo+branch for {}: {}",
+            "[AgentSession] Failed to look up session repo+branch for {}: {}",
             thread_id,
             e
         );
@@ -370,7 +370,7 @@ pub(crate) async fn lookup_latest_cc_session_id(
     .await
     .map_err(|e| {
         log!(
-            "[ClaudeCode] Failed to look up latest cc_session_id for {}: {}",
+            "[AgentSession] Failed to look up latest cc_session_id for {}: {}",
             thread_id,
             e
         );
@@ -397,7 +397,7 @@ pub(crate) async fn change_description_fallback(
             Ok(t) => t,
             Err(e) => {
                 log!(
-                    "[ClaudeCode] Failed to fetch thread title for change description: {}",
+                    "[AgentSession] Failed to fetch thread title for change description: {}",
                     e
                 );
                 None

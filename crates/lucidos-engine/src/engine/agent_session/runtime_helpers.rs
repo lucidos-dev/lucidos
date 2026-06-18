@@ -63,7 +63,7 @@ impl LucidosEngine {
                             },
                             meta: meta.clone(),
                         },
-                        "[ClaudeCode] CodingAgentTextStreamed flush on cancel",
+                        "[AgentSession] CodingAgentTextStreamed flush on cancel",
                     )
                     .await;
             }
@@ -98,7 +98,7 @@ impl LucidosEngine {
         let skip = flag.load(std::sync::atomic::Ordering::Acquire);
         if skip {
             crate::log!(
-                "[ClaudeCode] Skipping terminal emit ({}) for thread {} — external pre-emit already landed",
+                "[AgentSession] Skipping terminal emit ({}) for thread {} — external pre-emit already landed",
                 site,
                 thread_id
             );
@@ -191,7 +191,7 @@ impl LucidosEngine {
         let Some(kind) = stop_terminal_kind(is_shutdown, is_waiting, suppress_user_terminal)
         else {
             crate::log!(
-                "[ClaudeCode] {} arm: session {} stopped without a terminal event \
+                "[AgentSession] {} arm: session {} stopped without a terminal event \
                  (idle, user-action, or idle shutdown)",
                 arm,
                 thread_id
@@ -216,7 +216,7 @@ impl LucidosEngine {
         // Canceled inherits the existing meta.
         let mut emit_meta = meta.clone();
         Self::stamp_system_actor_if_aborted(&mut emit_meta, is_aborted);
-        let log_label = format!("[ClaudeCode] terminal event ({})", arm);
+        let log_label = format!("[AgentSession] terminal event ({})", arm);
         self.event_bus
             .emit_or_log(
                 crate::engine::event_bus::BusEvent::Thread {
@@ -229,9 +229,9 @@ impl LucidosEngine {
             .await;
     }
 
-    /// Emit a `CodingAgentPromptSent` event for automated Claude Code sessions (hardening,
+    /// Emit a `CodingAgentPromptSent` event for automated coding-agent sessions (hardening,
     /// merge conflict, recovery) and return the event ID for use as `origin_id`.
-    /// This ensures all events emitted by the Claude Code session have a valid
+    /// This ensures all events emitted by the coding-agent session have a valid
     /// `request_event_id` pointing to a real persisted event.
     ///
     /// `origin` flows onto the event so engine-internal callers (orphan recovery,
@@ -301,7 +301,7 @@ impl LucidosEngine {
                         },
                     };
                     crate::log!(
-                        "[ClaudeCode] CC task panicked for thread {}: {}",
+                        "[AgentSession] CC task panicked for thread {}: {}",
                         thread_id,
                         panic_msg
                     );
@@ -315,7 +315,7 @@ impl LucidosEngine {
                                 },
                                 meta: crate::engine::thread_events::EventMeta::NONE,
                             },
-                            "[ClaudeCode] ResponseFailed after panic",
+                            "[AgentSession] ResponseFailed after panic",
                         )
                         .await;
                     engine
@@ -328,7 +328,7 @@ impl LucidosEngine {
                                 },
                                 meta: crate::engine::thread_events::EventMeta::NONE,
                             },
-                            "[ClaudeCode] SessionEnded after panic",
+                            "[AgentSession] SessionEnded after panic",
                         )
                         .await;
                     engine.agent_sessions.lock().await.remove(&thread_id);

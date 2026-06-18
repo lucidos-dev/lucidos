@@ -65,6 +65,10 @@ export async function loadHistoricalTriggers(): Promise<void> {
 export function openAddTrigger(): void {
   panelOverlay.value = { type: 'form', form: { type: 'trigger' } };
   pushNavState();
+  // Lands the new-trigger form in the content pane: mobile swipe + desktop
+  // split expand. Mirrors openEditTrigger (same view, same overlay surface) —
+  // without it a click on a collapsed-split desktop silently looks like a no-op.
+  revealContentPane();
 }
 
 export function openEditTrigger(triggerId: string): void {

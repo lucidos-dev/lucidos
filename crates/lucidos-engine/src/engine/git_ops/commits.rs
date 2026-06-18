@@ -74,7 +74,15 @@ pub(crate) async fn auto_commit_safe_files_if_dirty(repo_root: &Path) -> bool {
 fn is_internal_auto_commit(subject: &str) -> bool {
     matches!(
         subject,
-        "Claude Code changes (auto-committed)"
+        "Coding agent changes (auto-committed)"
+            | "Coding agent changes (recovered after restart)"
+            | "Coding agent changes (pre-merge auto-commit)"
+            | "Coding agent changes (post-merge auto-commit)"
+            // Legacy subjects produced before the coding-agent rename. Keep
+            // matching them so internal auto-commits on threads created before
+            // this change stay filtered out of user-facing commit lists
+            // instead of suddenly surfacing as "meaningful" commits.
+            | "Claude Code changes (auto-committed)"
             | "Claude Code changes (recovered after restart)"
             | "Claude Code changes (pre-merge auto-commit)"
             | "Claude Code changes (post-merge auto-commit)"
@@ -188,17 +196,68 @@ pub(crate) async fn branch_changed_files(repo_root: &Path, branch_name: &str) ->
         .unwrap_or_default()
 }
 
+/// Check whether a branch carries authored (non-merge) commits that aren't yet
+/// on main. Stricter than `has_branch_commits`, which counts *all* commits ahead
+/// of main — including merge commits.
+///
+/// The distinction matters after an apply: when a branch's work is merged into
+/// main and the engine then back-merges main *into* the branch (conflict
+/// recovery), the branch is left with a merge commit ahead of main and a
+/// criss-crossed history with two merge bases. `has_branch_commits` is fooled by
+/// that merge commit (TRUE), and the three-dot `branch_changed_files` base
+/// regresses to the original fork point, re-surfacing the already-applied files
+/// as a phantom diff — so the startup recovery sweep re-proposed the
+/// already-applied change as a new pending change (real thread `bb9e68d6`).
+///
+/// A coding-agent worktree only ever produces *authored* work as non-merge
+/// commits (the agent's edits) — merge commits on the branch are exclusively
+/// engine-generated back-merges. So "has a non-merge commit not in main" is the
+/// honest test for "is there real un-applied work here".
+///
+/// Uses the same `default_local_branch` base as `has_branch_commits` (the gate
+/// it replaces); on git error it defaults to TRUE so a transient failure never
+/// silently swallows a real proposal — the empty-`branch_changed_files` check
+/// downstream is the second guard.
+pub(crate) async fn has_unmerged_authored_commits(repo_root: &Path, branch_name: &str) -> bool {
+    let base = default_local_branch(repo_root).await;
+    let range = format!("{}..{}", base, branch_name);
+    match git_cmd(&["rev-list", "--no-merges", "--count", &range], repo_root).await {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse::<u64>()
+            .map(|n| n > 0)
+            .unwrap_or(true),
+        Ok(o) => {
+            log!(
+                "[Git] git rev-list --no-merges failed for branch {}: {}",
+                branch_name,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            true
+        }
+        Err(e) => {
+            log!(
+                "[Git] git rev-list --no-merges failed for branch {}: {}",
+                branch_name, e
+            );
+            true
+        }
+    }
+}
+
 /// Files a Change proposal should reference for this branch, or `None` when the
-/// branch isn't proposal-worthy. `None` covers two cases: no commits ahead of
-/// main, or commits whose changes cancel out (commit + revert, e.g. CC's
-/// `npm install` lockfile rename + restore — zero net diff). Returning the file
-/// list here lets callers skip a second `branch_changed_files` call inside the
-/// proposal flow.
+/// branch isn't proposal-worthy. `None` covers three cases: no authored
+/// (non-merge) commits ahead of main (a bare branch, or one whose only commits
+/// ahead are engine back-merges of already-applied work — see
+/// `has_unmerged_authored_commits`), or authored commits whose changes cancel
+/// out (commit + revert, e.g. CC's `npm install` lockfile rename + restore —
+/// zero net diff). Returning the file list here lets callers skip a second
+/// `branch_changed_files` call inside the proposal flow.
 pub(crate) async fn proposal_files_for_branch(
     repo_root: &Path,
     branch_name: &str,
 ) -> Option<Vec<String>> {
-    if !has_branch_commits(repo_root, branch_name).await {
+    if !has_unmerged_authored_commits(repo_root, branch_name).await {
         return None;
     }
     let files = branch_changed_files(repo_root, branch_name).await;
@@ -313,12 +372,12 @@ pub(crate) async fn auto_commit_preserving_marker(
         if let Some(sha) = current_head_sha(worktree_path).await {
             if let Err(e) = record_hardened(pool, repo_root, branch_name, &sha).await {
                 log!(
-                    "[ClaudeCode] Failed to re-stamp hardened_branches for {}: {}",
+                    "[Git] Failed to re-stamp hardened_branches for {}: {}",
                     branch_name,
                     e
                 );
             } else {
-                log!("[ClaudeCode] Re-stamped harden marker after auto-commit");
+                log!("[Git] Re-stamped harden marker after auto-commit");
             }
         }
     }
@@ -388,7 +447,7 @@ pub(crate) async fn recover_no_commits_branch(
     change_files: &[String],
 ) -> Result<NoCommitsRecovery, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(ref wt) = find_worktree_for_branch(repo_root, branch_name).await {
-        auto_commit_worktree(wt, "Claude Code changes (pre-apply auto-commit)").await;
+        auto_commit_worktree(wt, "Coding agent changes (pre-apply auto-commit)").await;
     }
 
     if has_branch_commits(repo_root, branch_name).await {

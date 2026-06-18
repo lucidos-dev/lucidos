@@ -46,10 +46,14 @@ export interface ChatRequestBody {
   /** Legacy: inline base64 images. Kept for compat during the Phase 5
    *  cleanup window; new code uses `image_hashes`. */
   images?: Array<{ base64: string; mime_type: string }>;
-  use_claude_code?: boolean;
+  /** True when this request spawns / continues a coding-agent thread (any
+   *  backend), as opposed to a chat thread answered by the Lucidos Agent.
+   *  The `coding_agent` field below picks the backend. The engine still
+   *  accepts the legacy `use_claude_code` key via a serde alias. */
+  use_coding_agent?: boolean;
   cc_model?: string;
   /** Which coding-agent backend a NEW coding-agent thread runs on. Requires
-   *  `use_claude_code: true`. Ignored on follow-ups — the thread's stored
+   *  `use_coding_agent: true`. Ignored on follow-ups — the thread's stored
    *  backend wins (locked at first SessionStarted). */
   coding_agent?: CodingAgent;
   event_id?: string;
@@ -94,6 +98,20 @@ export interface NotificationsResponse {
 
 export interface CredentialsListResponse {
   credentials: CredentialInfo[];
+}
+
+/** A user-managed environment variable (Settings → Environment Variables).
+ *  Mirrors the engine row exposed by GET /api/v1/env-vars. */
+export interface EnvironmentVariable {
+  id: string;
+  name: string;
+  value: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EnvVarsListResponse {
+  env_vars: EnvironmentVariable[];
 }
 
 /** A chat model in the DB-backed registry (Settings → Models). Mirrors the

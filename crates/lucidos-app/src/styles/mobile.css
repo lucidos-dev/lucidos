@@ -26,6 +26,12 @@
         -webkit-user-select: text;
         user-select: text;
     }
+
+    /* The dropdown chevron is tiny by default — bump it on mobile so it reads as
+     * a clear affordance next to the larger touch-target trigger text. */
+    .dropdown-chevron {
+        font-size: 0.8125rem;
+    }
 }
 
 /* Drawer */
@@ -340,7 +346,7 @@
         right: 0;
         z-index: 100;
         will-change: transform;
-        background: var(--bg-primary);
+        background: var(--header-gradient);
         padding-top: env(safe-area-inset-top, 0px);
         flex-direction: column;
         align-items: stretch;
@@ -423,14 +429,11 @@
     }
 
     /* The threads header leads with a filter button before its altview-slot; the
-       thread (brand) header has no equivalent primary action since swipe-only nav
-       dropped the thread-grid toggle. Reserve that leading slot (one 1.75rem
-       header icon + the 0.25rem row gap = 2rem) so the nav slot aligns with the
-       altview-slot and the "Lucidos" brand starts at the same x as "Threads".
-       Without it the brand sits 32px (2rem) to the left of the threads title. */
-    .mobile-thread-header .mobile-header-row {
-        padding-left: 2rem;
-    }
+       thread (brand) header now leads with the hamburger menu (same 1.75rem
+       header icon + 0.25rem row gap = 2rem leading slot), so the nav slot aligns
+       with the altview-slot and the "Lucidos" brand starts at the same x as
+       "Threads" — no padding stand-in needed. The content header leads with the
+       same hamburger, keeping all three mobile headers in lockstep. */
 
     .mobile-nav-slot .content-back-btn,
     .mobile-nav-slot .content-forward-btn,
@@ -491,14 +494,17 @@
         background: none;
         border: none;
         outline: none;
-        color: var(--text-primary);
+        /* Rides directly on the brand-blue bar — light text + caret (same as the
+           desktop threads search in shell.css's brand-blue header block). */
+        color: var(--header-fg);
+        caret-color: var(--header-fg);
         font-size: 0.875rem;
         font-family: var(--font-ui);
         min-width: 0;
     }
 
     .mobile-thread-search-bar .thread-search-input::placeholder {
-        color: var(--text-muted);
+        color: var(--header-fg-muted);
     }
 
     /* ─── Sticky thread title bar inside the scroll container ─── */
@@ -666,6 +672,20 @@
         display: block;
         flex-shrink: 0;
         height: var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px)));
+    }
+
+    /* The inline form (trigger/credential/app/plugin editors) sits INSIDE the
+       .content-pane-body scroll container, which already carries the ::before
+       header spacer above. Its desktop `height: 100%` + own `overflow-y: auto`
+       made it a SECOND scroller sized to the full pane height — so positioned
+       after the spacer, its box bottom landed a header-height BELOW the viewport
+       and the Cancel/Save actions at the form's end were clipped off-screen and
+       unreachable on mobile. Let the form flow in the pane's own scroller
+       instead, and pad the bottom for the home-indicator safe area. */
+    .mobile-swipe-pane .inline-form {
+        height: auto;
+        overflow-y: visible;
+        padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
     }
 
     /* The ::before spacer replaces padding-top, so zero out the base padding-top
@@ -861,7 +881,7 @@
         border-radius: 50%;
         border: none;
         padding: 0;
-        background: var(--text-muted);
+        background: var(--header-fg-muted, var(--text-muted));
         opacity: 0.3;
         cursor: pointer;
         -webkit-tap-highlight-color: transparent;
@@ -869,7 +889,7 @@
 
     .mobile-dot.active {
         opacity: 1;
-        background: var(--accent);
+        background: var(--header-fg, var(--accent));
     }
 }
 

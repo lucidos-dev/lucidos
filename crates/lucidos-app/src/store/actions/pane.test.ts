@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
-  mobileView, threadDrawerOpen, threadDrawerWidth, splitRatio,
+  mobileView, threadDrawerOpen, threadDrawerWidth, splitRatio, focusedPane,
   DEFAULT_DRAWER_WIDTH, MIN_DRAWER_WIDTH, THREAD_DRAWER_WIDTH_KEY,
   MOBILE_VIEWS, PANE_INDEX, setMobileView, getInitialMobileView, type MobileView,
 } from '../store';
@@ -9,7 +9,7 @@ import {
   DEFAULT_SPLIT_RATIO, KEYBOARD_RESIZE_STEP_PX, MIN_THREAD_PANE_PX, MIN_CONTENT_PANE_PX,
 } from '../../components/layout/splitHelpers';
 import {
-  navigateToPane, checkPaneConsistency, toggleThreads,
+  navigateToPane, checkPaneConsistency, toggleThreads, focusPane,
   toggleThreadPane, toggleContentPane, stepThreadPaneWidth, stepThreadDrawerWidth, resetPaneLayout,
 } from './pane';
 
@@ -26,6 +26,7 @@ function resetState(view: MobileView = 'thread') {
   mobileView.value = view;
   threadDrawerOpen.value = false;
   drawerOpen.value = false;
+  focusedPane.value = 'thread';
 }
 
 describe('navigateToPane', () => {
@@ -174,20 +175,36 @@ describe('toggleThreads', () => {
     expect(checkPaneConsistency()).toBeNull();
   });
 
-  it('on desktop: toggles threadDrawerOpen on', () => {
+  it('on desktop: hidden drawer → shows it without changing focus', () => {
     (globalThis as any).innerWidth = 1024;
     threadDrawerOpen.value = false;
+    focusedPane.value = 'thread';
     toggleThreads();
     expect(threadDrawerOpen.value).toBe(true);
+    // Pure show/hide: the toggle never moves focus onto the drawer.
+    expect(focusedPane.value).toBe('thread');
     // mobileView unchanged on desktop
     expect(mobileView.value).toBe('thread');
   });
 
-  it('on desktop: toggles threadDrawerOpen off', () => {
+  it('on desktop: visible drawer → hides it (no focus stage)', () => {
     (globalThis as any).innerWidth = 1024;
     threadDrawerOpen.value = true;
+    focusedPane.value = 'thread';
+    toggleThreads();
+    // One click hides — no intermediate "take focus" stage.
+    expect(threadDrawerOpen.value).toBe(false);
+    expect(focusedPane.value).toBe('thread');
+  });
+
+  it('on desktop: hiding a focused drawer drops focus to the thread pane', () => {
+    (globalThis as any).innerWidth = 1024;
+    threadDrawerOpen.value = true;
+    focusedPane.value = 'drawer';
     toggleThreads();
     expect(threadDrawerOpen.value).toBe(false);
+    // A hidden pane must not stay the focused pane (would strand the focus wash).
+    expect(focusedPane.value).toBe('thread');
   });
 });
 
@@ -209,36 +226,78 @@ function mockLayoutWidths({ splitLayout, contentRow }: { splitLayout?: number; c
   });
 }
 
-describe('toggleThreadPane / toggleContentPane', () => {
+describe('toggleThreadPane / toggleContentPane (two-stage focus → hide)', () => {
   beforeEach(() => {
-    resetState();
+    resetState(); // focusedPane = 'thread'
     (globalThis as any).innerWidth = 1024;
     splitRatio.value = 0.5;
   });
   afterEach(() => vi.restoreAllMocks());
 
-  it('desktop: collapses the thread pane, then restores it to the default ratio', () => {
+  it('desktop thread pane: already focused → collapses (focus follows to content), then restores + refocuses', () => {
+    // focusedPane starts 'thread' and the pane is visible → first press hides it.
     toggleThreadPane();
     expect(splitRatio.value).toBe(0);
+    expect(focusedPane.value).toBe('content');
+    // Collapsed → next press expands and refocuses the thread pane.
     toggleThreadPane();
     expect(splitRatio.value).toBe(DEFAULT_SPLIT_RATIO);
+    expect(focusedPane.value).toBe('thread');
   });
 
-  it('desktop: collapses the content pane, then restores it to the default ratio', () => {
+  it('desktop thread pane: visible-but-unfocused → focuses first, hides only on the next press', () => {
+    focusedPane.value = 'content'; // thread pane visible but not focused
+    toggleThreadPane();
+    expect(splitRatio.value).toBe(0.5); // focus only — no collapse
+    expect(focusedPane.value).toBe('thread');
+    toggleThreadPane();
+    expect(splitRatio.value).toBe(0); // now it hides
+    expect(focusedPane.value).toBe('content');
+  });
+
+  it('desktop content pane: focuses first, then collapses, then restores + refocuses', () => {
+    // focusedPane starts 'thread' → first press just focuses content.
+    toggleContentPane();
+    expect(splitRatio.value).toBe(0.5);
+    expect(focusedPane.value).toBe('content');
+    // Focused + visible → next press collapses it (focus falls to thread).
     toggleContentPane();
     expect(splitRatio.value).toBe(1);
+    expect(focusedPane.value).toBe('thread');
+    // Collapsed → next press expands and refocuses content.
     toggleContentPane();
     expect(splitRatio.value).toBe(DEFAULT_SPLIT_RATIO);
+    expect(focusedPane.value).toBe('content');
   });
 
-  it('mobile: navigates to the pane instead of touching the split ratio', () => {
+  it('mobile: navigates to the pane instead of touching the split ratio or focus', () => {
     (globalThis as any).innerWidth = 375;
     toggleThreadPane();
     expect(mobileView.value).toBe('thread');
     toggleContentPane();
     expect(mobileView.value).toBe('content');
     expect(splitRatio.value).toBe(0.5);
+    expect(focusedPane.value).toBe('thread'); // unchanged on mobile
     expect(checkPaneConsistency()).toBeNull();
+  });
+});
+
+describe('focusPane', () => {
+  beforeEach(() => resetState());
+  afterEach(() => vi.restoreAllMocks());
+
+  it('desktop: sets the focused pane', () => {
+    (globalThis as any).innerWidth = 1024;
+    focusPane('content');
+    expect(focusedPane.value).toBe('content');
+    focusPane('drawer');
+    expect(focusedPane.value).toBe('drawer');
+  });
+
+  it('mobile: is a no-op (panes are navigated, not focused)', () => {
+    (globalThis as any).innerWidth = 375;
+    focusPane('content');
+    expect(focusedPane.value).toBe('thread');
   });
 });
 

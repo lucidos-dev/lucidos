@@ -470,6 +470,7 @@ print(json.dumps({
                 *auth_type,
                 auth_value,
                 None,
+                None,
             )
             .await
             .expect("upsert credential");

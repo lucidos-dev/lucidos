@@ -256,111 +256,149 @@ pub fn workspace_archive_name(workspace: &Path) -> &str {
         .unwrap_or("workspace")
 }
 
-/// Result of a successful backup restore — the new workspace's location.
-#[derive(Debug, Clone, Serialize)]
-pub struct RestoredWorkspace {
-    pub workspace_path: String,
-    pub workspace_name: String,
-}
-
-/// Authoritative restore-progress state, held by the engine for the duration of
-/// a restore and beyond (the terminal `Completed`/`Failed` is kept until the
-/// next restore starts). This is the SINGLE source of truth that BOTH the SSE
-/// `Restore*` events and the `GET /api/v1/backup/restore-status` endpoint
-/// serialize from — so a live stream and a page-reload refetch always render
-/// the identical state. A restore can run for many minutes; binding its state
-/// to the HTTP request lifetime (the old design) meant a tab reload or network
-/// blip cancelled the handler future, dropped the staging `TempDir`, and lost
-/// the whole download with nothing to reconnect to. See `restore_backup` in
-/// `api/backup.rs`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum RestoreState {
-    /// No restore has run since startup (or the field was never touched).
-    #[default]
-    Idle,
-    /// A restore is in flight. `phase`/`progress`/`total` mirror the
-    /// `restore_progress_sender` ticks (phase strings: downloading, decrypting,
-    /// decompressing, initializing, starting_db, restoring_db, done).
-    Running {
-        workspace_name: String,
-        phase: String,
-        progress: usize,
-        total: usize,
-    },
-    /// The restore finished; the new workspace is ready to start.
-    Completed {
-        workspace_name: String,
-        workspace_path: String,
-    },
-    /// The restore failed; `error` is the user-facing message.
-    Failed {
-        workspace_name: String,
-        error: String,
-    },
-}
-
-impl RestoreState {
-    /// True while a restore is actively running — used to reject a concurrent
-    /// restore (the engine runs one at a time).
-    pub fn is_running(&self) -> bool {
-        matches!(self, RestoreState::Running { .. })
+/// Parse the workspace name a backup archive was produced for, from its
+/// filename. `create_backup` stamps `lucidos-backup-{name}-{YYYYMMDD-HHMMSS}.enc`
+/// (see [`workspace_archive_name`]); this is the inverse, used by the gateway
+/// picker to derive a default workspace name for a restore. The `{name}` may
+/// itself contain hyphens (`e2e-test`), so we strip the fixed prefix/suffix and
+/// then the trailing `-YYYYMMDD-HHMMSS` timestamp (shape-validated via
+/// [`is_backup_timestamp`]). Returns `None` for anything not in that exact shape
+/// — the caller then asks the user for a name.
+pub fn parse_workspace_name_from_archive(filename: &str) -> Option<String> {
+    let rest = filename
+        .strip_prefix("lucidos-backup-")?
+        .strip_suffix(".enc")?;
+    // Split off the trailing `-HHMMSS`, then the `-YYYYMMDD` before it; whatever
+    // remains is the workspace name. Both halves must be timestamp-shaped.
+    let (before_time, time) = rest.rsplit_once('-')?;
+    let (name, date) = before_time.rsplit_once('-')?;
+    if name.is_empty() || !is_backup_timestamp(&format!("{date}-{time}")) {
+        return None;
     }
-
-    /// Atomically claim the restore slot: if no restore is running, transition to
-    /// `Running { phase: "starting" }` and return `true`; if one is already
-    /// running, leave the state untouched and return `false`. The caller holds
-    /// the engine's `restore_state` write lock across this call, which makes the
-    /// check-and-set indivisible — two concurrent requests can't both win.
-    pub fn try_start(&mut self, workspace_name: &str) -> bool {
-        if self.is_running() {
-            return false;
-        }
-        *self = RestoreState::Running {
-            workspace_name: workspace_name.to_string(),
-            phase: "starting".to_string(),
-            progress: 0,
-            total: 100,
-        };
-        true
-    }
+    Some(name.to_string())
 }
 
-/// Validate a workspace name for use as a directory name.
+/// Restore a local encrypted backup archive INTO an already-provisioned
+/// workspace directory + database. This is the gateway picker's restore path:
+/// the gateway has already reserved the registry entry, provisioned Postgres,
+/// and created `workspace_dir`; here we only download-free decrypt → decompress →
+/// move the workspace files in → `pg_restore` the dump into `database_url`.
 ///
-/// Rules: non-empty, no path traversal, filesystem-safe characters only
-/// (alphanumeric, hyphens, underscores), no leading dot.
-pub fn validate_workspace_name(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("Workspace name cannot be empty".into());
-    }
-    if name.starts_with('.') {
-        return Err("Workspace name cannot start with a dot".into());
-    }
-    if name.contains("..") || name.contains('/') || name.contains('\\') {
-        return Err("Workspace name contains invalid characters".into());
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(
-            "Workspace name may only contain letters, digits, hyphens, and underscores".into(),
-        );
-    }
-    Ok(())
-}
+/// Deliberately NARROWER than the old cloud `restore_backup`:
+///   * **No provider / download** — the archive is already on disk (`encrypted_path`).
+///   * **No `init-workspace.sh` / `~/workspaces/{name}`** — the gateway owns
+///     provisioning and the dir (which may live under the gateway app-data dir).
+///   * **No `user_dir/` extraction over `~/.lucidos`.** The archive carries the
+///     source machine's `~/.lucidos` under `user_dir/`; applying it on restore
+///     would CLOBBER the target's gateway registry
+///     (`~/.lucidos/gateway/config/workspaces.json`) and other machine-global
+///     state. We drop `user_dir/` from the staging tree before moving files in.
+///   * **No migrations** — the engine server the gateway spawns afterward runs
+///     `sqlx::migrate!()` at construction, upgrading an older-schema restore.
+pub async fn restore_archive_into(
+    workspace_dir: &Path,
+    database_url: &str,
+    key: &[u8],
+    encrypted_path: &Path,
+    progress: impl Fn(&str, usize, usize) + Send + Sync + 'static,
+) -> Result<(), BoxError> {
+    let temp_dir = tempfile::tempdir()?;
+    let progress = Arc::new(progress);
 
-/// Resolve the target workspace path from a name.
-/// Returns the full path under ~/workspaces/{name}.
-pub fn resolve_restore_workspace_path(name: &str) -> Result<PathBuf, BoxError> {
-    validate_workspace_name(name).map_err(|e| -> BoxError { e.into() })?;
-    let home = std::env::var("HOME").map_err(|_| "HOME not set")?;
-    let path = PathBuf::from(home).join("workspaces").join(name);
-    if path.exists() {
-        return Err(format!("Workspace '{}' already exists at {}", name, path.display()).into());
+    // Phase weights — there is no download phase (the file is already local), so
+    // decrypt starts at 0 and restore fills the remainder to 100.
+    let enc_bytes = std::fs::metadata(encrypted_path)?.len();
+    let (decrypt_end, decompress_end) = estimate_restore_weights(enc_bytes, 0);
+
+    // Phases 1-2: decrypt + decompress/untar into staging, then drop user_dir/
+    // (blocking I/O on the blocking pool).
+    let staging_dir = {
+        let progress = progress.clone();
+        let encrypted_path = encrypted_path.to_path_buf();
+        let key = key.to_vec();
+        let temp_path = temp_dir.path().to_path_buf();
+
+        tokio::task::spawn_blocking(move || -> Result<PathBuf, BoxError> {
+            // Phase 1: decrypt
+            progress("decrypting", 0, 100);
+            let compressed_path = temp_path.join("backup.tar.zst");
+            {
+                let total_bytes = std::fs::metadata(&encrypted_path)?.len();
+                let input = std::fs::File::open(&encrypted_path)?;
+                let mut last_pct = 0usize;
+                let reader = ProgressReader {
+                    inner: input,
+                    bytes_read: 0,
+                    callback: |done| {
+                        let pct = (decrypt_end as f64 * done as f64
+                            / total_bytes.max(1) as f64) as usize;
+                        let pct = pct.min(decrypt_end);
+                        if pct > last_pct {
+                            last_pct = pct;
+                            progress("decrypting", pct, 100);
+                        }
+                    },
+                };
+                let mut output = std::fs::File::create(&compressed_path)?;
+                crypto::decrypt(&key, reader, &mut output)?;
+            }
+
+            // Phase 2: decompress + untar into staging
+            progress("decompressing", decrypt_end, 100);
+            let staging_dir = temp_path.join("staging");
+            std::fs::create_dir_all(&staging_dir)?;
+            {
+                let file = std::fs::File::open(&compressed_path)?;
+                let decoder = zstd::Decoder::new(file)?;
+                let mut archive = tar::Archive::new(decoder);
+                archive.unpack(&staging_dir)?;
+            }
+
+            // Drop the archive's `user_dir/` (the source's ~/.lucidos) so it is
+            // neither applied over the target's ~/.lucidos (which would clobber
+            // the gateway registry) nor littered into the restored workspace.
+            let user_dir_staging = staging_dir.join("user_dir");
+            if user_dir_staging.exists() {
+                std::fs::remove_dir_all(&user_dir_staging)?;
+            }
+
+            Ok(staging_dir)
+        })
+        .await??
+    };
+
+    // Phase 3: move staged files into the (gateway-created) workspace dir.
+    progress("initializing", decompress_end, 100);
+    {
+        let workspace_dir = workspace_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<(), BoxError> {
+            std::fs::create_dir_all(&workspace_dir)?;
+            move_contents(&staging_dir, &workspace_dir)
+        })
+        .await??;
     }
-    Ok(path)
+
+    // Phase 4: restore the database dump into the provisioned Postgres. Skipped
+    // entirely when the archive carries no dump (no Postgres work, no psql) — a
+    // real backup always includes `lucidos_backup.dump`.
+    progress("restoring_db", decompress_end + 1, 100);
+    {
+        let ws_dir = workspace_dir.to_path_buf();
+        let database_url = database_url.to_string();
+        tokio::task::spawn_blocking(move || -> Result<(), BoxError> {
+            let dump_path = ws_dir.join("lucidos_backup.dump");
+            if dump_path.exists() {
+                terminate_other_connections(&database_url)?;
+                pg_restore(&database_url, &dump_path)?;
+                let _ = std::fs::remove_file(&dump_path);
+            }
+            Ok(())
+        })
+        .await??;
+    }
+
+    progress("done", 100, 100);
+    Ok(())
 }
 
 /// Create an encrypted backup of a workspace and its database.
@@ -589,193 +627,6 @@ pub async fn prune_old_backups(
         }
     }
     Ok(deleted)
-}
-
-/// Restore a backup into a brand-new workspace.
-///
-/// Pipeline: download → decrypt → decompress → create workspace → init postgres → pg_restore
-///
-/// The calling workspace is never touched. A new workspace directory is created at
-/// `~/workspaces/{workspace_name}`, provisioned via `init-workspace.sh`, and the
-/// backup's database is restored into the new workspace's postgres.
-pub async fn restore_backup(
-    workspace_name: &str,
-    key: &[u8],
-    backup_id: &str,
-    provider: &dyn BackupProvider,
-    progress: impl Fn(&str, usize, usize) + Send + Sync + 'static,
-) -> Result<RestoredWorkspace, BoxError> {
-    let workspace_path = resolve_restore_workspace_path(workspace_name)?;
-    let ws_name = workspace_name.to_string();
-
-    let temp_dir = tempfile::tempdir()?;
-    let progress = Arc::new(progress);
-
-    // Phase 1: download with progress (0% → download_end%)
-    let download_end = 15usize;
-    progress("downloading", 0, 100);
-    let encrypted_path = temp_dir.path().join("backup.enc");
-    let download_progress = |done: u64, total: u64| {
-        let pct = if total > 0 {
-            (download_end as f64 * done as f64 / total as f64) as usize
-        } else {
-            0
-        };
-        progress("downloading", pct, 100);
-    };
-    provider
-        .download(backup_id, &encrypted_path, &download_progress)
-        .await?;
-
-    // Estimate remaining phase weights from the downloaded file size
-    let enc_bytes = std::fs::metadata(&encrypted_path)?.len();
-    let (decrypt_end, decompress_end) = estimate_restore_weights(enc_bytes, download_end);
-
-    // Phases 2-3: decrypt + decompress into staging (blocking)
-    let staging_dir = {
-        let progress = progress.clone();
-        let encrypted_path = encrypted_path.clone();
-        let key = key.to_vec();
-        let temp_path = temp_dir.path().to_path_buf();
-
-        tokio::task::spawn_blocking(move || -> Result<PathBuf, BoxError> {
-            // Phase 2: decrypt
-            progress("decrypting", download_end, 100);
-            let compressed_path = temp_path.join("backup.tar.zst");
-            {
-                let total_bytes = std::fs::metadata(&encrypted_path)?.len();
-                let decrypt_range = decrypt_end - download_end;
-                let input = std::fs::File::open(&encrypted_path)?;
-                let mut last_pct = download_end;
-                let reader = ProgressReader {
-                    inner: input,
-                    bytes_read: 0,
-                    callback: |done| {
-                        let pct = download_end
-                            + (decrypt_range as f64 * done as f64 / total_bytes.max(1) as f64)
-                                as usize;
-                        let pct = pct.min(decrypt_end);
-                        if pct > last_pct {
-                            last_pct = pct;
-                            progress("decrypting", pct, 100);
-                        }
-                    },
-                };
-                let mut output = std::fs::File::create(&compressed_path)?;
-                crypto::decrypt(&key, reader, &mut output)?;
-            }
-
-            // Phase 3: decompress + untar into staging
-            progress("decompressing", decrypt_end, 100);
-            let staging_dir = temp_path.join("staging");
-            std::fs::create_dir_all(&staging_dir)?;
-            {
-                let file = std::fs::File::open(&compressed_path)?;
-                let decoder = zstd::Decoder::new(file)?;
-                let mut archive = tar::Archive::new(decoder);
-                archive.unpack(&staging_dir)?;
-            }
-
-            // Extract user_dir/ entries to ~/.lucidos/
-            if let Ok(home) = std::env::var("HOME") {
-                let user_dir_staging = staging_dir.join("user_dir");
-                if user_dir_staging.exists() {
-                    let user_dir = std::path::PathBuf::from(home).join(".lucidos");
-                    std::fs::create_dir_all(&user_dir)?;
-                    move_contents(&user_dir_staging, &user_dir)?;
-                    let _ = std::fs::remove_dir_all(&user_dir_staging);
-                }
-            }
-
-            Ok(staging_dir)
-        })
-        .await??
-    };
-
-    // Phase 4: create workspace directory and move files in
-    progress("initializing", decompress_end, 100);
-    {
-        let workspace_path = workspace_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), BoxError> {
-            std::fs::create_dir_all(&workspace_path)?;
-            if let Err(e) = move_contents(&staging_dir, &workspace_path) {
-                // `workspace_path` was just created in this function and
-                // `resolve_restore_workspace_path` guaranteed it did not exist
-                // beforehand, so this only ever removes a freshly-created,
-                // half-populated directory — never pre-existing user data. The
-                // cleanup is what lets the user retry the restore without hitting
-                // "workspace already exists". Log the failure (don't swallow it)
-                // so a botched cleanup that would block the retry is visible.
-                if let Err(rm) = std::fs::remove_dir_all(&workspace_path) {
-                    crate::log!(
-                        "[Backup] Restore failed and cleanup of partial workspace {} also failed: {} (original error: {})",
-                        workspace_path.display(),
-                        rm,
-                        e
-                    );
-                }
-                return Err(e);
-            }
-            Ok(())
-        })
-        .await??;
-    }
-
-    // Phase 5: provision postgres via init-workspace.sh
-    progress("starting_db", decompress_end + 1, 100);
-    let database_url = {
-        let ws_name = ws_name.clone();
-        tokio::task::spawn_blocking(move || init_workspace(&ws_name)).await??
-    };
-
-    // Phase 6: restore database
-    progress("restoring_db", decompress_end + 2, 100);
-    {
-        let ws_path = workspace_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), BoxError> {
-            terminate_other_connections(&database_url)?;
-            let dump_path = ws_path.join("lucidos_backup.dump");
-            if dump_path.exists() {
-                pg_restore(&database_url, &dump_path)?;
-                let _ = std::fs::remove_file(&dump_path);
-            }
-            Ok(())
-        })
-        .await??;
-    }
-
-    progress("done", 100, 100);
-
-    Ok(RestoredWorkspace {
-        workspace_path: workspace_path.to_string_lossy().to_string(),
-        workspace_name: ws_name,
-    })
-}
-
-/// Provision a new workspace by calling init-workspace.sh.
-///
-/// Returns the DATABASE_URL for the new workspace's postgres.
-fn init_workspace(workspace_name: &str) -> Result<String, BoxError> {
-    let init_script = crate::paths::script("init-workspace.sh")?;
-
-    let output = std::process::Command::new("bash")
-        .arg(&init_script)
-        .arg("-w")
-        .arg(workspace_name)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("init-workspace.sh failed: {}", stderr).into());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if let Some(url) = line.strip_prefix("DATABASE_URL=") {
-            return Ok(url.to_string());
-        }
-    }
-    Err("init-workspace.sh did not output DATABASE_URL".into())
 }
 
 /// Sum the on-disk size of every file that WILL be included in the backup tar

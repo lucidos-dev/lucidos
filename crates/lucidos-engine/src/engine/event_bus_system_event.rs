@@ -83,25 +83,6 @@ pub enum SystemEvent {
     BackupFailed {
         error: String,
     },
-    /// Restore progress tick. Transient (SSE-only). Mirrors the authoritative
-    /// `engine.restore_state` so a live client and a `GET /backup/restore-status`
-    /// refetch render the identical phase/percent.
-    RestoreProgress {
-        workspace_name: String,
-        phase: String,
-        progress: usize,
-        total: usize,
-    },
-    /// Restore finished — the new workspace is ready to start. Transient.
-    RestoreCompleted {
-        workspace_name: String,
-        workspace_path: String,
-    },
-    /// Restore failed. Transient; `error` is the user-facing message.
-    RestoreFailed {
-        workspace_name: String,
-        error: String,
-    },
     RecoveryProgress {
         completed: usize,
         total: usize,
@@ -491,6 +472,22 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// A user-managed environment variable was created or updated (upsert).
+    /// Unlike credentials, these are **not** secret — the `value` is carried so
+    /// the settings UI can refresh live without an extra fetch, and it may
+    /// appear in logs / the event store. That is the whole point of the feature.
+    EnvironmentVariableSet {
+        name: String,
+        value: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A user-managed environment variable was removed.
+    EnvironmentVariableDeleted {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     /// A chat-model registry entry was created (user-added via Settings →
     /// Models). The id is the request value (e.g. `claude-fable-5`); `provider`
     /// is the backend that serves it (`vertex` / `anthropic` / `openai`).
@@ -784,6 +781,8 @@ impl SystemEvent {
                 | Self::CredentialCreated { .. }
                 | Self::CredentialUpdated { .. }
                 | Self::CredentialDeleted { .. }
+                | Self::EnvironmentVariableSet { .. }
+                | Self::EnvironmentVariableDeleted { .. }
                 | Self::ModelCreated { .. }
                 | Self::ModelUpdated { .. }
                 | Self::ModelDeleted { .. }
@@ -815,9 +814,6 @@ impl SystemEvent {
             Self::BackupProgress { .. } => "BackupProgress",
             Self::BackupCompleted { .. } => "BackupCompleted",
             Self::BackupFailed { .. } => "BackupFailed",
-            Self::RestoreProgress { .. } => "RestoreProgress",
-            Self::RestoreCompleted { .. } => "RestoreCompleted",
-            Self::RestoreFailed { .. } => "RestoreFailed",
             Self::RecoveryProgress { .. } => "RecoveryProgress",
             Self::Toast { .. } => "Toast",
             Self::ArtifactImported { .. } => "ArtifactImported",
@@ -865,6 +861,8 @@ impl SystemEvent {
             Self::CredentialCreated { .. } => "CredentialCreated",
             Self::CredentialUpdated { .. } => "CredentialUpdated",
             Self::CredentialDeleted { .. } => "CredentialDeleted",
+            Self::EnvironmentVariableSet { .. } => "EnvironmentVariableSet",
+            Self::EnvironmentVariableDeleted { .. } => "EnvironmentVariableDeleted",
             Self::ModelCreated { .. } => "ModelCreated",
             Self::ModelUpdated { .. } => "ModelUpdated",
             Self::ModelDeleted { .. } => "ModelDeleted",
@@ -902,9 +900,6 @@ impl SystemEvent {
         "BackupProgress",
         "BackupCompleted",
         "BackupFailed",
-        "RestoreProgress",
-        "RestoreCompleted",
-        "RestoreFailed",
         "RecoveryProgress",
         "Toast",
         "ArtifactImported",
@@ -952,6 +947,8 @@ impl SystemEvent {
         "CredentialCreated",
         "CredentialUpdated",
         "CredentialDeleted",
+        "EnvironmentVariableSet",
+        "EnvironmentVariableDeleted",
         "ModelCreated",
         "ModelUpdated",
         "ModelDeleted",
@@ -992,9 +989,6 @@ impl SystemEvent {
             | Self::BackupProgress { .. }
             | Self::BackupCompleted { .. }
             | Self::BackupFailed { .. }
-            | Self::RestoreProgress { .. }
-            | Self::RestoreCompleted { .. }
-            | Self::RestoreFailed { .. }
             | Self::RecoveryProgress { .. }
             | Self::Toast { .. } => "ops",
             Self::ArtifactImported { .. }
@@ -1034,6 +1028,9 @@ impl SystemEvent {
             Self::CredentialCreated { .. }
             | Self::CredentialUpdated { .. }
             | Self::CredentialDeleted { .. } => "credential",
+            Self::EnvironmentVariableSet { .. } | Self::EnvironmentVariableDeleted { .. } => {
+                "environment_variable"
+            }
             Self::ModelCreated { .. } | Self::ModelUpdated { .. } | Self::ModelDeleted { .. } => {
                 "model"
             }
@@ -1125,6 +1122,8 @@ impl SystemEvent {
             Self::CredentialCreated { service_name, .. }
             | Self::CredentialUpdated { service_name, .. }
             | Self::CredentialDeleted { service_name, .. } => service_name.clone(),
+            Self::EnvironmentVariableSet { name, .. }
+            | Self::EnvironmentVariableDeleted { name, .. } => name.clone(),
             Self::ModelCreated { id, .. }
             | Self::ModelUpdated { id, .. }
             | Self::ModelDeleted { id, .. } => id.clone(),

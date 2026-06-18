@@ -4,7 +4,8 @@ import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { ensureChangeLoaded, revertChange } from '../../store/actions/chat-changes';
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDetailModal } from '../../store/store';
-import { LUCIDOS_AGENT_ICON, LUCIDOS_AGENT_LABEL, resumeEngineNote, stepStatus } from '../../store/thread-events';
+import { LUCIDOS_AGENT_LABEL, resumeEngineNote, stepStatus } from '../../store/thread-events';
+import { LucidosAgentGlyph } from '../shared/LucidosMark';
 import type { Exchange } from '../../store/thread-events';
 import type { Loadable, ResponseEvent } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
@@ -299,7 +300,7 @@ export function describeExecutor(
 ): { icon: ComponentChildren; label: string } {
   if (isCC && codingAgent === 'codex') return { icon: <CodexIcon />, label: 'Codex' };
   if (isCC) return { icon: <ClaudeIcon />, label: 'Claude Code' };
-  return { icon: LUCIDOS_AGENT_ICON, label: LUCIDOS_AGENT_LABEL };
+  return { icon: <LucidosAgentGlyph />, label: LUCIDOS_AGENT_LABEL };
 }
 
 interface ResponsePanelProps {

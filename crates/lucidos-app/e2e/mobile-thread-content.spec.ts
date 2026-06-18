@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { assertHealthy, navigateToApp, sendMessage, uniqueMessage, waitForResponse } from './helpers';
 
 test.describe('Mobile thread content visibility', () => {

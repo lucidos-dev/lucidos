@@ -218,8 +218,34 @@ pub(super) async fn health(State(state): State<AppState>) -> Json<serde_json::Va
         "engine_version": engine_version,
         "latest_engine_version": latest_engine_version,
         "latest_tauri_app_version": latest_tauri_app_version,
+        // True in a PACKAGED desktop build (runs as the launchd service / behind
+        // the bundled gateway; no source checkout). The frontend reads this to
+        // route the "Restart" control: packaged → restart the LaunchAgent
+        // (`launchctl kickstart -k`) or POST the bundled gateway; dev → the
+        // /restart script (`web-dev.sh --engine-only`, which rebuilds first).
+        "packaged": is_packaged(),
     }))
 }
+
+/// True in a packaged desktop build, detected by the ABSENCE of a Lucidos source
+/// checkout above the running binary: a packaged `.app` engine has no
+/// `scripts/web-dev.sh` ancestor (so [`crate::paths::repo_root`] errs), while a
+/// dev engine — built from source, whether under the gateway (ADR 0014) or the
+/// legacy single-engine model — resolves it.
+///
+/// The previous signal — `LUCIDOS_STATIC_DIR` being set — stopped discriminating
+/// when ADR 0014 made the DEV engine serve the built `dist/` from that same var.
+/// A dev engine then looked "packaged" and routed its Apply restart into
+/// [`restart_via_gateway`] (a plain-`http` POST to the dev gateway, which serves
+/// `https`) instead of rebuilding via `web-dev.sh --engine-only` — surfacing as
+/// "gateway restart request failed: error sending request for url".
+fn is_packaged() -> bool {
+    crate::paths::repo_root().is_err()
+}
+
+/// launchd label of the always-on engine service (matches
+/// `crates/lucidos-app/src/desktop.rs` `LAUNCH_AGENT_LABEL`).
+const LAUNCH_AGENT_LABEL: &str = "com.lucidos.engine";
 
 /// Read a VERSION file from disk, returning "unknown" if missing.
 fn read_version_file(path: &std::path::Path) -> String {
@@ -246,15 +272,17 @@ fn read_app_version() -> String {
     read_version_file(&path)
 }
 
-/// Spawn `web-dev.sh --engine-only` to rebuild and restart the engine binary,
-/// leaving Vite and parent scripts untouched. Errors return `{"error": msg}`
-/// so the UI can show the actual reason instead of a silent failure.
+/// Restart the engine. In a PACKAGED build the engine runs as a launchd service
+/// (`com.lucidos.engine`), so it restarts itself via `launchctl kickstart -k`
+/// (the dev `web-dev.sh` script isn't in the bundle). In dev it spawns
+/// `web-dev.sh --engine-only` to rebuild and restart the engine binary, leaving
+/// Vite and parent scripts untouched. Errors return `{"error": msg}` so the UI
+/// can show the actual reason instead of a silent failure.
 ///
-/// Before spawning the restart script: enumerates all in-flight chat + CC
-/// threads and pre-emits boundary events with `actor: <user>` so the post-
-/// restart timeline reads "You restarted" instead of "⚙ System restarted".
-/// Recovery on the new engine sees these threads are already terminated and
-/// skips them.
+/// Before restarting: enumerates all in-flight chat + CC threads and pre-emits
+/// boundary events with `actor: <user>` so the post-restart timeline reads "You
+/// restarted" instead of "⚙ System restarted". Recovery on the new engine sees
+/// these threads are already terminated and skips them.
 pub(super) async fn restart_engine(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -262,6 +290,28 @@ pub(super) async fn restart_engine(
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
     state.engine.abort_in_flight_for_restart(actor).await;
 
+    if is_packaged() {
+        // Under the workspace gateway (ADR 0014) the engine is spawned +
+        // supervised by the standalone `lucidos-gateway`; an Apply's restart asks
+        // the gateway to respawn THIS workspace's stack in place (a control
+        // call), leaving peers and the gateway untouched. The bundle binary is
+        // fixed, so no rebuild is needed — a stack respawn re-reads the merged
+        // files. The gateway injects LUCIDOS_GATEWAY_PORT + LUCIDOS_WORKSPACE_ID
+        // when it spawns us. Legacy single-engine packaging falls back to launchd.
+        if let (Ok(port), Ok(id)) = (
+            std::env::var("LUCIDOS_GATEWAY_PORT"),
+            std::env::var("LUCIDOS_WORKSPACE_ID"),
+        ) {
+            return restart_via_gateway(&port, &id).await;
+        }
+        return restart_via_launchd();
+    }
+
+    // Dev: the engine binary is built from source, so an Apply must REBUILD
+    // before restarting. `web-dev.sh --engine-only` rebuilds the binary and (in
+    // gateway dev) asks the gateway to respawn this workspace's stack onto it;
+    // in legacy dev it restarts the single engine. Either way the rebuild step
+    // is why dev does NOT call the gateway control API directly here.
     let script = crate::paths::script("web-dev.sh").map_err(|e| {
         log!("[Restart] {}", e);
         (
@@ -313,6 +363,70 @@ pub(super) async fn restart_engine(
         Ok(_) => Ok(StatusCode::OK),
         Err(e) => {
             let msg = format!("Failed to spawn {}: {}", script.display(), e);
+            log!("[Restart] {}", msg);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": msg })),
+            ))
+        }
+    }
+}
+
+/// Gateway-mode restart (ADR 0014): POST the gateway's control API (behind the
+/// sigil namespace `/~/`) to respawn just this workspace's stack. The gateway
+/// kills the old engine (SIGUSR1, with a drain window) and spawns a fresh one on
+/// the same loopback port; the frontend tolerates the brief network rejection
+/// after the 2xx.
+async fn restart_via_gateway(
+    gateway_port: &str,
+    workspace_id: &str,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let url = format!(
+        "http://127.0.0.1:{gateway_port}/~/api/v1/control/workspaces/{workspace_id}/restart"
+    );
+    log!("[Restart] Gateway mode: POST {}", url);
+    let client = reqwest::Client::new();
+    match client.post(&url).send().await {
+        Ok(resp) if resp.status().is_success() => Ok(StatusCode::OK),
+        Ok(resp) => {
+            let msg = format!("gateway restart returned {}", resp.status());
+            log!("[Restart] {}", msg);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": msg })),
+            ))
+        }
+        Err(e) => {
+            let msg = format!("gateway restart request failed: {e}");
+            log!("[Restart] {}", msg);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": msg })),
+            ))
+        }
+    }
+}
+
+/// Packaged restart: the engine runs as the `com.lucidos.engine` launchd
+/// service, so it restarts itself with `launchctl kickstart -k`. launchd
+/// SIGTERMs the service supervisor, which sends the engine its graceful-stop
+/// SIGUSR1 (with a drain window) and respawns a clean Postgres + engine. We
+/// spawn launchctl and return 200 immediately — the response flushes during the
+/// drain window, and the frontend already tolerates a network rejection after a
+/// 2xx while the engine is being killed.
+fn restart_via_launchd() -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    // `launchctl kickstart` targets `gui/<uid>/<label>`; resolve the uid of the
+    // user whose launchd domain the service was bootstrapped into (us).
+    let uid = unsafe { libc::getuid() };
+    let target = format!("gui/{uid}/{LAUNCH_AGENT_LABEL}");
+    log!("[Restart] Packaged mode: launchctl kickstart -k {}", target);
+    match std::process::Command::new("launchctl")
+        .args(["kickstart", "-k", &target])
+        .spawn()
+    {
+        Ok(_) => Ok(StatusCode::OK),
+        Err(e) => {
+            let msg = format!("Failed to restart service via launchctl: {e}");
             log!("[Restart] {}", msg);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -783,6 +897,22 @@ mod tests {
     #[test]
     fn validate_emittable_event_type_rejects_empty() {
         assert!(validate_emittable_event_type("").is_err());
+    }
+
+    /// Regression (ADR 0014): an engine built from a source checkout must report
+    /// as NOT packaged. The old `is_packaged()` keyed off `LUCIDOS_STATIC_DIR`,
+    /// which ADR 0014 made the DEV engine set too — so a dev engine looked
+    /// packaged and routed its Apply restart into the packaged gateway POST
+    /// (plain-`http` to the `https` dev gateway) instead of rebuilding via
+    /// `web-dev.sh --engine-only`. Detection is now the presence of the
+    /// `scripts/web-dev.sh` source marker, so the test binary (which lives inside
+    /// the repo) classifies as dev.
+    #[test]
+    fn is_packaged_false_for_source_build() {
+        assert!(
+            !is_packaged(),
+            "a source-built engine must not be classified as packaged"
+        );
     }
 
     /// `Accept-Encoding` parser must recognise gzip in any of its standard

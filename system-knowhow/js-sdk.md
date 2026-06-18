@@ -7,7 +7,7 @@ description: Complete API reference for the lucidos JS SDK — functions, types,
 
 The SDK is available as `lucidos` in app UIs. Import from `@anthropic/lucidos-sdk` in external projects.
 
-> From a Claude Code subprocess, prefer the `lucidos` CLI for `data.*` and `events.*` operations — see [`lucidos-cli.md`](./lucidos-cli.md).
+> From a coding-agent subprocess, prefer the `lucidos` CLI for `data.*` and `events.*` operations — see [`lucidos-cli.md`](./lucidos-cli.md).
 
 ## Setup
 
@@ -44,7 +44,7 @@ What each piece does — include only what you need:
 | `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script — reads the user's theme/font/scale from `localStorage` (shared with the parent shell via same-origin sandboxing) and sets `data-theme`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible — before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
 | `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling | App ships its own complete stylesheet and doesn't want Lucidos theming |
 | `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance, survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
-| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs an iframe-friendly link interceptor: `target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.navigate()` | App doesn't use `lucidos.*` |
+| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs two iframe-only side effects: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.navigate()`) and a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus — iframe keydowns otherwise never reach the host). Only modifier-bearing chords and Escape are forwarded; plain typing stays in the app. | App doesn't use `lucidos.*` |
 | `lucidos.ui.applyPreferences()` | Reads the user's theme/font/scale (resolving a `system` preference to the live OS light/dark) and sets `data-theme` + CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | **Don't skip if you include `sdk-iframe.css`** — without it the app ignores the user's light/system setting and stays on the default dark palette. Skip only when opting out of Lucidos theming entirely. |
 | `lucidos.ui.watchPreferences()` | Re-applies preferences live: when the user changes one (SSE `PreferencesChanged`), and — under a `system` preference — when the OS light/dark appearance flips (a `prefers-color-scheme` listener, off iOS, matching the host shell) | Static apps that have opted out of Lucidos theming |
 
@@ -74,7 +74,7 @@ What each piece does — include only what you need:
 .card a { color: var(--accent); }
 ```
 
-Apps using `lucidos._capture()` don't need to include `html2canvas` — the SDK loads it on demand from `/api/v1/static/html2canvas.min.js`.
+Apps using `lucidos._capture()` don't need to include `html2canvas` — the SDK loads it on demand from `/api/v1/static/html2canvas.min.js`. `html2canvas` can't rasterize CSS Color 4 functions (`color()`, `oklab()`, `oklch()`, `color-mix()`); when the screenshot fails for any reason the capture degrades to **DOM-only** — it returns an empty `screenshot` plus a `dom` layout snapshot (element positions + classes) prefixed with the failure reason, rather than throwing. The agent still sees the rendered layout instead of going blind.
 
 External-host apps point `baseUrl` at the Lucidos instance:
 
@@ -508,13 +508,13 @@ lucidos.notifications.markAllRead(): Promise<void>
 
 ```ts
 type NavigateTarget =
-  | 'files' | 'apps' | 'triggers' | 'thread-queue' | 'changes' | 'notifications'
+  | 'files' | 'apps' | 'app-store' | 'triggers' | 'thread-queue' | 'changes' | 'notifications'
   | 'settings' | 'app' | 'file' | 'trigger' | 'thread'
   | 'new-app' | 'new-trigger' | 'new-chat' | 'url';
 
 interface NavigateUi {
   target: NavigateTarget;
-  settings_view?: 'devices' | 'accounts' | 'backup' | 'memory' | 'repositories';
+  settings_view?: 'devices' | 'accounts' | 'backup' | 'memory' | 'repositories' | 'environment-variables';
   app_id?: string;
   file_path?: string;
   id?: string;
@@ -604,7 +604,7 @@ await fetch('/api/v1/notifications', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
-    title: 'Claude is asking',
+    title: 'Coding agent is asking',
     message: 'Permission needed.',
     thread_id: 't-9',
     event_id: 'e-7',

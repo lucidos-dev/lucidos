@@ -1,4 +1,4 @@
-import { test, expect, Page } from '@playwright/test';
+import { test, expect, Page } from './fixtures';
 import {
   navigateToApp, assertHealthy, pickComposeDestination, newThread,
   waitForVisibleInput, ensureOnThreadPane, blurActiveElement,
@@ -158,7 +158,7 @@ test.describe('Coding-agent control menu', () => {
 
     await sendMessage(page, `Say exactly: "codex ${msg}" and nothing else. Do not create any files.`);
     await expect.poll(() => sentBody?.coding_agent ?? null, { timeout: 5_000 }).toBe('codex');
-    expect(sentBody?.use_claude_code).toBe(true);
+    expect(sentBody?.use_coding_agent).toBe(true);
     expect(sentBody?.folder).toBeUndefined();
     expect(sentBody?.repo_id).toBeUndefined();
     if (!chatRequestFulfilled && typeof sentBody?.thread_id === 'string') {

@@ -970,6 +970,7 @@ impl EventBus {
             | ThreadEvent::AppUiCaptureRequested { .. }
             | ThreadEvent::NavigationRequested { .. }
             | ThreadEvent::CodingAgentThreadSpawned { .. }
+            | ThreadEvent::CodingAgentDiffChanged { .. }
             | ThreadEvent::ChildrenCountChanged { .. }
             | ThreadEvent::MissingHardeningDetected { .. }
             | ThreadEvent::CodingAgentSettingsChanged { .. }
@@ -983,6 +984,11 @@ impl EventBus {
             // section transition, no last_activity bump).
             | ThreadEvent::ImageUploaded { .. }
             | ThreadEvent::ContextCaptured { .. }
+            // User removed a queued prompt before ingestion. Pure marker:
+            // the original MessageReceived remains in history, and the
+            // renderer/agentic loop consult this row without changing the
+            // thread summary projection.
+            | ThreadEvent::QueuedMessageRemoved { .. }
             // Agent-driven dismissal of a prior tool result / child completion
             // from future resume context. Pure resume-helper input; no
             // projection state change.

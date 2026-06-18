@@ -1,8 +1,10 @@
 use super::*;
 
 use crate::core::{
-    AuthType, CredentialStore, ModelStore, OAuthStore, PinnedAppStore, PreferenceStore,
+    AuthType, CredentialStore, EnvironmentVariable, EnvironmentVariableStore, ModelStore,
+    OAuthStore, PinnedAppStore, PreferenceStore,
 };
+use crate::core::environment_variables::validate_name;
 use crate::engine::claude_code::{read_allowed_tools_file, write_allowed_tools_file};
 use crate::engine::command_permission::{
     read_agent_allowed_commands_file, write_agent_allowed_commands_file,
@@ -123,6 +125,18 @@ pub(super) async fn create_credential(
     Json(request): Json<CreateCredentialRequest>,
 ) -> Json<ApiResult> {
     let auth_type = AuthType::parse(&request.auth_type);
+    // Optional custom env var name — validated like a user env var (valid shape +
+    // not engine-reserved). Empty/whitespace → None (default CRED_<NAME>).
+    let env_var_name = request
+        .env_var_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(name) = env_var_name {
+        if let Err(rejection) = validate_name(name) {
+            return ApiResult::err(rejection.message(name));
+        }
+    }
     match CredentialStore::upsert(
         &state.pool,
         &request.service_name,
@@ -130,6 +144,7 @@ pub(super) async fn create_credential(
         auth_type,
         &request.auth_value,
         request.auth_header.as_deref(),
+        env_var_name,
     )
     .await
     {
@@ -194,6 +209,19 @@ pub(super) async fn update_credential(
         _ => request.base_url.clone(),
     };
 
+    // Optional custom env var name — validated; empty/whitespace clears it back
+    // to the default CRED_<NAME>.
+    let env_var_name = request
+        .env_var_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(name) = env_var_name {
+        if let Err(rejection) = validate_name(name) {
+            return ApiResult::err(rejection.message(name));
+        }
+    }
+
     match CredentialStore::update(
         &state.pool,
         &service,
@@ -201,6 +229,7 @@ pub(super) async fn update_credential(
         auth_type,
         request.auth_header.as_deref(),
         new_secret,
+        env_var_name,
     )
     .await
     {
@@ -321,13 +350,158 @@ pub(super) async fn delete_credential(
     }
 }
 
+// ===== Environment Variable Endpoints =====
+//
+// User-managed non-secret env vars (Settings → System → Environment variables).
+// Mirrors the credential CRUD shape, but the value IS broadcast in the
+// `EnvironmentVariableSet` event since these are deliberately not secret.
+
+#[derive(Serialize)]
+pub(super) struct EnvVarsListResponse {
+    env_vars: Vec<EnvironmentVariable>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct CreateEnvVarRequest {
+    name: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct UpdateEnvVarRequest {
+    value: String,
+}
+
+/// GET /api/v1/env-vars — list all user environment variables (name + value).
+pub(super) async fn list_env_vars(
+    State(state): State<AppState>,
+) -> Result<Json<EnvVarsListResponse>, (StatusCode, String)> {
+    let env_vars = EnvironmentVariableStore::list(&state.pool).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list environment variables: {}", e),
+        )
+    })?;
+    Ok(Json(EnvVarsListResponse { env_vars }))
+}
+
+/// POST /api/v1/env-vars — create (or replace) a variable. Validates the name
+/// shape and rejects engine-reserved names with 400.
+pub(super) async fn create_env_var(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateEnvVarRequest>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    if let Err(rejection) = validate_name(&request.name) {
+        return Err((StatusCode::BAD_REQUEST, rejection.message(&request.name)));
+    }
+    if let Err(e) =
+        EnvironmentVariableStore::upsert(&state.pool, &request.name, &request.value).await
+    {
+        return Ok(ApiResult::err(format!(
+            "Failed to save environment variable: {}",
+            e
+        )));
+    }
+    state
+        .engine
+        .event_bus
+        .emit_user_system(
+            &headers,
+            &state.pool,
+            "[Settings] EnvironmentVariableSet",
+            |actor| SystemEvent::EnvironmentVariableSet {
+                name: request.name.clone(),
+                value: request.value.clone(),
+                actor,
+            },
+        )
+        .await;
+    Ok(ApiResult::ok())
+}
+
+/// PUT /api/v1/env-vars?name=NAME — update an existing variable's value.
+pub(super) async fn update_env_var(
+    State(state): State<AppState>,
+    Query(query): Query<NameQuery>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateEnvVarRequest>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    // A stored name is already valid, but re-checking keeps the contract honest
+    // if an out-of-band row ever sneaks in.
+    if let Err(rejection) = validate_name(&query.name) {
+        return Err((StatusCode::BAD_REQUEST, rejection.message(&query.name)));
+    }
+    match EnvironmentVariableStore::update(&state.pool, &query.name, &request.value).await {
+        Ok(true) => {
+            state
+                .engine
+                .event_bus
+                .emit_user_system(
+                    &headers,
+                    &state.pool,
+                    "[Settings] EnvironmentVariableSet",
+                    |actor| SystemEvent::EnvironmentVariableSet {
+                        name: query.name.clone(),
+                        value: request.value.clone(),
+                        actor,
+                    },
+                )
+                .await;
+            Ok(ApiResult::ok())
+        }
+        Ok(false) => Ok(ApiResult::err(format!(
+            "Environment variable '{}' not found",
+            query.name
+        ))),
+        Err(e) => Ok(ApiResult::err(format!(
+            "Failed to update environment variable: {}",
+            e
+        ))),
+    }
+}
+
+/// DELETE /api/v1/env-vars?name=NAME — remove a variable.
+pub(super) async fn delete_env_var(
+    State(state): State<AppState>,
+    Query(query): Query<NameQuery>,
+    headers: HeaderMap,
+) -> Json<ApiResult> {
+    match EnvironmentVariableStore::delete(&state.pool, &query.name).await {
+        Ok(true) => {
+            state
+                .engine
+                .event_bus
+                .emit_user_system(
+                    &headers,
+                    &state.pool,
+                    "[Settings] EnvironmentVariableDeleted",
+                    |actor| SystemEvent::EnvironmentVariableDeleted {
+                        name: query.name.clone(),
+                        actor,
+                    },
+                )
+                .await;
+            ApiResult::ok()
+        }
+        Ok(false) => ApiResult::err(format!("Environment variable '{}' not found", query.name)),
+        Err(e) => ApiResult::err(format!("Failed to delete environment variable: {}", e)),
+    }
+}
+
 // ===== Model Registry Endpoints =====
 
 /// Provider values the registry accepts. Kept in lockstep with
 /// `crate::llm::model_registry::ProviderKind`.
 fn valid_provider(p: &str) -> bool {
-    matches!(p, "vertex" | "anthropic" | "openai")
+    matches!(
+        p,
+        "vertex" | "anthropic" | "openai" | "openrouter" | "local"
+    )
 }
+
+const PROVIDER_ERR: &str =
+    "Provider must be one of: vertex, anthropic, openai, openrouter, local";
 
 /// GET /api/v1/models — the full registry (enabled + disabled). The chat picker
 /// filters to `enabled`; the Settings → Models manager shows all.
@@ -358,7 +532,7 @@ pub(super) async fn create_model(
         return ApiResult::err("Model label cannot be empty");
     }
     if !valid_provider(&request.provider) {
-        return ApiResult::err("Provider must be one of: vertex, anthropic, openai");
+        return ApiResult::err(PROVIDER_ERR);
     }
     // User models sort after the builtins by default.
     let sort_order = request.sort_order.unwrap_or(1000);
@@ -406,7 +580,7 @@ pub(super) async fn update_model(
         let label = request.label.unwrap_or_else(|| existing.label.clone());
         let provider = request.provider.unwrap_or_else(|| existing.provider.clone());
         if !valid_provider(&provider) {
-            return ApiResult::err("Provider must be one of: vertex, anthropic, openai");
+            return ApiResult::err(PROVIDER_ERR);
         }
         let sort_order = request.sort_order.unwrap_or(existing.sort_order);
         let enabled = request.enabled.unwrap_or(existing.enabled);
@@ -1131,6 +1305,15 @@ pub(super) fn router() -> Router<AppState> {
         )
         .route("/credential-value", get(get_credential_value))
         .route("/email-account", get(get_email_account))
+        // User-managed non-secret environment variables
+        // (Settings → System → Environment variables).
+        .route(
+            "/env-vars",
+            get(list_env_vars)
+                .post(create_env_var)
+                .put(update_env_var)
+                .delete(delete_env_var),
+        )
         // Model registry — the DB-backed chat model list (Settings → Models).
         // Drives the Lucidos Agent picker + RoutingProvider provider selection.
         .route(
@@ -1303,5 +1486,23 @@ mod oauth_access_token_tests {
         }
 
         crate::test_support::teardown_test_db(&db_name).await;
+    }
+}
+
+#[cfg(test)]
+mod provider_validation_tests {
+    use super::*;
+
+    /// `valid_provider` must accept exactly the five `ProviderKind` values and
+    /// reject anything else — kept in lockstep with
+    /// `crate::llm::model_registry::ProviderKind`.
+    #[test]
+    fn valid_provider_accepts_known_and_rejects_unknown() {
+        for ok in ["vertex", "anthropic", "openai", "openrouter", "local"] {
+            assert!(valid_provider(ok), "{ok} must be accepted");
+        }
+        for bad in ["", "Vertex", "openai ", "ollama", "bogus"] {
+            assert!(!valid_provider(bad), "{bad:?} must be rejected");
+        }
     }
 }

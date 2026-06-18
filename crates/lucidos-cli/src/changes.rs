@@ -62,6 +62,7 @@ mod tests {
             root: PathBuf::from("/tmp/test-ws"),
             api_port: port,
             proto: "https".to_string(),
+            api_base_override: None,
         }
     }
 

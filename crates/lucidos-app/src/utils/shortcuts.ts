@@ -8,8 +8,8 @@ export type ShortcutId =
   | 'newThread'
   | 'closeThread'
   | 'searchEverywhere'
-  | 'previousThread'
-  | 'nextThread'
+  | 'historyBack'
+  | 'historyForward'
   | 'toggleThreadDrawer'
   | 'toggleThreadPane'
   | 'toggleContentPane'
@@ -50,11 +50,11 @@ export const SHORTCUT_DEFS: readonly ShortcutDef[] = [
   { id: 'newThread', label: 'New thread', category: 'Navigation', defaultBinding: B(true, true, false, 'o') },
   { id: 'closeThread', label: 'Close thread (cascade)', category: 'Navigation', defaultBinding: B(true, true, false, 'w') },
   { id: 'searchEverywhere', label: 'Search everywhere', category: 'Navigation', defaultBinding: B(true, true, false, 's') },
-  { id: 'previousThread', label: 'Previous thread', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowUp') },
-  { id: 'nextThread', label: 'Next thread', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowDown') },
-  { id: 'toggleThreadDrawer', label: 'Toggle thread drawer', category: 'Panes', defaultBinding: B(true, true, false, '1') },
-  { id: 'toggleThreadPane', label: 'Toggle thread pane', category: 'Panes', defaultBinding: B(true, true, false, '2') },
-  { id: 'toggleContentPane', label: 'Toggle content pane', category: 'Panes', defaultBinding: B(true, true, false, '3') },
+  { id: 'historyBack', label: 'Back (focused pane)', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowUp') },
+  { id: 'historyForward', label: 'Forward (focused pane)', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowDown') },
+  { id: 'toggleThreadDrawer', label: 'Show or hide thread drawer', category: 'Panes', defaultBinding: B(true, true, false, '1') },
+  { id: 'toggleThreadPane', label: 'Focus or hide thread pane', category: 'Panes', defaultBinding: B(true, true, false, '2') },
+  { id: 'toggleContentPane', label: 'Focus or hide content pane', category: 'Panes', defaultBinding: B(true, true, false, '3') },
   { id: 'narrowThreadPane', label: 'Narrow thread pane', category: 'Panes', defaultBinding: B(true, false, true, 'ArrowLeft') },
   { id: 'widenThreadPane', label: 'Widen thread pane', category: 'Panes', defaultBinding: B(true, false, true, 'ArrowRight') },
   { id: 'narrowThreadDrawer', label: 'Narrow thread drawer', category: 'Panes', defaultBinding: B(true, true, true, 'ArrowLeft') },

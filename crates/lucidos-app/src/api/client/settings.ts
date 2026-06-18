@@ -1,7 +1,7 @@
 import { API, json, text } from './_core';
 import { lucidos } from '@lucidos/sdk';
 import type { AuthType, EmailAccountInfo, Notification, OAuthAccountInfo } from '../../store/types';
-import type { ApiResult, CredentialsListResponse, DeviceInfo, MemoryEntriesResponse, MemorySourceResponse, MemoryStatsResponse, NotificationsResponse } from '../types';
+import type { ApiResult, CredentialsListResponse, DeviceInfo, EnvVarsListResponse, MemoryEntriesResponse, MemorySourceResponse, MemoryStatsResponse, NotificationsResponse } from '../types';
 
 // --- Notifications (SDK delegation) ---
 export function getNotifications(params?: {
@@ -34,11 +34,40 @@ export function createCredential(body: {
   base_url: string;
   auth_type: AuthType;
   auth_value: string;
+  /** Override the default `CRED_<NAME>` env var name. */
+  env_var_name?: string;
 }): Promise<ApiResult> {
   return json(`${API}/credentials`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+  });
+}
+
+// --- Environment variables (Settings → Environment Variables) ---
+export function listEnvVars(): Promise<EnvVarsListResponse> {
+  return json(`${API}/env-vars`);
+}
+
+export function createEnvVar(body: { name: string; value: string }): Promise<ApiResult> {
+  return json(`${API}/env-vars`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export function updateEnvVar(name: string, body: { value: string }): Promise<ApiResult> {
+  return json(`${API}/env-vars?name=${encodeURIComponent(name)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export function deleteEnvVarApi(name: string): Promise<ApiResult> {
+  return json(`${API}/env-vars?name=${encodeURIComponent(name)}`, {
+    method: 'DELETE',
   });
 }
 
@@ -61,6 +90,8 @@ export interface UpdateCredentialBody {
   auth_value?: string;
   /** Present only when editing an `email_password` credential. */
   email?: EmailAccountSettings;
+  /** Override the default `CRED_<NAME>` env var name. */
+  env_var_name?: string;
 }
 
 export function updateCredential(
@@ -317,66 +348,9 @@ export async function getBackupStatus(provider: string): Promise<BackupStatus> {
   return json(`${API}/backup/status?provider=${encodeURIComponent(provider)}`);
 }
 
-/** Authoritative restore state — mirrors the Rust `RestoreState` enum. The SAME
- *  shape arrives via the `Restore*` SSE events and from `getRestoreStatus()`, so
- *  a live stream and a page-reload refetch render identically. */
-export type RestoreState =
-  | { status: 'idle' }
-  | { status: 'running'; workspace_name: string; phase: string; progress: number; total: number }
-  | { status: 'completed'; workspace_name: string; workspace_path: string }
-  | { status: 'failed'; workspace_name: string; error: string };
-
-/** Kick off a restore. Returns 202 immediately — the restore runs detached on
- *  the engine and reports through `RestoreProgress`/`RestoreCompleted`/
- *  `RestoreFailed` SSE plus the refetchable `getRestoreStatus()`. Do NOT await
- *  this for the result; watch `restoreState` instead. */
-export async function restoreBackup(
-  provider: string,
-  backupId: string,
-  key: string,
-  workspaceName: string,
-): Promise<{ status: string }> {
-  return json(`${API}/backup/restore`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ provider, backup_id: backupId, key, workspace_name: workspaceName }),
-  });
-}
-
-/** The engine's current restore state, for reload re-attach. */
-export async function getRestoreStatus(): Promise<RestoreState> {
-  return json(`${API}/backup/restore-status`);
-}
-
-/** Drop a terminal (completed/failed) restore result so the banner clears and a
- *  reload agrees. Refused by the engine while a restore is still running. */
-export async function clearRestoreStatus(): Promise<void> {
-  await json(`${API}/backup/restore-status`, { method: 'DELETE' });
-}
-
-export interface ValidateNameResult {
-  valid: boolean;
-  reason?: string;
-}
-
-export async function validateWorkspaceName(name: string): Promise<ValidateNameResult> {
-  return json(`${API}/backup/validate-workspace-name?name=${encodeURIComponent(name)}`);
-}
-
-export interface StartWorkspaceResult {
-  url: string;
-  /** True only once the started workspace answered /health. The caller opens the
-   *  tab only when true, so it never opens a blank page against a booting engine. */
-  ready: boolean;
-}
-
-export async function startWorkspace(workspacePath: string): Promise<StartWorkspaceResult> {
-  return json(`${API}/backup/start-workspace`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ workspace_path: workspacePath }),
-  }, 120000);
-}
+// Restore lives in the workspace picker (gateway control plane), not here — see
+// `api/client/control.ts` (`restoreBackup` / `getRestoreStatus`). Settings keeps
+// only backup *creation* + scheduling.
 
 export interface BackupSchedule {
   schedule: string | null;

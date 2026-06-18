@@ -17,7 +17,7 @@ pub enum ThreadQueueKind {
     /// Chat sub-thread spawned by an agent (`run_thread` tool, agent-mode
     /// chat POSTs without Claude Code).
     SubThread,
-    /// Coding-agent thread spawned by an agent (`run_claude` tool, agent-mode
+    /// Coding-agent thread spawned by an agent (`run_coding_agent` tool, agent-mode
     /// chat POSTs with Claude Code).
     CodingAgent,
 }

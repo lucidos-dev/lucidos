@@ -24,6 +24,31 @@ export function isTouchSwipe(startX: number, startY: number, currentX: number, c
   return Math.hypot(currentX - startX, currentY - startY) > TOUCH_SWIPE_THRESHOLD_PX;
 }
 
+/** Where the tooltip's arrow should point. By default the tooltip anchors to the
+ *  *element's border* — horizontally centered, vertically at the top/bottom edge —
+ *  so it always sits fully OUTSIDE the element, pointing up (tooltip below) or down
+ *  (tooltip above) at it, no matter where the pointer entered and without drifting
+ *  as the pointer moves within it. This holds even for a TALL element such as a
+ *  wrapped-title thread drawer row: a height-based "follow the cursor" heuristic
+ *  used to flip any element over ~100px into pointer-tracking, which dropped the
+ *  tooltip *inside* the row and covered it.
+ *
+ *  Only elements that opt in via `data-tooltip-follow-cursor` (the full-height
+ *  split divider, where a border anchor would fling the tooltip to the far end of
+ *  the pane, away from the pointer) track the cursor instead. */
+export function computeTooltipAnchor(
+  rect: { left: number; width: number; top: number; bottom: number },
+  mouseX: number,
+  mouseY: number,
+  followCursor: boolean,
+): { anchorX: number; anchorTop: number; anchorBottom: number } {
+  return {
+    anchorX: followCursor ? mouseX : rect.left + rect.width / 2,
+    anchorTop: followCursor ? mouseY : rect.top,
+    anchorBottom: followCursor ? mouseY : rect.bottom,
+  };
+}
+
 /** Compute a new anchor point so the tooltip stays glued to the same spot on
  *  its target after the page (or any scroll container) has scrolled. The
  *  offset is captured at show-time relative to the target's top-left. */
@@ -34,12 +59,78 @@ export function reanchorToTarget(
   return { x: rect.left + offset.x, y: rect.top + offset.y };
 }
 
+/** Does this element carry tooltip content — plain `data-tooltip` text OR a
+ *  structured `data-tooltip-rows` grid? Both forms anchor the global system. */
+function hasTooltipContent(el: HTMLElement): boolean {
+  return el.hasAttribute('data-tooltip') || el.hasAttribute('data-tooltip-rows');
+}
+
 function shouldSuppress(target: HTMLElement): boolean {
+  // Structured-row tooltips never just repeat the visible row text, so the
+  // redundancy check (which only compares plain `data-tooltip`) never applies.
+  if (target.hasAttribute('data-tooltip-rows')) return false;
   const text = target.getAttribute('data-tooltip');
   if (!text) return false;
   const visible = target.textContent || '';
   const truncated = target.scrollWidth > target.clientWidth || target.scrollHeight > target.clientHeight;
   return isRedundantTooltip(visible, text, truncated);
+}
+
+/** A normalized structured-tooltip row: label, value, and an optional status
+ *  tone keyword that paints a leading dot in the value cell. */
+export interface ParsedTooltipRow {
+  label: string;
+  value: string;
+  tone?: string;
+}
+
+/** Parse a `data-tooltip-rows` JSON payload into normalized rows. Pure (no DOM)
+ *  so it's unit-testable; a malformed or non-array payload yields an empty list,
+ *  and the caller then renders nothing. */
+export function parseTooltipRows(rowsJson: string): ParsedTooltipRow[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rowsJson);
+  } catch {
+    // The payload is always this app's own `JSON.stringify(TooltipRow[])`, so a
+    // parse failure is a structurally-impossible programmer error, not a runtime
+    // condition the user could act on. Degrading to an empty tooltip is the
+    // correct (and only sensible) outcome — a hover-time error toast would be
+    // absurd UX — so we swallow it deliberately rather than surfacing it.
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  return parsed.map((r) => {
+    const row = r as { label?: unknown; value?: unknown; tone?: unknown };
+    return {
+      label: String(row.label ?? ''),
+      value: String(row.value ?? ''),
+      ...(typeof row.tone === 'string' ? { tone: row.tone } : {}),
+    };
+  });
+}
+
+/** Build the structured two-column label/value DOM rows for a `data-tooltip-rows`
+ *  tooltip, ready to mount into `#tooltip-text`. */
+function buildTooltipRows(rowsJson: string): HTMLElement[] {
+  return parseTooltipRows(rowsJson).map((r) => {
+    const row = document.createElement('div');
+    row.className = 'tt-row';
+    const label = document.createElement('span');
+    label.className = 'tt-label';
+    label.textContent = r.label;
+    const value = document.createElement('span');
+    value.className = 'tt-value';
+    if (r.tone) {
+      const dot = document.createElement('span');
+      dot.className = `tt-dot tt-dot-${r.tone}`;
+      value.appendChild(dot);
+    }
+    value.appendChild(document.createTextNode(r.value));
+    row.appendChild(label);
+    row.appendChild(value);
+    return row;
+  });
 }
 
 /**
@@ -83,12 +174,19 @@ export function useTooltip() {
 
     function position(target: HTMLElement, mouseX: number, mouseY: number) {
       ensureEl();
+      const rowsJson = target.getAttribute('data-tooltip-rows');
       const text = target.getAttribute('data-tooltip');
-      if (!text || !tipEl || !arrowEl || !titleEl || !textEl) return;
+      if ((!rowsJson && !text) || !tipEl || !arrowEl || !titleEl || !textEl) return;
 
       const title = target.getAttribute('data-tooltip-title') || '';
       titleEl.textContent = title;
-      textEl.textContent = text;
+      if (rowsJson !== null) {
+        textEl.classList.add('tooltip-rows');
+        textEl.replaceChildren(...buildTooltipRows(rowsJson));
+      } else {
+        textEl.classList.remove('tooltip-rows');
+        textEl.textContent = text;
+      }
 
       // Skip the show-time opacity dance if we're just re-positioning a
       // tooltip that's already on screen (e.g. mouse-move, scroll-follow):
@@ -104,10 +202,12 @@ export function useTooltip() {
       const targetRect = target.getBoundingClientRect();
       const gap = 8;
 
-      // For tall elements (like the split divider), position relative to
-      // the mouse cursor instead of the element's top/bottom edge.
-      const anchorTop = targetRect.height > 100 ? mouseY : targetRect.top;
-      const anchorBottom = targetRect.height > 100 ? mouseY : targetRect.bottom;
+      // Anchor to the element's border by default (so the tooltip always sits
+      // outside the element, even a tall wrapped-title drawer row); only elements
+      // that opt in via data-tooltip-follow-cursor (the split divider) track the
+      // pointer — see computeTooltipAnchor.
+      const followCursor = target.hasAttribute('data-tooltip-follow-cursor');
+      const { anchorX, anchorTop, anchorBottom } = computeTooltipAnchor(targetRect, mouseX, mouseY, followCursor);
 
       // Vertical: prefer above, fall back to below.
       // data-tooltip-below forces below (useful for elements at top of viewport).
@@ -126,16 +226,16 @@ export function useTooltip() {
         }
       }
 
-      // Horizontal: center on mouse, clamp to viewport
-      const left = clampToViewportX(mouseX - tipRect.width / 2, tipRect.width);
+      // Horizontal: center on the anchor, clamp to viewport.
+      const left = clampToViewportX(anchorX - tipRect.width / 2, tipRect.width);
 
       tipEl.style.top = `${top}px`;
       tipEl.style.left = `${left}px`;
       if (!wasVisible) tipEl.style.opacity = '1';
       tipEl.classList.toggle('above', above);
 
-      // Arrow: point at mouse X, clamped within tooltip bounds
-      const arrowX = Math.max(10, Math.min(mouseX - left, tipRect.width - 10));
+      // Arrow: point at the anchor X, clamped within tooltip bounds.
+      const arrowX = Math.max(10, Math.min(anchorX - left, tipRect.width - 10));
       arrowEl.style.left = `${arrowX}px`;
     }
 
@@ -156,7 +256,7 @@ export function useTooltip() {
     function findTarget(el: EventTarget | null): HTMLElement | null {
       let node = el as HTMLElement | null;
       while (node && node !== document.body) {
-        if (node.hasAttribute && node.hasAttribute('data-tooltip')) return node;
+        if (hasTooltipContent(node)) return node;
         node = node.parentElement;
       }
       return null;
@@ -170,7 +270,7 @@ export function useTooltip() {
       // cause phantom tooltips when drawers/overlays close.
       if (isTouchDevice) return;
       const target = findTarget(e.target);
-      if (!target || !target.getAttribute('data-tooltip')) {
+      if (!target || !hasTooltipContent(target)) {
         if (currentTarget) hide();
         return;
       }

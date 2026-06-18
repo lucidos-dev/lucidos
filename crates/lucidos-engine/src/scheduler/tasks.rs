@@ -13,6 +13,7 @@ mod tests {
         let valid = [
             "0 0 8 * * *",    // daily at 08:00
             "0 */30 * * * *", // every 30 minutes
+            crate::scheduler::plugin_updates::MARKETPLACE_UPDATE_CHECK_CRON,
             "0 0 22 * * 1-5", // weekdays at 22:00
             "0 0 0 1 * *",    // first of every month
             "0 0 8,20 * * *", // 08:00 and 20:00

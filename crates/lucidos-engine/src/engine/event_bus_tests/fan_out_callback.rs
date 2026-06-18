@@ -381,7 +381,7 @@ async fn test_fan_out_chat_children_all_report_back() {
     teardown_test_db(&db_name).await;
 }
 
-/// `relation: "top"` on `run_thread` / `run_claude` produces a top-thread:
+/// `relation: "top"` on `run_thread` / `run_coding_agent` produces a top-thread:
 /// the spawned thread carries `parent_thread_id = NULL` in its
 /// MessageReceived. `notify_parent_if_child` must early-return on the NULL
 /// projection lookup, so the fan-out callback channel must stay empty and
@@ -764,6 +764,205 @@ async fn test_cc_child_no_duplicate_callback_after_idle_then_session_ended() {
     .await;
 
     // Cleanup
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// ADR 0011, B1 (durability): a child completes, fires its in-memory
+/// `ParentCallback`, and the engine restarts before the listener consumes it —
+/// the wake is lost (the channel is recreated empty) but the
+/// `ChildThreadCompleted` is durably persisted on the parent. The boot-recovery
+/// sweep `refire_unprocessed_child_completions` must re-derive the lost wake from
+/// the persisted event and re-inject it, so the parent still resumes.
+#[tokio::test]
+async fn refire_reinjects_unprocessed_child_completion_after_restart() {
+    let (pool, db_name) = setup_test_db().await;
+
+    // --- before restart: bus1 with its own callback channel ---
+    let (bus1, mut rx1) = EventBus::new(pool.clone());
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+
+    // CC parent (top-level) + CC child spawned with parent_thread_id.
+    start_cc_session(&bus1, parent_id, "claude-code/parent", None).await;
+    bus1.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::MessageReceived {
+            text: "do subtask".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: Some(parent_id),
+            spawning_event_id: None,
+            mode: ActorMode::Agent,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+    emit_cc_session_started(&bus1, child_id).await;
+
+    // Child idles with changes → fires the live wake on rx1 + persists
+    // ChildThreadCompleted on the parent.
+    bus1.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::CodingAgentIdled {
+            has_changes: true,
+            is_external_repo: false,
+            requires_restart: false,
+            cc_session_id: None,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            reason: None,
+            worktree_path: None,
+            worktree_head_sha: None,
+            bg_bash_pending: false,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    // The live wake fired — then it's "lost" to the restart (we drain rx1 and
+    // drop the bus without the listener ever consuming it).
+    let mut live = vec![];
+    while let Ok(cb) = rx1.try_recv() {
+        live.push(cb);
+    }
+    assert_eq!(live.len(), 1, "the live wake must have fired before the restart");
+    let card_event_id = live[0].child_completed_event_id;
+    drop(rx1);
+    drop(bus1);
+
+    // --- after restart: fresh bus, empty channel (the wake is gone) ---
+    let (bus2, mut rx2) = EventBus::new(pool.clone());
+    let refired = bus2.refire_unprocessed_child_completions().await;
+    assert_eq!(
+        refired, 1,
+        "the boot sweep must re-fire exactly the one stranded wake"
+    );
+
+    let mut recovered = vec![];
+    while let Ok(cb) = rx2.try_recv() {
+        recovered.push(cb);
+    }
+    assert_eq!(
+        recovered.len(),
+        1,
+        "the re-fired wake must land on the fresh callback channel"
+    );
+    let cb = &recovered[0];
+    assert_eq!(cb.parent_thread_id, parent_id);
+    assert_eq!(cb.child_thread_id, child_id);
+    assert!(
+        cb.parent_is_coding_agent,
+        "parent is a CC thread — the re-fired wake must carry that so the resume routes correctly"
+    );
+    assert_eq!(
+        cb.child_completed_event_id, card_event_id,
+        "re-fired wake must anchor to the SAME persisted ChildThreadCompleted event"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// ADR 0011, B1 idempotency: a parent that already reacted to the completion
+/// (its resume emitted a later terminal event) must NOT be re-fired by the boot
+/// sweep — the `ChildThreadCompleted` is no longer the thread's latest event.
+/// Without this the sweep would re-resume a parent on every restart forever.
+#[tokio::test]
+async fn refire_skips_parent_that_already_resumed() {
+    let (pool, db_name) = setup_test_db().await;
+
+    let (bus1, mut rx1) = EventBus::new(pool.clone());
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+
+    start_cc_session(&bus1, parent_id, "claude-code/parent-resumed", None).await;
+    bus1.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::MessageReceived {
+            text: "do subtask".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: Some(parent_id),
+            spawning_event_id: None,
+            mode: ActorMode::Agent,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+    emit_cc_session_started(&bus1, child_id).await;
+    bus1.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::CodingAgentIdled {
+            has_changes: true,
+            is_external_repo: false,
+            requires_restart: false,
+            cc_session_id: None,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            reason: None,
+            worktree_path: None,
+            worktree_head_sha: None,
+            bg_bash_pending: false,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    // The parent RESUMED and idled — a terminal event on the parent AFTER the
+    // completion card. (The parent has no parent_thread_id, so this idle fires
+    // no further callback of its own.)
+    bus1.emit(BusEvent::Thread {
+        thread_id: parent_id,
+        event: ThreadEvent::CodingAgentIdled {
+            has_changes: false,
+            is_external_repo: false,
+            requires_restart: false,
+            cc_session_id: None,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            reason: None,
+            worktree_path: None,
+            worktree_head_sha: None,
+            bg_bash_pending: false,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    while rx1.try_recv().is_ok() {}
+    drop(rx1);
+    drop(bus1);
+
+    // Restart: the sweep must find nothing to do — the card is not the latest event.
+    let (bus2, mut rx2) = EventBus::new(pool.clone());
+    let refired = bus2.refire_unprocessed_child_completions().await;
+    assert_eq!(
+        refired, 0,
+        "a parent whose resume already emitted a later terminal must not be re-fired"
+    );
+    assert!(
+        rx2.try_recv().is_err(),
+        "no wake should land on the channel for an already-resumed parent"
+    );
+
     pool.close().await;
     teardown_test_db(&db_name).await;
 }

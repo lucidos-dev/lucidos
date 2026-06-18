@@ -108,6 +108,7 @@ fn thread_event_type_name_extraction() {
             ThreadEvent::ContinuationStarted {
                 branch: String::new(),
                 origin: None,
+                reason: None,
             },
             "ContinuationStarted",
         ),
@@ -332,6 +333,15 @@ fn transient_event_serializes() {
     let event2 = ThreadEvent::PreambleCompleted;
     let serialized2 = serde_json::to_value(&event2).unwrap();
     assert_eq!(serialized2["type"], "PreambleCompleted");
+
+    let event3 = ThreadEvent::CodingAgentDiffChanged { has_diff: true };
+    let serialized3 = serde_json::to_value(&event3).unwrap();
+    assert_eq!(serialized3["type"], "CodingAgentDiffChanged");
+    assert_eq!(serialized3["has_diff"], true);
+    assert!(
+        !event3.is_persisted(),
+        "CodingAgentDiffChanged is an SSE-only aggregate refresh"
+    );
 }
 
 /// Legacy persisted-row replay: any row that slipped into the events table
@@ -551,4 +561,3 @@ fn to_payload_removes_type_tag() {
     assert_eq!(payload3["text"], "answer");
     assert_eq!(payload3["images"][0], "img.png");
 }
-

@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { navigateToApp, assertHealthy } from './helpers';
 import {
   psql, git, WORKSPACE, cleanupCCThread, cleanupFileFromMain,
@@ -6,7 +6,7 @@ import {
 import { writeFileSync } from 'fs';
 import { resolve } from 'path';
 import { randomUUID } from 'crypto';
-import type { Page } from '@playwright/test';
+import type { Page } from './fixtures';
 
 /**
  * Verifies the WaitingBanner Diff button reacts to `coding_agent_has_diff` flips

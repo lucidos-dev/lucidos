@@ -7,8 +7,8 @@ use crate::engine::agent_session::prompts::{
 use crate::engine::agent_session::spawn::{resolve_branch_for_resume, BranchResolution};
 use crate::engine::claude_code::{WORKTREE_EXCLUDE_PATHS, WORKTREE_WORKSPACE_MARKER};
 use crate::engine::git_ops::{
-    add_paths_to_worktree_exclude, catchup_with_main, resolve_worktree_base, worktree_add,
-    worktree_current_branch,
+    add_paths_to_worktree_exclude, catchup_with_main, install_coding_agent_diff_hook,
+    resolve_worktree_base, worktree_add, worktree_current_branch,
 };
 use crate::engine::LucidosEngine;
 use std::path::PathBuf;
@@ -75,7 +75,7 @@ impl LucidosEngine {
         ) = if let Some((wt_path, branch)) = recovery_worktree {
             // Recovery mode: reuse an orphaned worktree from a previous session
             log!(
-                "[ClaudeCode] Starting recovery session on orphaned worktree: {} (branch {})",
+                "[AgentSession] Starting recovery session on orphaned worktree: {} (branch {})",
                 wt_path.display(),
                 branch
             );
@@ -149,22 +149,24 @@ impl LucidosEngine {
             }
 
             // Caller-supplied worktree path wins over branch-based lookup —
-            // see the `resume_worktree_path` parameter doc. The existence
-            // check guards downstream code that would otherwise treat a
-            // missing path as "existing worktree" and skip both the lookup
-            // and the create-worktree fallback.
-            let caller_worktree = resume_worktree_path
-                .as_ref()
-                .filter(|p| p.exists() && p.join(".git").exists())
-                .cloned();
+            // see the `resume_worktree_path` parameter doc. The validity check
+            // guards downstream code that would otherwise treat a missing or
+            // stranded path as "existing worktree" and skip both the lookup
+            // and the create-worktree fallback. `is_live_worktree_at` (not a
+            // bare `.git` existence test) ensures we never reuse a torn-down
+            // tree that git resolves to the enclosing data repo.
+            let caller_worktree = match resume_worktree_path.as_ref() {
+                Some(p) if crate::engine::git_ops::is_live_worktree_at(p).await => Some(p.clone()),
+                _ => None,
+            };
             if let Some(ref caller) = caller_worktree {
                 log!(
-                    "[ClaudeCode] Using caller-supplied worktree path for resume: {}",
+                    "[AgentSession] Using caller-supplied worktree path for resume: {}",
                     caller.display()
                 );
             } else if let Some(ref skipped) = resume_worktree_path {
                 log!(
-                    "[ClaudeCode] Caller-supplied worktree path {} no longer exists — falling back to branch lookup",
+                    "[AgentSession] Caller-supplied worktree path {} is missing or not a live linked worktree — falling back to branch lookup",
                     skipped.display()
                 );
             }
@@ -190,23 +192,30 @@ impl LucidosEngine {
                 .await
             };
 
-            // Treat the path as "existing" only if a real worktree (with a
-            // `.git` entry) lives there. If the recorded path no longer
-            // exists, fall through to the create branch below — calling
-            // `git worktree add` against an extinct location is fine; calling
-            // it against a stale directory would just error and surface to
-            // the user.
-            let existing_worktree = if resolved_path.exists()
-                && resolved_path.join(".git").exists()
-            {
-                Some(resolved_path.clone())
-            } else {
-                None
-            };
+            // Treat the path as "existing" only if a *live linked worktree*
+            // lives there — toplevel resolves to the path itself. A bare
+            // `.git`-exists test passes for a STRANDED tree (admin dir pruned
+            // by a cleanup that raced this resume, or a half-finished prior
+            // add), where git instead resolves upward to the enclosing data
+            // repo; reusing it would run Claude Code against that repo. If the
+            // recorded path is missing or stranded, fall through to the create
+            // branch below, which clears any dead residue first.
+            let existing_worktree =
+                if crate::engine::git_ops::is_live_worktree_at(&resolved_path).await {
+                    Some(resolved_path.clone())
+                } else {
+                    if resolved_path.exists() {
+                        log!(
+                            "[AgentSession] worktree path {} exists but is not a live linked worktree (stranded) — recreating instead of running against the enclosing repo",
+                            resolved_path.display()
+                        );
+                    }
+                    None
+                };
 
             let wt_path = if let Some(ref existing) = existing_worktree {
                 log!(
-                    "[ClaudeCode] Reusing existing worktree at {} for branch {}",
+                    "[AgentSession] Reusing existing worktree at {} for branch {}",
                     existing.display(),
                     branch_name
                 );
@@ -252,7 +261,7 @@ impl LucidosEngine {
                             match adopted {
                                 Some((new_branch, note)) => {
                                     log!(
-                                        "[ClaudeCode] Adopting renegade branch '{}' (was expecting '{}') for thread {}",
+                                        "[AgentSession] Adopting renegade branch '{}' (was expecting '{}') for thread {}",
                                         new_branch,
                                         branch_name,
                                         thread_id
@@ -262,12 +271,12 @@ impl LucidosEngine {
                                 }
                                 None => {
                                     log!(
-                                        "[ClaudeCode] Refusing spawn for thread {}: {}",
+                                        "[AgentSession] Refusing spawn for thread {}: {}",
                                         thread_id,
                                         mismatch
                                     );
                                     return Err(format!(
-                                        "Refusing to spawn Claude Code: {}",
+                                        "Refusing to spawn the coding agent: {}",
                                         mismatch
                                     )
                                     .into());
@@ -279,7 +288,7 @@ impl LucidosEngine {
                     match worktree_current_branch(existing).await {
                         Some(a) if a != branch_name => {
                             log!(
-                                "[ClaudeCode] Worktree {} is on branch {} (expected {}) — overriding",
+                                "[AgentSession] Worktree {} is on branch {} (expected {}) — overriding",
                                 wt_path.display(),
                                 a,
                                 branch_name
@@ -300,16 +309,28 @@ impl LucidosEngine {
             // changes". External repos keep the origin-or-HEAD contract.
             let worktree_base_branch = resolve_worktree_base(repo_root, is_external_repo).await;
 
-            // Create worktree if we're not reusing an existing one. If the
-            // deterministic path already exists ON DISK but git doesn't know
-            // about it (e.g. residue from an interrupted previous spawn), do
-            // NOT blow it away — we'd risk destroying user work. Surface the
-            // collision via the standard `git worktree add` error path so the
-            // caller can investigate. (The inverse residue — git still has the
-            // path registered but the directory is GONE — is auto-healed inside
-            // `worktree_add` via `git worktree prune`; that case has no user
-            // work to lose since the directory is already absent.)
+            // Create worktree if we're not reusing an existing one. A *stranded*
+            // directory may still occupy the target path — present on disk but
+            // not a live linked worktree (`existing_worktree` is None above):
+            // e.g. a Tier-0 cleanup that raced this resume, or a half-finished
+            // prior `git worktree add`. `git worktree add` would then fail with
+            // "already exists", and worse, leaving it in place is what let a
+            // resumed session run against the enclosing data repo. Clear the
+            // dead residue first so the spawn self-heals. This is safe precisely
+            // because `is_live_worktree_at` proved there is no live git state to
+            // lose — a worktree with real uncommitted work resolves as live and
+            // is reused upstream, never reaching here. Confined to the workspace
+            // worktrees dir as a blast-radius guard. (The inverse residue — git
+            // has the path registered but the directory is GONE — is auto-healed
+            // inside `worktree_add` via `git worktree prune`.)
             if existing_worktree.is_none() {
+                if wt_path.exists()
+                    && wt_path.starts_with(crate::engine::git_ops::worktrees_dir(
+                        self.workspace_path(),
+                    ))
+                {
+                    crate::engine::git_ops::clear_stranded_worktree_dir(repo_root, &wt_path).await;
+                }
                 if is_app_spawn {
                     // App spawn — sparse-checkout worktree narrowed to
                     // `data/apps/<id>/`. The standard `worktree_add` would
@@ -328,14 +349,14 @@ impl LucidosEngine {
                     )
                     .await
                     {
-                        log!("[ClaudeCode] Failed to create sparse app worktree: {}", e);
+                        log!("[AgentSession] Failed to create sparse app worktree: {}", e);
                         return Err(format!(
                             "Failed to create sparse-checkout app worktree: {e}"
                         )
                         .into());
                     }
                     log!(
-                        "[ClaudeCode] Created sparse app worktree at {} on branch {} (app={})",
+                        "[AgentSession] Created sparse app worktree at {} on branch {} (app={})",
                         wt_path.display(),
                         branch_name,
                         app_id
@@ -354,13 +375,13 @@ impl LucidosEngine {
                     Ok(o) if o.status.success() => {
                         if reusing_branch {
                             log!(
-                                "[ClaudeCode] Resumed worktree at {} on existing branch {}",
+                                "[AgentSession] Resumed worktree at {} on existing branch {}",
                                 wt_path.display(),
                                 branch_name
                             );
                         } else {
                             log!(
-                                "[ClaudeCode] Created worktree at {} on branch {}{}",
+                                "[AgentSession] Created worktree at {} on branch {}{}",
                                 wt_path.display(),
                                 branch_name,
                                 worktree_base_branch
@@ -372,17 +393,17 @@ impl LucidosEngine {
                     }
                     Ok(o) => {
                         let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                        log!("[ClaudeCode] Failed to create worktree: {}", stderr);
+                        log!("[AgentSession] Failed to create worktree: {}", stderr);
                         return Err(format!(
-                            "Failed to create git worktree for Claude Code isolation: {}",
+                            "Failed to create git worktree for coding-agent isolation: {}",
                             stderr
                         )
                         .into());
                     }
                     Err(e) => {
-                        log!("[ClaudeCode] Failed to run git worktree: {}", e);
+                        log!("[AgentSession] Failed to run git worktree: {}", e);
                         return Err(format!(
-                            "Failed to create git worktree for Claude Code isolation: {}",
+                            "Failed to create git worktree for coding-agent isolation: {}",
                             e
                         )
                         .into());
@@ -392,9 +413,60 @@ impl LucidosEngine {
             }
 
             log!(
-                "[ClaudeCode] [TIMING] worktree created: {:?}",
+                "[AgentSession] [TIMING] worktree created: {:?}",
                 cc_start.elapsed()
             );
+
+            // Belt-and-suspenders: the agent's cwd MUST exist before we spawn
+            // it. The branches above create a missing worktree
+            // (`existing_worktree` is None) or reuse a validated live one — but
+            // if the directory is STILL absent here (a reclaim or external
+            // removal that beat `is_live_worktree_at`, e.g. an auto-recovery
+            // resume firing right as the worktree was cleaned out from under a
+            // signal-killed session), spawning hands the agent a missing cwd
+            // and it dies with a cryptic `Path "<dir>" does not exist`
+            // ResponseFailed instead of recovering. Recreate from the branch
+            // one more time so the resume self-heals; only fail — with an
+            // actionable message — if even that cannot produce the directory.
+            if !wt_path.exists() {
+                log!(
+                    "[AgentSession] worktree {} still missing after setup — recreating from branch {} before spawn",
+                    wt_path.display(),
+                    branch_name
+                );
+                crate::engine::git_ops::clear_stranded_worktree_dir(repo_root, &wt_path).await;
+                let recreated = if is_app_spawn {
+                    match app_spawn_id.as_deref() {
+                        Some(app_id) => crate::engine::git_ops::create_sparse_app_worktree(
+                            repo_root,
+                            app_id,
+                            &branch_name,
+                            &wt_path,
+                        )
+                        .await
+                        .is_ok(),
+                        None => false,
+                    }
+                } else {
+                    matches!(
+                        worktree_add(repo_root, &wt_path, &[branch_name.as_str()]).await,
+                        Ok(o) if o.status.success()
+                    )
+                };
+                if !recreated || !wt_path.exists() {
+                    return Err(format!(
+                        "Coding-agent worktree {} is missing and could not be recreated from branch {} — resend the message to retry.",
+                        wt_path.display(),
+                        branch_name
+                    )
+                    .into());
+                }
+                log!(
+                    "[AgentSession] recreated missing worktree {} from branch {}",
+                    wt_path.display(),
+                    branch_name
+                );
+            }
 
             // Resumed/reused worktrees may be behind main. Catch them up so they
             // run the latest scripts/, configs, and source rather than stale
@@ -408,7 +480,7 @@ impl LucidosEngine {
             {
                 if let Err(e) = catchup_with_main(&wt_path).await {
                     log!(
-                        "[ClaudeCode] catchup_with_main failed for {} ({}) -- worktree is behind main; surfacing to the session instead of running stale",
+                        "[AgentSession] catchup_with_main failed for {} ({}) -- worktree is behind main; surfacing to the session instead of running stale",
                         wt_path.display(),
                         e
                     );
@@ -449,14 +521,14 @@ impl LucidosEngine {
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
                             Err(e) => {
                                 log!(
-                                    "[ClaudeCode] Skipping node_modules link — failed to clear stale dir: {}",
+                                    "[AgentSession] Skipping node_modules link — failed to clear stale dir: {}",
                                     e
                                 );
                                 false
                             }
                         };
                         if cleared {
-                            log!("[ClaudeCode] Linking node_modules to worktree...");
+                            log!("[AgentSession] Linking node_modules to worktree...");
                             // Try hardlinks first (instant, zero disk space).
                             // Falls back to full copy if hardlinks fail (e.g. cross-filesystem).
                             let hl = tokio::process::Command::new("cp")
@@ -469,7 +541,7 @@ impl LucidosEngine {
                                 .await;
                             let ok = matches!(&hl, Ok(o) if o.status.success());
                             if ok {
-                                log!("[ClaudeCode] node_modules hardlinked to worktree");
+                                log!("[AgentSession] node_modules hardlinked to worktree");
                             } else {
                                 match tokio::process::Command::new("cp")
                                     .args([
@@ -481,14 +553,14 @@ impl LucidosEngine {
                                     .await
                                 {
                                     Ok(o) if o.status.success() => {
-                                        log!("[ClaudeCode] node_modules copied to worktree");
+                                        log!("[AgentSession] node_modules copied to worktree");
                                     }
                                     Ok(o) => log!(
-                                        "[ClaudeCode] cp node_modules failed: {}",
+                                        "[AgentSession] cp node_modules failed: {}",
                                         String::from_utf8_lossy(&o.stderr).trim()
                                     ),
                                     Err(e) => {
-                                        log!("[ClaudeCode] Failed to copy node_modules: {}", e)
+                                        log!("[AgentSession] Failed to copy node_modules: {}", e)
                                     }
                                 }
                             }
@@ -497,7 +569,7 @@ impl LucidosEngine {
                         // npm ci wipes node_modules itself, so any stale Vite
                         // cache here is fine to leave.
                         log!(
-                            "[ClaudeCode] No node_modules in main repo to copy, running npm ci..."
+                            "[AgentSession] No node_modules in main repo to copy, running npm ci..."
                         );
                         match tokio::process::Command::new("npm")
                             .args(["ci", "--prefer-offline"])
@@ -506,20 +578,20 @@ impl LucidosEngine {
                             .await
                         {
                             Ok(o) if o.status.success() => {
-                                log!("[ClaudeCode] node_modules installed in worktree");
+                                log!("[AgentSession] node_modules installed in worktree");
                             }
                             Ok(o) => log!(
-                                "[ClaudeCode] npm ci failed in worktree: {}",
+                                "[AgentSession] npm ci failed in worktree: {}",
                                 String::from_utf8_lossy(&o.stderr).trim()
                             ),
-                            Err(e) => log!("[ClaudeCode] Failed to run npm ci in worktree: {}", e),
+                            Err(e) => log!("[AgentSession] Failed to run npm ci in worktree: {}", e),
                         }
                     }
                 }
             }
 
             log!(
-                "[ClaudeCode] [TIMING] node_modules setup done: {:?}",
+                "[AgentSession] [TIMING] node_modules setup done: {:?}",
                 cc_start.elapsed()
             );
 
@@ -535,7 +607,7 @@ impl LucidosEngine {
                 _ => ws_id,
             };
             if let Err(e) = tokio::fs::write(&marker, &marker_content).await {
-                log!("[ClaudeCode] Failed to write workspace marker: {}", e);
+                log!("[AgentSession] Failed to write workspace marker: {}", e);
             }
 
             // Add engine-injected paths to the worktree's git exclude so external
@@ -590,6 +662,17 @@ impl LucidosEngine {
                 branch_created,
             )
         };
+        if conflict_change.is_none() {
+            if let Some(ref wt_path) = worktree_path {
+                if let Err(e) = install_coding_agent_diff_hook(repo_root, wt_path).await {
+                    log!(
+                        "[AgentSession] Failed to install coding-agent diff hook for {}: {}",
+                        wt_path.display(),
+                        e
+                    );
+                }
+            }
+        }
         // Backend-specific teaching rides every prompt flavor (normal,
         // recovery, conflict, override) — a recovered or conflict-resolving
         // Codex session needs the CLI + question teaching just as much as a

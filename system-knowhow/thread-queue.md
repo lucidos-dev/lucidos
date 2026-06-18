@@ -1,6 +1,6 @@
 ---
 name: Thread Queue
-description: System-wide admission control for ALL thread work — the one shared capacity pool that gates every path that creates running work (event triggers, cron fires, the `run_thread` / `run_claude` LLM tools, agent/engine-mode `POST /chat/submit` that starts a new thread, AND user-initiated chat / user-typed coding-agent threads). Over capacity, work queues instead of running unbounded. User-initiated work is prioritized (drains first, ignores per-kind/per-trigger caps) but not exempt — it counts against the total and queues at true pool-max; `reserved_background` keeps it from starving triggers/cron. Documents what shares the pool, background vs. user-initiated mechanics, the capacity policy (total / per-kind / per-trigger caps, `reserved_background` floor, per-trigger queue ceiling with drop-oldest vs pause-trigger overflow, "0 means hold"), priority + FIFO ordering, the `thread_queue` projection (background only — user slots are in-memory) and restart/requeue semantics, the Thread Queue panel (Run now / Drop / edit policy), the backlog / at-capacity notifications, and the `/api/v1/thread-queue` HTTP surface. Load when the user asks why a trigger / spawn / chat is waiting, wants to change concurrency limits or capacity, mentions the Thread Queue panel, or is debugging back-pressure, queue draining, or restart re-queue behavior.
+description: System-wide admission control for ALL thread work — the one shared capacity pool that gates every path that creates running work (event triggers, cron fires, the `run_thread` / `run_coding_agent` LLM tools, agent/engine-mode `POST /chat/submit` that starts a new thread, AND user-initiated chat / user-typed coding-agent threads). Over capacity, work queues instead of running unbounded. User-initiated work is prioritized (drains first, ignores per-kind/per-trigger caps) but not exempt — it counts against the total and queues at true pool-max; `reserved_background` keeps it from starving triggers/cron. Documents what shares the pool, background vs. user-initiated mechanics, the capacity policy (total / per-kind / per-trigger caps, `reserved_background` floor, per-trigger queue ceiling with drop-oldest vs pause-trigger overflow, "0 means hold"), priority + FIFO ordering, the `thread_queue` projection (background only — user slots are in-memory) and restart/requeue semantics, the Thread Queue panel (Run now / Drop / edit policy), the backlog / at-capacity notifications, and the `/api/v1/thread-queue` HTTP surface. Load when the user asks why a trigger / spawn / chat is waiting, wants to change concurrency limits or capacity, mentions the Thread Queue panel, or is debugging back-pressure, queue draining, or restart re-queue behavior.
 ---
 
 # Thread Queue
@@ -24,8 +24,8 @@ priority can't starve triggers/cron.
 | An event trigger matching a domain/thread event | `event-trigger` | background — `submit` |
 | A trigger's cron schedule firing (incl. missed-grace catch-up) | `cron` | background — `submit` |
 | `run_thread` LLM tool (agent-driven sub-thread) | `sub-thread` | background — `submit` |
-| `run_claude` LLM tool (agent-driven coding-agent thread) | `coding-agent` | background — `submit` |
-| Agent/Engine-mode `POST /api/v1/chat/submit` that starts a NEW thread (cross-workspace task POSTs, `lucidos spawn-thread`) | `sub-thread` or `coding-agent`, by `use_claude_code` | background — `submit` |
+| `run_coding_agent` LLM tool (agent-driven coding-agent thread; `coding_agent` preserves Claude Code vs Codex) | `coding-agent` | background — `submit` |
+| Agent/Engine-mode `POST /api/v1/chat/submit` that starts a NEW thread (cross-workspace task POSTs, `lucidos spawn-thread`) | `sub-thread` or `coding-agent`, by `use_coding_agent`; `coding_agent` preserves Claude Code vs Codex for coding-agent rows | background — `submit` |
 | User-initiated chat / user-typed coding-agent threads (a person typing, any workspace; follow-ups on existing threads; child→parent callbacks) | `user-chat` | user — `acquire_user_slot` |
 
 NOT gated at all: mid-flight injections into an already-running thread (they feed
@@ -103,7 +103,9 @@ free slot to a waiting user — unless background is still below its reserved fl
 
 **Background** entries live in the `thread_queue` projection (event-sourced from
 `ThreadQueued` / `ThreadQueueAdmitted` / `ThreadQueueDropped` /
-`ThreadQueueCompleted`). On engine restart:
+`ThreadQueueCompleted`). Coding-agent requests persist the selected backend
+(`claude-code` default, `codex` when requested), so queue drain and restart
+requeue do not silently fall back to Claude Code. On engine restart:
 
 - `queued` entries are reloaded as-is.
 - `admitted` entries are work that died with the old process: trigger fires

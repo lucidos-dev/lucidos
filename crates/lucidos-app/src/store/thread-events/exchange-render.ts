@@ -743,22 +743,123 @@ export function isPendingFollowup(exchange: Exchange): boolean {
   return ev.type === 'MessageReceived' && !ev.created && !!ev._displayCreated;
 }
 
+/** A chat user message that has been accepted by the UI/server but not yet
+ *  ingested by the agentic loop. Optimistic messages have `_displayCreated`
+ *  and no `created`; persisted queued messages have `created`. Both stay
+ *  stepless until `UserPromptInjected` lands and is absorbed into the
+ *  exchange. */
+function isUningestedChatMessage(exchange: Exchange): boolean {
+  return exchange.userEvent.type === 'MessageReceived' && exchange.steps.length === 0;
+}
+
+function exchangeHasTerminalStep(exchange: Exchange): boolean {
+  return exchange.steps.some(({ event }) =>
+    event.type === 'ResponseGenerated'
+    || event.type === 'ResponseCanceled'
+    || event.type === 'ResponseAborted'
+    || event.type === 'ResponseFailed'
+    || event.type === 'CodingAgentIdled'
+    || event.type === 'SessionEnded'
+  );
+}
+
+/** Whether a non-queued exchange is a live/parked turn that can have chat
+ *  follow-ups queued behind it. Terminal lifecycle panels (change applied,
+ *  cancel/abort boundaries, etc.) deliberately return false so a new message
+ *  sent after idle becomes the active turn rather than a queued bubble. */
+function canQueueBehind(exchange: Exchange): boolean {
+  if (exchangeHasTerminalStep(exchange)) return false;
+  switch (exchange.userEvent.type) {
+    case 'MessageReceived':
+    case 'TriggerStarted':
+    case 'ContinuationStarted':
+    case 'UserQuestionAsked':
+    case 'CodingAgentPermissionRequest':
+    case 'CommandPermissionRequested':
+    case 'CredentialRequested':
+    case 'McpConsentRequested':
+    case 'ChildThreadCompleted':
+    case 'MissingHardeningDetected':
+    case 'MergeConflictDetected':
+      return true;
+    default:
+      return false;
+  }
+}
+
+export interface QueuedFollowupRun {
+  activeIndex: number;
+  queuedOrder: number[];
+  queuedIndices: Set<number>;
+}
+
+/** Locate the exchange that owns the active response plus queued follow-ups.
+ *  A question/permission divider can arrive after a queued MessageReceived but
+ *  before injection, so queued indices are tracked independently instead of
+ *  assuming one contiguous trailing run. CC/Codex are excluded because
+ *  follow-ups go straight to the subprocess stdin; only regular chat uses the
+ *  agentic-loop queue. */
+export function queuedFollowupRun(
+  exchanges: Exchange[],
+  threadBusy: boolean,
+  threadIsCC = false,
+): QueuedFollowupRun {
+  const empty: QueuedFollowupRun = {
+    activeIndex: exchanges.length - 1,
+    queuedOrder: [],
+    queuedIndices: new Set(),
+  };
+  if (!threadBusy || threadIsCC || exchanges.length === 0) return empty;
+
+  const candidates: number[] = [];
+  for (let i = 0; i < exchanges.length; i++) {
+    if (isUningestedChatMessage(exchanges[i])) candidates.push(i);
+  }
+  if (candidates.length === 0) return empty;
+
+  let activeIndex = -1;
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    if (isUningestedChatMessage(exchanges[i])) continue;
+    // Only the MOST RECENT settled/in-flight turn can own queued follow-ups,
+    // so stop at the first non-uningested exchange. If it can be queued behind
+    // (still streaming, or parked on a question) the follow-up queues behind
+    // it; if it's terminal the thread idled and the just-sent message IS the
+    // active turn. Walking PAST a terminal turn into older non-terminal ones —
+    // e.g. an answered `UserQuestionAsked` whose continuation flowed into the
+    // next question without ever producing a terminal step — wrongly rendered
+    // the fresh follow-up as "queued" up in history (real thread aa75ff37: the
+    // optimistic bubble blinked away from the bottom and reappeared in a Queued
+    // group above).
+    if (canQueueBehind(exchanges[i])) activeIndex = i;
+    break;
+  }
+  if (activeIndex === -1) activeIndex = candidates[0];
+
+  const queuedOrder = candidates.filter(i => i !== activeIndex);
+  if (queuedOrder.length === 0) {
+    return { ...empty, activeIndex };
+  }
+
+  const queuedIndices = new Set<number>(queuedOrder);
+
+  return {
+    activeIndex,
+    queuedOrder,
+    queuedIndices,
+  };
+}
+
 /** Index of the exchange the agent is actively working on — i.e. the one that
  *  owns the live stream and should read 'streaming'/'working', not the literal
  *  last exchange.
  *
- *  When the thread is busy, follow-ups typed while it worked are queued and
- *  appended AFTER the active turn (they sort last). So the active exchange is
- *  the last NON-pending one; the trailing pending exchanges are queued behind
- *  it. When the thread is idle, the literal last exchange is active (a
- *  freshly-sent message is about to be picked up — it must read 'Requesting',
- *  not 'Queued'). Returns `length - 1` for an empty/all-pending list. */
+ *  When the thread is busy, follow-ups typed while it worked are queued. The
+ *  active exchange is the live/parked non-queued turn when one exists;
+ *  otherwise it is the first stepless user message. When the thread is idle,
+ *  the literal last exchange is active (a freshly-sent message is about to be
+ *  picked up — it must read 'Requesting', not 'Queued'). */
 export function activeExchangeIndex(exchanges: Exchange[], threadBusy: boolean): number {
-  if (!threadBusy) return exchanges.length - 1;
-  for (let j = exchanges.length - 1; j >= 0; j--) {
-    if (!isPendingFollowup(exchanges[j])) return j;
-  }
-  return exchanges.length - 1;
+  return queuedFollowupRun(exchanges, threadBusy).activeIndex;
 }
 
 /** Derive ExchangeStatus for an exchange.
@@ -768,8 +869,19 @@ export function activeExchangeIndex(exchanges: Exchange[], threadBusy: boolean):
  *  @param threadIdle — true when CC is not producing output (see
  *         `isThreadQuiescent` in store.ts). When true and the exchange has no
  *         terminal event, the exchange was interrupted by an engine crash/lid
- *         close and should show as 'aborted', not 'streaming'. */
-export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLast: boolean, hasPriorActive?: boolean, threadIsCC?: boolean, threadIdle = false): ExchangeStatus {
+ *         close and should show as 'aborted', not 'streaming'.
+ *  @param threadAwaitingAnswer — true when the backend status is
+ *         `waiting_for_user_answer` (the thread is parked on, or resuming from,
+ *         a question / permission card). Such a thread is NEVER crashed, so the
+ *         stale-`'aborted'` detector below must not fire for it: a just-answered
+ *         question-divider whose resume `running` aggregate hasn't reached the
+ *         client yet would otherwise flash "Aborted" during the answer→resume
+ *         gap (the running status is set by `UserQuestionAnswered` /
+ *         `CodingAgentPermissionResolved` / `CommandPermissionResolved`, but the
+ *         client `meta.status` can briefly lag at `waiting_for_user_answer`).
+ *         A genuine crash settles to `idle`/`failed` — never
+ *         `waiting_for_user_answer` — so this never masks a real abort. */
+export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLast: boolean, hasPriorActive?: boolean, threadIsCC?: boolean, threadIdle = false, threadAwaitingAnswer = false): ExchangeStatus {
   let isComplete = false;
   let isCanceled = false;
   let isAborted = false;
@@ -930,6 +1042,24 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // injection routes new events back to the parent's request_event_id, so a
   // non-last exchange the loop is still actively processing has steps).
   if (!hasSteps && !isCC && (!isLast || threadIdle)) return 'done';
+  // A child-completion card is itself terminal — it renders the spawned
+  // sub-thread's result (success/failure/canceled). When the parent is
+  // QUIESCENT (idle, or parked on a question — both `threadIdle`) and never
+  // resumed to react (its in-memory wake was lost to a restart, or — real
+  // thread 276f5580 — its worktree was already gone), OR the card was
+  // superseded by a newer boundary (`!isLast`), the stepless card is terminal:
+  // return 'done' so it doesn't fall through to a phantom
+  // 'pending'/'coding-agent-working' spinner forever.
+  //
+  // But while the parent is still RUNNING and this is the last exchange, it is
+  // about to react to the completion — the WakeFromChild summary was injected
+  // into the live loop and its continuation now request-id-routes INTO this
+  // card (see the redirect-advance for ChildThreadCompleted in
+  // exchange-grouping.ts). Fall through to the normal pending/working machinery
+  // so the card shows a live "working" spinner during the gap before the first
+  // post-completion step, instead of a misleading "Done ✓" (real thread
+  // 4d193da8). Once steps arrive the spinner is driven by them as usual.
+  if (userEventType === 'ChildThreadCompleted' && !hasSteps && (threadIdle || !isLast)) return 'done';
   // CC exchanges are 'coding-agent-working' once they have steps, 'pending' before.
   if (isCC) return hasSteps ? 'coding-agent-working' : 'pending';
   if (streamingBuffer) return 'streaming';
@@ -945,7 +1075,16 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // ResponseAborted. Detect this BEFORE the streaming fallbacks so we show
   // "Aborted" instead of an eternal "Working" spinner.
   // hasSteps covers both tool calls AND TextStreamed events (both are in exchange.steps).
-  if (threadIdle && isLast && !isComplete && hasSteps) return 'aborted';
+  //
+  // EXCEPT when the thread is `waiting_for_user_answer` (threadAwaitingAnswer):
+  // a thread parked on / resuming from a question or permission card is never
+  // crashed. A just-answered question-divider (UserQuestionAnswered step, no
+  // terminal yet) whose resume `running` aggregate hasn't reached the client
+  // would otherwise flash "Aborted" during the answer→resume gap. The agent's
+  // continuation (and its terminal) is in flight; render it as working, not
+  // crashed. A genuine crash settles to `idle`/`failed`, never
+  // `waiting_for_user_answer`, so this can't mask a real abort.
+  if (threadIdle && !threadAwaitingAnswer && isLast && !isComplete && hasSteps) return 'aborted';
 
   // Persisted response text (TextStreamed events) without a completion event
   // means the response is still in progress — the streaming buffer was just

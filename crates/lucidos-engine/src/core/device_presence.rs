@@ -78,11 +78,21 @@ impl DevicePresenceStore {
     pub async fn candidates(
         pool: &PgPool,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        let cutoff = chrono::Utc::now() - PRESENCE_STALE_AFTER;
+        // Compute the staleness cutoff with the DATABASE clock, not the
+        // process clock: `record_visible` writes `visible_at = NOW()` (the DB's
+        // clock), so the comparison must use that same clock. Computing the
+        // cutoff from `chrono::Utc::now()` here would mix two clocks — a fresh
+        // row would look stale (or vice-versa) whenever the engine host and
+        // Postgres disagree on the time (Docker VM clock drift in tests; a
+        // separate DB host with NTP skew in production). `$1` is the
+        // `PRESENCE_STALE_AFTER` window in seconds, kept as the single source
+        // of truth for the threshold.
+        let stale_secs = PRESENCE_STALE_AFTER.num_seconds();
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT device_id FROM device_presence WHERE visible_at > $1",
+            "SELECT device_id FROM device_presence \
+             WHERE visible_at > NOW() - ($1::bigint * INTERVAL '1 second')",
         )
-        .bind(cutoff)
+        .bind(stale_secs)
         .fetch_all(pool)
         .await?;
         Ok(rows.into_iter().map(|(d,)| d).collect())

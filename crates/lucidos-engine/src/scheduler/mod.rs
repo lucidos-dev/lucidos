@@ -11,6 +11,7 @@
 //! - Fresh task data fetch on each execution
 
 pub mod notifications;
+pub(crate) mod plugin_updates;
 pub mod push;
 #[cfg(feature = "e2e-test-hooks")]
 pub mod push_test_log;
@@ -197,6 +198,28 @@ impl SchedulerManager {
         // is bounded (one SELECT plus one UPDATE per stale row).
         disable_push_on_stale_devices(self.engine.clone(), self.pool.clone(), STALE_DEVICE_DAYS)
             .await;
+
+        let engine_plugin_updates = self.engine.clone();
+        let pool_plugin_updates = self.pool.clone();
+        let plugin_update_job =
+            Job::new_async(MARKETPLACE_UPDATE_CHECK_CRON, move |_uuid, _lock| {
+                let engine = engine_plugin_updates.clone();
+                let pool = pool_plugin_updates.clone();
+                Box::pin(async move {
+                    run_plugin_marketplace_update_check(engine, pool).await;
+                })
+            })?;
+        self.scheduler.add(plugin_update_job).await?;
+        log!(
+            "[Scheduler] Registered system task: plugin_marketplace_update_check ({})",
+            MARKETPLACE_UPDATE_CHECK_CRON
+        );
+
+        let startup_engine = self.engine.clone();
+        let startup_pool = self.pool.clone();
+        tokio::spawn(async move {
+            run_plugin_marketplace_update_check(startup_engine, startup_pool).await;
+        });
 
         Ok(())
     }
@@ -934,6 +957,7 @@ pub(crate) fn handle_trigger_group_event(
 mod backup;
 use backup::run_scheduled_backup;
 pub(crate) use backup::{run_backup, BackupGuard};
+use plugin_updates::{run_plugin_marketplace_update_check, MARKETPLACE_UPDATE_CHECK_CRON};
 
 /// Flip `push_enabled` to false on every device whose `last_seen_at` is older
 /// than `cutoff_days`. Devices already disabled are filtered at the SELECT

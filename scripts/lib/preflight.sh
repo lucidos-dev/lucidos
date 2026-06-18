@@ -100,3 +100,18 @@ check_prereqs() {
         exit 1
     fi
 }
+
+# Tauri CLI (`cargo tauri`) — only tauri-dev.sh needs it, so it lives outside
+# check_prereqs (web-dev.sh shares that and must not force a CLI compile).
+# The installed binary is `cargo-tauri`, so detect that, not `tauri`. The repo
+# is on Tauri v2 (see crates/lucidos-app/Cargo.toml), so pin the CLI to the v2
+# major. Call after check_prereqs so cargo is guaranteed present.
+check_tauri_cli() {
+    if [[ "$OSTYPE" != "darwin"* ]]; then
+        command -v cargo-tauri >/dev/null 2>&1 || \
+            echo "Warning: 'cargo-tauri' not found — run: cargo install tauri-cli --version '^2.0' --locked" >&2
+        return 0
+    fi
+    _check_or_install cargo-tauri "Tauri v2 CLI (opens the desktop window)" \
+        "cargo install tauri-cli --version '^2.0' --locked" required
+}

@@ -1,6 +1,6 @@
 import { MODELS, REASONING_LEVELS } from '../models';
 import { chatModels } from '../store';
-import { ENGINE_LABEL, RESPONSE_CANCELED_SUMMARY, originMode, responseAbortedSummary } from './thread-event-types';
+import { ENGINE_LABEL, RESPONSE_CANCELED_SUMMARY, continuationStartedSummary, responseAbortedSummary } from './thread-event-types';
 import { CC_ACTIVITY_EVENTS } from './thread-meta';
 import type { ActorMode, SequencedEvent, StoredEvent, ThreadEvent, ThreadInitiator } from './thread-event-types';
 
@@ -26,6 +26,23 @@ export type Exchange = {
    *  captured 0 plus the field-level fingerprint covers those). */
   revision?: number;
 };
+
+/** Stable render key for an exchange — survives the optimistic→persisted swap.
+ *  An optimistic pending message renders as a synthetic exchange at a
+ *  MAX_SAFE_INTEGER `userSeq`; the persisted event that replaces it carries its
+ *  real (much smaller) DB seq. Keying the rendered `<ChatExchange>` by `userSeq`
+ *  would therefore change the key on the swap, remounting the DOM node — which
+ *  churns the auto-scroll observers and makes the just-sent follow-up visibly
+ *  disappear, then reappear once a later event re-snaps to the bottom. The
+ *  client `event_id` round-trips as the events-table primary key (see
+ *  `EventMeta.event_id`), so `userEvent._eventId` is identical across the swap
+ *  and is the right identity to key on. Fall back to a `seq:`-prefixed seq for
+ *  events without an id (legacy rows, synthetic boundaries); the prefix keeps a
+ *  fallback key from ever colliding with an `_eventId` value. */
+export function exchangeKey(exchange: Exchange): string {
+  const id = exchange.userEvent._eventId;
+  return id ? `id:${id}` : `seq:${exchange.userSeq}`;
+}
 
 /** The narrowed `UserQuestionAnswered` variant — exposed so call sites that
  *  walk an Exchange's steps can read the question's resolution (answer + actor)
@@ -84,16 +101,11 @@ export function exchangeUserMessage(exchange: Exchange): string {
     return ev.prompt || ev.trigger_name || '';
   }
   if (ev.type === 'ContinuationStarted') {
-    // Same event covers three triggers: real engine restart recovery,
-    // watchdog auto-recovery, and the user clicking Continue after a
-    // safety-net abort. `originMode` collapses the device/api-with-
-    // human-mode cases into 'human' — using it here (vs hand-checking
-    // `kind === 'device' || 'api'`) keeps the API-with-mode='engine'
-    // path on the engine-restart wording, which is what an engine-
-    // driven REST Continue actually is.
-    return originMode(ev.actor) === 'human'
-      ? 'Continued the response'
-      : 'Resumed after engine restart';
+    // One event covers three triggers; `continuationStartedSummary` reads
+    // `reason` first so an `auto_recovery_after_hang` resume (a local hang or
+    // stray signal-kill — NOT a restart) isn't mislabeled "Resumed after
+    // engine restart", then falls back to actor (human = clicked Continue).
+    return continuationStartedSummary(ev.reason, ev.actor);
   }
   if (ev.type === 'ResponseAborted') {
     return responseAbortedSummary(ev.actor, ev.cause);

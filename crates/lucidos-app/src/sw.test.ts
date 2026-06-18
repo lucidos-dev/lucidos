@@ -34,7 +34,7 @@ type FakeClient = {
 // `__LUCIDOS_BUILD_ID__` placeholder, flipping the SW's `IS_BUILT` gate true so
 // the navigation-shell cache (built mode only) is exercised. Omit it to test
 // the dev (un-stamped) behavior where the shell stays network-fresh.
-function loadSw(opts: { buildId?: string } = {}) {
+function loadSw(opts: { buildId?: string; scope?: string } = {}) {
   const source = opts.buildId
     ? swSource.replace(/__LUCIDOS_BUILD_ID__/g, opts.buildId)
     : swSource;
@@ -60,6 +60,9 @@ function loadSw(opts: { buildId?: string } = {}) {
   };
   const mockRegistration = {
     showNotification: vi.fn((_title: string, _opts: Record<string, unknown>) => Promise.resolve()),
+    // The SW derives SCOPE_PATH from registration.scope (ADR 0013 base-path
+    // awareness); root scope keeps the existing root-path assertions valid.
+    scope: opts.scope ?? 'https://example.com/',
   };
   const mockSelf = {
     addEventListener: (type: string, handler: (event: any) => void) => {
@@ -433,6 +436,39 @@ describe('Service Worker fetch handler — navigation shell (network-first)', ()
     const response = await event.respondWith.mock.calls[0][0];
     expect(sw.mockCache.put).not.toHaveBeenCalled();
     expect(response).toBe(bad);
+  });
+
+  it('built: navigate to a stopped/booting workspace shows the gateway 503 boot splash, NOT the cached shell (marker header present)', async () => {
+    const sw = loadSw({ buildId: STAMPED_BUILD });
+    const cached = new Response('<!doctype html>good shell');
+    sw.cacheStore.set('https://example.com/', cached);
+    const splash = new Response('<!doctype html>workspace starting…', {
+      status: 503,
+      headers: { 'x-lucidos-boot-splash': '1' },
+    });
+    sw.mockFetch.mockResolvedValue(splash);
+    const event = makeEvent('https://example.com/', 'GET', 'navigate');
+    sw.handlers.fetch(event);
+    const response = await event.respondWith.mock.calls[0][0];
+    expect(sw.mockCache.put).not.toHaveBeenCalled(); // never cache the 503
+    expect(response).toBe(splash); // splash wins over the stale cached shell
+  });
+
+  it('built: navigate gets any 503 as-is even WITHOUT the marker header (Apply-stale gateway omitting it)', async () => {
+    const sw = loadSw({ buildId: STAMPED_BUILD });
+    const cached = new Response('<!doctype html>good shell');
+    sw.cacheStore.set('https://example.com/', cached);
+    // A gateway predating the X-Lucidos-Boot-Splash marker still answers a
+    // stopped/booting workspace with a 503 splash; the engine is down either way,
+    // so the cached shell would just 503-storm. Key on the 503 status, not the
+    // header, so the splash shows against an older gateway too.
+    const splash = new Response('<!doctype html>workspace starting…', { status: 503 });
+    sw.mockFetch.mockResolvedValue(splash);
+    const event = makeEvent('https://example.com/', 'GET', 'navigate');
+    sw.handlers.fetch(event);
+    const response = await event.respondWith.mock.calls[0][0];
+    expect(sw.mockCache.put).not.toHaveBeenCalled();
+    expect(response).toBe(splash);
   });
 });
 
@@ -985,5 +1021,120 @@ describe('Service Worker notificationclick handler — deep-link routing', () =>
 
     expect(ev.notification.close).toHaveBeenCalledTimes(1);
   });
+
+  // Behind the workspace gateway several workspaces share one origin
+  // (/personal/, /dev/, …). A push for /personal is delivered to the /personal
+  // SW, but clients.matchAll({includeUncontrolled:true}) returns EVERY same-origin
+  // tab — including an open /dev tab. routeToDeepLink must only ever focus +
+  // postMessage a tab in ITS OWN scope, else the tap lands in the wrong
+  // workspace whose store has no such thread and "goes nowhere" (the reported
+  // bug). These lock the per-scope client selection.
+  const SCOPE_PERSONAL = 'https://example.com/personal/';
+
+  it('cross-workspace: a tab in a DIFFERENT scope is not focused/messaged — opens a new window in THIS scope', async () => {
+    const { handlers, matchAll, mockFetch, openWindow } = loadSw({ scope: SCOPE_PERSONAL });
+    mockFetch.mockResolvedValue(new Response('ok'));
+    // Only an out-of-scope /dev tab is open.
+    const devTab = topLevelClient('https://example.com/dev/');
+    matchAll.mockResolvedValue([devTab]);
+
+    const ev = makeClickEvent(threadData);
+    handlers.notificationclick(ev);
+    await Promise.all(ev._waited);
+
+    // The wrong-workspace tab is left alone — no hijack.
+    expect(devTab.postMessage).not.toHaveBeenCalled();
+    expect(devTab.focus).not.toHaveBeenCalled();
+    // Instead a window is opened at the engine-built deep link, resolved against
+    // THIS SW's scope (/personal/).
+    expect(openWindow).toHaveBeenCalledWith(
+      'https://example.com/personal/#notification=nid-thread&thread=tid-1&event=evt-7',
+    );
+  });
+
+  it('cross-workspace: posts the deep link only to the SAME-scope tab when both are open', async () => {
+    const { handlers, matchAll, mockFetch, openWindow } = loadSw({ scope: SCOPE_PERSONAL });
+    mockFetch.mockResolvedValue(new Response('ok'));
+    const devTab = topLevelClient('https://example.com/dev/');
+    const personalTab = topLevelClient('https://example.com/personal/');
+    // /dev listed first so an unfiltered find() would (wrongly) pick it.
+    matchAll.mockResolvedValue([devTab, personalTab]);
+
+    const ev = makeClickEvent(threadData);
+    handlers.notificationclick(ev);
+    await Promise.all(ev._waited);
+
+    expect(personalTab.postMessage).toHaveBeenCalledWith({ type: 'lucidos:deep-link', target: threadData });
+    expect(personalTab.focus).toHaveBeenCalledTimes(1);
+    expect(devTab.postMessage).not.toHaveBeenCalled();
+    expect(openWindow).not.toHaveBeenCalled();
+  });
+
+  it('marks read via the scoped notification/read endpoint (gateway scope prefix)', async () => {
+    const { handlers, matchAll, mockFetch } = loadSw({ scope: SCOPE_PERSONAL });
+    mockFetch.mockResolvedValue(new Response('ok'));
+    matchAll.mockResolvedValue([topLevelClient('https://example.com/personal/')]);
+
+    const ev = makeClickEvent(threadData);
+    handlers.notificationclick(ev);
+    await Promise.all(ev._waited);
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      'https://example.com/personal/api/v1/notification/read?id=nid-thread',
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
 });
 
+
+// ADR 0013: behind the workspace gateway the SW is registered at /ws/<id>/sw.js
+// with scope /ws/<id>/, so every same-origin path it matches or builds must be
+// resolved against that scope. These lock in the scope-relative behavior.
+describe('Service Worker base-path awareness (gateway scope)', () => {
+  const SCOPE = 'https://example.com/ws/work/';
+
+  it('intercepts /ws/<id>/api/v1 GETs (matched scope-relative)', () => {
+    const { handlers, mockFetch } = loadSw({ scope: SCOPE });
+    mockFetch.mockResolvedValue(new Response('ok'));
+    const ev = makeEvent('https://example.com/ws/work/api/v1/threads/list');
+    handlers.fetch(ev);
+    expect(ev.respondWith).toHaveBeenCalled();
+  });
+
+  it('does NOT intercept the scoped SSE stream', () => {
+    const { handlers } = loadSw({ scope: SCOPE });
+    const ev = makeEvent('https://example.com/ws/work/api/v1/events');
+    handlers.fetch(ev);
+    expect(ev.respondWith).not.toHaveBeenCalled();
+  });
+
+  it('cache-firsts scoped /assets bundles', () => {
+    const { handlers, mockFetch } = loadSw({ scope: SCOPE, buildId: 'abc123def456' });
+    mockFetch.mockResolvedValue(new Response('ok', { headers: { 'content-type': 'application/javascript' } }));
+    const ev = makeEvent('https://example.com/ws/work/assets/index-deadbeef.js');
+    handlers.fetch(ev);
+    expect(ev.respondWith).toHaveBeenCalled();
+  });
+
+  it('network-firsts the scoped navigation shell (/ws/<id>/)', () => {
+    const { handlers, mockFetch } = loadSw({ scope: SCOPE, buildId: 'abc123def456' });
+    mockFetch.mockResolvedValue(new Response('<html></html>', { headers: { 'content-type': 'text/html' } }));
+    // The scoped root resolves scope-relative to '/' → the SPA shell handler.
+    // (The browser only dispatches in-scope requests to a scoped SW, so an
+    // out-of-scope origin-root navigation never reaches this worker.)
+    const scopedNav = makeEvent('https://example.com/ws/work/', 'GET', 'navigate');
+    handlers.fetch(scopedNav);
+    expect(scopedNav.respondWith).toHaveBeenCalled();
+  });
+
+  it('renders push notifications with scope-prefixed icons', async () => {
+    const { handlers, mockRegistration } = loadSw({ scope: SCOPE });
+    await handlers.push({
+      data: { json: () => ({ web_push: 8030, notification: { title: 'T', body: 'B' } }) },
+      waitUntil: (p: Promise<unknown>) => p,
+    });
+    const opts = mockRegistration.showNotification.mock.calls[0][1] as Record<string, string>;
+    expect(opts.icon).toBe('/ws/work/favicon.svg');
+    expect(opts.navigate).toBe('https://example.com/ws/work/');
+  });
+});

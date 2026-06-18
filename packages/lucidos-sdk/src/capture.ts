@@ -81,24 +81,45 @@ export async function capture(): Promise<{ screenshot: string; dom: string }> {
   const vpW = Math.min(document.body.scrollWidth, 1024);
   const vpH = Math.min(window.innerHeight || 800, 1200);
 
-  const html2canvas = await loadHtml2Canvas();
-  const canvas = await html2canvas(document.body, {
-    scale: 1,
-    useCORS: true,
-    logging: false,
-    width: vpW,
-    height: vpH,
-    windowWidth: vpW,
-    windowHeight: vpH,
-    y: window.scrollY,
-  });
-  const screenshot = canvas.toDataURL('image/jpeg', 0.65).split(',')[1];
-
+  // Build the DOM snapshot FIRST, independently of html2canvas. html2canvas
+  // throws on CSS Color 4 functions (color(), oklab(), oklch(), color-mix())
+  // that modern stylesheets routinely use — and if it ran first and threw, the
+  // whole capture rejected, so the agent lost this textual layout too and went
+  // fully blind (it would then ship UI it couldn't see and claim it "renders
+  // fine"). This DOM walk only reads geometry + classes, so it can't fail on
+  // CSS the rasterizer can't parse — it's the reliable fallback.
   const foldY = vpH + 200;
   const state = { len: 0 };
-  const dom = serializeNode(document.body, 0, state, foldY);
+  const domSnapshot = serializeNode(document.body, 0, state, foldY);
   const truncated = state.len >= DOM_MAX
     ? `\n[DOM snapshot truncated at ~${Math.round(DOM_MAX / 1000)}KB]` : '';
+  const dom = domSnapshot + truncated;
 
-  return { screenshot, dom: dom + truncated };
+  // Screenshot is best-effort. On any failure (unsupported CSS color function,
+  // script load error) degrade to DOM-only: empty screenshot + a note, and
+  // resolve rather than reject. The engine's `format_capture_result` drops the
+  // image marker when the screenshot is empty and passes the DOM text through,
+  // so the agent still sees the rendered layout (element positions reveal
+  // overlaps/clipping) instead of just an error string.
+  try {
+    const html2canvas = await loadHtml2Canvas();
+    const canvas = await html2canvas(document.body, {
+      scale: 1,
+      useCORS: true,
+      logging: false,
+      width: vpW,
+      height: vpH,
+      windowWidth: vpW,
+      windowHeight: vpH,
+      y: window.scrollY,
+    });
+    const screenshot = canvas.toDataURL('image/jpeg', 0.65).split(',')[1];
+    return { screenshot, dom };
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return {
+      screenshot: '',
+      dom: `[screenshot unavailable: ${reason} — verify the layout from the DOM snapshot below, do not assume it renders correctly]\n${dom}`,
+    };
+  }
 }

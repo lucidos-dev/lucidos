@@ -323,6 +323,14 @@ pub struct AgentSession {
     /// AskUserQuestion, …) — legitimate silence, no fire from either
     /// watchdog.
     pub tools_in_flight: std::sync::Arc<std::sync::atomic::AtomicI32>,
+    /// Which coding-agent backend drives this session. Locked at session
+    /// creation. Read by the follow-up fast-path to decide how a mid-turn
+    /// follow-up is delivered: Claude Code steers the live turn via stdin, so
+    /// the message is forwarded as-is; Codex's app-server/exec protocols only
+    /// accept input at a turn boundary, so a mid-turn follow-up first
+    /// interrupts the running turn (see the Codex interrupt-and-redirect path
+    /// in `chat::process`).
+    pub coding_agent: crate::runtime::CodingAgent,
 }
 
 impl AgentSession {

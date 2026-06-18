@@ -22,7 +22,7 @@ export function SearchEverywhereButton({ showTooltip }: { showTooltip?: boolean 
         focusSearchInput,
       )}
       aria-label="Search everywhere"
-      data-tooltip={showTooltip ? tooltipWithShortcut('Search', 'searchEverywhere') : undefined}
+      data-tooltip={showTooltip ? tooltipWithShortcut('Search everywhere', 'searchEverywhere') : undefined}
     >
       <SearchIcon />
     </button>

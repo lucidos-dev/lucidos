@@ -347,6 +347,92 @@ async fn proposal_files_for_branch_rejects_no_commits() {
     );
 }
 
+/// Regression for real thread `bb9e68d6` ("Codex vs Claude Code for UI"): the
+/// branch's work was applied (merged into main), then the engine back-merged
+/// main *into* the branch at an earlier main tip (conflict recovery). That
+/// criss-cross leaves the branch with only a *merge* commit ahead of main and
+/// TWO merge bases, which regresses the three-dot `branch_changed_files` base to
+/// the original fork point — re-surfacing the already-applied file as a phantom
+/// diff. `has_branch_commits` (two-dot existence) is fooled by the merge commit,
+/// so the startup recovery sweep re-proposed the already-applied change as a new
+/// pending change (and `coding_agent_has_diff` reconciled to TRUE). A branch
+/// whose only commits ahead of main are merge commits has no authored work left
+/// to propose — `proposal_files_for_branch` must return `None`.
+#[tokio::test]
+async fn proposal_files_for_branch_rejects_already_applied_after_criss_cross_back_merge() {
+    let (_tmp, repo) = make_test_repo().await;
+
+    // The branch authors real work.
+    let _ = git_cmd(&["checkout", "-b", "claude-code/feature"], &repo).await;
+    tokio::fs::write(repo.join("work.rs"), "fn work() {}")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "branch authored work"], &repo).await;
+
+    // main advances independently.
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+    tokio::fs::write(repo.join("other.rs"), "fn other() {}")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "main independent work"], &repo).await;
+    let pre_apply_main =
+        String::from_utf8_lossy(&git_cmd(&["rev-parse", "HEAD"], &repo).await.unwrap().stdout)
+            .trim()
+            .to_string();
+
+    // Apply (main side): main merges the branch, so `work.rs` is now on main.
+    let _ = git_cmd(
+        &[
+            "merge",
+            "--no-ff",
+            "-m",
+            "apply: merge feature into main",
+            "claude-code/feature",
+        ],
+        &repo,
+    )
+    .await;
+
+    // Back-merge main's PRE-apply tip into the branch — the criss-cross that
+    // gives main and the branch two merge bases.
+    let _ = git_cmd(&["checkout", "claude-code/feature"], &repo).await;
+    let _ = git_cmd(
+        &[
+            "merge",
+            "--no-ff",
+            "-m",
+            "Merge branch 'main' into claude-code/feature",
+            &pre_apply_main,
+        ],
+        &repo,
+    )
+    .await;
+
+    // Precondition: a merge commit ahead of main fools the loose existence check.
+    assert!(
+        has_branch_commits(&repo, "claude-code/feature").await,
+        "precondition: the back-merge leaves a merge commit ahead of main"
+    );
+    // Precondition: the criss-cross regresses the three-dot base, so the
+    // already-applied file re-surfaces in `branch_changed_files`.
+    assert!(
+        !branch_changed_files(&repo, "claude-code/feature")
+            .await
+            .is_empty(),
+        "precondition: criss-cross regresses the 3-dot base, re-surfacing the applied file"
+    );
+
+    // But the branch has zero authored (non-merge) commits that aren't already
+    // in main, so it must NOT warrant a fresh Change proposal.
+    assert_eq!(
+        proposal_files_for_branch(&repo, "claude-code/feature").await,
+        None,
+        "already-applied branch with only a back-merge commit must not be re-proposed"
+    );
+}
+
 #[test]
 fn files_have_client_update_detects_frontend_files() {
     assert!(files_have_client_update(&["src/App.tsx".into()]));

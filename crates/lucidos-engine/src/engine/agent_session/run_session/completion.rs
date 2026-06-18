@@ -1,7 +1,8 @@
 use super::idle_snapshot::CodingAgentIdleSnapshot;
 use crate::engine::agent_session::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
 use crate::engine::agent_session::lifecycle::{
-    classify_session_end_action, should_auto_commit_on_cleanup, SessionEndAction, TerminalKind,
+    classify_session_end_action, conflict_resolution_cleanup_action,
+    should_auto_commit_on_cleanup, ConflictResolutionCleanupAction, SessionEndAction, TerminalKind,
 };
 use crate::engine::agent_session::resume::change_description_fallback;
 use crate::engine::change_ops::branch_is_hardened;
@@ -85,7 +86,7 @@ impl LucidosEngine {
         let engine_cancelled = agent_cancel.is_cancelled();
         if safety_net_fired {
             log!(
-                "[ClaudeCode] safety net firing for thread {} — buffered_text_len={}, watchdog_fired={}, killed_by_signal={}, engine_cancelled={}",
+                "[AgentSession] safety net firing for thread {} — buffered_text_len={}, watchdog_fired={}, killed_by_signal={}, engine_cancelled={}",
                 thread_id,
                 claude_text_buf.len(),
                 watchdog_fired,
@@ -113,7 +114,7 @@ impl LucidosEngine {
                     thread_id,
                     crate::engine::agent_recovery::AUTO_RECOVERY_AFTER_HANG_REASON,
                     meta.actor.clone(),
-                    "[ClaudeCode] safety-net ContinuationRequested (auto-recovery)",
+                    "[AgentSession] safety-net ContinuationRequested (auto-recovery)",
                 )
                 .await;
             }
@@ -129,7 +130,7 @@ impl LucidosEngine {
                     normalized_model.clone(),
                     cc_reasoning_effort.clone(),
                     emit_meta,
-                    "[ClaudeCode] safety-net ResponseAborted",
+                    "[AgentSession] safety-net ResponseAborted",
                 )
                 .await;
             }
@@ -150,7 +151,18 @@ impl LucidosEngine {
 
         // Auto-commit any uncommitted changes so they survive on disk.
         {
-            let is_shutdown = {
+            // Engine-global shutdown OR the per-session flag. `shutdown_agent_sessions`
+            // sets the per-session flag only on sessions present in `agent_sessions`
+            // when shutdown began — a session whose `spawn_or_resume` finished and
+            // inserted itself AFTER that pass (a slow ~30s `--resume` racing an Apply
+            // restart) keeps the flag `false`. Reading only the per-session flag then
+            // let finalize run full normal cleanup and `git branch -D` a still-resumable
+            // branch (the thread-9e37697e data-loss incident: a child's follow-up
+            // resumed during shutdown, its session was inserted after the flag pass, and
+            // its no-commit branch was reclaimed). `is_shutting_down()` is set first
+            // thing in every shutdown path, so OR-ing it closes the insert-after-the-pass
+            // race and preserves the worktree + branch for post-restart recovery.
+            let is_shutdown = self.is_shutting_down() || {
                 let guard = self.agent_sessions.lock().await;
                 guard
                     .get(&thread_id)
@@ -170,7 +182,7 @@ impl LucidosEngine {
                             wt,
                             &repo_root,
                             &branch_name,
-                            "Claude Code changes (auto-committed on shutdown)",
+                            "Coding agent changes (auto-committed on shutdown)",
                         )
                         .await;
                     }
@@ -214,11 +226,14 @@ impl LucidosEngine {
                 .as_deref()
                 .unwrap_or(&change.branch_name);
 
-            if has_unmerged {
+            if let ConflictResolutionCleanupAction::Abort { message } =
+                conflict_resolution_cleanup_action(has_unmerged, &last_terminal_kind)
+            {
                 let _ = git_cmd(&["merge", "--abort"], &cwd).await;
                 log!(
-                    "[AgentSession] Conflict resolution incomplete for {} — merge aborted in worktree",
-                    change.branch_name
+                    "[AgentSession] Conflict resolution not applied for {}: {}",
+                    change.branch_name,
+                    message
                 );
                 let _ = git_cmd(&["worktree", "remove", "--force", &wt_str], &repo_root).await;
                 let _ = git_cmd(&["branch", "-D", temp_branch], &repo_root).await;
@@ -231,7 +246,7 @@ impl LucidosEngine {
                 self.emit_apply_failed(
                     change.thread_id.unwrap_or(thread_id),
                     change.id,
-                    "Conflict resolution incomplete — merge aborted. The change is still pending; try applying again.",
+                    message,
                     apply_actor,
                 )
                 .await;
@@ -336,9 +351,9 @@ impl LucidosEngine {
             // abort, Failed, Canceled, Aborted, mid-turn user stop — leaves
             // worktree dirt uncommitted. See `should_auto_commit_on_cleanup`.
             if should_auto_commit_on_cleanup(should_discard, &last_terminal_kind) {
-                self.commit_dirty_logged("Claude Code changes", "Claude Code cleanup")
+                self.commit_dirty_logged("Coding agent changes", "coding agent cleanup")
                     .await;
-                auto_commit_preserving_marker(&self.pool, wt, &repo_root, &branch_name, "Claude Code changes (auto-committed)").await;
+                auto_commit_preserving_marker(&self.pool, wt, &repo_root, &branch_name, "Coding agent changes (auto-committed)").await;
             }
 
             if should_discard {
@@ -350,7 +365,7 @@ impl LucidosEngine {
                     .await
                     .unwrap_or_else(|e| {
                         log!(
-                            "[ClaudeCode] get_pending_by_branch({}): {} — skipping discard emit",
+                            "[AgentSession] get_pending_by_branch({}): {} — skipping discard emit",
                             branch_name,
                             e
                         );
@@ -368,7 +383,7 @@ impl LucidosEngine {
                                 },
                                 meta: meta.clone(),
                             },
-                            "[ClaudeCode] ChangeDiscarded (worktree cleanup)",
+                            "[AgentSession] ChangeDiscarded (worktree cleanup)",
                         )
                         .await;
                 }
@@ -378,10 +393,10 @@ impl LucidosEngine {
                 {
                     log!("[AgentSession] {}", e);
                 }
-                log!("[ClaudeCode] Discarding changes (branch {})", branch_name);
+                log!("[AgentSession] Discarding changes (branch {})", branch_name);
                 if let Err(e) = git_cmd(&["branch", "-D", &branch_name], &repo_root).await {
                     log!(
-                        "[ClaudeCode] Failed to delete branch {}: {}",
+                        "[AgentSession] Failed to delete branch {}: {}",
                         branch_name,
                         e
                     );
@@ -398,7 +413,7 @@ impl LucidosEngine {
                     // not if it ended up on the default branch (main/master) — otherwise
                     // the cleanup path could delete main.
                     if actual != &branch_name && actual != &base {
-                        log!("[ClaudeCode] Worktree is on branch '{}', tracked branch was '{}' — using actual branch",
+                        log!("[AgentSession] Worktree is on branch '{}', tracked branch was '{}' — using actual branch",
                             actual, branch_name);
                         actual.as_str()
                     } else {
@@ -446,19 +461,19 @@ impl LucidosEngine {
                 ) {
                     SessionEndAction::KeepExternalBranch => {
                         log!(
-                            "[ClaudeCode] External repo branch {} — keeping branch, no change proposed",
+                            "[AgentSession] External repo branch {} — keeping branch, no change proposed",
                             effective_branch
                         );
                     }
                     SessionEndAction::KeepCanceledBranch => {
                         log!(
-                            "[ClaudeCode] User cancelled (Esc) on branch {} — keeping branch resumable, no change proposed",
+                            "[AgentSession] User cancelled (Esc) on branch {} — keeping branch resumable, no change proposed",
                             effective_branch
                         );
                     }
                     SessionEndAction::CrashedKeepBranch => {
                         log!(
-                            "[ClaudeCode] Safety net fired with commits on {} — keeping branch on disk, NOT proposing change (thread ended in ResponseAborted)",
+                            "[AgentSession] Safety net fired with commits on {} — keeping branch on disk, NOT proposing change (thread ended in ResponseAborted)",
                             effective_branch
                         );
                     }
@@ -534,48 +549,34 @@ impl LucidosEngine {
                             }
                         }
                     }
-                    SessionEndAction::CleanupBranches => {
+                    SessionEndAction::KeepEmptyBranch => {
+                        // The session ended with no proposable diff (no commits, or
+                        // commits whose changes cancel out). The thread is still ALIVE
+                        // and resumable — the next message `--resume`s this branch via
+                        // its `cc_session_id`, and `recover_orphaned_worktrees` keys on
+                        // the branch ref to re-attach the session after a restart.
+                        //
+                        // Deleting the branch here — even with zero unique commits — is
+                        // the thread-9e37697e data-loss class: a dropped branch forces a
+                        // fresh branch from main and a dropped session id, discarding the
+                        // thread's conversation continuity. So KEEP the branch. An empty
+                        // branch is a cheap ref; the worktree_cleanup sweep reclaims
+                        // fully-merged branches once the thread is archived (or under
+                        // disk pressure). This mirrors `end_stale_waiting_session`'s
+                        // "keep empty branches" recovery stance. The explicit
+                        // Discard / conflict-resolution paths above are the only places
+                        // that legitimately `git branch -D` (the user asked, or it's a
+                        // throwaway merge temp branch).
                         if has_commits {
                             log!(
-                                "[AgentSession] Branch {} has commits but empty diff vs main — cleaning up without proposing",
+                                "[AgentSession] Branch {} has commits but empty diff vs main — keeping branch (session resumable), not proposing",
                                 effective_branch
                             );
-                        }
-                        // No real changes on the effective branch — clean up the tracked branch
-                        // if it's different (CC switched branches, original has no changes).
-                        // On DB error we keep the branch (safer than deleting work we
-                        // can't tell is still referenced).
-                        let pending_orig = self
-                            .changes()
-                            .has_pending_for_branch(&branch_name)
-                            .await
-                            .unwrap_or_else(|e| {
-                                log!(
-                                    "[AgentSession] has_pending_for_branch({}): {} — \
-                                     keeping branch defensively",
-                                    branch_name,
-                                    e
-                                );
-                                true
-                            });
-                        if effective_branch != branch_name && !pending_orig {
-                            let _ = git_cmd(&["branch", "-D", &branch_name], &repo_root).await;
-                        }
-                        let pending_eff = self
-                            .changes()
-                            .has_pending_for_branch(effective_branch)
-                            .await
-                            .unwrap_or_else(|e| {
-                                log!(
-                                    "[AgentSession] has_pending_for_branch({}): {} — \
-                                     keeping branch defensively",
-                                    effective_branch,
-                                    e
-                                );
-                                true
-                            });
-                        if !pending_eff {
-                            let _ = git_cmd(&["branch", "-D", effective_branch], &repo_root).await;
+                        } else {
+                            log!(
+                                "[AgentSession] Branch {} has no proposable diff — keeping branch (session resumable), not proposing",
+                                effective_branch
+                            );
                         }
                     }
                 }

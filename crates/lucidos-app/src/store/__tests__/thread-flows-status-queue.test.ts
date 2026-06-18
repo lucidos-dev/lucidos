@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { TS, getExchanges, getExchangesWithPending, getLabel, insertEvents, makeThread, nextSeq, resetSeqCounter } from './thread-flows-helpers';
-import { activeExchangeIndex, exchangeResponseEvents, exchangeResponseTimestamp, exchangeStatus, exchangeTimestamp, exchangeUserChannel, exchangeUserMessage, groupIntoExchanges, handleEvent, isPendingFollowup, type Exchange, type ThreadState } from '../thread-events';
+import { activeExchangeIndex, exchangeResponseEvents, exchangeResponseTimestamp, exchangeStatus, exchangeTimestamp, exchangeUserChannel, exchangeUserMessage, groupIntoExchanges, handleEvent, isPendingFollowup, queuedFollowupRun, type Exchange, type ThreadState } from '../thread-events';
 import { handleEventWithAgg } from './aggregate-test-helper';
 import { isActive, statusLabel } from '../exchange-status';
 import { effectiveThreadStatus } from '../store';
@@ -415,7 +415,7 @@ describe('Flow: Message queue — multiple pending messages', () => {
     expect(statusLabel(status1, false).label).toBe('Queued');
   });
 
-  it('superseded queued exchange shows "Done" instead of "Queued"', () => {
+  it('non-last queued exchange keeps the legacy done status fallback outside render', () => {
     const { map, id } = makeThread();
 
     // First exchange is active (streaming)
@@ -437,16 +437,16 @@ describe('Flow: Message queue — multiple pending messages', () => {
       steps: [],
     });
 
-    // Exchange 1 is NOT last (exchange 2 exists after it) → superseded.
-    // Even though hasPriorActive=true, it should NOT be 'queued' because it
-    // was superseded by a later message. It should be 'done' so that
-    // ChatExchange displays it as "Done ✓".
+    // exchangeStatus still only exposes one 'queued' exchange because the
+    // multi-message queued UI is now driven by renderExchanges' queuedRun.
+    // ChatExchange receives isQueued=true for this exchange in the renderer
+    // and suppresses the fallback response panel.
     const status1 = exchangeStatus(exchanges[1], '', false, true);
     expect(status1).not.toBe('queued');
     expect(status1).toBe('done');
     expect(statusLabel(status1, false).label).toBe('Done');
 
-    // Last queued exchange should still show 'queued'
+    // Last queued exchange still shows 'queued' through the legacy status path.
     const status2 = exchangeStatus(exchanges[2], '', true, true);
     expect(status2).toBe('queued');
     expect(statusLabel(status2, false).label).toBe('Queued');
@@ -469,7 +469,7 @@ describe('Flow: Message queue — multiple pending messages', () => {
     expect(thread.pendingUserMessages[0].eventId).toBe('msg-b');
   });
 
-  it('non-last superseded exchange returns done (displayed as "Done")', () => {
+  it('non-last queued exchange returns done through the status fallback', () => {
     const { map, id } = makeThread();
 
     // First exchange is active
@@ -479,7 +479,8 @@ describe('Flow: Message queue — multiple pending messages', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    // Two queued exchanges — exchange[1] is superseded by exchange[2]
+    // Two queued exchanges; renderExchanges marks both as queued, but the
+    // lower-level status fallback still only reports queued for the last one.
     exchanges.push({
       userEvent: { type: 'MessageReceived', text: 'Second' },
       userSeq: -1,
@@ -491,7 +492,7 @@ describe('Flow: Message queue — multiple pending messages', () => {
       steps: [],
     });
 
-    // Exchange[1] is not last (superseded) → 'done' (ChatExchange shows "Done ✓")
+    // Exchange[1] is not last → 'done' through exchangeStatus alone.
     const status1 = exchangeStatus(exchanges[1], '', false, true);
     expect(status1).toBe('done');
 
@@ -779,12 +780,117 @@ describe('Queued follow-ups behind an active turn', () => {
     expect(isPendingFollowup({ userEvent: { type: 'UserQuestionAsked', tool_use_id: 't', question: 'q' } as any, userSeq: 1, steps: [] })).toBe(false);
   });
 
-  it('activeExchangeIndex: last non-pending when busy, literal last when idle', () => {
+  it('activeExchangeIndex: active turn owns the stream while busy, literal last when idle', () => {
     const list = [real(), pend(1), pend(2)];
     expect(activeExchangeIndex(list, /* busy */ true)).toBe(0);  // the active turn
     expect(activeExchangeIndex(list, /* busy */ false)).toBe(2); // freshly-sent last
-    expect(activeExchangeIndex([real(), real()], true)).toBe(1); // all real → last
-    expect(activeExchangeIndex([pend(1), pend(2)], true)).toBe(1); // no active turn yet → last
+    expect(activeExchangeIndex([real(), real()], true)).toBe(0); // first stepless MR is in-flight
+    expect(activeExchangeIndex([pend(1), pend(2)], true)).toBe(0); // first optimistic MR is in-flight
+  });
+
+  it('queuedFollowupRun includes persisted MessageReceived follow-ups before injection', () => {
+    const active = {
+      userEvent: { type: 'MessageReceived', text: 'active', created: TS } as any,
+      userSeq: 1,
+      steps: [{ seq: 2, event: { type: 'TextStreamed', text: 'Working...', created: TS } as any }],
+    };
+    const persistedFollowup = {
+      userEvent: { type: 'MessageReceived', text: 'persisted follow-up', created: TS } as any,
+      userSeq: 3,
+      steps: [],
+    };
+
+    expect(isPendingFollowup(persistedFollowup)).toBe(false);
+    const run = queuedFollowupRun([active, persistedFollowup], /* busy */ true);
+    expect(run.activeIndex).toBe(0);
+    expect([...run.queuedIndices]).toEqual([1]);
+  });
+
+  it('queuedFollowupRun treats the first stepless message after a completed turn as active', () => {
+    const completed = {
+      userEvent: { type: 'MessageReceived', text: 'completed', created: TS } as any,
+      userSeq: 1,
+      steps: [{ seq: 2, event: { type: 'ResponseGenerated', created: TS } as any }],
+    };
+    const nextTurn = {
+      userEvent: { type: 'MessageReceived', text: 'next turn', created: TS } as any,
+      userSeq: 3,
+      steps: [],
+    };
+    const rapidFollowup = {
+      userEvent: { type: 'MessageReceived', text: 'queued behind next turn', created: TS } as any,
+      userSeq: 4,
+      steps: [],
+    };
+
+    const single = queuedFollowupRun([completed, nextTurn], /* busy */ true);
+    expect(single.activeIndex).toBe(1);
+    expect(single.queuedIndices.size).toBe(0);
+
+    const stacked = queuedFollowupRun([completed, nextTurn, rapidFollowup], /* busy */ true);
+    expect(stacked.activeIndex).toBe(1);
+    expect([...stacked.queuedIndices]).toEqual([2]);
+  });
+
+  it('queuedFollowupRun keeps persisted follow-ups queued when a question divider arrives after them', () => {
+    const active = {
+      userEvent: { type: 'MessageReceived', text: 'active', created: TS } as any,
+      userSeq: 1,
+      steps: [{ seq: 2, event: { type: 'TextStreamed', text: 'Working...', created: TS } as any }],
+    };
+    const queuedBeforeQuestion = {
+      userEvent: { type: 'MessageReceived', text: 'queued before question', created: TS } as any,
+      userSeq: 3,
+      steps: [],
+    };
+    const question = {
+      userEvent: {
+        type: 'UserQuestionAsked',
+        tool_use_id: 'q1',
+        cc_session_id: '',
+        question: 'Pick one',
+        options: [{ id: 'a', label: 'A' }],
+      } as any,
+      userSeq: 4,
+      steps: [],
+    };
+
+    const run = queuedFollowupRun([active, queuedBeforeQuestion, question], /* busy */ true);
+    expect(run.activeIndex).toBe(2);
+    expect([...run.queuedIndices]).toEqual([1]);
+  });
+
+  it('queuedFollowupRun releases a follow-up once UserPromptInjected is absorbed', () => {
+    const active = {
+      userEvent: { type: 'MessageReceived', text: 'active', created: TS } as any,
+      userSeq: 1,
+      steps: [{ seq: 2, event: { type: 'ResponseGenerated', created: TS } as any }],
+    };
+    const injectedFollowup = {
+      userEvent: { type: 'MessageReceived', text: 'injected follow-up', created: TS, _eventId: 'mr-2' } as any,
+      userSeq: 3,
+      steps: [{
+        seq: 4,
+        event: {
+          type: 'UserPromptInjected',
+          text: 'injected follow-up',
+          mode: 'human',
+          injected_message_id: 'mr-2',
+          created: TS,
+        } as any,
+      }],
+    };
+
+    const run = queuedFollowupRun([active, injectedFollowup], /* busy */ true);
+    expect(run.activeIndex).toBe(1);
+    expect(run.queuedIndices.size).toBe(0);
+  });
+
+  it('queuedFollowupRun leaves CC/Codex follow-ups unqueued', () => {
+    const list = [real(), pend(1), pend(2)];
+    const run = queuedFollowupRun(list, /* busy */ true, /* threadIsCC */ true);
+    expect(run.activeIndex).toBe(2);
+    expect(run.queuedIndices.size).toBe(0);
   });
 
   it('active streaming turn keeps the stream; stacked pending follow-ups are all queued', () => {

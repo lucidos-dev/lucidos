@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { navigateToApp, waitForVisibleInput, assertHealthy } from './helpers';
 
 test.describe('Prompt textarea resize', () => {

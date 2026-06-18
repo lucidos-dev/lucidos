@@ -32,6 +32,7 @@
 
 use async_trait::async_trait;
 use std::collections::VecDeque;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
@@ -40,8 +41,8 @@ use tokio_util::sync::CancellationToken;
 use super::agent_runtime::{
     AgentEvent, AgentInput, AgentRuntime, CodingAgent, ControlRequest, RunningAgent, SpawnArgs,
 };
-use super::claude_code::{format_exit_status, CcMenuOption};
-use super::codex_parse::{parse_codex_line, TurnTracker};
+use super::claude_code::{CcMenuOption, format_exit_status};
+use super::codex_parse::{TurnTracker, parse_codex_line};
 use super::lucidos_cli::{ensure_workspace_bin_symlink, lucidos_cli_dir};
 use super::spawn_env::{apply_lucidos_env, drain_stderr};
 
@@ -292,8 +293,9 @@ fn build_codex_turn_command(
     // Worktree-scoped writes, like CC's acceptEdits-in-cwd. Network stays on:
     // coding tasks need cargo/npm fetches, same as a CC session would run.
     cmd.arg("--sandbox").arg("workspace-write");
-    cmd.arg("-c").arg("sandbox_workspace_write.network_access=true");
-    for flag in lucidos_mcp_server_config_overrides() {
+    cmd.arg("-c")
+        .arg("sandbox_workspace_write.network_access=true");
+    for flag in lucidos_mcp_server_config_overrides(&config.env) {
         cmd.arg("-c").arg(flag);
     }
     if let Some(git_dir) = &config.git_common_dir {
@@ -304,7 +306,8 @@ fn build_codex_turn_command(
         cmd.arg("-m").arg(m);
     }
     if let Some(e) = effort.filter(|e| !e.is_empty()) {
-        cmd.arg("-c").arg(format!("model_reasoning_effort=\"{}\"", e));
+        cmd.arg("-c")
+            .arg(format!("model_reasoning_effort=\"{}\"", e));
     }
     for img in image_paths {
         cmd.arg("-i").arg(img);
@@ -334,22 +337,26 @@ fn build_codex_turn_command(
 
 /// `-c key=value` overrides wiring the lucidos MCP server into the exec
 /// driver's per-turn CLI invocation. Derived mechanically from
-/// [`lucidos_mcp_server_config_json`] — TOML inline values for these types
-/// are JSON-identical, so the two protocols structurally cannot drift.
+/// [`lucidos_mcp_server_config_json`] — one source of truth rendered as JSON
+/// for app-server and as TOML-compatible `-c` values for exec.
 ///
-/// Keys verified against codex-cli 0.139.0 (`codex mcp list -c …` accepts
-/// all four; unknown keys would fail config parse and kill the session).
-pub(super) fn lucidos_mcp_server_config_overrides() -> Vec<String> {
-    let config = lucidos_mcp_server_config_json();
+/// Keys verified against codex-cli 0.141.0 (`codex mcp list -c …` accepts
+/// this shape; unknown keys would fail config parse and kill the session).
+pub(super) fn lucidos_mcp_server_config_overrides(
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Vec<String> {
+    let config = lucidos_mcp_server_config_json(env);
     let map = config
         .as_object()
         .expect("lucidos MCP server config is an object");
     map.iter()
         .map(|(key, value)| {
-            format!(
-                "mcp_servers.lucidos.{key}={}",
+            let value = if key == "env" {
+                render_toml_inline_table(value)
+            } else {
                 serde_json::to_string(value).expect("config value serializes")
-            )
+            };
+            format!("mcp_servers.lucidos.{key}={value}")
         })
         .collect()
 }
@@ -371,18 +378,86 @@ pub const CODEX_ASK_USER_QUESTION_TOOL: &str = "mcp__lucidos__ask_user_question"
 /// - `enabled_tools` hides the CC-only `approve` permission tool — without it
 ///   Codex would advertise `mcp__lucidos__approve` to the model as an
 ///   ordinary callable tool.
+/// - `tools.ask_user_question.approval_mode = "approve"` trusts that ONE MCP
+///   tool so non-interactive Codex sessions don't auto-cancel it as an
+///   unapproved MCP call before the Lucidos QuestionCard endpoint can run.
 /// - `tool_timeout_sec` lifts codex's default per-tool cap to 24h (the codex
 ///   analog of CC's `MCP_TIMEOUT` env pair) — the user may take hours to
 ///   answer; a timeout would error the tool call and make the model re-ask.
+/// - `env` explicitly forwards the small Lucidos contract the MCP child needs
+///   (`LUCIDOS_WORKSPACE`, `LUCIDOS_THREAD_ID`, optional loopback base URL).
+///   Codex does not inherit the app-server/exec process env into stdio MCP
+///   children, so without this the server exits before `initialize` and the
+///   model sees no `ask_user_question` tool.
 /// - `command` is the bare binary name: `apply_lucidos_env` prepends the
-///   bundled CLI dir to `PATH`, which codex's MCP child inherits.
-pub(super) fn lucidos_mcp_server_config_json() -> serde_json::Value {
-    serde_json::json!({
-        "command": "lucidos",
-        "args": ["mcp-permission-server"],
-        "enabled_tools": ["ask_user_question"],
-        "tool_timeout_sec": 86400,
-    })
+///   bundled CLI dir to `PATH`, which codex itself uses to find the command.
+pub(super) fn lucidos_mcp_server_config_json(
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("command".to_string(), "lucidos".into());
+    obj.insert(
+        "args".to_string(),
+        serde_json::json!(["mcp-permission-server"]),
+    );
+    let mcp_env = lucidos_mcp_child_env(env);
+    if !mcp_env.is_empty() {
+        obj.insert("env".to_string(), serde_json::Value::Object(mcp_env));
+    }
+    obj.insert(
+        "enabled_tools".to_string(),
+        serde_json::json!(["ask_user_question"]),
+    );
+    obj.insert(
+        "tools".to_string(),
+        serde_json::json!({
+            "ask_user_question": {
+                "approval_mode": "approve",
+            },
+        }),
+    );
+    obj.insert("tool_timeout_sec".to_string(), 86400.into());
+    serde_json::Value::Object(obj)
+}
+
+const LUCIDOS_MCP_CHILD_ENV_KEYS: &[&str] = &[
+    "LUCIDOS_WORKSPACE",
+    "LUCIDOS_THREAD_ID",
+    "LUCIDOS_API_BASE_URL",
+];
+
+fn lucidos_mcp_child_env(
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for key in LUCIDOS_MCP_CHILD_ENV_KEYS {
+        let Some((_, value)) = env.iter().find(|(k, _)| k == OsStr::new(key)) else {
+            continue;
+        };
+        let Some(value) = value.to_str().filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        out.insert((*key).to_string(), value.into());
+    }
+    out
+}
+
+fn render_toml_inline_table(value: &serde_json::Value) -> String {
+    let Some(map) = value.as_object() else {
+        return "{}".to_string();
+    };
+    let pairs = LUCIDOS_MCP_CHILD_ENV_KEYS
+        .iter()
+        .filter_map(|key| {
+            map.get(*key).and_then(|value| value.as_str()).map(|value| {
+                format!(
+                    "{key} = {}",
+                    serde_json::to_string(value).expect("env value serializes")
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    format!("{{ {} }}", pairs.join(", "))
 }
 
 /// Which protocol drives a Codex session. Selected per spawn from
@@ -729,8 +804,7 @@ async fn run_turn(
             line_buf.clear();
         }
         // stdout EOF — drain whatever the OS still buffers, then wait.
-        let drain_deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
         loop {
             match tokio::time::timeout_at(drain_deadline, stdout_reader.read_line(&mut line_buf))
                 .await
@@ -763,7 +837,9 @@ async fn run_turn(
     }
     log!(
         "[Codex] turn child exited (pid={} status={})",
-        child_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string()),
+        child_pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "?".to_string()),
         format_exit_status(&wait_result),
     );
 
@@ -800,7 +876,10 @@ async fn run_turn(
                 (!t.is_empty()).then(|| t.to_string())
             })
             .unwrap_or_else(|| {
-                format!("codex exited unexpectedly ({})", format_exit_status(&wait_result))
+                format!(
+                    "codex exited unexpectedly ({})",
+                    format_exit_status(&wait_result)
+                )
             });
         let _ = events_tx.send(AgentEvent::Result {
             text: tracker.turn_text(),

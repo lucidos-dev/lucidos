@@ -1,9 +1,19 @@
 import { execSync } from 'child_process';
-import { mkdirSync, writeFileSync, rmSync } from 'fs';
+import { mkdirSync, writeFileSync, rmSync, realpathSync } from 'fs';
 import { resolve } from 'path';
 import { randomUUID } from 'crypto';
 
 export const WORKSPACE = resolve(process.env.E2E_WORKSPACE ?? `${process.env.HOME}/workspaces/e2e-test`);
+
+/**
+ * Canonical (symlink-resolved) workspace path, matching the engine's
+ * `canonical_repo_root` (Rust `Path::canonicalize`). The implementation-plan
+ * floor and the `planned_branches` / `hardened_branches` markers key on this
+ * form, so a seeded marker row must use it to be found at Apply time.
+ */
+export const WORKSPACE_CANONICAL = (() => {
+  try { return realpathSync(WORKSPACE); } catch { return WORKSPACE; }
+})();
 
 export function git(args: string[]): string {
   const quoted = args.map(a => a.includes(' ') ? `"${a}"` : a).join(' ');
@@ -13,11 +23,16 @@ export function git(args: string[]): string {
 let cachedDbPort: string | null = null;
 export function getDbPort(): string {
   if (cachedDbPort) return cachedDbPort;
-  const cksum = execSync(`printf '%s' '${WORKSPACE}' | cksum | cut -d' ' -f1`, { encoding: 'utf-8' }).trim();
-  const container = `lucidos-pg-${cksum}`;
+  const container = process.env.LUCIDOS_SHARED_PG_CONTAINER ?? 'lucidos-pg-shared';
   const portLine = execSync(`docker port ${container} 5432`, { encoding: 'utf-8' }).trim();
   cachedDbPort = portLine.split(':').pop()!;
   return cachedDbPort;
+}
+
+export function getDbName(): string {
+  const basename = WORKSPACE.split(/[\\/]/).filter(Boolean).pop() ?? 'workspace';
+  const slug = basename.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'workspace';
+  return `lucidos_${slug}`;
 }
 
 /** Wipe drawer state between tests in the same Playwright project. The DB
@@ -52,7 +67,7 @@ export function clearNotifications(): void {
 export function psql(sql: string): string {
   const dbPort = getDbPort();
   return execSync(
-    `psql "postgres://lucidos:lucidos@localhost:${dbPort}/lucidos" -t`,
+    `psql "postgres://lucidos:lucidos@localhost:${dbPort}/${getDbName()}" -t`,
     { encoding: 'utf-8', input: sql },
   ).trim();
 }
@@ -119,6 +134,10 @@ export function createCCThreadWithChange(titlePrefix: string, suffix: string, op
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${respEventId}', 'ResponseGenerated', '{"text":"Done.","images":[]}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${idleEventId}', 'CodingAgentIdled', '{"has_changes":true,"is_external_repo":false,"requires_restart":${requiresRestart}}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     `INSERT INTO changes (id, request_id, branch_name, repo_root, description, file_count, files, requires_restart, hardened, thread_id) VALUES ('${changeId}', '${requestId}', '${branch}', '${WORKSPACE}', '${titlePrefix} change ${suffix}', 1, ARRAY['${file}'], ${requiresRestart}, true, '${threadId}')`,
+    // The Apply floor (Lucidos-source changes) requires a Planned marker. A
+    // real CC session would set it; this direct seed mirrors that, keyed on the
+    // canonical repo_root the engine looks the marker up by.
+    `INSERT INTO planned_branches (repo_root, branch_name, state, head_sha) VALUES ('${WORKSPACE_CANONICAL}', '${branch}', 'acknowledged_simple', 'seeded') ON CONFLICT (repo_root, branch_name) DO NOTHING`,
   ].join(';\n'));
 
   return { threadId, changeId, branch, file };
@@ -130,6 +149,7 @@ export function cleanupCCThread(threadId: string, changeId?: string, branch?: st
   if (branch) try { git(['branch', '-D', branch]); } catch { /* */ }
   try { psql([
     ...(changeId ? [`DELETE FROM changes WHERE id = '${changeId}'`] : []),
+    ...(branch ? [`DELETE FROM planned_branches WHERE branch_name = '${branch}'`] : []),
     `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
     `DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`,
   ].join(';\n')); } catch { /* */ }

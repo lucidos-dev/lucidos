@@ -164,6 +164,13 @@ impl LucidosEngine {
                                             event: crate::engine::thread_events::ThreadEvent::ContinuationStarted {
                                                 branch: String::new(),
                                                 origin: None,
+                                                // Forward the originating reason so the
+                                                // timeline labels the resume honestly:
+                                                // user_clicked_continue = real restart
+                                                // resume; auto_recovery_after_hang = a
+                                                // local hang/stray-signal interrupt, NOT
+                                                // a restart.
+                                                reason: continue_reason.clone(),
                                             },
                                             meta: crate::engine::thread_events::EventMeta {
                                                 channel: Some(
@@ -283,7 +290,17 @@ impl LucidosEngine {
         // (a sub-5173 value yields negative API/PG offsets). Writing a
         // value the script will later reject would self-inflict a
         // bootblock on the next dev-mode launch.
-        if workspace_was_uninitialized {
+        // A PACKAGED gateway engine binds a LOOPBACK port (LUCIDOS_BIND_LOOPBACK=1)
+        // that is NOT the user-facing vite port — pinning it into lucidos.toml
+        // would poison the next `scripts/lib/ports.sh` allocation (it reads
+        // lucidos.toml as the vite pin), so skip it. A DEV gateway engine (ADR
+        // 0014 "Dev runtime topology") binds the user-facing vite port DIRECTLY
+        // and does NOT set LUCIDOS_BIND_LOOPBACK, so `behind_gateway` is false and
+        // it pins the real port — correct, that IS the workspace's vite port.
+        let behind_gateway = std::env::var("LUCIDOS_BIND_LOOPBACK")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if workspace_was_uninitialized && !behind_gateway {
             match std::env::var("LUCIDOS_API_PORT")
                 .ok()
                 .and_then(|s| s.parse::<u16>().ok())
@@ -702,9 +719,6 @@ impl LucidosEngine {
             cancel_rebuild: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             backup_in_progress: AtomicBool::new(false),
-            restore_state: Arc::new(std::sync::RwLock::new(
-                crate::core::backup::RestoreState::default(),
-            )),
             active_threads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             thread_completion: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cc_commands_cache: tokio::sync::RwLock::new(Self::load_cc_commands_cache(

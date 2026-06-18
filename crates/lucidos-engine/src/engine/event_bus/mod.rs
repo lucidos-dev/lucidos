@@ -52,9 +52,9 @@ pub struct EmittedEvent {
     /// Typed event — consumers match on the variant.
     pub typed: BusEvent,
     /// Post-event projection snapshot. Set for persisted Thread events
-    /// (fetched in-tx after the projection update). `None` for transient
-    /// Thread events, System events, and child-count broadcasts — those
-    /// don't represent a state delta the frontend needs to apply.
+    /// (fetched in-tx after the projection update) and for a few transient
+    /// thread broadcasts that carry out-of-band projection refreshes.
+    /// `None` for System events and projection-free transient Thread events.
     pub aggregate: Option<crate::core::store::ThreadAggregate>,
 }
 
@@ -331,6 +331,55 @@ impl EventBus {
             typed: BusEvent::System(event),
             aggregate: None,
         });
+    }
+
+    /// Reconcile the live git-diff flag and broadcast the updated aggregate if
+    /// the flag changed.
+    ///
+    /// Used by the coding-agent worktree's post-commit hook. This intentionally
+    /// updates only `coding_agent_has_diff`: the formal proposal lifecycle
+    /// (`coding_agent_proposed`, `changes` row, Apply button) remains owned by
+    /// `ChangeProposed` at coding-agent idle.
+    pub async fn set_coding_agent_has_diff_and_broadcast(
+        &self,
+        thread_id: Uuid,
+        has_diff: bool,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "UPDATE thread_summaries \
+             SET coding_agent_has_diff = $2 \
+             WHERE thread_id = $1 \
+               AND coding_agent_has_diff IS DISTINCT FROM $2",
+        )
+        .bind(thread_id)
+        .bind(has_diff)
+        .execute(&mut *tx)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        let aggregate = crate::core::store::fetch_thread_aggregate(&mut *tx, thread_id).await?;
+        tx.commit().await?;
+
+        if let Some(aggregate) = aggregate {
+            let _ = self.event_tx.send(EmittedEvent {
+                event_id: Uuid::new_v4(),
+                seq: None,
+                created: Utc::now(),
+                typed: BusEvent::Thread {
+                    thread_id,
+                    event: ThreadEvent::CodingAgentDiffChanged { has_diff },
+                    meta: EventMeta::NONE,
+                },
+                aggregate: Some(aggregate),
+            });
+        }
+
+        Ok(true)
     }
 
     // ---- Shared persistence ----

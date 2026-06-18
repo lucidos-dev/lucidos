@@ -27,6 +27,7 @@ fn test_spawn_args<'a>(
         repo_name: None,
         interactive: false,
         continuation: false,
+        user_env_vars: &[],
     }
 }
 
@@ -49,6 +50,7 @@ fn test_spawn_args_with_event<'a>(
         repo_name: None,
         interactive: false,
         continuation: false,
+        user_env_vars: &[],
     }
 }
 
@@ -71,7 +73,49 @@ fn test_spawn_args_with_repo<'a>(
         repo_name,
         interactive: false,
         continuation: false,
+        user_env_vars: &[],
     }
+}
+
+#[test]
+fn build_command_injects_user_env_vars_and_engine_wins() {
+    // A user-defined env var lands in the coding-agent subprocess env, and an
+    // engine-owned var (LUCIDOS_REPO, set from repo_name) wins over a user var
+    // of the same name because user vars are applied FIRST in apply_lucidos_env.
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let user_env = vec![
+        ("MY_FLAG".to_string(), "1".to_string()),
+        ("LUCIDOS_REPO".to_string(), "user-supplied".to_string()),
+    ];
+    let args = SpawnArgs {
+        worktree_path: p,
+        workspace_path: p,
+        allowed_tools: None,
+        system_prompt: None,
+        resume_session_id: None,
+        model: None,
+        reasoning_effort: None,
+        thread_id,
+        spawning_event_id: None,
+        repo_name: Some("engine-repo"),
+        interactive: false,
+        continuation: false,
+        user_env_vars: &user_env,
+    };
+    let cmd = build_command(&args, None);
+    let env = collect_envs(&cmd);
+    assert_eq!(
+        env.get(std::ffi::OsStr::new("MY_FLAG")).map(|v| v.as_os_str()),
+        Some(std::ffi::OsStr::new("1")),
+        "user env var must be injected into the spawned subprocess"
+    );
+    assert_eq!(
+        env.get(std::ffi::OsStr::new("LUCIDOS_REPO"))
+            .map(|v| v.as_os_str()),
+        Some(std::ffi::OsStr::new("engine-repo")),
+        "engine-owned LUCIDOS_REPO must override a user var of the same name"
+    );
 }
 
 #[test]
@@ -305,6 +349,40 @@ fn build_command_sets_permission_mode_accept_edits() {
         args[mode_idx + 1],
         "acceptEdits",
         "acceptEdits auto-approves in-cwd writes; only out-of-cwd / Bash routes through the prompt tool"
+    );
+}
+
+#[test]
+fn build_command_includes_partial_messages_on_fresh_and_resumed_sessions() {
+    // `--include-partial-messages` makes CC stream `stream_event` deltas, which
+    // the engine turns into `AgentEvent::StreamActivity` liveness pings that keep
+    // the watchdog's inactivity clock fresh through a long single step (extended
+    // thinking on a hard problem). It MUST be set on RESUMED sessions too —
+    // follow-ups, engine-restart recovery, merge-conflict resolution, hardening —
+    // because those unattended long steps are exactly what the watchdog used to
+    // kill mid-work: a `--resume` spawn emitted no deltas at all, so the clock
+    // only ticked at step boundaries. The flag is a streaming-output option,
+    // orthogonal to `--resume`; the old fresh-only gate was a fossil from when
+    // resume lived in a separate spawn path.
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+
+    let fresh = build_command(&test_spawn_args(p, p, thread_id), None);
+    assert!(
+        collect_args(&fresh)
+            .iter()
+            .any(|a| a == "--include-partial-messages"),
+        "fresh session must request partial messages"
+    );
+
+    let mut resumed_args = test_spawn_args(p, p, thread_id);
+    resumed_args.resume_session_id = Some("sess-1");
+    let resumed = build_command(&resumed_args, None);
+    assert!(
+        collect_args(&resumed)
+            .iter()
+            .any(|a| a == "--include-partial-messages"),
+        "resumed session must ALSO request partial messages — else the watchdog is blind to its streaming and kills long active steps"
     );
 }
 

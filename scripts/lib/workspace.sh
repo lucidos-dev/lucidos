@@ -28,10 +28,10 @@ parse_dev_args() {
     RELEASE=""
     ENGINE_ONLY=""
     FOLLOW_LOG=""
-    # Built frontend is the DEFAULT (vite build --watch + vite preview): the SW
-    # caches bundled /assets/* so an iOS PWA resumes instantly, and the client
-    # can't drift ahead of the engine. Pass --hmr to opt into the live Vite dev
-    # server instead (HMR, for active frontend iteration).
+    # The engine serves the built dist/ DIRECTLY (ADR 0014) — `vite build --watch`
+    # rebuilds it on source change; the SW caches bundled /assets/* so an iOS PWA
+    # resumes instantly. BUILT stays set for back-compat with callers that read it
+    # (the old `--hmr` live-dev-server path was removed — there is no Vite proxy).
     BUILT="1"
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -39,33 +39,27 @@ parse_dev_args() {
             -b|--build) BUILD="1"; shift ;;
             -r|--release) RELEASE="1"; shift ;;
             -f|--follow) FOLLOW_LOG="1"; shift ;;
-            --hmr|--dev) BUILT=""; shift ;;
-            --built) BUILT="1"; shift ;;   # explicit; built is already the default
+            --built) BUILT="1"; shift ;;   # accepted for back-compat; always built now
             --engine-only) ENGINE_ONLY="1"; BUILD="1"; shift ;;
             -h|--help)
                 echo "Usage: $SCRIPT_NAME -w <workspace> [OPTIONS]"
                 echo ""
                 echo "Options:"
                 echo "  -w, --workspace DIR   Workspace directory or name (required)"
-                echo "  -b, --build           Build engine before starting"
+                echo "  -b, --build           Build engine + gateway before starting"
                 echo "  -r, --release         Build in release mode (slower build, faster runtime)"
                 echo "  -f, --follow          Tail the engine log after startup (default: exit after ready)"
-                echo "  --hmr                 Use the live Vite dev server (HMR) instead of the default"
-                echo "                        built frontend. Faster frontend iteration, but the iOS PWA"
-                echo "                        cold-loads slowly over a network link. (alias: --dev)"
-                echo "  --built               Serve a built frontend — the DEFAULT (vite build --watch +"
-                echo "                        vite preview): SW-cached /assets/* for instant PWA resume;"
-                echo "                        rebuilds on change with a 'New version available' toast."
-                echo "                        Listed for clarity; you get this without the flag."
                 echo "  --engine-only         Rebuild and restart only the engine (skip Vite, keep parent scripts)"
                 echo "  -h, --help            Show this help"
                 echo ""
+                echo "The engine serves the built frontend (dist/) directly (ADR 0014);"
+                echo "\`vite build --watch\` rebuilds it on change. There is no live dev server."
+                echo ""
                 echo "Examples:"
-                echo "  $SCRIPT_NAME -w dev               # ~/workspaces/dev (built frontend, the default)"
-                echo "  $SCRIPT_NAME -w personal -b       # ~/workspaces/personal, build engine first"
+                echo "  $SCRIPT_NAME -w dev               # ~/workspaces/dev"
+                echo "  $SCRIPT_NAME -w personal -b       # ~/workspaces/personal, build first"
                 echo "  $SCRIPT_NAME -w dev -f             # start and tail the engine log"
                 echo "  $SCRIPT_NAME -w /some/path -b -r  # absolute path, release build"
-                echo "  $SCRIPT_NAME -w dev -b --hmr       # live Vite dev server (HMR) for frontend iteration"
                 exit 0
                 ;;
             *) echo "Unknown option: $1"; exit 1 ;;
@@ -162,20 +156,21 @@ resolve_workspace() {
     fi
 
     # Ensure workspace directories exist.
-    # PGDATA is no longer a host directory — it lives on a Docker named volume
-    # (`lucidos-pg-data-$PG_NAME`). See docker-compose.dev.yml for why.
+    # PGDATA is no longer a host directory. Steady state is one shared Docker
+    # volume (`lucidos-pg-data-shared`) with one database per workspace; legacy
+    # `lucidos-pg-data-$PG_NAME` volumes are migration sources only.
     mkdir -p "$WORKSPACE/artifacts"
     mkdir -p "$WORKSPACE/.lucidos"
 
     # Workspace-scoped state files
     ENGINE_PIDFILE="$WORKSPACE/.lucidos/engine.pid"
     FRONTEND_PIDFILE="$WORKSPACE/.lucidos/frontend.pid"
-    # NOTE: --built mode's `vite build --watch` is NOT workspace-scoped — it
-    # produces the SHARED crates/lucidos-app/dist/ that every workspace of this
-    # checkout serves through its own `vite preview`, so it's a checkout-level
-    # singleton tracked by build_watch_pidfile (below), not a per-workspace pid.
-    # A legacy per-workspace build-watch.pid from pre-singleton runs is cleaned
-    # up by kill_stale_processes / stop.sh.
+    # NOTE: `vite build --watch` is NOT workspace-scoped — it produces the SHARED
+    # crates/lucidos-app/dist/ that every workspace of this checkout serves
+    # (the engine serves it directly via LUCIDOS_STATIC_DIR, ADR 0014), so it's a
+    # checkout-level singleton tracked by build_watch_pidfile (below), not a
+    # per-workspace pid. A legacy per-workspace build-watch.pid from pre-singleton
+    # runs is cleaned up by kill_stale_processes / stop.sh.
     ENGINE_LOG="$WORKSPACE/.lucidos/engine.log"
 
     # Compute a short name for the postgres container from workspace path
@@ -220,52 +215,410 @@ detect_vite_tls() {
 }
 
 # ── setup_postgres ──────────────────────────────────────────────────────
-# Start or verify Docker postgres container for workspace.
+# Start/verify the ONE shared Docker Postgres cluster and ensure this
+# workspace's database exists. Legacy per-workspace containers/volumes are kept
+# intact; if present and this shared database has not been verified, they are
+# dumped/restored into the shared cluster first.
+shared_pg_container() { echo "${LUCIDOS_SHARED_PG_CONTAINER:-lucidos-pg-shared}"; }
+shared_pg_volume()    { echo "${LUCIDOS_SHARED_PG_VOLUME:-lucidos-pg-data-shared}"; }
+
+workspace_database_name() {
+    local id
+    id="$(workspace_slug)"
+    echo "lucidos_$id"
+}
+
+workspace_database_url() {
+    echo "postgres://lucidos:lucidos@localhost:$PG_PORT/$(workspace_database_name)"
+}
+
+_shared_pg_ident() {
+    local name="$1"
+    if [[ ! "$name" =~ ^[a-z0-9_-]+$ ]]; then
+        echo "ERROR: invalid shared Postgres database name: $name" >&2
+        return 1
+    fi
+    printf '"%s"' "$name"
+}
+
+_shared_pg_literal() {
+    local value="$1"
+    value=${value//\'/\'\'}
+    printf "'%s'" "$value"
+}
+
 setup_postgres() {
     export LUCIDOS_WORKSPACE="$WORKSPACE"
-    export LUCIDOS_PG_NAME="$PG_NAME"
     export LUCIDOS_PG_PORT="$PG_PORT"
 
-    _migrate_postgres_if_needed
-    _migrate_postgres_volume_if_needed
+    if _legacy_postgres_exists; then
+        _migrate_postgres_if_needed
+        _migrate_postgres_volume_if_needed
+    fi
 
-    local need_restart=""
-    if docker inspect "lucidos-pg-$PG_NAME" >/dev/null 2>&1; then
+    _ensure_shared_postgres_container || return 1
+    _migrate_workspace_postgres_to_shared_if_needed || return 1
+    _ensure_shared_workspace_database "$(workspace_database_name)" || return 1
+}
+
+_legacy_postgres_exists() {
+    docker inspect "lucidos-pg-$PG_NAME" >/dev/null 2>&1 && return 0
+    docker volume inspect "lucidos-pg-data-$PG_NAME" >/dev/null 2>&1 && return 0
+    [ -f "$WORKSPACE/data/postgres/PG_VERSION" ] && return 0
+    return 1
+}
+
+_pg_port_is_shared_or_free() {
+    local port="$1"
+    port_is_free "$port" && return 0
+    local container
+    container=$(docker ps --filter "publish=$port" --format "{{.Names}}" 2>/dev/null | head -1)
+    [ -n "$container" ] && [ "$container" = "$(shared_pg_container)" ]
+}
+
+_ensure_shared_postgres_container() {
+    local container volume need_start=""
+    container="$(shared_pg_container)"
+    volume="$(shared_pg_volume)"
+
+    if docker inspect "$container" >/dev/null 2>&1; then
         local container_status
-        container_status=$(docker inspect --format='{{.State.Status}}' "lucidos-pg-$PG_NAME" 2>/dev/null || echo "")
+        container_status=$(docker inspect --format='{{.State.Status}}' "$container" 2>/dev/null || echo "")
         if [ "$container_status" != "running" ]; then
-            need_restart="container not running (status: $container_status)"
+            echo "Starting shared PostgreSQL container $container (was $container_status)"
+            docker start "$container" >/dev/null || return 1
         else
-            # PGDATA must be on the named Docker volume `lucidos-pg-data-$PG_NAME`.
-            # `.Mounts[].Name` is set for `volume`-type mounts and empty for
-            # `bind`-type mounts, so a legacy bind-mount container fails this
-            # check and triggers a restart (after the volume migration above
-            # has already moved the data into the named volume).
             local actual_volume expected_volume
-            actual_volume=$(docker inspect --format='{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}' "lucidos-pg-$PG_NAME" 2>/dev/null || echo "")
-            expected_volume="lucidos-pg-data-$PG_NAME"
+            actual_volume=$(docker inspect --format='{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql"}}{{.Name}}{{end}}{{end}}' "$container" 2>/dev/null || echo "")
+            expected_volume="$volume"
             if [ "$actual_volume" != "$expected_volume" ]; then
-                need_restart="volume mismatch (expected $expected_volume, got '${actual_volume:-bind mount or empty}')"
+                echo "ERROR: shared PostgreSQL container $container uses unexpected volume '${actual_volume:-bind mount or empty}' (expected $expected_volume)" >&2
+                return 1
             fi
         fi
     else
-        need_restart="container does not exist"
+        need_start="1"
     fi
 
-    if [ -n "$need_restart" ]; then
-        echo "PostgreSQL: $need_restart"
-        _start_postgres_container
-    else
-        # Read the actual published port from the running container
-        local actual_pg_port
-        actual_pg_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "lucidos-pg-$PG_NAME" 2>/dev/null || echo "")
-        if [ -n "$actual_pg_port" ] && [ "$actual_pg_port" != "$PG_PORT" ]; then
-            PG_PORT="$actual_pg_port"
-            export PG_PORT
-            export LUCIDOS_PG_PORT="$PG_PORT"
+    if [ -n "$need_start" ]; then
+        local pg_steps=0
+        while ! _pg_port_is_shared_or_free "$PG_PORT"; do
+            local squatter
+            squatter=$(docker ps --filter "publish=$PG_PORT" --format "{{.Names}}" 2>/dev/null | head -1)
+            echo "[ports] shared PG port $PG_PORT occupied${squatter:+ by container $squatter}, trying $(( PG_PORT + 1 ))" >&2
+            PG_PORT=$(( PG_PORT + 1 ))
+            pg_steps=$(( pg_steps + 1 ))
+            if [ "$pg_steps" -gt 1000 ]; then
+                echo "ERROR: could not find a free shared PostgreSQL port near $(( PG_PORT - pg_steps ))" >&2
+                return 1
+            fi
+        done
+        export PG_PORT
+        export LUCIDOS_PG_PORT="$PG_PORT"
+
+        echo "Starting shared PostgreSQL (port $PG_PORT, container $container)"
+        docker volume create "$volume" >/dev/null || return 1
+        # --shm-size=1g: Postgres builds the pgvector HNSW index with parallel
+        # maintenance workers that use POSIX shared memory under /dev/shm. Docker's
+        # 64m default overflows ("could not resize shared memory segment ... No
+        # space left on device") when restoring/migrating a workspace with a
+        # sizeable memory_entries table, aborting the migration and leaving the
+        # workspace stuck on the gateway's "Workspace starting…" page. 1g is a
+        # generous, safe ceiling for a personal machine.
+        #
+        # max_connections=500: this is ONE shared cluster for every workspace on
+        # the machine (ADR 0014 §6/§7), and each engine opens a pool of up to 50
+        # connections (construction.rs). Postgres' default 100 is exhausted by
+        # just two busy workspaces, so a third fails to start with "sorry, too
+        # many clients already". 500 fits ~10 concurrent engines. Keep this in
+        # lockstep with crates/lucidos-gateway/src/postgres.rs.
+        if ! docker run -d \
+            --name "$container" \
+            --restart unless-stopped \
+            --shm-size=1g \
+            -p "127.0.0.1:$PG_PORT:5432" \
+            -e POSTGRES_USER=lucidos \
+            -e POSTGRES_PASSWORD=lucidos \
+            -e POSTGRES_DB=postgres \
+            -v "$volume:/var/lib/postgresql" \
+            --label "lucidos.shared-postgres=true" \
+            pgvector/pgvector:pg18 \
+            postgres -c max_connections=500 >/dev/null; then
+            echo "ERROR: failed to start shared PostgreSQL container $container" >&2
+            return 1
         fi
-        echo "PostgreSQL already running for this workspace (port $PG_PORT)"
     fi
+
+    local actual_pg_port
+    actual_pg_port=$(docker inspect --format='{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "$container" 2>/dev/null || echo "")
+    if [ -n "$actual_pg_port" ] && [ "$actual_pg_port" != "$PG_PORT" ]; then
+        PG_PORT="$actual_pg_port"
+        export PG_PORT
+        export LUCIDOS_PG_PORT="$PG_PORT"
+    fi
+
+    echo -n "Waiting for shared PostgreSQL"
+    for _ in {1..60}; do
+        if docker exec "$container" pg_isready -U lucidos -d postgres >/dev/null 2>&1; then
+            echo " ready!"
+            return 0
+        fi
+        echo -n "."
+        sleep 1
+    done
+    echo ""
+    echo "ERROR: shared PostgreSQL did not become ready" >&2
+    return 1
+}
+
+_shared_database_exists() {
+    local db="$1" container
+    container="$(shared_pg_container)"
+    docker exec "$container" psql -U lucidos -d postgres -tAc \
+        "SELECT 1 FROM pg_database WHERE datname=$(_shared_pg_literal "$db")" 2>/dev/null | grep -qx 1
+}
+
+_create_shared_database() {
+    local db="$1" ident
+    ident="$(_shared_pg_ident "$db")" || return 1
+    docker exec "$(shared_pg_container)" psql -U lucidos -d postgres -v ON_ERROR_STOP=1 -c \
+        "CREATE DATABASE $ident OWNER lucidos" >/dev/null
+}
+
+_drop_shared_database() {
+    local db="$1" ident lit
+    ident="$(_shared_pg_ident "$db")" || return 1
+    lit="$(_shared_pg_literal "$db")"
+    docker exec "$(shared_pg_container)" psql -U lucidos -d postgres -c \
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$lit AND pid <> pg_backend_pid()" >/dev/null 2>&1 || true
+    docker exec "$(shared_pg_container)" psql -U lucidos -d postgres -c \
+        "DROP DATABASE IF EXISTS $ident" >/dev/null
+}
+
+_verify_shared_pg_database() {
+    local db="$1"
+    docker exec "$(shared_pg_container)" psql -U lucidos -d "$db" -tAc "SELECT 1" 2>/dev/null | grep -qx 1
+}
+
+_ensure_shared_workspace_database() {
+    local db="$1"
+    if _shared_database_exists "$db"; then
+        _verify_shared_pg_database "$db" || return 1
+        echo "PostgreSQL shared database ready: $db (container $(shared_pg_container), port $PG_PORT)"
+        return 0
+    fi
+    echo "Creating shared PostgreSQL database: $db"
+    _create_shared_database "$db" || return 1
+    _verify_shared_pg_database "$db" || return 1
+}
+
+_shared_pg_migration_marker() {
+    echo "$WORKSPACE/.lucidos/shared-postgres-$(workspace_database_name).verified"
+}
+
+_legacy_pg_container() {
+    echo "lucidos-pg-$PG_NAME"
+}
+
+_legacy_pg_volume() {
+    echo "lucidos-pg-data-$PG_NAME"
+}
+
+_legacy_pg_volume_layout() {
+    local volume="$1" old_ver
+    if docker run --rm -v "$volume:/v:ro" pgvector/pgvector:pg18 \
+        sh -c 'test -f /v/18/docker/PG_VERSION' >/dev/null 2>&1; then
+        echo "parent:18"
+        return 0
+    fi
+    old_ver=$(docker run --rm -v "$volume:/v:ro" pgvector/pgvector:pg18 \
+        sh -c 'cat /v/PG_VERSION 2>/dev/null' | tr -d '[:space:]')
+    if [[ "$old_ver" =~ ^[0-9]+$ ]]; then
+        echo "root:$old_ver"
+        return 0
+    fi
+    return 1
+}
+
+_start_legacy_postgres_from_volume() {
+    local container volume layout image mount
+    container="$(_legacy_pg_container)"
+    volume="$(_legacy_pg_volume)"
+    layout="$(_legacy_pg_volume_layout "$volume")" || {
+        echo "ERROR: could not determine layout of legacy Postgres volume $volume; old data was not touched." >&2
+        return 1
+    }
+
+    case "$layout" in
+        parent:*)
+            image="pgvector/pgvector:pg18"
+            mount="/var/lib/postgresql"
+            ;;
+        root:*)
+            image="pgvector/pgvector:pg${layout#root:}"
+            mount="/var/lib/postgresql/data"
+            ;;
+        *)
+            echo "ERROR: unsupported legacy Postgres volume layout '$layout'; old data was not touched." >&2
+            return 1
+            ;;
+    esac
+
+    echo "Recreating legacy PostgreSQL container $container from volume $volume for migration..."
+    if ! docker run -d \
+        --name "$container" \
+        -v "$volume:$mount" \
+        -e POSTGRES_USER=lucidos \
+        -e POSTGRES_PASSWORD=lucidos \
+        -e POSTGRES_DB=lucidos \
+        --label "lucidos.legacy-postgres=true" \
+        "$image" >/dev/null; then
+        echo "ERROR: could not start legacy PostgreSQL container from $volume; old data was not touched." >&2
+        return 1
+    fi
+}
+
+_ensure_legacy_postgres_running() {
+    local container="$(_legacy_pg_container)"
+    if ! docker inspect "$container" >/dev/null 2>&1; then
+        if docker volume inspect "$(_legacy_pg_volume)" >/dev/null 2>&1; then
+            _start_legacy_postgres_from_volume || return 1
+            _migrate_postgres_if_needed || return 1
+            container="$(_legacy_pg_container)"
+        else
+            return 1
+        fi
+    fi
+    if [ "$(docker inspect --format='{{.State.Status}}' "$container" 2>/dev/null)" != "running" ]; then
+        echo "Starting legacy PostgreSQL container $container for migration..."
+        docker start "$container" >/dev/null || return 1
+    fi
+    echo -n "Waiting for legacy PostgreSQL"
+    for _ in {1..120}; do
+        if docker exec "$container" pg_isready -U lucidos -d lucidos >/dev/null 2>&1; then
+            echo " ready!"
+            return 0
+        fi
+        echo -n "."
+        sleep 1
+    done
+    echo ""
+    echo "ERROR: legacy PostgreSQL container $container did not become ready; old cluster left intact." >&2
+    return 1
+}
+
+_legacy_pg_events_count() {
+    local container="$(_legacy_pg_container)"
+    docker exec "$container" psql -U lucidos -d lucidos -tAc \
+        "SELECT CASE WHEN to_regclass('public.events') IS NULL THEN 0 ELSE (SELECT count(*) FROM public.events) END" \
+        2>/dev/null | tr -d '[:space:]'
+}
+
+_shared_pg_events_count() {
+    local db="$1"
+    docker exec "$(shared_pg_container)" psql -U lucidos -d "$db" -tAc \
+        "SELECT CASE WHEN to_regclass('public.events') IS NULL THEN 0 ELSE (SELECT count(*) FROM public.events) END" \
+        2>/dev/null | tr -d '[:space:]'
+}
+
+_write_shared_pg_migration_marker() {
+    local db="$1" source="$2" marker
+    marker="$(_shared_pg_migration_marker)"
+    mkdir -p "$WORKSPACE/.lucidos"
+    cat > "$marker" <<EOF
+verified_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+database=$db
+shared_container=$(shared_pg_container)
+legacy_source=$source
+EOF
+}
+
+_dump_legacy_postgres_to_file() {
+    local dump="$1" container
+    container="$(_legacy_pg_container)"
+    docker exec "$container" rm -f /tmp/lucidos-shared-migrate.dump >/dev/null 2>&1 || true
+    echo "Dumping legacy workspace database from $container ..."
+    if ! docker exec "$container" pg_dump -U lucidos -d lucidos -Fc -f /tmp/lucidos-shared-migrate.dump; then
+        echo "ERROR: pg_dump failed; old cluster left intact." >&2
+        return 1
+    fi
+    if ! docker exec "$container" sh -c 'pg_restore -l /tmp/lucidos-shared-migrate.dump | grep -q .'; then
+        echo "ERROR: dump archive verification failed; old cluster left intact." >&2
+        return 1
+    fi
+    docker cp "$container:/tmp/lucidos-shared-migrate.dump" "$dump" >/dev/null || return 1
+    docker exec "$container" rm -f /tmp/lucidos-shared-migrate.dump >/dev/null 2>&1 || true
+}
+
+_migrate_workspace_postgres_to_shared_if_needed() {
+    local db marker container dump legacy_count shared_count
+    db="$(workspace_database_name)"
+    marker="$(_shared_pg_migration_marker)"
+    container="$(_legacy_pg_container)"
+
+    if ! _legacy_postgres_exists; then
+        return 0
+    fi
+
+    # If the shared DB already exists, never overwrite it. Verify enough to make
+    # decommission explicit and safe; if the legacy DB has more events, abort so
+    # the user does not silently boot on an empty/newer target.
+    if _shared_database_exists "$db"; then
+        _verify_shared_pg_database "$db" || return 1
+        if [ ! -f "$marker" ] && docker inspect "$container" >/dev/null 2>&1; then
+            _ensure_legacy_postgres_running || return 1
+            legacy_count="$(_legacy_pg_events_count)"
+            shared_count="$(_shared_pg_events_count "$db")"
+            if [ -n "$legacy_count" ] && [ -n "$shared_count" ] && [ "$legacy_count" -gt "$shared_count" ]; then
+                echo "ERROR: shared database $db exists but has fewer events ($shared_count) than legacy $container ($legacy_count)." >&2
+                echo "       Refusing to overwrite shared data. Old cluster left intact." >&2
+                return 1
+            fi
+            _write_shared_pg_migration_marker "$db" "$container (pre-existing shared db)"
+        fi
+        return 0
+    fi
+
+    if ! docker inspect "$container" >/dev/null 2>&1 && \
+       ! docker volume inspect "$(_legacy_pg_volume)" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    _ensure_legacy_postgres_running || return 1
+    mkdir -p "$WORKSPACE/.lucidos"
+    dump="$WORKSPACE/.lucidos/shared-postgres-$db.pending.dump"
+    rm -f "$dump"
+
+    echo ""
+    echo "Migrating workspace PostgreSQL into shared cluster."
+    echo "  Source: $container database lucidos"
+    echo "  Target: $(shared_pg_container) database $db"
+    _dump_legacy_postgres_to_file "$dump" || return 1
+
+    echo "Creating shared database $db and restoring dump..."
+    _create_shared_database "$db" || return 1
+    if ! docker cp "$dump" "$(shared_pg_container):/tmp/lucidos-shared-restore.dump" >/dev/null; then
+        _drop_shared_database "$db"
+        echo "ERROR: could not copy dump into shared PostgreSQL container; old cluster left intact." >&2
+        return 1
+    fi
+    if ! docker exec "$(shared_pg_container)" pg_restore -U lucidos --no-owner --no-privileges \
+        --exit-on-error -d "$db" /tmp/lucidos-shared-restore.dump; then
+        _drop_shared_database "$db"
+        echo "ERROR: restore into shared PostgreSQL failed; old cluster left intact." >&2
+        return 1
+    fi
+    docker exec "$(shared_pg_container)" rm -f /tmp/lucidos-shared-restore.dump >/dev/null 2>&1 || true
+    _verify_shared_pg_database "$db" || { _drop_shared_database "$db"; return 1; }
+    _write_shared_pg_migration_marker "$db" "$container"
+
+    local archived="$WORKSPACE/.lucidos/shared-postgres-$db.restored-$(date +%Y%m%d%H%M%S).dump"
+    mv "$dump" "$archived" 2>/dev/null || true
+    echo "Shared PostgreSQL migration verified. Legacy container/volume kept for rollback:"
+    echo "  $container / lucidos-pg-data-$PG_NAME"
+    echo "Decommission explicitly after checking the workspace:"
+    echo "  ./scripts/decommission-legacy-postgres.sh -w $WORKSPACE"
+    echo ""
 }
 
 # One-time rebrand migration: container named with the legacy prefix and
@@ -427,7 +780,7 @@ _migrate_postgres_volume_if_needed() {
     fi
 
     # Run inside the postgres image so `chown postgres` resolves to the right
-    # uid (999 in pgvector/pgvector:pg17; using the name keeps this correct if
+    # uid (999 in pgvector/pgvector:pg18; using the name keeps this correct if
     # the base image ever changes). Postgres refuses to start with PGDATA perms
     # other than 0700, and `cp -a` preserves the host's perms (often 0755 on
     # macOS bind mounts) — chmod here, not after the container starts.
@@ -435,7 +788,7 @@ _migrate_postgres_volume_if_needed() {
     if ! docker run --rm \
         -v "$pg_data_dir:/src:ro" \
         -v "$volume_name:/dst" \
-        pgvector/pgvector:pg17 \
+        pgvector/pgvector:pg18 \
         sh -c 'cp -a /src/. /dst/ && chown -R postgres:postgres /dst && chmod 700 /dst'; then
         echo "ERROR: failed to copy PGDATA into volume $volume_name. Removing partial volume." >&2
         docker volume rm "$volume_name" >/dev/null 2>&1 || true
@@ -459,6 +812,159 @@ _migrate_postgres_volume_if_needed() {
         fi
     fi
     echo ""
+}
+
+# One-time MAJOR-version migration (PG 17 → 18). The named volume was created
+# when the image was pgvector/pgvector:pg17, whose PGDATA was the volume root
+# (/var/lib/postgresql/data). PG 18's image relocated PGDATA to
+# /var/lib/postgresql/18/docker and mounts the volume at the parent
+# /var/lib/postgresql, so the old cluster cannot be opened in place — a logical
+# dump/restore is required.
+#
+# Boots a throwaway PG 17 server on the old volume, pg_dump's the `lucidos`
+# database to <workspace>/.lucidos, verifies the archive, then removes the old
+# volume so _start_postgres_container can initdb a fresh PG 18 cluster into the
+# (recreated) named volume. _restore_postgres_major_dump_if_pending finishes the
+# restore once the PG 18 server is up.
+#
+# Idempotent: no-op when the volume is absent (fresh install) or already in PG 18
+# layout (/18/docker/PG_VERSION present). The dump archive is kept (never
+# deleted) so the migration is recoverable. Returns non-zero ONLY when an
+# in-progress migration could not complete safely (caller aborts the start).
+_migrate_postgres_major_if_needed() {
+    local volume_name="lucidos-pg-data-$PG_NAME"
+    local image_peek="pgvector/pgvector:pg18"   # always present once compose has run
+    local pending="$WORKSPACE/.lucidos/pg-major-migrate.pending.dump"
+
+    # No volume → fresh install; compose will initdb a PG 18 cluster.
+    docker volume inspect "$volume_name" >/dev/null 2>&1 || return 0
+
+    # Already PG 18 layout → nothing to do.
+    if docker run --rm -v "$volume_name:/v" "$image_peek" \
+        sh -c 'test -f /v/18/docker/PG_VERSION' >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Old layout keeps PGDATA at the volume root. Read its catalog major version.
+    local old_ver
+    old_ver=$(docker run --rm -v "$volume_name:/v" "$image_peek" \
+        sh -c 'cat /v/PG_VERSION 2>/dev/null' | tr -d '[:space:]')
+    # No PG_VERSION at root and no 18/docker → empty/foreign volume; let compose
+    # initdb fresh rather than risk a destructive guess.
+    [ -n "$old_ver" ] || return 0
+    if [ "$old_ver" -ge 18 ] 2>/dev/null; then
+        return 0
+    fi
+    # Boot the image matching the volume's actual catalog version (a newer
+    # server cannot open an older cluster). The project has only shipped PG 17,
+    # but deriving the tag keeps the migration correct for any past major.
+    local image_old="pgvector/pgvector:pg${old_ver}"
+
+    echo ""
+    echo "Migrating PostgreSQL cluster PG $old_ver → 18 (logical dump/restore)."
+    echo "(One-time. PG 18 relocated PGDATA, so the PG $old_ver cluster cannot be opened in place.)"
+    echo "  Volume:  $volume_name"
+    echo "  Archive: $pending"
+
+    # Release the volume from the workspace container before booting a temp one.
+    docker rm -f "lucidos-pg-$PG_NAME" >/dev/null 2>&1 || true
+
+    local tmp="lucidos-pg-migrate-$PG_NAME"
+    docker rm -f "$tmp" >/dev/null 2>&1 || true
+
+    echo "  Booting temporary PG $old_ver to dump the event store..."
+    if ! docker run -d --name "$tmp" \
+        -v "$volume_name:/var/lib/postgresql/data" \
+        -e POSTGRES_USER=lucidos -e POSTGRES_PASSWORD=lucidos -e POSTGRES_DB=lucidos \
+        "$image_old" >/dev/null 2>&1; then
+        echo "ERROR: could not start temporary PG $old_ver for migration (old volume intact)." >&2
+        return 1
+    fi
+
+    local ready=""
+    for _ in $(seq 1 60); do
+        if docker exec "$tmp" pg_isready -U lucidos >/dev/null 2>&1; then ready=1; break; fi
+        sleep 1
+    done
+    if [ -z "$ready" ]; then
+        echo "ERROR: temporary PG $old_ver did not become ready; aborting (old volume intact)." >&2
+        docker logs --tail 30 "$tmp" >&2 || true
+        docker rm -f "$tmp" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    mkdir -p "$WORKSPACE/.lucidos"
+    echo "  Dumping 'lucidos' database (custom format)..."
+    if ! docker exec "$tmp" pg_dump -U lucidos -d lucidos -Fc -f /tmp/lucidos.dump; then
+        echo "ERROR: pg_dump failed; aborting (old volume intact)." >&2
+        docker rm -f "$tmp" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    # Verify the archive lists a non-empty TOC before trusting it.
+    if ! docker exec "$tmp" sh -c 'pg_restore -l /tmp/lucidos.dump | grep -q .'; then
+        echo "ERROR: dump archive verification failed; aborting (old volume intact)." >&2
+        docker rm -f "$tmp" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if ! docker cp "$tmp:/tmp/lucidos.dump" "$pending" >/dev/null 2>&1; then
+        echo "ERROR: could not copy dump out of temporary container; aborting (old volume intact)." >&2
+        docker rm -f "$tmp" >/dev/null 2>&1 || true
+        return 1
+    fi
+    docker rm -f "$tmp" >/dev/null 2>&1 || true
+
+    # Dump is verified and on the host — safe to drop the old volume so compose
+    # recreates it in the PG 18 layout. The archive at $pending is the backup.
+    if ! docker volume rm "$volume_name" >/dev/null 2>&1; then
+        echo "ERROR: could not remove old volume $volume_name after dumping." >&2
+        echo "       Dump archive preserved at $pending" >&2
+        return 1
+    fi
+    echo "  PG $old_ver cluster dumped; old volume removed. A fresh PG 18 cluster will be initialized."
+}
+
+# Finish a pending PG 17 → 18 migration: restore the dumped `lucidos` database
+# into the freshly-initialized PG 18 cluster. No-op when no migration is pending.
+# Called by _start_postgres_container once the PG 18 server is ready and BEFORE
+# the vector extension is (re)created — the dump already carries it.
+_restore_postgres_major_dump_if_pending() {
+    local pending="$WORKSPACE/.lucidos/pg-major-migrate.pending.dump"
+    [ -f "$pending" ] || return 0
+
+    local container="lucidos-pg-$PG_NAME"
+    local archived="$WORKSPACE/.lucidos/pg-major-migrate.restored-$(date +%Y%m%d%H%M%S).dump"
+
+    # Guard against double-apply: only restore into a pristine cluster. If the
+    # event store already exists (a prior restore that completed but failed to
+    # archive the marker), skip and archive the dump.
+    if docker exec "$container" psql -U lucidos -d lucidos -tAc \
+        "SELECT to_regclass('public.events') IS NOT NULL" 2>/dev/null | grep -q t; then
+        echo "PG 18 cluster already populated; skipping restore. Dump archived at $archived"
+        mv "$pending" "$archived" 2>/dev/null || true
+        return 0
+    fi
+
+    echo "Restoring event store into PG 18 from $pending ..."
+    if ! docker cp "$pending" "$container:/tmp/restore.dump" >/dev/null 2>&1; then
+        echo "ERROR: could not copy dump into $container; PG 17 archive kept at $pending" >&2
+        return 1
+    fi
+    # -U lucidos is required: `docker exec` runs as the image's root user (it
+    # bypasses the entrypoint's gosu drop to postgres), so without it pg_restore
+    # connects as PG role "root", which does not exist.
+    if ! docker exec "$container" pg_restore -U lucidos --no-owner --no-privileges \
+        --exit-on-error -d lucidos /tmp/restore.dump; then
+        echo "ERROR: pg_restore failed restoring the PG 17 → 18 migration." >&2
+        echo "       The PG 17 dump is preserved at $pending — re-run after fixing the cause:" >&2
+        echo "         docker cp $pending $container:/tmp/restore.dump" >&2
+        echo "         docker exec $container pg_restore -U lucidos --no-owner --no-privileges -d lucidos /tmp/restore.dump" >&2
+        return 1
+    fi
+    docker exec "$container" rm -f /tmp/restore.dump >/dev/null 2>&1 || true
+    mv "$pending" "$archived" 2>/dev/null || true
+    echo "PG 17 → 18 migration complete. Dump archived at $archived"
 }
 
 _start_postgres_container() {
@@ -517,6 +1023,11 @@ _start_postgres_container() {
         echo -n "."
         sleep 1
     done
+
+    # Finish a pending PG 17 → 18 migration (restore into the fresh cluster)
+    # before anything else touches the database. A failed restore aborts the
+    # start so the engine never boots on a half-restored event store.
+    _restore_postgres_major_dump_if_pending || return 1
 
     docker exec "lucidos-pg-$PG_NAME" psql -U lucidos -d lucidos -c "CREATE EXTENSION IF NOT EXISTS vector;" > /dev/null 2>&1 || true
 }
@@ -650,11 +1161,24 @@ kill_stale_processes() {
         done < <(pgrep -f "(dev|web-dev|tauri-dev)\\.sh.*$WORKSPACE" 2>/dev/null || true)
     fi
 
+    # Gateway-mode --engine-only (ADR 0014): leave the shared gateway AND this
+    # engine alone. The gateway is on the fixed GATEWAY_PORT and the engine on
+    # ENGINE_PORT (VITE_PORT, network-bound — dev topology §4); killing either
+    # here would force a full gateway restart (disrupting peers). Instead
+    # start_gateway reuses the live shared gateway and asks it to respawn just
+    # THIS workspace's engine onto the freshly-built binary — a targeted Apply
+    # restart. A full `-b` launch (no --engine-only) falls through and reclaims
+    # the ports, replacing both.
+    local skip_engine_kill=""
+    if [ -n "$ENGINE_ONLY" ] && [ -z "${LUCIDOS_NO_GATEWAY:-}" ]; then
+        skip_engine_kill="1"
+    fi
+
     # With -b: kill existing engine so we start the freshly built one.
     # Use SIGUSR1, not SIGTERM — the engine ignores SIGTERM to survive
     # accidental `xargs kill` from CC subprocess test scripts (see
     # main.rs shutdown_signal). SIGUSR1 is the legitimate stop signal.
-    if [ -n "$BUILD" ]; then
+    if [ -n "$BUILD" ] && [ -z "$skip_engine_kill" ]; then
         if [ -f "$ENGINE_PIDFILE" ]; then
             local old_pid
             old_pid="$(cat "$ENGINE_PIDFILE" 2>/dev/null || true)"
@@ -667,19 +1191,42 @@ kill_stale_processes() {
             rm -f "$ENGINE_PIDFILE"
         fi
 
-        # Kill any orphaned engine still holding the engine port. The engine
-        # binds VITE_PORT after swap_ports (API_PORT is Vite's internal port —
-        # see swap_ports), so an orphaned engine squats VITE_PORT, NOT API_PORT.
-        # Skip the pid we already signaled above: in --engine-only restarts the
-        # engine we just SIGUSR1'd is still draining on this port, and is not a
-        # separate orphan.
+        # Full `-b` rebuild in gateway mode (not --engine-only Apply, which is
+        # skip_engine_kill): also stop the ONE shared gateway so the freshly built
+        # `lucidos-gateway` binary is used and a stale/unhealthy gateway can't
+        # squat the fixed gateway port. SIGUSR1 = graceful stop leaving its
+        # engines for re-adoption; the fresh gateway re-adopts every running peer
+        # (so peers survive with only a brief proxy gap) and the launcher then
+        # starts this workspace's engine (killed above). The gateway is its own
+        # binary (ADR 0014) — a different process name than the engine, so the
+        # orphan-port reclaim below must match it too. (CC's Apply uses
+        # --engine-only and does NOT take this branch, so it never disrupts peers.)
+        if [ -z "${LUCIDOS_NO_GATEWAY:-}" ] && [ -f "$(gateway_pidfile)" ]; then
+            local gw_old
+            gw_old="$(cat "$(gateway_pidfile)" 2>/dev/null || true)"
+            if [ -n "$gw_old" ] && kill -0 "$gw_old" 2>/dev/null; then
+                echo "Stopping existing gateway for rebuild (PID $gw_old)..."
+                kill -USR1 "$gw_old" 2>/dev/null || true
+                engine_pids_to_reap="${engine_pids_to_reap:+$engine_pids_to_reap }$gw_old"
+                killed=1
+            fi
+            rm -f "$(gateway_pidfile)"
+        fi
+
+        # Kill any orphan still holding VITE_PORT (= ENGINE_PORT). In the ADR 0014
+        # dev topology the ENGINE binds this port directly; in legacy mode it's
+        # also the engine; on the first `-b` after the old gateway-on-the-user-
+        # port topology it could be an old `lucidos-engine --gateway` — hence the
+        # `lucidos-gateway` match too. (The gateway's own port, GATEWAY_PORT, is
+        # reclaimed by the pidfile kill above + the start_gateway safety net.)
+        # Skip pids already signaled above (still draining); only touch our binaries.
         if ! port_is_free "$VITE_PORT"; then
             local occupant occupant_cmd
             occupant=$(lsof -ti :"$VITE_PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)
             if [ -n "$occupant" ] && ! _pid_in_list "$occupant" "$engine_pids_to_reap"; then
                 occupant_cmd=$(ps -p "$occupant" -o comm= 2>/dev/null || true)
-                if [[ "$occupant_cmd" == *lucidos-engine* ]]; then
-                    echo "Killing orphaned engine on port $VITE_PORT (PID $occupant)..."
+                if [[ "$occupant_cmd" == *lucidos-engine* || "$occupant_cmd" == *lucidos-gateway* ]]; then
+                    echo "Killing orphaned $occupant_cmd on port $VITE_PORT (PID $occupant)..."
                     kill -USR1 "$occupant" 2>/dev/null || true
                     engine_pids_to_reap="${engine_pids_to_reap:+$engine_pids_to_reap }$occupant"
                     killed=1
@@ -688,16 +1235,13 @@ kill_stale_processes() {
         fi
     fi
 
-    # Stop any existing frontend for THIS workspace (skip in --engine-only mode)
-    if [ -z "$ENGINE_ONLY" ] && [ -f "$FRONTEND_PIDFILE" ]; then
-        local old_pid
-        old_pid="$(cat "$FRONTEND_PIDFILE" 2>/dev/null || true)"
-        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-            echo "Stopping existing frontend for this workspace (PID $old_pid)..."
-            kill "$old_pid" 2>/dev/null || true
-            killed=1
-        fi
-        rm -f "$FRONTEND_PIDFILE"
+    # Release this workspace's frontend marker (skip in --engine-only mode). In
+    # built mode the marker is the SHARED build-watch pid (the engine serves
+    # dist/ directly, no per-workspace preview) — release_frontend_marker removes
+    # the file without killing the shared watch; a distinct dev-server pid (e2e)
+    # is killed.
+    if [ -z "$ENGINE_ONLY" ]; then
+        [ -n "$(release_frontend_marker "$FRONTEND_PIDFILE")" ] && killed=1
     fi
 
     # The --built mode `vite build --watch` is now a checkout-level singleton
@@ -737,13 +1281,43 @@ kill_stale_processes() {
     fi
 }
 
+# ── select_cargo_lock_holders ───────────────────────────────────────────
+# Print the PIDs of real `cargo` processes whose command line includes
+# `check` — the IDE / rust-analyzer processes that hold the shared `target/`
+# build lock and must be cleared before a fresh `cargo build`.
+#
+# CRITICAL — filter by the process's EXECUTABLE, not a substring of its whole
+# command line. `pgrep -f 'cargo check'` matches the phrase ANYWHERE in a
+# process's argv, which also snares coding-agent subprocesses (claude / codex)
+# whose injected prompt or args merely CONTAIN "cargo check" (a CC session
+# working on a build does). Killing those by PID bypasses their process-group
+# isolation and SIGTERMs a live coding-agent session — in THIS workspace or,
+# because `target/` is shared across workspaces launched from one checkout, in
+# ANOTHER workspace entirely. That is the exit=143 cross-workspace kill that
+# silently terminated a parked CC session during an unrelated workspace's
+# rebuild. Matching on the executable basename (`cargo`) keeps the
+# lock-release intent while making it impossible to target a CC subprocess.
+select_cargo_lock_holders() {
+    local p comm
+    for p in $(pgrep -f 'cargo check' 2>/dev/null || true); do
+        # `ps -o comm=` is the executable path (macOS) or a bare name; compare
+        # the basename so a rustup/homebrew `cargo` shim still matches and a
+        # `claude` / `node` / `codex` subprocess never does.
+        comm="$(ps -p "$p" -o comm= 2>/dev/null || true)"
+        [ "${comm##*/}" = "cargo" ] && printf '%s\n' "$p"
+    done
+}
+
 # ── build_or_find_engine ────────────────────────────────────────────────
-# Build engine if BUILD is set, otherwise find existing binary. Sets ENGINE_BIN.
+# Build engine (+ gateway + cli) if BUILD is set, otherwise find existing
+# binaries. Sets ENGINE_BIN and GATEWAY_BIN.
 build_or_find_engine() {
     if [ -n "$BUILD" ]; then
-        # Kill IDE cargo check processes that hold the artifact directory lock
+        # Clear IDE/rust-analyzer `cargo check` processes holding the shared
+        # target/ build lock. Scoped to real cargo processes — see
+        # select_cargo_lock_holders for why a raw `pgrep -f` is unsafe.
         local check_pids
-        check_pids=$(pgrep -f 'cargo check' 2>/dev/null || true)
+        check_pids=$(select_cargo_lock_holders)
         if [ -n "$check_pids" ]; then
             echo "Killing cargo check processes to release build lock..."
             echo "$check_pids" | xargs kill 2>/dev/null || true
@@ -767,22 +1341,29 @@ build_or_find_engine() {
         if [ -n "${ENGINE_BUILD_FEATURES:-}" ]; then
             feature_args=(--features "$ENGINE_BUILD_FEATURES")
         fi
+        # lucidos-gateway (ADR 0014) is the standalone front the dev launcher
+        # spawns; build it alongside the engine + cli.
         if [ -n "$RELEASE" ]; then
-            cargo build -p lucidos-engine "${feature_args[@]}" -p lucidos-cli --release
+            cargo build -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli --release
             ENGINE_BIN="$PROJECT_DIR/target/release/lucidos-engine"
+            GATEWAY_BIN="$PROJECT_DIR/target/release/lucidos-gateway"
         else
-            cargo build -p lucidos-engine "${feature_args[@]}" -p lucidos-cli
+            cargo build -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli
             ENGINE_BIN="$PROJECT_DIR/target/debug/lucidos-engine"
+            GATEWAY_BIN="$PROJECT_DIR/target/debug/lucidos-gateway"
         fi
-        # Re-sign the freshly built binary with the stable dev identity so macOS
+        # Re-sign the freshly built binaries with the stable dev identity so macOS
         # TCC permission grants persist across rebuilds (best-effort; no-op off
         # macOS or until ./scripts/dev-codesign-setup.sh has been run once).
         sign_engine_binary "$ENGINE_BIN"
+        sign_engine_binary "$GATEWAY_BIN"
     else
         if [ -n "$RELEASE" ] && [ -f "$PROJECT_DIR/target/release/lucidos-engine" ]; then
             ENGINE_BIN="$PROJECT_DIR/target/release/lucidos-engine"
+            GATEWAY_BIN="$PROJECT_DIR/target/release/lucidos-gateway"
         elif [ -f "$PROJECT_DIR/target/debug/lucidos-engine" ]; then
             ENGINE_BIN="$PROJECT_DIR/target/debug/lucidos-engine"
+            GATEWAY_BIN="$PROJECT_DIR/target/debug/lucidos-gateway"
         else
             echo "No engine binary found. Run with -b to build."
             exit 1
@@ -791,28 +1372,54 @@ build_or_find_engine() {
 }
 
 # ── swap_ports ──────────────────────────────────────────────────────────
-# Engine takes VITE_PORT (user-facing), Vite runs on API_PORT (internal).
-# Sets ENGINE_PORT, INTERNAL_VITE_PORT. Writes .lucidos/ports. Exports env vars.
+# Dev runtime topology (ADR 0014 §4 — "one engine serves both gateway-fronted
+# and legacy-direct access, per request"):
+#   • ENGINE_PORT  = VITE_PORT (5173+offset) — the engine binds this DIRECTLY
+#     (network-bound), serving the workspace app at `/` (base `/`). So
+#     `https://localhost:$ENGINE_PORT/` works as before, exactly. This stays
+#     PER-WORKSPACE so multiple engines coexist.
+#   • GATEWAY_PORT = a FIXED machine-global port (default 5251 in dev, the
+#     gateway's own DEFAULT_GATEWAY_PORT; override with LUCIDOS_DEV_GATEWAY_PORT;
+#     the packaged desktop app keeps the historical 5252, so dev + packaged
+#     coexist out of the box) — NOT the
+#     per-workspace API_PORT. There is ONE shared gateway per machine; it binds
+#     this fixed port and serves `/<slug>/` (proxying to each engine) + the
+#     picker at `/~/`. A fixed port is required because every workspace launch
+#     reuses the SAME gateway (ADR 0014 §10) rather than starting its own.
+# Both are reachable at once in dev; the engine serves the built dist/ directly
+# via LUCIDOS_STATIC_DIR (no Vite in the serving path). Writes .lucidos/ports
+# (the engine's direct port, so the CLI reaches the engine). Exports env vars.
 swap_ports() {
-    INTERNAL_VITE_PORT="$API_PORT"
     ENGINE_PORT="$VITE_PORT"
+    GATEWAY_PORT="${LUCIDOS_DEV_GATEWAY_PORT:-5251}"
 
-    # Update ports file to reflect swapped assignments
+    # The ports file records the engine's direct port — the CLI / cross-workspace
+    # callers talk to the engine, not the gateway.
     cat > "$WORKSPACE/.lucidos/ports" <<EOF
 API_PORT=$ENGINE_PORT
 VITE_PORT=$ENGINE_PORT
+PG_PORT=$PG_PORT
+PG_DATABASE=$(workspace_database_name)
+DATABASE_URL=$(workspace_database_url)
 EOF
 
     detect_vite_tls
 
+    # LUCIDOS_API_PORT here is the ENGINE's port (the legacy/direct + tauri/e2e
+    # paths spawn the engine on it). start_gateway overrides LUCIDOS_API_PORT to
+    # GATEWAY_PORT for the gateway process itself.
     export LUCIDOS_API_PORT="$ENGINE_PORT"
-    export DATABASE_URL="postgres://lucidos:lucidos@localhost:$PG_PORT/lucidos"
+    export DATABASE_URL="$(workspace_database_url)"
     export WORKSPACE_PATH="$WORKSPACE"
-    export LUCIDOS_DEV_PROXY="$VITE_PROTO://localhost:$INTERNAL_VITE_PORT"
+    # The engine (direct) and the gateway (picker) both serve the built dist/.
+    export LUCIDOS_STATIC_DIR="$FRONTEND_DIR/dist"
 }
 
 source "$(dirname "${BASH_SOURCE[0]}")/sleep.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/engine_supervisor.sh"
+# Gateway gets its OWN supervisor (decoupled from the engine's) — a machine-global
+# daemon that survives the launching shell / terminal (run_gateway_supervised).
+source "$(dirname "${BASH_SOURCE[0]}")/gateway_supervisor.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/codesign.sh"
 
 # ── enable_clamshell_prevention ────────────────────────────────────────
@@ -942,6 +1549,236 @@ start_engine() {
     fi
 }
 
+# ── Workspace gateway (ADR 0014) ──────────────────────────────────────────
+# Dev runs ONE machine-global `lucidos-gateway` binary as the user-facing front
+# (on the fixed gateway port, default 5251 in dev — the packaged app keeps 5252).
+# It reverse-proxies /<slug>/ to each
+# workspace's engine (which it spawns + supervises) and serves the workspace
+# picker behind the sigil namespace /~/. The registry, pidfile, and log live
+# under a SHARED, machine-global dir ($HOME/.lucidos/gateway) — NOT per-workspace
+# — so every `web-dev.sh` launch accumulates into ONE registry served by ONE
+# gateway, and the picker lists every workspace ever launched (ADR 0014 §10). A
+# workspace's engine still binds its own per-workspace direct port (ENGINE_PORT =
+# VITE_PORT), so `https://localhost:$ENGINE_PORT/` reaches it directly too.
+# More workspaces are also created from the picker (the gateway then provisions
+# their Docker Postgres itself). Set LUCIDOS_NO_GATEWAY=1 to fall back to the
+# legacy direct-engine model (engine serves the app at / directly).
+
+# The gateway's app-data dir is machine-global (one gateway per machine), so it
+# is keyed off $HOME, not $WORKSPACE. Mirrors the gateway's own resolve_app_data
+# default ($HOME/.lucidos/gateway).
+gateway_data_dir() { echo "${LUCIDOS_GATEWAY_DATA:-$HOME/.lucidos/gateway}"; }
+gateway_pidfile()  { echo "$(gateway_data_dir)/gateway.pid"; }
+gateway_log()      { echo "$(gateway_data_dir)/gateway.log"; }
+
+# Stable, filesystem/URL-safe slug from the workspace dir basename — the routing
+# key (/<slug>/). Mirrors gateway::registry::slugify; empty → "workspace".
+workspace_slug() {
+    local s
+    s="$(basename "$WORKSPACE" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+    [ -n "$s" ] && echo "$s" || echo "workspace"
+}
+
+# Seed/refresh this workspace's entry in the SHARED gateway registry, preserving
+# every other workspace's entry AND this workspace's user-set display name +
+# autostart toggle (so a picker rename / autostart flip sticks across relaunch —
+# only the runtime fields dir/port are refreshed). A brand-new entry
+# is appended with autostart OFF (manual): an explicit launch starts it this
+# session, but it won't auto-start on a future gateway boot unless the user opts
+# in via the picker toggle. The registry `port` is the engine's DIRECT port
+# (ENGINE_PORT = the user-facing VITE_PORT, ADR 0014 §4): the gateway spawns the
+# engine network-bound there (so `https://localhost:$ENGINE_PORT/` works
+# directly) and proxies `/<slug>/` to it. Sets GATEWAY_WS_ID.
+seed_gateway_registry() {
+    local data reg id name
+    data="$(gateway_data_dir)"
+    mkdir -p "$data/config"
+    reg="$data/config/workspaces.json"
+    id="$(workspace_slug)"
+    name="$(basename "$WORKSPACE")"
+    GATEWAY_WS_ID="$id"
+    python3 - "$reg" "$id" "$name" "$WORKSPACE" "$ENGINE_PORT" <<'PY'
+import json, sys
+reg, wid, name, wdir, port = sys.argv[1:6]
+try:
+    with open(reg) as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+wss = data.get("workspaces", [])
+found = False
+for w in wss:
+    if w.get("id") == wid:
+        # Preserve user-set name + autostart; refresh only the runtime fields.
+        w["dir"] = wdir
+        w["port"] = int(port)
+        # ADR 0014 §6/§7: steady state is one shared PG cluster with one
+        # database per workspace. A legacy database_url meant "migrate from
+        # per-workspace PG"; once web-dev has migrated/verified this workspace,
+        # remove it so the gateway provisions/uses the shared DB.
+        w.pop("database_url", None)
+        w.setdefault("autostart", False)
+        found = True
+        break
+if not found:
+    wss.append({"id": wid, "name": name, "dir": wdir, "port": int(port),
+                "autostart": False})
+data["workspaces"] = wss
+with open(reg, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+    echo "Gateway registry: $reg  (workspace '$id' → engine :$ENGINE_PORT, database $(workspace_database_name), shared gateway :$GATEWAY_PORT)"
+}
+
+# Wait for /<slug>/api/v1/health — the engine the gateway spawned.
+wait_for_workspace_health() {
+    echo -n "Waiting for workspace '$GATEWAY_WS_ID' engine"
+    local i
+    for i in $(seq 1 90); do
+        if curl -sk "$PROTO://localhost:$GATEWAY_PORT/$GATEWAY_WS_ID/api/v1/health" >/dev/null 2>&1; then
+            echo " ready!"; return 0
+        fi
+        echo -n "."; sleep 1
+    done
+    echo ""
+    echo "WARNING: workspace engine not healthy yet — check the picker or the gateway log:"
+    echo "  $(gateway_log)"
+}
+
+# Start (or reuse) the ONE shared workspace gateway on the fixed GATEWAY_PORT. It
+# spawns + supervises each workspace's engine network-bound on its own
+# ENGINE_PORT (so the app is reachable directly there too, ADR 0014 §4) and
+# routes /<slug>/ + the picker at /~/. Because new workspaces default to
+# autostart OFF, the gateway's own boot does NOT spawn this workspace — so AFTER
+# the gateway is up we always POST its control API to start (or respawn, for an
+# Apply) THIS workspace's engine. Sets GATEWAY_PID; leaves ENGINE_SUPERVISOR_PID
+# EMPTY (the detached gateway supervisor is a machine-global daemon web-dev.sh
+# must never `wait` on — its non-tty wait falls back to the pidfile poll).
+start_gateway() {
+    GATEWAY_MODE=1
+    # GATEWAY_PORT (fixed, default 5251 in dev) and ENGINE_PORT (=VITE_PORT) are set by
+    # swap_ports. The gateway's data dir / pidfile / log are machine-global.
+    local gw_pidfile gw_log
+    mkdir -p "$(gateway_data_dir)"
+    gw_pidfile="$(gateway_pidfile)"
+    gw_log="$(gateway_log)"
+
+    export LUCIDOS_API_PORT="$GATEWAY_PORT"
+    export LUCIDOS_GATEWAY_DATA="$(gateway_data_dir)"
+    export LUCIDOS_GATEWAY_PG_BACKEND="docker"
+    export LUCIDOS_GATEWAY_PG_PORT="$PG_PORT"
+    export LUCIDOS_GATEWAY_PG_CONTAINER="$(shared_pg_container)"
+    export LUCIDOS_ENGINE_BIN="$ENGINE_BIN"
+    # Dev: the gateway spawns the engine NETWORK-BOUND on its port (not
+    # loopback-only) so `https://localhost:$ENGINE_PORT/` reaches the app
+    # directly, in addition to `…:$GATEWAY_PORT/<slug>/` through the gateway
+    # (ADR 0014 §4 — loopback-only is the packaged posture, not dev).
+    export LUCIDOS_GATEWAY_ENGINE_LOOPBACK="0"
+    # The gateway serves the picker from dist/ and passes LUCIDOS_STATIC_DIR
+    # through to the engines it spawns so they serve dist/ too (set by swap_ports;
+    # re-exported here for clarity).
+    export LUCIDOS_STATIC_DIR="$FRONTEND_DIR/dist"
+
+    # Reuse a healthy gateway already on the port (no -b restart). Ask it to
+    # (re)start this workspace's stack so a rebuilt binary / refreshed registry
+    # takes effect — this is the engine-only Apply path in gateway dev. The
+    # gateway's own surface lives behind the sigil namespace (/~/, ADR 0014 §2).
+    if [ -f "$gw_pidfile" ]; then
+        local existing; existing="$(cat "$gw_pidfile" 2>/dev/null || true)"
+        if [ -n "$existing" ] && kill -0 "$existing" 2>/dev/null \
+           && curl -sk "$PROTO://localhost:$GATEWAY_PORT/~/api/v1/health" >/dev/null 2>&1; then
+            echo "Reusing existing gateway (PID $existing) on port $GATEWAY_PORT"
+            GATEWAY_PID="$existing"; ENGINE_SUPERVISOR_PID=""
+            start_caffeinate
+            curl -sk -X POST "$PROTO://localhost:$GATEWAY_PORT/~/api/v1/control/workspaces/$GATEWAY_WS_ID/restart" >/dev/null 2>&1 || true
+            wait_for_workspace_health
+            return
+        fi
+    fi
+
+    echo ""
+    echo "Starting Lucidos workspace gateway..."
+    if [ -f "$gw_log" ]; then
+        local log_size; log_size=$(stat -f %z "$gw_log" 2>/dev/null || echo 0)
+        if [ "$log_size" -gt 10485760 ]; then
+            tail -c 1048576 "$gw_log" > "$gw_log.tmp" 2>/dev/null && mv "$gw_log.tmp" "$gw_log"
+        fi
+    fi
+    ulimit -n 8192 2>/dev/null
+    start_caffeinate
+
+    # Safety net: ensure GATEWAY_PORT is free before binding. kill_stale_processes
+    # already SIGUSR1'd + reaped a prior gateway on a `-b`; this clears a wedged or
+    # leftover one (e.g. the first `-b` after upgrading from the old gateway-on-
+    # the-user-port topology) so the fresh gateway doesn't hit AddrInUse.
+    if ! port_is_free "$GATEWAY_PORT"; then
+        local occ occ_cmd; occ=$(lsof -ti :"$GATEWAY_PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)
+        occ_cmd=$(ps -p "$occ" -o comm= 2>/dev/null || true)
+        # Only ever signal one of OUR binaries (never broad-kill a foreign
+        # occupant on this fixed gateway port — CLAUDE.md kill safety). The
+        # gateway (lucidos-gateway) or, on the first `-b` after an older
+        # topology, an old `lucidos-engine --gateway`.
+        if [ -n "$occ" ] && { [[ "$occ_cmd" == *lucidos-gateway* ]] || [[ "$occ_cmd" == *lucidos-engine* ]]; }; then
+            echo "Reclaiming gateway port $GATEWAY_PORT from $occ_cmd (PID $occ)..."
+            kill -USR1 "$occ" 2>/dev/null || true
+            local _i; for _i in $(seq 1 10); do port_is_free "$GATEWAY_PORT" && break; sleep 0.3; done
+            port_is_free "$GATEWAY_PORT" || kill -KILL "$occ" 2>/dev/null || true
+        fi
+    fi
+
+    # Spawn the DEDICATED gateway supervisor (gateway_supervisor.sh), NOT the
+    # engine's. It ignores SIGHUP/SIGINT/SIGTERM, so it survives this launcher's
+    # shell exiting and the terminal closing — the gateway is a machine-global
+    # daemon, not a child of this dev session (the orphan-on-terminal-close bug).
+    # `disown` removes it from this shell's job table so web-dev.sh never `wait`s
+    # on the daemon, and ENGINE_SUPERVISOR_PID is left EMPTY in gateway mode (the
+    # gateway, not start_engine, owns the engines) so web-dev.sh's non-tty wait
+    # falls back to the pidfile poll instead of blocking on the daemon.
+    ( run_gateway_supervised "$gw_pidfile" "$gw_log" "$GATEWAY_BIN" ) &
+    GATEWAY_SUPERVISOR_PID=$!
+    disown "$GATEWAY_SUPERVISOR_PID" 2>/dev/null || true
+    ENGINE_SUPERVISOR_PID=""
+
+    local pid_deadline=$(( $(date +%s) + 5 ))
+    while [ "$(date +%s)" -lt "$pid_deadline" ]; do
+        if [ -s "$gw_pidfile" ]; then
+            GATEWAY_PID="$(cat "$gw_pidfile" 2>/dev/null || true)"
+            [ -n "$GATEWAY_PID" ] && kill -0 "$GATEWAY_PID" 2>/dev/null && break
+        fi
+        sleep 0.1
+    done
+
+    echo -n "Waiting for gateway"
+    local ready="" i
+    for i in $(seq 1 30); do
+        if curl -sk "$PROTO://localhost:$GATEWAY_PORT/~/api/v1/health" >/dev/null 2>&1; then
+            echo " ready!"; ready="yes"; break
+        fi
+        echo -n "."; sleep 1
+    done
+    if [ -z "$ready" ]; then
+        echo ""
+        echo "ERROR: gateway failed to start within 30s. Check logs:"
+        tail -20 "$gw_log"
+        kill -KILL "$GATEWAY_SUPERVISOR_PID" 2>/dev/null || true
+        exit 1
+    fi
+    # Fresh gateway is up. Its boot adopts already-running engines + spawns
+    # autostart workspaces, but NOT this just-launched one (autostart defaults
+    # OFF), so start it explicitly via the control API — same call the reuse path
+    # makes, so both paths end with this workspace's engine running.
+    curl -sk -X POST "$PROTO://localhost:$GATEWAY_PORT/~/api/v1/control/workspaces/$GATEWAY_WS_ID/restart" >/dev/null 2>&1 || true
+    wait_for_workspace_health
+}
+
+# The gateway is now ONE shared machine-global process fronting every workspace,
+# so stop.sh's stop_workspace does NOT tear it down — it POSTs the gateway's
+# /stop control API to stop just the target workspace's engine (the gateway drops
+# that stack so its supervisor won't respawn it; the registry entry survives, so
+# the workspace stays listed in the picker as stopped). web-dev.sh's Ctrl+C trap
+# (cleanup_processes) likewise leaves the shared gateway running. To stop the
+# gateway itself: `kill $(cat "$(gateway_data_dir)/gateway.pid")`.
+
 # ── running_frontend_workspaces_in_project ─────────────────────────────
 # Echo workspace names whose frontend.pid points to a live Vite process
 # whose physical cwd is inside the given project directory. Comparison
@@ -982,21 +1819,22 @@ running_frontend_workspaces_in_project() (
 )
 
 # ── shared build-watch (checkout-level singleton) ───────────────────────
-# --built mode's `vite build --watch` produces the SHARED crates/lucidos-app/dist/
-# that every workspace of this checkout serves via its own `vite preview`. It is
-# therefore a checkout-level singleton, NOT per workspace: the first --built
-# workspace to start it owns it; later workspaces reuse it (start_frontend_built).
-# Rebuilding it per workspace would republish a byte-fresh sw.js into the shared
-# dist/ and spuriously fire the "New version available" toast on every OTHER
-# workspace's open tab (the determinism guard means identical source never changes
-# the BUILD_ID — so the toast only fires when a republish drags those tabs forward).
+# `vite build --watch` produces the SHARED crates/lucidos-app/dist/ that every
+# workspace of this checkout serves (each engine serves it directly via
+# LUCIDOS_STATIC_DIR, ADR 0014). It is therefore a checkout-level singleton, NOT
+# per workspace: the first workspace to start it owns it; later workspaces reuse
+# it (start_frontend_built). Rebuilding it per workspace would republish a
+# byte-fresh sw.js into the shared dist/ and spuriously fire the "New version
+# available" toast on every OTHER workspace's open tab (the determinism guard
+# means identical source never changes the BUILD_ID — so the toast only fires
+# when a republish drags those tabs forward).
 build_watch_pidfile() { echo "$PROJECT_DIR/crates/lucidos-app/.build-watch/pid"; }
 build_watch_log()     { echo "$PROJECT_DIR/crates/lucidos-app/.build-watch/log"; }
 
 # Tear down the shared build-watch only when NO workspace of this checkout is
 # still serving the frontend. Call AFTER this workspace's frontend.pid has been
 # removed, so running_frontend_workspaces_in_project no longer counts us. No-op
-# when no shared build-watch is recorded (e.g. --hmr mode).
+# when no shared build-watch is recorded.
 teardown_shared_build_watch_if_idle() {
     local pidfile; pidfile="$(build_watch_pidfile)"
     [ -f "$pidfile" ] || return 0
@@ -1007,6 +1845,33 @@ teardown_shared_build_watch_if_idle() {
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         echo "Stopping shared frontend build-watch (PID $pid) — no workspaces left serving this checkout"
         kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+}
+
+# ── release_frontend_marker ─────────────────────────────────────────────
+# Release a workspace's frontend marker (its `.lucidos/frontend.pid`). ADR 0014:
+# the engine serves the built dist/ directly — there is no per-workspace `vite
+# preview`. In built mode frontend.pid records the SHARED build-watch pid purely
+# for ref-counting (running_frontend_workspaces_in_project), so it must NEVER be
+# killed here (peers may share it) — only the FILE is removed; the shared watch's
+# fate is decided by teardown_shared_build_watch_if_idle. A frontend.pid that
+# differs from the shared build-watch pid is a genuine per-workspace process (the
+# legacy/e2e live dev server) and IS killed. Echoes "1" if it killed a process.
+release_frontend_marker() {
+    local pidfile="$1"
+    [ -f "$pidfile" ] || return 0
+    local fpid bwpid
+    fpid="$(cat "$pidfile" 2>/dev/null || true)"
+    bwpid="$(cat "$(build_watch_pidfile)" 2>/dev/null || true)"
+    if [ -n "$fpid" ] && [ "$fpid" != "$bwpid" ] && kill -0 "$fpid" 2>/dev/null; then
+        # Human message to stderr so callers' `$(release_frontend_marker …)` capture
+        # gets ONLY the "1" sentinel on stdout (and still surfaces the line).
+        echo "Stopping frontend dev server (PID $fpid)" >&2
+        kill "$fpid" 2>/dev/null || true
+        rm -f "$pidfile"
+        echo "1"
+        return 0
     fi
     rm -f "$pidfile"
 }
@@ -1156,98 +2021,33 @@ build_sdk() {
     (cd "$PROJECT_DIR/packages/lucidos-sdk" && npm run build)
 }
 
-# ── wait_for_frontend ────────────────────────────────────────────────────
-# Poll a probe URL until it returns the expected content-type, or fail (60s).
-# Args: $1 = probe URL, $2 = kind (`js` for the dev /@vite/client probe,
-# `html` for the built preview SPA-index probe). On timeout, tears down the
-# frontend (and the build-watch process, if any) and exits 1.
-wait_for_frontend() {
-    local probe_url="$1" kind="$2"
-    echo -n "Waiting for frontend"
-    local content_type="" ok="" deadline=$((SECONDS + 60))
-    while (( SECONDS < deadline )); do
-        # `|| true` keeps curl's exit 7 (connect refused while it spins up) from
-        # tripping `set -e` through the assignment on macOS bash 3.2.
-        content_type=$(curl -sk --connect-timeout 1 --max-time 2 -o /dev/null -w "%{content_type}" "$probe_url" 2>/dev/null || true)
-        case "$kind:$content_type" in
-            js:text/javascript*|js:application/javascript*) ok="yes" ;;
-            html:text/html*) ok="yes" ;;
-        esac
-        if [ -n "$ok" ]; then
-            echo " ready!"
-            return 0
-        fi
-        echo -n "."
-        sleep 1
-    done
-
-    echo ""
-    echo "ERROR: frontend did not become ready within 60 seconds." >&2
-    echo "  $probe_url returned content-type: ${content_type:-<no response>}" >&2
-    kill "$FRONTEND_PID" 2>/dev/null || true
-    rm -f "$FRONTEND_PIDFILE"
-    # Only tear down the shared build-watch if THIS launch started it (owns it);
-    # a reused one belongs to a sibling workspace still serving the checkout.
-    if [ -n "${BUILD_WATCH_OWNED:-}" ] && [ -n "${BUILD_WATCH_PID:-}" ]; then
-        kill "$BUILD_WATCH_PID" 2>/dev/null || true
-        rm -f "$(build_watch_pidfile)" 2>/dev/null || true
-    fi
-    exit 1
-}
-
 # ── start_vite ──────────────────────────────────────────────────────────
-# Install npm deps if needed, start the frontend on the internal port, wait
-# for ready. Two modes: a built frontend (the default — vite build --watch +
-# vite preview, no HMR), or the live Vite dev server (`--hmr`). Sets
-# FRONTEND_PID (and, in built mode, BUILD_WATCH_PID).
+# Install npm deps if needed, then ensure the shared `vite build --watch` is
+# running so dist/ exists + rebuilds on source change. ADR 0014: the engine
+# serves dist/ DIRECTLY (LUCIDOS_STATIC_DIR) — there is no `vite preview` and no
+# live dev server. ENGINE_ONLY restarts never reach here (web-dev.sh exits before
+# start_vite), so a CC Apply leaves the running build-watch untouched.
 start_vite() {
     ensure_frontend_deps
-    export VITE_PORT="$INTERNAL_VITE_PORT"
-    export API_PORT="$ENGINE_PORT"
-    detect_vite_tls
-
-    # Built frontend is the default: parse_dev_args sets BUILT=1 unless --hmr.
-    # The e2e harness drives start_vite without parse_dev_args and never sets
-    # BUILT, so `${BUILT:-}` is empty there → it stays on the live Vite dev
-    # server (unchanged by this default). ENGINE_ONLY restarts never reach here
-    # (web-dev.sh exits before start_vite), so a CC Apply restart leaves the
-    # already-running preview + build-watch untouched.
-    if [ -n "${BUILT:-}" ]; then
-        start_frontend_built
-    else
-        start_frontend_dev
-    fi
+    start_frontend_built
 }
 
-# Live Vite dev server with HMR.
-start_frontend_dev() {
-    echo "Starting Vite dev server..."
-    (cd "$FRONTEND_DIR" && npx vite --host --port "$INTERNAL_VITE_PORT") > /dev/null 2>&1 &
-    FRONTEND_PID=$!
-    echo $FRONTEND_PID > "$FRONTEND_PIDFILE"
-
-    # Probe `/@vite/client` instead of `/`. A wedged Vite (e.g. node_modules
-    # mutated under it) still returns 200 on `/` with the SPA index, so the
-    # old probe passed for a server that would serve a blank page. The Vite
-    # internal `/@vite/client` endpoint must return text/javascript — anything
-    # else means Vite is broken even if it's listening.
-    wait_for_frontend "$VITE_PROTO://localhost:$INTERNAL_VITE_PORT/@vite/client" js
-}
-
-# Built frontend: `vite build --watch` produces a bundled, content-hashed
-# dist/ (rebuilding on source change), served statically by `vite preview`.
-# No HMR — the SW caches /assets/* so an iOS PWA resumes instantly, and the
-# "New version available" toast (driven by the per-build sw.js stamp) signals
-# when a rebuild is ready to reload. Note: like the dev server, this skips
-# `tsc --noEmit` — type errors surface at the explicit build / in CC harden.
+# Built frontend: the build-watch (dev-build-watch.mjs) runs a clean `vite build`
+# per change, producing a bundled, content-hashed dist/ served DIRECTLY by the
+# engine via LUCIDOS_STATIC_DIR (ADR 0014 — no `vite preview`). The SW caches
+# /assets/* so an iOS PWA resumes instantly, and the "New version available" toast
+# (driven by the per-build sw.js stamp) signals when a rebuild is ready to reload.
+# Note: this skips `tsc --noEmit` — type errors surface at the explicit build / in
+# CC harden.
 #
-# The `vite build --watch` + dist/ are a CHECKOUT-LEVEL singleton shared by every
-# workspace of this checkout (build_watch_pidfile). This launch REUSES a healthy
-# shared build-watch instead of rebuilding when another workspace is already
-# serving the checkout — a rebuild would republish a byte-fresh sw.js into the
-# shared dist/ and spuriously fire "New version available" on those workspaces'
-# open tabs. A SOLO `-b` restart still rebuilds from scratch (clears a wedged
-# build-watch — the stale-CSS remedy — and matches the pre-singleton behavior).
+# The build-watch + dist/ are a CHECKOUT-LEVEL singleton shared by every workspace
+# of this checkout (build_watch_pidfile). This launch REUSES a healthy shared
+# build-watch instead of rebuilding when another workspace is already serving the
+# checkout — a rebuild would republish a byte-fresh sw.js into the shared dist/ and
+# spuriously fire "New version available" on those workspaces' open tabs. A SOLO
+# `-b` restart still rebuilds from scratch (matches the pre-singleton behavior).
+# (The build-watch can no longer serve stale CSS: each rebuild is a fresh `vite
+# build` process with no incremental cache — so there is no wedge to remedy.)
 start_frontend_built() {
     local bw_pidfile bw_log
     bw_pidfile="$(build_watch_pidfile)"
@@ -1259,6 +2059,12 @@ start_frontend_built() {
     if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null && [ -f "$FRONTEND_DIR/dist/index.html" ]; then
         healthy=1
     fi
+
+    # No age-based recycle needed any more: the build-watch (dev-build-watch.mjs)
+    # runs a CLEAN `vite build` in a fresh child process per change, so it has no
+    # long-lived incremental cache to wedge. The served dist/ always reflects the
+    # current source no matter how long the watch has run — the old "recycle an
+    # over-age watch to clear a stale-CSS wedge" heuristic is obsolete.
 
     # Is another workspace of THIS checkout currently serving the shared dist/?
     # (This workspace's own frontend.pid was removed by kill_stale_processes, so
@@ -1273,21 +2079,26 @@ start_frontend_built() {
     if [ -n "$healthy" ] && { [ -n "$others_serving" ] || [ -z "${BUILD:-}" ]; }; then
         echo "Reusing shared frontend build-watch (PID $existing_pid) serving $FRONTEND_DIR/dist."
         BUILD_WATCH_OWNED=""
+        BUILD_WATCH_PID="$existing_pid"
     else
         if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
             echo "Replacing existing frontend build-watch (PID $existing_pid)..."
             kill "$existing_pid" 2>/dev/null || true
         fi
-        echo "Building frontend (vite build --watch)..."
-        # Clean slate. dist/ is the LIVE dir preview serves; dist.staging/dist.prev
+        echo "Building frontend (fresh vite build per change)..."
+        # Clean slate. dist/ is the LIVE dir the engine serves; dist.staging/dist.prev
         # are the atomic-publish scratch dirs (LUCIDOS_ATOMIC_DIST in vite.config.ts):
-        # the watch builds into dist.staging and renames it onto dist/ only after a
-        # complete build, so a failed/interrupted rebuild can't leave preview serving
-        # a shell-less dist/ (the "404 on every page" failure mode).
+        # each build builds into dist.staging and renames it onto dist/ only after a
+        # complete build, so a failed/interrupted rebuild can't leave the engine
+        # serving a shell-less dist/ (the "404 on every page" failure mode).
         rm -rf "$FRONTEND_DIR/dist" "$FRONTEND_DIR/dist.staging" "$FRONTEND_DIR/dist.prev"
-        # Build output goes to a log (not /dev/null) so a build failure is one
-        # `tail` away instead of an unexplained 404.
-        (cd "$FRONTEND_DIR" && LUCIDOS_ATOMIC_DIST=1 npx vite build --watch) > "$bw_log" 2>&1 &
+        # dev-build-watch.mjs runs a clean `vite build` (fresh process, no
+        # incremental cache → no stale-CSS wedge) on every change, setting
+        # LUCIDOS_ATOMIC_DIST for each child build itself. Output goes to a log
+        # (not /dev/null) so a build failure is one `tail` away. `exec` makes the
+        # tracked pid the node watcher itself, so teardown's `kill` lands on it
+        # (firing its SIGTERM handler → kills the in-flight build, no orphan).
+        (cd "$FRONTEND_DIR" && exec node dev-build-watch.mjs) > "$bw_log" 2>&1 &
         BUILD_WATCH_PID=$!
         BUILD_WATCH_OWNED=1
         echo "$BUILD_WATCH_PID" > "$bw_pidfile"
@@ -1298,7 +2109,7 @@ start_frontend_built() {
             if [ -f "$FRONTEND_DIR/dist/index.html" ]; then echo " done!"; break; fi
             if ! kill -0 "$BUILD_WATCH_PID" 2>/dev/null; then
                 echo ""
-                echo "ERROR: vite build --watch exited before producing dist/index.html. See $bw_log" >&2
+                echo "ERROR: frontend build-watch exited before producing dist/index.html. See $bw_log" >&2
                 rm -f "$bw_pidfile"
                 exit 1
             fi
@@ -1314,15 +2125,14 @@ start_frontend_built() {
         fi
     fi
 
-    echo "Starting vite preview..."
-    # Serve the published LIVE dir explicitly — the build redirects build.outDir to
-    # dist.staging under LUCIDOS_ATOMIC_DIST, but preview must always serve dist/.
-    (cd "$FRONTEND_DIR" && npx vite preview --host --port "$INTERNAL_VITE_PORT" --outDir dist) > /dev/null 2>&1 &
-    FRONTEND_PID=$!
-    echo $FRONTEND_PID > "$FRONTEND_PIDFILE"
-
-    # Preview serves the SPA index (text/html) — a built app has no /@vite/client.
-    wait_for_frontend "$VITE_PROTO://localhost:$INTERNAL_VITE_PORT/" html
+    # No `vite preview` (ADR 0014): the engine serves dist/ directly via
+    # LUCIDOS_STATIC_DIR. Record this workspace's "serving" marker as the SHARED
+    # build-watch pid so teardown ref-counting (running_frontend_workspaces_in_project
+    # → teardown_shared_build_watch_if_idle) keeps the watch alive while any
+    # workspace of the checkout is up, and tears it down when the last one stops.
+    # release_frontend_marker never kills this pid (it matches the build-watch).
+    FRONTEND_PID="$BUILD_WATCH_PID"
+    echo "$FRONTEND_PID" > "$FRONTEND_PIDFILE"
 }
 
 # ── sleep_prevention_status ─────────────────────────────────────────────
@@ -1360,25 +2170,28 @@ show_banner() {
         echo "  Lucidos dev server ready"
     fi
     echo "  Workspace:   $WORKSPACE"
-    echo "  Local:       $PROTO://localhost:$ENGINE_PORT"
-    echo "  Network:     $PROTO://$local_ip:$ENGINE_PORT"
+    # Dev topology (ADR 0014 §4): the engine is reachable DIRECTLY on its port
+    # (app at /), AND through the gateway on GATEWAY_PORT under /<slug>/ (picker
+    # at /~/). Legacy direct-engine mode (no gateway) prints just the engine URL.
+    echo "  Local:       $PROTO://localhost:$ENGINE_PORT/"
+    echo "  Network:     $PROTO://$local_ip:$ENGINE_PORT/"
     if [ -n "$ts_hostname" ]; then
-        echo "  Tailscale:   $PROTO://$ts_hostname:$ENGINE_PORT"
+        echo "  Tailscale:   $PROTO://$ts_hostname:$ENGINE_PORT/"
     fi
-    # Frontend line is mode-aware: only the full web launch (`mode = web`) knows
-    # the chosen frontend mode via BUILT. tauri-dev always runs the live dev
-    # server (`npm run dev`) regardless of BUILT; an --engine-only restart never
-    # touched the frontend, so it can't claim a mode.
-    if [ "$mode" = "tauri" ]; then
-        echo "  Vite HMR:    $PROTO://localhost:$INTERNAL_VITE_PORT"
-    elif [ "$mode" = "engine-only" ]; then
-        echo "  Frontend:    $PROTO://localhost:$INTERNAL_VITE_PORT (unchanged)"
-    elif [ -n "${BUILT:-}" ]; then
-        echo "  Frontend:    built (vite preview) $PROTO://localhost:$INTERNAL_VITE_PORT"
+    if [ -n "${GATEWAY_MODE:-}" ] && [ -n "${GATEWAY_WS_ID:-}" ]; then
+        echo "  Gateway:     $PROTO://localhost:$GATEWAY_PORT/$GATEWAY_WS_ID/  (workspace via gateway)"
+        echo "  Picker:      $PROTO://localhost:$GATEWAY_PORT/~/"
+    fi
+    # ADR 0014: the engine serves the built dist/ directly (no Vite in the
+    # serving path) in every mode, including tauri-dev (the window loads dist/
+    # from the engine via devUrl). An --engine-only restart leaves the running
+    # build-watch untouched.
+    if [ "$mode" = "engine-only" ]; then
+        echo "  Frontend:    built dist/ served by the engine (unchanged)"
     else
-        echo "  Vite HMR:    $PROTO://localhost:$INTERNAL_VITE_PORT"
+        echo "  Frontend:    built dist/ served by the engine (fresh vite build per change)"
     fi
-    echo "  PostgreSQL:  localhost:$PG_PORT"
+    echo "  PostgreSQL:  shared localhost:$PG_PORT / $(workspace_database_name)"
     echo "  Engine:      Native macOS"
     echo "  Sleep:       $(sleep_prevention_status)"
     echo "  Log:         $ENGINE_LOG"
@@ -1391,17 +2204,19 @@ show_banner() {
 cleanup_processes() {
     echo ""
     release_sleep_lock
-    if [ -f "$FRONTEND_PIDFILE" ]; then
-        kill "$(cat "$FRONTEND_PIDFILE" 2>/dev/null)" 2>/dev/null || true
-        rm -f "$FRONTEND_PIDFILE"
-    fi
-    # The --built mode `vite build --watch` is a checkout-level singleton shared
-    # across workspaces; tear it down only when no workspace is still serving
-    # this checkout's frontend (this workspace's frontend.pid was removed just
-    # above, so it no longer counts). No-op in --hmr mode.
+    # Release this workspace's frontend marker (never kills the shared build-watch
+    # — see release_frontend_marker; ADR 0014).
+    release_frontend_marker "$FRONTEND_PIDFILE" >/dev/null
+    # The `vite build --watch` is a checkout-level singleton shared across
+    # workspaces; tear it down only when no workspace is still serving this
+    # checkout's frontend (this workspace's frontend.pid was removed just above,
+    # so it no longer counts).
     teardown_shared_build_watch_if_idle
     echo "Engine still running for workspace: $WORKSPACE (port $ENGINE_PORT)"
     echo "Stop with: ./scripts/stop.sh -w $WORKSPACE"
-    echo "PostgreSQL still running (container lucidos-pg-$PG_NAME). Stop with:"
-    echo "  ./scripts/stop.sh -w $WORKSPACE --force"
+    echo "Shared PostgreSQL still running (container $(shared_pg_container)) for all workspaces."
+    if _legacy_postgres_exists; then
+        echo "Legacy per-workspace PostgreSQL is preserved for rollback. Decommission after verifying with:"
+        echo "  ./scripts/decommission-legacy-postgres.sh -w $WORKSPACE"
+    fi
 }

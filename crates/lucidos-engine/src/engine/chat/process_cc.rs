@@ -137,7 +137,7 @@ impl LucidosEngine {
         // Direct run_direct_agent here is NOT a parallel path:
         // `run_cc_chat_branch` IS the CC slow path of
         // `process_message_with_steps_internal` (chat/process.rs's
-        // `use_claude_code == Some(true)` branch routes here). The
+        // `use_coding_agent == Some(true)` branch routes here). The
         // unified router funnels every chat-driven and agent-driven CC
         // turn through this call; it's the bottom of the funnel.
         let result = self

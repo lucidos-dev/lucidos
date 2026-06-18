@@ -34,10 +34,19 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'devices', label: 'Devices', subview: 'devices', path: 'Settings' },
   { id: 'accounts', label: 'Accounts', subview: 'accounts', path: 'Settings' },
   { id: 'repositories', label: 'Repositories', subview: 'repositories', path: 'Settings' },
-  { id: 'backup', label: 'Backup', subview: 'backup', path: 'Settings' },
-  { id: 'memory', label: 'Memory', subview: 'memory', path: 'Settings' },
   { id: 'permissions', label: 'Permissions', subview: 'permissions', path: 'Settings', keywords: 'permissions security command guard safety allowlist claude code lucidos agent bash python tools' },
   { id: 'keyboard-shortcuts', label: 'Keyboard Shortcuts', subview: 'keyboard-shortcuts', path: 'Settings', keywords: 'keybindings hotkeys shortcut' },
+  { id: 'system', label: 'System', subview: 'system', path: 'Settings', keywords: 'connection status workspace path api versions build uptime restart refresh update' },
+
+  // System subpanels
+  { id: 'backup', label: 'Backup', subview: 'backup', path: 'Settings → System' },
+  { id: 'memory', label: 'Memory', subview: 'memory', path: 'Settings → System' },
+  { id: 'disk-usage', label: 'Disk Usage', subview: 'disk-usage', path: 'Settings → System', keywords: 'storage space disk usage data' },
+
+  // System overview
+  { id: 'system:connection', label: 'Connection', subview: 'system', path: 'Settings → System', anchor: 'system:connection', keywords: 'status workspace path api url' },
+  { id: 'system:versions', label: 'Versions', subview: 'system', path: 'Settings → System', anchor: 'system:versions', keywords: 'lucidos engine client build release uptime' },
+  { id: 'system:maintenance', label: 'Maintenance', subview: 'system', path: 'Settings → System', anchor: 'system:maintenance', keywords: 'restart rebuild refresh update client engine' },
 
   // Models subview
   { id: 'models:chat', label: 'Chat', subview: 'models', path: 'Settings → Models', anchor: 'models:chat' },
@@ -63,9 +72,8 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'appearance:mobile', label: 'Mobile', subview: 'appearance', path: 'Settings → Appearance', anchor: 'appearance:mobile' },
   { id: 'appearance:mobile-header-sticky', label: 'Keep header visible', subview: 'appearance', path: 'Settings → Appearance → Mobile', anchor: 'appearance:mobile-header-sticky' },
 
-  // Backup subview
-  { id: 'backup:restore', label: 'Restore from backup', subview: 'backup', path: 'Settings → Backup', anchor: 'backup:restore' },
-  { id: 'backup:provider', label: 'Provider', subview: 'backup', path: 'Settings → Backup', anchor: 'backup:provider' },
+  // Backup subview (restore moved to the workspace picker — no in-app entry)
+  { id: 'backup:provider', label: 'Provider', subview: 'backup', path: 'Settings → System → Backup', anchor: 'backup:provider' },
 
   // Accounts subview
   { id: 'accounts:credentials', label: 'Credentials', subview: 'accounts', path: 'Settings → Accounts', anchor: 'accounts:credentials' },

@@ -1,8 +1,48 @@
 use super::super::LucidosEngine;
-use crate::core::PreferenceStore;
+use crate::core::environment_variables::validate_name;
+use crate::core::{EnvironmentVariableStore, PreferenceStore};
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 
 impl LucidosEngine {
+    /// Handler for the `set_environment_variable` tool — the LLM-suggestable path
+    /// to define a user environment variable (Settings → System → Environment
+    /// variables). Validates the name (shape + not engine-reserved), upserts, and
+    /// emits `EnvironmentVariableSet` (value carried — these are non-secret).
+    /// Takes effect on the next spawned subprocess; no restart.
+    pub(crate) async fn execute_environment_variable_tool(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let name = args["name"].as_str().unwrap_or("").trim();
+        let value = args["value"].as_str().unwrap_or("");
+
+        if name.is_empty() {
+            return Ok("Error: name is required".to_string());
+        }
+        if let Err(rejection) = validate_name(name) {
+            return Ok(format!("Error: {}", rejection.message(name)));
+        }
+
+        if let Err(e) = EnvironmentVariableStore::upsert(&self.pool, name, value).await {
+            return Ok(format!("Error: Failed to save environment variable: {}", e));
+        }
+
+        self.event_bus
+            .emit(BusEvent::System(SystemEvent::EnvironmentVariableSet {
+                name: name.to_string(),
+                value: value.to_string(),
+                actor: None,
+            }))
+            .await?;
+
+        Ok(format!(
+            "[ACTION COMPLETED] Environment variable '{}' set. It is injected into newly \
+             spawned subprocesses (run_bash, run_python, scheduled scripts, coding agents) — \
+             no restart needed. Note these are NOT secret; for API keys/tokens use a credential.",
+            name
+        ))
+    }
+
     pub(crate) async fn execute_preferences_tool(
         &self,
         name: &str,
@@ -98,8 +138,17 @@ impl LucidosEngine {
                 }
 
                 if enabled {
-                    // Return marker — the SSE processing loop will detect this and send the event
-                    Ok("[PUSH_NOTIFICATION_REQUEST][ACTION COMPLETED] Push notifications enabled. The browser will now ask for permission to show notifications.".to_string())
+                    // Return marker — the SSE processing loop (agentic_loop/run.rs) keys off
+                    // the `[PUSH_NOTIFICATION_REQUEST]` prefix to emit the thread event that
+                    // drives the frontend `initPushSubscription()` handshake, so it MUST stay
+                    // first. The rest is platform-aware copy for the LLM to relay: the browser
+                    // permission prompt only exists on web / PWA. The desktop (Tauri) app has no
+                    // such prompt — its WKWebView can't subscribe to Web Push, so it renders
+                    // native macOS notifications (UNUserNotificationCenter) governed by System
+                    // Settings, which only work in a packaged build; native banners are inert in
+                    // a tauri-dev build, so dev uses the browser/PWA web-push path instead. See
+                    // system-knowhow/notifications.md §4 "Enabling".
+                    Ok("[PUSH_NOTIFICATION_REQUEST][ACTION COMPLETED] Push notifications enabled for this device. Tell the user what to expect based on how they run Lucidos: in a web browser or installed PWA, the browser will now ask for notification permission — they should click Allow; in the packaged desktop app there is no browser or in-app permission prompt — notifications arrive as native macOS notifications governed by System Settings → Notifications (macOS asks for permission on first launch; if no banner appears, allow Lucidos there). Note: in a development build (tauri-dev) native desktop banners don't appear at all — run Lucidos in a browser/PWA to receive notifications while developing. Either way, they'll get notifications for triggered tasks and alerts.".to_string())
                 } else {
                     Ok("[ACTION COMPLETED] Push notifications declined. The user won't be asked again.".to_string())
                 }

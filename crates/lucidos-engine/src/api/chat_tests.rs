@@ -133,7 +133,7 @@ fn base_req(mode: ActorMode) -> ChatRequest {
         images: None,
         image_hashes: None,
         device_id: None,
-        use_claude_code: None,
+        use_coding_agent: None,
         coding_agent: None,
         cc_model: None,
         event_id: None,
@@ -223,7 +223,7 @@ fn invalid_spawning_event_uuid_returns_400() {
 fn chat_request_requires_mode() {
     let body = serde_json::json!({
         "message": "spawned task",
-        "use_claude_code": true,
+        "use_coding_agent": true,
     });
     let result: Result<ChatRequest, _> = serde_json::from_value(body);
     assert!(result.is_err(), "ChatRequest must require mode field");
@@ -237,6 +237,20 @@ fn chat_request_mode_field_deserializes() {
     });
     let req: ChatRequest = serde_json::from_value(body).unwrap();
     assert_eq!(req.mode, ActorMode::Human);
+}
+
+#[test]
+fn chat_request_accepts_legacy_use_claude_code_alias() {
+    // Back-compat: payloads persisted / sent before the
+    // `use_claude_code` → `use_coding_agent` rename (queued ThreadQueueRequest
+    // rows, in-flight clients) must still deserialize via the serde alias.
+    let body = serde_json::json!({
+        "message": "spawned task",
+        "mode": "agent",
+        "use_claude_code": true,
+    });
+    let req: ChatRequest = serde_json::from_value(body).unwrap();
+    assert_eq!(req.use_coding_agent, Some(true));
 }
 
 #[test]
@@ -325,20 +339,28 @@ fn continuity_chat_thread_with_chat_followup_is_ok() {
 #[test]
 fn continuity_chat_thread_rejects_cc_followup() {
     let err =
-        validate_thread_continuity(Some("chat"), None, None, Some(true), Some("repo-a"), None).unwrap_err();
+        validate_thread_continuity(Some("chat"), None, None, Some(true), Some("repo-a"), None)
+            .unwrap_err();
     assert_eq!(err.0, StatusCode::CONFLICT);
     assert!(err.1.contains("Lucidos"));
-    assert!(err.1.contains("Claude Code"));
+    assert!(err.1.contains("coding-agent"));
 }
 
 #[test]
 fn continuity_cc_thread_rejects_chat_followup() {
-    let err = validate_thread_continuity(Some("claude_code"), Some("repo-a"), None, None, None, None)
-        .unwrap_err();
-    assert_eq!(err.0, StatusCode::CONFLICT);
     let err =
-        validate_thread_continuity(Some("claude_code"), Some("repo-a"), None, Some(false), None, None)
+        validate_thread_continuity(Some("claude_code"), Some("repo-a"), None, None, None, None)
             .unwrap_err();
+    assert_eq!(err.0, StatusCode::CONFLICT);
+    let err = validate_thread_continuity(
+        Some("claude_code"),
+        Some("repo-a"),
+        None,
+        Some(false),
+        None,
+        None,
+    )
+    .unwrap_err();
     assert_eq!(err.0, StatusCode::CONFLICT);
 }
 
@@ -375,10 +397,15 @@ fn continuity_cc_thread_rejects_different_repo() {
 fn continuity_cc_thread_with_no_request_repo_is_ok() {
     // Request omits repo_id => frontend will inherit from the thread.
     // Don't 409 just because the field is missing.
-    assert!(
-        validate_thread_continuity(Some("claude_code"), Some("repo-a"), None, Some(true), None, None)
-            .is_ok()
-    );
+    assert!(validate_thread_continuity(
+        Some("claude_code"),
+        Some("repo-a"),
+        None,
+        Some(true),
+        None,
+        None
+    )
+    .is_ok());
 }
 
 #[test]
@@ -386,10 +413,15 @@ fn continuity_cc_thread_with_no_existing_repo_is_ok() {
     // First Claude Code session bound but cc_repo_id wasn't recorded (e.g. older
     // event before SessionStarted carried repo_id). Don't gate on a
     // missing existing value — just let the request through.
-    assert!(
-        validate_thread_continuity(Some("claude_code"), None, None, Some(true), Some("repo-b"), None)
-            .is_ok()
-    );
+    assert!(validate_thread_continuity(
+        Some("claude_code"),
+        None,
+        None,
+        Some(true),
+        Some("repo-b"),
+        None
+    )
+    .is_ok());
 }
 
 #[test]
@@ -447,40 +479,85 @@ fn continuity_cc_thread_accepts_matching_backend() {
 
 #[test]
 fn continuity_trigger_thread_treated_as_chat() {
-    // Trigger threads aren't claude_code, so use_claude_code=true is a
-    // mode switch and must be rejected.
-    let err = validate_thread_continuity(Some("trigger"), None, None, Some(true), None, None).unwrap_err();
-        assert_eq!(err.0, StatusCode::CONFLICT);
+    // Trigger threads aren't coding-agent threads, so use_coding_agent=true is
+    // a mode switch and must be rejected.
+    let err = validate_thread_continuity(Some("trigger"), None, None, Some(true), None, None)
+        .unwrap_err();
+    assert_eq!(err.0, StatusCode::CONFLICT);
+}
+
+// ── drain_orphan_queue ──
+
+fn make_orphan(text: &str) -> InjectedPrompt {
+    InjectedPrompt {
+        text: text.to_string(),
+        event_id: Some(Uuid::new_v4()),
+        mode: ActorMode::Human,
+        spawning_event_id: None,
+        images: None,
+        origin: None,
+        kind: crate::engine::InjectedPromptKind::UserText,
     }
+}
 
-    // ── drain_orphan_queue ──
-
-    fn make_orphan(text: &str) -> InjectedPrompt {
-        InjectedPrompt {
-            text: text.to_string(),
-            event_id: Some(Uuid::new_v4()),
-            mode: ActorMode::Human,
-            spawning_event_id: None,
-            images: None,
-            origin: None,
-            kind: crate::engine::InjectedPromptKind::UserText,
-        }
+fn make_wake(text: &str) -> InjectedPrompt {
+    InjectedPrompt {
+        text: text.to_string(),
+        event_id: Some(Uuid::new_v4()),
+        mode: ActorMode::Agent,
+        spawning_event_id: Some(Uuid::new_v4()),
+        images: None,
+        origin: None,
+        kind: crate::engine::InjectedPromptKind::WakeFromChild,
     }
+}
 
-    #[tokio::test]
-    async fn drain_orphan_queue_processes_each_initial_orphan_in_order() {
-        let initial = vec![make_orphan("a"), make_orphan("b"), make_orphan("c")];
-    let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+#[tokio::test]
+async fn drain_orphan_queue_coalesces_contiguous_user_orphans_in_order() {
+    let initial = vec![make_orphan("a"), make_orphan("b"), make_orphan("c")];
+    let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
     let processed_clone = processed.clone();
-    drain_orphan_queue(initial, move |orphan| {
+    drain_orphan_queue(initial, move |orphans| {
         let processed = processed_clone.clone();
         async move {
-            processed.lock().unwrap().push(orphan.text.clone());
+            processed
+                .lock()
+                .unwrap()
+                .push(orphans.into_iter().map(|orphan| orphan.text).collect());
             Vec::new()
         }
     })
     .await;
-    assert_eq!(*processed.lock().unwrap(), vec!["a", "b", "c"]);
+    assert_eq!(
+        *processed.lock().unwrap(),
+        vec![vec!["a".to_string(), "b".to_string(), "c".to_string()]]
+    );
+}
+
+#[tokio::test]
+async fn drain_orphan_queue_keeps_wake_from_child_separate() {
+    let initial = vec![make_orphan("a"), make_wake("wake"), make_orphan("b")];
+    let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+    let processed_clone = processed.clone();
+    drain_orphan_queue(initial, move |orphans| {
+        let processed = processed_clone.clone();
+        async move {
+            processed
+                .lock()
+                .unwrap()
+                .push(orphans.into_iter().map(|orphan| orphan.text).collect());
+            Vec::new()
+        }
+    })
+    .await;
+    assert_eq!(
+        *processed.lock().unwrap(),
+        vec![
+            vec!["a".to_string()],
+            vec!["wake".to_string()],
+            vec!["b".to_string()]
+        ]
+    );
 }
 
 // Regression: a re-processed orphan whose own loop produces NEW orphans
@@ -495,10 +572,11 @@ async fn drain_orphan_queue_processes_orphans_of_orphans() {
     let initial = vec![make_orphan("a")];
     let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let processed_clone = processed.clone();
-    drain_orphan_queue(initial, move |orphan| {
+    drain_orphan_queue(initial, move |orphans| {
         let processed = processed_clone.clone();
         async move {
-            let text = orphan.text.clone();
+            assert_eq!(orphans.len(), 1);
+            let text = orphans[0].text.clone();
             processed.lock().unwrap().push(text.clone());
             if text == "a" {
                 vec![make_orphan("b")]
@@ -517,11 +595,13 @@ async fn drain_orphan_queue_handles_deep_chains() {
     let initial = vec![make_orphan("0")];
     let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let processed_clone = processed.clone();
-    drain_orphan_queue(initial, move |orphan| {
+    drain_orphan_queue(initial, move |orphans| {
         let processed = processed_clone.clone();
         async move {
-            let n: i32 = orphan.text.parse().unwrap();
-            processed.lock().unwrap().push(orphan.text);
+            assert_eq!(orphans.len(), 1);
+            let text = orphans.into_iter().next().unwrap().text;
+            let n: i32 = text.parse().unwrap();
+            processed.lock().unwrap().push(text);
             if n < 4 {
                 vec![make_orphan(&(n + 1).to_string())]
             } else {
@@ -537,7 +617,7 @@ async fn drain_orphan_queue_handles_deep_chains() {
 async fn drain_orphan_queue_no_op_for_empty_initial() {
     let processed = std::sync::Arc::new(std::sync::Mutex::new(0usize));
     let processed_clone = processed.clone();
-    drain_orphan_queue(vec![], move |_orphan| {
+    drain_orphan_queue(vec![], move |_orphans| {
         let processed = processed_clone.clone();
         async move {
             *processed.lock().unwrap() += 1;
@@ -546,4 +626,104 @@ async fn drain_orphan_queue_no_op_for_empty_initial() {
     })
     .await;
     assert_eq!(*processed.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn queued_message_lookup_binds_thread_aggregate_id_as_text() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _cb_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let injected_message_id = Uuid::new_v4();
+    let removed_message_id = Uuid::new_v4();
+
+    bus.emit(crate::engine::event_bus::BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: "queued".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            event_id: Some(injected_message_id),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .expect("MessageReceived must persist");
+
+    bus.emit(crate::engine::event_bus::BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::UserPromptInjected {
+            text: "queued".into(),
+            mode: ActorMode::Human,
+            origin: None,
+            injected_message_id: Some(injected_message_id),
+        },
+        meta: EventMeta {
+            request_event_id: Some(injected_message_id),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .expect("UserPromptInjected must persist");
+
+    bus.emit(crate::engine::event_bus::BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: "remove me".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            event_id: Some(removed_message_id),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .expect("second MessageReceived must persist");
+
+    bus.emit(crate::engine::event_bus::BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::QueuedMessageRemoved { removed_message_id },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .expect("QueuedMessageRemoved must persist");
+
+    assert!(
+        queued_message_already_injected(&pool, thread_id, injected_message_id)
+            .await
+            .expect("injected lookup must not type-error"),
+        "injected lookup must find the matching marker"
+    );
+    assert!(
+        queued_message_already_removed(&pool, thread_id, removed_message_id)
+            .await
+            .expect("removed lookup must not type-error"),
+        "removed lookup must find the matching marker"
+    );
+    assert!(
+        !queued_message_already_injected(&pool, thread_id, removed_message_id)
+            .await
+            .expect("non-match lookup must not type-error"),
+        "lookup must not match the wrong marker field"
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
 }

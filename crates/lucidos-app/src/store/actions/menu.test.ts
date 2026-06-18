@@ -33,11 +33,15 @@ vi.mock('../../utils/viewport', () => ({ isMobile: () => true }));
 // Mock credentials loader (called by openSettingsSubview('accounts'))
 vi.mock('./credentials', () => ({ loadCredentials: vi.fn().mockResolvedValue(undefined) }));
 
+// Mock env var loader (called by openSettingsSubview('environment-variables'))
+vi.mock('./environmentVariables', () => ({ loadEnvironmentVariables: vi.fn().mockResolvedValue(undefined) }));
+
 // Mock API calls triggered by switchMenuItem's data loaders
 vi.mock('../../api/client', () => ({
   getNotifications: vi.fn().mockResolvedValue({ notifications: [], unread_count: 0, has_more: false }),
   listTriggers: vi.fn().mockResolvedValue({ triggers: [] }),
   listAppsApi: vi.fn().mockResolvedValue([]),
+  fetchPluginCatalog: vi.fn().mockResolvedValue({ marketplaces: [], plugins: [], errors: [] }),
   listDevices: vi.fn().mockResolvedValue({ devices: [] }),
 }));
 
@@ -142,6 +146,7 @@ describe('switchMenuItem', () => {
     expect(activeMenuItem.value).toBe('thread-queue');
     expect(revealContentPane).toHaveBeenCalledTimes(1);
   });
+
 });
 
 describe('openSettingsSubview', () => {
@@ -184,6 +189,12 @@ describe('openSettingsSubview', () => {
     // on mobile — without this, tapping a settings deep-link from a chat on
     // mobile silently left the user on the thread pane.
     openSettingsSubview('devices');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens the environment-variables subview', () => {
+    openSettingsSubview('environment-variables');
+    expect(settingsSubview.value).toBe('environment-variables');
     expect(revealContentPane).toHaveBeenCalledTimes(1);
   });
 });

@@ -52,7 +52,7 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
     // must update the inline value to match the SSE-resolved theme so the
     // body's `var(--bg-primary, ...)` paints the right color even though
     // inline styles win over the stylesheet cascade.
-    const inlineProps: Record<string, string> = { '--bg-primary': '#0d1117' };
+    const inlineProps: Record<string, string> = { '--bg-primary': '#0b2342' };
     const realStyle = (document as any).documentElement.style;
     (document as any).documentElement.style = {
       setProperty: (k: string, v: string) => { inlineProps[k] = v; },

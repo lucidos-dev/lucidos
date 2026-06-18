@@ -537,7 +537,7 @@ async fn branch_changed_files_filters_lucidos_runtime_paths() {
     .await
     .unwrap();
     let _ = git_cmd(&["add", "-A"], &repo).await.unwrap();
-    let _ = git_cmd(&["commit", "-m", "Claude Code changes"], &repo)
+    let _ = git_cmd(&["commit", "-m", "Coding agent changes"], &repo)
         .await
         .unwrap();
 

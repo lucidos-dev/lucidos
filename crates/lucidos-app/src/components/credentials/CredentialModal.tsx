@@ -144,6 +144,7 @@ function CredentialFormInner({
   const initialBaseUrl = existingCred?.base_url || request?.base_url || '';
   const initialAuthType = existingCred?.auth_type || request?.auth_type || 'api_key';
   const initialAuthHeader = existingCred?.auth_header || 'Authorization';
+  const initialEnvVarName = existingCred?.env_var_name || request?.env_var_name || '';
   const serviceDisabled = !!editing || !!request?.service;
 
   const instructions = request?.prompt || null;
@@ -163,6 +164,7 @@ function CredentialFormInner({
   const serviceRef = useRef<HTMLInputElement>(null);
   const baseUrlRef = useRef<HTMLInputElement>(null);
   const authHeaderRef = useRef<HTMLInputElement>(null);
+  const envVarNameRef = useRef<HTMLInputElement>(null);
   const valueRef = useRef<HTMLInputElement>(null);
   const usernameRef = useRef<HTMLInputElement>(null);
   const passwordRef = useRef<HTMLInputElement>(null);
@@ -239,6 +241,8 @@ function CredentialFormInner({
     const baseUrl = baseUrlRef.current?.value.trim() || '';
     const authType = selectedAuthType;
     const fields = collectFields();
+    // Custom env var name is offered for every type except email_password.
+    const envVarName = isEmailPassword ? undefined : envVarNameRef.current?.value.trim() || undefined;
 
     if (authType === 'oauth_client') {
       // Pair validation: if either custom endpoint URL is given, both must be.
@@ -278,10 +282,11 @@ function CredentialFormInner({
         auth_header: authHeaderRef.current?.value.trim() || initialAuthHeader,
         auth_value: authValue,
         email,
+        env_var_name: envVarName,
       };
       await submitCredentialEdit(editing, body);
     } else {
-      await submitNewCredential(service, baseUrl, authType, authValue);
+      await submitNewCredential(service, baseUrl, authType, authValue, envVarName);
     }
   }
 
@@ -327,6 +332,16 @@ function CredentialFormInner({
                 value={selectedAuthType}
                 onChange={(v) => setSelectedAuthType(v as AuthType)}
               />
+            </div>
+            <div class="form-group">
+              <label>Env var name <span class="form-hint">(optional)</span></label>
+              <input
+                ref={envVarNameRef}
+                type="text"
+                defaultValue={initialEnvVarName}
+                placeholder="MY_API_TOKEN"
+              />
+              <div class="form-hint">Also injects the secret under this name, in addition to the default CRED_&lt;NAME&gt;.</div>
             </div>
           </>
         )}

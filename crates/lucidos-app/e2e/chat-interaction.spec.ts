@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import {
   navigateToApp, sendMessage, sendFollowUp, waitForResponse,
   uniqueMessage, assertHealthy, countExchanges, waitForExchangeCount, newThread,

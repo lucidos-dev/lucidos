@@ -7,6 +7,7 @@ fn continuation_started_event_can_carry_engine_origin() {
         origin: Some(MessageOrigin::Engine {
             reason: EngineReason::ContinuationStarted,
         }),
+        reason: None,
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["type"], "ContinuationStarted");
@@ -20,7 +21,7 @@ fn continuation_started_event_origin_defaults_to_none_when_missing() {
     let json = r#"{"type":"ContinuationStarted","branch":"claude-code/20260318"}"#;
     let parsed: ThreadEvent = serde_json::from_str(json).unwrap();
     match parsed {
-        ThreadEvent::ContinuationStarted { branch, origin } => {
+        ThreadEvent::ContinuationStarted { branch, origin, .. } => {
             assert_eq!(branch, "claude-code/20260318");
             assert!(origin.is_none());
         }

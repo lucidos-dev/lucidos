@@ -9,7 +9,7 @@
 //!   3. The ports file may contain `PROTO=http|https` (defaults to `https`).
 //!
 //! If the CLI ever changes either contract, this file MUST follow — otherwise
-//! `lucidos spawn-thread --to <ws>` and `run_claude(workspace=<ws>)` would
+//! `lucidos spawn-thread --to <ws>` and `run_coding_agent(workspace=<ws>)` would
 //! resolve to different places.
 //!
 //! See `workspace_client.rs` for the actual outbound POST that uses these.

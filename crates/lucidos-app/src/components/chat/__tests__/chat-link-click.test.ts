@@ -275,6 +275,7 @@ describe('chat link click — the bug-report scenario', () => {
     ['notifications/', 'notifications'],
     ['notifications?refresh=1', 'notifications'],
     ['apps', 'apps'],
+    ['app-store', 'app-store'],
     ['triggers', 'triggers'],
     ['changes', 'changes'],
     ['files', 'files'],

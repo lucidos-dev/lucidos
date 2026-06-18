@@ -54,7 +54,7 @@ Friction signals to pull:
 | Dead triggers | `TriggerCreated` with zero matching `TriggerCompleted` since creation |
 | App errors | App emits its own error events, or `ToolResult` errors in app-spawned threads |
 | User corrections in chats | `MessageReceived` immediately following a `ResponseGenerated` / `ResponseAborted` / `ToolResult` whose text reads like a correction ("no", "don't", "stop", "actually", "that's wrong", "instead", "you misunderstood") |
-| CC sessions ending without a useful change | `CodingAgentIdled` followed by `ChangeDiscarded`, or no `ChangeProposed` at all when one was clearly expected |
+| Coding-agent sessions ending without a useful change | `CodingAgentIdled` followed by `ChangeDiscarded`, or no `ChangeProposed` at all when one was clearly expected |
 | Engine crashes / supervisor respawns | `EngineSupervisorRespawned` — bash supervisor logged the previous engine pid died with a non-graceful exit (SIGKILL, panic, OOM, process-group kill). Payload carries `exit_code` (137 = SIGKILL, 143 = SIGTERM via 128+N, etc.) and `died_at`. Always `[engine]` scope. A single occurrence in the window is reportable even below the ≥3 threshold (catastrophic-single rule); cluster + report whenever the engine had to be respawned at all. |
 
 Trigger intent text lives in `TriggerCreated` payloads (`run.intent`) — pull it when assessing trigger findings.
@@ -73,10 +73,10 @@ The audience differs: `[workspace]` findings get actioned in the workspace itsel
 
 Scope tag *is* the routing decision; never re-route by hand.
 
-- **`[workspace]` → Lucidos handles it.** The Lucidos LLM has the tools needed to edit knowhow, trigger configs, app code, intents, and repo registration. Action through a regular Lucidos chat thread, not Claude Code.
-- **`[engine]` → Claude Code handles it.** Findings land in the Lucidos source repo (Rust crates, engine config, SDK/CLI surface, `system-knowhow/` itself). Action via `run_claude` against the Lucidos repo.
+- **`[workspace]` → Lucidos handles it.** The Lucidos LLM has the tools needed to edit knowhow, trigger configs, app code, intents, and repo registration. Action through a regular Lucidos chat thread, not a coding-agent thread.
+- **`[engine]` → a coding agent handles it.** Findings land in the Lucidos source repo (Rust crates, engine config, SDK/CLI surface, `system-knowhow/` itself). Action via `run_coding_agent` against the Lucidos repo.
 
-A `[workspace]` finding never goes to CC; an `[engine]` finding never goes to a Lucidos chat.
+A `[workspace]` finding never goes to a coding-agent session; an `[engine]` finding never goes to a Lucidos chat.
 
 ### Noise filter
 
@@ -119,9 +119,9 @@ When the same correction shape recurs across threads ("the report is too long", 
 - `ResponseFailed` / `ResponseAborted` → `[engine]`. Engine-side issues (model errors, timeouts, parse failures); group by error reason where the payload carries one. Fix lives in engine config or upstream retry logic, not in workspace content.
 - `ResponseCanceled` → `[workspace]`. User is stopping the LLM mid-stride; read the surrounding context, infer what made them pull the plug, propose a knowhow change that gets the LLM there faster.
 
-#### 7. CC sessions that produce nothing
+#### 7. Coding-agent sessions that produce nothing
 
-`CodingAgentIdled` with no `ChangeProposed` (or a `ChangeDiscarded` immediately after Apply isn't reached) on a recurring task suggests the knowhow that drives that CC flow is unclear about what success looks like. Fix lives in the knowhow.
+`CodingAgentIdled` with no `ChangeProposed` (or a `ChangeDiscarded` immediately after Apply isn't reached) on a recurring task suggests the knowhow that drives that coding-agent flow is unclear about what success looks like. Fix lives in the knowhow.
 
 #### 8. App-level friction — splits
 

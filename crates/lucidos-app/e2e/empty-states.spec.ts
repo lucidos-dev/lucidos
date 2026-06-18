@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { navigateToApp, assertHealthy, newThread, openThreadDrawer, waitForVisibleInput } from './helpers';
 
 test.describe('Empty and error states', () => {

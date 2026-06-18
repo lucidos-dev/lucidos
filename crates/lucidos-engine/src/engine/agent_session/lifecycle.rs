@@ -275,6 +275,37 @@ pub(super) fn should_auto_commit_on_cleanup(
     !should_discard && matches!(last_terminal, Some(TerminalKind::Generated))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ConflictResolutionCleanupAction {
+    Apply,
+    Abort { message: &'static str },
+}
+
+/// Decide whether a conflict-resolution worktree is safe to fast-forward into
+/// main. A clean `Generated` result is the only apply path. Anything else means
+/// the merge-fix turn was interrupted, failed, aborted, or never produced a
+/// trustworthy terminal event, so the original change must stay pending.
+pub(super) fn conflict_resolution_cleanup_action(
+    has_unmerged: bool,
+    last_terminal: &Option<TerminalKind>,
+) -> ConflictResolutionCleanupAction {
+    if has_unmerged {
+        return ConflictResolutionCleanupAction::Abort {
+            message: "Conflict resolution incomplete — merge aborted. The change is still pending; try applying again.",
+        };
+    }
+
+    match last_terminal {
+        Some(TerminalKind::Generated) => ConflictResolutionCleanupAction::Apply,
+        Some(TerminalKind::Canceled(_)) => ConflictResolutionCleanupAction::Abort {
+            message: "Conflict resolution canceled — merge aborted. The change is still pending; try applying again.",
+        },
+        _ => ConflictResolutionCleanupAction::Abort {
+            message: "Conflict resolution did not finish cleanly — merge aborted. The change is still pending; try applying again.",
+        },
+    }
+}
+
 /// True when an arriving `Result` is the "stale --resume" signal — CC echoed
 /// our forwarded user message back as an empty answer because the persisted
 /// session id no longer exists. The run-loop responds by killing the worktree
@@ -345,10 +376,20 @@ pub(super) enum SessionEndAction {
     /// so `resolve_branch_for_resume` finds it; do NOT propose, because a
     /// cancelled turn is half-finished work the user shouldn't be invited to
     /// apply (mirrors `should_propose_change_at_idle`). Without this the
-    /// no-commits cancel path falls into `CleanupBranches` → `git branch -D`,
-    /// which is exactly what made a cancel spawn a fresh, amnesiac CC session.
+    /// no-commits cancel path falls into `KeepEmptyBranch` (still resumable, but
+    /// without the cancel-specific "half-finished, don't propose" semantics).
     KeepCanceledBranch,
-    CleanupBranches,
+    /// Ordinary session end with no proposable diff (no commits, or commits
+    /// whose changes cancel out). The thread is still ALIVE and resumable, so
+    /// the branch is KEPT — the next message `--resume`s it via its
+    /// `cc_session_id`, and `recover_orphaned_worktrees` keys on the branch ref
+    /// to re-attach the session after a restart. Deleting a zero-commit branch
+    /// here (the pre-2026-06 behavior) destroyed resumability — the
+    /// thread-9e37697e data-loss class. The branch is a cheap ref; the
+    /// worktree_cleanup sweep reclaims fully-merged branches once the thread is
+    /// archived (or under disk pressure). Renamed from `CleanupBranches` when
+    /// the deletion was removed — the action no longer cleans up anything.
+    KeepEmptyBranch,
 }
 
 /// External repos with commits keep their branch even when the diff is empty —
@@ -364,7 +405,7 @@ pub(super) enum SessionEndAction {
 /// `user_canceled` is set when the last terminal was a user-driven
 /// `Canceled(UserStop)` (the Stop button, which now routes through CC's native
 /// interrupt/Esc). A cancel keeps the branch so the session stays resumable,
-/// and never proposes — it ranks above `Propose`/`CleanupBranches` but below the
+/// and never proposes — it ranks above `Propose`/`KeepEmptyBranch` but below the
 /// external/crash keep-branch arms (those already keep the branch and carry
 /// more specific semantics). It can't co-occur with `safety_net_fired`: a
 /// cancel emits a terminal event, so `safety_net_fired` (= no terminal) is
@@ -381,7 +422,7 @@ pub(super) fn classify_session_end_action(
         (true, false, true) => SessionEndAction::CrashedKeepBranch,
         _ if user_canceled => SessionEndAction::KeepCanceledBranch,
         (true, false, false) if !proposal_files_empty => SessionEndAction::Propose,
-        _ => SessionEndAction::CleanupBranches,
+        _ => SessionEndAction::KeepEmptyBranch,
     }
 }
 

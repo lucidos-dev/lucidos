@@ -4,7 +4,6 @@ import preact from '@preact/preset-vite';
 import { resolve } from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
-import { normalizeCss, isCssWedge, type CssBuildSnapshot } from './src/dev/cssWedgeDetect';
 
 const VITE_PORT = parseInt(process.env.VITE_PORT || '5173');
 
@@ -169,10 +168,12 @@ function buildIdVirtualModule(): Plugin {
  * hashes), so it is DETERMINISTIC: a no-op rebuild (e.g. relaunching the dev
  * harness with unchanged source) yields the same id and does not spuriously
  * report an update. Rewriting the placeholder in already-hashed JS leaves the
- * filename (and thus the next build's id) untouched, so determinism holds. Vite
- * copies public/ (including sw.js) into dist/ at BUNDLE_START — before this
- * writeBundle hook — so dist/sw.js already exists here. `apply: 'build'` keeps
- * it inert during `vite serve`, where the literal placeholder is harmless.
+ * filename (and thus the next build's id) untouched, so determinism holds.
+ * sw.js must already be in the outDir here: in a single-shot build Vite copies
+ * public/ before this writeBundle hook, and in the dev build-watch
+ * `syncPublicDir` (ordered before this plugin) re-copies it on every rebuild —
+ * see that plugin for why Vite alone isn't enough. `apply: 'build'` keeps it
+ * inert during `vite serve`, where the literal placeholder is harmless.
  */
 function stampServiceWorker(): Plugin {
   return {
@@ -197,6 +198,42 @@ function stampServiceWorker(): Plugin {
       for (const name of Object.keys(bundle)) {
         if (name.endsWith('.js')) stamp(resolve(outDir, name));
       }
+    },
+  };
+}
+
+/**
+ * Re-copy public/ into the build outDir on EVERY build of the dev build-watch.
+ *
+ * `vite build --watch` copies publicDir only on the INITIAL build — public files
+ * (sw.js, manifest.json, the favicons, icons/, splash/) aren't part of the
+ * bundle graph, so the watcher skips them on incremental rebuilds
+ * (vitejs/vite#18655). On its own that just leaves them stale; combined with
+ * `atomicDistPublish` swapping the WHOLE staging dir onto the live dist/, the
+ * first incremental rebuild WIPES them from the served dist/ entirely. The
+ * engine then serves the SPA shell for /sw.js (text/html), so service-worker
+ * registration fails with a MIME error ("push notifications may not work") and
+ * the PWA manifest + icons 404 — on direct AND gateway access alike.
+ *
+ * This runs in writeBundle ordered BEFORE stampServiceWorker (earlier in the
+ * plugins array) so the freshly re-copied sw.js is present for its BUILD_ID
+ * stamp — copying after the stamp would overwrite it with the unstamped source
+ * (IS_BUILT=false, no update toast). Scoped to the dev build-watch
+ * (LUCIDOS_ATOMIC_DIST): a single-shot production build (npm run build / CI /
+ * Tauri) copies public correctly on its own, so it stays byte-identical.
+ */
+function syncPublicDir(): Plugin {
+  const enabled = !!process.env.LUCIDOS_ATOMIC_DIST;
+  const publicDir = resolve(__dirname, 'public');
+  return {
+    name: 'lucidos-sync-public-dir',
+    apply: 'build',
+    writeBundle(options) {
+      if (!enabled || !fs.existsSync(publicDir)) return;
+      const outDir = options.dir ?? resolve(__dirname, 'dist');
+      // Merge public/ children into outDir (overwriting); leaves the emitted
+      // assets/ + index.html untouched (they aren't in public/).
+      fs.cpSync(publicDir, outDir, { recursive: true });
     },
   };
 }
@@ -249,79 +286,16 @@ function atomicDistPublish(): Plugin {
   };
 }
 
-/**
- * Warn when the long-running `vite build --watch` (the `--built` dev mode) has
- * wedged its CSS pipeline and is serving STALE CSS.
- *
- * The watch survives engine-only Apply restarts (workspace.sh keeps it running),
- * so a single watch process can stay alive for days across many rebuilds. Once
- * observed (after a 1.5-day-old watch + a large class rename), it kept re-emitting
- * fresh JS from changed source while serving a FROZEN, stale CSS bundle — the
- * served index.html paired new JS (new class names) with old CSS (old class
- * names), so every renamed/new class had no rule and the app rendered unstyled,
- * SILENTLY. The fix is operational (restart the frontend → clean build), but the
- * desync was invisible until the bundles were diffed by hand.
- *
- * This guard makes it loud. Its signature is precise: read the CSS *source* fresh
- * from disk each build (independent of Vite's wedged module cache) and compare a
- * normalized hash of it against the previous build; if the source changed but the
- * emitted CSS bundle did NOT, the pipeline is serving stale CSS — log it. The
- * `lucidos:css-staleness` line lands in `<ws>/.lucidos/build-watch.log` the
- * instant the wedge produces a desync, turning an hour of bundle archaeology into
- * one log line.
- *
- * Scoped to the dev build-watch (LUCIDOS_ATOMIC_DIST) — a single-shot production
- * build (`npm run build` / CI / Tauri) is a fresh process and cannot wedge, and
- * stays byte-identical. Warn-only and fully try/catch-guarded: a guard must never
- * break a build or alter its output.
- */
-function cssStalenessGuard(): Plugin {
-  const enabled = !!process.env.LUCIDOS_ATOMIC_DIST;
-  const srcDir = resolve(__dirname, 'src');
-  let prev: CssBuildSnapshot | null = null;
-
-  function collectCss(dir: string, out: string[]): void {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const p = resolve(dir, entry.name);
-      if (entry.isDirectory()) collectCss(p, out);
-      else if (entry.name.endsWith('.css')) out.push(p);
-    }
-  }
-
-  return {
-    name: 'lucidos-css-staleness-guard',
-    apply: 'build',
-    writeBundle(_options, bundle) {
-      if (!enabled) return;
-      try {
-        const files: string[] = [];
-        collectCss(srcDir, files);
-        files.sort();
-        const normalized = files
-          .map((f) => normalizeCss(fs.readFileSync(f, 'utf-8')))
-          .join('\n');
-        const curr: CssBuildSnapshot = {
-          cssSourceHash: crypto.createHash('sha256').update(normalized).digest('hex').slice(0, 16),
-          cssOutputFingerprint: Object.keys(bundle).filter((k) => k.endsWith('.css')).sort().join('\n'),
-        };
-        if (isCssWedge(prev, curr)) {
-          console.warn(
-            '\n[lucidos:css-staleness] CSS source changed but the emitted CSS bundle did NOT — ' +
-            'the long-running `vite build --watch` has wedged its CSS cache and is serving STALE styles ' +
-            '(fresh JS, frozen CSS → renamed/new classes have no rules and render unstyled). ' +
-            'Restart the frontend build: `./scripts/stop.sh -w <ws> && ./scripts/web-dev.sh -w <ws>`.\n'
-          );
-        }
-        prev = curr;
-      } catch {
-        // A guard must never break the build — skip silently on any error.
-      }
-    },
-  };
-}
-
 export default defineConfig({
-  plugins: [engineVersionPlugin(), buildIdVirtualModule(), suppressMergeReload(), stampServiceWorker(), cssStalenessGuard(), preact(), atomicDistPublish()],
+  // Relative asset base (ADR 0013): the built index.html references its bundle
+  // as `./assets/…` so the same build serves under both `/` (dev/gateway root)
+  // and `/ws/<id>/` (a workspace behind the gateway, where the gateway injects
+  // `<base href="/ws/<id>/">` to scope these). At the root with no <base> they
+  // resolve to `/assets/…` exactly as before — backward-compatible for the
+  // engine static-serve, `vite preview`, and Tauri. In `vite serve` (HMR) a
+  // relative base falls back to `/`, so the dev server is unaffected.
+  base: './',
+  plugins: [engineVersionPlugin(), buildIdVirtualModule(), suppressMergeReload(), syncPublicDir(), stampServiceWorker(), preact(), atomicDistPublish()],
   build: {
     rollupOptions: {
       output: {
@@ -367,8 +341,10 @@ export default defineConfig({
         key: fs.readFileSync(keyFile!),
       },
     }),
-    // No proxy needed — browser opens engine port directly, engine reverse-proxies
-    // unmatched requests to Vite via LUCIDOS_DEV_PROXY in dev mode.
+    // The `server` block is only used by a manual `vite serve` (`npm run dev`).
+    // It is NOT part of the dev harness anymore (ADR 0014): web-dev / tauri-dev /
+    // e2e all build dist/ and the engine serves it directly via LUCIDOS_STATIC_DIR
+    // — there is no engine→Vite proxy. Kept for standalone frontend iteration.
   },
   // `vite preview` (used by web-dev.sh --built to serve the built dist/) reads
   // `preview.*`, NOT `server.*` — mirror host/port/strictPort and TLS here so the

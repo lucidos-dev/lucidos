@@ -88,6 +88,7 @@ impl ThreadEvent {
     pub fn event_type(&self) -> &'static str {
         match self {
             Self::MessageReceived { .. } => "MessageReceived",
+            Self::QueuedMessageRemoved { .. } => "QueuedMessageRemoved",
             Self::TextStreamed { .. } => "TextStreamed",
             Self::ThoughtStreamed { .. } => "ThoughtStreamed",
             Self::ContextCaptured { .. } => "ContextCaptured",
@@ -162,6 +163,7 @@ impl ThreadEvent {
             Self::AppUiCaptureRequested { .. } => "AppUiCaptureRequested",
             Self::NavigationRequested { .. } => "NavigationRequested",
             Self::CodingAgentThreadSpawned { .. } => "CodingAgentThreadSpawned",
+            Self::CodingAgentDiffChanged { .. } => "CodingAgentDiffChanged",
             Self::ChildrenCountChanged { .. } => "ChildrenCountChanged",
         }
     }
@@ -200,6 +202,7 @@ impl ThreadEvent {
                 | Self::AppUiCaptureRequested { .. }
                 | Self::NavigationRequested { .. }
                 | Self::CodingAgentThreadSpawned { .. }
+                | Self::CodingAgentDiffChanged { .. }
                 | Self::ChildrenCountChanged { .. }
         )
     }

@@ -92,7 +92,7 @@
     letter-spacing: 0.03em;
     color: var(--text-secondary);
     background: var(--bg-tertiary, var(--bg-primary));
-    border: 1px solid var(--border-secondary, var(--border-primary));
+    border: 1px solid var(--border-color);
     border-radius: 0.25rem;
     padding: 0 0.25rem;
     line-height: 1.3;

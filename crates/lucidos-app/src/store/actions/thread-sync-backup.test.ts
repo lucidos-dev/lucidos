@@ -2,7 +2,6 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { signal } from '@preact/signals-core';
 
 const backupProgress = signal<{ phase: string; progress: number; total: number } | null>(null);
-const backupListVersion = signal(0);
 const backupStatusVersion = signal(0);
 const showToast = vi.fn();
 
@@ -19,7 +18,6 @@ vi.mock('../store', () => ({
   codingAgentSessionVersion: signal(0),
   memoryRebuildProgress: signal(null),
   backupProgress,
-  backupListVersion,
   backupStatusVersion,
   recoveryProgress: signal(null),
   panelOverlay: signal(null),
@@ -73,18 +71,16 @@ describe('handleGlobalEvent — Backup terminal events', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     backupProgress.value = { phase: 'encrypting', progress: 60, total: 100 };
-    backupListVersion.value = 0;
     backupStatusVersion.value = 0;
   });
 
-  it('BackupCompleted clears progress, toasts once, and bumps list + status versions', () => {
+  it('BackupCompleted clears progress, toasts once, and bumps the status version', () => {
     handleGlobalEvent('BackupCompleted', {
       filename: 'lucidos-backup-personal-20260504-090000.enc',
       size_bytes: 927_401_289,
     });
 
     expect(backupProgress.value).toBeNull();
-    expect(backupListVersion.value).toBe(1);
     expect(backupStatusVersion.value).toBe(1);
     expect(showToast).toHaveBeenCalledExactlyOnceWith(
       'Backup created: lucidos-backup-personal-20260504-090000.enc (884 MB)',
@@ -92,14 +88,12 @@ describe('handleGlobalEvent — Backup terminal events', () => {
     );
   });
 
-  it('BackupFailed clears progress, toasts the error, and bumps status (not list) version', () => {
+  it('BackupFailed clears progress, toasts the error, and bumps the status version', () => {
     handleGlobalEvent('BackupFailed', {
       error: 'Token refresh failed (invalid_grant)',
     });
 
     expect(backupProgress.value).toBeNull();
-    // A failed backup doesn't change the list, but it IS a new last-run outcome.
-    expect(backupListVersion.value).toBe(0);
     expect(backupStatusVersion.value).toBe(1);
     expect(showToast).toHaveBeenCalledExactlyOnceWith(
       'Backup failed: Token refresh failed (invalid_grant)',

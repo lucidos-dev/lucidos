@@ -110,7 +110,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn ws_at(root: PathBuf) -> Workspace {
-        Workspace { root, api_port: 0, proto: "https".to_string() }
+        Workspace { root, api_port: 0, proto: "https".to_string(), api_base_override: None }
     }
 
     #[test]

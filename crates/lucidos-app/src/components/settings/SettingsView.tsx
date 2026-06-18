@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'preact/hooks';
-import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, chatModels, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, animationSpeed, speedMultiplier, repositories } from '../../store/store';
+import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, chatModels, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, animationSpeed, speedMultiplier, repositories, enginePackaged } from '../../store/store';
 import { devices, getDeviceId, loadDevices, updateDeviceName, toggleDevicePush, removeDevice } from '../../store/actions/devices';
 import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCaptureContext, setCaptureContext, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, type Theme, type FontFamily } from '../../store/actions/preferences';
 import { openScaleModal } from '../shared/scaleModalState';
@@ -12,13 +12,17 @@ import { chatModelOptions, loadChatModels } from '../../store/actions/models';
 import { ModelsManager } from './ModelsManager';
 import { AnthropicProviderSettings } from './AnthropicProviderSettings';
 import { OpenAiProviderSettings } from './OpenAiProviderSettings';
+import { OpenRouterProviderSettings } from './OpenRouterProviderSettings';
+import { LocalProviderSettings } from './LocalProviderSettings';
 import { Dropdown } from '../shared/Dropdown';
-import { MemoryInspector } from './MemoryInspector';
-import { BackupSection } from './BackupSection';
 import { AllowlistEditor } from './AllowlistEditor';
 import { getCcAllowedTools, putCcAllowedTools, getAgentAllowedCommands, putAgentAllowedCommands } from '../../api/client';
 import { KeyboardShortcutsSection } from './KeyboardShortcutsSection';
-import { DiskUsagePage } from './DiskUsagePage';
+import { MarketplacesSection } from './MarketplacesSection';
+import { MobileAccessPage } from './MobileAccessPage';
+import { EnvironmentVariablesPage } from './EnvironmentVariablesPage';
+import { SystemPage } from './SystemPage';
+import { isTauri } from '../../utils/platform';
 import { ChevronRightIcon } from '../shared/icons';
 import { CredentialItem } from '../credentials/CredentialItem';
 import { openAddCredential, loadCredentials } from '../../store/actions/credentials';
@@ -771,6 +775,8 @@ export function SettingsView() {
           <div class="settings-section-title" data-search-anchor="models:providers">Providers</div>
           <AnthropicProviderSettings />
           <OpenAiProviderSettings />
+          <OpenRouterProviderSettings />
+          <LocalProviderSettings />
         </div>
         <ModelsManager />
       </>
@@ -854,16 +860,20 @@ export function SettingsView() {
 
   function renderSubview() {
     switch (settingsSubview.value) {
+      case 'system': return <SystemPage />;
       case 'models': return modelsSection();
       case 'appearance': return appearanceSection();
-      case 'memory': return <MemoryInspector />;
+      case 'memory': return <SystemPage panel="memory" />;
       case 'devices': return devicesSection();
       case 'accounts': return accountsSection();
-      case 'backup': return <BackupSection />;
+      case 'backup': return <SystemPage panel="backup" />;
       case 'repositories': return repositoriesSection();
+      case 'marketplaces': return <MarketplacesSection />;
+      case 'mobile-access': return <MobileAccessPage />;
       case 'permissions': return permissionsSection();
       case 'keyboard-shortcuts': return <KeyboardShortcutsSection />;
-      case 'disk-usage': return <DiskUsagePage />;
+      case 'disk-usage': return <SystemPage panel="disk-usage" />;
+      case 'environment-variables': return <EnvironmentVariablesPage />;
       default: return null;
     }
   }
@@ -876,9 +886,15 @@ export function SettingsView() {
     );
   }
 
+  // Mobile Access is meaningful only for the packaged desktop app's always-on
+  // service (its Tauri commands surface the connect URLs + drive Tailscale).
+  const navItems = SETTINGS_NAV_ITEMS.filter(
+    ({ key }) => key !== 'mobile-access' || (isTauri() && enginePackaged.value),
+  );
+
   return (
     <div class="content-view active settings-panel">
-      {SETTINGS_NAV_ITEMS.map(({ key, label }) => (
+      {navItems.map(({ key, label }) => (
         <div class="settings-section" key={key}>
           <div class="settings-section-title settings-nav-row" onClick={() => openSettingsSubview(key)}>
             <span>{label}</span>

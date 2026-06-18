@@ -6,6 +6,7 @@
     display: flex;
     align-items: center;
     gap: 0.5rem;
+    padding-left: var(--turn-body-inset);
     margin-bottom: 0.7rem;
     min-height: 1.2rem;
     font-size: 0.75rem;
@@ -998,4 +999,3 @@ body:not(.is-touch) .code-block-copy-btn.copy-btn-copied {
     font-style: italic;
     font-size: 0.85rem;
 }
-

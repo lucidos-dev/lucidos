@@ -21,19 +21,30 @@ pub(crate) fn credential_request_payload(
     base_url: &str,
     auth_type: &str,
 ) -> String {
-    credential_request_with_defaults(service, prompt, base_url, auth_type, serde_json::Map::new())
+    credential_request_with_defaults(
+        service,
+        prompt,
+        base_url,
+        auth_type,
+        serde_json::Map::new(),
+        None,
+    )
 }
 
 /// Build the enveloped credential-request payload, optionally attaching an
-/// oauth `defaults` block (endpoint URLs + scopes the modal pre-fills). An empty
+/// oauth `defaults` block (endpoint URLs + scopes the modal pre-fills) and an
+/// `env_var_name` the modal pre-fills into its custom-env-var-name field. An empty
 /// `defaults` map omits the block entirely, so the modal treats it as a custom
-/// provider and expands the endpoint section for manual entry.
+/// provider and expands the endpoint section for manual entry. A `None`/blank
+/// `env_var_name` omits the field, so the modal starts empty (default
+/// `CRED_<NAME>` injection).
 pub(crate) fn credential_request_with_defaults(
     service: &str,
     prompt: &str,
     base_url: &str,
     auth_type: &str,
     defaults: serde_json::Map<String, serde_json::Value>,
+    env_var_name: Option<&str>,
 ) -> String {
     let mut payload = serde_json::json!({
         "service": service,
@@ -43,6 +54,9 @@ pub(crate) fn credential_request_with_defaults(
     });
     if !defaults.is_empty() {
         payload["defaults"] = serde_json::Value::Object(defaults);
+    }
+    if let Some(name) = env_var_name.map(str::trim).filter(|s| !s.is_empty()) {
+        payload["env_var_name"] = serde_json::Value::String(name.to_string());
     }
     credential_request_envelope(payload)
 }
@@ -77,6 +91,20 @@ impl LucidosEngine {
                     return Ok("Error: service_name, prompt, and base_url are required".to_string());
                 }
 
+                // Optional custom env var name to pre-fill the modal with. Validate
+                // it the same way the Settings UI does (the API boundary re-validates
+                // on submit, but rejecting here gives the agent a precise error
+                // instead of silently pre-filling a name the user can't save).
+                let env_var_name = args["env_var_name"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                if let Some(name) = env_var_name {
+                    if let Err(rejection) = crate::core::environment_variables::validate_name(name) {
+                        return Ok(format!("Error: {}", rejection.message(name)));
+                    }
+                }
+
                 // Check if credential already exists
                 if let Ok(Some(_)) = CredentialStore::get(&self.pool, service_name).await {
                     return Ok(format!(
@@ -100,6 +128,7 @@ impl LucidosEngine {
                     base_url,
                     auth_type,
                     defaults,
+                    env_var_name,
                 ))
             }
             "connect_oauth_account" => {
@@ -233,6 +262,7 @@ mod tests {
             "https://healthcare.googleapis.com",
             "oauth_client",
             defaults,
+            None,
         );
         let parsed = parse_payload(&result);
         assert_eq!(parsed["service"], "oauth:ghealth");
@@ -252,11 +282,47 @@ mod tests {
             "https://api.example.com",
             "oauth_client",
             serde_json::Map::new(),
+            None,
         );
         let parsed = parse_payload(&result);
         assert!(
             parsed.get("defaults").is_none(),
             "an empty defaults map must omit the block entirely: {parsed}"
         );
+    }
+
+    #[test]
+    fn env_var_name_is_attached_when_supplied() {
+        let result = credential_request_with_defaults(
+            "apple",
+            "Enter your app-specific password.",
+            "https://api.apple.com",
+            "password",
+            serde_json::Map::new(),
+            Some("APPLE_PASSWORD"),
+        );
+        let parsed = parse_payload(&result);
+        assert_eq!(parsed["env_var_name"], "APPLE_PASSWORD");
+    }
+
+    #[test]
+    fn blank_env_var_name_omits_the_field() {
+        // Whitespace-only / empty names must not pre-fill the modal — the
+        // credential then injects under the default CRED_<NAME> form only.
+        for name in [None, Some(""), Some("   ")] {
+            let result = credential_request_with_defaults(
+                "svc",
+                "prompt",
+                "https://api.example.com",
+                "api_key",
+                serde_json::Map::new(),
+                name,
+            );
+            let parsed = parse_payload(&result);
+            assert!(
+                parsed.get("env_var_name").is_none(),
+                "a blank env_var_name ({name:?}) must omit the field: {parsed}"
+            );
+        }
     }
 }

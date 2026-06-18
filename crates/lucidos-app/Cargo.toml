@@ -6,15 +6,39 @@ edition = "2021"
 [dependencies]
 tauri = { version = "2", features = ["unstable"] }
 tauri-plugin-window-state = "2"
+# Auto-update from GitHub Releases ("update available -> restart") + the confirm
+# dialog it shows. See src/updater.rs and tauri.conf.json plugins.updater.
+tauri-plugin-updater = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Native macOS notifications WITH click delivery. tauri-plugin-notification's
-# desktop show() is fire-and-forget (no click callback), so we drive
-# mac-notification-sys directly — the same crate notify-rust uses under the
-# hood — and block for the click response on a worker thread. See
-# `show_native_notification` in lib.rs and system-knowhow/notifications.md §4.
+# Native macOS notifications via Apple's modern UserNotifications framework
+# (UNUserNotificationCenter), driven directly through objc2. Replaces the
+# deprecated NSUserNotification path (mac-notification-sys / notify-rust), which
+# no longer delivers on recent macOS. Requires a packaged .app bundle to work
+# (no-op in tauri-dev). See src/notifications.rs and
+# system-knowhow/notifications.md §4. Versions track Tauri 2's own objc2 stack
+# (objc2 0.6 / framework crates 0.3).
 [target.'cfg(target_os = "macos")'.dependencies]
-mac-notification-sys = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
+objc2-user-notifications = { version = "0.3", features = [
+    "UNUserNotificationCenter",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationResponse",
+    "UNNotification",
+    "UNNotificationTrigger",
+    "block2",
+] }
+block2 = "0.6"
+
+# uid lookup + signal handlers for the always-on launchd service (desktop.rs):
+# `launchctl` domain targets need the numeric uid, and the service supervisor
+# catches SIGTERM/SIGINT to tear the embedded stack down gracefully.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

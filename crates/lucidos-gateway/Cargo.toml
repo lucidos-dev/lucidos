@@ -1,0 +1,32 @@
+[package]
+name = "lucidos-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The workspace gateway (ADR 0014): a standalone reverse-proxy + control plane
+# that fronts N per-workspace `lucidos-engine` stacks. Deliberately has NO
+# dependency on `lucidos-engine` — the only network-facing process must link
+# proxy + supervise + registry code, not the engine's heavy core (LLM clients,
+# agent loop, EventBus, sqlx, every credential path). The small shared surface
+# it needs (a `log!` macro, hop-by-hop helpers, the umbrella release string, a
+# Postgres readiness probe) is duplicated here rather than shared, on purpose.
+
+[[bin]]
+name = "lucidos-gateway"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+axum = { version = "0.7", features = ["macros", "multipart"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "set-header"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+dotenvy = "0.15"

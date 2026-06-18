@@ -1,13 +1,13 @@
 //! `lucidos spawn-thread` — POST a new thread to another (or this) Lucidos workspace.
 //!
 //! Defaults caller_* fields from env vars set by the engine when it spawns a
-//! Claude Code subprocess: `$LUCIDOS_WORKSPACE` (basename → caller_workspace),
+//! coding-agent subprocess: `$LUCIDOS_WORKSPACE` (basename → caller_workspace),
 //! `$LUCIDOS_THREAD_ID` → caller_thread_id, `$LUCIDOS_EVENT_ID` → caller_event_id.
-//! `--repo` defaults from `$LUCIDOS_REPO` (the calling CC's repo) so a CC
-//! subprocess automatically inherits its caller's repo without callers having
-//! to pass it; callers can still override with `--repo <name>` or pass `--repo ""`
-//! to force the target workspace's default repo.
-//! `mode` defaults to "agent" since this CLI is invoked from CC subprocesses;
+//! `--repo` defaults from `$LUCIDOS_REPO` (the calling coding-agent thread's repo)
+//! so a coding-agent subprocess automatically inherits its caller's repo without
+//! callers having to pass it; callers can still override with `--repo <name>` or
+//! pass `--repo ""` to force the target workspace's default repo.
+//! `mode` defaults to "agent" since this CLI is invoked from coding-agent subprocesses;
 //! override with --mode for engine-mode helpers.
 //!
 //! `--relation child` emits `parent_thread_id` + `spawning_event_id` instead
@@ -21,12 +21,13 @@
 //! The CLI generates the new thread's UUID up front and includes it in the
 //! request body so it can print a `[title](thread:workspace/uuid)` markdown
 //! link on stdout — the engine renders this as a clickable thread link when a
-//! CC subprocess includes it in its response.
+//! coding-agent subprocess includes it in its response.
 //!
-//! `--folder <path>` targets a folder instead of a repo: with `--cc`, a
-//! `data/apps/<id>` value spawns an *app coding-agent thread* — the engine
+//! `--folder <path>` targets a folder instead of a repo: with `--cc`,
+//! `--codex`, or `--coding-agent`, a `data/apps/<id>` value spawns an
+//! *app coding-agent thread* — the engine
 //! resolves the `folder` body field through the same `coding_agent_kind`
-//! pipeline `run_claude(folder=…)` uses (sparse-checkout worktree of the app
+//! pipeline `run_coding_agent(folder=…)` uses (sparse-checkout worktree of the app
 //! folder, Apply ff-merges to the workspace's main, no `/harden`, no engine
 //! restart). `--folder` is mutually exclusive with `--repo` (enforced by clap)
 //! and suppresses the `$LUCIDOS_REPO` default, because the engine rejects a
@@ -38,21 +39,30 @@ use crate::workspace::{read_ports, BoxError};
 use crate::{CliRelation, SpawnThreadArgs};
 
 pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
+    let selected_coding_agent = if args.codex {
+        Some(crate::CliCodingAgent::Codex)
+    } else {
+        args.coding_agent
+    };
+    let use_coding_agent = args.cc || selected_coding_agent.is_some();
+
     // `--folder` only makes sense for coding-agent threads (it targets an app
-    // folder for a CC worktree). Reject early with a clear message — clap
+    // folder for a coding-agent worktree). Reject early with a clear message — clap
     // already rejects `--folder` together with `--repo`.
-    if args.folder.is_some() && !args.cc {
+    if args.folder.is_some() && !use_coding_agent {
         return Err(
-            "--folder requires --cc (folder targeting only applies to coding-agent threads)".into(),
+            "--folder requires --cc, --codex, or --coding-agent (folder targeting only applies to coding-agent threads)".into(),
         );
     }
 
     let target_root = resolve_target(&args.to)?;
     let (api_port, ports_proto) = read_ports(&target_root.join(".lucidos/ports"))?;
 
-    let caller_workspace = std::env::var("LUCIDOS_WORKSPACE")
-        .ok()
-        .and_then(|p| PathBuf::from(p).file_name().map(|n| n.to_string_lossy().into_owned()));
+    let caller_workspace = std::env::var("LUCIDOS_WORKSPACE").ok().and_then(|p| {
+        PathBuf::from(p)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+    });
     let caller_thread_id = std::env::var("LUCIDOS_THREAD_ID").ok();
     let caller_event_id = std::env::var("LUCIDOS_EVENT_ID").ok();
 
@@ -81,13 +91,14 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
                 "--relation child requires --to to match $LUCIDOS_WORKSPACE basename ({}), got {} \
                  — same-workspace only (callbacks across workspaces are unsupported)",
                 caller_basename, target_basename
-            ).into());
+            )
+            .into());
         }
     }
 
     // Resolve --repo: explicit `Some` (including empty string) wins; otherwise
-    // fall back to $LUCIDOS_REPO (the engine sets this on every CC subprocess
-    // to the calling thread's repo name). Passing `--repo ""` explicitly
+    // fall back to $LUCIDOS_REPO (the engine sets this on every coding-agent
+    // subprocess to the calling thread's repo name). Passing `--repo ""` explicitly
     // requests the workspace default even when the env var is set.
     //
     // `--folder` suppresses the env-var default entirely: the engine 400s on a
@@ -114,29 +125,61 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
         "mode": args.mode.as_wire(),
         "thread_id": thread_id,
     });
-    let obj = body.as_object_mut().expect("json! created an object literal");
-    if let Some(ref t) = args.title { obj.insert("title".into(), t.clone().into()); }
-    if args.cc { obj.insert("use_claude_code".into(), true.into()); }
-    if let Some(m) = args.cc_model { obj.insert("cc_model".into(), m.into()); }
-    if let Some(m) = args.model { obj.insert("model".into(), m.into()); }
-    if let Some(r) = repo { obj.insert("repo_id".into(), r.into()); }
+    let obj = body
+        .as_object_mut()
+        .expect("json! created an object literal");
+    if let Some(ref t) = args.title {
+        obj.insert("title".into(), t.clone().into());
+    }
+    if use_coding_agent {
+        obj.insert("use_coding_agent".into(), true.into());
+    }
+    if let Some(agent) = selected_coding_agent {
+        obj.insert("coding_agent".into(), agent.as_wire().into());
+    }
+    if let Some(m) = args.cc_model {
+        obj.insert("cc_model".into(), m.into());
+    }
+    if let Some(m) = args.model {
+        obj.insert("model".into(), m.into());
+    }
+    if let Some(r) = repo {
+        obj.insert("repo_id".into(), r.into());
+    }
     // App coding-agent thread targeting: the engine resolves `folder` through
-    // the shared `coding_agent_kind` pipeline (same as `run_claude(folder=…)`).
-    if let Some(ref f) = args.folder { obj.insert("folder".into(), f.clone().into()); }
+    // the shared `coding_agent_kind` pipeline (same as
+    // `run_coding_agent(folder=…)`).
+    if let Some(ref f) = args.folder {
+        obj.insert("folder".into(), f.clone().into());
+    }
 
     match relation {
         CliRelation::Child => {
-            if let Some(t) = caller_thread_id { obj.insert("parent_thread_id".into(), t.into()); }
-            if let Some(e) = caller_event_id { obj.insert("spawning_event_id".into(), e.into()); }
+            if let Some(t) = caller_thread_id {
+                obj.insert("parent_thread_id".into(), t.into());
+            }
+            if let Some(e) = caller_event_id {
+                obj.insert("spawning_event_id".into(), e.into());
+            }
         }
         CliRelation::Top => {
-            if let Some(w) = caller_workspace { obj.insert("caller_workspace".into(), w.into()); }
-            if let Some(t) = caller_thread_id { obj.insert("caller_thread_id".into(), t.into()); }
-            if let Some(e) = caller_event_id { obj.insert("caller_event_id".into(), e.into()); }
+            if let Some(w) = caller_workspace {
+                obj.insert("caller_workspace".into(), w.into());
+            }
+            if let Some(t) = caller_thread_id {
+                obj.insert("caller_thread_id".into(), t.into());
+            }
+            if let Some(e) = caller_event_id {
+                obj.insert("caller_event_id".into(), e.into());
+            }
         }
     }
 
-    let scheme = if args.insecure_http { "http" } else { &ports_proto };
+    let scheme = if args.insecure_http {
+        "http"
+    } else {
+        &ports_proto
+    };
     let url = format!("{}://localhost:{}/api/v1/chat/stream", scheme, api_port);
     let client = crate::http::client()?;
     let start = std::time::Instant::now();
@@ -205,8 +248,10 @@ fn resolve_target(name_or_path: &str) -> Result<PathBuf, BoxError> {
     if !candidate.join(".lucidos/ports").is_file() {
         return Err(format!(
             "Target workspace '{}' not found at {} (no .lucidos/ports).",
-            name_or_path, candidate.display()
-        ).into());
+            name_or_path,
+            candidate.display()
+        )
+        .into());
     }
     Ok(candidate)
 }
@@ -217,7 +262,10 @@ mod tests {
 
     #[test]
     fn label_uses_title_when_given() {
-        assert_eq!(link_label(Some("Fix repo flag"), "irrelevant body"), "Fix repo flag");
+        assert_eq!(
+            link_label(Some("Fix repo flag"), "irrelevant body"),
+            "Fix repo flag"
+        );
     }
 
     #[test]
@@ -239,7 +287,10 @@ mod tests {
 
     #[test]
     fn label_strips_newlines_to_keep_link_on_one_line() {
-        assert_eq!(link_label(Some("line1\nline2\rline3"), "msg"), "line1line2line3");
+        assert_eq!(
+            link_label(Some("line1\nline2\rline3"), "msg"),
+            "line1line2line3"
+        );
     }
 
     #[test]

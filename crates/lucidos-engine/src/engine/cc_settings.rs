@@ -46,17 +46,29 @@ pub(crate) fn build_cc_settings_json() -> String {
                 },
                 {
                     "matcher": "Edit",
-                    "hooks": [{
-                        "type": "command",
-                        "command": "lucidos cc-edit-preread"
-                    }]
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "lucidos cc-edit-preread"
+                        },
+                        {
+                            "type": "command",
+                            "command": "lucidos cc-plan-gate"
+                        }
+                    ]
                 },
                 {
                     "matcher": "Write",
-                    "hooks": [{
-                        "type": "command",
-                        "command": "lucidos cc-edit-preread"
-                    }]
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "lucidos cc-edit-preread"
+                        },
+                        {
+                            "type": "command",
+                            "command": "lucidos cc-plan-gate"
+                        }
+                    ]
                 }
             ],
             "Stop": [{
@@ -190,6 +202,38 @@ mod tests {
             edit_entry["hooks"][0]["command"], "lucidos cc-edit-preread",
             "must invoke the cc-edit-preread subcommand the engine ships",
         );
+    }
+
+    #[test]
+    fn json_registers_plan_gate_hook_on_edit_and_write() {
+        // The implementation-plan pre-edit gate runs alongside cc-edit-preread
+        // on both Edit and Write. It must be the SECOND hook (index 1) so the
+        // existing preread assertions on index 0 stay valid; both run for the
+        // same tool, composing the two preconditions (read-first AND planned).
+        let json = build_cc_settings_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entries = parsed["hooks"]["PreToolUse"].as_array().expect("array");
+        for tool in ["Edit", "Write"] {
+            let entry = entries
+                .iter()
+                .find(|e| e["matcher"] == tool)
+                .unwrap_or_else(|| panic!("must register a {tool} matcher"));
+            let hooks = entry["hooks"].as_array().expect("hooks array");
+            assert!(
+                hooks
+                    .iter()
+                    .any(|h| h["command"] == "lucidos cc-plan-gate"),
+                "{tool} matcher must include the cc-plan-gate hook so the \
+                 implementation-plan marker is enforced before edits",
+            );
+            // Preread must still be present — the two gates compose.
+            assert!(
+                hooks
+                    .iter()
+                    .any(|h| h["command"] == "lucidos cc-edit-preread"),
+                "{tool} matcher must keep the cc-edit-preread hook",
+            );
+        }
     }
 
     #[test]

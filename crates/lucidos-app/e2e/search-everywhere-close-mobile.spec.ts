@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { navigateToApp, assertHealthy, enableMobileHeaderSticky } from './helpers';
 
 // Touch-only regression: tapping the search toggle again (while the palette is

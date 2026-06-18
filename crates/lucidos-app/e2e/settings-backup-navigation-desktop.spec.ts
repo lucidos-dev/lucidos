@@ -24,13 +24,14 @@
  * (the Backup panel) and the Settings menu item carries the active state in the
  * nav drawer — both layout-stable on desktop.
  */
-import { test, expect } from '@playwright/test';
-import { assertHealthy, navigateToApp, clickVisibleElement } from './helpers';
+import { test, expect } from './fixtures';
+import { assertHealthy, navigateToApp, clickVisibleElement, waitForEventStream } from './helpers';
 
-/** Section title unique to BackupSection ("Restore from backup"). It renders
- *  unconditionally — independent of whether the backup provider list has
- *  loaded — so it's a stable "the Backup panel rendered" marker. */
-const BACKUP_RESTORE_ANCHOR = '[data-search-anchor="backup:restore"]';
+/** The Provider row in BackupSection. It renders unconditionally — independent
+ *  of whether the backup provider list has loaded — so it's a stable "the Backup
+ *  panel rendered" marker. (Restore moved to the workspace picker; the former
+ *  "backup:restore" anchor no longer exists.) */
+const BACKUP_PANEL_ANCHOR = '[data-search-anchor="backup:provider"]';
 
 test.describe('navigate_ui → Settings > Backup', () => {
   test.beforeEach(async ({ page }) => {
@@ -39,6 +40,7 @@ test.describe('navigate_ui → Settings > Backup', () => {
 
   test('POST /api/v1/ui/navigate { settings, backup } renders the Backup panel and activates the Settings menu item', async ({ page }) => {
     await navigateToApp(page);
+    await waitForEventStream(page);
 
     // Emit NavigationRequested via the engine → it fans out over SSE → the
     // page's thread-sync handler routes it through handleNavigationRequest.
@@ -49,10 +51,9 @@ test.describe('navigate_ui → Settings > Backup', () => {
     expect(res.ok(), `POST /api/v1/ui/navigate -> ${res.status()}`).toBeTruthy();
 
     // 1. The Backup panel renders: the content pane switches to the settings
-    //    panel showing the BackupSection sub-view. We require the
-    //    "Restore from backup" anchor to be a visible descendant of
-    //    `.settings-panel` so we're asserting the rendered sub-view, not a
-    //    stray search-index node.
+    //    panel showing the BackupSection sub-view. We require the Provider-row
+    //    anchor to be a visible descendant of `.settings-panel` so we're
+    //    asserting the rendered sub-view, not a stray search-index node.
     await page.waitForFunction((sel) => {
       const panel = document.querySelector('.settings-panel');
       if (!panel) return false;
@@ -60,7 +61,7 @@ test.describe('navigate_ui → Settings > Backup', () => {
       if (!anchor) return false;
       const rect = anchor.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0;
-    }, BACKUP_RESTORE_ANCHOR, { timeout: 15_000 });
+    }, BACKUP_PANEL_ANCHOR, { timeout: 15_000 });
 
     // The content-pane header title is derived from
     // activeMenuItem === 'settings' && settingsSubview === 'backup'

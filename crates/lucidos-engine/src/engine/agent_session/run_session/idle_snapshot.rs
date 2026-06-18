@@ -40,7 +40,7 @@ impl LucidosEngine {
                     },
                     meta: meta.clone(),
                 },
-                "[ClaudeCode] CodingAgentIdled",
+                "[AgentSession] CodingAgentIdled",
             )
             .await;
     }

@@ -14,7 +14,10 @@ pub mod vertex;
 pub use anthropic::{AnthropicAuth, AnthropicProvider};
 pub use image::{ImageProvider, ImageSize};
 pub use model_registry::{ModelRegistry, ProviderKind};
-pub use openai::{resolve_openai_api_key, OpenAiKeySource, OpenAiProvider};
+pub use openai::{
+    resolve_bearer_key, resolve_openai_api_key, OpenAiKeySource, OpenAiProvider,
+    OPENAI_DEFAULT_BASE_URL,
+};
 pub use provider::{ContentBlock, LlmProvider, Message, MessageContent, TokenCallback, ToolCall};
 pub use routing::RoutingProvider;
 pub use tools::{

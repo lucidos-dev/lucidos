@@ -74,7 +74,7 @@ async fn shutdown_signal(
     // set much later (scheduler.shutdown()), too late to gate these events.
     engine.mark_shutting_down();
 
-    // Gracefully stop Claude Code sessions — interrupts active work,
+    // Gracefully stop coding-agent sessions — interrupts active work,
     // waits for CodingAgentIdled events (which persist cc_session_id),
     // then cancels remaining sessions. Must happen before HTTP shutdown
     // so the event bus can still persist events.
@@ -134,13 +134,104 @@ fn build_openai_provider(
     }
 }
 
+/// OpenRouter's OpenAI-compatible base URL.
+const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+/// Build the OpenRouter provider — an [`OpenAiProvider`] pinned to OpenRouter's
+/// OpenAI-compatible Chat Completions endpoint — from a stored `openrouter`
+/// credential (Settings → Providers) with the `LUCIDOS_OPENROUTER_API_KEY`
+/// env var as a fallback. Sends OpenRouter's optional `HTTP-Referer` / `X-Title`
+/// attribution headers. `None` when no key is configured.
+fn build_openrouter_provider(
+    credential: Option<(lucidos_engine::core::AuthType, String)>,
+    env_key: Option<String>,
+    default_model: &str,
+) -> Option<OpenAiProvider> {
+    let key = lucidos_engine::llm::resolve_bearer_key(credential, env_key)?;
+    let extra_headers = vec![
+        ("HTTP-Referer".to_string(), "https://lucidos.dev".to_string()),
+        ("X-Title".to_string(), "Lucidos".to_string()),
+    ];
+    match OpenAiProvider::new_with_base_url(
+        key,
+        default_model.to_string(),
+        OPENROUTER_BASE_URL,
+        extra_headers,
+        true,
+    ) {
+        Ok(p) => {
+            log!("[Startup] OpenRouter provider configured");
+            Some(p)
+        }
+        Err(e) => {
+            log!("[Startup] Failed to build OpenRouter provider: {}", e);
+            None
+        }
+    }
+}
+
+/// Build the local OpenAI-compatible provider (Ollama / LM Studio / vLLM /
+/// llama.cpp). Opt-in: only built when the user has signalled local use via the
+/// `local_base_url` preference (`base_url_pref`), a `local` credential
+/// (`api_key_cred`), or the `LUCIDOS_LOCAL_BASE_URL` / `LUCIDOS_LOCAL_API_KEY`
+/// env vars — otherwise `None`, so a default localhost backend isn't conjured
+/// for users who never asked for it (and the "no provider configured" guard
+/// stays honest). The base URL resolves pref → env → [`DEFAULT_LOCAL_BASE_URL`];
+/// the key is optional (the `Authorization` header is omitted when empty).
+///
+/// [`DEFAULT_LOCAL_BASE_URL`]: lucidos_engine::core::DEFAULT_LOCAL_BASE_URL
+fn build_local_provider(
+    base_url_pref: Option<String>,
+    api_key_cred: Option<String>,
+    default_model: &str,
+) -> Option<OpenAiProvider> {
+    let base_pref = base_url_pref.filter(|s| !s.trim().is_empty());
+    let base_env = std::env::var("LUCIDOS_LOCAL_BASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let key = api_key_cred.filter(|s| !s.trim().is_empty()).or_else(|| {
+        std::env::var("LUCIDOS_LOCAL_API_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    });
+
+    if base_pref.is_none() && base_env.is_none() && key.is_none() {
+        return None;
+    }
+
+    let base = base_pref
+        .or(base_env)
+        .unwrap_or_else(|| lucidos_engine::core::DEFAULT_LOCAL_BASE_URL.to_string());
+    match OpenAiProvider::new_with_base_url(
+        key.unwrap_or_default(),
+        default_model.to_string(),
+        &base,
+        Vec::new(),
+        true,
+    ) {
+        Ok(p) => {
+            log!(
+                "[Startup] Local OpenAI-compatible provider configured (base {})",
+                base
+            );
+            Some(p)
+        }
+        Err(e) => {
+            log!("[Startup] Failed to build local provider: {}", e);
+            None
+        }
+    }
+}
+
 /// Open a short-lived pool to assemble the direct OpenAI + Anthropic providers
 /// (from the `openai` / `anthropic` credentials set in Settings → Providers)
 /// and the model→provider registry. Providers are built before
 /// `LucidosEngine::new` creates its own pool, so — like `read_vertex_region_pref`
 /// — this uses a throwaway connection. The OpenAI key prefers the stored
 /// credential and falls back to `openai_env_key` (the `OPENAI_API_KEY` launch
-/// env var). Returns `(openai, anthropic, id→provider map)`; each degrades to
+/// env var); OpenRouter and the local OpenAI-compatible backend resolve the
+/// same way (credential → env). Returns
+/// `(openai, anthropic, openrouter, local, id→provider map)`; each degrades to
 /// `None`/empty on any DB or credential error so the engine still boots on its
 /// other providers.
 async fn load_direct_providers_and_registry(
@@ -150,6 +241,8 @@ async fn load_direct_providers_and_registry(
 ) -> (
     Option<OpenAiProvider>,
     Option<lucidos_engine::llm::AnthropicProvider>,
+    Option<OpenAiProvider>,
+    Option<OpenAiProvider>,
     std::collections::HashMap<String, lucidos_engine::llm::ProviderKind>,
 ) {
     let pool = match sqlx::postgres::PgPoolOptions::new()
@@ -164,9 +257,21 @@ async fn load_direct_providers_and_registry(
                 "[Startup] Could not open pool for direct-provider credentials / model registry: {}",
                 e
             );
-            // No DB access, but the OPENAI_API_KEY env fallback must still work.
+            // No DB access, but the env-var fallbacks must still work.
             let openai = build_openai_provider(None, openai_env_key, default_model);
-            return (openai, None, std::collections::HashMap::new());
+            let openrouter = build_openrouter_provider(
+                None,
+                std::env::var("LUCIDOS_OPENROUTER_API_KEY").ok(),
+                default_model,
+            );
+            let local = build_local_provider(None, None, default_model);
+            return (
+                openai,
+                None,
+                openrouter,
+                local,
+                std::collections::HashMap::new(),
+            );
         }
     };
 
@@ -217,7 +322,47 @@ async fn load_direct_providers_and_registry(
     };
     let openai = build_openai_provider(openai_credential, openai_env_key, default_model);
 
-    (openai, anthropic, registry_map)
+    // OpenRouter: a stored `openrouter` credential wins; otherwise the env fallback.
+    let openrouter_credential =
+        match lucidos_engine::core::CredentialStore::get(&pool, "openrouter").await {
+            Ok(Some(cred)) => Some((cred.auth_type, cred.auth_value)),
+            Ok(None) => None,
+            Err(e) => {
+                log!("[Startup] Failed to read OpenRouter credential: {}", e);
+                None
+            }
+        };
+    let openrouter = build_openrouter_provider(
+        openrouter_credential,
+        std::env::var("LUCIDOS_OPENROUTER_API_KEY").ok(),
+        default_model,
+    );
+
+    // Local OpenAI-compatible: base URL from the `local_base_url` pref (env /
+    // default applied inside the builder) and an optional `local` credential.
+    let local_base_pref = match lucidos_engine::core::PreferenceStore::get(
+        &pool,
+        lucidos_engine::core::PREF_LOCAL_BASE_URL,
+    )
+    .await
+    {
+        Ok(opt) => opt,
+        Err(e) => {
+            log!("[Startup] Failed to read local_base_url preference: {}", e);
+            None
+        }
+    };
+    let local_key = match lucidos_engine::core::CredentialStore::get(&pool, "local").await {
+        Ok(Some(cred)) => Some(cred.auth_value),
+        Ok(None) => None,
+        Err(e) => {
+            log!("[Startup] Failed to read local provider credential: {}", e);
+            None
+        }
+    };
+    let local = build_local_provider(local_base_pref, local_key, default_model);
+
+    (openai, anthropic, openrouter, local, registry_map)
 }
 
 fn get_gcloud_project() -> Option<String> {
@@ -293,7 +438,77 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
+    // The workspace gateway is now the standalone `lucidos-gateway` binary
+    // (ADR 0014 §1) — it spawns this engine per workspace via LUCIDOS_ENGINE_BIN.
+    // A stray `--gateway` flag is a misconfiguration; fail loudly rather than
+    // silently booting a single engine on the gateway's port.
+    if std::env::args().skip(1).any(|a| a == "--gateway") {
+        return Err("`--gateway` was removed from lucidos-engine; run the \
+                    `lucidos-gateway` binary instead (ADR 0014)"
+            .into());
+    }
+
+    // One-shot restore subcommand: the workspace gateway shells out to this to
+    // decrypt + unpack + pg_restore a LOCAL backup archive INTO a workspace dir +
+    // database it already provisioned (the gateway can't link the engine crate —
+    // ADR 0014 §1 — so it reaches the restore logic via this binary). The engine
+    // server the gateway then spawns runs migrations at construction, upgrading an
+    // older-schema restore. Handled before the heavy server boot below.
+    if std::env::args().nth(1).as_deref() == Some("restore-archive") {
+        return build_runtime()?.block_on(run_restore_archive());
+    }
+
     build_runtime()?.block_on(run())
+}
+
+/// `lucidos-engine restore-archive --file <enc> --workspace-dir <dir>`.
+///
+/// Restores a local encrypted backup archive into the given (already-provisioned)
+/// workspace directory + database. The base64 key comes from `LUCIDOS_RESTORE_KEY`
+/// and the connection string from `DATABASE_URL` — both via env so neither the
+/// key nor a DB password ever lands in argv (argv is visible in `ps`). Prints
+/// `LUCIDOS_RESTORE_PHASE=<phase>:<pct>` lines to stdout so the gateway can
+/// surface coarse progress in the picker; exits non-zero with the error on stderr.
+async fn run_restore_archive() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::io::Write;
+
+    let mut file: Option<PathBuf> = None;
+    let mut workspace_dir: Option<PathBuf> = None;
+    let mut it = std::env::args().skip(2); // skip bin name + "restore-archive"
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--file" => file = it.next().map(PathBuf::from),
+            "--workspace-dir" => workspace_dir = it.next().map(PathBuf::from),
+            other => {
+                return Err(format!("restore-archive: unexpected argument '{other}'").into());
+            }
+        }
+    }
+    let file = file.ok_or("restore-archive: --file is required")?;
+    let workspace_dir = workspace_dir.ok_or("restore-archive: --workspace-dir is required")?;
+
+    let _ = dotenvy::dotenv();
+    let key_b64 = std::env::var("LUCIDOS_RESTORE_KEY")
+        .map_err(|_| "restore-archive: LUCIDOS_RESTORE_KEY env var is required")?;
+    let key = lucidos_engine::core::backup::crypto::key_from_base64(&key_b64)
+        .map_err(|e| format!("restore-archive: invalid key: {e}"))?;
+    let database_url = lucidos_engine::core::database_url();
+
+    lucidos_engine::core::backup::restore_archive_into(
+        &workspace_dir,
+        &database_url,
+        &key,
+        &file,
+        |phase, cur, _total| {
+            // One progress line per tick; the gateway parses the latest phase for
+            // the picker's restore-status. Best-effort — a write failure is fine.
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "LUCIDOS_RESTORE_PHASE={phase}:{cur}");
+            let _ = out.flush();
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -307,7 +522,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = dotenvy::dotenv();
 
     // Raise file descriptor limit — macOS defaults to 256 which is too low
-    // for an engine running multiple Claude Code sessions, SSE streams, DB pool, and
+    // for an engine running multiple coding-agent sessions, SSE streams, DB pool, and
     // a Vite dev proxy simultaneously.
     raise_fd_limit();
 
@@ -342,18 +557,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::fs::create_dir_all(&workspace_path)?;
     log!("[Startup] Using workspace: {}", workspace_path.display());
 
-    // Load this workspace's own `.env` (override semantics) on top of the global
-    // `.env` loaded above, so each workspace can carry its own environment — e.g.
-    // a workspace-specific GitHub auth account via GH_CONFIG_DIR / GIT_SSH_COMMAND
-    // that `gh` / `git push` from agent subprocesses pick up. Values land in the
-    // engine's process env, so every spawned subprocess inherits them.
-    match lucidos_engine::core::load_workspace_env(&workspace_path) {
-        Some(path) => log!("[Startup] Loaded per-workspace .env from {}", path.display()),
-        None => log!(
-            "[Startup] No per-workspace .env under {} — skipping",
-            workspace_path.join(lucidos_engine::core::DATA_DIR).display()
-        ),
-    }
+    // The legacy per-workspace `data/.env` is retired in favour of the DB-backed
+    // environment_variables store. Its contents are migrated into the DB and the
+    // file removed below, AFTER the engine (and thus the DB + migrations) is up —
+    // see the `migrate_env_file_to_db` call after `LucidosEngine::new`.
 
     // Upgrade legacy `apis.json` (single `auth.type` per provider) to
     // the pipeline shape. Idempotent. Failure is fatal — better to
@@ -433,26 +640,50 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // OpenAI prefers a stored `openai` credential and falls back to the
         // OPENAI_API_KEY launch env var.
         let openai_env_key = std::env::var("OPENAI_API_KEY").ok();
-        let (openai, anthropic, registry_map) =
+        let (openai, anthropic, openrouter, local, registry_map) =
             load_direct_providers_and_registry(&database_url, &model, openai_env_key).await;
         if let Ok(mut guard) = model_registry.write() {
             *guard = registry_map;
         }
 
-        if vertex.is_none() && openai.is_none() && anthropic.is_none() {
-            panic!("No LLM provider configured. Set VERTEX_PROJECT_ID (Claude/Gemini via Vertex), configure an OpenAI or Anthropic credential (Settings → Providers) or OPENAI_API_KEY (GPT), or LUCIDOS_MODEL=mock (for testing).");
+        if vertex.is_none()
+            && openai.is_none()
+            && anthropic.is_none()
+            && openrouter.is_none()
+            && local.is_none()
+        {
+            // A packaged desktop build sets LUCIDOS_FALLBACK_MOCK=1 so the engine
+            // still boots on first run — before the user has entered any provider
+            // credential — instead of crashing the .app on launch. Dev and docker
+            // leave it unset and keep the fail-fast panic. Once a provider is
+            // configured (Settings → Providers, persisted in the DB) the next boot
+            // finds it above and uses it for real.
+            let fallback_mock = std::env::var("LUCIDOS_FALLBACK_MOCK")
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false);
+            if fallback_mock {
+                log!("[Startup] No LLM provider configured — falling back to the mock provider (LUCIDOS_FALLBACK_MOCK set). Add a provider in Settings → Providers, then restart.");
+                (
+                    Arc::new(lucidos_engine::llm::mock::MockProvider::new(model.clone())),
+                    None,
+                )
+            } else {
+                panic!("No LLM provider configured. Set VERTEX_PROJECT_ID (Claude/Gemini via Vertex), configure an OpenAI / Anthropic / OpenRouter credential (Settings → Providers) or OPENAI_API_KEY / LUCIDOS_OPENROUTER_API_KEY, set a local OpenAI-compatible base URL (Settings → Providers or LUCIDOS_LOCAL_BASE_URL), or LUCIDOS_MODEL=mock (for testing).");
+            }
+        } else {
+            (
+                Arc::new(RoutingProvider::new(
+                    vertex,
+                    openai,
+                    anthropic,
+                    openrouter,
+                    local,
+                    model_registry.clone(),
+                    model,
+                )),
+                vtc,
+            )
         }
-
-        (
-            Arc::new(RoutingProvider::new(
-                vertex,
-                openai,
-                anthropic,
-                model_registry.clone(),
-                model,
-            )),
-            vtc,
-        )
     };
 
     // Create engine with pgvector for embeddings
@@ -467,6 +698,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await?;
     log!("[Startup] PostgreSQL connected");
+
+    // Retire the legacy per-workspace `data/.env`: import its KEY=VALUE lines
+    // into the environment_variables table and delete the file. Runs once the DB
+    // + migrations are up; self-idempotent (the file is gone afterwards).
+    lucidos_engine::core::environment_variables::migrate_env_file_to_db(
+        engine.pool(),
+        &workspace_path,
+    )
+    .await;
+    // Apply stored env vars to the engine's OWN process env so engine-internal
+    // shell-outs that inherit it (the engine's git push/fetch/clone, MCP
+    // servers, …) see them — restoring what `data/.env` used to provide. Runs
+    // after the migration so just-migrated vars are included. Reserved names are
+    // filtered, so engine-critical process vars are never clobbered.
+    lucidos_engine::core::environment_variables::apply_to_process_env(engine.pool()).await;
 
     // Extract shared read-only resources before wrapping engine in Arc
     let event_store = engine.event_store().clone();
@@ -517,7 +763,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // Reset CC threads stuck in 'waiting' with no pending proposal.
-    // After restart, Claude Code sessions are dead — threads with no pending proposal
+    // After restart, coding-agent sessions are dead — threads with no pending proposal
     // have nothing for the user to act on and should go idle. Chat threads can
     // no longer reach 'waiting' (ResponseAborted goes idle, ResponseFailed goes
     // to 'failed'), so the source='claude_code' scope is defensive.
@@ -663,6 +909,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await;
 
+    // Re-deliver parent-resume wakes lost to the restart (ADR 0011, B1). The
+    // in-memory ParentCallback channel was recreated empty above, so any blocking
+    // child that completed while the engine was down — or whose wake was queued
+    // but not consumed when it died — left a persisted ChildThreadCompleted on
+    // its parent with no resume fired. This sweep re-injects those wakes onto the
+    // same channel `start_parent_callback_listener` (started above) is already
+    // draining, so the parent resumes through the identical live path. Runs after
+    // the orphan/has-diff/held-back recovery so a parent that was mid-resume when
+    // the engine died is recovered by CC auto-resume, not double-fired here.
+    shared_engine
+        .event_bus
+        .refire_unprocessed_child_completions()
+        .await;
+
     // Start memory indexer — subscribes to EventBus and indexes chat events
     lucidos_engine::engine::memory_consumer::spawn(shared_engine.clone());
 
@@ -752,7 +1012,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Bind to [::] (dual-stack) — accepts both IPv4 and IPv6 connections.
     // macOS defaults to IPV6_V6ONLY=0, so [::]:port handles IPv4 too.
     // This avoids ECONNREFUSED when clients resolve localhost to ::1.
-    let addr = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, api_port));
+    //
+    // Under the workspace gateway (ADR 0013) the engine binds loopback only
+    // (`LUCIDOS_BIND_LOOPBACK=1`) — the gateway is the sole network-facing
+    // surface and proxies over `http://127.0.0.1:<port>`.
+    let bind_loopback = std::env::var("LUCIDOS_BIND_LOOPBACK")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let addr = if bind_loopback {
+        SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, api_port))
+    } else {
+        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, api_port))
+    };
 
     let handle = axum_server::Handle::new();
     tokio::spawn(shutdown_signal(

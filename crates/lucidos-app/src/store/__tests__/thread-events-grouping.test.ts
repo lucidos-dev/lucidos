@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { TS, makeThreadState } from './thread-events-helpers';
-import { computeExchanges, exchangeStatus, groupIntoExchanges, handleEvent, resumeEngineNote, unresumedAbortIndex, type StoredEvent, type ThreadAggregate, type ThreadEvent, type ThreadState, type TransientEvent } from '../thread-events';
+import { computeExchanges, exchangeKey, exchangeStatus, groupIntoExchanges, handleEvent, resumeEngineNote, unresumedAbortIndex, type Exchange, type StoredEvent, type ThreadAggregate, type ThreadEvent, type ThreadState, type TransientEvent } from '../thread-events';
 
 describe('aggregate-takes-precedence over event-type lookups', () => {
   function makeAggregate(overrides: Partial<ThreadAggregate> = {}): ThreadAggregate {
@@ -158,6 +158,38 @@ describe('groupIntoExchanges', () => {
     expect(exchanges[1].userEvent.type).toBe(type);
     expect(exchanges[1].userSeq).toBe(3);
     expect(exchanges[1].steps).toHaveLength(0);
+  });
+
+  // Regression (real thread 276f5580): a background WorktreeCleaned event is
+  // pure bookkeeping (EventClass::Metadata in Rust, no render case). It must
+  // NOT be folded as a step into whatever exchange happens to be `current` —
+  // here the trailing ChildThreadCompleted card. The leak flipped the card's
+  // status to a phantom 'coding-agent-working' that survived reloads.
+  it('does not fold WorktreeCleaned into any exchange, leaving the child card "done"', () => {
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'spawn a child' }],
+      [2, { type: 'CodingAgentTextStreamed', text: 'Spawned successfully' } as ThreadEvent],
+      [3, { type: 'CodingAgentIdled', has_changes: false }],
+      // Child finishes → completion card opens a new exchange on the parent.
+      [4, { type: 'ChildThreadCompleted', child_thread_id: 'c1', status: 'success', summary: 'done' } as ThreadEvent],
+      // An hour later the cleanup worker emits this onto the same thread.
+      // WorktreeCleaned is now a first-class ThreadEvent variant (the
+      // union-coverage contract test keeps it in sync with the generated
+      // EVENT_CLASSIFICATION), so it constructs without a cast.
+      [5, { type: 'WorktreeCleaned', tier: 0, freed_bytes: 15853 }],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    // The WorktreeCleaned event belongs to no exchange.
+    const allSteps = exchanges.flatMap(e => e.steps.map(s => s.event.type));
+    expect(allSteps).not.toContain('WorktreeCleaned');
+    // The child-completion card is the last exchange and has no steps…
+    const card = exchanges[exchanges.length - 1];
+    expect(card.userEvent.type).toBe('ChildThreadCompleted');
+    expect(card.steps).toHaveLength(0);
+    // …so it reads as terminal on an idle CC thread, not a phantom spinner.
+    expect(
+      exchangeStatus(card, '', /* isLast */ true, /* hasPriorActive */ false, /* threadIsCC */ true, /* threadIdle */ true),
+    ).toBe('done');
   });
 
   it('splits at ResponseAborted: terminates prior exchange AND opens an empty boundary exchange', () => {
@@ -755,8 +787,9 @@ describe('handleEvent', () => {
     const threadMap = new Map([['thread-1', thread]]);
 
     expect(thread.pendingUserMessages).toHaveLength(1);
-    handleEvent(threadMap, 'thread-1', 1, { type: 'MessageReceived', text: 'optimistic message' }, TS, 'msg-1');
+    const result = handleEvent(threadMap, 'thread-1', 1, { type: 'MessageReceived', text: 'optimistic message' }, TS, 'msg-1');
     expect(thread.pendingUserMessages).toEqual([]);
+    expect(result.clearedPendingUserMessage).toBe(true);
   });
 
   it('does not clear pendingUserMessages on transient events', () => {
@@ -774,10 +807,11 @@ describe('handleEvent', () => {
     const threadMap = new Map([['thread-1', thread]]);
 
     // A ToolCalled event arrives — should NOT clear pending messages
-    handleEvent(threadMap, 'thread-1', 100, { type: 'ToolCalled', name: 'search', args: {} }, TS);
+    const result = handleEvent(threadMap, 'thread-1', 100, { type: 'ToolCalled', name: 'search', args: {} }, TS);
 
     // pendingUserMessages should still be there
     expect(thread.pendingUserMessages).toHaveLength(1);
+    expect(result.clearedPendingUserMessage).toBe(false);
 
     // Only the ToolCalled event — no synthetic MessageReceived
     expect(thread.events.size).toBe(1);
@@ -802,13 +836,75 @@ describe('handleEvent', () => {
     expect(thread.pendingUserMessages[0].eventId).toBe('msg-3');
   });
 
+  it('clears matching pendingUserMessage on QueuedMessageRemoved', () => {
+    const thread = makeThreadState();
+    thread.pendingUserMessages = [
+      { text: 'first', eventId: 'msg-1', created: '2026-01-01T00:00:00Z' },
+      { text: 'second', eventId: 'msg-2', created: '2026-01-01T00:00:00Z' },
+    ];
+    const threadMap = new Map([['thread-1', thread]]);
+
+    const result = handleEvent(threadMap, 'thread-1', 3, {
+      type: 'QueuedMessageRemoved',
+      removed_message_id: 'msg-2',
+    } as ThreadEvent, TS, 'remove-1');
+
+    expect(thread.pendingUserMessages).toEqual([
+      { text: 'first', eventId: 'msg-1', created: '2026-01-01T00:00:00Z' },
+    ]);
+    expect(result.clearedPendingUserMessage).toBe(true);
+  });
+
+  it('hides a removed queued MessageReceived while it remains un-injected', () => {
+    const thread = makeThreadState();
+    const threadMap = new Map([['thread-1', thread]]);
+
+    handleEvent(threadMap, 'thread-1', 1, { type: 'MessageReceived', text: 'active' }, TS, 'msg-1');
+    handleEvent(threadMap, 'thread-1', 2, { type: 'TextStreamed', text: 'working' }, TS, 'stream-1');
+    handleEvent(threadMap, 'thread-1', 3, { type: 'MessageReceived', text: 'queued' }, TS, 'msg-2');
+    handleEvent(threadMap, 'thread-1', 4, {
+      type: 'QueuedMessageRemoved',
+      removed_message_id: 'msg-2',
+    } as ThreadEvent, TS, 'remove-1');
+
+    const exchanges = computeExchanges(thread);
+    expect(exchanges).toHaveLength(1);
+    expect(exchanges[0].userEvent.type).toBe('MessageReceived');
+    expect((exchanges[0].userEvent as Extract<ThreadEvent, { type: 'MessageReceived' }>).text).toBe('active');
+  });
+
+  it('does not hide a removed message once UserPromptInjected already attached', () => {
+    const thread = makeThreadState();
+    const threadMap = new Map([['thread-1', thread]]);
+
+    handleEvent(threadMap, 'thread-1', 1, { type: 'MessageReceived', text: 'active' }, TS, 'msg-1');
+    handleEvent(threadMap, 'thread-1', 2, { type: 'TextStreamed', text: 'working' }, TS, 'stream-1');
+    handleEvent(threadMap, 'thread-1', 3, { type: 'MessageReceived', text: 'queued' }, TS, 'msg-2');
+    handleEvent(threadMap, 'thread-1', 4, {
+      type: 'QueuedMessageRemoved',
+      removed_message_id: 'msg-2',
+    } as ThreadEvent, TS, 'remove-1');
+    handleEvent(threadMap, 'thread-1', 5, {
+      type: 'UserPromptInjected',
+      text: 'queued',
+      mode: 'human',
+      injected_message_id: 'msg-2',
+    } as ThreadEvent, TS, 'inject-1');
+
+    const exchanges = computeExchanges(thread);
+    expect(exchanges).toHaveLength(2);
+    expect((exchanges[1].userEvent as Extract<ThreadEvent, { type: 'MessageReceived' }>).text).toBe('queued');
+    expect(exchanges[1].steps.map(step => step.event.type)).toEqual(['UserPromptInjected']);
+  });
+
   it('clears matching pendingUserMessage on UserPromptInjected with matching event_id', () => {
     const thread = makeThreadState();
     thread.pendingUserMessages = [{ text: 'fix the bug', eventId: 'inject-1', created: '2026-01-01T00:00:00Z' }];
     const threadMap = new Map([['thread-1', thread]]);
 
-    handleEvent(threadMap, 'thread-1', 10, { type: 'UserPromptInjected', text: 'fix the bug' }, TS, 'inject-1');
+    const result = handleEvent(threadMap, 'thread-1', 10, { type: 'UserPromptInjected', text: 'fix the bug' }, TS, 'inject-1');
     expect(thread.pendingUserMessages).toEqual([]);
+    expect(result.clearedPendingUserMessage).toBe(true);
   });
 
   // Free-form CC question answers route through process.rs's
@@ -824,13 +920,14 @@ describe('handleEvent', () => {
     ];
     const threadMap = new Map([['thread-1', thread]]);
 
-    handleEvent(threadMap, 'thread-1', 10, {
+    const result = handleEvent(threadMap, 'thread-1', 10, {
       type: 'UserQuestionAnswered',
       tool_use_id: 'tu-1',
       answer: { kind: 'FreeText', text: 'Ask anyway but proceed if reversible' },
     } as ThreadEvent, TS);
 
     expect(thread.pendingUserMessages).toEqual([]);
+    expect(result.clearedPendingUserMessage).toBe(true);
   });
 
   // Selected answers come from the option-button POST path which never adds
@@ -894,3 +991,57 @@ describe('handleEvent', () => {
 // ===========================================================================
 // UserPromptInjected — groupIntoExchanges
 // ===========================================================================
+
+// ===========================================================================
+// exchangeKey — stable render identity across the optimistic→persisted swap
+// ===========================================================================
+describe('exchangeKey', () => {
+  it('keeps the same key when an optimistic pending message becomes a persisted MessageReceived', () => {
+    // Reproduces the "follow-up disappears, then shows up after a while" bug.
+    // The optimistic synthetic exchange sorts at a MAX_SAFE_INTEGER seq; the
+    // persisted MessageReceived carries its real (much smaller) DB seq. Keying
+    // the rendered <ChatExchange> by `userSeq` therefore changes the key on the
+    // swap, remounting the DOM node — which churns the auto-scroll observers and
+    // leaves the message off-screen until a later event re-snaps to the bottom.
+    // The client `event_id` round-trips as the events-table PK, so `_eventId` is
+    // identical across the swap and is the stable identity to key on.
+    const thread = makeThreadState();
+    const EVENT_ID = 'client-uuid-1';
+    thread.pendingUserMessages.push({ text: 'logo must match height', eventId: EVENT_ID, created: TS });
+    const map = new Map([['thread-1', thread]]);
+
+    // Optimistic phase.
+    const optimistic = computeExchanges(thread);
+    expect(optimistic).toHaveLength(1);
+    const optimisticEx = optimistic[0];
+    expect(optimisticEx.userEvent.type).toBe('MessageReceived');
+    const optimisticKey = exchangeKey(optimisticEx);
+
+    // Server confirmation: real MessageReceived arrives via SSE with the SAME
+    // client event_id but a real DB seq. handleEvent clears the optimistic row.
+    handleEvent(map, 'thread-1', 42, { type: 'MessageReceived', text: 'logo must match height' } as ThreadEvent, TS, EVENT_ID);
+    expect(thread.pendingUserMessages).toHaveLength(0);
+
+    const persisted = computeExchanges(thread);
+    expect(persisted).toHaveLength(1);
+    const persistedEx = persisted[0];
+
+    // The seq genuinely changes — the old `'ex-' + userSeq` key would remount.
+    expect(persistedEx.userSeq).not.toBe(optimisticEx.userSeq);
+    // …but the stable key does not, so Preact reconciles the node in place.
+    expect(exchangeKey(persistedEx)).toBe(optimisticKey);
+  });
+
+  it('falls back to a unique seq-based key when the user event has no _eventId', () => {
+    const a: Exchange = { userEvent: { type: 'MessageReceived', text: 'x' } as StoredEvent, userSeq: 3, steps: [] };
+    const b: Exchange = { userEvent: { type: 'MessageReceived', text: 'y' } as StoredEvent, userSeq: 4, steps: [] };
+    expect(exchangeKey(a)).not.toBe(exchangeKey(b));
+  });
+
+  it('never collides an _eventId key with a seq fallback key', () => {
+    // A seq fallback could otherwise stringify to the same value as an _eventId.
+    const withId: Exchange = { userEvent: { type: 'MessageReceived', text: 'x', _eventId: '5' } as StoredEvent, userSeq: 99, steps: [] };
+    const withoutId: Exchange = { userEvent: { type: 'MessageReceived', text: 'y' } as StoredEvent, userSeq: 5, steps: [] };
+    expect(exchangeKey(withId)).not.toBe(exchangeKey(withoutId));
+  });
+});

@@ -196,6 +196,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_seeds_glm_5_2_on_openrouter() {
+        let (pool, db_name) = setup_test_db().await;
+        let m = ModelStore::get(&pool, "z-ai/glm-5.2")
+            .await
+            .unwrap()
+            .expect("GLM 5.2 builtin must be seeded");
+        assert_eq!(m.provider, "openrouter");
+        assert_eq!(m.label, "GLM 5.2");
+        assert!(m.is_builtin(), "GLM 5.2 must be a builtin (disable-only)");
+        assert!(m.enabled, "GLM 5.2 builtin is enabled by default");
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
     async fn create_update_delete_user_model_round_trips() {
         let (pool, db_name) = setup_test_db().await;
 

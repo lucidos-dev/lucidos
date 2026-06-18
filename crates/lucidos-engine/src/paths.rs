@@ -96,6 +96,12 @@ mod tests {
     /// 50724c03 — `com.apple.Virtualization.VirtualMachine` diagnostic at
     /// 22:44, DB pool timeouts at 05:50, force restart at 07:18). Switching
     /// to a Docker named volume keeps fsyncs inside the VM's ext4.
+    ///
+    /// PG 18's image relocated PGDATA to /var/lib/postgresql/18/docker and
+    /// declares its VOLUME at the parent /var/lib/postgresql (PG 17 used
+    /// /var/lib/postgresql/data for both), so the named volume must be mounted
+    /// at the parent — mounting the old /data path would strand PGDATA on an
+    /// anonymous volume that is lost on each container recreate.
     #[test]
     fn dev_postgres_uses_named_volume_not_bind_mount() {
         let repo = repo_root().expect("repo root");
@@ -103,9 +109,16 @@ mod tests {
             .expect("docker-compose.dev.yml must exist");
 
         assert!(
-            yml.contains("- lucidos-pg-data:/var/lib/postgresql/data"),
-            "Postgres PGDATA must be a named volume, not a host bind mount.\n\
-             Expected line: '- lucidos-pg-data:/var/lib/postgresql/data'\n\
+            yml.contains("- lucidos-pg-data:/var/lib/postgresql\n"),
+            "Postgres PGDATA must be a named volume mounted at the parent\n\
+             /var/lib/postgresql (PG 18 keeps the cluster under it at 18/docker).\n\
+             Expected line: '- lucidos-pg-data:/var/lib/postgresql'\n\
+             Got docker-compose.dev.yml:\n{yml}"
+        );
+        assert!(
+            !yml.contains("- lucidos-pg-data:/var/lib/postgresql/data"),
+            "PG 17 mount path must be gone — PG 18 relocated PGDATA, so mounting\n\
+             the named volume at /var/lib/postgresql/data loses data on recreate.\n\
              Got docker-compose.dev.yml:\n{yml}"
         );
         assert!(

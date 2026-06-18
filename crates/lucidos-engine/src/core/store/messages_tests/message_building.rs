@@ -352,12 +352,12 @@ fn orchestrator_resume_history_preserves_tool_calls() {
         ),
         make_event(
             "ToolCalled",
-            json!({"name": "run_claude", "args": {"prompt": "/harden-project"}}),
+            json!({"name": "run_coding_agent", "args": {"prompt": "/harden-project"}}),
             5,
         ),
         make_event(
             "ToolResult",
-            json!({"name": "run_claude", "success": true, "result": "Claude Code session started"}),
+            json!({"name": "run_coding_agent", "success": true, "result": "Claude Code session started"}),
             6,
         ),
         make_event("TextStreamed", json!({"text": "Step 2 started."}), 7),
@@ -394,8 +394,8 @@ fn orchestrator_resume_history_preserves_tool_calls() {
         summary
     );
     assert!(
-        summary.contains("run_claude") || summary.contains("Claude Code"),
-        "summary should mention run_claude, got: {}",
+        summary.contains("run_coding_agent") || summary.contains("Claude Code"),
+        "summary should mention run_coding_agent, got: {}",
         summary
     );
 }

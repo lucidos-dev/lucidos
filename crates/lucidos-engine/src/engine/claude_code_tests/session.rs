@@ -290,12 +290,13 @@ fn make_test_session(
         last_event_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         pending_followups: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         tools_in_flight: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
     }
 }
 
 /// Validates that when a Claude Code session is idle (is_waiting=true), a follow-up
 /// message is routed via msg_tx instead of being rejected with
-/// "Claude Code is already running".
+/// "A coding agent is already running".
 #[tokio::test]
 async fn idle_session_routes_followup_via_msg_tx() {
     use crate::engine::AgentUserInput;

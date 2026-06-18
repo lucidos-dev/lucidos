@@ -65,6 +65,22 @@ fn message_origin_engine_scheduler_carries_trigger_metadata() {
 }
 
 #[test]
+fn message_origin_engine_plugin_auto_update_carries_marketplace_metadata() {
+    let origin = MessageOrigin::Engine {
+        reason: EngineReason::PluginAutoUpdate {
+            plugin_id: "browser-learning".to_string(),
+            marketplace_id: "core".to_string(),
+            marketplace_name: "Core".to_string(),
+        },
+    };
+    let json = serde_json::to_value(&origin).unwrap();
+    assert_eq!(json["reason"]["kind"], "plugin_auto_update");
+    assert_eq!(json["reason"]["plugin_id"], "browser-learning");
+    assert_eq!(json["reason"]["marketplace_id"], "core");
+    assert_eq!(json["reason"]["marketplace_name"], "Core");
+}
+
+#[test]
 fn message_origin_engine_round_trips_through_serde() {
     let original = MessageOrigin::Engine {
         reason: EngineReason::HardenRetrigger,
@@ -229,4 +245,3 @@ fn message_origin_mode_reads_field_for_workspace_and_thread_link() {
     assert_eq!(ws.mode(), ActorMode::Agent);
     assert_eq!(tl.mode(), ActorMode::Engine);
 }
-

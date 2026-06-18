@@ -165,17 +165,25 @@ mod relation_tests {
     }
 
     #[test]
-    fn child_run_claude_text_describes_new_thread() {
+    fn child_run_coding_agent_text_describes_new_thread() {
         let child = Uuid::new_v4();
-        let text = Relation::Child.run_claude_success_text(child, "dev");
+        let text = Relation::Child.run_coding_agent_success_text(
+            child,
+            "dev",
+            crate::runtime::CodingAgent::ClaudeCode,
+        );
         assert!(text.contains("Claude Code"));
         assert!(text.contains(&child.to_string()));
     }
 
     #[test]
-    fn top_run_claude_text_states_no_callback() {
+    fn top_run_coding_agent_text_states_no_callback() {
         let child = Uuid::new_v4();
-        let text = Relation::Top.run_claude_success_text(child, "dev");
+        let text = Relation::Top.run_coding_agent_success_text(
+            child,
+            "dev",
+            crate::runtime::CodingAgent::ClaudeCode,
+        );
         assert!(
             text.contains("NOT report back") || text.contains("not report back"),
             "top CC spawn must explicitly say there is no callback: {}",
@@ -185,10 +193,14 @@ mod relation_tests {
     }
 
     #[test]
-    fn run_claude_text_stamps_workspace_into_body_and_link() {
+    fn run_coding_agent_text_stamps_workspace_into_body_and_link() {
         let child = Uuid::new_v4();
         for relation in [Relation::Child, Relation::Top] {
-            let text = relation.run_claude_success_text(child, "personal");
+            let text = relation.run_coding_agent_success_text(
+                child,
+                "personal",
+                crate::runtime::CodingAgent::ClaudeCode,
+            );
             assert!(
                 text.contains("workspace 'personal'"),
                 "{:?} CC ack must name the workspace in the body: {}",

@@ -27,8 +27,8 @@ const CROSS_WORKSPACE_TIMEOUT: Duration = Duration::from_secs(30);
 /// fires against a hung peer without paying the production 30-second cost.
 ///
 /// - `danger_accept_invalid_certs(true)` matches the other localhost engine
-///   clients (`api/proxy.rs`, `dev_proxy.rs`, `api/backup.rs`) since each
-///   workspace engine ships a self-signed cert.
+///   clients (`api/proxy.rs`, `api/backup.rs`) since each workspace engine
+///   ships a self-signed cert.
 /// - `timeout(timeout)` bounds each request so a hung peer can't pin the
 ///   calling thread (see `harden-engine-workspace-client-no-timeout` in the
 ///   work tracker).
@@ -42,9 +42,9 @@ pub(crate) fn build_cross_workspace_client(timeout: Duration) -> reqwest::Result
 /// Shared HTTP client for cross-workspace POSTs. Lazily built once so
 /// repeated calls reuse the connection pool and the rustls context —
 /// `Client::builder().build()` is non-trivial. Production callers (chat
-/// `run_claude` cross-workspace spawn, in-tree tests against a local axum
-/// listener) all go through this so any TLS / timeout policy lives in one
-/// place. See `build_cross_workspace_client` for the knobs.
+/// `run_coding_agent` cross-workspace spawn, in-tree tests against a local
+/// axum listener) all go through this so any TLS / timeout policy lives in
+/// one place. See `build_cross_workspace_client` for the knobs.
 pub fn cross_workspace_http_client() -> &'static Client {
     static CLIENT: LazyLock<Client> = LazyLock::new(|| {
         build_cross_workspace_client(CROSS_WORKSPACE_TIMEOUT)
@@ -107,23 +107,43 @@ pub async fn workspace_post<B: serde::Serialize>(
     Ok(client.post(url).json(&merged).send().await?)
 }
 
-/// Build the `/api/v1/chat/stream` body for a cross-workspace Claude Code spawn.
+/// The user-facing parameters for spawning a coding-agent thread in another
+/// workspace: the prompt plus the optional title / target folder / backend.
+/// Grouped because these five always travel together from the caller down to
+/// the request-body builder; passing them as a unit keeps the spawn helper
+/// under clippy's argument-count limit without an artificial wrapper.
+pub struct CrossWorkspaceSpawn<'a> {
+    /// The instruction sent to the spawned coding-agent thread.
+    pub prompt: &'a str,
+    /// Optional thread title; omitted from the body when `None`/empty.
+    pub title: Option<&'a str>,
+    /// Deprecated alias for `folder` (a registered repo id/name).
+    pub repo: Option<&'a str>,
+    /// Canonical target folder for the spawn (`data/apps/<id>/` or a repo root).
+    pub folder: Option<&'a str>,
+    /// Which backend drives the thread; receiver defaults to Claude Code.
+    pub coding_agent: Option<crate::runtime::CodingAgent>,
+}
+
+/// Build the `/api/v1/chat/stream` body for a cross-workspace coding-agent spawn.
 ///
 /// Pre-generates `thread_id` (caller-supplied) so the caller can return a
 /// workspace-qualified link without a second request. Mirrors `lucidos
-/// spawn-thread --cc`'s body shape (see
+/// spawn-thread --cc` / `--codex` body shape (see
 /// `crates/lucidos-cli/src/spawn_thread.rs`) so both paths land equivalent
 /// threads in the receiving engine.
-pub(crate) fn build_cross_workspace_cc_body(
+pub(crate) fn build_cross_workspace_coding_agent_body(
     cc_thread_id: Uuid,
     prompt: &str,
     title: Option<&str>,
     repo: Option<&str>,
+    folder: Option<&str>,
+    coding_agent: Option<crate::runtime::CodingAgent>,
 ) -> Value {
     let mut body = serde_json::json!({
         "message": prompt,
         "thread_id": cc_thread_id.to_string(),
-        "use_claude_code": true,
+        "use_coding_agent": true,
     });
     let obj = body.as_object_mut().expect("json! built an object");
     if let Some(t) = title.filter(|s| !s.is_empty()) {
@@ -132,30 +152,47 @@ pub(crate) fn build_cross_workspace_cc_body(
     if let Some(r) = repo.filter(|s| !s.is_empty()) {
         obj.insert("repo_id".into(), Value::String(r.to_string()));
     }
+    if let Some(f) = folder.filter(|s| !s.is_empty()) {
+        obj.insert("folder".into(), Value::String(f.to_string()));
+    }
+    if let Some(agent) = coding_agent {
+        obj.insert(
+            "coding_agent".into(),
+            Value::String(agent.as_str().to_string()),
+        );
+    }
     body
 }
 
-/// Spawn a Claude Code thread in another workspace.
+/// Spawn a coding-agent thread in another workspace.
 ///
-/// POSTs to the target workspace's `/api/v1/chat/stream` with `use_claude_code:
+/// POSTs to the target workspace's `/api/v1/chat/stream` with `use_coding_agent:
 /// true` and the caller_* / mode fields merged in via `workspace_post`.
 /// Returns the pre-generated `thread_id` on success so the caller can build
 /// the user-facing link.
 ///
 /// `scheme` is "https" in production; tests pass "http" to avoid TLS setup
 /// against a plain axum listener.
-pub async fn spawn_claude_in_workspace(
+pub async fn spawn_coding_agent_in_workspace(
     client: &Client,
     target: &CrossWorkspaceTarget,
-    prompt: &str,
-    title: Option<&str>,
-    repo: Option<&str>,
+    spawn: &CrossWorkspaceSpawn<'_>,
     ctx: &WorkspaceCallCtx,
     scheme: &str,
 ) -> Result<Uuid, String> {
     let cc_thread_id = Uuid::new_v4();
-    let body = build_cross_workspace_cc_body(cc_thread_id, prompt, title, repo);
-    let url = format!("{}://localhost:{}/api/v1/chat/stream", scheme, target.api_port);
+    let body = build_cross_workspace_coding_agent_body(
+        cc_thread_id,
+        spawn.prompt,
+        spawn.title,
+        spawn.repo,
+        spawn.folder,
+        spawn.coding_agent,
+    );
+    let url = format!(
+        "{}://localhost:{}/api/v1/chat/stream",
+        scheme, target.api_port
+    );
     let resp = workspace_post(client, &url, &body, ctx)
         .await
         .map_err(|e| format!("cross-workspace POST to {} failed: {}", url, e))?;
@@ -291,32 +328,91 @@ mod tests {
     }
 
     #[test]
-    fn build_cc_body_includes_required_fields_and_optional_when_set() {
+    fn build_coding_agent_body_includes_required_fields_and_optional_when_set() {
         let tid = Uuid::new_v4();
-        let body = build_cross_workspace_cc_body(tid, "do the thing", Some("My title"), Some("Lucidos"));
+        let body = build_cross_workspace_coding_agent_body(
+            tid,
+            "do the thing",
+            Some("My title"),
+            Some("Lucidos"),
+            None,
+            Some(crate::runtime::CodingAgent::Codex),
+        );
         assert_eq!(body["message"], "do the thing");
         assert_eq!(body["thread_id"], tid.to_string());
-        assert_eq!(body["use_claude_code"], true);
+        assert_eq!(body["use_coding_agent"], true);
         assert_eq!(body["title"], "My title");
         assert_eq!(body["repo_id"], "Lucidos");
+        assert_eq!(body["coding_agent"], "codex");
     }
 
     #[test]
-    fn build_cc_body_omits_title_and_repo_when_unset_or_empty() {
+    fn build_coding_agent_body_includes_folder_when_set() {
         let tid = Uuid::new_v4();
-        let body = build_cross_workspace_cc_body(tid, "x", None, None);
-        assert!(body.get("title").is_none(), "title must be omitted: {:?}", body);
-        assert!(body.get("repo_id").is_none(), "repo_id must be omitted: {:?}", body);
+        let body = build_cross_workspace_coding_agent_body(
+            tid,
+            "do the thing",
+            None,
+            None,
+            Some("data/apps/momentum"),
+            Some(crate::runtime::CodingAgent::Codex),
+        );
+        assert_eq!(body["folder"], "data/apps/momentum");
+        assert_eq!(body["coding_agent"], "codex");
+        assert!(
+            body.get("repo_id").is_none(),
+            "folder body must not also carry repo_id: {:?}",
+            body
+        );
+    }
+
+    #[test]
+    fn build_coding_agent_body_omits_title_and_repo_when_unset_or_empty() {
+        let tid = Uuid::new_v4();
+        let body = build_cross_workspace_coding_agent_body(tid, "x", None, None, None, None);
+        assert!(
+            body.get("title").is_none(),
+            "title must be omitted: {:?}",
+            body
+        );
+        assert!(
+            body.get("repo_id").is_none(),
+            "repo_id must be omitted: {:?}",
+            body
+        );
+        assert!(
+            body.get("coding_agent").is_none(),
+            "coding_agent must be omitted when unset: {:?}",
+            body
+        );
+        assert!(
+            body.get("folder").is_none(),
+            "folder must be omitted when unset: {:?}",
+            body
+        );
         // Empty strings are treated as absent so the receiver doesn't see "".
-        let body = build_cross_workspace_cc_body(tid, "x", Some(""), Some(""));
-        assert!(body.get("title").is_none(), "empty title must be omitted: {:?}", body);
-        assert!(body.get("repo_id").is_none(), "empty repo must be omitted: {:?}", body);
+        let body = build_cross_workspace_coding_agent_body(tid, "x", Some(""), Some(""), Some(""), None);
+        assert!(
+            body.get("title").is_none(),
+            "empty title must be omitted: {:?}",
+            body
+        );
+        assert!(
+            body.get("repo_id").is_none(),
+            "empty repo must be omitted: {:?}",
+            body
+        );
+        assert!(
+            body.get("folder").is_none(),
+            "empty folder must be omitted: {:?}",
+            body
+        );
     }
 
     #[tokio::test]
-    async fn spawn_claude_in_workspace_posts_cc_body_with_caller_context() {
+    async fn spawn_coding_agent_in_workspace_posts_body_with_caller_context() {
         // End-to-end shape check: the helper must POST to <port>/api/v1/chat/stream
-        // with use_claude_code=true and the caller_* + mode fields merged in.
+        // with use_coding_agent=true and the caller_* + mode fields merged in.
         // Without these, the receiving engine rejects Agent-mode messages
         // with 400 (no provenance).
         use std::sync::{Arc, Mutex};
@@ -328,8 +424,7 @@ mod tests {
             axum::routing::post(move |body: axum::Json<Value>| {
                 let captured = captured_for_handler.clone();
                 async move {
-                    *captured.lock().unwrap() =
-                        Some(("/api/v1/chat/stream".into(), body.0));
+                    *captured.lock().unwrap() = Some(("/api/v1/chat/stream".into(), body.0));
                     axum::http::StatusCode::OK
                 }
             }),
@@ -354,12 +449,16 @@ mod tests {
             mode: ActorMode::Agent,
         };
         let client = cross_workspace_http_client();
-        let cc_thread_id = spawn_claude_in_workspace(
+        let cc_thread_id = spawn_coding_agent_in_workspace(
             client,
             &target,
-            "build the feature",
-            Some("Add feature X"),
-            Some("Lucidos"),
+            &CrossWorkspaceSpawn {
+                prompt: "build the feature",
+                title: Some("Add feature X"),
+                repo: None,
+                folder: Some("data/apps/momentum"),
+                coding_agent: Some(crate::runtime::CodingAgent::Codex),
+            },
             &ctx,
             "http",
         )
@@ -374,9 +473,11 @@ mod tests {
         assert_eq!(path, "/api/v1/chat/stream");
         assert_eq!(body["message"], "build the feature");
         assert_eq!(body["thread_id"], cc_thread_id.to_string());
-        assert_eq!(body["use_claude_code"], true);
+        assert_eq!(body["use_coding_agent"], true);
+        assert_eq!(body["coding_agent"], "codex");
         assert_eq!(body["title"], "Add feature X");
-        assert_eq!(body["repo_id"], "Lucidos");
+        assert_eq!(body["folder"], "data/apps/momentum");
+        assert!(body.get("repo_id").is_none());
         // Cross-workspace provenance: receiver MUST see caller_workspace +
         // mode=agent or it rejects the request as malformed.
         assert_eq!(body["caller_workspace"], "dev");
@@ -384,7 +485,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_claude_in_workspace_propagates_http_error_with_status_and_body() {
+    async fn spawn_coding_agent_in_workspace_propagates_http_error_with_status_and_body() {
         // 4xx/5xx from the receiver must surface as Err so the LLM sees the
         // failure instead of the helper falsely reporting success.
         let app = axum::Router::new().route(
@@ -408,9 +509,21 @@ mod tests {
             proto: "http".to_string(),
         };
         let client = cross_workspace_http_client();
-        let err = spawn_claude_in_workspace(client, &target, "x", None, None, &ctx(), "http")
-            .await
-            .expect_err("4xx must surface as Err");
+        let err = spawn_coding_agent_in_workspace(
+            client,
+            &target,
+            &CrossWorkspaceSpawn {
+                prompt: "x",
+                title: None,
+                repo: None,
+                folder: None,
+                coding_agent: None,
+            },
+            &ctx(),
+            "http",
+        )
+        .await
+        .expect_err("4xx must surface as Err");
         assert!(err.contains("400"), "error must include status: {}", err);
         assert!(
             err.contains("locked to Lucidos mode"),

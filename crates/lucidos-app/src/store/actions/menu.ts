@@ -8,10 +8,12 @@ import { revealContentPane } from './pane';
 import type { SettingsSubview } from '../store';
 import type { MenuItem } from '../types';
 import { loadCredentials } from './credentials';
+import { loadEnvironmentVariables } from './environmentVariables';
 import { loadDevices } from './devices';
 import { loadNotifications } from './notifications';
 import { loadTriggers } from './triggers';
 import { loadApps } from './apps';
+import { loadPluginCatalog } from './plugin-marketplaces';
 import { pushNavState } from './navigation';
 
 /** Set the active menu item, without pushing nav state or loading data.
@@ -58,6 +60,8 @@ export function switchMenuItem(item: MenuItem) {
 export function openSettingsSubview(key: Exclude<SettingsSubview, 'main'>) {
   settingsSubview.value = key;
   if (key === 'accounts') void loadCredentials();
+  if (key === 'environment-variables') void loadEnvironmentVariables();
+  if (key === 'marketplaces') void loadPluginCatalog();
   panelOverlay.value = null;
   localStorage.removeItem('file-preview-open');
   localStorage.removeItem('app-window-open');

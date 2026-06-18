@@ -95,7 +95,7 @@ describe('effectiveSendMode', () => {
   });
 
   it('falls back to currentComposeMode when no thread is focused (compose view)', () => {
-    inputMode.value = { type: 'claude_code' };
+    inputMode.value = { type: 'coding_agent' };
     expect(effectiveSendMode(undefined)).toBe('claude_code');
     inputMode.value = { type: 'do' };
     expect(effectiveSendMode(undefined)).toBe('lucidos');
@@ -110,14 +110,14 @@ describe('effectiveSendMode', () => {
     inputMode.value = { type: 'do' };
     expect(effectiveSendMode(makeComposingThread('claude_code'))).toBe('claude_code');
 
-    inputMode.value = { type: 'claude_code' };
+    inputMode.value = { type: 'coding_agent' };
     expect(effectiveSendMode(makeComposingThread('lucidos'))).toBe('lucidos');
   });
 
   it("falls back to currentComposeMode if a composing thread's composeMode is missing", () => {
     // composeMode can be null when the row arrived via SSE before the engine
     // ack'd with the picked mode.
-    inputMode.value = { type: 'claude_code' };
+    inputMode.value = { type: 'coding_agent' };
     expect(effectiveSendMode(makeComposingThread(null))).toBe('claude_code');
   });
 

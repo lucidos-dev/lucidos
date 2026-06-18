@@ -5,7 +5,7 @@
 use super::super::event_bus::{BusEvent, EventBus};
 use super::super::git_ops::git_cmd;
 use super::super::thread_events::{EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 
@@ -222,10 +222,236 @@ pub(crate) async fn last_turn_ended_cleanly(
     matches!(row.as_deref(), Some("ResponseGenerated"))
 }
 
+/// Last-resort recovery for an actively-running coding-agent branch whose ref
+/// vanished from every repo (`recover_orphaned_worktrees`'s "branch not found
+/// in any repo" arm) while its deterministic worktree directory survived on
+/// disk. Recreates the branch ref at the worktree's recorded `HEAD` so the
+/// session can be `--resume`d on the original branch instead of being torn down
+/// and restarted from a fresh branch (which drops the `cc_session_id` and the
+/// thread's conversation continuity — the thread-9e37697e failure mode).
+///
+/// Returns `Some((repo_root, worktree_path))` when the branch was recreated and
+/// the session can resume; `None` (caller falls back to ending the stuck
+/// session — the genuine last resort) when:
+///   - the worktree directory is absent (nothing recoverable),
+///   - its `HEAD` does not resolve to a real commit (a dangling symref left by
+///     out-of-band ref deletion — we never *guess* a SHA, which could mis-point
+///     a commit-bearing branch onto the wrong history), or
+///   - the repo root can't be resolved or the `git branch` create fails.
+///
+/// Pure git/filesystem — no engine/DB dependency — so it is unit-testable
+/// against a real worktree without instantiating a `LucidosEngine`.
+pub(crate) async fn recover_branch_ref_from_worktree(
+    workspace_path: &Path,
+    thread_id: Uuid,
+    branch_name: &str,
+) -> Option<(PathBuf, PathBuf)> {
+    let wt = crate::engine::agent_session::resume::deterministic_worktree_path(
+        workspace_path,
+        thread_id,
+    );
+    if !matches!(tokio::fs::try_exists(&wt).await, Ok(true)) {
+        return None;
+    }
+    // Resolve the worktree's HEAD to a concrete commit. `--verify` makes git
+    // fail (non-zero) rather than echo the literal "HEAD" when the symref
+    // dangles, so a deleted-branch-but-symref-still-points-at-it worktree
+    // (unrecoverable without fsck) falls through to the last-resort path
+    // instead of recreating the branch at a bogus value.
+    let head_sha = match git_cmd(&["rev-parse", "--verify", "HEAD"], &wt).await {
+        Ok(o) if o.status.success() => {
+            let sha = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if sha.is_empty() {
+                return None;
+            }
+            sha
+        }
+        _ => return None,
+    };
+    let repo_root = crate::engine::worktree_cleanup::resolve_repo_root_from_worktree(&wt).await?;
+    match git_cmd(&["branch", branch_name, &head_sha], &repo_root).await {
+        Ok(o) if o.status.success() => {
+            log!(
+                "[Recovery] Recreated missing branch {} at {} from surviving worktree {} — session resumable",
+                branch_name,
+                &head_sha[..head_sha.floor_char_boundary(8)],
+                wt.display()
+            );
+            Some((repo_root, wt))
+        }
+        Ok(o) => {
+            log!(
+                "[Recovery] Could not recreate branch {} from worktree {}: {}",
+                branch_name,
+                wt.display(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            None
+        }
+        Err(e) => {
+            log!(
+                "[Recovery] git branch create for {} errored: {}",
+                branch_name,
+                e
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::git_ops::{git_cmd, worktrees_dir};
     use std::collections::HashMap;
+
+    /// Build a fresh git repo at `workspace` with one commit on `main` and an
+    /// empty `.lucidos/worktrees/`. Returns nothing — the caller uses
+    /// `workspace` as both repo root and workspace root.
+    async fn init_repo(workspace: &Path) {
+        git_cmd(&["init", "--initial-branch=main"], workspace)
+            .await
+            .unwrap();
+        git_cmd(&["config", "user.email", "recover@test"], workspace)
+            .await
+            .unwrap();
+        git_cmd(&["config", "user.name", "Recover Test"], workspace)
+            .await
+            .unwrap();
+        tokio::fs::write(workspace.join("seed.txt"), "seed")
+            .await
+            .unwrap();
+        git_cmd(&["add", "."], workspace).await.unwrap();
+        git_cmd(&["commit", "-m", "seed"], workspace).await.unwrap();
+        let _ = worktrees_dir(workspace);
+    }
+
+    async fn rev_parse(repo: &Path, rev: &str) -> Option<String> {
+        let o = git_cmd(&["rev-parse", "--verify", rev], repo).await.ok()?;
+        o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    }
+
+    /// Regression for the thread-9e37697e recovery half: when a resumable
+    /// coding-agent branch's ref has vanished but its deterministic worktree
+    /// directory survives with a resolvable HEAD, recovery recreates the branch
+    /// from that HEAD (so the session can `--resume`) instead of ending the
+    /// stuck session and dropping the session id.
+    #[tokio::test]
+    async fn recover_branch_ref_recreates_missing_branch_from_surviving_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        init_repo(&workspace).await;
+
+        let thread_id = Uuid::new_v4();
+        let branch = "claude-code/recover-test";
+        let wt = crate::engine::agent_session::resume::deterministic_worktree_path(
+            &workspace, thread_id,
+        );
+        git_cmd(
+            &["worktree", "add", "-b", branch, &wt.to_string_lossy(), "main"],
+            &workspace,
+        )
+        .await
+        .unwrap();
+        let head_before = rev_parse(&wt, "HEAD").await.expect("worktree HEAD resolves");
+
+        // Simulate the branch-ref loss while the worktree dir survives: detach
+        // the worktree's HEAD (so it still resolves to a commit), then delete
+        // the branch ref. This is exactly the "branch not found in any repo,
+        // worktree survives" state recovery's last-resort arm guards against.
+        git_cmd(&["checkout", "--detach"], &wt).await.unwrap();
+        git_cmd(&["branch", "-D", branch], &workspace).await.unwrap();
+        assert!(
+            rev_parse(&workspace, &format!("refs/heads/{}", branch))
+                .await
+                .is_none(),
+            "precondition: branch ref must be gone"
+        );
+
+        let recovered = recover_branch_ref_from_worktree(&workspace, thread_id, branch).await;
+        let (repo_root, wt_path) =
+            recovered.expect("must recover the branch from the surviving worktree");
+        assert_eq!(wt_path, wt, "returns the recovered worktree path");
+        // `resolve_repo_root_from_worktree` canonicalizes (macOS resolves
+        // `/var` → `/private/var`), so compare canonical forms.
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        assert_eq!(
+            canon(&repo_root),
+            canon(&workspace),
+            "resolves the worktree's repo root"
+        );
+
+        let head_after = rev_parse(&workspace, &format!("refs/heads/{}", branch))
+            .await
+            .expect("branch ref must be recreated");
+        assert_eq!(
+            head_after, head_before,
+            "recreated branch must point at the worktree's recorded HEAD, not a guessed commit"
+        );
+    }
+
+    /// No worktree on disk → nothing to recover from → `None` so the caller
+    /// falls back to ending the stuck session (the genuine last resort).
+    #[tokio::test]
+    async fn recover_branch_ref_returns_none_when_worktree_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        init_repo(&workspace).await;
+        let _ = worktrees_dir(&workspace);
+
+        let recovered =
+            recover_branch_ref_from_worktree(&workspace, Uuid::new_v4(), "claude-code/missing")
+                .await;
+        assert!(
+            recovered.is_none(),
+            "absent worktree must not recover — caller ends the stuck session"
+        );
+    }
+
+    /// A dangling HEAD symref (branch ref deleted out-of-band, worktree HEAD
+    /// still says `ref: refs/heads/<branch>`) is unrecoverable without fsck —
+    /// the helper must refuse rather than guess a SHA and mis-point the branch.
+    #[tokio::test]
+    async fn recover_branch_ref_returns_none_on_dangling_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        init_repo(&workspace).await;
+
+        let thread_id = Uuid::new_v4();
+        let branch = "claude-code/dangling-test";
+        let wt = crate::engine::agent_session::resume::deterministic_worktree_path(
+            &workspace, thread_id,
+        );
+        git_cmd(
+            &["worktree", "add", "-b", branch, &wt.to_string_lossy(), "main"],
+            &workspace,
+        )
+        .await
+        .unwrap();
+        // Delete the branch ref directly, leaving the worktree HEAD as a
+        // dangling `ref: refs/heads/<branch>` symref — `rev-parse HEAD` fails.
+        let ref_path = workspace
+            .join(".git/refs/heads")
+            .join(branch.strip_prefix("claude-code/").unwrap());
+        let _ = tokio::fs::remove_file(
+            workspace.join(format!(".git/refs/heads/{}", branch)),
+        )
+        .await;
+        let _ = tokio::fs::remove_file(&ref_path).await;
+        git_cmd(&["pack-refs", "--all"], &workspace).await.ok();
+        let _ = tokio::fs::remove_file(
+            workspace.join(format!(".git/refs/heads/{}", branch)),
+        )
+        .await;
+
+        let recovered = recover_branch_ref_from_worktree(&workspace, thread_id, branch).await;
+        assert!(
+            recovered.is_none(),
+            "dangling HEAD symref is unrecoverable — must NOT guess a SHA"
+        );
+    }
 
     #[test]
     fn orphan_recovery_target_surfaces_known_branch_and_skips_unknown() {

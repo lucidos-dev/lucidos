@@ -11,12 +11,20 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-/// Which provider backend serves a model.
+/// Which provider backend serves a model. `OpenAi`, `OpenRouter`, and `Local`
+/// all speak the OpenAI Chat Completions wire format but are distinct backends
+/// (different base URL / key / headers), so they map to separate provider
+/// instances in [`crate::llm::routing::RoutingProvider`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Vertex,
     Anthropic,
     OpenAi,
+    /// OpenRouter (`https://openrouter.ai/api/v1`) — e.g. GLM 5.2.
+    OpenRouter,
+    /// A generic OpenAI-compatible local server (Ollama / LM Studio / vLLM /
+    /// llama.cpp), base URL configurable.
+    Local,
 }
 
 impl ProviderKind {
@@ -28,6 +36,8 @@ impl ProviderKind {
         match s {
             "anthropic" => Self::Anthropic,
             "openai" => Self::OpenAi,
+            "openrouter" => Self::OpenRouter,
+            "local" => Self::Local,
             _ => Self::Vertex,
         }
     }
@@ -102,8 +112,29 @@ mod tests {
     fn parse_maps_known_providers_and_defaults_to_vertex() {
         assert_eq!(ProviderKind::parse("anthropic"), ProviderKind::Anthropic);
         assert_eq!(ProviderKind::parse("openai"), ProviderKind::OpenAi);
+        assert_eq!(ProviderKind::parse("openrouter"), ProviderKind::OpenRouter);
+        assert_eq!(ProviderKind::parse("local"), ProviderKind::Local);
         assert_eq!(ProviderKind::parse("vertex"), ProviderKind::Vertex);
         assert_eq!(ProviderKind::parse("something-new"), ProviderKind::Vertex);
+    }
+
+    #[test]
+    fn registry_routes_openrouter_and_local_by_exact_hit() {
+        // OpenRouter / local ids have no prefix heuristic — the registry exact
+        // hit is authoritative (the seeded GLM 5.2 builtin is never deletable,
+        // so its mapping is always present).
+        let reg = registry(&[
+            ("z-ai/glm-5.2", ProviderKind::OpenRouter),
+            ("llama3.1", ProviderKind::Local),
+        ]);
+        assert_eq!(
+            provider_kind_for(&reg, "z-ai/glm-5.2"),
+            ProviderKind::OpenRouter
+        );
+        assert_eq!(provider_kind_for(&reg, "llama3.1"), ProviderKind::Local);
+        // Absent from the table → prefix heuristic, which has no rule for these
+        // shapes, so it falls back to Vertex (documented limitation).
+        assert_eq!(provider_kind_for(&empty(), "z-ai/glm-5.2"), ProviderKind::Vertex);
     }
 
     #[test]

@@ -9,7 +9,7 @@
  * internals (Lucidos title + connection status + workspace name), so the
  * priority truncation behavior is verified for both.
  */
-import { test, expect, Page } from '@playwright/test';
+import { test, expect, Page } from './fixtures';
 import { assertHealthy, navigateToApp, ensureOnThreadPane } from './helpers';
 
 interface RectBounds { left: number; right: number; top: number; bottom: number }

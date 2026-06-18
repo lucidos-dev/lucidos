@@ -6,6 +6,7 @@ mod checkpoint;
 mod commits;
 mod harden_marker;
 mod merge;
+mod plan_marker;
 mod restart_detection;
 mod worktree;
 
@@ -13,6 +14,7 @@ pub(crate) use checkpoint::*;
 pub(crate) use commits::*;
 pub(crate) use harden_marker::*;
 pub(crate) use merge::*;
+pub(crate) use plan_marker::*;
 pub(crate) use restart_detection::*;
 pub(crate) use worktree::*;
 
@@ -64,6 +66,10 @@ mod merge_tests;
 mod harden_marker_tests;
 
 #[cfg(test)]
+#[path = "../git_ops_tests/plan_marker.rs"]
+mod plan_marker_tests;
+
+#[cfg(test)]
 #[path = "../git_ops_tests/branch_queries.rs"]
 mod branch_queries_tests;
 
@@ -74,3 +80,7 @@ mod recover_exclude_tests;
 #[cfg(test)]
 #[path = "../git_ops_tests/spawn_cleanup.rs"]
 mod spawn_cleanup_tests;
+
+#[cfg(test)]
+#[path = "../git_ops_tests/worktree_validity.rs"]
+mod worktree_validity_tests;

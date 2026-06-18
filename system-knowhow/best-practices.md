@@ -94,35 +94,34 @@ gws calendar list        # GWS_CONFIG_DIR is empty → wrong/no account
 Fixes, in order of preference:
 
 1. **Inline the env var on the same line as the command**: `GWS_CONFIG_DIR=/Users/me/.config/gws-work gws calendar list`. For `cd`, chain in one call: `cd /some/dir && ./run.sh`.
-2. **Same value across ALL calls in the workspace?** Put it in `data/.env` (see the section right below) so every subprocess inherits it without any export.
+2. **Same value across ALL calls in the workspace?** Define an **environment variable** (see the section right below) so every subprocess inherits it without any export.
 
 Exception: `CRED_*`, `OAUTH_*_ACCESS_TOKEN`, and `LUCIDOS_WORKSPACE` **are** injected into every subprocess by the engine, so those appear in each fresh call with no export needed.
 
-## data/.env — Per-Workspace Environment Overrides
+## Environment variables — Per-Workspace Config
 
-Optional file at `data/.env` (gitignored — safe for secrets, never committed to the artifacts repo). On startup the engine loads it with **override** semantics *after* the global `.env`, so values here win over the global `.env` and the inherited process env. The loaded variables land in the engine's process env, so **every subprocess inherits them** — `run_bash`, `run_python`, scheduled scripts, and Claude Code sessions.
+For environment that must be the **SAME for every subprocess in this workspace**, define an **environment variable** (Settings → System → Environment variables). These are DB-backed, non-secret `NAME=value` pairs the engine injects as real env vars into **every** subprocess it spawns — `run_bash`, `run_python`, background tasks, scheduled scripts, triggers, and coding-agent (Claude Code / Codex) sessions.
 
-> ⚠️ **The engine reads `data/.env` only once, at startup. After you create or edit it, the engine must be restarted for the new values to take effect** — there is no live reload.
+- **You (the agent) can set one** with the `set_environment_variable` tool (`name`, `value`); the user can also add/edit them in Settings. Changes take effect on the **next** tool call / agent turn — **no engine restart**. (Exception: vars consumed by the engine's *own* shell-outs — e.g. `GIT_SSH_COMMAND` / `GH_CONFIG_DIR` used by the engine's Apply-time `git push` — are read into the engine process env at startup, so a *change* to those reaches the engine's own git on the next restart. Tool/agent subprocesses still see the change immediately.)
+- **Non-secret only.** Values appear in logs, the event store, and tool-call payloads — that's intentional. For API keys, tokens, or passwords use a **credential** (`request_credential`) instead, which is injected as `CRED_<NAME>` and kept out of the event log.
+- **Names** are uppercase letters/digits/underscores, not starting with a digit (e.g. `CLAUDE_CODE_USE_VERTEX`, `LUCIDOS_REPO`). Engine-owned names (`CRED_*`, `OAUTH_*`, `PG*`, `PATH`, internal `LUCIDOS_*` like `LUCIDOS_WORKSPACE`) are rejected, and engine-owned vars always win a collision.
 
-Use `data/.env` for environment that must be the **SAME for every subprocess in this workspace** and **differ from other workspaces** on the same machine — per-workspace identity: a `gh` config dir, a Google `gws` config dir + project id, an SSH key. The motivating case is a **per-workspace GitHub account**, so `gh` / `git push` run from agent subprocesses authenticate as the right identity:
+The motivating case is **per-workspace identity** — a `gh` config dir, a Google `gws` config dir + project id, an SSH command — so `gh` / `git push` from agent subprocesses authenticate as the right account:
 
-```dotenv
-# Point gh at a config dir already authenticated to THIS workspace's account
+```
 GH_CONFIG_DIR=/Users/me/.config/gh-work
-# Force git's SSH to use a specific key for that account
-GIT_SSH_COMMAND="ssh -i /Users/me/.ssh/id_work -o IdentitiesOnly=yes"
+GIT_SSH_COMMAND=ssh -i /Users/me/.ssh/id_work -o IdentitiesOnly=yes
 ```
 
-Setup is **partly interactive** — you (the agent) can write `data/.env`, but the user must complete the auth handshake:
+Setup is **partly interactive** — you can set the variables, but the user must complete the auth handshake:
 
 1. Pick a dedicated gh config dir and authenticate it once (user-run, opens a browser): `GH_CONFIG_DIR=<dir> gh auth login`.
 2. For SSH push, make sure the key referenced by `GIT_SSH_COMMAND` is registered on that GitHub account.
-3. Write `data/.env` with the variables above.
-4. **Restart the engine** — `data/.env` is read once at startup, so new or edited values only take effect after a restart.
+3. Set `GH_CONFIG_DIR` and `GIT_SSH_COMMAND` via `set_environment_variable` (or Settings → System → Environment variables).
 
-Verify it loaded: the startup log shows `[Startup] Loaded per-workspace .env from <path>`.
+**Want a credential's secret under a specific env var name?** A credential can be given a custom env var name, so its secret injects as e.g. `GITHUB_TOKEN` **in addition to** the default `CRED_<NAME>` (an extra alias — the `CRED_` form still works) — useful when a CLI/SDK expects an exact variable name. Set it two ways: in the credential editor (Settings → credential editor), or up front when the agent requests the credential — `request_credential` takes an optional `env_var_name` arg that pre-fills the modal's "Env var name" field (the user can still edit or clear it before saving). The name must match `[A-Z_][A-Z0-9_]*` and can't be an engine-owned name (`CRED_*`, `OAUTH_*`, `PG*`, `PATH`, `LUCIDOS_*`). Single-value auth types only — it's ignored for `password` credentials (which split into `_USERNAME`/`_PASSWORD`).
 
-> ⚠️ **`write_file` can't write to the `data/` root** — it writes git-tracked content into typed subdirs and defaults untyped paths under `artifacts/`. An explicit `data/<x>` that isn't a typed subdir (e.g. `data/.env`) is **rejected** rather than silently committed to `artifacts/.env`. To write a loose data-root file like `data/.env` (gitignored config), use `run_python` (its cwd is the workspace root): `open('data/.env', 'w').write(...)`.
+> Note: the legacy `data/.env` file mechanism was retired in favour of this store. Any existing `data/.env` is migrated into the environment-variables store on the next engine startup and the file is removed.
 
 ## Key Rules
 

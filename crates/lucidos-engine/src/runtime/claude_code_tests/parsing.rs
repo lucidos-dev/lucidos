@@ -265,12 +265,22 @@ fn parse_control_response_ignored() {
     assert!(events.is_empty());
 }
 
-// CC 2.1.76+ sends streaming deltas as "stream_event" — silently ignored
+// CC 2.1.76+ sends streaming deltas as "stream_event" wrappers. They carry no
+// content to persist (the complete text/tool call arrives later as
+// assistant/tool_result), but each one PROVES the subprocess is alive and
+// actively producing output — so the parser emits a content-free
+// `StreamActivity` liveness ping. Without it the watchdog's inactivity clock
+// only ticks at step boundaries, and one long step (extended thinking on a
+// hard problem) is killed mid-work even though CC is streaming the whole time.
 #[test]
-fn parse_stream_event_ignored() {
+fn parse_stream_event_emits_liveness() {
     let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}}"#;
     let events = parse_line(line);
-    assert_eq!(events.len(), 0);
+    assert!(
+        matches!(&events[..], [AgentEvent::StreamActivity]),
+        "stream_event must yield a single StreamActivity liveness ping, got {:?}",
+        events
+    );
 }
 
 #[test]
@@ -432,28 +442,32 @@ fn parse_full_cc_session() {
     assert!(
         matches!(&all_events[0], AgentEvent::Init { session_id, .. } if session_id == "sess-1")
     );
+    // stream_event → StreamActivity liveness ping (keeps the watchdog clock fresh)
+    assert!(matches!(&all_events[1], AgentEvent::StreamActivity));
     // assistant text + tool_use
-    assert!(matches!(&all_events[1], AgentEvent::Message { text, .. } if text == "Reading file."));
-    assert!(matches!(&all_events[2], AgentEvent::ToolUse { name, .. } if name == "Read"));
+    assert!(matches!(&all_events[2], AgentEvent::Message { text, .. } if text == "Reading file."));
+    assert!(matches!(&all_events[3], AgentEvent::ToolUse { name, .. } if name == "Read"));
     // user tool_result
     assert!(
-        matches!(&all_events[3], AgentEvent::ToolResult { output, status, .. } if output == "file contents" && status == "success")
+        matches!(&all_events[4], AgentEvent::ToolResult { output, status, .. } if output == "file contents" && status == "success")
     );
+    // second stream_event → StreamActivity
+    assert!(matches!(&all_events[5], AgentEvent::StreamActivity));
     // second assistant text
     assert!(
-        matches!(&all_events[4], AgentEvent::Message { text, .. } if text == "Here are the contents.")
+        matches!(&all_events[6], AgentEvent::Message { text, .. } if text == "Here are the contents.")
     );
     // result
     assert!(matches!(
-        &all_events[5],
+        &all_events[7],
         AgentEvent::Result {
             duration_ms: 5000,
             error: None,
             ..
         }
     ));
-    // stream_events were silently ignored
-    assert_eq!(all_events.len(), 6);
+    // 6 content events + the 2 stream_event liveness pings
+    assert_eq!(all_events.len(), 8);
 }
 
 #[test]

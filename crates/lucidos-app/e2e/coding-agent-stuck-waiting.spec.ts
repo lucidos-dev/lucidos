@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import {
   navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, waitForVisibleInput,
 } from './helpers';
@@ -6,7 +6,7 @@ import {
   psql, createCCThreadWithChange, cleanupCCThread, cleanupFileFromMain,
 } from './db-helpers';
 import { randomUUID } from 'crypto';
-import type { Page } from '@playwright/test';
+import type { Page } from './fixtures';
 
 /** Click Apply, wait for Archive (ChangeApplied keeps archive_state=inbox), click Archive, poll until archived. */
 async function applyAndDismiss(page: Page, threadId: string): Promise<void> {

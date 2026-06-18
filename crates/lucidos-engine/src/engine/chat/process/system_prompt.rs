@@ -11,7 +11,8 @@ use crate::runtime::BrowserLogins;
 use chrono::Utc;
 
 use super::super::process_helpers::{
-    build_system_knowhow_section, build_trigger_knowhow_section, TriggerContext, ENGINE_RESTART_RULE,
+    build_system_knowhow_section, build_trigger_knowhow_section, TriggerContext,
+    ENGINE_RESTART_RULE,
 };
 
 /// Nudges the Lucidos chat agent to use the `ask_user_question` tool for any
@@ -23,8 +24,7 @@ use super::super::process_helpers::{
 /// "never offer next-step alternatives." Mirrors the CC-side
 /// `ASK_USER_QUESTION_RULE` in `agent_session::prompts` (same spirit, chat-
 /// tuned wording — lowercase tool name, no CC-only PreToolUse caveats).
-pub(crate) const ASK_USER_QUESTION_RULE: &str =
-    "ASKING THE USER QUESTIONS:\n\
+pub(crate) const ASK_USER_QUESTION_RULE: &str = "ASKING THE USER QUESTIONS:\n\
      Use the `ask_user_question` tool for any question with 2-4 discrete \
      answers, including the binary yes/no case. The Lucidos UI renders the \
      options as clickable buttons; alternatives listed only in your message \
@@ -56,6 +56,27 @@ pub(crate) const ASK_USER_QUESTION_RULE: &str =
      for presenting 2-4 next-step alternatives, decision points, or yes/no \
      confirmations AFTER you've done the work — anywhere a button beats a \
      typed reply.\n\
+     \n\
+     ANSWER FIRST, THEN OFFER CHOICES: `ask_user_question` is an addendum to \
+     your reply, NEVER a replacement for it. When the user's latest message \
+     carries substance — facts they gave you, a question they asked, a \
+     decision they stated — engage with THAT first (answer it, or act on it), \
+     and only then offer next-step buttons. Two hard rules. (1) If the user \
+     asked you a question, ANSWER it — never bounce back your own \"what do \
+     you want me to do now?\" menu in its place. (2) If the user just gave \
+     you what you asked for last turn, that is a green light to PROCEED \
+     (ACTION FIRST) — do the work, don't re-ask \"should I do it?\" with \
+     options that are the very thing you already offered to do. (3) NEVER \
+     write a question whose premise assumes the user has seen reasoning that \
+     lives only in your thinking block — phrasings like \"now that you know \
+     …\", \"given all that\", or \"now that it makes sense\" are a red flag \
+     that you worked it out privately but never told them (your thinking is \
+     invisible to the user). Put that explanation in your reply text FIRST, \
+     in the same turn, THEN ask. A good \
+     question-card turn is [substantive reply / the work you just did] + an \
+     `ask_user_question` for a genuinely-open next step; a bare card that \
+     ignores what the user just said — or one that leans on an unshared \
+     \"why\" — is the bug.\n\
      \n\
      NEVER parallel-call `ask_user_question` alongside other tools — if \
      you're asking a question, stop after the tool call and wait for the \
@@ -334,8 +355,8 @@ Always use clean, structured markdown:
   - [tracked here]
 
 THINKING vs RESPONSE:
-- Your thinking block is for ALL internal reasoning, analysis, data inspection, and deliberation.
-- Your response text is what the user sees. It contains ONLY the final, user-facing message — no analysis, no English summaries of what you found, no reasoning.
+- Your thinking block is your private scratchpad — reasoning, data inspection, weighing options, deliberation. THE USER NEVER SEES IT. Anything they need — a finding, an explanation, the answer to a "why / where / how" question, the reason behind a recommendation — reaches them ONLY if you put it in your RESPONSE text. Reasoning that stays in the thinking block did NOT get communicated, no matter how thoroughly you worked it out — so never ask a follow-up that assumes the user saw it (e.g. "now that you know where it came from…" when you only figured that out in your head).
+- Your response is the clean, final user-facing message: don't paste raw chain-of-thought, don't narrate every step you took, don't restate intermediate analysis you've already moved past. But "no raw reasoning dump" NEVER means "no explanation" — when the user asks why/where/how, the explanation IS the final message. Withholding it because it feels like "analysis" is the bug, not the rule.
 - NEVER repeat yourself between tool calls. If you already explained your analysis before a tool call, do NOT restate it after the tool returns. Just proceed to the next action or give your final answer. The user already read your earlier text — repeating it wastes their time.
 
 CONVERSATION STYLE:
@@ -512,7 +533,7 @@ Use emit_event and query_events to track and retrieve structured facts about wha
 
 PARALLEL WORK (FAN-OUT):
 You have two tools for spawning Lucidos threads:
-- run_claude: Start a Claude Code session for code tasks (creates worktree, proposes changes)
+- run_coding_agent: Start a coding-agent session for code tasks (creates worktree, proposes changes). Default is Claude Code; set `coding_agent="codex"` when the user asks for Codex or OpenAI Codex.
 - run_thread: Start a Lucidos thread for non-code tasks (research, analysis, drafting)
 Both accept an optional `relation` argument (default `"child"`):
 - `relation: "child"` — child thread. Runs independently; when it completes a callback resumes this thread with its result. Use for delegated subtasks whose outcome you need yourself. (`"sub"` is accepted as a back-compat alias.)

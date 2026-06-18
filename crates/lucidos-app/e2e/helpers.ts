@@ -74,15 +74,15 @@ export async function waitForVisibleInput(page: Page, timeout = 30_000): Promise
   return page.locator('[data-role="prompt-input"]:visible').first();
 }
 
-/** Navigate to `url` (DOMContentLoaded) with a BOUNDED per-attempt timeout and a
+/** Navigate to `url` (main-document commit) with a BOUNDED per-attempt timeout and a
  *  retry. THE canonical way to load the app in e2e — specs should route their
  *  `page.goto` through this rather than calling `page.goto` directly.
  *
  *  THE WEDGE IT GUARDS. On the `mobile-webkit` project (WebKit engine) the FIRST
  *  navigation in a fresh context intermittently wedged — `page.goto('/')` hung
- *  until its 30s timeout, DOMContentLoaded never fired, a (random) test failed,
- *  and it passed only on Playwright's fresh-context retry. WebKit-only. Two
- *  distinct causes were identified (2026-06 — see docs/e2e-test-decisions.md
+ *  until its 30s timeout, the app-specific readiness checks never ran, a
+ *  (random) test failed, and it passed only on Playwright's fresh-context retry.
+ *  WebKit-only. Two distinct causes were identified (2026-06 — see docs/e2e-test-decisions.md
  *  "mobile-webkit navigation wedge"); neither is the dev server, engine,
  *  reverse-proxy, transport, or product code (all ruled out: reproduces against
  *  bundled `dist`, over HTTP/1.1 + HTTP/2, over IPv4 + IPv6, engine never sees
@@ -97,15 +97,17 @@ export async function waitForVisibleInput(page: Page, timeout = 30_000): Promise
  *     sets an explicit `proxy` (inert server + localhost `bypass`) so WebKit
  *     skips system proxy discovery and connects to our localhost-only suite
  *     DIRECT. Deterministic; needs no retry.
- *  2. RESIDUAL — a WebContent cold-start / load stall under heavy host
- *     contention, seen even on a no-proxy host. There is no reliable in-helper
- *     prevention (an `about:blank` warmup was tried and did NOT prevent it — the
- *     stall is in the real document load, which a blank nav doesn't warm); a
- *     fresh browser context clears it, i.e. the whole-test `retries: 1` plus the
- *     WebKit RSS reaper, the standard mitigation for browser-infra flakes.
+ *  2. RESIDUAL — a WebContent cold-start / document lifecycle stall under heavy
+ *     host contention, seen even on a no-proxy host. The app does not require
+ *     DOMContentLoaded as a readiness signal; callers wait for visible UI state
+ *     afterwards. Waiting only for the main-document response commit avoids
+ *     converting a post-commit browser lifecycle stall into a false app-load
+ *     failure. A pre-commit cold-context stall is handled earlier by the
+ *     mobile-webkit context preflight in e2e/fixtures.ts.
  *
- *  What this helper does for the residual case: CAP the hang (fail at
- *  ATTEMPTS*timeout instead of the full 120s test budget) and re-navigate once.
+ *  What this helper does after the fixture preflight: CAP any later pre-commit
+ *  hang (fail at ATTEMPTS*timeout instead of the full 120s test budget) and
+ *  re-navigate once.
  *  Callers assert real readiness explicitly afterwards (waitForVisibleInput, an
  *  :visible iframe/#ask, etc.). */
 export async function gotoWithRetry(page: Page, url = '/'): Promise<void> {
@@ -114,25 +116,32 @@ export async function gotoWithRetry(page: Page, url = '/'): Promise<void> {
   let lastErr: unknown;
   for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
     try {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PER_ATTEMPT_TIMEOUT_MS });
+      await page.goto(url, { waitUntil: 'commit', timeout: PER_ATTEMPT_TIMEOUT_MS });
       return;
     } catch (err) {
       lastErr = err;
-      // Stalled (DCL never fired). Re-navigate — recovers a transient stall; a
-      // sticky freeze falls through to the whole-test fresh-context retry.
+      // Stalled before the main response committed. Re-navigate once; a sticky
+      // freeze still falls through to the whole-test fresh-context retry.
     }
   }
   throw lastErr;
 }
 
 export async function navigateToApp(page: Page): Promise<void> {
-  // gotoWithRetry: a bare page.goto can hang the whole 120s test budget on
-  // mobile-webkit when the app-root navigation wedges (see gotoWithRetry).
-  // SPA readiness is asserted explicitly below via waitForVisibleInput — that is
-  // what guarantees the app is interactive.
+  // gotoWithRetry avoids WebKit document-lifecycle stalls; SPA readiness is
+  // asserted explicitly below via visible UI state.
   await gotoWithRetry(page, '/');
   await ensureOnThreadPane(page);
   await waitForVisibleInput(page);
+}
+
+/** Wait until the page's SSE event stream is open.
+ *  Required before tests emit transient engine events that are delivered only
+ *  over SSE, such as `/api/v1/ui/navigate` NavigationRequested events. */
+export async function waitForEventStream(page: Page, timeout = 10_000): Promise<void> {
+  await page.waitForFunction(() => {
+    return document.documentElement.dataset.lucidosEventStream === 'connected';
+  }, undefined, { timeout });
 }
 
 export async function sendMessage(page: Page, text: string): Promise<void> {
@@ -248,12 +257,11 @@ export async function openThreadDrawer(page: Page): Promise<void> {
     });
   });
   if (!isOpen) {
-    // Several ThreadToggleButton instances exist (drawer header,
-    // collapsed-thread-actions, thread pane), and the drawer-header copy
-    // stays mounted through its exit transition — target the
-    // collapsed-thread-actions one explicitly: it is the interactable
-    // opener whenever the drawer is closed.
-    await page.locator('.collapsed-thread-actions button[aria-label="Toggle thread drawer"]').click();
+    // Several ThreadToggleButton instances exist (thread-header brand,
+    // collapsed-thread-actions, thread pane), and the brand copy stays mounted
+    // (faded) while the drawer is closed — target the collapsed-thread-actions
+    // one explicitly: it is the interactable opener whenever the drawer is closed.
+    await page.locator('.collapsed-thread-actions button[aria-label="Show or hide thread drawer"]').click();
   }
   // Wait for the drawer's open width-transition (`width var(--duration-slow)`)
   // to SETTLE — not merely to be non-zero. Returning at width > 0 catches the
@@ -591,6 +599,38 @@ export async function openFilesPanel(page: Page): Promise<void> {
       return rect.width > 0 && rect.height > 0;
     });
   }, undefined, { timeout: 5_000 });
+}
+
+/** The triggers panel's "Add Trigger" card (dual-layout safe, visible copy). */
+export function addTriggerCard(page: Page): Locator {
+  return page.locator('.list-row-add-card:visible', { hasText: 'Add Trigger' }).first();
+}
+
+/** Navigate to the Triggers panel. The nav drawer (with the menu items) is
+ *  hidden by default on BOTH layouts and opened via the `.hamburger-panel`
+ *  toggle, so open it first, then click 'Triggers'. On mobile the hamburger
+ *  lives on the content pane, so swipe there first. Finally waits for the
+ *  panel's "Add Trigger" card so callers never click a still-loading list. */
+export async function openTriggersPanel(page: Page): Promise<void> {
+  if (isMobileViewport(page)) {
+    await page.evaluate(() => {
+      const dot = document.querySelector('button.mobile-dot[aria-label="content view"]');
+      if (dot) (dot as HTMLElement).click();
+    });
+    await page.waitForTimeout(300);
+  }
+  await clickVisibleElement(page, '.hamburger-panel');
+  await page.waitForFunction(() => {
+    const items = document.querySelectorAll('.drawer-item');
+    return Array.from(items).some(el => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+  }, undefined, { timeout: 5_000 });
+  await clickVisibleElement(page, '.drawer-item', 'Triggers');
+  // The Add Trigger card only renders once the triggers list has loaded — wait
+  // for it so the create flow doesn't race the projection fetch.
+  await expect(addTriggerCard(page)).toBeVisible({ timeout: 10_000 });
 }
 
 /** Best-effort dismiss of an idle CC session by clicking Done (dual-layout safe) */

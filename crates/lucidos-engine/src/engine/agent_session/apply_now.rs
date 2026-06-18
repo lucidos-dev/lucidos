@@ -2,8 +2,8 @@ use crate::engine::change_ops::{branch_is_hardened, now_epoch_millis};
 use crate::engine::git_ops::{
     auto_commit_preserving_marker, auto_commit_safe_files_if_dirty, auto_commit_worktree,
     branch_changed_files, catchup_and_ff_to_main, commits_in_range, consume_harden_marker,
-    default_local_branch, describe_branch_changes, files_have_client_update, files_require_restart,
-    git_cmd, has_branch_commits, push_main_in_background,
+    consume_plan_marker, default_local_branch, describe_branch_changes, files_have_client_update,
+    files_require_restart, git_cmd, has_branch_commits, push_main_in_background,
 };
 use crate::engine::thread_events::{EventChannel, MessageOrigin};
 use crate::engine::{AgentUserInput, LucidosEngine};
@@ -53,7 +53,7 @@ impl LucidosEngine {
                     drop(guard);
 
                     // Fast path: apply existing pending change directly when
-                    // there's no live agent session. Claude Code sessions
+                    // there's no live agent session. Coding-agent sessions
                     // cleanly exit at idle (Phase 5.3), so "no live session" is the
                     // expected post-clean-idle state for any thread the user
                     // returns to apply later — not a signal that the prior
@@ -256,7 +256,7 @@ impl LucidosEngine {
                         .map(|s| s.process_exited)
                         .unwrap_or(true)
                     {
-                        return Err(format!("Claude Code session ended while {}", context).into());
+                        return Err(format!("Coding agent session ended while {}", context).into());
                     }
                 }
             }
@@ -306,7 +306,7 @@ impl LucidosEngine {
 
         crate::engine::git_ops::commit_worktree_or_err(
             worktree_path,
-            &format!("Claude Code changes ({})", context),
+            &format!("Coding agent changes ({})", context),
         )
         .await
         .map(|_| ())
@@ -336,7 +336,7 @@ impl LucidosEngine {
             worktree_path,
             repo_root,
             branch_name,
-            "Claude Code changes (auto-committed)",
+            "Coding agent changes (auto-committed)",
         )
         .await;
 
@@ -441,7 +441,7 @@ impl LucidosEngine {
             .await?;
 
         // Step 5: Check main repo for uncommitted changes
-        self.commit_dirty_logged("Claude Code changes", "apply_now auto-commit")
+        self.commit_dirty_logged("Coding agent changes", "apply_now auto-commit")
             .await;
         if auto_commit_safe_files_if_dirty(repo_root).await {
             let msg = "Cannot merge: the repository has uncommitted changes. Commit or stash them first, then try again.";
@@ -531,7 +531,7 @@ impl LucidosEngine {
             kind: crate::engine::AgentInputKind::User,
         }) {
             return Err(format!(
-                "Failed to send merge prompt to Claude Code session — receiver gone: {}",
+                "Failed to send merge prompt to the coding-agent session — receiver gone: {}",
                 e
             )
             .into());
@@ -549,6 +549,14 @@ impl LucidosEngine {
             return Err(e);
         }
 
+        if !crate::engine::agent_recovery::last_turn_ended_cleanly(&self.pool, thread_id).await
+        {
+            let _ = git_cmd(&["merge", "--abort"], worktree_path).await;
+            return Err(
+                "Conflict resolution did not finish cleanly — merge aborted. The change is still pending; try applying again.".into(),
+            );
+        }
+
         // Verify CC completed the merge
         let main_merged = git_cmd(
             &["merge-base", "--is-ancestor", "main", branch_name],
@@ -559,14 +567,14 @@ impl LucidosEngine {
         .unwrap_or(false);
         if !main_merged {
             return Err(
-                "Claude Code session ended without completing the merge. Try applying again.".into(),
+                "Coding agent session ended without completing the merge. Try applying again.".into(),
             );
         }
 
         // Auto-commit any leftover changes
         auto_commit_worktree(
             worktree_path,
-            "Claude Code changes (post-merge auto-commit)",
+            "Coding agent changes (post-merge auto-commit)",
         )
         .await;
 
@@ -670,6 +678,11 @@ impl LucidosEngine {
         }
 
         consume_harden_marker(&self.pool, repo_root, branch_name).await;
+        // The worktree/branch is reset for reuse below — clear the Planned
+        // marker too so the next round of work on this branch re-triggers the
+        // plan gate (a new planning decision for new work), mirroring the
+        // harden-marker reset.
+        consume_plan_marker(&self.pool, repo_root, branch_name).await;
         self.reset_worktree_and_idle(thread_id, worktree_path).await;
         push_main_in_background(repo_root);
         self.broadcast_changes_updated().await;

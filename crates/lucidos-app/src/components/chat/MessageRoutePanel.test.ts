@@ -357,6 +357,68 @@ describe('executorExtras', () => {
     expect(extras.ccSessionId).toBe('s1');
   });
 
+  it('reads session id from CodingAgentSettingsChanged when SessionStarted carries an empty id (real Claude Code/Codex path)', () => {
+    // The engine emits SessionStarted with session_id: "" at spawn; the real id
+    // arrives from the agent's Init event on CodingAgentSettingsChanged — same
+    // shape for both backends.
+    const userEvent = stamp(0, { type: 'MessageReceived', text: 'go' });
+    const sessionStarted = stamp(1, { type: 'SessionStarted', session_id: '', branch: 'claude-code/turn-1' });
+    const init = stamp(2, { type: 'CodingAgentSettingsChanged', cc_session_id: 'real-sid', coding_agent: 'codex' });
+    const exchange: Exchange = {
+      userEvent,
+      userSeq: 1,
+      steps: [{ seq: 2, event: sessionStarted }, { seq: 3, event: init }],
+    };
+    const events = new Map<number, StoredEvent>([[1, userEvent], [2, sessionStarted], [3, init]]);
+    const extras = executorExtras(exchange, events);
+    expect(extras.branch).toBe('claude-code/turn-1');
+    expect(extras.ccSessionId).toBe('real-sid');
+  });
+
+  it('carries the Init session id into a follow-up exchange in the same session', () => {
+    // Turn 1: SessionStarted (empty id) + CodingAgentSettingsChanged (Init id).
+    // Turn 2: no fresh Init — the panel must still report the session id.
+    const t1User = stamp(0, { type: 'MessageReceived', text: 'first' });
+    const sessionStarted = stamp(1, { type: 'SessionStarted', session_id: '', branch: 'claude-code/turn-1' });
+    const init = stamp(2, { type: 'CodingAgentSettingsChanged', cc_session_id: 'real-sid' });
+    const t2User = stamp(300, { type: 'MessageReceived', text: 'follow up' });
+
+    const followUp: Exchange = { userEvent: t2User, userSeq: 10, steps: [] };
+    const events = new Map<number, StoredEvent>([[1, t1User], [2, sessionStarted], [3, init], [10, t2User]]);
+    const extras = executorExtras(followUp, events);
+    expect(extras.ccSessionId).toBe('real-sid');
+  });
+
+  it('reads session id from CodingAgentIdled when no settings event carried it', () => {
+    const userEvent = stamp(0, { type: 'MessageReceived', text: 'go' });
+    const sessionStarted = stamp(1, { type: 'SessionStarted', session_id: '', branch: 'claude-code/x' });
+    const idled = stamp(2, { type: 'CodingAgentIdled', has_changes: true, cc_session_id: 'idle-sid' });
+    const exchange: Exchange = {
+      userEvent,
+      userSeq: 1,
+      steps: [{ seq: 2, event: sessionStarted }, { seq: 3, event: idled }],
+    };
+    const events = new Map<number, StoredEvent>([[1, userEvent], [2, sessionStarted], [3, idled]]);
+    const extras = executorExtras(exchange, events);
+    expect(extras.ccSessionId).toBe('idle-sid');
+  });
+
+  it('a later settings change without a session id does not clear the established id', () => {
+    const userEvent = stamp(0, { type: 'MessageReceived', text: 'go' });
+    const sessionStarted = stamp(1, { type: 'SessionStarted', session_id: '', branch: 'claude-code/x' });
+    const init = stamp(2, { type: 'CodingAgentSettingsChanged', cc_session_id: 'real-sid' });
+    // User flips permission mode mid-session — this settings event carries no id.
+    const permChange = stamp(3, { type: 'CodingAgentSettingsChanged', permission_mode: 'plan' });
+    const exchange: Exchange = {
+      userEvent,
+      userSeq: 1,
+      steps: [{ seq: 2, event: sessionStarted }, { seq: 3, event: init }, { seq: 4, event: permChange }],
+    };
+    const events = new Map<number, StoredEvent>([[1, userEvent], [2, sessionStarted], [3, init], [4, permChange]]);
+    const extras = executorExtras(exchange, events);
+    expect(extras.ccSessionId).toBe('real-sid');
+  });
+
   it('reads branch from ContinuationStarted (engine restart resumes a Claude Code session)', () => {
     const recovered = stamp(0, { type: 'ContinuationStarted', branch: 'recovered-branch' });
     const followUp = stamp(60, { type: 'MessageReceived', text: 'continue' });

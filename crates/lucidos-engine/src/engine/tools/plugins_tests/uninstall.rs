@@ -147,6 +147,7 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
         SourceType::Archive,
         false,
         None,
+        None,
     )
     .await
     .expect("install should succeed on empty workspace");
@@ -210,6 +211,7 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
         SourceType::Archive,
         false,
         None,
+        None,
     )
     .await
     .expect_err("second install must hit conflict");
@@ -238,6 +240,7 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
         &unpacked_v2,
         SourceType::Archive,
         true,
+        None,
         None,
     )
     .await

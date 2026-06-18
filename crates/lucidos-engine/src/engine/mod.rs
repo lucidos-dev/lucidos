@@ -34,6 +34,10 @@ pub(crate) mod trigger_group_writes;
 pub mod types;
 pub mod worktree_cleanup;
 
+pub(crate) use agentic_loop::{
+    coalesced_images_for_reprocess, coalesced_user_text_for_reprocess,
+    emit_user_prompt_injected_event, filter_removed_queued_prompts,
+};
 pub(crate) use chat::generate_thread_title;
 pub(crate) use change_ops::now_epoch_millis;
 #[cfg(test)]
@@ -157,14 +161,6 @@ pub struct LucidosEngine {
     /// Acquired via `scheduler::BackupGuard::try_acquire`. POST /api/v1/backup
     /// returns 409 when the guard is held; the scheduled cron skips its tick.
     pub backup_in_progress: AtomicBool,
-    /// Authoritative restore-progress state — the single source of truth that
-    /// both the `Restore*` SSE events and `GET /api/v1/backup/restore-status`
-    /// serialize from, so a live stream and a reload refetch always agree.
-    /// `restore_backup` flips this to `Running` (rejecting a concurrent restore)
-    /// under the write lock, the spawned task updates it on every progress tick,
-    /// and the terminal `Completed`/`Failed` is kept until the next restore so a
-    /// page reloaded right after completion still shows the result.
-    pub restore_state: Arc<std::sync::RwLock<crate::core::backup::RestoreState>>,
     /// Per-thread handles (cancellation token + injection channel). Key = thread_id.
     /// Uses std::sync::Mutex since operations are trivial (insert/remove),
     /// and this allows the ThreadGuard to clean up synchronously in Drop (even on panic).
@@ -241,7 +237,7 @@ pub struct LucidosEngine {
     >,
     /// Frontend origin URL (e.g., "https://lucidos.example.com"), set from first request's Origin header
     pub frontend_origin: std::sync::Mutex<Option<String>>,
-    /// Active Claude Code sessions keyed by thread_id.
+    /// Active coding-agent sessions keyed by thread_id.
     pub(crate) agent_sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
     /// Per-thread loaded knowhow set — populated when `load_knowhow` is called,
     /// consumed when assembling the user message + stubbing resume tool blocks.
@@ -572,7 +568,7 @@ pub(crate) fn migrate_legacy_auth_modules_dir(workspace_path: &Path) {
 
 mod engine_impl;
 
-/// `processing_thread_ids - all_cc_thread_ids`. Idle Claude Code sessions stay in
+/// `processing_thread_ids - all_cc_thread_ids`. Idle coding-agent sessions stay in
 /// `active_threads` between turns, so the exclusion set must cover them or
 /// they get misclassified as chat threads.
 fn partition_chat_thread_ids(
@@ -590,7 +586,7 @@ fn partition_chat_thread_ids(
 /// force-evicting after the `register_thread_queued` 60s timeout. Without
 /// this pre-emit, the run-loop's stop arm would default to `ResponseCanceled`
 /// (`is_shutdown=false`, no user-action suppress flag set) and the user would
-/// see a misleading "Canceled". Claude Code sessions also get `external_terminal_emitted`
+/// see a misleading "Canceled". Coding-agent sessions also get `external_terminal_emitted`
 /// set so the run-loop arm skips its duplicate emit; chat threads' `agentic_loop`
 /// may still emit a duplicate `ResponseCanceled`, which the frontend deflates
 /// because `Aborted` is checked before `Canceled` in `exchangeStatus`.

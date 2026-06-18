@@ -1,16 +1,16 @@
 ---
 name: Lucidos CLI (`lucidos`)
-description: Shell command available on PATH for any subprocess Lucidos spawns (Python, bash, Claude Code) — writes files under `data/`, emits and queries domain events, lists thread summaries (`lucidos threads list/count`), spawns threads (`lucidos spawn-thread`, including app coding-agent threads via `--folder data/apps/<id>`), lists and applies pending changes (`lucidos changes list` / `lucidos changes apply <id>`), reads system-knowhow on demand (`lucidos knowhow list` / `lucidos knowhow read <id>` — how an app coding-agent thread fetches app-building guides), and calls external APIs through the engine proxy so credentials never appear in script source, args, env vars, or logs. Prefer this over hand-rolling HTTP calls back to the engine and over `curl -H "Authorization: Bearer $CRED_..."`.
+description: Shell command available on PATH for any subprocess Lucidos spawns (Python, bash, Claude Code, Codex) — writes files under `data/`, emits and queries domain events, lists thread summaries (`lucidos threads list/count`), spawns threads (`lucidos spawn-thread`, including Codex via `--codex` / `--coding-agent codex` and app coding-agent threads via `--folder data/apps/<id>`), lists and applies pending changes (`lucidos changes list` / `lucidos changes apply <id>`), reads system-knowhow on demand (`lucidos knowhow list` / `lucidos knowhow read <id>` — how an app coding-agent thread fetches app-building guides), and calls external APIs through the engine proxy so credentials never appear in script source, args, env vars, or logs. Prefer this over hand-rolling HTTP calls back to the engine and over `curl -H "Authorization: Bearer $CRED_..."`.
 ---
 
 # `lucidos` CLI
 
-A shell command (`lucidos`) available on the `PATH` of every subprocess Lucidos spawns — Python scripts, bash scripts, Claude Code sessions. Use it whenever a script needs to:
+A shell command (`lucidos`) available on the `PATH` of every subprocess Lucidos spawns — Python scripts, bash scripts, coding-agent sessions (Claude Code or Codex). Use it whenever a script needs to:
 
 - write files into the workspace's `data/` directory
 - emit or query domain events on the workspace's event store
 - list or count *thread summaries* in the workspace — useful for "is anything still running?" gates in triggers
-- spawn a new *thread* — a chat thread, or (`--cc`) a *coding-agent thread* on a repo or an app folder (`--folder data/apps/<id>`) — `lucidos spawn-thread`
+- spawn a new *thread* — a chat thread, or a *coding-agent thread* on a repo or an app folder (`--cc` for Claude Code, `--codex` / `--coding-agent codex` for Codex, `--folder data/apps/<id>` for app worktrees) — `lucidos spawn-thread`
 - list pending / applied *changes* (`lucidos changes list`) and apply a pending one (the coding-agent-proposed branch waiting on the Apply button) — `lucidos changes apply <id>`
 - read engine-shipped system-knowhow (and user knowhow) — `lucidos knowhow list` / `lucidos knowhow read <id>` — the way an *app coding-agent thread* (whose worktree can't see `system-knowhow/`) pulls app-building guides on demand
 - call an external API that's configured in `data/config/apis.json` (auth header injected by the engine — credential never appears in the script)
@@ -18,15 +18,32 @@ A shell command (`lucidos`) available on the `PATH` of every subprocess Lucidos 
 
 The CLI is a thin Rust wrapper around the engine's HTTP API and filesystem conventions — for app UI usage see the JS [`lucidos.data.*`](./js-sdk.md) reference. Scripts should always prefer the CLI over hand-rolling HTTP calls back to the engine.
 
+Some subcommands are hidden and engine-internal. They are documented here only
+so the workspace-facing CLI surface stays complete; scripts and users should not
+invoke them directly.
+
 ## When to use this
 
 - **Python scripts** (`apps/<name>/scripts/*.py`, `triggers/<name>/scripts/*.py`, `knowhow/*/scripts/*.py`) — invoke via `subprocess.run(['lucidos', 'data', 'write', ...])`. The CLI is on PATH and `LUCIDOS_WORKSPACE` is set automatically.
 - **Bash scripts** (same locations, `*.sh`) — call `lucidos` directly. PATH is set up before the script runs.
-- **CC subprocesses** — running in a worktree under `<workspace>/.lucidos/worktrees/<id>/`, where `Write`/`Edit` lands in the worktree (not the workspace), so dev-server links 404. Use `lucidos data write` instead.
+- **Coding-agent subprocesses** — running in a worktree under `<workspace>/.lucidos/worktrees/<id>/`, where editor writes land in the worktree (not the workspace), so dev-server links 404. Use `lucidos data write` instead.
 
 For app UIs (in the browser) keep using the JS SDK (`lucidos.data.*`, `lucidos.events.*`). The CLI is for shell / subprocess contexts only.
 
 ## Subcommands
+
+### Hidden: `lucidos coding-agent-diff-hook`
+
+Internal callback installed as a git `post-commit` hook in Lucidos-managed
+coding-agent worktrees. When a coding-agent process has `LUCIDOS_THREAD_ID` set,
+the callback posts the current repo root and branch to the parent engine so
+`coding_agent_has_diff` can refresh immediately after a commit. It is silent,
+best-effort, and does not create a `ChangeProposed` event or an Apply-able
+change; formal proposal still happens when the coding-agent turn idles.
+
+Do not call this from scripts. It is scoped to the engine-installed hook and
+requires the Lucidos subprocess-origin headers that the CLI attaches in spawned
+subprocesses.
 
 ### `lucidos data path <relative> [--mkdir]`
 
@@ -187,18 +204,24 @@ $ if [ "$(lucidos threads count --active | jq .count)" -eq 0 ]; then
 
 Cheaper than materialising the full list just to read `.length` on big workspaces.
 
-### `lucidos spawn-thread --to <WS> --message <M> [--cc] [--folder <path> | --repo <name>] [--relation child|top] [--title <T>] [--model <M>] [--cc-model <M>]`
+### `lucidos spawn-thread --to <WS> --message <M> [--cc | --codex | --coding-agent <backend>] [--folder <path> | --repo <name>] [--relation child|top] [--title <T>] [--model <M>] [--cc-model <M>]`
 
-Start a new *thread* in another (or this same) workspace — a *chat thread* by default, or a *coding-agent thread* with `--cc`. `--to` names the target workspace (resolved under `$LUCIDOS_WORKSPACES_ROOT`, or an absolute path). Caller provenance (`caller_*` fields) defaults from `$LUCIDOS_WORKSPACE` / `$LUCIDOS_THREAD_ID` / `$LUCIDOS_EVENT_ID`, which the engine sets on every spawned subprocess. Prints a clickable `[title](thread:<ws>/<uuid>)` markdown link on stdout.
+Start a new *thread* in another (or this same) workspace — a *chat thread* by default, or a *coding-agent thread* with a coding-agent flag. `--to` names the target workspace (resolved under `$LUCIDOS_WORKSPACES_ROOT`, or an absolute path). Caller provenance (`caller_*` fields) defaults from `$LUCIDOS_WORKSPACE` / `$LUCIDOS_THREAD_ID` / `$LUCIDOS_EVENT_ID`, which the engine sets on every spawned subprocess. Prints a clickable `[title](thread:<ws>/<uuid>)` markdown link on stdout.
 
 `--relation top` (the default) starts an independent thread that does not report back; `--relation child` is a same-workspace parent-with-callback spawn (the calling thread auto-resumes when the child finishes).
 
-**Worktree targeting for `--cc` threads:**
+**Coding-agent backend:**
+
+- `--cc` — legacy shortcut for a Claude Code coding-agent thread.
+- `--codex` — shortcut for a Codex coding-agent thread; implies coding-agent mode and sends `coding_agent: "codex"` to the engine.
+- `--coding-agent <backend>` — explicit backend selector. Valid values are `claude-code` (alias `claude_code`) and `codex`; this also implies coding-agent mode.
+
+**Worktree targeting for coding-agent threads:**
 
 - `--repo <name|uuid>` — create the worktree from a registered *repository*. Defaults from `$LUCIDOS_REPO` (the engine sets it to the calling thread's repo) so a coding-agent sidequest stays in its caller's repo. Pass `--repo ""` to force the target workspace's default repo.
-- `--folder <path>` — target an app folder instead, spawning an **app coding-agent thread**. A `data/apps/<id>` value (workspace-relative, resolved on the *target* workspace) creates a sparse-checkout worktree narrowed to that app folder whose *Apply* ff-merges into the workspace's `main` — no `/harden`, no engine restart. This is the same machinery the `run_claude` tool's `folder` argument produces. Only whole app folders are valid; the engine rejects other `data/` subtrees, app subpaths, and non-existent folders.
+- `--folder <path>` — target an app folder instead, spawning an **app coding-agent thread**. A `data/apps/<id>` value (workspace-relative, resolved on the *target* workspace) creates a sparse-checkout worktree narrowed to that app folder whose *Apply* ff-merges into the workspace's `main` — no `/harden`, no engine restart. This is the same machinery the `run_coding_agent` tool's `folder` argument produces. Only whole app folders are valid; the engine rejects other `data/` subtrees, app subpaths, and non-existent folders.
 
-`--folder` and `--repo` are mutually exclusive, and `--folder` requires `--cc` (the CLI errors before any HTTP round-trip on either). When `--folder` is set the `$LUCIDOS_REPO` default is suppressed — the engine rejects a request that carries both a repo and a folder.
+`--folder` and `--repo` are mutually exclusive, and `--folder` requires a coding-agent flag (`--cc`, `--codex`, or `--coding-agent`; the CLI errors before any HTTP round-trip otherwise). When `--folder` is set the `$LUCIDOS_REPO` default is suppressed — the engine rejects a request that carries both a repo and a folder.
 
 ```bash
 # Spawn an app coding-agent thread to work on an app in this workspace.
@@ -207,6 +230,12 @@ $ lucidos spawn-thread --to personal --cc --relation top \
     --title "Autoresearch session" \
     --message "Run one research session per data/apps/momentum-autoresearch/knowhow."
 [Autoresearch session](thread:personal/2f1c…)
+
+# Spawn a Codex coding-agent thread in the dev workspace.
+$ lucidos spawn-thread --to dev --codex --relation top \
+    --title "Codex review" \
+    --message "Review the current app folder and fix the failing test."
+[Codex review](thread:dev/7a42…)
 ```
 
 ### `lucidos notify --title <T> --message <M> [--app-id <APP>] [--tap <T>] [--thread-id <UUID>] [--event-id <UUID>]`
@@ -224,7 +253,7 @@ Both `--title` and `--message` are required and must be non-empty (the engine re
 
 #### Deep-linking back to the originating event
 
-For event-driven triggers ("Claude is asking", "credential needed", …) the right behaviour is for the push tap to scroll straight to the specific event card the user needs to act on. Three flags wire this up:
+For event-driven triggers ("coding agent is asking", "credential needed", …) the right behaviour is for the push tap to scroll straight to the specific event card the user needs to act on. Three flags wire this up:
 
 - **`--tap <modal|none|navigate>`** — which kind of tap. `modal` (default) opens the inbox modal. `none` is the passive variant — no destination; the row marks itself read on in-app toast display or OS push tap (which just launches the PWA). Use for purely informational pushes that need no follow-up ("Backup complete", "Sync finished"). `navigate` deep-links to the target inferred from the other flags: `--thread-id` → navigate to that thread (scrolling and pulsing `--event-id` when set); `--app-id` → navigate to that app. When both `--thread-id` and `--app-id` are present, thread wins (the more common CTA shape — "answer this question").
 - **`--thread-id <UUID>`** — the originating thread. With `--tap navigate`, the tap deep-links straight to this thread instead of the inbox modal. Even without `--tap`, this stamps the notification so the modal's "Open thread" button resolves.
@@ -233,7 +262,7 @@ For event-driven triggers ("Claude is asking", "credential needed", …) the rig
 ```bash
 # Deep-link the push to the exact UserQuestionAsked card on tap.
 lucidos notify \
-  --title "Claude is asking" \
+  --title "Coding agent is asking" \
   --message "Ship it?" \
   --tap navigate \
   --thread-id "$TRIGGER_EVENT_THREAD_ID" \
@@ -323,16 +352,33 @@ curl -k -X POST "https://localhost:$LUCIDOS_API_PORT/api/v1/changes/$CID/apply"
 lucidos changes apply "$CID"
 ```
 
-If a script genuinely needs to call the HTTP endpoint directly (test harness, external tool that can't shell out to the CLI), forward both headers explicitly:
+If a script genuinely needs to call the HTTP endpoint directly (test harness, external tool that can't shell out to the CLI), forward both headers explicitly and build the base URL from `$LUCIDOS_API_BASE_URL`:
 
 ```bash
 curl -k -X POST \
   -H "x-lucidos-agent-origin-token: $LUCIDOS_AGENT_ORIGIN_TOKEN" \
   -H "x-lucidos-source-thread-id: $LUCIDOS_THREAD_ID" \
-  "https://localhost:$LUCIDOS_API_PORT/api/v1/changes/$CID/apply"
+  "${LUCIDOS_API_BASE_URL:-https://localhost:$LUCIDOS_API_PORT}/api/v1/changes/$CID/apply"
 ```
 
-The engine listens on `https://` with a self-signed cert in dev (`-k` / `_create_unverified_context()` accepts it; the CLI already does). The token env var is process-local secret state set by the engine on every spawned subprocess; the thread id is set when the subprocess has a spawning thread. See `docs/apply-change-api.md` for the response shape and the full apply workflow.
+Use `$LUCIDOS_API_BASE_URL` (set by the engine on every spawned subprocess) rather than building the URL from `$LUCIDOS_API_PORT` yourself: under the workspace gateway (ADR 0014) the engine binds a **loopback HTTP** port and the user-facing port belongs to the gateway, which routes the workspace under `/<slug>/` — a bare `https://localhost:$LUCIDOS_API_PORT/api/v1/...` request there never reaches the engine (the gateway resolves the first path segment as a workspace slug). `$LUCIDOS_API_BASE_URL` is the exact base the engine answers on (loopback `http://` under the gateway; `https://` self-signed in the legacy single-engine model, which `-k` / `_create_unverified_context()` accepts). The fallback to `$LUCIDOS_API_PORT` covers older engines that predate the var. The token env var is process-local secret state set by the engine on every spawned subprocess; the thread id is set when the subprocess has a spawning thread. See `docs/apply-change-api.md` for the response shape and the full apply workflow.
+
+### `lucidos planned mark (--plan <path> | --simple "<reason>")` / `lucidos planned state`
+
+Record or query the *plan marker* — the durable enforcement that the `implementation-plan` skill (or an explicit local-fix acknowledgment) ran before a *Lucidos-source* coding-agent branch is edited and applied. A marker MUST exist on the branch or Claude Code's first source edit is blocked (the `cc-plan-gate` PreToolUse hook) and Apply is refused (the engine's plan floor). Wraps `POST /api/v1/internal/mark-planned` / `GET /api/v1/internal/planned-state`.
+
+```bash
+# Complex work: the implementation-plan skill writes the plan, then records this for you:
+lucidos planned mark --plan docs/plans/2026-06-18-my-change.md
+
+# Genuinely local fix that doesn't warrant a plan — acknowledge instead:
+lucidos planned mark --simple "rename a misspelled variable"
+
+# Inspect the current branch's marker (PRESENT or MISSING):
+lucidos planned state
+```
+
+`mark` resolves repo_root / branch / HEAD from `$PWD`'s git worktree (like `lucidos hardened mark`). Pass exactly one of `--plan` / `--simple`. Both recorded states satisfy every gate; only the absence of a marker blocks. App coding-agent threads and external repos are exempt (the gate is a no-op there). Normally you don't call `mark --plan` by hand — the `implementation-plan` skill does — but `mark --simple` is the agent's escape hatch for a change too small to plan. (`lucidos cc-plan-gate` is the hidden PreToolUse hook that enforces this; it is not invoked directly.)
 
 ### `lucidos knowhow list`
 
@@ -438,10 +484,15 @@ If you find a script doing `curl -H "Authorization: Bearer $CRED_..."` against a
 
 The CLI figures out **which workspace** to talk to in this order:
 
-1. **`$LUCIDOS_WORKSPACE`** environment variable. The engine sets this on every spawned subprocess (Python, bash, CC), so this is the authoritative path for the engine-spawned case.
+1. **`$LUCIDOS_WORKSPACE`** environment variable. The engine sets this on every spawned subprocess (Python, bash, coding-agent sessions), so this is the authoritative path for the engine-spawned case.
 2. **Walk up from `$PWD`** looking for the first ancestor directory that contains a `.lucidos/ports` file. Fallback for terminal users running the CLI by hand without the env var set.
 
 You should never need to think about this — the env var is configured automatically when the engine spawns the subprocess.
+
+**Reaching the engine API.** Once the workspace is located, the CLI picks the engine's base URL in this order:
+
+1. **`$LUCIDOS_API_BASE_URL`** — set by the engine on every spawned subprocess when it is reachable somewhere other than the ports-file port. Under the workspace gateway (ADR 0014) the engine binds a **loopback HTTP** port while the user-facing port belongs to the gateway (which routes the workspace under `/<slug>/`), so the engine hands the CLI the exact loopback URL. Without this, a bare `https://localhost:<gateway-port>/api/v1/...` request would never reach the engine (the gateway resolves the first path segment as a workspace slug).
+2. **`.lucidos/ports`** (`API_PORT` + optional `PROTO`, default `https`) — the legacy single-engine model, where the engine listens directly on the user-facing port. Used when `$LUCIDOS_API_BASE_URL` is absent (legacy / Tauri / terminal).
 
 ## Common patterns
 
@@ -513,11 +564,11 @@ For every script the engine spawns, it:
 2. Prepends `<workspace>/.lucidos/bin` to `PATH`.
 3. Sets `LUCIDOS_WORKSPACE=<workspace>` so the CLI's fallback always resolves.
 
-For CC sessions it additionally drops a skill file at `<worktree>/.claude/skills/lucidos-cli/SKILL.md` so CC discovers the CLI via its normal skill mechanism. A one-line reminder ("Use the `lucidos` CLI for any data-dir writes or event emits.") in your trigger/app prompt is still good belt-and-braces.
+For Claude Code sessions it additionally drops a skill file at `<worktree>/.claude/skills/lucidos-cli/SKILL.md` so Claude Code discovers the CLI via its normal skill mechanism. Codex sessions receive the CLI guidance in their system prompt. A one-line reminder ("Use the `lucidos` CLI for any data-dir writes or event emits.") in your trigger/app prompt is still good belt-and-braces.
 
 ## Implementation
 
 - Source: `crates/lucidos-cli/`
 - Shared engine wiring: `crates/lucidos-engine/src/runtime/lucidos_cli.rs` — `lucidos_cli_dir` discovers the binary, `ensure_workspace_bin_symlink` installs the workspace-relative symlink, `workspace_script_env_vars` builds the env var bundle.
-- Used by `claude_code.rs` (CC sessions) and `engine/mod.rs::build_script_env_vars` (Python/bash tool calls + scheduled scripts).
+- Used by `claude_code.rs` (Claude Code sessions) and `engine/mod.rs::build_script_env_vars` (Python/bash tool calls + scheduled scripts).
 - The CLI itself is a thin wrapper — see [`js-sdk.md`](./js-sdk.md) for the equivalent in-browser API used by app UIs.

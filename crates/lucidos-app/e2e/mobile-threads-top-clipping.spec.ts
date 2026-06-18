@@ -26,7 +26,7 @@
  * the same observable transition (content-box unchanged, padding
  * changed) the observer must catch.
  */
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { assertHealthy, ensureMobileView, navigateToApp, sendMessage, uniqueMessage, waitForResponse } from './helpers';
 
 const SIMULATED_SAFE_AREA_TOP_PX = 59; // iPhone 14 Pro dynamic-island inset

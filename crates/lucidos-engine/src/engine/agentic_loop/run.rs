@@ -19,6 +19,104 @@ use super::super::LucidosEngine;
 use super::helpers::*;
 
 impl LucidosEngine {
+    async fn strip_original_user_images_after_first_llm_call(
+        &self,
+        messages: &mut [Message],
+        original_user_message_idx: usize,
+        image_description_handle: &mut Option<
+            tokio::task::JoinHandle<Option<(String, String)>>,
+        >,
+        origin_id: Uuid,
+        thread_id: Uuid,
+        meta: &crate::engine::thread_events::EventMeta,
+    ) {
+        // Resolve the Flash description (should be done by now — Flash is much
+        // faster than the main model's first response). The handle yields
+        // `(description, model)` so we can stamp the producing model on
+        // the emitted `ImageDescribed` event.
+        let described = if let Some(handle) = image_description_handle.take() {
+            match handle.await {
+                Ok(opt) => opt.filter(|(d, _)| !is_bad_image_description(d)),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let image_description: Option<&str> = described.as_ref().map(|(d, _)| d.as_str());
+
+        if let Some(msg) = messages.get_mut(original_user_message_idx) {
+            if let MessageContent::Blocks(blocks) = &mut msg.content {
+                let desc = image_description.unwrap_or("user-attached image").to_string();
+                let stripped = replace_image_blocks(blocks, || format!("[image: {}]", desc));
+                if stripped > 0 {
+                    log!(
+                        "[AgentLoop] Stripped {}KB of image data from context after first LLM call",
+                        stripped / 1024
+                    );
+                }
+            }
+        }
+
+        // Emit one `ImageDescribed` event per attached hash so the
+        // description is preserved as a derived past-tense fact — who
+        // (model) saw what (hash) and when (event timestamp). The hashes
+        // come from the persisted MessageReceived row so failed-decode
+        // images dropped at emit time are NOT re-included here. Idempotent
+        // on retries: this helper only runs when `iterations == 1`.
+        if let Some((desc, model)) = described {
+            let hashes = match self.event_store.get_event_by_id(origin_id).await {
+                Ok(Some(row)) => row
+                    .payload
+                    .get("user_image_hashes")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|h| h.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                Ok(None) => {
+                    log!(
+                        "[AgentLoop] ImageDescribed: origin event {} not found, skipping emit",
+                        origin_id
+                    );
+                    Vec::new()
+                }
+                Err(e) => {
+                    log!(
+                        "[AgentLoop] ImageDescribed: failed to load origin event {}: {}",
+                        origin_id, e
+                    );
+                    Vec::new()
+                }
+            };
+            for hash in hashes {
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::ImageDescribed {
+                                source_event_id: origin_id,
+                                hash,
+                                description: desc.clone(),
+                                model: model.clone(),
+                            },
+                            // Engine-internal enrichment; inherit the turn's
+                            // channel but drop request_event_id (this isn't a
+                            // response to the user's request, it's a derived
+                            // fact about the request itself).
+                            meta: crate::engine::thread_events::EventMeta {
+                                channel: meta.channel,
+                                ..crate::engine::thread_events::EventMeta::NONE
+                            },
+                        },
+                        "[AgentLoop] ImageDescribed",
+                    )
+                    .await;
+            }
+        }
+    }
+
     /// The agentic loop: call LLM → parse response → execute tools → repeat.
     ///
     /// Returns ProcessResult on completion.
@@ -95,6 +193,7 @@ impl LucidosEngine {
         // Maintained across iterations: trim pass 2 may remove older messages, which
         // shifts the captured index down by the number removed (handled below).
         let mut user_message_idx = messages.len().saturating_sub(1);
+        let mut original_user_message_idx = user_message_idx;
         let mut images: Vec<String> = Vec::new(); // Track screenshots created during this request
         let mut last_tool_call: Option<(String, String)> = None; // (tool_name, key) - key derived by derive_call_key
         let mut consecutive_same_call = 0;
@@ -162,6 +261,7 @@ impl LucidosEngine {
             // index guard ensures every removal sits strictly below
             // user_message_idx, so it shifts down by removed_count.
             user_message_idx = user_message_idx.saturating_sub(removed_count);
+            original_user_message_idx = original_user_message_idx.saturating_sub(removed_count);
             // Safety net: validate tool_use/tool_result pairing after trimming.
             // The primary fix ensures correct block ordering, but this catches any
             // edge case where pairing breaks (trimming bugs, injection ordering, etc.)
@@ -471,29 +571,20 @@ impl LucidosEngine {
                     synth_id,
                 );
             }
-            let suppressed_tool_turn_text = suppress_tool_turn_text(&mut response);
-            if suppressed_tool_turn_text {
-                crate::log!(
-                    "[AgenticLoop] thread={} suppressed assistant text attached to a tool-call turn",
-                    thread_id
-                );
-            }
-            let suppress_tool_turn_flush = !response.tool_calls.is_empty();
-
             // Final flush — send any remaining buffered text and persist
-            // remainder. When inline repair fired, use the cleaned text
-            // (tag-stripped) so the frontend's live view and persisted
-            // TextStreamed events both reflect the repaired body.
+            // remainder. This includes the assistant's preamble on a tool-call
+            // turn ("Let me organize the cards…" before write_file): the loop
+            // streams it so the agent explains along the way, not just at the
+            // end. When inline repair fired, use the cleaned text (tag-stripped)
+            // so the frontend's live view and persisted TextStreamed events both
+            // reflect the repaired body.
             let (flush_text, remaining_to_persist) = {
                 let raw = raw_buffer.lock().unwrap();
-                let effective: &str = if suppress_tool_turn_flush {
-                    ""
-                } else {
-                    inline_repair
-                        .as_ref()
-                        .map(|d| d.cleaned_text.as_str())
-                        .unwrap_or(raw.as_str())
-                };
+                let effective: &str = effective_flush_text(
+                    inline_repair.as_ref().map(|d| d.cleaned_text.as_str()),
+                    raw.as_str(),
+                    response.content.as_deref(),
+                );
                 let cloned = if effective.is_empty() {
                     None
                 } else {
@@ -543,6 +634,56 @@ impl LucidosEngine {
 
             // No more tool calls - we have the final answer
             if response.tool_calls.is_empty() {
+                // A user may have sent follow-ups while this LLM call was in
+                // flight. If the model returned a plain final answer (no tool
+                // loop), this is the last chance to ingest them before the
+                // response terminates and they become orphaned follow-up turns.
+                // Preserve the draft assistant text in history, append the
+                // coalesced injection as one user message, and continue so the
+                // agent answers the queued updates in this same turn.
+                let mut injected_prompts = Vec::new();
+                while let Ok(prompt) = injection_rx.try_recv() {
+                    injected_prompts.push(prompt);
+                }
+                let injected_prompts =
+                    filter_removed_queued_prompts(&self.pool, thread_id, injected_prompts).await;
+                if !injected_prompts.is_empty() {
+                    if let Some(answer) = response
+                        .content
+                        .as_deref()
+                        .map(|c| self.clean_response(c))
+                        .filter(|c| !c.is_empty())
+                    {
+                        messages.push(Message {
+                            role: "assistant".to_string(),
+                            content: MessageContent::Text(answer),
+                        });
+                    }
+                    if append_injected_prompts_to_messages(
+                        &self.event_bus,
+                        thread_id,
+                        &meta,
+                        messages,
+                        injected_prompts,
+                    )
+                    .await
+                    {
+                        user_message_idx = messages.len().saturating_sub(1);
+                        if iterations == 1 {
+                            self.strip_original_user_images_after_first_llm_call(
+                                messages,
+                                original_user_message_idx,
+                                &mut image_description_handle,
+                                origin_id,
+                                thread_id,
+                                &meta,
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
+                }
+
                 // Refresh any app UIs that were modified during the tool loop
                 for app_id in &modified_app_uis {
                     self.event_bus
@@ -959,8 +1100,9 @@ impl LucidosEngine {
                 );
 
                 // Persist + broadcast ToolCalled. Capture the event_id so spawn-style
-                // tools (run_thread, run_claude) can record which tool call triggered
-                // the spawn — this becomes the new thread's `spawning_event_id`.
+                // tools (run_thread, run_coding_agent) can record which tool call
+                // triggered the spawn — this becomes the new thread's
+                // `spawning_event_id`.
                 let tool_called_event_id = self
                     .event_bus
                     .emit_for_id(crate::engine::event_bus::BusEvent::Thread {
@@ -1379,77 +1521,18 @@ impl LucidosEngine {
                 while let Ok(prompt) = injection_rx.try_recv() {
                     injected_prompts.push(prompt);
                 }
-                for prompt in injected_prompts {
-                    match &prompt.kind {
-                        super::super::InjectedPromptKind::WakeFromChild => {
-                            crate::log!(
-                                "[Inject] Wake-from-child (spawning_event {:?}) into active parent {}",
-                                prompt.spawning_event_id,
-                                thread_id
-                            );
-                            // Caller (`process_message_with_steps`) already
-                            // formatted the block via
-                            // `format_child_thread_completed_block`; the same
-                            // formatter `build_session_messages` uses on
-                            // reload, so the inflight wake matches what a
-                            // post-restart resume would project.
-                            messages.push(Message {
-                                role: "user".to_string(),
-                                content: MessageContent::Text(prompt.text.clone()),
-                            });
-                            continue;
-                        }
-                        super::super::InjectedPromptKind::UserText => {}
-                    }
-
-                    crate::log!(
-                        "[Inject] Mid-flight {:?} prompt injected into thread {}: {}",
-                        prompt.mode,
-                        thread_id,
-                        &prompt.text[..prompt.text.floor_char_boundary(80)]
-                    );
-
-                    emit_user_prompt_injected_event(&self.event_bus, thread_id, &meta, &prompt)
-                        .await;
-
-                    let framed = match prompt.mode {
-                        super::super::thread_events::ActorMode::Human => format!(
-                            "[USER CORRECTION — the user sent this while you were working. \
-                             Prioritize this over your current plan and adjust accordingly.]\n\n{}",
-                            prompt.text
-                        ),
-                        super::super::thread_events::ActorMode::Agent
-                        | super::super::thread_events::ActorMode::Engine => format!(
-                            "[SYSTEM UPDATE — new information arrived while you were working. \
-                             Incorporate this into your current response.]\n\n{}",
-                            prompt.text
-                        ),
-                    };
-                    let content = if let Some(imgs) = &prompt.images {
-                        if !imgs.is_empty() {
-                            let mut blocks = vec![ContentBlock::Text { text: framed }];
-                            for img in imgs {
-                                // Fit each injected image to the model size target
-                                // (compress only if over) — same gate as the initial
-                                // send, so a large mid-flight upload can't 400.
-                                let fitted = img.clone().fit_for_llm();
-                                blocks.push(ContentBlock::Image {
-                                    source_type: "base64".to_string(),
-                                    media_type: fitted.mime_type,
-                                    data: fitted.base64,
-                                });
-                            }
-                            MessageContent::Blocks(blocks)
-                        } else {
-                            MessageContent::Text(framed)
-                        }
-                    } else {
-                        MessageContent::Text(framed)
-                    };
-                    messages.push(Message {
-                        role: "user".to_string(),
-                        content,
-                    });
+                let injected_prompts =
+                    filter_removed_queued_prompts(&self.pool, thread_id, injected_prompts).await;
+                if append_injected_prompts_to_messages(
+                    &self.event_bus,
+                    thread_id,
+                    &meta,
+                    messages,
+                    injected_prompts,
+                )
+                .await
+                {
+                    user_message_idx = messages.len().saturating_sub(1);
                 }
             }
 
@@ -1458,97 +1541,16 @@ impl LucidosEngine {
             // already seen the actual bytes — subsequent iterations only need the
             // description to remember what was shown.
             if iterations == 1 {
-                // Resolve the Flash description (should be done by now — Flash is much
-                // faster than the main model's first response). The handle yields
-                // `(description, model)` so we can stamp the producing model on
-                // the emitted `ImageDescribed` event.
-                let described = if let Some(handle) = image_description_handle.take() {
-                    match handle.await {
-                        Ok(opt) => opt.filter(|(d, _)| !is_bad_image_description(d)),
-                        Err(_) => None,
-                    }
-                } else {
-                    None
-                };
-                let image_description: Option<&str> = described.as_ref().map(|(d, _)| d.as_str());
-
-                if let Some(msg) = messages.get_mut(user_message_idx) {
-                    if let MessageContent::Blocks(blocks) = &mut msg.content {
-                        let desc = image_description
-                            .unwrap_or("user-attached image")
-                            .to_string();
-                        let stripped = replace_image_blocks(blocks, || format!("[image: {}]", desc));
-                        if stripped > 0 {
-                            log!(
-                                "[AgentLoop] Stripped {}KB of image data from context after first LLM call",
-                                stripped / 1024
-                            );
-                        }
-                    }
-                }
-
-                // Emit one `ImageDescribed` event per attached hash so the
-                // description is preserved as a derived past-tense fact —
-                // who (model) saw what (hash) and when (event timestamp).
-                // The hashes come from the persisted MessageReceived row so
-                // failed-decode images dropped at emit time are NOT
-                // re-included here. Idempotent on retries: this branch only
-                // runs on iteration 1.
-                if let Some((desc, model)) = described {
-                    let hashes = match self.event_store.get_event_by_id(origin_id).await {
-                        Ok(Some(row)) => row
-                            .payload
-                            .get("user_image_hashes")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|h| h.as_str().map(str::to_string))
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default(),
-                        Ok(None) => {
-                            log!(
-                                "[AgentLoop] ImageDescribed: origin event {} not found, skipping emit",
-                                origin_id
-                            );
-                            Vec::new()
-                        }
-                        Err(e) => {
-                            log!(
-                                "[AgentLoop] ImageDescribed: failed to load origin event {}: {}",
-                                origin_id, e
-                            );
-                            Vec::new()
-                        }
-                    };
-                    for hash in hashes {
-                        self.event_bus
-                            .emit_or_log(
-                                crate::engine::event_bus::BusEvent::Thread {
-                                    thread_id,
-                                    event: crate::engine::thread_events::ThreadEvent::ImageDescribed {
-                                        source_event_id: origin_id,
-                                        hash,
-                                        description: desc.clone(),
-                                        model: model.clone(),
-                                    },
-                                    // Engine-internal enrichment; inherit the
-                                    // turn's channel but drop request_event_id
-                                    // (this isn't a response to the user's
-                                    // request, it's a derived fact about the
-                                    // request itself).
-                                    meta: crate::engine::thread_events::EventMeta {
-                                        channel: meta.channel,
-                                        ..crate::engine::thread_events::EventMeta::NONE
-                                    },
-                                },
-                                "[AgentLoop] ImageDescribed",
-                            )
-                            .await;
-                    }
-                }
+                self.strip_original_user_images_after_first_llm_call(
+                    messages,
+                    original_user_message_idx,
+                    &mut image_description_handle,
+                    origin_id,
+                    thread_id,
+                    &meta,
+                )
+                .await;
             }
         }
     }
-
 }

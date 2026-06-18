@@ -163,7 +163,6 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
       <div
         class="thread-title-input thread-title-display"
         onClick={startEditing}
-        data-tooltip="Click to rename"
       >{title}</div>
       {/* Mobile: a <textarea> so a long title wraps to multiple lines and the
           whole text stays visible while editing (autoResizeTextarea grows it to
@@ -199,6 +198,13 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
           onKeyDown={handleKeyDown}
           onBlur={editing ? handleBlur : undefined}
           data-escape-self
+          // The tooltip lives on this transparent overlay <input>, not on the
+          // read-only display div beneath it: the overlay (position:absolute,
+          // inset:0) is what the pointer actually hits while idle, and the
+          // global tooltip system walks UP from the hovered node — it never
+          // reaches the display div (a sibling, not an ancestor). Cleared while
+          // editing so it doesn't pop over the rename field.
+          data-tooltip={editing ? undefined : 'Edit thread name (can suggest new name)'}
           tabIndex={editing ? 0 : -1}
         />
       )}

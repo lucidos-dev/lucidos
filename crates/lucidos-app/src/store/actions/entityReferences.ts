@@ -5,7 +5,7 @@
  * Wired at the SSE dispatch level in thread-sync.ts, NOT as a side-effect of
  * handleThreadEvent or handleGlobalEvent.
  */
-import { panelOverlay, appsList, triggers, credentials, chatModels, oauthAccounts, repositories, artifacts } from '../store';
+import { panelOverlay, appsList, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, artifacts } from '../store';
 import { loadApps } from './apps';
 import { loadChatModels } from './models';
 import { loadTriggers } from './triggers';
@@ -14,6 +14,7 @@ import { loadTriggerGroups } from './triggerGroups';
 import { loadArtifacts } from './artifacts';
 import { removePinnedAppLocal, loadPinnedApps } from './pinnedApps';
 import { loadCredentials } from './credentials';
+import { loadEnvironmentVariables } from './environmentVariables';
 import { loadOAuthAccounts } from './oauth';
 import { loadRepositories } from './repositoriesLoader';
 import { loadDevices, devices, getDeviceId } from './devices';
@@ -156,6 +157,10 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     case 'CredentialUpdated':
     case 'CredentialDeleted':
       if (credentials.value.status === 'loaded') void loadCredentials();
+      break;
+    case 'EnvironmentVariableSet':
+    case 'EnvironmentVariableDeleted':
+      if (environmentVariables.value.status === 'loaded') void loadEnvironmentVariables();
       break;
     case 'ModelCreated':
     case 'ModelUpdated':

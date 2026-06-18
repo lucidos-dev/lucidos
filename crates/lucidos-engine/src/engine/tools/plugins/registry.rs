@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use crate::core::plugin_marketplaces::InstalledPluginSummary;
 use crate::core::plugins::{self, compare_versions, PluginManifest, UpdateDecision};
 use crate::core::DATA_DIR;
 
@@ -76,6 +77,27 @@ async fn project_installs(
     Ok(state)
 }
 
+pub(crate) async fn installed_plugin_summaries(
+    pool: &sqlx::PgPool,
+) -> Result<Vec<InstalledPluginSummary>, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(project_installs(pool)
+        .await?
+        .into_iter()
+        .map(|(id, payload)| {
+            let rec = InstalledRecord { payload };
+            let app_id = primary_app_id(&rec.files(), &id);
+            InstalledPluginSummary {
+                id: id.clone(),
+                name: rec.name().unwrap_or(&id).to_string(),
+                version: rec.version().unwrap_or("unknown").to_string(),
+                source: rec.source().map(ToOwned::to_owned),
+                setup_thread_id: rec.setup_thread_id().map(ToOwned::to_owned),
+                app_id,
+            }
+        })
+        .collect())
+}
+
 /// Read the latest known install record for a plugin id by scanning the
 /// `events` table. Returns `None` if the plugin is not installed (never
 /// installed, or installed then uninstalled).
@@ -123,6 +145,35 @@ impl InstalledRecord {
             })
             .unwrap_or_default()
     }
+    // `setup_thread_id` sits alongside `summary`/`files`/`installed_at` in the
+    // event's `manifest` payload map (one level above the raw toml, which is
+    // the nested `manifest/manifest`). Absent on installs that shipped no
+    // `setup` field and on every pre-feature legacy row.
+    pub(crate) fn setup_thread_id(&self) -> Option<&str> {
+        self.payload
+            .pointer("/data/manifest/setup_thread_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// The app a plugin's "Open" button should launch: the first `apps/<app-id>/`
+/// directory among the installed files, preferring an app whose id equals the
+/// plugin id (the common one-app-named-after-the-plugin case). Returns `None`
+/// for plugins that install no app (knowhow/triggers/scripts only).
+pub(crate) fn primary_app_id(files: &[String], plugin_id: &str) -> Option<String> {
+    let mut app_ids: Vec<&str> = files
+        .iter()
+        .filter_map(|f| f.strip_prefix("apps/"))
+        .filter_map(|rest| rest.split('/').next())
+        .filter(|seg| !seg.is_empty())
+        .collect();
+    app_ids.sort_unstable();
+    app_ids.dedup();
+    if app_ids.contains(&plugin_id) {
+        return Some(plugin_id.to_string());
+    }
+    app_ids.first().map(|s| s.to_string())
 }
 
 /// Normalize a free-form plugin reference into the dash-slug form used by

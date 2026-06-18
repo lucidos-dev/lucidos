@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { navigateToApp, gotoWithRetry } from './helpers';
 
 // Regression: ResizeObserver alone doesn't fire when only the scroll

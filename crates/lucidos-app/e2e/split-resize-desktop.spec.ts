@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Page } from './fixtures';
 import { assertHealthy, navigateToApp, openThreadDrawer } from './helpers';
 
 /** Free divider drags with a deferred snap (SplitLayout / DrawerDivider +
@@ -150,7 +150,9 @@ test.describe('Split layout — free drag with deferred snap', () => {
   test('drawer toggle slides the drawer header shut with the drawer — no pop', async ({ page }) => {
     await openDrawerAndSettle(page);
 
-    await page.locator('button[aria-label="Toggle thread drawer"]:visible').first().click();
+    // openDrawerAndSettle opened the drawer; the toggle is a plain show/hide, so
+    // this second click simply hides it (no focus stage in between).
+    await page.locator('button[aria-label="Show or hide thread drawer"]:visible').first().click();
     // The drawer header must pass through intermediate widths: it stays
     // mounted and its width rides --content-offset through the transition.
     // The old conditional render unmounted it at toggle time — width would

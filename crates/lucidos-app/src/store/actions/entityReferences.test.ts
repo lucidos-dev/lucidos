@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { panelOverlay, pinnedApps, credentials, oauthAccounts, repositories, artifacts } from '../store';
+import { panelOverlay, pinnedApps, credentials, environmentVariables, oauthAccounts, repositories, artifacts } from '../store';
 import type { App } from '../types';
 
 // Mock loader functions to prevent API calls
@@ -7,6 +7,7 @@ vi.mock('./apps', () => ({ loadApps: vi.fn() }));
 vi.mock('./triggers', () => ({ loadTriggers: vi.fn() }));
 vi.mock('./artifacts', () => ({ loadArtifacts: vi.fn() }));
 vi.mock('./credentials', () => ({ loadCredentials: vi.fn() }));
+vi.mock('./environmentVariables', () => ({ loadEnvironmentVariables: vi.fn() }));
 vi.mock('./oauth', () => ({ loadOAuthAccounts: vi.fn() }));
 vi.mock('./repositoriesLoader', () => ({ loadRepositories: vi.fn() }));
 vi.mock('./devices', async () => {
@@ -29,6 +30,7 @@ import { loadApps } from './apps';
 import { loadTriggers } from './triggers';
 import { loadArtifacts } from './artifacts';
 import { loadCredentials } from './credentials';
+import { loadEnvironmentVariables } from './environmentVariables';
 import { loadOAuthAccounts } from './oauth';
 import { loadRepositories } from './repositoriesLoader';
 import { loadDevices, devices } from './devices';
@@ -65,6 +67,7 @@ describe('processSSEForReferences', () => {
     // Reset settings caches between tests so the gated-handler assertions
     // can't leak `status: 'loaded'` across describe blocks.
     credentials.value = { status: 'not-loaded' };
+    environmentVariables.value = { status: 'not-loaded' };
     oauthAccounts.value = { status: 'not-loaded' };
     repositories.value = { status: 'not-loaded' };
     devices.value = { status: 'not-loaded' };
@@ -409,6 +412,22 @@ describe('processSSEForReferences', () => {
       processSSEForReferences('CredentialUpdated', { service_name: 'openai' });
       processSSEForReferences('CredentialDeleted', { service_name: 'openai' });
       expect(loadCredentials).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  describe('EnvironmentVariable* events', () => {
+    it('does not reload when env vars cache is not-loaded', () => {
+      environmentVariables.value = { status: 'not-loaded' };
+      processSSEForReferences('EnvironmentVariableSet', { name: 'LUCIDOS_REPO', value: 'x' });
+      processSSEForReferences('EnvironmentVariableDeleted', { name: 'LUCIDOS_REPO' });
+      expect(loadEnvironmentVariables).not.toHaveBeenCalled();
+    });
+
+    it('reloads on each event when env vars cache is loaded', () => {
+      environmentVariables.value = { status: 'loaded', data: [] };
+      processSSEForReferences('EnvironmentVariableSet', { name: 'LUCIDOS_REPO', value: 'x' });
+      processSSEForReferences('EnvironmentVariableDeleted', { name: 'LUCIDOS_REPO' });
+      expect(loadEnvironmentVariables).toHaveBeenCalledTimes(2);
     });
   });
 

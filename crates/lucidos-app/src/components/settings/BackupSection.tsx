@@ -1,8 +1,8 @@
-import { Fragment, type VNode } from 'preact';
-import { useState, useEffect, useRef } from 'preact/hooks';
-import { backupProgress, restoreState, backupListVersion, backupStatusVersion, showToast } from '../../store/store';
+import { type VNode } from 'preact';
+import { useState, useEffect } from 'preact/hooks';
+import { backupProgress, backupStatusVersion, showToast } from '../../store/store';
 import { grantOAuthScope } from '../../store/actions/oauth';
-import { formatDateTime, formatTimeAgo } from '../../utils/formatTime';
+import { formatTimeAgo } from '../../utils/formatTime';
 import { formatBytes } from '../../utils/formatBytes';
 import { Dropdown } from '../shared/Dropdown';
 import {
@@ -15,26 +15,21 @@ import {
   getBackupRetention,
   setBackupRetention,
   createBackup,
-  listBackups,
   getBackupStatus,
-  restoreBackup,
-  getRestoreStatus,
-  clearRestoreStatus,
-  validateWorkspaceName,
-  startWorkspace,
   ApiError,
-  type BackupEntry,
   type BackupProviderInfo,
   type BackupKeyResponse,
   type BackupStatus,
   type BackupLastRun,
-  type ValidateNameResult,
 } from '../../api/client';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { errorDetail } from '../../utils/errorDetail';
 
+// Restore lives in the workspace picker now (it provisions the new workspace);
+// this section is backup creation + key + scheduling only. These are the phases
+// the backup pipeline reports via BackupProgress.
 const PHASE_LABELS: Record<string, string> = {
   starting: 'Starting...',
   estimating: 'Estimating...',
@@ -42,12 +37,6 @@ const PHASE_LABELS: Record<string, string> = {
   compressing: 'Compressing...',
   encrypting: 'Encrypting...',
   uploading: 'Uploading...',
-  downloading: 'Downloading...',
-  decrypting: 'Decrypting...',
-  decompressing: 'Decompressing...',
-  initializing: 'Initializing workspace...',
-  starting_db: 'Starting database...',
-  restoring_db: 'Restoring database...',
 };
 
 const SCHEDULE_OPTIONS: { label: string; value: string }[] = [
@@ -66,12 +55,6 @@ const RETENTION_OPTIONS: { label: string; value: string }[] = [
   { label: 'Keep 50', value: '50' },
 ];
 
-/** Extract workspace name from backup filename: lucidos-backup-{name}-{YYYYMMDD}-{HHMMSS}.enc */
-function extractWorkspaceName(filename: string): string {
-  const match = filename.match(/^lucidos-backup-(.+)-\d{8}-\d{6}\.enc$/);
-  return match ? match[1] : '';
-}
-
 function scheduleLabel(cron: string): string {
   const match = SCHEDULE_OPTIONS.find((o) => o.value === cron);
   return match ? match.label : cron;
@@ -87,8 +70,8 @@ const STATUS_POLL_MS = 4000;
 
 type LiveProgress = { phase: string; progress: number; total: number } | null;
 
-/** Shared progress-bar fill used by both the health card and the restore flow.
- *  Null when total is unknown (0) so the bar doesn't render a 0%/NaN width. */
+/** Progress-bar fill for the health card's running state. Null when total is
+ *  unknown (0) so the bar doesn't render a 0%/NaN width. */
 function progressBarFill(progress: { progress: number; total: number }): VNode | null {
   if (progress.total <= 0) return null;
   const pct = Math.round((progress.progress / progress.total) * 100);
@@ -230,11 +213,7 @@ export function BackupSection() {
   // null until the on-mount existence probe answers. Drives the button label
   // (Show vs Generate) without revealing or minting the key.
   const [keyExists, setKeyExists] = useState<boolean | null>(null);
-  const [backupsLoadable, setBackupsLoadable] = useState<Loadable<BackupEntry[]>>({ status: 'not-loaded' });
-  const showBackupsLoading = useDelayedLoading(backupsLoadable);
   const [statusLoadable, setStatusLoadable] = useState<Loadable<BackupStatus>>({ status: 'not-loaded' });
-  const [selectedBackupId, setSelectedBackupId] = useState<string | null>(null);
-  const [restoreKey, setRestoreKey] = useState('');
   const [schedule, setSchedule] = useState<string>('off');
   const [scheduleLoaded, setScheduleLoaded] = useState(false);
   const [scheduleSaving, setScheduleSaving] = useState(false);
@@ -242,12 +221,6 @@ export function BackupSection() {
   const [retentionLoaded, setRetentionLoaded] = useState(false);
   const [retentionSaving, setRetentionSaving] = useState(false);
   const [granting, setGranting] = useState(false);
-  const [restoreWorkspaceName, setRestoreWorkspaceName] = useState('');
-  const [nameValidation, setNameValidation] = useState<ValidateNameResult | null>(null);
-  const [nameValidating, setNameValidating] = useState(false);
-  const [startingWorkspace, setStartingWorkspace] = useState(false);
-  const nameDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const nameSeqRef = useRef(0);
 
   useEffect(() => {
     setProvidersLoadable({ status: 'loading' });
@@ -274,15 +247,6 @@ export function BackupSection() {
       showToast(`Failed to load backup retention: ${errorDetail(err)}`, 'error');
     });
 
-    // Re-attach to any in-flight (or just-finished) restore. This seeds the
-    // SAME restoreState shape the Restore* SSE events drive, so a page reloaded
-    // mid-restore shows the identical phase/percent — the stream and the refetch
-    // never diverge. Best-effort: a failed probe leaves restoreState null (no
-    // banner), and the next SSE event re-establishes it.
-    getRestoreStatus().then((s) => {
-      restoreState.value = s;
-    }).catch(() => { /* no banner until SSE or a successful later fetch */ });
-
     // Probe whether a backup key already exists so the key button labels itself
     // correctly ("Show backup key" vs "Generate new backup key") without
     // revealing the secret or minting one. Best-effort startup probe: a failed
@@ -292,12 +256,6 @@ export function BackupSection() {
     getBackupKeyExists()
       .then((r) => setKeyExists(r.exists))
       .catch(() => { /* label falls back to "Show"; the click handler resolves it */ });
-  }, []);
-
-  // Cancel any pending workspace-name validation debounce on unmount so a
-  // late timer can't call setNameValidation on a detached component.
-  useEffect(() => () => {
-    if (nameDebounceRef.current) clearTimeout(nameDebounceRef.current);
   }, []);
 
   const loadedProviders = providersLoadable.status === 'loaded' ? providersLoadable.data : null;
@@ -311,27 +269,7 @@ export function BackupSection() {
 
   const selectedReady = loadedProviders?.find((p) => p.id === selectedProvider)?.ready ?? false;
 
-  // Backup progress (BackupProgress SSE) is now backup-only — restore has its
-  // own RestoreProgress stream + restoreState, so there's no cross-labeling.
   const progress = backupProgress.value;
-
-  // Restore UI is driven entirely by restoreState (seeded from getRestoreStatus
-  // on load, kept current by Restore* SSE) so a live page and a reloaded page
-  // render the identical phase/percent/result.
-  const restore = restoreState.value;
-  const restoring = restore?.status === 'running';
-  const restoreLiveProgress = restore?.status === 'running'
-    ? { phase: restore.phase, progress: restore.progress, total: restore.total }
-    : null;
-  const restoredWorkspace = restore?.status === 'completed'
-    ? { workspace_path: restore.workspace_path, workspace_name: restore.workspace_name }
-    : null;
-
-  useEffect(() => {
-    if (selectedProvider && selectedReady) {
-      void loadBackups();
-    }
-  }, [selectedProvider, selectedReady, backupListVersion.value]);
 
   // Backup health card — refetch on provider change and after every terminal
   // backup SSE (backupStatusVersion bumps on BackupCompleted AND BackupFailed).
@@ -455,17 +393,6 @@ export function BackupSection() {
     }
   }
 
-  async function loadBackups() {
-    if (!selectedProvider) return;
-    setBackupsLoadable({ status: 'loading' });
-    try {
-      const list = await listBackups(selectedProvider);
-      setBackupsLoadable({ status: 'loaded', data: list });
-    } catch (err) {
-      setBackupsLoadable(toFailed(err));
-    }
-  }
-
   async function loadStatus() {
     if (!selectedProvider) return;
     setStatusLoadable({ status: 'loading' });
@@ -474,89 +401,6 @@ export function BackupSection() {
       setStatusLoadable({ status: 'loaded', data: status });
     } catch (err) {
       setStatusLoadable(toFailed(err));
-    }
-  }
-
-  function handleNameChange(name: string) {
-    setRestoreWorkspaceName(name);
-    setNameValidation(null);
-    if (nameDebounceRef.current) clearTimeout(nameDebounceRef.current);
-    if (!name.trim()) {
-      setNameValidating(false);
-      return;
-    }
-    setNameValidating(true);
-    const seq = ++nameSeqRef.current;
-    nameDebounceRef.current = setTimeout(async () => {
-      try {
-        const result = await validateWorkspaceName(name.trim());
-        if (nameSeqRef.current === seq) setNameValidation(result);
-      } catch {
-        if (nameSeqRef.current === seq) setNameValidation({ valid: false, reason: 'Validation failed' });
-      } finally {
-        if (nameSeqRef.current === seq) setNameValidating(false);
-      }
-    }, 300);
-  }
-
-  async function handleRestore() {
-    if (!selectedProvider || !selectedBackupId || !restoreKey.trim() || !restoreWorkspaceName.trim()) return;
-    if (nameValidation && !nameValidation.valid) return;
-    // Optimistically show "starting" so the bar appears before the first SSE.
-    // The engine immediately sets its own authoritative Running, and the
-    // Restore* SSE (or a reload's getRestoreStatus) keep it in lockstep.
-    restoreState.value = {
-      status: 'running',
-      workspace_name: restoreWorkspaceName.trim(),
-      phase: 'starting',
-      progress: 0,
-      total: 100,
-    };
-    try {
-      // 202 Accepted — the restore runs DETACHED on the engine and survives a
-      // tab reload/close. The outcome arrives via RestoreCompleted/RestoreFailed
-      // SSE; we must NOT await it here (that was the bug — a dropped request
-      // cancelled the restore mid-download).
-      await restoreBackup(selectedProvider, selectedBackupId, restoreKey.trim(), restoreWorkspaceName.trim());
-    } catch (err) {
-      showToast(`Restore failed: ${errorDetail(err)}`, 'error');
-      // Reconcile with the engine's authoritative state — e.g. a 409 means a
-      // real restore is already running; don't clobber it with a fake "failed".
-      try {
-        restoreState.value = await getRestoreStatus();
-      } catch {
-        restoreState.value = { status: 'idle' };
-      }
-    }
-  }
-
-  async function handleOpenWorkspace() {
-    if (!restoredWorkspace) return;
-    setStartingWorkspace(true);
-    try {
-      const result = await startWorkspace(restoredWorkspace.workspace_path);
-      if (result.ready) {
-        window.open(result.url, '_blank');
-      } else {
-        // Spawned but /health hasn't answered yet (first -b build can take
-        // minutes). Don't open a blank tab — tell the user to retry.
-        showToast('Workspace is still starting — click Open again in a moment.', 'warning');
-      }
-    } catch (err) {
-      showToast(`Failed to start workspace: ${errorDetail(err)}`, 'error');
-    } finally {
-      setStartingWorkspace(false);
-    }
-  }
-
-  async function handleDismissRestore() {
-    const prev = restoreState.value;
-    restoreState.value = { status: 'idle' };
-    try {
-      await clearRestoreStatus();
-    } catch (err) {
-      restoreState.value = prev;
-      showToast(`Failed to dismiss: ${errorDetail(err)}`, 'error');
     }
   }
 
@@ -597,248 +441,114 @@ export function BackupSection() {
   const backingUp = progress !== null;
 
   return (
-    <>
-      <div class="settings-section">
-        <div class="settings-section-title">Backup</div>
+    <div class="settings-section">
+      <div class="settings-section-title">Backup</div>
 
-        {backupHealthCard({
-          status: statusLoadable,
-          liveProgress: progress,
-          providerName: providerInfo?.name ?? selectedProvider,
-        })}
+      {backupHealthCard({
+        status: statusLoadable,
+        liveProgress: progress,
+        providerName: providerInfo?.name ?? selectedProvider,
+      })}
 
-        <div class="settings-row" data-search-anchor="backup:provider">
-          <span class="settings-row-label">Provider</span>
-          <Dropdown
-            options={providerOptions}
-            value={selectedProvider}
-            disabled={!loadedProviders}
-            onChange={(v) => {
-              setSelectedProvider(v);
-              setBackupsLoadable({ status: 'not-loaded' });
-              setSelectedBackupId(null);
-            }}
-          />
-          {providersLoadable.status === 'failed' && (
-            <span class="error-text">Failed to load providers: {providersLoadable.error}</span>
-          )}
-          {providersLoadable.status === 'loading' && showProvidersLoading && (
-            <span class="form-hint">Loading providers...</span>
-          )}
+      <div class="settings-row" data-search-anchor="backup:provider">
+        <span class="settings-row-label">Provider</span>
+        <Dropdown
+          options={providerOptions}
+          value={selectedProvider}
+          disabled={!loadedProviders}
+          onChange={(v) => setSelectedProvider(v)}
+        />
+        {providersLoadable.status === 'failed' && (
+          <span class="error-text">Failed to load providers: {providersLoadable.error}</span>
+        )}
+        {providersLoadable.status === 'loading' && showProvidersLoading && (
+          <span class="form-hint">Loading providers...</span>
+        )}
+      </div>
+
+      {providerInfo && !providerInfo.connected && (
+        <div style="font-size: 0.6875rem; color: var(--accent-red); margin-bottom: 0.5rem;">
+          Connect your {providerInfo.name} account in Settings → Accounts to enable backups.
         </div>
+      )}
 
-        {providerInfo && !providerInfo.connected && (
-          <div style="font-size: 0.6875rem; color: var(--accent-red); margin-bottom: 0.5rem;">
-            Connect your {providerInfo.name} account in Settings → Accounts to enable backups.
-          </div>
-        )}
-
-        {providerInfo && providerInfo.connected && !providerInfo.ready && (
-          <div style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.6875rem; color: var(--accent-red);">
-            <span>{providerInfo.name} access not granted.</span>
-            <button
-              class="action-btn action-btn-confirm"
-              disabled={granting}
-              onClick={handleGrantAccess}
-            >
-              {granting ? 'Waiting for browser...' : 'Grant access'}
-            </button>
-          </div>
-        )}
-
-        {providerInfo?.ready && providerInfo.folder_url && (
-          <div class="backup-folder-link-row">
-            <a
-              class="accent-link"
-              href={providerInfo.folder_url}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              View backups folder in {providerInfo.name} ↗
-            </a>
-          </div>
-        )}
-
-        <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+      {providerInfo && providerInfo.connected && !providerInfo.ready && (
+        <div style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.6875rem; color: var(--accent-red);">
+          <span>{providerInfo.name} access not granted.</span>
           <button
             class="action-btn action-btn-confirm"
-            disabled={backingUp || !selectedProvider || !providerInfo?.ready}
-            onClick={handleBackup}
+            disabled={granting}
+            onClick={handleGrantAccess}
           >
-            {backingUp ? 'Backing up...' : 'Back up now'}
+            {granting ? 'Waiting for browser...' : 'Grant access'}
           </button>
-          {scheduleLoaded && (
-            <Dropdown
-              options={SCHEDULE_OPTIONS}
-              value={schedule}
-              disabled={scheduleSaving || !selectedProvider}
-              onChange={handleScheduleChange}
-            />
-          )}
-          {retentionLoaded && (
-            <Dropdown
-              options={RETENTION_OPTIONS}
-              value={retention}
-              disabled={retentionSaving || !selectedProvider}
-              onChange={handleRetentionChange}
-            />
-          )}
         </div>
+      )}
 
-        {/* Live backup progress is shown by the health card at the top of this
-            section (backupHealthCard's running branch) — no duplicate bar here. */}
-
-        <div style="display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-top: 0.5rem;">
-          <button
-            class="action-btn"
-            onClick={handleKeyButton}
+      {providerInfo?.ready && providerInfo.folder_url && (
+        <div class="backup-folder-link-row">
+          <a
+            class="accent-link"
+            href={providerInfo.folder_url}
+            target="_blank"
+            rel="noopener noreferrer"
           >
-            {backupKeyButtonLabel(keyExists, showKey)}
-          </button>
-          {showKey && keyInfo && (
-            <>
-              <span style="font-size: 0.6875rem; color: var(--text-muted); font-family: var(--font-mono); user-select: all;">
-                {keyInfo.key}
-              </span>
-              <button class="action-btn" onClick={copyKey}>Copy</button>
-            </>
-          )}
+            View backups folder in {providerInfo.name} ↗
+          </a>
         </div>
+      )}
+
+      <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+        <button
+          class="action-btn action-btn-confirm"
+          disabled={backingUp || !selectedProvider || !providerInfo?.ready}
+          onClick={handleBackup}
+        >
+          {backingUp ? 'Backing up...' : 'Back up now'}
+        </button>
+        {scheduleLoaded && (
+          <Dropdown
+            options={SCHEDULE_OPTIONS}
+            value={schedule}
+            disabled={scheduleSaving || !selectedProvider}
+            onChange={handleScheduleChange}
+          />
+        )}
+        {retentionLoaded && (
+          <Dropdown
+            options={RETENTION_OPTIONS}
+            value={retention}
+            disabled={retentionSaving || !selectedProvider}
+            onChange={handleRetentionChange}
+          />
+        )}
+      </div>
+
+      {/* Live backup progress is shown by the health card at the top of this
+          section (backupHealthCard's running branch) — no duplicate bar here. */}
+
+      <div style="display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-top: 0.5rem;">
+        <button
+          class="action-btn"
+          onClick={handleKeyButton}
+        >
+          {backupKeyButtonLabel(keyExists, showKey)}
+        </button>
         {showKey && keyInfo && (
-          <div style="font-size: 0.6875rem; color: var(--accent-red); margin-top: 0.25rem;">
-            Store this key somewhere safe right now — you need it to restore, and it cannot be recovered.
-          </div>
+          <>
+            <span style="font-size: 0.6875rem; color: var(--text-muted); font-family: var(--font-mono); user-select: all;">
+              {keyInfo.key}
+            </span>
+            <button class="action-btn" onClick={copyKey}>Copy</button>
+          </>
         )}
       </div>
-
-      <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor="backup:restore">Restore from backup</div>
-
-        {/* Restore status banner — driven entirely by restoreState (SSE + the
-            on-load getRestoreStatus seed), so it renders the same whether the
-            page watched the restore live or was reloaded mid-restore. Lives
-            outside the per-row form so it survives losing the row selection. */}
-        {restore && restore.status === 'running' && (
-          <div class="backup-health-card" data-state="running" style="margin-bottom: 0.75rem;">
-            <span class="backup-health-line">
-              Restoring "{restore.workspace_name}" — {PHASE_LABELS[restore.phase] || restore.phase}
-            </span>
-            {restoreLiveProgress && progressBarFill(restoreLiveProgress)}
-          </div>
-        )}
-        {restore && restore.status === 'completed' && (
-          <div class="backup-health-card" data-state="running" style="margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
-            <span class="backup-health-line">
-              Restored "{restore.workspace_name}" to {restore.workspace_path}
-            </span>
-            <button
-              class="action-btn action-btn-confirm"
-              disabled={startingWorkspace}
-              onClick={handleOpenWorkspace}
-            >
-              {startingWorkspace ? (<><span class="mini-spinner" />{' Starting...'}</>) : 'Open workspace'}
-            </button>
-            <button class="action-btn" onClick={handleDismissRestore}>Dismiss</button>
-          </div>
-        )}
-        {restore && restore.status === 'failed' && (
-          <div class="backup-health-card" data-state="failed" style="margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
-            <span class="backup-health-line">Restore failed: {restore.error}</span>
-            <button class="action-btn" onClick={handleDismissRestore}>Dismiss</button>
-          </div>
-        )}
-
-        {backupsLoadable.status === 'loading' && showBackupsLoading && (
-          <div class="loading-spinner" />
-        )}
-
-        {backupsLoadable.status === 'failed' && (
-          <div class="error-text" style="padding: 0.5rem 0;">Failed to load backups: {backupsLoadable.error}</div>
-        )}
-
-        {backupsLoadable.status === 'loaded' && backupsLoadable.data.length === 0 && (
-          <div class="empty-state">No backups found</div>
-        )}
-
-        {backupsLoadable.status === 'loaded' && backupsLoadable.data.length > 0 && (
-          <div class="list-rows">
-            {backupsLoadable.data.map((b) => {
-              const isSelected = selectedBackupId === b.id;
-              return (
-                <Fragment key={b.id}>
-                  <div
-                    class={`list-row ${isSelected ? 'backup-selected' : ''}`}
-                    onClick={() => {
-                      if (isSelected) {
-                        setSelectedBackupId(null);
-                        setRestoreWorkspaceName('');
-                        setNameValidation(null);
-                      } else {
-                        setSelectedBackupId(b.id);
-                        const name = extractWorkspaceName(b.filename);
-                        setRestoreWorkspaceName(name);
-                        setNameValidation(null);
-                        if (name) handleNameChange(name);
-                      }
-                    }}
-                  >
-                    <div class="list-row-info">
-                      <div class="title">{b.filename}</div>
-                      <div class="list-row-details">
-                        <span>{formatDateTime(new Date(b.created_at))}</span>
-                        {' \u00b7 '}
-                        <span>{formatBytes(b.size_bytes)}</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  {isSelected && (
-                    <div style="padding: 0.5rem 0.75rem 0.75rem; display: flex; flex-direction: column; gap: 0.5rem;">
-                      <div style="display: flex; align-items: center; gap: 0.5rem;">
-                        <input
-                          type="text"
-                          class="backup-key-input"
-                          placeholder="Workspace name"
-                          value={restoreWorkspaceName}
-                          onInput={(e) => handleNameChange((e.target as HTMLInputElement).value)}
-                        />
-                        {nameValidating && <span class="mini-spinner" />}
-                        {nameValidation && !nameValidation.valid && (
-                          <span style="font-size: 0.6875rem; color: var(--accent-red);">
-                            {nameValidation.reason}
-                          </span>
-                        )}
-                        {nameValidation?.valid && (
-                          <span style="font-size: 0.6875rem; color: var(--accent-green);">Available</span>
-                        )}
-                      </div>
-                      <div style="display: flex; align-items: center; gap: 0.75rem;">
-                        <input
-                          type="password"
-                          class="backup-key-input"
-                          placeholder="Enter backup key"
-                          value={restoreKey}
-                          onInput={(e) => setRestoreKey((e.target as HTMLInputElement).value)}
-                        />
-                        <button
-                          class="action-btn action-btn-confirm"
-                          disabled={restoring || !restoreKey.trim() || !restoreWorkspaceName.trim() || (nameValidation !== null && !nameValidation.valid)}
-                          onClick={handleRestore}
-                        >
-                          {restoring ? 'Restoring...' : 'Restore'}
-                        </button>
-                      </div>
-                      {/* Live progress + the completed/failed result render in the
-                          restore-status banner above, so they survive a reload and
-                          don't depend on this row staying selected. */}
-                    </div>
-                  )}
-                </Fragment>
-              );
-            })}
-          </div>
-        )}
-      </div>
-    </>
+      {showKey && keyInfo && (
+        <div style="font-size: 0.6875rem; color: var(--accent-red); margin-top: 0.25rem;">
+          Store this key somewhere safe right now — you need it to restore, and it cannot be recovered.
+          You restore a backup from the workspace picker.
+        </div>
+      )}
+    </div>
   );
 }

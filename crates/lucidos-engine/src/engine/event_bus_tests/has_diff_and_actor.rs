@@ -1,10 +1,10 @@
 use super::super::*;
 use super::*;
 
-/// Per-commit ChangeProposed (empty change_id, populated commit_sha) must flip
-/// coding_agent_has_diff to TRUE so the Diff button surfaces immediately after a
-/// commit lands. This is the live signal — set in the same projection tx as
-/// the event insert.
+/// Legacy per-commit ChangeProposed (empty change_id, populated commit_sha)
+/// must stay inert. Immediate Diff-button visibility now comes from the
+/// coding-agent post-commit hook refreshing `coding_agent_has_diff` directly,
+/// not from creating a partial proposal event.
 #[tokio::test]
 async fn per_commit_change_proposed_does_not_change_has_diff() {
     let (pool, db_name) = setup_test_db().await;
@@ -34,6 +34,68 @@ async fn per_commit_change_proposed_does_not_change_has_diff() {
         before, after,
         "per-commit ChangeProposed (empty change_id) must NOT change coding_agent_has_diff — \
          it's inert in the projection"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn coding_agent_diff_refresh_sets_has_diff_and_broadcasts_aggregate() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    start_cc_session(&bus, thread_id, "feat-branch", None).await;
+    let mut rx = bus.subscribe();
+
+    let changed = bus
+        .set_coding_agent_has_diff_and_broadcast(thread_id, true)
+        .await
+        .unwrap();
+    assert!(changed, "first refresh must report a projection change");
+
+    let stored: bool = sqlx::query_scalar(
+        "SELECT coding_agent_has_diff FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(stored, "projection flag must be updated in the DB");
+
+    let emitted = rx.recv().await.unwrap();
+    assert_eq!(emitted.seq, None, "diff refresh is transient, not persisted");
+    match emitted.typed {
+        BusEvent::Thread {
+            thread_id: emitted_thread_id,
+            event: ThreadEvent::CodingAgentDiffChanged { has_diff },
+            ..
+        } => {
+            assert_eq!(emitted_thread_id, thread_id);
+            assert!(has_diff);
+        }
+        other => panic!("expected CodingAgentDiffChanged broadcast, got {:?}", other),
+    }
+    let aggregate = emitted
+        .aggregate
+        .expect("diff refresh must carry a fresh aggregate snapshot");
+    assert!(
+        aggregate.coding_agent_has_diff,
+        "aggregate must carry coding_agent_has_diff=true"
+    );
+
+    let unchanged = bus
+        .set_coding_agent_has_diff_and_broadcast(thread_id, true)
+        .await
+        .unwrap();
+    assert!(!unchanged, "second refresh with same value must be a no-op");
+    assert!(
+        matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ),
+        "unchanged refresh must not broadcast duplicate transient events"
     );
 
     pool.close().await;

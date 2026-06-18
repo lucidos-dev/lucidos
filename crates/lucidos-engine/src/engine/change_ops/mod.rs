@@ -114,6 +114,15 @@ impl ApplyKindContext {
     pub fn is_app(&self) -> bool {
         matches!(self.kind, CodingAgentKind::App)
     }
+
+    /// True for Lucidos-source changes (not app, not external). The
+    /// implementation-plan floor applies only here: app threads don't plan,
+    /// and external repos have no `docs/plans/` convention or `lucidos planned`
+    /// marker. Legacy NULL `coding_agent_kind` parses to `Lucidos`, so old
+    /// rows are gated — correct, since they ARE Lucidos-source.
+    pub fn is_lucidos_source(&self) -> bool {
+        matches!(self.kind, CodingAgentKind::Lucidos)
+    }
 }
 
 impl super::LucidosEngine {

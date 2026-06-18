@@ -90,6 +90,7 @@ pub struct NavigateUi {
 pub enum NavigateTarget {
     Files,
     Apps,
+    AppStore,
     Triggers,
     ThreadQueue,
     Changes,

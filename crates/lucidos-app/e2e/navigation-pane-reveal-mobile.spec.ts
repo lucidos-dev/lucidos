@@ -31,7 +31,7 @@
  *     deterministic LLM response. Covered at the linkifier + click-handler
  *     unit level (chat-link-click.test.ts END-TO-END test) instead.
  */
-import { test, expect, Page } from '@playwright/test';
+import { test, expect, Page } from './fixtures';
 import {
   assertHealthy,
   navigateToApp,

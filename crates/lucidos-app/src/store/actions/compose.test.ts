@@ -302,7 +302,7 @@ describe('updateCompose discards empty composing drafts', () => {
     map.set('t-1', makeThread({ state: 'composing', composeText: '', composeImages: [], composeMode: null }));
     threadMap.value = map;
     focusedThreadId.value = 't-1';
-    inputMode.value = { type: 'claude_code' };
+    inputMode.value = { type: 'coding_agent' };
 
     updateCompose('t-1', { mode: 'claude_code' });
 
@@ -311,7 +311,7 @@ describe('updateCompose discards empty composing drafts', () => {
     expect(getDraft('t-1').mode).toBe('claude_code');
     // The discardCompose path would have reset this to {type:'do'} as a
     // session-stickiness guard — proving auto-discard fired.
-    expect(inputMode.value).toEqual({ type: 'claude_code' });
+    expect(inputMode.value).toEqual({ type: 'coding_agent' });
   });
 
   it('still auto-discards when text is cleared in the same patch that sets a mode', () => {
@@ -794,7 +794,7 @@ describe('inputMode is sticky across compose sessions (toggle remembers last pic
     globalThis.fetch = mockFetch as unknown as typeof fetch;
     connectionStatus.value = 'connected';
     focusedThreadId.value = 't-1';
-    inputMode.value = { type: 'claude_code' };
+    inputMode.value = { type: 'coding_agent' };
   });
 
   afterEach(() => {
@@ -817,9 +817,9 @@ describe('inputMode is sticky across compose sessions (toggle remembers last pic
     }));
     threadMap.value = map;
 
-    await sendCompose('t-1', { useClaudeCode: true });
+    await sendCompose('t-1', { useCodingAgent: true });
 
-    expect(inputMode.value).toEqual({ type: 'claude_code' });
+    expect(inputMode.value).toEqual({ type: 'coding_agent' });
   });
 
   it('discardCompose leaves inputMode alone so the next fresh compose stays on the user pick', async () => {
@@ -834,7 +834,7 @@ describe('inputMode is sticky across compose sessions (toggle remembers last pic
 
     await discardCompose('t-1');
 
-    expect(inputMode.value).toEqual({ type: 'claude_code' });
+    expect(inputMode.value).toEqual({ type: 'coding_agent' });
   });
 
   it('sendCompose started from lucidos leaves inputMode at lucidos', async () => {
@@ -848,7 +848,7 @@ describe('inputMode is sticky across compose sessions (toggle remembers last pic
     }));
     threadMap.value = map;
 
-    await sendCompose('t-1', { useClaudeCode: false });
+    await sendCompose('t-1', { useCodingAgent: false });
 
     expect(inputMode.value).toEqual({ type: 'do' });
   });
@@ -864,7 +864,7 @@ describe('inputMode is sticky across compose sessions (toggle remembers last pic
  *  effortLevel default until an unrelated thread-switch/reload reset it. */
 describe('CC pending pick is one-shot per spawned thread (no cross-thread leak)', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
-  let chatBodies: Array<{ use_claude_code?: boolean; reasoning_effort?: string; cc_model?: string }>;
+  let chatBodies: Array<{ use_coding_agent?: boolean; reasoning_effort?: string; cc_model?: string }>;
 
   beforeEach(() => {
     chatBodies = [];
@@ -907,7 +907,7 @@ describe('CC pending pick is one-shot per spawned thread (no cross-thread leak)'
     threadMap.value = new Map<string, ThreadState>().set('cc-1', composingCcThread('cc-1', 'do a thing'));
     focusedThreadId.value = 'cc-1';
 
-    await sendCompose('cc-1', { useClaudeCode: true });
+    await sendCompose('cc-1', { useCodingAgent: true });
 
     expect(chatBodies).toHaveLength(1);
     expect(chatBodies[0].reasoning_effort).toBe('max'); // the pick reached the spawn
@@ -919,14 +919,14 @@ describe('CC pending pick is one-shot per spawned thread (no cross-thread leak)'
 
     threadMap.value = new Map<string, ThreadState>().set('cc-A', composingCcThread('cc-A', 'first'));
     focusedThreadId.value = 'cc-A';
-    await sendCompose('cc-A', { useClaudeCode: true });
+    await sendCompose('cc-A', { useCodingAgent: true });
 
     // Brand-new compose; the user did NOT pick an effort this time.
     threadMap.value = new Map(threadMap.value).set('cc-B', composingCcThread('cc-B', 'second'));
     focusedThreadId.value = 'cc-B';
-    await sendCompose('cc-B', { useClaudeCode: true });
+    await sendCompose('cc-B', { useCodingAgent: true });
 
-    const ccBodies = chatBodies.filter((b) => b.use_claude_code);
+    const ccBodies = chatBodies.filter((b) => b.use_coding_agent);
     expect(ccBodies).toHaveLength(2);
     expect(ccBodies[0].reasoning_effort).toBe('max');     // first thread honored the pick
     expect(ccBodies[1].reasoning_effort).toBeUndefined();  // second falls through to the default
@@ -937,7 +937,7 @@ describe('CC pending pick is one-shot per spawned thread (no cross-thread leak)'
     threadMap.value = new Map<string, ThreadState>().set('cc-m', composingCcThread('cc-m', 'pick model once'));
     focusedThreadId.value = 'cc-m';
 
-    await sendCompose('cc-m', { useClaudeCode: true });
+    await sendCompose('cc-m', { useCodingAgent: true });
 
     expect(chatBodies[0].cc_model).toBe('opus[1m]');
     expect(codingAgentPendingModel.value).toBeNull();

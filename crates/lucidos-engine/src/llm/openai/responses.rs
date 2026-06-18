@@ -15,8 +15,6 @@ use super::{
     DEFAULT_MAX_COMPLETION_TOKENS,
 };
 
-const OPENAI_RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
-
 impl OpenAiProvider {
     /// Convert internal messages to Responses API input items.
     ///
@@ -397,10 +395,7 @@ impl OpenAiProvider {
             attempt += 1;
 
             let resp = match self
-                .streaming_client
-                .post(OPENAI_RESPONSES_URL)
-                .header("Authorization", format!("Bearer {}", self.api_key))
-                .header("Content-Type", "application/json")
+                .apply_headers(self.streaming_client.post(&self.responses_url))
                 .json(&body)
                 .send()
                 .await

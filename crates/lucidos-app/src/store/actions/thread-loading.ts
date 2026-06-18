@@ -122,6 +122,13 @@ export function upsertThread(
     if (saved) existing.meta.saved = true;
     if (info.title && info.title !== PENDING_TITLE_PLACEHOLDER && !generatedTitleIds.has(info.thread_id)) existing.meta.title = info.title;
     if (info.created_at) existing.meta.createdAt = info.created_at;
+    // Snapshot the live (pre-overlay) last_activity so the status guard below
+    // can spot a stale GET. `apiTime` (this snapshot), `existing.meta.updatedAt`
+    // (last applied live event) and the per-thread refresh's currentAggregate
+    // are all the SAME monotonic thread_summaries.last_activity column read at
+    // different times — so an older `apiTime` means this GET fired before a
+    // live event we've already applied.
+    const liveUpdatedAt = existing.meta.updatedAt;
     const apiTime = info.last_activity || info.created_at;
     // ISO-8601 UTC timestamps from the backend (`...Z`) are lexicographically
     // ordered the same way they're chronologically ordered — fixed-width
@@ -135,8 +142,15 @@ export function upsertThread(
     if (info.last_agent_action && (!existing.meta.lastAgentAction || info.last_agent_action > existing.meta.lastAgentAction)) existing.meta.lastAgentAction = info.last_agent_action;
     if (info.channel) existing.meta.channel = info.channel as ThreadMeta['channel'];
     if (info.initiator) existing.meta.initiator = info.initiator;
-    // Update status from API — the backend is authoritative.
-    if (info.status) existing.meta.status = info.status as ThreadStatus;
+    // Update status from the snapshot — backend-authoritative, but only when
+    // this GET isn't stale. A resync GET (loadAllThreads on SSE reconnect /
+    // visibility resume) that fired while the thread was `running` and landed
+    // AFTER live SSE applied the terminal `ResponseGenerated` (status='idle')
+    // would otherwise clobber idle → running — the dot stuck on "running" until
+    // reload. `apiTime < liveUpdatedAt` means exactly that. Mirrors the
+    // monotonic stale-GET guards on updatedAt / lastUserAction above.
+    const statusSnapshotStale = !!apiTime && !!liveUpdatedAt && apiTime < liveUpdatedAt;
+    if (info.status && !statusSnapshotStale) existing.meta.status = info.status as ThreadStatus;
     if (info.message_count) existing.meta.messageCount = info.message_count;
     // Skip section + codingAgentProposed when a local archive-flip happened
     // AT OR AFTER this GET went out — its snapshot is stale by definition.
@@ -708,13 +722,26 @@ function applyEventRows(
   // Backend snapshot is the source of truth for meta — overlay last so any
   // per-event mutations during replay don't leak through to thread.meta.
   if (currentAggregate) {
-    applyAggregateToMeta(thread.meta, currentAggregate);
-    // Same archive race guard as the SSE path in thread-sync.ts: a replay
-    // initiated before the user's Archive click ships a pre-archive
-    // aggregate that would otherwise revert the optimistic flip.
-    if (archivingThreadIds.value.has(threadId)) {
-      thread.meta.section = 'archived';
-      thread.meta.codingAgentProposed = false;
+    // Staleness guard (mirrors upsertThread): `currentAggregate.lastActivity`
+    // and `thread.meta.updatedAt` are the SAME monotonic
+    // thread_summaries.last_activity column read at different times. A snapshot
+    // fetched before a live event we've already applied is stale — applying it
+    // would regress status (running clobbering a live idle — the dot stuck on
+    // "running" until reload), updatedAt, and counts back in time. Skip the
+    // overlay entirely; the fresher live SSE state stands. New event rows above
+    // are folded in first and advance updatedAt, so a refresh that brought
+    // genuinely-new work is never misclassified as stale.
+    const snapshotStale = !!currentAggregate.lastActivity && !!thread.meta.updatedAt
+      && currentAggregate.lastActivity < thread.meta.updatedAt;
+    if (!snapshotStale) {
+      applyAggregateToMeta(thread.meta, currentAggregate);
+      // Same archive race guard as the SSE path in thread-sync.ts: a replay
+      // initiated before the user's Archive click ships a pre-archive
+      // aggregate that would otherwise revert the optimistic flip.
+      if (archivingThreadIds.value.has(threadId)) {
+        thread.meta.section = 'archived';
+        thread.meta.codingAgentProposed = false;
+      }
     }
   }
 

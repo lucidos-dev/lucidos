@@ -6,6 +6,7 @@ describe('extractNavTargetFromHref', () => {
     // Bare panel names — what the system prompt teaches the LLM to write
     ['notifications', 'notifications'],
     ['apps', 'apps'],
+    ['app-store', 'app-store'],
     ['triggers', 'triggers'],
     ['changes', 'changes'],
     ['files', 'files'],
@@ -413,6 +414,52 @@ describe('linkifyPaths', () => {
     const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
     expect(result).toContain('class="app-link"');
     expect(result).toContain('data-app-id="todo"');
+  });
+
+  it.each([
+    'app',
+    'app/',
+    'app:',
+    'app:/',
+  ])('rewrites bare [Name](%s) (no id) to app-link via the anchor TEXT', (href) => {
+    // Real shape from the bug-report thread: the coding agent, told only to
+    // "mention the app name", over-helpfully wrote a markdown link with a bare
+    // `app` href and no id:
+    //   The preview auto-refreshes in [Site Publisher](app) — hit Publish.
+    // pulldown_cmark renders that as `<a href="app">Site Publisher</a>`, which
+    // matches neither the `app:<id>` / `apps/<id>` shapes (no id) nor a nav
+    // panel (`app` singular isn't one). Left alone the browser resolves the
+    // relative href against the gateway base (`/<slug>/`) → `/<slug>/app`, a
+    // dead end. Recover the app from the anchor's visible text instead.
+    const html = `<p>Open <a href="${href}">Site Publisher</a> and publish.</p>`;
+    const result = linkifyPaths(html, [], [{ name: 'Site Publisher', id: 'site-publisher' }]);
+    expect(result).toContain('class="app-link"');
+    expect(result).toContain('data-app-id="site-publisher"');
+    expect(result).toContain('>Site Publisher</a>');
+    expect(result).not.toContain(`href="${href}"`);
+  });
+
+  it('resolves a bare [id](app) anchor by app id text too', () => {
+    const html = '<p>See <a href="app">site-publisher</a>.</p>';
+    const result = linkifyPaths(html, [], [{ name: 'Site Publisher', id: 'site-publisher' }]);
+    expect(result).toContain('data-app-id="site-publisher"');
+  });
+
+  it('leaves a bare [unknown](app) anchor alone when the text names no known app', () => {
+    const html = '<p>Open <a href="app">Some Other Thing</a>.</p>';
+    const result = linkifyPaths(html, [], [{ name: 'Site Publisher', id: 'site-publisher' }]);
+    expect(result).toContain('href="app"');
+    expect(result).not.toContain('app-link');
+  });
+
+  it('does not treat the apps panel href as a bare app link', () => {
+    // `apps` (plural) is a nav panel target — it must keep routing to the Apps
+    // list, never get hijacked by the bare-app text fallback.
+    const html = '<p>Browse <a href="apps">Site Publisher</a>.</p>';
+    const result = linkifyPaths(html, [], [{ name: 'Site Publisher', id: 'site-publisher' }]);
+    expect(result).toContain('class="nav-link"');
+    expect(result).toContain('data-nav-target="apps"');
+    expect(result).not.toContain('app-link');
   });
 
   it('leaves app:<unknown-id> anchors alone (same gate as apps/<unknown-id>)', () => {

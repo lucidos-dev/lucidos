@@ -85,6 +85,23 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.variant).toBe('system');
   });
 
+  it('ContinuationStarted (auto_recovery_after_hang): NOT labeled an engine restart', () => {
+    // A hung subprocess OR a stray signal-kill (e.g. another workspace's
+    // `cargo check` build-lock kill landing on this CC subprocess) auto-resumes
+    // with reason=auto_recovery_after_hang — nothing restarted, so it must not
+    // claim "Resumed after engine restart" (the wording that made a user think
+    // restarting an unrelated workspace had restarted theirs). The reason wins
+    // over the actor.
+    const ex = exchangeWith({
+      type: 'ContinuationStarted',
+      reason: 'auto_recovery_after_hang',
+      actor: { kind: 'system' },
+    });
+    const desc = describeInitiator(ex, '', [], 'tid');
+    expect(desc.summary).toBe('Resumed after an interruption');
+    expect(desc.summary).not.toBe('Resumed after engine restart');
+  });
+
   it('ResponseAborted (system actor): chip is "System", summary "Response interrupted"', () => {
     // The host system killed the underlying process (engine shutdown,
     // safety-net catch, OS signal). Engine just marked it on recovery.

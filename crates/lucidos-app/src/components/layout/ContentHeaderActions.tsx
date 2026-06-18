@@ -3,9 +3,9 @@ import type { ComponentChild } from 'preact';
 import { useState, useEffect } from 'preact/hooks';
 import { NotificationsBell } from '../notifications/NotificationsBell';
 import { TimeTravelDropdown } from '../apps/TimeTravelDropdown';
-import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, filePreviewEditing, appPseudoFullscreen, parseRepoPath } from '../../store/store';
+import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen } from '../../store/store';
 import { closeUrl, refreshFilePreview } from '../../store/actions/artifacts';
-import { getAppFrameSrc, getVisibleAppFrame, exitPseudoFullscreen, refreshAppUI } from '../../store/actions/apps';
+import { getAppFrameSrc, getVisibleAppFrame, exitPseudoFullscreen, refreshAppUI, toggleAppSearch } from '../../store/actions/apps';
 import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon } from '../shared/icons';
 import { RENDERABLE_EXTS, isEditableDataFile } from '../files/previewExts';
 import { isTauri, isIOSPwa } from '../../utils/platform';
@@ -193,6 +193,17 @@ export function ContentHeaderActions() {
   } else if (!overlay && activeMenuItem.value === 'files') {
     addAction('search',
       <button class="icon-btn header-icon file-search-btn" onClick={(e) => openFileSearch(e.currentTarget)} aria-label="Search files" data-tooltip="Search files">
+        <SearchIcon />
+      </button>,
+    );
+  } else if (!overlay && activeMenuItem.value === 'apps') {
+    addAction('search',
+      <button
+        class={`icon-btn header-icon apps-search-btn${appSearchOpen.value ? ' filter-active' : ''}`}
+        onClick={toggleAppSearch}
+        aria-label="Search apps"
+        data-tooltip="Search apps"
+      >
         <SearchIcon />
       </button>,
     );

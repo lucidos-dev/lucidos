@@ -108,7 +108,30 @@ function postprocessCopyBlocks(html: string, encodedTexts: Map<number, string>):
 // elements (<p>, <strong>, <code>, etc.) are NOT in this list and pass through.
 const DANGEROUS_TAG = /<(\/?)(iframe|script|style|object|embed|applet|base|meta|link)(\s[^>]*)?>/gi;
 
-export function renderMarkdown(md: string): string {
+// LRU cache for parsed markdown. `renderMarkdown` is pure (same input → same
+// HTML), but the chat timeline calls it INLINE on every render of every exchange
+// (response text, each tool result, each thought, prompts). A re-render of a
+// thread — e.g. the thread flipping idle→running when a follow-up is sent busts
+// the per-exchange memo for ALL exchanges — therefore re-parsed every block's
+// markdown synchronously. On a heavy thread (dozens of tool results + thoughts)
+// that storm froze the main thread for a second or two. Caching by raw input
+// makes those re-parses O(1) lookups. The live streaming buffer opts out
+// (`cache: false`) — its text changes every token, so caching it would only
+// thrash the cache and evict the stable, reused entries.
+const MARKDOWN_CACHE_MAX = 400;
+const markdownCache = new Map<string, string>();
+
+export function renderMarkdown(md: string, opts?: { cache?: boolean }): string {
+  const useCache = opts?.cache !== false;
+  if (useCache) {
+    const hit = markdownCache.get(md);
+    if (hit !== undefined) {
+      // LRU touch: move to most-recently-used.
+      markdownCache.delete(md);
+      markdownCache.set(md, hit);
+      return hit;
+    }
+  }
   // Preprocess copy blocks before marked parsing
   const encodedTexts = new Map<number, string>();
   const preprocessed = preprocessCopyBlocks(md, encodedTexts);
@@ -130,6 +153,14 @@ export function renderMarkdown(md: string): string {
       return `href="#" data-thread-id="${threadId}"${wsAttr} class="thread-link"`;
     }
   );
+  if (useCache) {
+    markdownCache.set(md, html);
+    if (markdownCache.size > MARKDOWN_CACHE_MAX) {
+      // Evict the least-recently-used (first key in insertion order).
+      const oldest = markdownCache.keys().next().value;
+      if (oldest !== undefined) markdownCache.delete(oldest);
+    }
+  }
   return html;
 }
 

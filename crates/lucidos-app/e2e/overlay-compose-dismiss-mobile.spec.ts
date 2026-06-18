@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { navigateToApp, assertHealthy, enableMobileHeaderSticky } from './helpers';
 
 // Touch-only regression: when an overlay is open, tapping a sibling button that

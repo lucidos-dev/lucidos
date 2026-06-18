@@ -29,6 +29,10 @@ interface DropdownProps {
   filterable?: boolean;
   /** Allow typing a custom value not in the options list */
   freeText?: boolean;
+  /** Keyboard selection usually restores focus to the trigger for accessibility.
+   *  Callers that synchronously focus a follow-up input from onChange can opt
+   *  out so the trigger does not steal focus back. */
+  restoreFocusOnSelect?: boolean;
 }
 
 /** Walk `options` from `start` in direction `step` (±1), skipping any
@@ -47,7 +51,17 @@ function nextEnabledIndex(options: DropdownOption[], start: number, step: 1 | -1
   return start;
 }
 
-export function Dropdown({ options, value, onChange, disabled, placeholder, class: className, filterable, freeText }: DropdownProps) {
+export function Dropdown({
+  options,
+  value,
+  onChange,
+  disabled,
+  placeholder,
+  class: className,
+  filterable,
+  freeText,
+  restoreFocusOnSelect = true,
+}: DropdownProps) {
   // Anchor element when open, null when closed. `useAnchoredPosition` reacts
   // to anchor changes via its effect deps — no separate `open` flag needed.
   // The menu uses `position: fixed` so it escapes any `overflow: hidden`
@@ -175,7 +189,7 @@ export function Dropdown({ options, value, onChange, disabled, placeholder, clas
         if (freeText) commit(picked); else onChange(picked);
         closeDropdown();
         inputRef.current?.blur();
-        buttonRef.current?.focus();
+        if (restoreFocusOnSelect) buttonRef.current?.focus();
       } else if (freeText && draftRef.current.trim()) {
         commit();
         closeDropdown();

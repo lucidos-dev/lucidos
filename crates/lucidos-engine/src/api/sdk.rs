@@ -49,6 +49,16 @@ pub(super) async fn serve_sdk_iframe_audio_js() -> Response {
 }
 
 fn find_sdk_bundle() -> String {
+    // Packaged desktop bundle: the launcher sets LUCIDOS_SDK_DIR to the staged
+    // SDK resource dir (which contains sdk.js). Checked first so the bundle
+    // doesn't depend on cwd / exe-relative layout. No-op when unset (dev/docker).
+    if let Some(dir) = std::env::var_os("LUCIDOS_SDK_DIR") {
+        let path = std::path::Path::new(&dir).join("sdk.js");
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            return content;
+        }
+    }
+
     let search_paths = [
         "packages/lucidos-sdk/dist/sdk.js",
         "../packages/lucidos-sdk/dist/sdk.js",

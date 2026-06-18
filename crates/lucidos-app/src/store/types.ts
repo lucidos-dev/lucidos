@@ -38,8 +38,11 @@ export function setLoadingIfFresh<T>(signal: { value: Loadable<T> }): void {
 export const MENU_ITEMS = ['files', 'apps', 'triggers', 'thread-queue', 'settings', 'changes', 'notifications'] as const;
 export type MenuItem = typeof MENU_ITEMS[number];
 
-// Connection status
-export type ConnectionStatus = 'connected' | 'disconnected';
+// Connection status. 'connecting' is the initial state before the first
+// /health poll resolves — it renders the dot neutral grey (no red, no blink),
+// so a page refresh never flashes red while the first check is in flight. The
+// 5s poll only ever resolves to 'connected' or 'disconnected' thereafter.
+export type ConnectionStatus = 'connected' | 'disconnected' | 'connecting';
 
 // A single step in chat processing (tool call, memory search, etc.)
 export interface Step {
@@ -371,6 +374,9 @@ export interface CredentialInfo {
   auth_type: AuthType;
   auth_header: string;
   created_at: string;
+  /** Custom env var name the credential's secret is exposed under, overriding
+   *  the default `CRED_<NAME>`. `null` when using the default. */
+  env_var_name?: string | null;
 }
 
 // Email account server settings (no password) — used to pre-fill the edit form
@@ -484,6 +490,56 @@ export interface CredentialRequest {
     userinfo_url?: string | null;
     scopes?: string;
   };
+  /** Optional custom env var name the agent passed via `request_credential`.
+   *  Pre-fills the modal's "Env var name" field so the secret also injects under
+   *  this exact name (in addition to the default `CRED_<NAME>`). The user can
+   *  edit or clear it before saving. */
+  env_var_name?: string;
+}
+
+export interface PluginMarketplace {
+  id: string;
+  name: string;
+  source: string;
+}
+
+export type MarketplacePluginStatus = 'available' | 'installed' | 'update_available';
+
+export interface MarketplacePlugin {
+  marketplace_id: string;
+  marketplace_name: string;
+  id: string;
+  name: string;
+  description: string;
+  version: string;
+  source: string;
+  manifest: Record<string, unknown>;
+  content: string[];
+  files_count: number;
+  status: MarketplacePluginStatus;
+  installed_version?: string;
+  /** Setup thread spawned at install (installed plugins that shipped a `setup`
+   *  field only). The card's "Setup" button opens it. */
+  setup_thread_id?: string;
+  /** True once the setup thread has finished — flips the card button from
+   *  "Setup" to "Open". Absent/false for plugins without setup. */
+  setup_complete?: boolean;
+  /** The plugin's primary app (`data/apps/<id>/`), if it ships one. The card's
+   *  "Open" button launches it; absent → nothing to open. */
+  app_id?: string;
+}
+
+export interface MarketplaceScanError {
+  marketplace_id: string;
+  marketplace_name: string;
+  source: string;
+  error: string;
+}
+
+export interface MarketplaceCatalog {
+  marketplaces: PluginMarketplace[];
+  plugins: MarketplacePlugin[];
+  errors: MarketplaceScanError[];
 }
 
 /** Plugin install awaiting user confirmation in the install panel. Mirrors

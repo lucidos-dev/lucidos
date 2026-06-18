@@ -4,9 +4,11 @@ import { useMemo, useRef } from 'preact/hooks';
 import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
-import type { Exchange, ThreadEvent } from '../../store/thread-events';
-import { ENGINE_LABEL, ENGINE_ICON, actorInitiator, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, isEmptyContinuedExchange, isCanceledQuestionDivider, changePanelHasContinuation, findCommandPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, responseAbortedSummary, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import type { Exchange, ThreadEvent, MessageOrigin } from '../../store/thread-events';
+import { ENGINE_LABEL, ENGINE_ICON, SYSTEM_ICON, SYSTEM_LABEL, API_CALLER_ICON, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, isEmptyContinuedExchange, isCanceledQuestionDivider, changePanelHasContinuation, findCommandPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import { LucidosAgentGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, openImagePopupFromGroup, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
+import { removeQueuedMessage } from '../../store/actions/chat';
 import { preserveOnToggle } from './scrollState';
 import { openFilePreview } from '../../store/actions/artifacts';
 import { openApp } from '../../store/actions/apps';
@@ -21,6 +23,7 @@ import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref } from '../../utils/linkifyPaths';
 import { handleNavigationRequest } from '../../store/actions/thread-sync';
 import { ChangeBody, CheckpointCard, ContinueButton, FileList, GeneratedImage, InitiatorPanel, InlineStep, MarkdownBlock, ResponsePanel, ResumeNoteBody, UserMessageBody, changeAccent, changeActions, describeExecutor } from './chat-exchange-parts';
+import { TrashIcon } from '../shared/icons';
 
 // Stable refs so loadedOr fallback doesn't yield a fresh [] each render —
 // without these, every dependent useMemo invalidates on every render whenever
@@ -67,7 +70,7 @@ interface Props {
   /** True when this is a chat follow-up the user typed while the agent was busy
    *  — it's queued behind the active turn and not yet ingested. Computed in
    *  `renderExchanges` (it needs thread-level busy state + the active-exchange
-   *  index); drives the "Queued ○" marker on the bubble. */
+   *  index); drives the "Queued" marker on the bubble. */
   isQueued?: boolean;
   /** Lifted from `threadMap.value.get(threadId)?.meta.channel === 'claude_code'`
    *  in `renderExchanges` so this component does not subscribe to threadMap
@@ -79,11 +82,16 @@ interface Props {
   /** Lifted from `isRenderedThreadIdle(threadMap.value.get(threadId))` — quiescent
    *  by raw status, but false while an optimistic resume is in flight. */
   threadIdle: boolean;
+  /** Lifted from `threadMap.value.get(threadId)?.meta.status === 'waiting_for_user_answer'`.
+   *  Tells `exchangeStatus` the thread is parked on / resuming from a question or
+   *  permission card — never crashed — so a just-answered divider doesn't flash
+   *  "Aborted" during the answer→resume gap. See `exchangeStatus`. */
+  threadAwaitingAnswer: boolean;
   /** Lifted from `cancelingThreadIds.value.has(threadId)`. */
   threadCanceling: boolean;
 }
 
-function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, imageOffset = 0, priorModel, priorEffort, isUnresumedAbort, threadIsCC, threadCodingAgent, threadIdle, threadCanceling }: Props) {
+function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, imageOffset = 0, priorModel, priorEffort, isUnresumedAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling }: Props) {
   const rootRef = useRef<HTMLDivElement>(null);
   const showDetails = detailsExpanded.value;
   const showSteps = stepsExpanded.value;
@@ -96,7 +104,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   const responseTextRaw = exchangeResponseText(exchange);
   const steps = exchangeSteps(exchange, isLast, threadIdle);
   const events = exchangeResponseEvents(exchange, imageOffset, isLast, threadIdle);
-  const status = exchangeStatus(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle);
+  const status = exchangeStatus(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle, threadAwaitingAnswer);
   const error = exchangeError(exchange);
 
   // Cap detection reads ResponseGenerated.text directly via exchangeEngineLimitDetail —
@@ -105,7 +113,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // channel the agent appears to stop silently mid-task.
   const engineLimitDetail = !streamingBuffer ? exchangeEngineLimitDetail(exchange) : '';
   const isEngineLimit = !!engineLimitDetail;
-  const streamingHtml = streamingBuffer ? renderMarkdown(streamingBuffer) : '';
+  // The live streaming buffer changes every token — opt it out of the markdown
+  // cache so its short-lived fragments don't evict the stable, reused entries.
+  const streamingHtml = streamingBuffer ? renderMarkdown(streamingBuffer, { cache: false }) : '';
   const responseHtml = responseTextRaw ? renderMarkdown(responseTextRaw) : '';
   const responseHtmlCombined = streamingHtml || responseHtml;
   const hasResponse = !!responseHtmlCombined || isEngineLimit;
@@ -305,10 +315,33 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // agent chip.
   const isUserMessageBubble = exchange.userEvent.type === 'MessageReceived' && initiator.variant === 'user';
   // A queued follow-up (typed while the agent was busy, not yet ingested) shows
-  // a "Queued ○" tag in its own bubble header — where dividers show "Answered
+  // a "Queued" tag in its own bubble header — where dividers show "Answered
   // ✓" — instead of a faux "Lucidos Agent — Queued" response panel below it.
   // The message is the user's, and a stack of them should each read as waiting.
   const isQueuedUserMessage = !!isQueued && isUserMessageBubble;
+  const queuedMessageId = isQueuedUserMessage ? exchange.userEvent._eventId : undefined;
+  // The trash button lives INSIDE the status label (an existing `display:flex`
+  // row) rather than in a separate wrapper, so "Queued" and the trash stay on
+  // one line using only CSS that already ships — no dependency on a fresh rule.
+  const queuedStatus = (
+    <span class="exchange-status-label exchange-status-queued">
+      {'Queued'}
+      {queuedMessageId && (
+        <button
+          type="button"
+          class="icon-btn queued-message-remove"
+          aria-label="Remove queued message"
+          data-tooltip="Remove queued message"
+          onClick={(e) => {
+            e.stopPropagation();
+            void removeQueuedMessage(threadId, queuedMessageId);
+          }}
+        >
+          <TrashIcon />
+        </button>
+      )}
+    </span>
+  );
   const isChromeless = isUserMessageBubble || isChangePanel;
   const isAbortPanel = exchange.userEvent.type === 'ResponseAborted';
   const isCancelPanel = exchange.userEvent.type === 'ResponseCanceled';
@@ -351,11 +384,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     <div class="chat-exchange" ref={rootRef} data-event-id={exchange.userEvent._eventId} data-change-id={changeId || undefined}>
       <InitiatorPanel
         initiator={isQueuedUserMessage
-          ? { ...initiator, status: (
-              <span class="exchange-status-label exchange-status-queued">
-                {'Queued'}<span class="exchange-status-queued">{'○'}</span>
-              </span>
-            ) }
+          ? { ...initiator, status: queuedStatus }
           : initiator}
         timestamp={formatMessageTimestamp(timestamp)}
         onActorClick={initiator.actorClickable === false
@@ -475,6 +504,7 @@ function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.threadIsCC !== next.threadIsCC) return false;
   if (prev.threadCodingAgent !== next.threadCodingAgent) return false;
   if (prev.threadIdle !== next.threadIdle) return false;
+  if (prev.threadAwaitingAnswer !== next.threadAwaitingAnswer) return false;
   if (prev.threadCanceling !== next.threadCanceling) return false;
   const a = prev.exchange;
   const b = next.exchange;
@@ -542,9 +572,7 @@ export interface InitiatorDescriptor {
 function initiatorSummary(ev: Exchange['userEvent']): string {
   switch (ev.type) {
     case 'TriggerStarted':           return 'Trigger fired';
-    case 'ContinuationStarted':         return originMode(ev.actor) === 'human'
-      ? 'Continued the response'
-      : 'Resumed after engine restart';
+    case 'ContinuationStarted':         return continuationStartedSummary(ev.reason, ev.actor);
     case 'ResponseAborted':            return responseAbortedSummary(ev.actor, ev.cause);
     // ResponseCanceled carries its text as the header label (RESPONSE_CANCELED_SUMMARY),
     // not as a summary line — see its describeInitiator arm.
@@ -576,6 +604,32 @@ function initiatorSummary(ev: Exchange['userEvent']): string {
  *  recovery) hardcode `'system'` regardless of the actor in their header. */
 function actorVariant(actor: Parameters<typeof actorInitiator>[0]): InitiatorVariant {
   return originMode(actor) === 'agent' ? 'lucidos' : 'system';
+}
+
+/** Map a `MessageOrigin` to its display icon + label. The chip answers "who
+ *  decided this" with one of the closed set of known actors: **You** (a real
+ *  browser device), **Lucidos Agent** (LLM acting on behalf of the user —
+ *  rendered as the Lucidos mark), **Lucidos Engine** (deterministic engine
+ *  work), **System** (host killed the process), or **API caller** (external
+ *  HTTP caller that did NOT self-identify as one of the above).
+ *
+ *  "You" is reserved for `kind: device` — a browser session bound to a known
+ *  device row. Any other human-mode origin (anonymous API client, cross-workspace
+ *  human, …) renders as "API caller" so an unauthenticated POST can never
+ *  impersonate the user in the timeline. The popover still discloses the
+ *  origin kind, user-agent, and workspace name underneath.
+ *
+ *  Lives in the view layer (not the store) because the agent icon is a brand
+ *  component (`<LucidosAgentGlyph/>`), matching how `describeExecutor` resolves
+ *  the same glyph — the store model stays free of UI components. */
+export function actorInitiator(actor: MessageOrigin | undefined): { icon: ComponentChildren; label: string } {
+  if (actor?.kind === 'system') return { icon: SYSTEM_ICON, label: SYSTEM_LABEL };
+  if (actor?.kind === 'device') return { icon: '\u{1F464}', label: 'You' };
+  switch (originMode(actor)) {
+    case 'human':  return { icon: API_CALLER_ICON, label: API_CALLER_LABEL };
+    case 'agent':  return { icon: <LucidosAgentGlyph />, label: LUCIDOS_AGENT_LABEL };
+    case 'engine': return { icon: ENGINE_ICON, label: ENGINE_LABEL };
+  }
 }
 
 /** Build a `'user'`-variant initiator descriptor with the standard human chip

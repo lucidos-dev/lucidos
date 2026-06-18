@@ -3,7 +3,9 @@ import { ApiError, confirmPluginInstall, cancelPluginInstall } from '../../api/c
 import { errorDetail } from '../../utils/errorDetail';
 import { pushNavState } from './navigation';
 import { revealContentPane } from './pane';
+import { focusThread } from './threads';
 import type { PluginInstallRequest } from '../types';
+import { refreshPluginCatalog } from './plugin-marketplaces';
 
 /** Open the plugin install panel for the staged install in `request`. The
  *  panel takes over the content pane (same surface as the credential
@@ -30,6 +32,17 @@ export async function confirmPluginInstallAction(installId: string, pluginName: 
       `${pluginName}: ${result.summary} (${result.installed_files.length} files)`,
       'success',
     );
+    void refreshPluginCatalog();
+    // When the plugin shipped `setup` instructions the engine spawns a Lucidos
+    // Agent thread to walk the user through them. Drop the user straight into it
+    // so setup happens in front of them instead of silently in the background.
+    // Use focusThread (not …OrBootstrap): the thread was spawned via the Thread
+    // Queue and its summary row may not exist yet, so a bootstrap fetch would
+    // 404 → "Thread not found". focusThread just sets focus and lets the row +
+    // events stream in over SSE as the spawn runs.
+    if (result.setup_thread_id) {
+      focusThread(result.setup_thread_id);
+    }
   } catch (e) {
     showToast(`Install failed: ${errorDetail(e)}`, 'error');
   } finally {

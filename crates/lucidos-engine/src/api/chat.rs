@@ -1,6 +1,6 @@
 use super::actor::build_message_origin;
 use super::*;
-use crate::engine::thread_events::ActorMode;
+use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
 use crate::engine::thread_state::ThreadState;
 use crate::engine::InjectedPrompt;
 use std::collections::VecDeque;
@@ -49,17 +49,56 @@ pub(crate) async fn process_orphan_chain(
     thread_id: Uuid,
     initial_orphans: Vec<InjectedPrompt>,
 ) {
-    drain_orphan_queue(initial_orphans, |orphan| {
+    drain_orphan_queue(initial_orphans, |orphans| {
         let engine = engine.clone();
         async move {
+            let orphans =
+                crate::engine::filter_removed_queued_prompts(engine.pool(), thread_id, orphans)
+                    .await;
+            let Some(first) = orphans.first() else {
+                return Vec::new();
+            };
+
+            let (text, images, mode, spawning_event_id, origin_event_id) =
+                if matches!(&first.kind, crate::engine::InjectedPromptKind::UserText) {
+                    let base_meta = crate::engine::thread_events::EventMeta {
+                        request_event_id: first.event_id,
+                        ..crate::engine::thread_events::EventMeta::NONE
+                    };
+                    for orphan in orphans.iter().skip(1) {
+                        crate::engine::emit_user_prompt_injected_event(
+                            &engine.event_bus,
+                            thread_id,
+                            &base_meta,
+                            orphan,
+                        )
+                        .await;
+                    }
+                    (
+                        crate::engine::coalesced_user_text_for_reprocess(&orphans),
+                        crate::engine::coalesced_images_for_reprocess(&orphans),
+                        first.mode,
+                        first.spawning_event_id,
+                        first.event_id,
+                    )
+                } else {
+                    (
+                        first.text.clone(),
+                        first.images.clone(),
+                        first.mode,
+                        first.spawning_event_id,
+                        first.event_id,
+                    )
+                };
+
             match engine
                 .process_message_with_steps(
-                    &orphan.text,
+                    &text,
                     None,
                     None,
                     None,
                     None,
-                    orphan.images.as_deref(),
+                    images.as_deref(),
                     None,
                     None,
                     None,
@@ -68,11 +107,13 @@ pub(crate) async fn process_orphan_chain(
                     None,
                     None,
                     None,
-                    orphan.spawning_event_id,
-                    orphan.mode,
+                    spawning_event_id,
+                    mode,
                     None,
                     None,
-                    orphan.event_id,
+                    // The first orphan was already emitted as MessageReceived
+                    // before it entered the injection channel.
+                    origin_event_id,
                     None,
                     None,
                 )
@@ -81,7 +122,8 @@ pub(crate) async fn process_orphan_chain(
                 Ok(res) => res.orphaned_injections,
                 Err(e) => {
                     log!(
-                        "[Chat] Failed to re-process orphaned injection for thread {}: {}",
+                        "[Chat] Failed to re-process {} orphaned injection(s) for thread {}: {}",
+                        orphans.len(),
                         thread_id,
                         e
                     );
@@ -100,12 +142,24 @@ pub(crate) async fn process_orphan_chain(
 /// processed too") is unit-testable without a real engine.
 async fn drain_orphan_queue<F, Fut>(initial: Vec<InjectedPrompt>, mut process_one: F)
 where
-    F: FnMut(InjectedPrompt) -> Fut,
+    F: FnMut(Vec<InjectedPrompt>) -> Fut,
     Fut: std::future::Future<Output = Vec<InjectedPrompt>>,
 {
     let mut queue: VecDeque<InjectedPrompt> = initial.into();
-    while let Some(item) = queue.pop_front() {
-        let new_orphans = process_one(item).await;
+    while let Some(first) = queue.pop_front() {
+        let mut batch = vec![first];
+        if matches!(&batch[0].kind, crate::engine::InjectedPromptKind::UserText) {
+            while queue
+                .front()
+                .is_some_and(|p| matches!(&p.kind, crate::engine::InjectedPromptKind::UserText))
+            {
+                if let Some(next) = queue.pop_front() {
+                    batch.push(next);
+                }
+            }
+        }
+
+        let new_orphans = process_one(batch).await;
         queue.extend(new_orphans);
     }
 }
@@ -237,14 +291,14 @@ pub(super) fn validate_thread_continuity(
     let requested_is_cc = requested_use_cc == Some(true);
     if existing_is_cc != requested_is_cc {
         let from = if existing_is_cc {
-            "Claude Code"
+            "coding-agent"
         } else {
-            "Lucidos"
+            "Lucidos Agent"
         };
         let to = if requested_is_cc {
-            "Claude Code"
+            "coding-agent"
         } else {
-            "Lucidos"
+            "Lucidos Agent"
         };
         return Err((
             StatusCode::CONFLICT,
@@ -353,6 +407,111 @@ pub(super) async fn chat(
 #[derive(Serialize)]
 pub(super) struct ChatSubmitResponse {
     event_id: String,
+}
+
+#[derive(Deserialize)]
+struct RemoveQueuedMessageRequest {
+    thread_id: String,
+    message_id: String,
+}
+
+async fn queued_message_already_removed(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    message_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+            SELECT 1
+              FROM events
+             WHERE aggregate = 'thread'
+               AND aggregate_id = $1
+               AND event_type = 'QueuedMessageRemoved'
+               AND payload->>'removed_message_id' = $2
+        )",
+    )
+    .bind(thread_id.to_string())
+    .bind(message_id.to_string())
+    .fetch_one(pool)
+    .await
+}
+
+async fn queued_message_already_injected(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    message_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+            SELECT 1
+              FROM events
+             WHERE aggregate = 'thread'
+               AND aggregate_id = $1
+               AND event_type = 'UserPromptInjected'
+               AND payload->>'injected_message_id' = $2
+        )",
+    )
+    .bind(thread_id.to_string())
+    .bind(message_id.to_string())
+    .fetch_one(pool)
+    .await
+}
+
+async fn remove_queued_message(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<RemoveQueuedMessageRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let thread_id = Uuid::parse_str(&request.thread_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let message_id = Uuid::parse_str(&request.message_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let already_removed = queued_message_already_removed(&state.pool, thread_id, message_id)
+        .await
+        .map_err(|e| {
+            log!(
+                "[Chat] queued-message remove: failed to check removal marker for {}: {}",
+                message_id,
+                e
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if already_removed {
+        return Ok(StatusCode::OK);
+    }
+
+    let already_injected = queued_message_already_injected(&state.pool, thread_id, message_id)
+        .await
+        .map_err(|e| {
+            log!(
+                "[Chat] queued-message remove: failed to check injection marker for {}: {}",
+                message_id,
+                e
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if already_injected {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    state
+        .engine
+        .event_bus
+        .emit(crate::engine::event_bus::BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::QueuedMessageRemoved {
+                removed_message_id: message_id,
+            },
+            meta: EventMeta {
+                channel: Some(EventChannel::Chat),
+                actor,
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(StatusCode::OK)
 }
 
 /// POST endpoint for chat with progress updates.
@@ -504,13 +663,13 @@ pub(super) async fn chat_submit(
     } else {
         request.images.take()
     };
-    let use_claude_code = request.use_claude_code;
+    let use_coding_agent = request.use_coding_agent;
     let cc_model = request.cc_model;
     let coding_agent = request.coding_agent;
     // `coding_agent` is a coding-agent-spawn payload — without CC requested it
     // would silently vanish (the chat-agent path never reads it). Reject early.
-    if coding_agent.is_some() && use_claude_code != Some(true) {
-        log!("[Chat] chat_submit received `coding_agent` without `use_claude_code=true` — rejecting");
+    if coding_agent.is_some() && use_coding_agent != Some(true) {
+        log!("[Chat] chat_submit received `coding_agent` without `use_coding_agent=true` — rejecting");
         return Err(StatusCode::BAD_REQUEST);
     }
     let event_id = request.event_id;
@@ -563,9 +722,9 @@ pub(super) async fn chat_submit(
         // `folder` is a CC-spawn payload — when CC isn't requested, the
         // resolved app_id_to_stash would sit forever in `pending_app_spawn`
         // because the chat agent path never pops it. Reject early.
-        if use_claude_code != Some(true) {
+        if use_coding_agent != Some(true) {
             log!(
-                "[Chat] chat_submit received `folder` without `use_claude_code=true` — rejecting"
+                "[Chat] chat_submit received `folder` without `use_coding_agent=true` — rejecting"
             );
             return Err(StatusCode::BAD_REQUEST);
         }
@@ -748,7 +907,7 @@ pub(super) async fn chat_submit(
                     Some(&source),
                     existing_repo.as_deref(),
                     existing_agent.as_deref(),
-                    use_claude_code,
+                    use_coding_agent,
                     repo_id.as_deref(),
                     coding_agent,
                 ) {
@@ -787,7 +946,7 @@ pub(super) async fn chat_submit(
             device_id: device_id.clone(),
             model: model.clone(),
             reasoning_effort: reasoning_effort.clone(),
-            use_claude_code,
+            use_coding_agent,
             repo_id: repo_id.clone(),
             cc_model: cc_model.clone(),
             coding_agent,
@@ -871,7 +1030,7 @@ pub(super) async fn chat_submit(
                 reasoning_effort.as_deref(),
                 chat_images.as_deref(),
                 device_id.as_deref(),
-                use_claude_code,
+                use_coding_agent,
                 event_id.as_deref(),
                 thread_id,
                 conflict_change_id,
@@ -1087,6 +1246,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/chat", post(chat))
         .route("/chat/stream", post(chat_submit))
         .route("/chat/cancel", post(cancel_chat))
+        .route("/chat/queued-message/remove", post(remove_queued_message))
 }
 
 #[cfg(test)]

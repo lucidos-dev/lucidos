@@ -52,6 +52,9 @@ export async function uploadPluginArchive(file: File): Promise<PluginArchiveUplo
 export interface PluginConfirmInstallResponse {
   summary: string;
   installed_files: string[];
+  /** Set when the plugin shipped `setup` instructions: the Lucidos Agent thread
+   *  spawned to walk the user through them. The frontend navigates here. */
+  setup_thread_id?: string;
 }
 
 /** User accepted the staged install in the install panel. The engine writes

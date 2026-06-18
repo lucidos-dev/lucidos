@@ -13,6 +13,7 @@ import type {
   TriggerGroup,
   HistoricalTriggerInfo,
   App,
+  MarketplaceCatalog,
   ConfirmState,
   ConfirmDetails,
   ResponseEvent,
@@ -30,8 +31,8 @@ import { DEFAULT_CHAT_MODEL } from './models';
 import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
 import type { EventChannel, ArchiveState, DisplaySection } from '../generated/thread-lifecycle';
 import { resetContentScroll } from '../hooks/useScrollMemory';
-import type { Change, CodingAgentModelValue, CodingAgentReasoningEffort, RestoreState } from '../api/client';
-import type { ModelInfo } from '../api/types';
+import type { Change, CodingAgentModelValue, CodingAgentReasoningEffort } from '../api/client';
+import type { EnvironmentVariable, ModelInfo } from '../api/types';
 import { markSwUpdateDismissed } from '../hooks/sw-update';
 
 /** localStorage key holding the focused thread id across reloads. Focus is
@@ -107,25 +108,48 @@ export function closeInlineForm(): void {
 }
 
 // --- Settings subview ---
-export type SettingsSubview = 'main' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'disk-usage' | 'permissions' | 'keyboard-shortcuts';
+export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'marketplaces' | 'disk-usage' | 'permissions' | 'keyboard-shortcuts' | 'mobile-access' | 'environment-variables';
+export type SettingsNavKey = Exclude<SettingsSubview, 'main'>;
+export interface SettingsNavItem {
+  key: SettingsNavKey;
+  label: string;
+}
 export const settingsSubview = signal<SettingsSubview>('main');
 /** Anchor to scroll/highlight after navigating from Search Everywhere. SettingsView clears it after applying. */
 export const settingsScrollTarget = signal<string | null>(null);
 
-export const SETTINGS_NAV_ITEMS: Array<{ key: Exclude<SettingsSubview, 'main'>; label: string }> = [
+export const SETTINGS_SYSTEM_SUBPANEL_ITEMS: SettingsNavItem[] = [
+  { key: 'backup', label: 'Backup' },
+  { key: 'memory', label: 'Memory' },
+  { key: 'disk-usage', label: 'Disk Usage' },
+  { key: 'environment-variables', label: 'Environment Variables' },
+];
+
+export const SETTINGS_NAV_ITEMS: SettingsNavItem[] = [
   { key: 'models', label: 'Models' },
   { key: 'appearance', label: 'Appearance' },
   { key: 'devices', label: 'Devices' },
   { key: 'accounts', label: 'Accounts' },
   { key: 'repositories', label: 'Repositories' },
-  { key: 'backup', label: 'Backup' },
-  { key: 'memory', label: 'Memory' },
+  { key: 'marketplaces', label: 'Marketplaces' },
+  // Packaged desktop only — gated to isTauri() && enginePackaged in SettingsView.
+  { key: 'mobile-access', label: 'Mobile Access' },
   { key: 'permissions', label: 'Permissions' },
   { key: 'keyboard-shortcuts', label: 'Keyboard Shortcuts' },
-  { key: 'disk-usage', label: 'Disk Usage' },
+  { key: 'system', label: 'System' },
 ];
 
+export function settingsSubviewLabel(key: Exclude<SettingsSubview, 'main'>): string | undefined {
+  return [...SETTINGS_NAV_ITEMS, ...SETTINGS_SYSTEM_SUBPANEL_ITEMS].find(item => item.key === key)?.label;
+}
+
 // --- Active menu item ---
+// Migrate the retired 'app-store' menu item → the Apps section's Store tab.
+// Written before `appsTab` hydrates (further down) so it picks up the Store tab.
+if (localStorage.getItem('lucidos-active-menu-item') === 'app-store') {
+  localStorage.setItem('lucidos-active-menu-item', 'apps');
+  localStorage.setItem('lucidos-apps-tab', 'store');
+}
 const savedMenuItem = localStorage.getItem('lucidos-active-menu-item');
 export const activeMenuItem = signal<MenuItem>(
   savedMenuItem && (MENU_ITEMS as readonly string[]).includes(savedMenuItem)
@@ -134,7 +158,7 @@ export const activeMenuItem = signal<MenuItem>(
 );
 
 // --- Connection ---
-export const connectionStatus = signal<ConnectionStatus>('disconnected');
+export const connectionStatus = signal<ConnectionStatus>('connecting');
 export const isConnected = computed(() => connectionStatus.value === 'connected');
 export const workspaceName = signal<string>('');
 export const workspacePath = signal<string>('');
@@ -144,6 +168,10 @@ export const lucidosReleaseDirty = signal<boolean>(false);
 export const engineVersion = signal<string | null>(null);
 export const latestEngineVersion = signal<string | null>(null);
 export const latestTauriAppVersion = signal<string | null>(null);
+/** True when the connected engine is a packaged desktop build. Routes the
+ *  "Restart" control (LaunchAgent kickstart vs. dev rebuild script) and gates
+ *  the Tauri-only Mobile Access settings page. Set from /health. */
+export const enginePackaged = signal<boolean>(false);
 
 // --- Model (persisted via preferences; populated by loadPreferences) ---
 export const currentModel = signal(DEFAULT_CHAT_MODEL);
@@ -581,6 +609,14 @@ export const SPLIT_RATIO_KEY = 'lucidos-split-ratio';
 export const splitRatio = signal(
   parseFloat(localStorage.getItem(SPLIT_RATIO_KEY) || '0.4')
 );
+
+/** Which desktop pane currently holds focus. Drives the two-stage pane toggles
+ *  (a toggle first focuses an unfocused pane, then hides it on the next press)
+ *  and the accent line under the focused pane's header region. Desktop-only:
+ *  mobile navigates between panes instead of focusing one. Not persisted — a
+ *  fresh load focuses the chat pane, the primary work area. */
+export type FocusedPane = 'drawer' | 'thread' | 'content';
+export const focusedPane = signal<FocusedPane>('thread');
 // --- Mobile view ---
 // Single source of truth for mobile pane definitions.
 // Adding or reordering a pane here automatically updates:
@@ -614,7 +650,7 @@ export function setMobileView(view: MobileView) {
 // --- Input Mode ---
 export type InputMode =
   | { type: 'do' }
-  | { type: 'claude_code' };
+  | { type: 'coding_agent' };
 
 /** Remembers the last pick across page reloads via localStorage. The matching
  *  persist effect lives in `effects.ts`. `sendCompose` / `discardCompose` no
@@ -625,7 +661,11 @@ function restoreInputMode(): InputMode {
     const raw = localStorage.getItem('lucidos-input-mode');
     if (!raw) return { type: 'do' };
     const parsed = JSON.parse(raw) as { type?: unknown };
-    if (parsed?.type === 'claude_code') return { type: 'claude_code' };
+    // Accept the legacy `'claude_code'` value persisted before the rename so a
+    // reload doesn't silently drop the user's stuck coding-agent compose mode.
+    if (parsed?.type === 'coding_agent' || parsed?.type === 'claude_code') {
+      return { type: 'coding_agent' };
+    }
     return { type: 'do' };
   } catch (err) {
     // Startup probe the user did not initiate — no toast/Loadable surface
@@ -853,6 +893,9 @@ export const discardingCCThreadIds = signal<Set<string>>(new Set());
  *  the Cancel button (shows "Cancel...") and drives the spinner status label.
  *  Cleared when the thread leaves active status (via PromptInput effect). */
 export const cancelingThreadIds = signal<Set<string>>(new Set());
+/** Queued chat messages being removed optimistically, keyed by thread + event id. */
+export const removingQueuedMessageIds = signal<Set<string>>(new Set());
+export const queuedMessageRemovalKey = (threadId: string, messageId: string): string => `${threadId}:${messageId}`;
 /** Thread IDs where a pending question was just answered and the agent's resume
  *  hasn't yet advanced the client's `meta.status` off `waiting_for_user_answer`.
  *  Read by `isRenderedThreadIdle` to suppress the answer→resume "Aborted" flash
@@ -1042,6 +1085,9 @@ export const pageTitle = computed(() =>
 // --- Credentials ---
 export const credentials = signal<Loadable<CredentialInfo[]>>({ status: 'not-loaded' });
 
+// --- Environment variables (Settings → Environment Variables) ---
+export const environmentVariables = signal<Loadable<EnvironmentVariable[]>>({ status: 'not-loaded' });
+
 // --- Chat model registry (Settings → Models; drives the Lucidos Agent picker) ---
 export const chatModels = signal<Loadable<ModelInfo[]>>({ status: 'not-loaded' });
 
@@ -1106,6 +1152,7 @@ export function resetCodingAgentPendingPreferences(): void {
 
 // --- Apps ---
 export const appsList = signal<Loadable<App[]>>({ status: 'not-loaded' });
+export const marketplaceCatalog = signal<Loadable<MarketplaceCatalog>>({ status: 'not-loaded' });
 /** When set, the app UI iframe renders at this historical commit. null = live/latest. */
 export const appCommit = signal<string | null>(null);
 /** Incremented to force-refresh app UI iframes. Used as a cache-busting key in the
@@ -1126,6 +1173,20 @@ export const wipPreviewThreadId = signal<string | null>(null);
 export const pinnedApps = signal<Loadable<PinnedAppEntry[]>>(
   hydratePinnedAppsFromStorage(),
 );
+
+/** Which tab the Apps section shows: the user's **Installed** apps, or the
+ *  **Store** (the former App Store — browse/install plugins from registered
+ *  marketplaces). Persisted so a reload returns to the same tab. */
+export type AppsTab = 'installed' | 'store';
+function hydrateAppsTab(): AppsTab {
+  return localStorage.getItem('lucidos-apps-tab') === 'store' ? 'store' : 'installed';
+}
+export const appsTab = signal<AppsTab>(hydrateAppsTab());
+/** Inline search bar in the Apps panel header (the SearchIcon). Filters the
+ *  active tab client-side — installed apps on Installed, plugins on Store —
+ *  mirroring the thread search. */
+export const appSearchOpen = signal(false);
+export const appSearchQuery = signal('');
 
 
 // --- Preferences ---
@@ -1270,23 +1331,12 @@ export * from './messageRoutePanel';
 /** Updated from SSE memory_rebuilding events. null = not rebuilding. */
 export const memoryRebuildProgress = signal<{ processed: number; total: number; percent: number } | null>(null);
 
-/** Updated from SSE BackupProgress events. null = not backing up/restoring. */
+/** Updated from SSE BackupProgress events. null = not backing up. */
 export const backupProgress = signal<{ phase: string; progress: number; total: number } | null>(null);
-
-/** Authoritative restore state, kept in lockstep by the `Restore*` SSE events
- *  AND seeded from `getRestoreStatus()` on load, so a mid-restore page reload
- *  re-attaches to the identical phase/percent/result. null = not yet fetched. */
-export const restoreState = signal<RestoreState | null>(null);
-
-/** Bumped on every BackupCompleted SSE event. BackupSection re-fetches the
- *  list when this changes, so any mounted instance (in either layout copy)
- *  sees the new entry without each running its own completion handler. */
-export const backupListVersion = signal(0);
 
 /** Bumped on every terminal backup SSE event (BackupCompleted AND
  *  BackupFailed). BackupSection re-fetches `/backup/status` when this changes
- *  so the health card reflects the new last-run outcome — failures don't
- *  change the backup list, so they can't piggyback on backupListVersion. */
+ *  so the health card reflects the new last-run outcome. */
 export const backupStatusVersion = signal(0);
 
 /** Updated from SSE RecoveryProgress events. null = not recovering. */

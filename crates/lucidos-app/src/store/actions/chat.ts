@@ -13,11 +13,13 @@ import {
   codingAgentPendingModel,
   codingAgentPendingReasoningEffort,
   cancelingThreadIds,
+  removingQueuedMessageIds,
+  queuedMessageRemovalKey,
   setFocusedThread,
 } from '../store';
 import type { ChatContext } from './chatContext';
 import type { ChatRequestBody } from '../../api/types';
-import { submitChat, cancelChat, stopClaudeCode, isTransportError } from '../../api/client';
+import { submitChat, cancelChat, stopClaudeCode, isTransportError, removeQueuedMessage as removeQueuedMessageRequest } from '../../api/client';
 import { getUnreachableEngineMsg } from './connection';
 import { getDeviceId } from './devices';
 import { handleEvent, makeOptimisticThreadState, type StoredEvent } from '../thread-events';
@@ -35,15 +37,25 @@ import { errorDetail } from '../../utils/errorDetail';
  *  stuck indefinitely when SSE drops after submitChat() succeeds. */
 export const PENDING_MESSAGE_SAFETY_MS = 30_000;
 
+type RemovedPendingMessage = {
+  index: number;
+  message: {
+    text: string;
+    eventId: string;
+    created: string;
+    image_hashes?: string[];
+  };
+};
+
 /** Remove an optimistic pending message from a thread.
  *  Without cleanup, the thread stays stuck in "Requesting..." forever
  *  (pendingUserMessages never cleared → effectiveThreadStatus returns 'running'). */
-function removePendingMessage(threadId: string, eventId: string): void {
+export function removePendingMessage(threadId: string, eventId: string): RemovedPendingMessage | null {
   const t = threadMap.value.get(threadId);
-  if (!t) return;
+  if (!t) return null;
   const idx = t.pendingUserMessages.findIndex(m => m.eventId === eventId);
   if (idx !== -1) {
-    t.pendingUserMessages.splice(idx, 1);
+    const [message] = t.pendingUserMessages.splice(idx, 1);
     threadMap.value = new Map(threadMap.value);
     // Same contract as addPendingMessage / the unreachable-engine path:
     // `activeExchanges` subscribes only to the per-thread bump and reads
@@ -51,6 +63,37 @@ function removePendingMessage(threadId: string, eventId: string): void {
     // synthetic exchange (composed from pendingUserMessages) keeps painting
     // in the focused ThreadView until the next SSE event for this thread.
     bumpThreadEvents(threadId);
+    return { index: idx, message };
+  }
+  return null;
+}
+
+function restorePendingMessage(threadId: string, removed: RemovedPendingMessage | null): void {
+  if (!removed) return;
+  const t = threadMap.value.get(threadId);
+  if (!t || t.pendingUserMessages.some(m => m.eventId === removed.message.eventId)) return;
+  const idx = Math.max(0, Math.min(removed.index, t.pendingUserMessages.length));
+  t.pendingUserMessages.splice(idx, 0, removed.message);
+  threadMap.value = new Map(threadMap.value);
+  bumpThreadEvents(threadId);
+}
+
+export async function removeQueuedMessage(threadId: string, messageId: string): Promise<void> {
+  const key = queuedMessageRemovalKey(threadId, messageId);
+  if (removingQueuedMessageIds.value.has(key)) return;
+
+  removingQueuedMessageIds.value = new Set([...removingQueuedMessageIds.value, key]);
+  const removedPending = removePendingMessage(threadId, messageId);
+
+  try {
+    await removeQueuedMessageRequest(threadId, messageId);
+  } catch (err) {
+    const next = new Set(removingQueuedMessageIds.value);
+    next.delete(key);
+    removingQueuedMessageIds.value = next;
+    restorePendingMessage(threadId, removedPending);
+    void refreshThreadEvents(threadId).catch(() => {});
+    showToast(`Failed to remove queued message: ${errorDetail(err)}`, 'error');
   }
 }
 
@@ -149,7 +192,7 @@ export { loadRepositories } from './repositoriesLoader';
 export async function sendMessage(
   message: string,
   imageHashes?: string[],
-  options?: { useClaudeCode?: boolean; context?: ChatContext | null; threadId?: string; focus?: boolean },
+  options?: { useCodingAgent?: boolean; context?: ChatContext | null; threadId?: string; focus?: boolean },
 ): Promise<void> {
   threadsLoaded.value = true;
   const eventId = crypto.randomUUID();
@@ -173,7 +216,7 @@ export async function sendMessage(
     map.set(threadId, makeOptimisticThreadState({
       id: threadId,
       title: message.slice(0, 40),
-      channel: options?.useClaudeCode ? 'claude_code' : 'chat',
+      channel: options?.useCodingAgent ? 'claude_code' : 'chat',
       initiator: 'user',
       eventsLoaded: true,
     }));
@@ -203,9 +246,9 @@ export async function sendMessage(
   // insert below creates a state='active' row for raw new sends.
   const isCcThread = threadBeforeSend
     ? threadBeforeSend.meta.channel === 'claude_code'
-    : !!options?.useClaudeCode;
+    : !!options?.useCodingAgent;
   if (isCcThread) {
-    body.use_claude_code = true;
+    body.use_coding_agent = true;
     // Backend selection. Compose-promoted threads carry the binding on meta
     // (set in sendCompose); loaded follow-ups carry the server's stored value
     // (thread summary `coding_agent`); raw-new sends read the picker signal
@@ -262,7 +305,7 @@ export async function sendMessage(
 
   // CC ignores url_context; only send for non-CC threads. Content extraction is
   // tauri-only (browser can't read cross-origin iframes); fall back to URL+title.
-  if (panelUrl.value && !body.use_claude_code) {
+  if (panelUrl.value && !body.use_coding_agent) {
     let extractedTitle: string | undefined;
     let extractedContent = '';
     if (isTauri()) {

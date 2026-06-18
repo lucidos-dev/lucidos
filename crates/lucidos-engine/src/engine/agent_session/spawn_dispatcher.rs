@@ -75,8 +75,9 @@ pub enum SpawnRequest {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) enum SpawnTrigger {
-    /// A user message arrived on a CC-channel thread. Equivalent of today's
-    /// HTTP chat handler entering the `use_claude_code == Some(true)` branch.
+    /// A user message arrived on a coding-agent-channel thread. Equivalent of
+    /// today's HTTP chat handler entering the `use_coding_agent == Some(true)`
+    /// branch.
     /// Currently observed in shadow mode — the chat handler still spawns CC.
     UserMessage {
         thread_id: Uuid,

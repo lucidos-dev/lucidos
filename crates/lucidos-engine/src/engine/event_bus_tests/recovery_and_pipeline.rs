@@ -93,6 +93,7 @@ async fn engine_restart_continue_cycle_leaves_parent_blocking_count_at_zero() {
             event: ThreadEvent::ContinuationStarted {
                 branch: "claude-code/test".into(),
                 origin: None,
+                reason: None,
             },
             meta: EventMeta {
                 channel: Some(EventChannel::ClaudeCode),

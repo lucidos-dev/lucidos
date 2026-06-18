@@ -63,6 +63,8 @@ import {
   destinationToOptionValue,
   parseOptionValue,
   destinationCaption,
+  composeDraftContextName,
+  LUCIDOS_SOURCE_REPO_NAME,
   REGISTER_REPO_OPTION_VALUE,
   type ComposeDestination,
 } from './composeDestination';
@@ -133,7 +135,7 @@ describe('applyDestination', () => {
 
     applyDestination(id, { kind: 'coding', scope: { kind: 'app', appId: 'a1' } });
 
-    expect(inputMode.value).toEqual({ type: 'claude_code' });
+    expect(inputMode.value).toEqual({ type: 'coding_agent' });
     expect(selectedScope.value).toEqual({ kind: 'app', appId: 'a1' });
     expect(getDraft(id).mode).toBe('claude_code');
   });
@@ -156,7 +158,7 @@ describe('applyDestination', () => {
   it('no focused thread updates only the global signals', () => {
     applyDestination(null, { kind: 'coding', scope: { kind: 'lucidos' } });
 
-    expect(inputMode.value).toEqual({ type: 'claude_code' });
+    expect(inputMode.value).toEqual({ type: 'coding_agent' });
     expect(selectedScope.value).toEqual({ kind: 'lucidos' });
     expect(getDraft(null).mode).toBe(null);
   });
@@ -188,7 +190,7 @@ describe('applyDestination', () => {
   it('null draft mode is patched even when the global mode already matches', () => {
     // null = the engine hasn't acked a pick yet; the patch locks it in.
     const id = 'dest-null-mode';
-    inputMode.value = { type: 'claude_code' };
+    inputMode.value = { type: 'coding_agent' };
     putThread(id, 'composing');
     setDraft(id, { text: 'x', image_hashes: [], mode: null });
 
@@ -222,5 +224,41 @@ describe('destinationCaption', () => {
     expect(caption).toContain('review the diff from the thread');
     expect(caption).not.toContain('Apply');
     expect(destinationCaption(dest)).toContain('the repository');
+  });
+});
+
+describe('composeDraftContextName', () => {
+  const repos = [
+    { id: 'r1', name: 'my-project' },
+    { id: 'r2', name: 'another-repo' },
+  ];
+
+  it('chat draft has no context chip — same as a started chat thread', () => {
+    expect(composeDraftContextName('lucidos', { kind: 'lucidos' }, repos)).toBeUndefined();
+    expect(composeDraftContextName(null, { kind: 'lucidos' }, repos)).toBeUndefined();
+    // A chat draft ignores any leftover coding scope.
+    expect(composeDraftContextName('lucidos', { kind: 'external', repoId: 'r1' }, repos)).toBeUndefined();
+  });
+
+  it('Lucidos source coding draft chips "Lucidos" (matches the started thread)', () => {
+    expect(composeDraftContextName('claude_code', { kind: 'lucidos' }, repos))
+      .toBe(LUCIDOS_SOURCE_REPO_NAME);
+  });
+
+  it('app coding draft chips the app id (matches appIdFromFolder on started threads)', () => {
+    expect(composeDraftContextName('claude_code', { kind: 'app', appId: 'habit-tracker' }, repos))
+      .toBe('habit-tracker');
+  });
+
+  it('external coding draft resolves the repo id to its name', () => {
+    expect(composeDraftContextName('claude_code', { kind: 'external', repoId: 'r2' }, repos))
+      .toBe('another-repo');
+  });
+
+  it('external coding draft is undefined until the repos list resolves the id', () => {
+    expect(composeDraftContextName('claude_code', { kind: 'external', repoId: 'r1' }, []))
+      .toBeUndefined();
+    expect(composeDraftContextName('claude_code', { kind: 'external', repoId: 'gone' }, repos))
+      .toBeUndefined();
   });
 });

@@ -93,6 +93,9 @@
 .thread-drawer-list {
     flex: 1;
     overflow-y: auto;
+    /* Breathing room above the first section header so it isn't flush against
+       the "Threads" header chrome above the list. */
+    padding-top: 0.75rem;
     padding-bottom: 0.25rem;
     /* No reserved scrollbar gutter. The app's global `::-webkit-scrollbar`
      * (components.css) gives every scroller a 0.5rem *classic* bar that reserves
@@ -266,9 +269,16 @@
     transition: color var(--duration-fast) ease;
 }
 
+/* The expanded-state chevron is sized to match the collapsed-state count badge
+ * (a 1rem box) so toggling a family open/closed swaps the two controls in place
+ * with no jump in size or vertical position: both ride `.family-disclosure`
+ * (bottom-anchored, `align-items: center`), so equal box heights land their tops
+ * the same distance below the title. Was 0.75rem/line-height 1 — visibly smaller
+ * than the badge and sitting a touch lower. Mobile bumps both to a 1.25rem box
+ * (see the ≤768px block). */
 .family-disclosure-glyph {
-    font-size: 0.75rem;
-    line-height: 1;
+    font-size: 1rem;
+    line-height: 1rem;
 }
 
 /* Reserve vertical room below the title / "N exchanges" meta for the bottom-
@@ -283,10 +293,12 @@
  * right column does the row get taller, pushing the badge clear of the title.
  *
  * Reserve = the badge's top edge above the row padding-box bottom, less the
- * row's own padding-bottom. Mobile: bottom 0.625rem + badge height 1.25rem −
- * padding-bottom 0.5rem = 1.375rem, rounded up to 1.5rem for clearance. */
+ * row's own padding-bottom. Mobile clearance floor: bottom 0.625rem + badge
+ * height 1.25rem − padding-bottom 0.5rem = 1.375rem; we use 1.875rem so the
+ * title clears the control with a visible gap (≈0.625rem) instead of sitting
+ * right on top of it (the old 1.5rem left only ~0.25rem). */
 .thread-row.thread-row-has-family .thread-row-left {
-    padding-bottom: 1.5rem;
+    padding-bottom: 1.875rem;
 }
 
 @media (hover: hover) {
@@ -297,7 +309,11 @@
 
 /* Collapsed-only count badge — shared by collapsed section headers (number of
  * threads in the section) and collapsed family parents (number of hidden
- * sub-threads). Neutral pill so it reads as a quiet count, not a CTA. */
+ * sub-threads). Subtle accent-blue fill so the count reads as a pill, not a
+ * bare number. On a focused parent row the row bg is --bg-selected (#1c3c64
+ * dark), nearly identical to --bg-tertiary — so a neutral gray badge lost its
+ * fill there; the blue tint stays distinct against both the normal and the
+ * focused row bg. */
 .collapse-count-badge {
     font-size: 0.625rem;
     font-weight: 600;
@@ -307,26 +323,14 @@
     text-align: center;
     border-radius: 0.625rem;
     color: var(--text-secondary);
-    background: var(--bg-tertiary);
-    font-variant-numeric: tabular-nums;
-}
-
-/* The collapsed sub-thread count badge (inside .family-disclosure) takes a
- * subtle accent-blue fill instead of the neutral --bg-tertiary above. On a
- * focused parent row the row bg is --bg-selected (#1e2430 dark), nearly
- * identical to --bg-tertiary — so the gray badge lost its fill and read as a
- * bare number on the selected row. The blue tint stays distinct against both
- * the normal and the focused row bg. Section-header count badges (also
- * .collapse-count-badge) keep the neutral fill — this is scoped to the family
- * disclosure only. */
-.family-disclosure .collapse-count-badge {
     background: color-mix(in srgb, var(--accent) 15%, transparent);
+    font-variant-numeric: tabular-nums;
 }
 
 /* Dark mode: lift the accent share so the fill reads a touch bluer against the
  * darker row backgrounds (the 15% tint above looks washed out on dark). Light
  * mode keeps the base 15% — it stays distinct there already. */
-html[data-theme="dark"] .family-disclosure .collapse-count-badge {
+html[data-theme="dark"] .collapse-count-badge {
     background: color-mix(in srgb, var(--accent) 24%, transparent);
 }
 
@@ -340,10 +344,12 @@ html[data-theme="dark"] .family-disclosure .collapse-count-badge {
     background: var(--bg-selected);
 }
 
+/* Keyboard highlight (arrow-key nav) reads exactly like a mouse hover — the
+ * `--bg-secondary` fill, no accent outline. (`--bg-secondary` not `--bg-hover`
+ * for the same reason the hover rule above uses it: `--bg-hover` is dark enough
+ * to merge with the row's hairline divider into one thick band.) */
 .thread-row.thread-row-highlighted {
-    background: var(--bg-hover);
-    outline: 1px solid var(--accent);
-    outline-offset: -1px;
+    background: var(--bg-secondary);
 }
 
 .thread-row.thread-row-highlighted.thread-row-focused {
@@ -494,21 +500,25 @@ html[data-theme="dark"] .family-disclosure .collapse-count-badge {
         gap: 0.125rem;
     }
 
+    /* Match the row's top padding (0.5rem, from base `.list-row`) so the title
+     * has symmetric breathing room above and below — the old 0.125rem crowded
+     * the title against the row's bottom divider. */
     .thread-row {
-        padding-bottom: 0.125rem;
+        padding-bottom: 0.5rem;
     }
 
-    /* Track the copy icon's line: row padding-bottom 0.125rem +
-     * (1.25rem icon − 1rem badge)/2 = 0.25rem. */
+    /* Track the copy icon's line: row padding-bottom 0.5rem +
+     * (1.25rem icon − 1rem badge)/2 = 0.625rem. */
     .family-disclosure {
-        bottom: 0.25rem;
+        bottom: 0.625rem;
     }
 
-    /* Desktop badge is smaller and the row padding-bottom tighter, so the
-     * title-column reserve shrinks to match: bottom 0.25rem + badge height
-     * 1rem − padding-bottom 0.125rem = 1.125rem, rounded up to 1.25rem. */
+    /* Desktop badge/chevron are a 1rem box (vs mobile's 1.25rem). Clearance
+     * floor: badge bottom 0.625rem + height 1rem − row padding-bottom 0.5rem =
+     * 1.125rem; we use 1.625rem so the title clears the control with a visible
+     * gap (≈0.625rem) instead of crowding it (the old 1.25rem left only ~0.25rem). */
     .thread-row.thread-row-has-family .thread-row-left {
-        padding-bottom: 1.25rem;
+        padding-bottom: 1.625rem;
     }
 
     /* Centers the dot on the title's first line. 1.125rem read a hair high
@@ -532,11 +542,15 @@ html[data-theme="dark"] .family-disclosure .collapse-count-badge {
 
     /* Bigger sub-thread disclosure on touch — both the ▴ chevron (expanded) and
      * the collapsed count badge are fiddly tap targets / hard to read at the base
-     * size; bump both so the affordance is easy to hit. The control is bottom-
-     * anchored, so it grows upward; the base `bottom` is tuned (0.625rem) to keep
-     * the now-taller 1.25rem chevron/badge centered on the copy-icon line. */
+     * size; bump both to a 1.25rem box so the affordance is easy to hit AND the
+     * chevron stays the same size/position as the badge across the toggle (the
+     * line-height pins the glyph box to the badge's 1.25rem height — without it
+     * the base 1rem line-height would leave the chevron a hair short). The control
+     * is bottom-anchored, so it grows upward; the base `bottom` is tuned (0.625rem)
+     * to keep the 1.25rem chevron/badge centered on the copy-icon line. */
     .family-disclosure-glyph {
         font-size: 1.25rem;
+        line-height: 1.25rem;
     }
 
     /* Scoped to .family-disclosure so collapsed section-header count badges keep
@@ -575,7 +589,7 @@ html[data-theme="dark"] .family-disclosure .collapse-count-badge {
     min-width: 0;
 }
 
-.threads-header.search-active > *:not(.thread-search-bar):not(.thread-toggle) {
+.threads-header.search-active > *:not(.thread-search-bar) {
     display: none !important;
 }
 
@@ -644,14 +658,22 @@ html[data-theme="dark"] .family-disclosure .collapse-count-badge {
     padding: 0;
 }
 
+.drawer-section-collapsed::after {
+    content: '';
+    display: block;
+    margin: 0.5rem 1rem 0;
+    border-bottom: 1px solid var(--border-color);
+    pointer-events: none;
+}
+
 /* Room between sections — the gap after a section's last thread, before the
    next section's header. Adjacent-sibling so it never lands above the FIRST
-   section: the top header stays tight to the search/filter bar above it, while
-   every later header gets breathing room from the section that precedes it.
-   (Empty sections render `null`, so the first rendered `.drawer-section` is
-   genuinely the topmost one.) Restores the inter-section separation that shrank
-   when the header's top padding was trimmed, without re-bloating the top
-   header. */
+   section: the first section's breathing room comes from the list's own
+   `padding-top` above, not from this margin, while every later header gets its
+   gap from the section that precedes it. (Empty sections render `null`, so the
+   first rendered `.drawer-section` is genuinely the topmost one.) Restores the
+   inter-section separation that shrank when the header's top padding was
+   trimmed, without re-bloating the top header. */
 .drawer-section + .drawer-section {
     margin-top: 0.75rem;
 }
@@ -685,6 +707,11 @@ html[data-theme="dark"] .family-disclosure .collapse-count-badge {
     display: flex;
     align-items: center;
     gap: 0.25rem;
+}
+
+.list-section-title-collapsible > .collapse-count-badge {
+    position: relative;
+    top: -0.0625rem;
 }
 
 @media (hover: hover) {

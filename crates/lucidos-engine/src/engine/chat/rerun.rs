@@ -174,6 +174,9 @@ impl LucidosEngine {
                 event: ThreadEvent::ContinuationStarted {
                     branch: String::new(),
                     origin: None,
+                    // Chat rerun carries its own engine note, not a CC
+                    // continuation reason.
+                    reason: None,
                 },
                 meta: EventMeta {
                     channel: Some(resume_channel),

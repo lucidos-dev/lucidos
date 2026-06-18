@@ -1,7 +1,12 @@
 import { effect } from '@preact/signals';
 import { engineRestarting } from '../../store/store';
+import { BASE_PATH } from '../../utils/basePath';
 
-export const API_BASE = '';
+// Base-path aware (ADR 0014): behind the workspace gateway the bundle is served
+// under `/<slug>/`, so every API URL must carry that prefix. `BASE_PATH` is
+// `/<slug>` behind the gateway (read from the stamped `<base href>`) and `''`
+// at a legacy root.
+export const API_BASE = BASE_PATH;
 // Single source of truth for the HTTP API prefix. Every fetch in this file
 // builds onto `${API}/…` so the version is stamped exactly once.
 // See CLAUDE.md "API URL Conventions".

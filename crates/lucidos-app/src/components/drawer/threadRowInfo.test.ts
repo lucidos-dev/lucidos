@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { threadContextName, threadRowTooltip } from './threadRowInfo';
+import { threadContextName, threadRowTooltip, type TooltipRow } from './threadRowInfo';
 import type { ThreadMeta } from '../../store/thread-events';
 
 describe('threadContextName', () => {
@@ -31,25 +31,31 @@ describe('threadRowTooltip', () => {
     codingAgentProposed: false,
   } as unknown as ThreadMeta;
 
-  it('includes You / Agent / Context / Status / exchanges / Started lines', () => {
-    const tip = threadRowTooltip(base, 'idle');
-    const lines = tip.split('\n');
-    expect(lines[0]).toMatch(/^You · .+ago$/);
-    expect(lines[1]).toMatch(/^Agent · .+ago$/);
-    expect(tip).toContain('Repository · lucidos');
-    expect(tip).toContain('Status · Idle');
-    expect(tip).toContain('3 exchanges');
-    expect(tip).toMatch(/Started · /);
+  const byLabel = (rows: TooltipRow[], label: string) =>
+    rows.find((r) => r.label === label);
+
+  it('emits Status / You / Agent / Context / Exchanges / Started rows', () => {
+    const rows = threadRowTooltip(base, 'idle');
+    expect(rows.map((r) => r.label)).toEqual(['Status', 'You', 'Agent', 'Repository', 'Exchanges', 'Started']);
+    expect(byLabel(rows, 'You')?.value).toMatch(/ago$/);
+    expect(byLabel(rows, 'Agent')?.value).toMatch(/ago$/);
+    expect(byLabel(rows, 'Repository')?.value).toBe('lucidos');
+    expect(byLabel(rows, 'Status')?.value).toBe('Idle');
+    expect(byLabel(rows, 'Status')?.tone).toBe('idle');
+    expect(byLabel(rows, 'Exchanges')?.value).toBe('3');
+    expect(byLabel(rows, 'Started')?.value).toMatch(/ago$/);
   });
 
-  it('reads "Changes ready" when a change is proposed and not running', () => {
-    const tip = threadRowTooltip({ ...base, codingAgentProposed: true } as ThreadMeta, 'idle');
-    expect(tip).toContain('Status · Changes ready');
+  it('reads "Changes ready" (changes tone) when a change is proposed and not running', () => {
+    const rows = threadRowTooltip({ ...base, codingAgentProposed: true } as ThreadMeta, 'idle');
+    expect(byLabel(rows, 'Status')?.value).toBe('Changes ready');
+    expect(byLabel(rows, 'Status')?.tone).toBe('changes');
   });
 
-  it('singularizes a one-message thread', () => {
-    const tip = threadRowTooltip({ ...base, messageCount: 1 } as ThreadMeta, 'running');
-    expect(tip).toContain('1 exchange\n');
-    expect(tip).toContain('Status · Running');
+  it('marks a running thread with the running tone', () => {
+    const rows = threadRowTooltip({ ...base, messageCount: 1 } as ThreadMeta, 'running');
+    expect(byLabel(rows, 'Exchanges')?.value).toBe('1');
+    expect(byLabel(rows, 'Status')?.value).toBe('Running');
+    expect(byLabel(rows, 'Status')?.tone).toBe('running');
   });
 });

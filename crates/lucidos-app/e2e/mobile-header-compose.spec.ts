@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { assertHealthy, navigateToApp, waitForVisibleInput, blurActiveElement, getHeaderTop, disableMobileHeaderSticky } from './helpers';
 
 test.describe('Mobile header in compose view', () => {

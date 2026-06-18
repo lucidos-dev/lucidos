@@ -43,10 +43,17 @@ async fn health_has_expected_fields() {
         "engine_version",
         "release",
         "release_dirty",
+        // packaged-mode signal — drives the frontend's Restart routing.
+        "packaged",
     ] {
         assert!(
             body.get(field).is_some() && !body[field].is_null(),
             "Missing field: {field}"
         );
     }
+    // The e2e engine is built from the source checkout (it serves the built
+    // `dist/` via LUCIDOS_STATIC_DIR, but that is no longer the packaged signal —
+    // ADR 0014 makes dev engines set it too). `is_packaged()` keys off the
+    // presence of a source checkout, so a source-built engine is `false`.
+    assert_eq!(body["packaged"], false, "e2e engine is not a packaged build");
 }

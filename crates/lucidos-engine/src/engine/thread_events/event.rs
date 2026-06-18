@@ -102,7 +102,7 @@ pub enum ThreadEvent {
         mode: ActorMode,
         /// Model the engine will use to answer this message. Stamped at request
         /// time so the route tooltip can display it before ResponseGenerated
-        /// fires. Claude Code sessions still rely on CodingAgentSettingsChanged.
+        /// fires. Coding-agent sessions still rely on CodingAgentSettingsChanged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
         /// Reasoning effort the engine will use to answer this message.
@@ -114,6 +114,13 @@ pub enum ThreadEvent {
         /// legacy `device_id` / `parent_thread_id` fields when this is None.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<MessageOrigin>,
+    },
+    /// User removed a queued chat follow-up before the agentic loop ingested it.
+    /// The original `MessageReceived` stays in the append-only log; renderers
+    /// hide it while it is still stepless, and the agentic loop skips the
+    /// matching injected prompt when it drains the queue.
+    QueuedMessageRemoved {
+        removed_message_id: uuid::Uuid,
     },
     TextStreamed {
         text: String,
@@ -275,6 +282,17 @@ pub enum ThreadEvent {
         /// "Engine · Auto-resumed after restart" for recovered sessions.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<MessageOrigin>,
+        /// Why the continuation opened — forwarded from the originating
+        /// `ContinuationRequested.reason`. The frontend reads it to label the
+        /// resume honestly: `user_clicked_continue` is genuinely a resume
+        /// after an engine restart, but `auto_recovery_after_hang` fires for a
+        /// hung subprocess OR a stray signal-kill (e.g. a cross-workspace
+        /// `cargo check` broad-kill) where NO engine restart happened —
+        /// labeling those "Resumed after engine restart" misattributes a local
+        /// interruption to a restart. `None` for legacy rows and the chat
+        /// rerun path (which carries its own engine note instead).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     SessionStarted {
         session_id: String,
@@ -880,7 +898,7 @@ pub enum ThreadEvent {
         branch_deleted: bool,
     },
 
-    /// A child thread spawned by `run_thread` / `run_claude` finished its turn.
+    /// A child thread spawned by `run_thread` / `run_coding_agent` finished its turn.
     /// Emitted on the **parent** thread by the EventBus fan-out fan-in path
     /// when the child reaches a terminal event (CC: `CodingAgentIdled` or
     /// `SessionEnded`; chat: `ResponseGenerated` / `ResponseFailed`).
@@ -1017,6 +1035,9 @@ pub enum ThreadEvent {
         title: String,
         #[serde(default = "default_coding_agent_claude_code", alias = "agent")]
         coding_agent: CodingAgent,
+    },
+    CodingAgentDiffChanged {
+        has_diff: bool,
     },
     ChildrenCountChanged {
         active: i64,

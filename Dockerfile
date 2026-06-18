@@ -16,8 +16,8 @@ FROM debian:bookworm-slim
 # Install PostgreSQL, pgvector, and other dependencies
 RUN apt-get update && apt-get install -y \
     # PostgreSQL
-    postgresql-17 \
-    postgresql-17-pgvector \
+    postgresql-18 \
+    postgresql-18-pgvector \
     # Python
     python3 \
     python3-pip \

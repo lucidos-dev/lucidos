@@ -1,4 +1,4 @@
-import { useState } from 'preact/hooks';
+import { useState, useRef } from 'preact/hooks';
 import type { TriggerGroup } from '../../store/types';
 import { collapsedTriggerGroupIds, toggleTriggerGroupCollapsed } from '../../store/store';
 import { deleteTriggerGroup, renameTriggerGroup } from '../../store/actions/triggerGroups';
@@ -18,11 +18,17 @@ export function TriggerGroupHeader({ group }: Props) {
   const collapsed = collapsedTriggerGroupIds.value.has(group.id);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(group.name);
+  // Enter and blur BOTH call commit; committing unmounts the input, whose
+  // trailing blur would rename a second time. Guard with a submit-once flag,
+  // reset when editing reopens.
+  const renamingRef = useRef(false);
 
   async function commit() {
+    if (renamingRef.current) return;
     const trimmed = draft.trim();
     if (!trimmed) { setEditing(false); setDraft(group.name); return; }
     if (trimmed === group.name) { setEditing(false); return; }
+    renamingRef.current = true;
     const ok = await renameTriggerGroup(group.id, trimmed);
     if (!ok) setDraft(group.name);
     setEditing(false);
@@ -61,7 +67,7 @@ export function TriggerGroupHeader({ group }: Props) {
         <button
           class="action-btn"
           type="button"
-          onClick={e => { e.stopPropagation(); setDraft(group.name); setEditing(true); }}
+          onClick={e => { e.stopPropagation(); renamingRef.current = false; setDraft(group.name); setEditing(true); }}
           data-tooltip="Rename group"
         >
           Rename

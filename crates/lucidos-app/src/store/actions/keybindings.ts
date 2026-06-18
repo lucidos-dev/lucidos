@@ -25,6 +25,17 @@ import {
  *  devices via PreferencesChanged like any other preference. */
 export const KEYBINDINGS_PREF_KEY = 'keybindings';
 
+/** Shortcut ids that were renamed after users may have persisted overrides under
+ *  the old key. `overrides()` falls back to the legacy key so a rename never
+ *  silently drops a user's custom binding; the next `setBinding` rewrites the map
+ *  with the current id (legacy keys aren't re-emitted), so the old key fades out
+ *  naturally. `previousThread`/`nextThread` became `historyBack`/`historyForward`
+ *  when the shortcut went from thread-only to focused-pane-aware. */
+const LEGACY_SHORTCUT_IDS: Partial<Record<ShortcutId, string>> = {
+  historyBack: 'previousThread',
+  historyForward: 'nextThread',
+};
+
 type EventLike = Pick<KeyboardEvent, 'metaKey' | 'ctrlKey' | 'shiftKey' | 'altKey' | 'key'>;
 
 /** Parse the persisted override map from the preferences signal. Tolerant of a
@@ -44,7 +55,12 @@ function overrides(): Partial<Record<ShortcutId, Binding>> {
   const map = parsed as Record<string, unknown>;
   const out: Partial<Record<ShortcutId, Binding>> = {};
   for (const def of SHORTCUT_DEFS) {
-    const v = map[def.id];
+    const legacyKey = LEGACY_SHORTCUT_IDS[def.id];
+    // Prefer the current id; fall back to the pre-rename key so a renamed
+    // shortcut keeps the user's custom binding.
+    const v = typeof map[def.id] === 'string'
+      ? map[def.id]
+      : (legacyKey ? map[legacyKey] : undefined);
     if (typeof v === 'string') {
       const b = parseBinding(v);
       if (b) out[def.id] = b;

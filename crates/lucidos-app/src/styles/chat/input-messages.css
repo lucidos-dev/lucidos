@@ -349,14 +349,11 @@
     max-height: 20rem;
 }
 
-/* The Lucidos Agent control button renders the agent glyph (an emoji) rather
-   than an SVG, tinted to the agent's identity color like the CC button is. */
-.lucidos-commands-btn {
-    color: var(--initiator-agent);
-}
-
+/* The Lucidos Agent control button renders the agent glyph as the Lucidos mark
+   (an inline SVG with its own brand gradient — no `color` tint applies). */
 .lucidos-agent-glyph {
-    font-size: var(--icon-size-md);
+    display: inline-flex;
+    align-items: center;
     line-height: 1;
 }
 
@@ -780,6 +777,57 @@
     font-size: 0.8rem;
 }
 
+.queued-message-remove {
+    width: 1.25rem;
+    height: 1.25rem;
+    padding: 0.125rem;
+    color: var(--text-muted);
+    justify-content: center;
+}
+
+.queued-message-remove svg {
+    width: 0.85rem;
+    height: 0.85rem;
+}
+
+@media (hover: hover) {
+    .queued-message-remove:hover {
+        color: var(--accent-red);
+        background: color-mix(in srgb, var(--accent-red) 12%, transparent);
+    }
+}
+
+.queued-message-group {
+    padding: 0.2rem 0 0;
+}
+
+.queued-message-group-summary {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.375rem;
+    min-height: 1.75rem;
+    padding: 0.25rem var(--turn-body-inset);
+    color: var(--text-muted);
+    cursor: pointer;
+    user-select: none;
+    font-size: 0.75rem;
+}
+
+.queued-message-group-summary::-webkit-details-marker {
+    display: none;
+}
+
+.queued-message-group-label {
+    font-weight: 600;
+}
+
+@media (hover: hover) {
+    .queued-message-group-summary:hover {
+        color: var(--text-secondary);
+    }
+}
+
 .exchange-status-awaiting {
     color: var(--text-secondary);
     font-size: 0.8rem;
@@ -881,6 +929,7 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     display: flex;
     align-items: center;
     gap: 0.5rem;
+    padding-left: var(--turn-body-inset);
     margin-bottom: 0.7rem;
     min-height: 1.2rem;
     font-size: 0.75rem;
@@ -1075,4 +1124,3 @@ button.initiator-actor,
 .initiator-files li {
     margin: 0.125rem 0;
 }
-

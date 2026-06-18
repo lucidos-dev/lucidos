@@ -1,8 +1,10 @@
-import { showToast, dismissToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, updateAvailable, restartGroups, applyingChangeIds, applyAllInProgress, toasts, engineRestarting, engineVersion, latestEngineVersion } from '../store';
+import { showToast, dismissToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, updateAvailable, restartGroups, applyingChangeIds, applyAllInProgress, toasts, engineRestarting, engineVersion, latestEngineVersion, enginePackaged } from '../store';
 import { toFailed } from '../types';
 import type { Loadable } from '../types';
 import type { RestartGroup } from '../store';
 import { applyChange as apiApply, discardChange as apiDiscard, applyAllChanges as apiApplyAll, cancelApplyAllChanges as apiCancelApplyAll, discardAllChanges as apiDiscardAll, revertChange as apiRevert, fetchChanges as apiFetchChanges, getChangeById as apiGetChangeById, restartEngine, ApiError } from '../../api/client';
+import { isTauri } from '../../utils/platform';
+import { invoke } from '../../utils/tauri';
 import { isNewerVersion } from '../../utils/version';
 import { refreshClient } from '../../hooks/sw-update';
 import { errorDetail } from '../../utils/errorDetail';
@@ -103,7 +105,18 @@ function persistRestartGroups(): void {
  *  long sessions. */
 const RESTART_TOAST_MESSAGE = 'Engine restart required to apply changes.';
 
-/** Set restarting state, show info toast, and call the restart API. */
+/** Set restarting state, show info toast, and trigger the engine restart.
+ *
+ *  Routing by mode (the `packaged` signal comes from /health):
+ *   - packaged + Tauri  → `restart_service` Tauri command runs
+ *     `launchctl kickstart -k`. Most reliable here — the GUI process can drive
+ *     launchd even if the engine is wedged/unreachable.
+ *   - packaged + browser/PWA (no Tauri) → POST /restart; the engine kickstarts
+ *     its own LaunchAgent (the dev rebuild script isn't in the bundle).
+ *   - dev (Tauri or web) → POST /restart spawns `web-dev.sh --engine-only`.
+ *
+ *  In every case the engine goes away and `checkConnection()` clears
+ *  `engineRestarting` on reconnect (started_at change). */
 export async function initiateEngineRestart(): Promise<void> {
   engineRestarting.value = true;
   // dismissable: false — see ToastItem.dismissable.
@@ -112,6 +125,13 @@ export async function initiateEngineRestart(): Promise<void> {
   // status banner.
   showToast('Restarting engine...', 'info', { key: RESTART_TOAST_KEY, spinning: true, dismissable: false, showDuringRestart: true });
   try {
+    if (enginePackaged.value && isTauri()) {
+      // Drive launchd directly from the desktop shell — works even if the
+      // engine is unresponsive. invoke rejects with a string error.
+      await invoke('restart_service');
+      // Service is being killed + respawned; reconnect detection takes over.
+      return;
+    }
     await restartEngine();
   } catch (e) {
     if (e instanceof ApiError) {
@@ -121,7 +141,14 @@ export async function initiateEngineRestart(): Promise<void> {
       showToast(`Restart failed: ${e.reason}`, 'error', { key: RESTART_TOAST_KEY });
       return;
     }
-    // Network rejection after a 2xx: web-dev.sh is killing the engine.
+    if (typeof e === 'string') {
+      // restart_service (Tauri) rejects with a plain string. The service is
+      // still alive — revert the indicator and surface the reason.
+      engineRestarting.value = false;
+      showToast(`Restart failed: ${e}`, 'error', { key: RESTART_TOAST_KEY });
+      return;
+    }
+    // Network rejection after a 2xx: the engine is being killed.
     // Leave engineRestarting set; checkConnection() clears it on reconnect.
   }
 }

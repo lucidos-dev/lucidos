@@ -310,7 +310,10 @@ async fn tier_0_removes_clean_worktree_with_no_commits_after_grace() {
     insert_old_event(&pool, thread_id, TIER_0_AGE_SECS).await;
 
     let rx = bus.subscribe();
-    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    // Reclaim is disk-gated now (a non-archived worktree is kept while disk is
+    // comfortable) — drive Tier 0 via soft pressure.
+    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.free_soft_bytes = u64::MAX;
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
@@ -339,7 +342,10 @@ async fn tier_0_skips_branch_with_commits_ahead_of_main() {
     insert_old_event(&pool, thread_id, TIER_0_AGE_SECS).await;
 
     let rx = bus.subscribe();
-    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    // Under soft pressure so the commits-ahead skip — not ample disk — is the
+    // operative reason Tier 0 doesn't fire.
+    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.free_soft_bytes = u64::MAX;
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
@@ -369,7 +375,10 @@ async fn tier_0_respects_one_hour_grace_window() {
     insert_old_event(&pool, thread_id, 30 * 60).await;
 
     let rx = bus.subscribe();
-    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    // Under soft pressure so the 1 h grace — not ample disk — is the operative
+    // reason Tier 0 doesn't fire yet.
+    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.free_soft_bytes = u64::MAX;
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
@@ -399,8 +408,10 @@ async fn tier_0_fires_within_grace_under_disk_pressure() {
     insert_old_event(&pool, thread_id, 30).await;
 
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    // Force disk pressure: pretend the volume is entirely below the hard
-    // threshold so `under_hard` is true.
+    // Force real disk pressure: the volume sits below BOTH thresholds (in
+    // production hard < soft, so under_hard implies under_soft). Soft opens the
+    // reclaim gate; hard drops the Tier 0 grace to zero so it fires immediately.
+    worker.free_soft_bytes = u64::MAX;
     worker.free_hard_bytes = u64::MAX;
 
     let rx = bus.subscribe();
@@ -451,7 +462,10 @@ async fn tier_0_skips_thread_with_pending_change() {
     .expect("insert pending change");
 
     let rx = bus.subscribe();
-    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    // Under soft pressure so the pending-change skip — not ample disk — is the
+    // operative reason Tier 0 doesn't fire.
+    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.free_soft_bytes = u64::MAX;
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
@@ -492,12 +506,16 @@ async fn tier_0_skips_thread_with_live_agent_session() {
     insert_old_event(&pool, thread_id, TIER_0_AGE_SECS).await;
 
     let rx = bus.subscribe();
-    let worker = make_worker_with_active(
+    // Under soft pressure so the live-session skip — not ample disk — is the
+    // operative reason no cleanup runs (active threads are exempt even when the
+    // disk is tight enough that reclaim would otherwise be eligible).
+    let mut worker = make_worker_with_active(
         pool.clone(),
         bus.clone(),
         root.clone(),
         active_threads(&[thread_id]),
     );
+    worker.free_soft_bytes = u64::MAX;
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;

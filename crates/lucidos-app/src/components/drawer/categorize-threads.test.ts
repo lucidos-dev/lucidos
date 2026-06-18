@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { categorizeThreads, computeFamilyKeys } from './ThreadDrawer';
+import { categorizeThreads, computeFamilyKeys, THREAD_DRAWER_SECTION_ORDER } from './ThreadDrawer';
 import type { ThreadState, ThreadMeta, ThreadStatus } from '../../store/thread-events';
 import type { ArchiveState } from '../../generated/thread-lifecycle';
 
@@ -60,16 +60,12 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
 
 // Convenience builders. A running thread and a CTA (codingAgentProposed) thread
 // both land in Current — the former is the system's turn, the latter the
-// user's — distinguished at the row level (status icon / attention sort), not
-// by a separate section.
+// user's — distinguished at the row level (status icon / attention filter), not
+// by a separate section. Current itself sorts purely by creation time.
 const running = (id: string, opts: ThreadOpts = {}) =>
     makeThread(id, { ...opts, status: 'running' });
 const withCta = (id: string, opts: ThreadOpts = {}) =>
     makeThread(id, { ...opts, codingAgentProposed: true, section: 'inbox' });
-// Awaiting a user answer / permission request — reviewTier 0, the top of the
-// attention group (more critical than a pending change, which blocks nobody).
-const waiting = (id: string, opts: ThreadOpts = {}) =>
-    makeThread(id, { ...opts, status: 'waiting_for_user_answer', section: 'inbox' });
 const inSaved = (id: string, opts: ThreadOpts = {}) =>
     makeThread(id, { ...opts, saved: true });
 const inArchive = (id: string, opts: ThreadOpts = {}) =>
@@ -169,6 +165,12 @@ describe('categorizeThreads — family-aware section routing', () => {
     });
 });
 
+describe('ThreadDrawer section order', () => {
+    it('renders Saved before Current and Archive', () => {
+        expect(THREAD_DRAWER_SECTION_ORDER).toEqual(['saved', 'current', 'archive']);
+    });
+});
+
 describe('computeFamilyKeys — family-aware effective sort keys', () => {
     it('parent inherits the freshest descendant updatedAt for recency sort', () => {
         const parent = makeThread('parent', { updatedAt: '2026-04-01T00:00:00Z' });
@@ -180,46 +182,6 @@ describe('computeFamilyKeys — family-aware effective sort keys', () => {
         expect(keys.get('parent')?.recentKey).toBe('2026-05-15T00:00:00Z');
         // Every family member maps to the same family-derived record.
         expect(keys.get('child')?.recentKey).toBe('2026-05-15T00:00:00Z');
-    });
-
-    it('parent inherits the highest-priority review tier from any descendant', () => {
-        // Parent running (no CTA, tier 2), child has codingAgentProposed (tier 1).
-        const parent = running('parent');
-        const child = withCta('child', { parentId: 'parent' });
-        const keys = computeFamilyKeys([parent, child]);
-        expect(keys.get('parent')?.reviewTier).toBe(1);
-        expect(keys.get('child')?.reviewTier).toBe(1);
-    });
-
-    it('floats a waiting-for-answer family above a proposed-change family', () => {
-        // A user question / permission request (reviewTier 0) blocks the agent,
-        // so it outranks a family that merely has a change ready to review
-        // (reviewTier 1) — even when the proposal saw more recent activity.
-        const proposed = withCta('proposed', { updatedAt: '2026-05-20T00:00:00Z' });
-        const asking = waiting('asking', { updatedAt: '2026-05-01T00:00:00Z' });
-        const threads = [proposed, asking];
-        const keys = computeFamilyKeys(threads);
-        expect(keys.get('asking')?.reviewTier).toBe(0);
-        expect(keys.get('proposed')?.reviewTier).toBe(1);
-        const sorted = [...threads].sort((a, b) => {
-            const ka = keys.get(a.meta.id)!;
-            const kb = keys.get(b.meta.id)!;
-            if (ka.reviewTier !== kb.reviewTier) return ka.reviewTier - kb.reviewTier;
-            return kb.recentKey.localeCompare(ka.recentKey);
-        });
-        expect(ids(sorted)).toEqual(['asking', 'proposed']);
-    });
-
-    it('inherits tier 0 when a descendant is awaiting an answer, beating a proposed sibling', () => {
-        // Mixed family: a proposed child (tier 1) and a waiting child (tier 0).
-        // The family takes the min → tier 0, so it sorts to the very top.
-        const parent = running('parent');
-        const proposedChild = withCta('proposed-child', { parentId: 'parent' });
-        const askingChild = waiting('asking-child', { parentId: 'parent' });
-        const keys = computeFamilyKeys([parent, proposedChild, askingChild]);
-        expect(keys.get('parent')?.reviewTier).toBe(0);
-        expect(keys.get('proposed-child')?.reviewTier).toBe(0);
-        expect(keys.get('asking-child')?.reviewTier).toBe(0);
     });
 
     it('isolated family with stale parent + fresh child sorts above an unrelated stale family', () => {

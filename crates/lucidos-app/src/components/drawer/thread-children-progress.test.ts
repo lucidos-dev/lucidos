@@ -72,6 +72,7 @@ function familyRenderState(
 ) {
   const hasFamily = opts.collapsible && meta.totalChildrenCount > 0;
   const hasActiveChildren = meta.activeChildrenCount > 0;
+  const a11yCount = `${meta.totalChildrenCount} sub-thread${meta.totalChildrenCount === 1 ? '' : 's'}`;
   return {
     // The toggle button itself renders whenever the family is collapsible.
     hasDisclosure: hasFamily,
@@ -79,7 +80,10 @@ function familyRenderState(
     showChevron: hasFamily && !opts.isCollapsed,
     showCount: hasFamily && opts.isCollapsed,
     countText: hasFamily && opts.isCollapsed ? String(meta.totalChildrenCount) : null,
-    a11yCount: `${meta.totalChildrenCount} sub-thread${meta.totalChildrenCount === 1 ? '' : 's'}`,
+    a11yCount,
+    // The control's own tooltip + aria-label, so hovering the badge/chevron
+    // never falls through to the row's general thread tooltip.
+    disclosureLabel: opts.isCollapsed ? `Show ${a11yCount}` : 'Hide sub-threads',
     visualStatus: resolveVisualStatus(status, hasActiveChildren, meta.codingAgentProposed),
   };
 }
@@ -178,6 +182,19 @@ describe('family disclosure visibility', () => {
 
     expect(familyRenderState(one.meta, 'idle').a11yCount).toBe('1 sub-thread');
     expect(familyRenderState(many.meta, 'idle').a11yCount).toBe('3 sub-threads');
+  });
+
+  it('disclosure label is "Show N sub-threads" collapsed, "Hide sub-threads" expanded', () => {
+    const one = makeThread('t1', { totalChildrenCount: 1, activeChildrenCount: 0 });
+    const many = makeThread('t2', { totalChildrenCount: 3, activeChildrenCount: 0 });
+    const collapsed = { collapsible: true, isCollapsed: true };
+    const expanded = { collapsible: true, isCollapsed: false };
+
+    // Collapsed names the hidden count (smart-plural).
+    expect(familyRenderState(one.meta, 'idle', collapsed).disclosureLabel).toBe('Show 1 sub-thread');
+    expect(familyRenderState(many.meta, 'idle', collapsed).disclosureLabel).toBe('Show 3 sub-threads');
+    // Expanded drops the count — children are listed inline.
+    expect(familyRenderState(many.meta, 'idle', expanded).disclosureLabel).toBe('Hide sub-threads');
   });
 });
 

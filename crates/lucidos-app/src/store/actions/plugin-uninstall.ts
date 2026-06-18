@@ -1,9 +1,15 @@
 import { panelOverlay, showToast, closeInlineForm } from '../store';
-import { ApiError, confirmPluginUninstall, cancelPluginUninstall } from '../../api/client';
+import {
+  ApiError,
+  confirmPluginUninstall,
+  cancelPluginUninstall,
+  stagePluginUninstall,
+} from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
 import { pushNavState } from './navigation';
 import { revealContentPane } from './pane';
-import type { PluginUninstallRequest } from '../types';
+import type { MarketplacePlugin, PluginUninstallRequest } from '../types';
+import { refreshPluginCatalog } from './plugin-marketplaces';
 
 /** Open the plugin uninstall panel for the staged uninstall in `request`.
  *  Mirrors `openPluginInstallRequest` — panel takes over the content pane,
@@ -14,6 +20,18 @@ export function openPluginUninstallRequest(request: PluginUninstallRequest): voi
   panelOverlay.value = { type: 'form', form: { type: 'plugin-uninstall', request } };
   pushNavState();
   revealContentPane();
+}
+
+/** App Store "Uninstall" button. Stages the uninstall from the UI (the same
+ *  confirm panel the `uninstall_plugin` LLM tool produces) and opens it. The
+ *  panel's Confirm deletes the recorded files; nothing is touched until then. */
+export async function uninstallMarketplacePlugin(plugin: MarketplacePlugin): Promise<void> {
+  try {
+    const request = await stagePluginUninstall(plugin.id);
+    openPluginUninstallRequest(request);
+  } catch (e) {
+    showToast(`Failed to stage plugin uninstall: ${errorDetail(e)}`, 'error');
+  }
 }
 
 /** User clicked Confirm — engine deletes the recorded files from `data/`,
@@ -31,6 +49,7 @@ export async function confirmPluginUninstallAction(uninstallId: string, pluginNa
       `${pluginName}: ${result.summary} (${result.files_deleted.length} files removed${missingNote})`,
       'success',
     );
+    void refreshPluginCatalog();
   } catch (e) {
     showToast(`Uninstall failed: ${errorDetail(e)}`, 'error');
   } finally {

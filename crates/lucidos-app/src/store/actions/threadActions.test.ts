@@ -117,6 +117,18 @@ describe('resolveThreadActions', () => {
     expect(kinds(resolveThreadActions('t1'))).toEqual(['discard_draft', 'save']);
   });
 
+  it('composing draft does not offer the save toggle', () => {
+    // A composing draft is excluded from every drawer section (including Saved),
+    // so saving it would set is_saved but leave the row in the compose surface.
+    setThread(makeThreadState('t1', {
+      meta: { state: 'composing', section: 'inbox', status: 'idle', composeText: 'half a thought' },
+    }));
+    const actions = resolveThreadActions('t1');
+    expect(kinds(actions)).toEqual(['discard_draft', 'archive']);
+    expect(kinds(actions)).not.toContain('save');
+    expect(kinds(actions)).not.toContain('unsave');
+  });
+
   it('returns [] for an unknown thread', () => {
     expect(resolveThreadActions('nope')).toEqual([]);
   });

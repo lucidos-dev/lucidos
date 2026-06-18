@@ -10,7 +10,6 @@ mod control;
 mod merge_session;
 mod spawn;
 
-
 /// Look up a repo's cached CC commands by its on-disk path.
 ///
 /// Returns the cached entry for `repo_path`, or empty defaults on miss.
@@ -486,6 +485,8 @@ pub(crate) struct SpawnAgentThreadParams {
     /// workspace git narrowed to `data/apps/<id>/`. `repo_id` MUST be
     /// `None` when this is set — apps are not in the repo registry.
     pub app_id: Option<String>,
+    /// Backend to launch for this coding-agent thread.
+    pub coding_agent: crate::runtime::CodingAgent,
 }
 
 /// Returns true iff `thread_summaries.status` is currently `'running'`.

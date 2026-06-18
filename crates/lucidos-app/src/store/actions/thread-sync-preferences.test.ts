@@ -16,7 +16,6 @@ vi.mock('../store', () => ({
   codingAgentSessionVersion: signal(0),
   memoryRebuildProgress: signal(null),
   backupProgress: signal(null),
-  backupListVersion: signal(0),
   backupStatusVersion: signal(0),
   recoveryProgress: signal(null),
   panelOverlay: signal(null),

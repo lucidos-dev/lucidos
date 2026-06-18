@@ -37,6 +37,17 @@ const NO_PULL_REQUESTS_RULE: &str = "NO PULL REQUESTS: Lucidos is not a PR-based
     Apply, your branch lands on main and is pushed to the remote in one step. Override CC's \
     default \"Creating pull requests\" guidance — it does not apply here.";
 
+/// Commit-cadence guidance shared across coding-agent prompts. The engine
+/// updates the review surface from commits, so agents should checkpoint
+/// coherent finished slices while they work without creating noisy
+/// commit-per-edit history.
+const COMMIT_CADENCE_RULE: &str = "COMMIT CADENCE: Commit completed, coherent slices of work \
+    as you go, not only at the end. Use `git status` and `git diff` to review what will be \
+    included before each commit. Do not commit after every tiny edit; do commit after each \
+    self-contained fix, feature slice, cleanup checkpoint, or other reviewable unit so the \
+    Diff view and recovery state stay current. Avoid committing known-broken work unless you \
+    are explicitly checkpointing an intermediate state and the commit message says so.";
+
 /// Apply/restart rule shared across Lucidos-repo CC system prompts. The
 /// file-type list and the hard ban must stay in sync with
 /// `engine::git_ops::files_require_restart` (the truth) and the
@@ -68,6 +79,29 @@ const HARDENING_RULE: &str = "HARDENING: Once your implementation is complete an
     phases when no relevant layers were touched. The harden marker only exists if you actually \
     invoke `/harden` — without the marker, the user pays the wait when they click Apply.";
 
+/// Implementation-planning rule shared by the two Lucidos-source prompts
+/// (`worktree_system_prompt`, `recovery_system_prompt`). Lives in the shared
+/// base — NOT in a backend section — so it reaches BOTH Claude Code (via
+/// `--append-system-prompt`) and Codex (via `developerInstructions`). It is the
+/// soft, prospective half of enforcement; the hard halves are the Claude-Code
+/// `cc-plan-gate` PreToolUse hook (blocks the first source edit until a marker
+/// exists) and the Apply floor (refuses a marker-less Lucidos-source change).
+/// Codex has no PreToolUse hook, so for Codex this rule + the Apply floor are
+/// the whole enforcement. Keep in sync with the `implementation-plan` skill
+/// (`.claude/skills/implementation-plan/SKILL.md`) and `lucidos planned`.
+const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST code edit, decide \
+    whether this is complex work — ADR- or design-thread-backed, cross-layer, any routing / \
+    topology / storage / security / migration / process change, or anything beyond a local bug \
+    fix. If it is, produce an implementation plan FIRST: run the `implementation-plan` skill \
+    (`.claude/skills/implementation-plan/SKILL.md`) — it turns the prompt, any grill/design \
+    thread, ADRs, and code reconnaissance into `docs/plans/<date>-<slug>.md` and records the \
+    plan marker for you via `lucidos planned mark --plan <path>`. If this is genuinely a local \
+    fix, acknowledge that instead with `lucidos planned mark --simple \"<one-line reason>\"`. \
+    Either way a Planned marker MUST exist before the change can be applied: Claude Code blocks \
+    your first source edit until one is set, and Apply refuses a marker-less change. Writing the \
+    plan file itself under `docs/plans/` is never blocked. Keep the plan's load-bearing \
+    invariants in view while you edit; do not defer their first appearance to `/harden`.";
+
 /// Tell CC that "Task not found" / "task already completed" after a task ends
 /// is expected — the engine evicts the bg-bash registry record on completion,
 /// and CC's own task-list entries also get cleaned up. CC was treating these
@@ -86,8 +120,7 @@ const TASK_LIFECYCLE_RULE: &str = "TASK LIFECYCLE: After a background task ends,
 /// Lucidos UI renders as clickable buttons — instead of listing options in
 /// plaintext that the user has to retype. Applies to chat-style prompts only;
 /// hardening and merge-conflict sessions don't dialogue with the user.
-const ASK_USER_QUESTION_RULE: &str =
-    "ASKING USERS: When you need an answer from the user — a yes/no decision, picking \
+const ASK_USER_QUESTION_RULE: &str = "ASKING USERS: When you need an answer from the user — a yes/no decision, picking \
      between approaches, choosing from a small list — use the `AskUserQuestion` tool. \
      The Lucidos UI renders its options as clickable buttons; options listed only in your \
      message text force the user to type their reply instead of clicking. ALWAYS provide the \
@@ -115,9 +148,13 @@ const ASK_USER_QUESTION_RULE: &str =
      can no longer be safely routed as a free-text answer, and your own parallel work has \
      wasted tokens on an unconfirmed direction. Wait for the answer, THEN continue.";
 
-/// Permission allowlist rule shared across all CC system prompts.
-/// Lucidos passes `--allowedTools` when spawning CC, which overrides settings.json
-/// permission rules — so tool allowlist edits MUST go in `~/.lucidos/cc-allowed-tools`.
+/// Permission allowlist rule — Claude Code ONLY. Lucidos passes
+/// `--allowedTools` when spawning CC, which overrides settings.json permission
+/// rules, so tool allowlist edits MUST go in `~/.lucidos/cc-allowed-tools`.
+/// None of this applies to Codex (it uses its own sandbox + approval-policy
+/// model — approval cards raised by the app-server's `requestApproval`, not
+/// `--allowedTools`), so [`append_backend_rules`] appends this only in the
+/// `ClaudeCode` arm — mirroring how [`CODEX_CLI_RULE`] is Codex-only.
 const PERMISSION_CONFIG_RULE: &str = "\n\n\
     PERMISSION CONFIG: Lucidos passes `--allowedTools` to your Claude Code subprocess. This flag \
     OVERRIDES `~/.claude/settings.json` permission rules — adding a tool to settings.json's \
@@ -170,16 +207,14 @@ const APP_KNOWHOW_RULE: &str = "APP-BUILDING KNOWHOW: This workspace's engine sh
     for file layout and where app data lives read `system-knowhow/best-practices`. Load the \
     relevant knowhow before writing app code rather than guessing.";
 
-/// Codex-only teaching appended to every Codex-bound system prompt by
-/// [`append_backend_rules`]. Two gaps it closes (see ADR 0004 follow-up +
-/// `docs/plans/2026-06-12-codex-workspace-writes-and-user-questions.md`):
-/// CC sessions get the lucidos-cli skill installed into the worktree and the
-/// native `AskUserQuestion` tool; Codex gets neither, so without this section
-/// a Codex session can't land files in the workspace's `data/` tree and
-/// guesses instead of asking. Deliberately condensed — it costs tokens on
-/// every fresh Codex session. The AGENTS.md alternative was rejected
-/// (dirty-diff in external repos + shared-git-dir exclude leakage).
-const CODEX_SESSION_RULES: &str = "\n\n\
+/// Codex-only CLI teaching appended to every Codex-bound system prompt by
+/// [`append_backend_rules`]. CC sessions get the lucidos-cli skill installed
+/// into the worktree; Codex gets neither that skill nor a project AGENTS.md,
+/// so without this section it can't land files in the workspace's `data/`
+/// tree. Deliberately condensed — it costs tokens on every fresh Codex
+/// session. The AGENTS.md alternative was rejected (dirty-diff in external
+/// repos + shared-git-dir exclude leakage).
+const CODEX_CLI_RULE: &str = "\n\n\
     LUCIDOS CLI: The `lucidos` CLI is on your PATH. Your sandbox only permits writes inside \
     this worktree, but the CLI talks HTTP to the parent Lucidos engine (network is enabled), \
     so it works where direct writes are blocked. Use it whenever output belongs in the parent \
@@ -194,8 +229,16 @@ const CODEX_SESSION_RULES: &str = "\n\n\
     - `lucidos changes list` / `lucidos changes apply <id>` — list / apply a pending change. \
     Never hand-roll the HTTP call with curl — the CLI forwards the subprocess-origin headers \
     so the action is attributed to the agent, not the user.\n\
-    - `lucidos spawn-thread --to <workspace> [--cc] --message ... --title ...` — spawn a new \
-    Lucidos thread (always ask the user before spawning).\n\n\
+    - `lucidos spawn-thread --to <workspace> [--cc|--codex|--coding-agent <backend>] --message ... \
+    --title ...` — spawn a new Lucidos thread. Use `--codex` when the user asks for Codex \
+    (always ask the user before spawning).";
+
+/// Codex replacement for [`ASK_USER_QUESTION_RULE`]. Codex sessions do not
+/// have Claude Code's native `AskUserQuestion` tool; their clickable-question
+/// path is the Lucidos MCP server's `ask_user_question` tool. This replaces
+/// the shared Claude-style rule inside [`append_backend_rules`] instead of
+/// appending after it, so Codex never sees conflicting instructions.
+const CODEX_ASK_USER_QUESTION_RULE: &str = "\
     ASKING USERS: When you need the user's decision — a yes/no, picking between approaches, \
     choosing from a short list — call the `ask_user_question` tool (on the `lucidos` MCP \
     server) instead of guessing or asking in plain text. The Lucidos UI renders the options \
@@ -203,27 +246,38 @@ const CODEX_SESSION_RULES: &str = "\n\n\
     mid-turn. Arguments: `question` (required, the full question text), `options` (2-4 short \
     answer labels; omit for free-text), `multi_select` (allow picking several). One question \
     per call. An answer of `(canceled)` means the user dismissed the question — stop and wait \
-    for their next instruction instead of re-asking. Do not guess when the tool can ask.";
+    for their next instruction instead of re-asking. Do not guess when the tool can ask. \
+    NEVER parallel-call `ask_user_question` alongside other tools — if you're asking a \
+    question, stop the assistant message after the `ask_user_question` tool call and do not \
+    include any sibling tool calls.";
 
-/// Append backend-specific rules to a finished system prompt. Claude Code
-/// prompts pass through unchanged (CC gets the lucidos-cli skill file + the
-/// native `AskUserQuestion` tool instead); Codex prompts gain
-/// [`CODEX_SESSION_RULES`]. Called from `resolve_run_worktree_context` with
-/// the backend `run_direct_agent` already resolved — do NOT re-query
-/// `thread_summaries` here.
+/// Append backend-specific rules to a finished system prompt — the single
+/// point where the two coding-agent backends diverge. Claude Code prompts gain
+/// [`PERMISSION_CONFIG_RULE`] (the `--allowedTools` / `~/.lucidos/cc-allowed-tools`
+/// mechanics are CC-only); Codex prompts replace [`ASK_USER_QUESTION_RULE`]
+/// with [`CODEX_ASK_USER_QUESTION_RULE`] and append [`CODEX_CLI_RULE`]. Each
+/// backend gets ONLY its own section: the CC permission-config rule would be
+/// misleading noise on a Codex session, which surfaces permissions through its
+/// sandbox + approval-policy model (approval cards raised by the app-server),
+/// not `--allowedTools`.
+/// Called from `resolve_run_worktree_context` with the backend
+/// `run_direct_agent` already resolved — do NOT re-query `thread_summaries` here.
 pub(super) fn append_backend_rules(
     prompt: String,
     coding_agent: crate::runtime::CodingAgent,
 ) -> String {
     match coding_agent {
-        crate::runtime::CodingAgent::ClaudeCode => prompt,
-        crate::runtime::CodingAgent::Codex => format!("{prompt}{CODEX_SESSION_RULES}"),
+        crate::runtime::CodingAgent::ClaudeCode => format!("{prompt}{PERMISSION_CONFIG_RULE}"),
+        crate::runtime::CodingAgent::Codex => {
+            let prompt = prompt.replace(ASK_USER_QUESTION_RULE, CODEX_ASK_USER_QUESTION_RULE);
+            format!("{prompt}{CODEX_CLI_RULE}")
+        }
     }
 }
 
 /// Build the system prompt for Lucidos-source coding-agent threads.
-/// Used by both user-initiated Claude Code sessions and LLM-invoked
-/// `claude_code` tool calls when editing the Lucidos source tree. Three
+/// Used by both user-initiated coding-agent sessions and LLM-invoked
+/// `run_coding_agent` tool calls when editing the Lucidos source tree. Three
 /// sibling builders exist for the other worktree flavors:
 /// `external_repo_system_prompt`, `app_worktree_system_prompt`.
 pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) -> String {
@@ -244,12 +298,14 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
          (`./scripts/web-dev.sh -w e2e-test -b`), then run tests (`./scripts/e2e.sh` for full \
          API + browser, or `./scripts/e2e-api.sh` / `./scripts/e2e-browser.sh` for one suite). \
          All commands run from your worktree directory.\n\n\
+         {implementation_plan}\n\n\
          {apply_restart}\n\n\
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check for \
          uncommitted changes. If you abandoned an approach and took a different one, the old \
          edits may still be in the working tree. Discard them with `git checkout -- <file>`. \
          Only intentional changes should remain — stale uncommitted edits get carried into the \
          pending change and cause confusion when the user reviews it.\n\n\
+         {commit_cadence}\n\n\
          COMMANDS: Never use /cpa — it is for the main working tree only. \
          Just commit directly with `git add <file>` + `git commit -m \"message\"`. \
          The engine pushes to remote after the user clicks Apply (which is what merges your \
@@ -264,16 +320,17 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
          before finishing.\n\n\
          CRITICAL: Never run `exit` as a bash command. If the user asks you to exit or stop, \
          simply say goodbye and finish your response — the Lucidos engine manages your lifecycle. \
-         Running `exit` in bash can crash the host application.{process_safety}{permission_config}",
+         Running `exit` in bash can crash the host application.{process_safety}",
         preamble = workspace_preamble(workspace_name),
         branch = branch_name,
         no_pull_requests = NO_PULL_REQUESTS_RULE,
+        implementation_plan = IMPLEMENTATION_PLAN_RULE,
         apply_restart = APPLY_RESTART_RULE,
+        commit_cadence = COMMIT_CADENCE_RULE,
         hardening = HARDENING_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
         process_safety = process_safety_rule(true),
-        permission_config = PERMISSION_CONFIG_RULE,
     )
 }
 
@@ -300,15 +357,16 @@ pub(super) fn external_repo_system_prompt(
          out on — run `git branch --show-current` before you finish to confirm.\n\n\
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check for \
          uncommitted changes. Commit or discard anything unintentional.\n\n\
+         {commit_cadence}\n\n\
          {ask_user_question}\n\n\
          {task_lifecycle}\n\n\
          CRITICAL: Never run `exit` as a bash command. If the user asks you to exit or stop, \
          simply say goodbye and finish your response — the Lucidos engine manages your lifecycle. \
-         Running `exit` in bash can crash the host application.{process_safety}{permission_config}",
+         Running `exit` in bash can crash the host application.{process_safety}",
+        commit_cadence = COMMIT_CADENCE_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
         process_safety = process_safety_rule(false),
-        permission_config = PERMISSION_CONFIG_RULE,
     )
 }
 
@@ -326,15 +384,16 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
          5. If the work is incomplete or broken, either finish it or revert the problematic parts\n\n\
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check for \
          uncommitted changes. Commit or discard anything unintentional.\n\n\
+         {commit_cadence}\n\n\
          {ask_user_question}\n\n\
          {task_lifecycle}\n\n\
-         CRITICAL: Never run `exit` as a bash command.{process_safety}{permission_config}",
+         CRITICAL: Never run `exit` as a bash command.{process_safety}",
         branch = branch_name,
         repo = repo_name,
+        commit_cadence = COMMIT_CADENCE_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
         process_safety = process_safety_rule(false),
-        permission_config = PERMISSION_CONFIG_RULE,
     )
 }
 
@@ -353,9 +412,11 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
          2. Run `git diff` to check for uncommitted changes\n\
          3. If the work looks complete, clean up and finish\n\
          4. If incomplete, continue where you left off\n\n\
+         {implementation_plan}\n\n\
          {apply_restart}\n\n\
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check for \
          uncommitted changes. Discard unintentional changes with `git checkout -- <file>`.\n\n\
+         {commit_cadence}\n\n\
          COMMANDS: Never use /cpa — it is for the main working tree only. \
          Just commit directly with `git add <file>` + `git commit -m \"message\"`. \
          The engine pushes to remote after the user clicks Apply (which is what merges your \
@@ -364,16 +425,17 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
          {hardening}\n\n\
          {ask_user_question}\n\n\
          {task_lifecycle}\n\n\
-         CRITICAL: Never run `exit` as a bash command.{process_safety}{permission_config}",
+         CRITICAL: Never run `exit` as a bash command.{process_safety}",
         preamble = workspace_preamble(workspace_name),
         branch = branch_name,
         no_pull_requests = NO_PULL_REQUESTS_RULE,
+        implementation_plan = IMPLEMENTATION_PLAN_RULE,
         apply_restart = APPLY_RESTART_RULE,
+        commit_cadence = COMMIT_CADENCE_RULE,
         hardening = HARDENING_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
         process_safety = process_safety_rule(true),
-        permission_config = PERMISSION_CONFIG_RULE,
     )
 }
 
@@ -426,6 +488,7 @@ pub(super) fn app_worktree_system_prompt(
          for uncommitted changes. If you abandoned an approach and took a different one, \
          the old edits may still be in the working tree. Discard them with `git \
          checkout -- <file>`. Only intentional changes should remain.\n\n\
+         {commit_cadence}\n\n\
          COMMANDS: Never use /cpa — it is for the main working tree only. \
          Just commit directly with `git add <file>` + `git commit -m \"message\"`.\n\n\
          NO PULL REQUESTS: This workspace's git is local — there is no remote and no PR \
@@ -439,12 +502,12 @@ pub(super) fn app_worktree_system_prompt(
          output before finishing.\n\n\
          CRITICAL: Never run `exit` as a bash command. If the user asks you to exit or \
          stop, simply say goodbye and finish your response — the Lucidos engine manages \
-         your lifecycle. Running `exit` in bash can crash the host application.{process_safety}{permission_config}",
+         your lifecycle. Running `exit` in bash can crash the host application.{process_safety}",
+        commit_cadence = COMMIT_CADENCE_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
         app_knowhow = APP_KNOWHOW_RULE,
         process_safety = process_safety_rule(false),
-        permission_config = PERMISSION_CONFIG_RULE,
     )
 }
 
@@ -473,15 +536,16 @@ pub(super) fn app_worktree_recovery_system_prompt(
          {app_knowhow}\n\n\
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check \
          for uncommitted changes. Discard unintentional changes with `git checkout -- <file>`.\n\n\
+         {commit_cadence}\n\n\
          COMMANDS: Never use /cpa. Just commit with `git add` + `git commit -m \"…\"`.\n\n\
          {ask_user_question}\n\n\
          {task_lifecycle}\n\n\
-         CRITICAL: Never run `exit` as a bash command.{process_safety}{permission_config}",
+         CRITICAL: Never run `exit` as a bash command.{process_safety}",
+        commit_cadence = COMMIT_CADENCE_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
         app_knowhow = APP_KNOWHOW_RULE,
         process_safety = process_safety_rule(false),
-        permission_config = PERMISSION_CONFIG_RULE,
     )
 }
 
@@ -509,7 +573,7 @@ pub(super) fn conflict_resolution_system_prompt() -> &'static str {
      CRITICAL: Never run `exit` as a bash command."
 }
 
-/// Build a merge prompt for Claude Code sessions.
+/// Build a merge prompt for coding-agent sessions.
 /// `merge_target` is the branch to merge (e.g. "main" or a feature branch name).
 /// `context` is an optional prefix (e.g. "You are running in a temporary merge worktree.").
 /// `description` is an optional change description appended at the end.
@@ -700,6 +764,56 @@ mod tests {
     }
 
     #[test]
+    fn coding_agent_prompts_encourage_regular_reviewable_commits() {
+        let cases: &[(&str, String)] = &[
+            (
+                "worktree_system_prompt",
+                worktree_system_prompt("feature/x", "dev"),
+            ),
+            (
+                "external_repo_system_prompt",
+                external_repo_system_prompt("Acme", "feature/x", "origin/main"),
+            ),
+            (
+                "recovery_system_prompt",
+                recovery_system_prompt("feature/x", "dev"),
+            ),
+            (
+                "external_repo_recovery_system_prompt",
+                external_repo_recovery_system_prompt("Acme", "feature/x"),
+            ),
+            (
+                "app_worktree_system_prompt",
+                app_worktree_system_prompt("feature/x", "dev", "momentum", "{}"),
+            ),
+            (
+                "app_worktree_recovery_system_prompt",
+                app_worktree_recovery_system_prompt("feature/x", "dev", "momentum"),
+            ),
+        ];
+
+        for (label, prompt) in cases {
+            for needle in [
+                "COMMIT CADENCE",
+                "Commit completed, coherent slices of work as you go",
+                "Do not commit after every tiny edit",
+                "Diff view and recovery state stay current",
+                "known-broken work",
+            ] {
+                assert!(
+                    prompt.contains(needle),
+                    "{label} must keep regular-commit guidance (`{needle}`)",
+                );
+            }
+        }
+
+        assert!(
+            !conflict_resolution_system_prompt().contains("COMMIT CADENCE"),
+            "merge-conflict sessions should make the single merge commit after all conflicts are resolved",
+        );
+    }
+
+    #[test]
     fn chat_style_prompts_nudge_use_of_ask_user_question() {
         let cases: &[(&str, String)] = &[
             (
@@ -725,7 +839,9 @@ mod tests {
                 "{label} must nudge CC to use AskUserQuestion for choice-shaped questions",
             );
             assert!(
-                !prompt.to_lowercase().contains("default to `askuserquestion`"),
+                !prompt
+                    .to_lowercase()
+                    .contains("default to `askuserquestion`"),
                 "{label} must keep the AskUserQuestion rule as an unconditional imperative \
                  — softer phrasing (\"default to\") let CC slip back to plaintext for \
                  yes/no questions trailing a long markdown answer",
@@ -753,13 +869,84 @@ mod tests {
         }
     }
 
+    /// The implementation-plan rule must live in the shared Lucidos-source
+    /// base so it reaches BOTH Claude Code AND Codex (Codex has no PreToolUse
+    /// hook, so the prompt + Apply floor are its only enforcement). It must NOT
+    /// appear in external-repo or app prompts (no `docs/plans/` convention
+    /// there). The marker CLI must be named so the agent knows how to satisfy
+    /// the gate for a local fix.
+    #[test]
+    fn lucidos_source_prompts_carry_implementation_plan_rule_for_both_backends() {
+        let lucidos_cases: &[(&str, String)] = &[
+            (
+                "worktree_system_prompt",
+                worktree_system_prompt("feature/x", "dev"),
+            ),
+            (
+                "recovery_system_prompt",
+                recovery_system_prompt("feature/x", "dev"),
+            ),
+        ];
+        for (label, base) in lucidos_cases {
+            for needle in [
+                "IMPLEMENTATION PLAN:",
+                "implementation-plan",
+                "lucidos planned mark --simple",
+                "docs/plans/",
+            ] {
+                assert!(
+                    base.contains(needle),
+                    "{label} must carry the implementation-plan rule (`{needle}`)",
+                );
+            }
+            // Both backends inherit it: the rule is in the shared base, so the
+            // appended backend section can't strip it.
+            for agent in [
+                crate::runtime::CodingAgent::ClaudeCode,
+                crate::runtime::CodingAgent::Codex,
+            ] {
+                let full = append_backend_rules(base.clone(), agent);
+                assert!(
+                    full.contains("IMPLEMENTATION PLAN:"),
+                    "{label} must keep the implementation-plan rule for {:?}",
+                    agent,
+                );
+            }
+        }
+
+        // External repos and app worktrees have no docs/plans convention —
+        // the rule must NOT leak into their prompts.
+        let exempt: &[(&str, String)] = &[
+            (
+                "external_repo_system_prompt",
+                external_repo_system_prompt("Acme", "feature/x", "origin/main"),
+            ),
+            (
+                "app_worktree_system_prompt",
+                app_worktree_system_prompt("feature/x", "dev", "momentum", "{}"),
+            ),
+        ];
+        for (label, prompt) in exempt {
+            assert!(
+                !prompt.contains("IMPLEMENTATION PLAN:"),
+                "{label} must NOT carry the implementation-plan rule (no docs/plans there)",
+            );
+        }
+    }
+
     #[test]
     fn lucidos_worktree_prompt_keeps_harden_and_cpa_guidance() {
         // Don't accidentally strip these from the Lucidos-repo prompt while
         // tightening the external one — `/harden` and `/cpa` are real here.
         let prompt = worktree_system_prompt("feature/x", "dev");
-        assert!(prompt.contains("/harden"), "Lucidos prompt must keep /harden guidance");
-        assert!(prompt.contains("/cpa"), "Lucidos prompt must keep /cpa guidance");
+        assert!(
+            prompt.contains("/harden"),
+            "Lucidos prompt must keep /harden guidance"
+        );
+        assert!(
+            prompt.contains("/cpa"),
+            "Lucidos prompt must keep /cpa guidance"
+        );
     }
 
     /// Both Lucidos-repo prompts must carry the full APPLY/RESTART rule. Past
@@ -890,7 +1077,7 @@ mod tests {
         }
     }
 
-    /// The Codex teaching section must be appended for Codex and ONLY for
+    /// The Codex teaching section must be applied for Codex and ONLY for
     /// Codex: CC sessions already get the lucidos-cli skill file + the native
     /// `AskUserQuestion` tool, so duplicating the teaching there wastes
     /// context; a Codex session without it can't land workspace `data/` files
@@ -910,24 +1097,86 @@ mod tests {
             assert!(
                 codex.contains(needle),
                 "Codex prompt must teach `{needle}` — the sandboxed session has no other \
-                 path to workspace writes / user questions",
+                path to workspace writes / user questions",
             );
         }
         assert!(
-            codex.starts_with(&base),
-            "backend rules must append, not replace, the worktree prompt",
+            !codex.contains("AskUserQuestion"),
+            "Codex prompt must not carry Claude Code's native AskUserQuestion rule; \
+             Codex uses the lucidos MCP ask_user_question tool"
+        );
+        assert!(
+            !codex.contains("request_user_input"),
+            "Codex prompt must not point at Codex's plan-only request_user_input helper"
+        );
+        assert!(
+            codex.contains("NEVER parallel-call `ask_user_question` alongside other tools"),
+            "Codex prompt must keep the no-parallel-call question safety rule with the \
+             available MCP tool name"
+        );
+        let codex_base = base.replace(ASK_USER_QUESTION_RULE, CODEX_ASK_USER_QUESTION_RULE);
+        assert!(
+            codex.starts_with(&codex_base),
+            "Codex backend rules must preserve the base prompt while replacing only the \
+             backend-specific user-question rule",
         );
 
+        // CC gets its OWN backend section (the permission-config rule), not the
+        // Codex CLI teaching — so it appends to the base rather than passing
+        // through unchanged, but it must never duplicate the Codex section.
         let cc = append_backend_rules(base.clone(), crate::runtime::CodingAgent::ClaudeCode);
-        assert_eq!(
-            cc, base,
-            "Claude Code prompts must pass through unchanged — CC gets the lucidos-cli \
-             skill + native AskUserQuestion instead",
+        assert!(
+            cc.starts_with(&base),
+            "backend rules must append, not replace, the worktree prompt",
         );
         assert!(
             !cc.contains("lucidos data write"),
-            "the CC base prompt must not duplicate the CLI teaching",
+            "the CC prompt must not duplicate the Codex CLI teaching",
         );
+    }
+
+    /// The permission-config rule (`--allowedTools` / `~/.lucidos/cc-allowed-tools`
+    /// mechanics) is Claude-Code-only and must be appended for CC and ONLY for
+    /// CC — mirroring how [`CODEX_CLI_RULE`] is Codex-only. Codex
+    /// permissions surface through its own sandbox + approval-policy model
+    /// (approval cards raised by the app-server), so the CC mechanics are
+    /// misleading noise (and wasted tokens) on a Codex session. The shared
+    /// base prompt must carry NEITHER backend's section: `append_backend_rules`
+    /// is the single split point.
+    #[test]
+    fn permission_config_rule_is_claude_code_only() {
+        let base = worktree_system_prompt("feature/x", "dev");
+        // The base must not embed the permission-config rule — it is appended
+        // per-backend, so a base that already carried it would leak the CC-only
+        // mechanics into Codex via append-on-top.
+        for needle in ["PERMISSION CONFIG:", "--allowedTools", "cc-allowed-tools"] {
+            assert!(
+                !base.contains(needle),
+                "shared base prompt must not embed `{needle}` — the permission-config rule \
+                 is appended only by append_backend_rules (Claude Code arm)",
+            );
+        }
+
+        let cc = append_backend_rules(base.clone(), crate::runtime::CodingAgent::ClaudeCode);
+        for needle in [
+            "PERMISSION CONFIG:",
+            "--allowedTools",
+            "~/.lucidos/cc-allowed-tools",
+        ] {
+            assert!(
+                cc.contains(needle),
+                "Claude Code prompt must carry the full permission-config rule (`{needle}`)",
+            );
+        }
+
+        let codex = append_backend_rules(base, crate::runtime::CodingAgent::Codex);
+        for needle in ["PERMISSION CONFIG:", "--allowedTools", "cc-allowed-tools"] {
+            assert!(
+                !codex.contains(needle),
+                "Codex prompt must NOT carry the CC-only permission-config rule (`{needle}`) — \
+                 Codex permissions surface via its sandbox + approval-policy model",
+            );
+        }
     }
 
     /// Conflict-resolution sessions run unattended in a temp worktree — the

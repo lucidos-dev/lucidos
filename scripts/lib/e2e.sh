@@ -62,33 +62,31 @@ ensure_workspace_running() {
         start_engine
     fi
 
-    # ── Vite ──
-    detect_vite_tls
-
-    if curl -sk "${VITE_PROTO}://localhost:${vite_port}/" >/dev/null 2>&1; then
-        echo "Vite already running on port $vite_port"
-    else
-        INTERNAL_VITE_PORT="$vite_port"
-        ENGINE_PORT="$engine_port"
-        start_vite
+    # ── Frontend (ADR 0014: the engine serves the built dist/ directly) ──
+    # No Vite dev server / proxy. swap_ports exported LUCIDOS_STATIC_DIR, so the
+    # legacy engine started above serves dist/ at / (base path '', no gateway).
+    # The e2e run tests a fixed build, so a one-shot `vite build` suffices.
+    if [ ! -f "$FRONTEND_DIR/dist/index.html" ]; then
+        echo "Building frontend (vite build)..."
+        (cd "$FRONTEND_DIR" && npx vite build) || { echo "ERROR: frontend build failed" >&2; return 1; }
     fi
 
-    # Final check: engine must proxy frontend (retry up to 30s)
-    echo -n "Verifying frontend proxy"
-    local proxy_ready=""
+    # Final check: the engine must serve the built frontend at / (retry up to 30s)
+    echo -n "Verifying engine serves the frontend"
+    local frontend_ready=""
     for i in {1..30}; do
         if curl -sk "${PROTO}://localhost:${engine_port}/" 2>/dev/null | grep -q "<!DOCTYPE" 2>/dev/null; then
             echo " ready!"
-            proxy_ready="yes"
+            frontend_ready="yes"
             break
         fi
         echo -n "."
         sleep 1
     done
 
-    if [ -z "$proxy_ready" ]; then
+    if [ -z "$frontend_ready" ]; then
         echo ""
-        echo "WARNING: Engine not serving frontend (Vite proxy may not be connected)"
+        echo "WARNING: Engine not serving the built frontend (is LUCIDOS_STATIC_DIR set / dist/ built?)"
     fi
 
     # Export for test scripts
@@ -272,16 +270,8 @@ setup_e2e_session() {
 stop_e2e_workspace() {
     echo "Stopping e2e workspace..."
     "$_E2E_SCRIPTS_DIR/stop.sh" -w "$E2E_WORKSPACE" 2>/dev/null || true
-
-    # Also stop Vite
-    if [ -f "$FRONTEND_PIDFILE" ]; then
-        local vite_pid
-        vite_pid="$(cat "$FRONTEND_PIDFILE" 2>/dev/null)"
-        if [ -n "$vite_pid" ] && kill -0 "$vite_pid" 2>/dev/null; then
-            kill "$vite_pid" 2>/dev/null || true
-        fi
-        rm -f "$FRONTEND_PIDFILE"
-    fi
+    # ADR 0014: no long-lived frontend process to stop — the engine serves the
+    # built dist/ directly and the one-shot `vite build` exits on its own.
 }
 
 # Drops the public schema if any row in _sqlx_migrations references a version
@@ -290,7 +280,9 @@ stop_e2e_workspace() {
 # refuses to start the engine with VersionMissing(...).
 purge_orphan_migrations() {
     local migrations_dir="$_E2E_PROJECT_DIR/crates/lucidos-engine/migrations"
-    local container="lucidos-pg-$PG_NAME"
+    local container db
+    container="$(shared_pg_container)"
+    db="$(workspace_database_name)"
 
     local valid_versions
     valid_versions=$(ls "$migrations_dir" 2>/dev/null | grep -oE '^[0-9]{14}' | sort -u | paste -sd, -)
@@ -301,26 +293,28 @@ purge_orphan_migrations() {
     # errors out on a fresh DB. Two round trips lets the count query fail
     # loudly on a real psql/container problem instead of being masked.
     local table_exists
-    table_exists=$(docker exec "$container" psql -U lucidos -d lucidos -At -c \
+    table_exists=$(docker exec "$container" psql -U lucidos -d "$db" -At -c \
         "SELECT to_regclass('_sqlx_migrations') IS NOT NULL;")
     [ "$table_exists" = "t" ] || return 0
 
     local orphan_count
-    orphan_count=$(docker exec "$container" psql -U lucidos -d lucidos -At -c \
+    orphan_count=$(docker exec "$container" psql -U lucidos -d "$db" -At -c \
         "SELECT count(*) FROM _sqlx_migrations WHERE version NOT IN ($valid_versions);")
 
     if [ "${orphan_count:-0}" -gt 0 ]; then
         echo "Found $orphan_count orphan migration(s) from abandoned branches — resetting schema"
-        docker exec "$container" psql -U lucidos -d lucidos -q -c \
+        docker exec "$container" psql -U lucidos -d "$db" -q -c \
             "DROP SCHEMA public CASCADE; CREATE SCHEMA public; CREATE EXTENSION IF NOT EXISTS vector;"
     fi
 }
 
 reset_e2e_database() {
-    local container="lucidos-pg-$PG_NAME"
+    local container db
+    container="$(shared_pg_container)"
+    db="$(workspace_database_name)"
 
     echo "Resetting database..."
-    docker exec "$container" psql -U lucidos -q -c "
+    docker exec "$container" psql -U lucidos -d "$db" -q -c "
         DO \$\$
         DECLARE r RECORD;
         BEGIN

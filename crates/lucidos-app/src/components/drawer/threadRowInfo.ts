@@ -28,17 +28,32 @@ export function threadContextName(f: ThreadContextFields): string | undefined {
   return undefined;
 }
 
-/** The context LINE for the tooltip — the type word plus the name, so the
- *  tooltip is self-describing even though the row chips are name-only. */
-function threadContextLine(f: ThreadContextFields): string {
+/** The context ROW for the tooltip — a `{ label, value }` pair so the type word
+ *  (Repository / App / Trigger / Type) sits in the dim left column and its name
+ *  in the bright right column, matching every other tooltip row. The row chips
+ *  are name-only; this keeps the tooltip self-describing. */
+function threadContextRow(f: ThreadContextFields): TooltipRow {
   const name = threadContextName(f);
-  if (f.channel === 'trigger') return name ? `Trigger · ${name}` : 'Trigger';
+  if (f.channel === 'trigger') return name ? { label: 'Trigger', value: name } : { label: 'Type', value: 'Trigger' };
   if (f.channel === 'claude_code') {
-    if (f.codingAgentKind === 'app') return name ? `App · ${name}` : 'App';
-    return name ? `Repository · ${name}` : 'Repository';
+    if (f.codingAgentKind === 'app') return name ? { label: 'App', value: name } : { label: 'Type', value: 'App' };
+    return name ? { label: 'Repository', value: name } : { label: 'Type', value: 'Repository' };
   }
-  if (f.channel === 'chat') return 'Chat';
-  return formatChannel(f.channel);
+  if (f.channel === 'chat') return { label: 'Type', value: 'Chat' };
+  return { label: 'Type', value: formatChannel(f.channel) };
+}
+
+/** A tone keyword that maps to a small colored status dot in the tooltip's value
+ *  cell — the only place a row carries one. Mirrors the row's status dot so the
+ *  word and the color can't disagree. */
+export type StatusTone = 'running' | 'changes' | 'waiting' | 'failed' | 'idle';
+
+/** One row of the structured thread tooltip: a dim label and its value, with an
+ *  optional status `tone` that paints a leading dot in the value cell. */
+export interface TooltipRow {
+  label: string;
+  value: string;
+  tone?: StatusTone;
 }
 
 /** Human-readable status word for the tooltip. A pending change reads as
@@ -55,22 +70,32 @@ function statusWord(status: ThreadStatus, codingAgentProposed: boolean): string 
   }
 }
 
-/** Multi-line tooltip text for a thread row, rendered via the global
- *  `data-tooltip` system (which honors `\n` through `white-space: pre-line`).
+/** Status dot tone, kept in lockstep with `statusWord` above. */
+function statusTone(status: ThreadStatus, codingAgentProposed: boolean): StatusTone {
+  if (status === 'running') return 'running';
+  if (codingAgentProposed) return 'changes';
+  switch (status) {
+    case 'waiting_for_user_answer': return 'waiting';
+    case 'failed': return 'failed';
+    default: return 'idle';
+  }
+}
+
+/** Structured rows for a thread row's tooltip, rendered as a two-column
+ *  label/value grid by the global tooltip system (`data-tooltip-rows`).
  *  `status` is the effective status the caller already derived for the row's
  *  dot, so the tooltip and the dot can't disagree. */
-export function threadRowTooltip(meta: ThreadMeta, status: ThreadStatus): string {
-  const exchanges = `${meta.messageCount} exchange${meta.messageCount === 1 ? '' : 's'}`;
+export function threadRowTooltip(meta: ThreadMeta, status: ThreadStatus): TooltipRow[] {
   // Fall back to createdAt/updatedAt if the attributed-recency fields are absent
   // (test fixtures); production always has them.
   const userAt = meta.lastUserAction || meta.createdAt;
   const agentAt = meta.lastAgentAction || meta.updatedAt || meta.createdAt;
   return [
-    `You · ${formatTimeAgo(new Date(userAt))}`,
-    `Agent · ${formatTimeAgo(new Date(agentAt))}`,
-    threadContextLine(meta),
-    `Status · ${statusWord(status, meta.codingAgentProposed)}`,
-    exchanges,
-    `Started · ${formatTimeAgo(new Date(meta.createdAt))}`,
-  ].join('\n');
+    { label: 'Status', value: statusWord(status, meta.codingAgentProposed), tone: statusTone(status, meta.codingAgentProposed) },
+    { label: 'You', value: formatTimeAgo(new Date(userAt)) },
+    { label: 'Agent', value: formatTimeAgo(new Date(agentAt)) },
+    threadContextRow(meta),
+    { label: 'Exchanges', value: String(meta.messageCount) },
+    { label: 'Started', value: formatTimeAgo(new Date(meta.createdAt)) },
+  ];
 }

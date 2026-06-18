@@ -1,8 +1,27 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+// @ts-expect-error - Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
+// @ts-expect-error - same
+import { dirname, resolve } from 'node:path';
+// @ts-expect-error - same
+import { fileURLToPath } from 'node:url';
 import { drawerOpen } from '../Drawer';
 import { threadDrawerOpen, mobileView } from '../../../store/store';
 import { MobileDotIndicator } from '../MobileAppHeader';
 import { navigateToPane } from '../../../store/actions/pane';
+
+const here: string = dirname(fileURLToPath(import.meta.url));
+const mobileCss = readFileSync(
+  resolve(here, '../../../styles/mobile.css'),
+  'utf-8',
+);
+
+function ruleBody(selector: string): string {
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const m = mobileCss.match(new RegExp(`(^|\\n)\\s*${escaped}\\s*\\{([^}]*)\\}`));
+  if (!m) throw new Error(`${selector} rule not found`);
+  return m[2];
+}
 
 describe('MobileDotIndicator — always visible', () => {
   beforeEach(() => {
@@ -33,6 +52,13 @@ describe('MobileDotIndicator — always visible', () => {
     threadDrawerOpen.value = true;
     const vnode = (MobileDotIndicator as () => unknown)();
     expect(vnode).not.toBeNull();
+  });
+});
+
+describe('MobileDotIndicator — header contrast', () => {
+  it('uses header foreground tokens for inactive and active dots', () => {
+    expect(ruleBody('.mobile-dot')).toMatch(/background:\s*var\(--header-fg-muted,\s*var\(--text-muted\)\)/);
+    expect(ruleBody('.mobile-dot.active')).toMatch(/background:\s*var\(--header-fg,\s*var\(--accent\)\)/);
   });
 });
 

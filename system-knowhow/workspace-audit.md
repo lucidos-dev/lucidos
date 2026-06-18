@@ -19,9 +19,9 @@ This knowhow does **not** restate the rules. It points at them. Each check below
 
 | Reference | Owns |
 |---|---|
-| `system-knowhow/best-practices.md` | Workspace file conventions: artifacts/, apps/, knowhow/, intents/, scripts/, config/ layout, `data/.env` per-workspace env overrides, naming, "never nest artifacts", import-the-minimum |
+| `system-knowhow/best-practices.md` | Workspace file conventions: artifacts/, apps/, knowhow/, intents/, scripts/, config/ layout, per-workspace environment variables (Settings → System → Environment variables / `set_environment_variable`), naming, "never nest artifacts", import-the-minimum |
 | `system-knowhow/js-sdk.md` | Current app HTML boilerplate and the full `lucidos.*` API surface (anything not listed is either deprecated or invented) |
-| `system-knowhow/lucidos-cli.md` | What scripts and CC subprocesses use for `data.*` writes, `events.*` emits, `proxy` calls to external APIs (preferred over raw `curl -H "Authorization: ..."` with `$CRED_*`), and `spawn-thread` thread spawning (sub-threads + cross-workspace) |
+| `system-knowhow/lucidos-cli.md` | What scripts and coding-agent subprocesses use for `data.*` writes, `events.*` emits, `proxy` calls to external APIs (preferred over raw `curl -H "Authorization: ..."` with `$CRED_*`), and `spawn-thread` thread spawning (sub-threads + cross-workspace, including Codex via `--codex`) |
 | `system-knowhow/intent-registry.md` | Which on-disk files become intents in the system prompt (trigger files double as intents — easy to miss) |
 | The active engine system prompt | The intent vs knowhow taxonomy, the trigger worked example |
 
@@ -67,7 +67,7 @@ Per the engine prompt's taxonomy section and the worked example in `docs/taxonom
 
 - **Notification routing — `tap` opt-ins for CTA-shaped triggers.** For each trigger whose `run.intent` mentions `send_notification` (or each `NotificationCreated` event traceable to a trigger), look at the body the trigger produces. Per `system-knowhow/building-a-trigger.md` § "Notification routing":
   - Body reads like a direct CTA inside an app ("check in", "open <X>", "tap to log") **and** the trigger sets `app_id` → suggest `tap: { kind: 'navigate', to: { target: 'app', app_id: '<id>' } }` so the tap skips the modal.
-  - Body reads like a question or prompt that needs the user back in the conversation ("Claude is asking", "needs your input", "respond to") → suggest `tap: { kind: 'navigate', to: { target: 'thread', id: '<thread_id>', event_id: '<event_id?>' } }`.
+  - Body reads like a question or prompt that needs the user back in the conversation ("coding agent is asking", "needs your input", "respond to") → suggest `tap: { kind: 'navigate', to: { target: 'thread', id: '<thread_id>', event_id: '<event_id?>' } }`.
   - Body reads like a multi-result panel-shaped destination ("N changes ready to apply", "3 triggers failed overnight") → suggest `tap: { kind: 'navigate', to: { target: 'changes' | 'triggers' | 'files' | 'notifications' } }` for the matching panel.
   - Body reads like a purely informational push that needs no follow-up ("backup complete", "sync finished", "5 tasks today") → suggest `tap: { kind: 'none' }` so the row marks itself read on display and doesn't sit in the inbox.
   - Body reads like a status report the user re-reads later ("daily summary", "weekly digest") → leave `tap` at the default `{ kind: 'modal' }`.
@@ -112,7 +112,7 @@ Per `docs/taxonomy.md` (frontmatter shape) and `system-knowhow/best-practices.md
 - App-scoped knowhow doesn't reference things outside its app; shared knowhow doesn't name specific apps.
 - **Orphaned files under `data/knowhow/`** — a knowhow file whose id appears in NO trigger's stale `run.knowhow` (see § 1), in NO intent's `knowhow:` frontmatter (see § 4), and in NO app `manifest.json`/`config/*.json` reference is potentially dead. Most common cause is a trigger that lost its `run.knowhow` reference when the preload was retired and never had its content moved into the trigger's intent. Surface the file path and recommend either (a) inlining the relevant procedure into a trigger's intent, (b) moving the file into `data/triggers/<slug>/knowhow/` if it was always trigger-specific, or (c) deleting it if no consumer remains. Severity: **stale** (review). Reference: `system-knowhow/building-a-trigger.md`.
 
-Per `system-knowhow/lucidos-cli.md` and `system-knowhow/best-practices.md` § `config/`, also grep knowhow bodies for pre-proxy API patterns — knowhow tells future LLM/CC sessions *how* to call APIs, so a stale recipe propagates the leak even after apps and scripts are clean. Patterns to flag:
+Per `system-knowhow/lucidos-cli.md` and `system-knowhow/best-practices.md` § `config/`, also grep knowhow bodies for pre-proxy API patterns — knowhow tells future LLM/coding-agent sessions *how* to call APIs, so a stale recipe propagates the leak even after apps and scripts are clean. Patterns to flag:
 
 - `curl -H "Authorization: Bearer $CRED_<NAME>"` (or any inline credential header) in a code fence labelled `bash`/`sh`.
 - `requests.get(url, headers={"Authorization": f"Bearer {os.environ['CRED_...']}"})` and equivalents in Python.

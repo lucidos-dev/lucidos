@@ -67,6 +67,7 @@ pub const DELETE_TRIGGER_GROUP: &str = "delete_trigger_group";
 pub const SET_LANGUAGE: &str = "set_language";
 pub const SET_TIMEZONE: &str = "set_timezone";
 pub const ENABLE_PUSH_NOTIFICATIONS: &str = "enable_push_notifications";
+pub const SET_ENVIRONMENT_VARIABLE: &str = "set_environment_variable";
 
 // Credentials & OAuth
 pub const REQUEST_CREDENTIAL: &str = "request_credential";
@@ -84,7 +85,8 @@ pub const REFRESH_APP: &str = "refresh_app";
 pub const CAPTURE_APP: &str = "capture_app";
 
 // Fan-out / child threads (handled by handle_special_tool)
-pub const RUN_CLAUDE: &str = "run_claude";
+pub const RUN_CODING_AGENT: &str = "run_coding_agent";
+pub const RUN_CLAUDE_LEGACY: &str = "run_claude";
 pub const RUN_THREAD: &str = "run_thread";
 
 // Memory
@@ -135,6 +137,7 @@ pub const MANAGE_REPOSITORIES: &str = "manage_repositories";
 
 // Plugins
 pub const INSTALL_PLUGIN: &str = "install_plugin";
+pub const REGISTER_PLUGIN_MARKETPLACE: &str = "register_plugin_marketplace";
 pub const CHECK_PLUGIN_UPDATES: &str = "check_plugin_updates";
 pub const UPDATE_PLUGIN: &str = "update_plugin";
 pub const UNINSTALL_PLUGIN: &str = "uninstall_plugin";

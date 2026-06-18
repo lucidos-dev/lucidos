@@ -141,6 +141,91 @@ async fn apply_unhardened_change_emits_missing_hardening_detected() {
     pool.close().await;
 }
 
+/// The implementation-plan floor: a Lucidos-source change with NO Planned
+/// marker must be refused at Apply (hard block, no auto-recovery), even when it
+/// IS hardened. Mirrors `apply_unhardened_change_emits_missing_hardening_detected`
+/// but opts out of the seed's default marker via `planned: false`.
+#[tokio::test]
+async fn apply_unplanned_change_is_blocked() {
+    let client = http_client();
+    let ws = workspace_path();
+    let repo_root = ws.to_str().unwrap();
+
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+
+    let suffix = Uuid::new_v4().as_simple().to_string()[..8].to_string();
+    let branch = format!("e2e-test/unplanned-{}", suffix);
+    let thread_id = Uuid::new_v4();
+    let change_id = Uuid::new_v4();
+
+    seed_cc_thread_summary(&pool, thread_id, "idle").await;
+
+    // Seed a hardened change but explicitly WITHOUT a plan marker.
+    let seed_url = format!("{}/api/v1/internal/seed-change-for-test", base_url());
+    let seed = client
+        .post(&seed_url)
+        .json(&json!({
+            "change_id": change_id.to_string(),
+            "thread_id": thread_id.to_string(),
+            "branch_name": branch,
+            "repo_root": repo_root,
+            "description": "E2E unplanned change",
+            "files": ["e2e-unplanned.txt"],
+            "requires_restart": false,
+            "hardened": true,
+            "planned": false,
+        }))
+        .send()
+        .await
+        .expect("seed request failed");
+    assert!(seed.status().is_success(), "seed failed: {}", seed.status());
+
+    let url = format!("{}/api/v1/changes/{}/apply", base_url(), change_id);
+    let resp = client.post(&url).send().await.expect("Apply request failed");
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.expect("Invalid JSON from apply");
+
+    assert_eq!(
+        status, 400,
+        "Apply of an unplanned change must be refused (400), got {}: {:?}",
+        status, body
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("implementation-plan marker")),
+        "Error must name the missing plan marker: {:?}",
+        body
+    );
+
+    // ChangeApplyFailed must be recorded for the timeline.
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1::text AND event_type = 'ChangeApplyFailed'",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count query failed");
+    assert!(n >= 1, "expected a ChangeApplyFailed event, found {n}");
+
+    // Cleanup
+    let _ = sqlx::query("DELETE FROM events WHERE aggregate_id = $1::text")
+        .bind(thread_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM changes WHERE id = $1")
+        .bind(change_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await;
+    pool.close().await;
+}
+
 /// Sequential apply of two changes must both succeed.
 /// Regression test: after applying the first change, the working tree was left
 /// dirty (detached HEAD caused `reset --hard HEAD` to target the wrong commit),

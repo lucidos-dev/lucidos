@@ -60,6 +60,18 @@ pub enum AgentEvent {
     },
     /// Streamed assistant text fragment.
     Message { role: String, text: String },
+    /// Liveness ping — the agent emitted an intermediate streaming delta (CC's
+    /// `stream_event` wrapper) that carries no content to persist: the complete
+    /// text and tool calls arrive separately as `Message` / `ToolUse`. Its sole
+    /// purpose is to prove the subprocess is alive and actively producing output
+    /// so the watchdog's inactivity clock (`AgentSession::last_event_at`, bumped
+    /// for every received event) can tell a long-but-active step (extended
+    /// thinking, a large generation) apart from a genuinely hung process. Without
+    /// it the clock only ticks at step boundaries (a completed message or tool
+    /// result), and a single step longer than `WATCHDOG_INACTIVITY_LIMIT_MS` is
+    /// killed mid-work. Consumers persist nothing for this variant. Backends
+    /// whose deltas already arrive as `Message` events (Codex) never emit it.
+    StreamActivity,
     /// Tool invocation. `id` is the agent's tool-use identifier — persisted on
     /// `UserQuestionAsked` so a reply can be matched back to its question.
     ToolUse {
@@ -183,6 +195,14 @@ pub struct SpawnArgs<'a> {
     /// first turn with an equivalent continuation prompt instead of waiting
     /// for an input that will never arrive.
     pub continuation: bool,
+    /// User-managed non-secret environment variables (`(NAME, value)` pairs from
+    /// `EnvironmentVariableStore::env_pairs`). Applied FIRST in
+    /// `runtime::spawn_env::apply_lucidos_env`, before every engine-owned var, so
+    /// the engine always wins a collision (e.g. a user `LUCIDOS_REPO` is
+    /// overridden by the spawn's repo context). Fetched by the spawn
+    /// orchestration (which has the pool); empty for callers that don't inject
+    /// (tests, engine-internal spawns with no user env).
+    pub user_env_vars: &'a [(String, String)],
 }
 
 /// An in-band permission request raised by the agent's own protocol — the

@@ -40,3 +40,8 @@ Keep entries scannable. A decision log nobody reads is just more drift.
 - [0008 — User-initiated work shares the one capacity pool: prioritized, but counted and queued (reserves a background floor)](0008-user-initiated-work-counts-against-the-pool.md)
 - [0009 — An empty completion is an error only when it's genuinely an error, classified per-cause across providers](0009-empty-completion-classification.md)
 - [0010 — The user-half of the Thread Queue pool mirrors `thread_summaries.status` (one reconcile point, not hand-synced acquire/release)](0010-user-pool-mirrors-thread-status.md)
+- [0011 — A blocking child's completion is durably delivered to its parent: the persisted `ChildThreadCompleted` is the source of truth, the in-memory wake is a cache rebuilt on boot](0011-parent-child-fan-in-durability.md)
+- [0012 — Self-contained desktop app: the launcher owns Postgres + engine, the engine serves the UI same-origin, first-run falls back to mock, auto-update ships via GitHub Releases](0012-self-contained-desktop-app.md)
+- [0013 — Multi-workspace via a workspace gateway: one reverse-proxy fronts N always-on per-workspace engine stacks, addressed by path prefix](0013-multi-workspace-gateway.md) *(refined by 0014: standalone gateway crate, `/<workspace>` prefix, shared Postgres cluster, engine-served frontend)*
+- [0014 — Multi-workspace redesign: standalone gateway crate, `/<workspace>` path prefix, shared Postgres cluster, engine-served frontend](0014-multi-workspace-redesign.md)
+- [0015 — Restore lives in the workspace picker: local-file only, run via the engine `restore-archive` subcommand](0015-restore-in-the-workspace-picker.md)

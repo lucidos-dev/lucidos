@@ -21,10 +21,18 @@
 
 import type { Scope } from './store';
 import type { ComposeMode } from './actions/compose';
+import type { ComposeChannelMode } from './thread-events';
 
 export type ComposeDestination =
   | { kind: 'lucidos-agent' }
   | { kind: 'coding'; scope: Scope };
+
+/** Display name of the Lucidos source as a repository — the registered repo is
+ *  named "Lucidos", so a Lucidos-source coding-agent thread shows this string
+ *  as its `cc_repo_name` chip (see `repo_name_expr` in the engine). Also the
+ *  predicate the destination picker uses to exclude the Lucidos source from the
+ *  external-repo list. */
+export const LUCIDOS_SOURCE_REPO_NAME = 'Lucidos';
 
 /** Sentinel option value for the "＋ Register a repository…" action row.
  *  NOT part of the destination encoding — callers must check for it BEFORE
@@ -63,6 +71,30 @@ export function parseOptionValue(v: string): ComposeDestination {
   if (v.startsWith('repo:')) return { kind: 'coding', scope: { kind: 'external', repoId: v.slice(5) } };
   if (v.startsWith('app:')) return { kind: 'coding', scope: { kind: 'app', appId: v.slice(4) } };
   return { kind: 'lucidos-agent' };
+}
+
+/** The repo/app context-name chip for a compose draft, mirroring
+ *  `threadContextName` (which reads a started thread's bound `meta`) but reading
+ *  the device-global compose `selectedScope` — a draft hasn't bound its meta
+ *  yet (see `sendCompose`). Returns undefined for a chat draft: a Lucidos thread
+ *  carries no context chip, same as a started chat thread.
+ *
+ *  Resolution matches what started threads show: the Lucidos source → "Lucidos"
+ *  (its repo name), an app → the app id (started app threads chip the id via
+ *  `appIdFromFolder`, not the name), an external repo → its name from the repos
+ *  list (undefined until the list loads — both lists are eager-loaded at
+ *  startup, so this is only a cold-start gap). */
+export function composeDraftContextName(
+  mode: ComposeChannelMode,
+  scope: Scope,
+  repos: readonly { id: string; name: string }[],
+): string | undefined {
+  if (mode !== 'claude_code') return undefined;
+  switch (scope.kind) {
+    case 'lucidos': return LUCIDOS_SOURCE_REPO_NAME;
+    case 'app': return scope.appId;
+    case 'external': return repos.find(r => r.id === scope.repoId)?.name || undefined;
+  }
 }
 
 /** One-line consequence caption for the current destination — the compose

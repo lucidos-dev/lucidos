@@ -1,9 +1,5 @@
 use super::*;
 
-/// Serializes the `load_workspace_env` tests: each mutates process-global env
-/// (via `set_var` / the override load), so they must not interleave.
-static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[test]
 fn pg_env_vars_extracts_standard_url() {
     let vars = pg_env_vars("postgres://lucidos:lucidos@localhost:5432/lucidos");
@@ -24,6 +20,32 @@ fn pg_env_vars_accepts_postgresql_scheme() {
     assert_eq!(map.get("PGHOST").map(String::as_str), Some("h"));
     assert_eq!(map.get("PGPORT").map(String::as_str), Some("1234"));
     assert_eq!(map.get("PGDATABASE").map(String::as_str), Some("db"));
+}
+
+#[test]
+fn pg_env_vars_accepts_passwordless_trust_auth_url() {
+    // The gateway's embedded (packaged) Postgres backend hands the engine a
+    // passwordless URL (trust auth on loopback). It must parse so a picker
+    // restore's `pg_restore`/`psql` get PG* env; PGPASSWORD is simply omitted.
+    let vars = pg_env_vars("postgres://lucidos@127.0.0.1:5599/lucidos");
+    let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
+    assert_eq!(map.get("PGUSER").map(String::as_str), Some("lucidos"));
+    assert_eq!(map.get("PGHOST").map(String::as_str), Some("127.0.0.1"));
+    assert_eq!(map.get("PGPORT").map(String::as_str), Some("5599"));
+    assert_eq!(map.get("PGDATABASE").map(String::as_str), Some("lucidos"));
+    assert!(
+        !map.contains_key("PGPASSWORD"),
+        "a passwordless URL must not emit PGPASSWORD"
+    );
+}
+
+#[test]
+fn pg_env_vars_explicit_empty_password_still_emits_pgpassword() {
+    // `user:@host` carried an (empty) password segment; preserve prior behavior
+    // of emitting an empty PGPASSWORD so the no-segment case stays distinct.
+    let vars = pg_env_vars("postgres://u:@host:5432/db");
+    let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
+    assert_eq!(map.get("PGPASSWORD").map(String::as_str), Some(""));
 }
 
 #[test]
@@ -296,6 +318,21 @@ fn test_describe_tool_threads_and_changes() {
             &serde_json::json!({ "image": "thread:1", "path": "photos/a.jpg" })
         ),
         "Saving image to photos/a.jpg..."
+    );
+    assert_eq!(
+        describe_tool("run_coding_agent", &serde_json::json!({})),
+        "Executing Claude Code..."
+    );
+    assert_eq!(
+        describe_tool(
+            "run_coding_agent",
+            &serde_json::json!({ "coding_agent": "codex" })
+        ),
+        "Executing Codex..."
+    );
+    assert_eq!(
+        describe_tool("run_claude", &serde_json::json!({ "coding_agent": "codex" })),
+        "Executing Codex..."
     );
 }
 
@@ -889,68 +926,3 @@ fn pin_workspace_vite_port_noop_when_file_exists() {
     );
 }
 
-/// `load_workspace_env` reads `<workspace>/data/.env` and applies it with
-/// override semantics: a value in the per-workspace file wins over the value
-/// already present in the process env (which models the global `.env` +
-/// inherited shell env). It returns the path it loaded.
-#[test]
-fn load_workspace_env_loads_and_overrides_when_present() {
-    let _guard = ENV_TEST_LOCK.lock().unwrap();
-    let key = "LUCIDOS_TEST_WS_ENV_OVERRIDE";
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join("data")).unwrap();
-    std::fs::write(
-        dir.path().join("data/.env"),
-        format!("{key}=from-workspace\n"),
-    )
-    .unwrap();
-
-    // SAFETY: process-wide env mutation gated by ENV_TEST_LOCK.
-    unsafe {
-        std::env::set_var(key, "from-global");
-    }
-
-    let loaded = load_workspace_env(dir.path());
-    assert_eq!(
-        loaded.as_deref(),
-        Some(dir.path().join("data/.env").as_path()),
-        "returns the loaded path"
-    );
-    assert_eq!(
-        std::env::var(key).ok().as_deref(),
-        Some("from-workspace"),
-        "per-workspace value must override the pre-existing process env value"
-    );
-
-    unsafe {
-        std::env::remove_var(key);
-    }
-}
-
-/// No `data/.env` → `load_workspace_env` is a no-op: returns `None` and leaves
-/// the existing process env untouched.
-#[test]
-fn load_workspace_env_noop_when_absent() {
-    let _guard = ENV_TEST_LOCK.lock().unwrap();
-    let key = "LUCIDOS_TEST_WS_ENV_ABSENT";
-    let dir = tempfile::tempdir().unwrap();
-    // data/ exists but carries no .env.
-    std::fs::create_dir_all(dir.path().join("data")).unwrap();
-
-    // SAFETY: process-wide env mutation gated by ENV_TEST_LOCK.
-    unsafe {
-        std::env::set_var(key, "from-global");
-    }
-
-    let loaded = load_workspace_env(dir.path());
-    assert!(loaded.is_none(), "absent .env must return None");
-    assert_eq!(
-        std::env::var(key).ok().as_deref(),
-        Some("from-global"),
-        "process env must be untouched when no per-workspace .env exists"
-    );
-
-    unsafe {
-        std::env::remove_var(key);
-    }
-}

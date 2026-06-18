@@ -6,6 +6,7 @@ import { AppHeader } from './components/layout/AppHeader';
 import { Drawer } from './components/layout/Drawer';
 import { MobileSwipeContainer } from './components/layout/MobileSwipeContainer';
 import { ConfirmDialog } from './components/shared/ConfirmDialog';
+import { BootSplash } from './components/shared/BootSplash';
 import { LandscapeLock } from './components/shared/LandscapeLock';
 import { ThreadDrawer } from './components/drawer/ThreadDrawer';
 import { DrawerDivider } from './components/layout/DrawerDivider';
@@ -100,6 +101,7 @@ export function App() {
       <NotificationsModalSlot />
       <SearchEverywhereSlot />
       <UiBlockingOverlay />
+      <BootSplash />
     </>
   );
 }

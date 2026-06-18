@@ -1,4 +1,4 @@
-import { connectionStatus, dismissToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, TOAST_AUTO_DISMISS_MS } from '../store';
+import { connectionStatus, dismissToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, TOAST_AUTO_DISMISS_MS } from '../store';
 import { checkHealth, API_BASE } from '../../api/client';
 import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearForcedRetries } from './thread-loading';
@@ -215,6 +215,7 @@ export async function checkConnection(): Promise<boolean> {
       lucidosRelease.value = health.release;
     }
     lucidosReleaseDirty.value = health.release_dirty === true;
+    enginePackaged.value = health.packaged === true;
     if (health.engine_version) {
       engineVersion.value = health.engine_version;
     }

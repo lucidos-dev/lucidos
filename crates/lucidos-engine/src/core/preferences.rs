@@ -27,6 +27,16 @@ pub const DEFAULT_CHAT_MODEL: &str = "claude-opus-4-8@default";
 // Vertex AI configuration
 pub const PREF_VERTEX_REGION: &str = "vertex_region";
 
+// Local OpenAI-compatible provider base URL (also written by frontend Settings
+// UI). Points the `local` provider at Ollama / LM Studio / vLLM / llama.cpp.
+pub const PREF_LOCAL_BASE_URL: &str = "local_base_url";
+
+/// Default base URL for the `local` provider when neither the `local_base_url`
+/// preference nor the `LUCIDOS_LOCAL_BASE_URL` env var is set — Ollama's
+/// OpenAI-compatible endpoint. Mirrored on the frontend in
+/// `crates/lucidos-app/src/components/settings/LocalProviderSettings.tsx`.
+pub const DEFAULT_LOCAL_BASE_URL: &str = "http://localhost:11434/v1";
+
 // Image generation model (also written by frontend Settings UI)
 pub const PREF_IMAGE_MODEL: &str = "image_model";
 

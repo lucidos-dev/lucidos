@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { marked } from 'marked';
 import { renderMarkdown, renderMarkdownInline, renderMarkdownInlineWithLinks } from './renderMarkdown';
 
 describe('renderMarkdown', () => {
@@ -455,6 +456,33 @@ Use this pattern for all prompts.`;
       expect(html).toContain('data-thread-id="1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff"');
       expect(html).toContain('data-thread-workspace="dev"');
       expect(html).not.toContain('href="thread:');
+    });
+  });
+
+  // Regression guard for the "heavy thread freezes on send" fix: re-rendering a
+  // thread re-calls renderMarkdown for every block; without caching, each
+  // re-render re-parsed all of them (the markdown re-parse storm). The cache
+  // makes a repeated input an O(1) lookup; the live streaming buffer opts out.
+  describe('parse caching', () => {
+    it('caches by input so a repeated render does not re-parse', () => {
+      const spy = vi.spyOn(marked, 'parse');
+      const md = '**cache-hit-unique-marker-alpha** with `code` and a list\n- one\n- two';
+      const before = spy.mock.calls.length;
+      const a = renderMarkdown(md);
+      const b = renderMarkdown(md);
+      expect(b).toBe(a);
+      expect(spy.mock.calls.length).toBe(before + 1); // parsed once; second was a cache hit
+      spy.mockRestore();
+    });
+
+    it('cache:false bypasses the cache (streaming buffer never pollutes it)', () => {
+      const spy = vi.spyOn(marked, 'parse');
+      const md = '**cache-bypass-unique-marker-beta** streaming fragment';
+      const before = spy.mock.calls.length;
+      renderMarkdown(md, { cache: false });
+      renderMarkdown(md, { cache: false });
+      expect(spy.mock.calls.length).toBe(before + 2); // re-parsed both times, not cached
+      spy.mockRestore();
     });
   });
 });

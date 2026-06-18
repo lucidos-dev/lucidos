@@ -23,6 +23,8 @@ export function navigateTapLabel(to: NavigateUi): string {
       return 'View files';
     case 'apps':
       return 'View apps';
+    case 'app-store':
+      return 'Open app store';
     case 'triggers':
       return 'View triggers';
     case 'thread-queue':

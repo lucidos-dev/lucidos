@@ -126,14 +126,14 @@ describe('apply* functions mirror to localStorage for FOUC inline script', () =>
     applyTheme('light');
     expect(inlineProps['--bg-primary']).toBe('#ffffff');
     applyTheme('dark');
-    expect(inlineProps['--bg-primary']).toBe('#0d1117');
+    expect(inlineProps['--bg-primary']).toBe('#0b2342');
   });
 
   it('applyTheme sets html.style.background inline so the WebView has a paintable bg before global.css loads', () => {
     // See preferences.ts:applyTheme for why — iOS PWA cold-restart flash.
     const el = (document as any).documentElement;
     applyTheme('dark');
-    expect(el.style.background).toBe('#0d1117');
+    expect(el.style.background).toBe('#0b2342');
     applyTheme('light');
     expect(el.style.background).toBe('#ffffff');
   });

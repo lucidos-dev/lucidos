@@ -77,10 +77,27 @@ impl LucidosEngine {
         thread_id: Option<Uuid>,
     ) -> Vec<(String, String)> {
         use crate::core::oauth;
-        use crate::core::{CredentialStore, OAuthStore};
+        use crate::core::{CredentialStore, EnvironmentVariableStore, OAuthStore};
         use crate::runtime::lucidos_cli::{lucidos_cli_dir, workspace_script_env_vars};
 
-        let mut env_vars = workspace_script_env_vars(self.workspace_path(), lucidos_cli_dir());
+        // User-managed environment variables FIRST. Everything engine-owned
+        // below (workspace/PATH, PG*, origin token, host-protection, CRED_*,
+        // OAUTH_*) is appended after, and the spawn applies the pairs in order
+        // via `cmd.env`, so a user var can never override an engine-owned one
+        // (`env_pairs` also drops reserved names as a second backstop).
+        let mut env_vars: Vec<(String, String)> = Vec::new();
+        match EnvironmentVariableStore::env_pairs(&self.pool).await {
+            Ok(pairs) => env_vars.extend(pairs),
+            Err(e) => log!(
+                "[Python] Failed to load user environment variables for env injection: {}",
+                e
+            ),
+        }
+
+        env_vars.extend(workspace_script_env_vars(
+            self.workspace_path(),
+            lucidos_cli_dir(),
+        ));
 
         // PG* env so spawned scripts can run `psql -c '…'` bare. Keeps the
         // password out of argv (which we capture into events) — see

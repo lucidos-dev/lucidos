@@ -2,6 +2,7 @@ import {
   mobileView, setMobileView, splitRatio, threadDrawerOpen, threadDrawerWidth,
   DEFAULT_DRAWER_WIDTH, THREAD_DRAWER_WIDTH_KEY,
   MOBILE_VIEWS, PANE_INDEX, PANE_COUNT, type MobileView,
+  focusedPane, type FocusedPane,
 } from '../store';
 import { forceCloseDrawer } from '../../components/layout/Drawer';
 import {
@@ -11,6 +12,16 @@ import {
   KEYBOARD_RESIZE_STEP_PX, MIN_THREAD_PANE_PX, MIN_CONTENT_PANE_PX,
 } from '../../components/layout/splitHelpers';
 import { isMobile } from '../../utils/viewport';
+import { focusPaneMainControl } from '../../components/layout/paneFocus';
+
+/** Set the focused pane AND move real DOM focus into it. Used by the keyboard
+ *  toggles/shortcuts so "focus pane" actually lands focus on the pane's main
+ *  control (and Tab then cycles within it). The pointer-down path uses the
+ *  signal-only `focusPane` instead — a click already places its own focus. */
+function focusPaneAndControl(pane: FocusedPane): void {
+  focusedPane.value = pane;
+  focusPaneMainControl(pane);
+}
 
 /** Clamp a pane index + delta to valid bounds and return the target MobileView.
  *  Returns null if the result is the same as the current pane. */
@@ -51,11 +62,25 @@ export function revealContentPane() {
   }
 }
 
-/** Toggle the thread list visibility.
+/** Move desktop pane focus. No-op on mobile, where panes are navigated, not
+ *  focused. Called on a pointer-down inside a pane so the focus indicator always
+ *  tracks where the user is actually working, and by the two-stage toggles. */
+export function focusPane(pane: FocusedPane): void {
+  if (isMobile()) return;
+  focusedPane.value = pane;
+}
+
+/** Show or hide the thread list (drawer). A plain visibility toggle — unlike the
+ *  pane toggles below it does NOT move pane focus: opening the drawer reveals it
+ *  without stealing keyboard focus, so the icon is purely show/hide.
  *
- *  - **Mobile**: navigates to threads pane (pane 0) so that dots, header, and
+ *  - **Mobile**: navigates to the threads pane (pane 0) so dots, header, and
  *    pane content all update atomically via the `mobileView` signal.
- *  - **Desktop**: toggles `threadDrawerOpen` (drawer overlay in split layout).
+ *  - **Desktop**: flips `threadDrawerOpen`. When hiding a drawer that currently
+ *    holds focus, focus falls back to the thread pane it was overlaying — a
+ *    hidden pane must never stay the focused pane or the focus wash strands on an
+ *    invisible region. That fix-up is signal-only; no DOM focus is moved, so the
+ *    toggle never lands keyboard focus on a pane the way the old focus stage did.
  *
  *  This is the ONLY correct way for UI elements to show/hide the thread list.
  *  Never toggle `threadDrawerOpen` directly on mobile — it bypasses mobileView
@@ -63,32 +88,55 @@ export function revealContentPane() {
 export function toggleThreads() {
   if (isMobile()) {
     navigateToPane('threads');
-  } else {
-    threadDrawerOpen.value = !threadDrawerOpen.value;
+    return;
+  }
+  threadDrawerOpen.value = !threadDrawerOpen.value;
+  if (!threadDrawerOpen.value && focusedPane.value === 'drawer') {
+    focusedPane.value = 'thread';
   }
 }
 
-/** Collapse/expand the thread pane. Desktop: same semantics as double-clicking
- *  the content-side header — collapsed restores to DEFAULT_SPLIT_RATIO, visible
+/** Collapse/expand the thread pane with two-stage focus → hide. Desktop: a
+ *  collapsed pane expands to DEFAULT_SPLIT_RATIO and takes focus; a
+ *  visible-but-unfocused pane just takes focus; a focused, visible pane
  *  collapses to 0 (the drawer hides with it and restores on expand, see
- *  SplitLayout's drawerVisible). Mobile: swipe to the thread pane instead —
- *  panes there are navigated, not collapsed. */
+ *  SplitLayout's drawerVisible) and focus falls to the content pane that fills
+ *  the gap. Mobile: swipe to the thread pane instead — panes there are
+ *  navigated, not collapsed. */
 export function toggleThreadPane(): void {
   if (isMobile()) {
     navigateToPane('thread');
     return;
   }
-  setSplitRatio(toggleThreadPaneRatio(splitRatio.value));
+  if (splitRatio.value === 0) {
+    setSplitRatio(toggleThreadPaneRatio(splitRatio.value)); // expand
+    focusPaneAndControl('thread');
+  } else if (focusedPane.value !== 'thread') {
+    focusPaneAndControl('thread');
+  } else {
+    setSplitRatio(toggleThreadPaneRatio(splitRatio.value)); // collapse
+    focusPaneAndControl('content');
+  }
 }
 
-/** Collapse/expand the content pane. Desktop mirror of toggleThreadPane
- *  (thread-side header double-click). Mobile: swipe to the content pane. */
+/** Collapse/expand the content pane. Desktop mirror of toggleThreadPane: a
+ *  collapsed pane (ratio >= 1) expands and takes focus; a visible-but-unfocused
+ *  pane just takes focus; a focused, visible pane collapses and focus falls to
+ *  the thread pane that fills the gap. Mobile: swipe to the content pane. */
 export function toggleContentPane(): void {
   if (isMobile()) {
     navigateToPane('content');
     return;
   }
-  setSplitRatio(toggleContentPaneRatio(splitRatio.value));
+  if (splitRatio.value >= 1) {
+    setSplitRatio(toggleContentPaneRatio(splitRatio.value)); // expand
+    focusPaneAndControl('content');
+  } else if (focusedPane.value !== 'content') {
+    focusPaneAndControl('content');
+  } else {
+    setSplitRatio(toggleContentPaneRatio(splitRatio.value)); // collapse
+    focusPaneAndControl('thread');
+  }
 }
 
 /** Keyboard resize: move the split divider by one KEYBOARD_RESIZE_STEP_PX step.

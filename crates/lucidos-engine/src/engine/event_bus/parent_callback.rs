@@ -146,13 +146,13 @@ impl EventBus {
             return;
         }
 
-        // Claude Code sessions can terminate without ever emitting CodingAgentIdled or
+        // Coding-agent sessions can terminate without ever emitting CodingAgentIdled or
         // SessionEnded — e.g. the user cancels and the session sits archived,
         // leaving only ResponseCanceled (or a terminal-cause ResponseAborted
         // from a SafetyNet / ProcessKilled crash) as the signal. The
         // `!callback_already_sent` guard collapses multiple terminal events
         // for the same child to a single decrement. ResponseFailed sits in
-        // the gated set too: a failing CC turn typically emits ResponseFailed
+        // the gated set too: a failing coding-agent turn typically emits ResponseFailed
         // immediately followed by CodingAgentIdled, and ResponseFailed's
         // `should_callback` branch marks callback_sent — so the follow-up
         // Idled early-returns via the dedup guard and never decrements. Add
@@ -187,9 +187,9 @@ impl EventBus {
         // "Canceled" card and the LLM learns the child was stopped.
         // ResponseAborted is NOT — the user already sees the child's error
         // state (SafetyNet/ProcessKilled), and engine-shutdown aborts are
-        // transient (and were filtered out above). For CC children,
+        // transient (and were filtered out above). For coding-agent children,
         // SessionEnded also counts when no prior callback was sent — handles
-        // Claude Code sessions that end without ever idling.
+        // coding-agent sessions that end without ever idling.
         let should_callback = matches!(
             (is_coding_agent, event),
             (true, ThreadEvent::CodingAgentIdled { .. })
@@ -515,6 +515,98 @@ impl EventBus {
                 e
             );
         }
+    }
+
+    /// Boot-recovery sweep that re-derives parent-resume wakes lost to an engine
+    /// restart (ADR 0011, weakness B1). The in-memory `ParentCallback` channel is
+    /// recreated empty on restart, so a child that completed while the engine was
+    /// down — or whose wake was queued but not yet consumed when it died — leaves
+    /// a persisted `ChildThreadCompleted` on the parent with no resume ever fired.
+    /// Without this sweep the fan-in strands permanently.
+    ///
+    /// Selection: every parent whose **latest persisted event is a
+    /// `ChildThreadCompleted`** — nothing came after the completion card, so the
+    /// parent never reacted. The moment a parent resumes it emits a fresh terminal
+    /// event with a higher sequence, so a processed completion is no longer the
+    /// latest event and is skipped; a resume that died mid-flight leaves a
+    /// `SessionStarted` / streamed token as the latest event and is handled by the
+    /// CC auto-resume recovery instead, not re-fired here. This makes the sweep
+    /// idempotent across boots via the event-id anchor, with no double-handling.
+    ///
+    /// Each candidate is re-injected onto the same `parent_callback_tx` the live
+    /// fan-in uses, so the already-running listener drains it through the exact
+    /// same `notify_parent_of_child_completion` path — the recovery duplicates no
+    /// resume logic, it only re-delivers the lost wake. Returns the number of
+    /// wakes re-fired (for the boot log). Mirrors
+    /// `propose_held_back_changes_on_startup`: the persisted event is the source
+    /// of truth, the in-memory wake is a cache rebuilt from it.
+    pub async fn refire_unprocessed_child_completions(&self) -> usize {
+        // `e.aggregate_id` is the parent thread id (text); `payload->>'child_thread_id'`
+        // is the child's uuid string. The JOIN drops parents whose summary row is
+        // gone (can't resume a parent with no row); `state IS DISTINCT FROM
+        // 'discarded'` (NULL-safe) skips a parent the user threw away while still
+        // selecting legacy NULL-state rows. The NOT EXISTS makes the card the
+        // thread's last word — scoped to `aggregate = 'thread'` to match
+        // `lookup_last_activity` and never let a same-id non-thread event suppress
+        // a real fan-in. See the selection rationale above.
+        let rows: Vec<(Uuid, String, Option<String>, bool)> = match sqlx::query_as(
+            "SELECT e.id, e.aggregate_id, e.payload->>'child_thread_id', p.is_coding_agent \
+             FROM events e \
+             JOIN thread_summaries p ON p.thread_id = e.aggregate_id::uuid \
+             WHERE e.event_type = 'ChildThreadCompleted' \
+               AND p.state IS DISTINCT FROM 'discarded' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM events later \
+                 WHERE later.aggregate = 'thread' \
+                   AND later.aggregate_id = e.aggregate_id \
+                   AND later.sequence > e.sequence \
+               )",
+        )
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                crate::log!(
+                    "[FanOut] refire_unprocessed_child_completions query failed: {} — \
+                     skipping recovery sweep this boot",
+                    e
+                );
+                return 0;
+            }
+        };
+
+        let mut refired = 0usize;
+        for (event_id, parent_str, child_str, parent_is_coding_agent) in rows {
+            let (Ok(parent_id), Some(Ok(child_id))) = (
+                parent_str.parse::<Uuid>(),
+                child_str.as_deref().map(str::parse::<Uuid>),
+            ) else {
+                crate::log!(
+                    "[FanOut] Skipping unprocessed ChildThreadCompleted {} — \
+                     malformed parent ({:?}) or child ({:?}) id",
+                    event_id,
+                    parent_str,
+                    child_str
+                );
+                continue;
+            };
+            crate::log!(
+                "[FanOut] Re-firing lost parent wake: child {} completed, parent {} never resumed (event {})",
+                child_id,
+                parent_id,
+                event_id
+            );
+            self.send_parent_callback(parent_id, child_id, event_id, parent_is_coding_agent);
+            refired += 1;
+        }
+        if refired > 0 {
+            crate::log!(
+                "[FanOut] Re-fired {} unprocessed child-completion wake(s) lost to engine restart",
+                refired
+            );
+        }
+        refired
     }
 
     fn send_parent_callback(

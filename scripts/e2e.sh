@@ -54,6 +54,15 @@ echo ""
 echo "═══════════════════════════════════════════════════"
 echo "  Running browser e2e tests"
 echo "═══════════════════════════════════════════════════"
+# The API phase populated the workspace DB with throwaway threads. The browser
+# phase's FIRST project (mobile-webkit) deliberately skips its own DB reset on
+# the assumption the workspace was just freshly booted (see e2e-browser.sh —
+# only projects 2+ reset). Under this umbrella that assumption is false: the API
+# phase ran first, so mobile-webkit would inherit hundreds of API-phase threads
+# and fail drawer-order-sensitive specs (e.g. threads.spec.ts "thread loads with
+# correct messages when clicked" picked an API thread as the first drawer row).
+# Reset here so mobile-webkit gets the clean DB it expects.
+reset_e2e_database
 "$SCRIPT_DIR/e2e-browser.sh"
 
 echo ""

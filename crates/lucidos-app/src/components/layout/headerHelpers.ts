@@ -1,5 +1,6 @@
-import { activeMenuItem, panelOverlay, activeInlineForm, panelUrl, panelTitle, settingsSubview, SETTINGS_NAV_ITEMS, triggers, appsList, parseRepoPath, repoPending, selectedChange, wipPreviewThreadId, threadMap } from '../../store/store';
+import { activeMenuItem, panelOverlay, activeInlineForm, panelUrl, panelTitle, settingsSubview, settingsSubviewLabel, triggers, appsList, parseRepoPath, repoPending, selectedChange, wipPreviewThreadId, threadMap } from '../../store/store';
 import { CODING_AGENT_CHANNEL, type ThreadChannel, type InlineForm } from '../../store/store';
+import type { NavEntry } from '../../store/actions/navigation';
 import { loadedOr } from '../../store/types';
 import { formatChannel } from '../../utils/formatChannel';
 import { PENDING_TITLE_PLACEHOLDER } from '../../store/thread-events';
@@ -67,9 +68,65 @@ export function getContentTitle(): string {
   }
   if (overlay?.type === 'url-preview') return pageTitle || getHostname(url!);
   if (!overlay && active === 'settings' && settingsSubview.value !== 'main') {
-    return SETTINGS_NAV_ITEMS.find(i => i.key === settingsSubview.value)?.label || '';
+    return settingsSubviewLabel(settingsSubview.value) || '';
   }
   return menuLabels[active] || '';
+}
+
+/** Title for an arbitrary captured `NavEntry` — the rows in the back/forward
+ *  long-press history menu. Mirrors `getContentTitle` but reads the entry's own
+ *  fields instead of the live signals (so past entries label correctly), and
+ *  falls back to the host name for url-preview entries since the live page
+ *  <title> isn't captured in history. */
+export function navEntryTitle(entry: NavEntry): string {
+  const overlay = entry.overlay;
+  if (overlay?.type === 'form') return getFormTitle(overlay.form);
+  if (overlay?.type === 'app-ui') {
+    const wip = entry.wipPreviewThreadId;
+    if (wip) {
+      const wipTitle = threadMap.value.get(wip)?.meta.title;
+      if (wipTitle && wipTitle !== PENDING_TITLE_PLACEHOLDER) return `${overlay.app.name} (WIP by ${wipTitle})`;
+      if (wipTitle) return `${overlay.app.name} (WIP)`;
+    }
+    return overlay.app.name;
+  }
+  if (overlay?.type === 'file-preview') return overlay.path.split('/').pop() || overlay.path;
+  if (overlay?.type === 'url-preview') return getHostname(overlay.url);
+  if (overlay?.type === 'notification-detail') return overlay.notification.title || 'Notification';
+  if (!overlay && entry.menuItem === 'settings' && entry.settingsSubview !== 'main') {
+    return settingsSubviewLabel(entry.settingsSubview) || 'Settings';
+  }
+  return menuLabels[entry.menuItem] || entry.menuItem;
+}
+
+/** Content-pane category for a captured `NavEntry` — drives the icon shown
+ *  beside each row in the content back/forward history menu (PanelNav). Mirrors
+ *  `navEntryTitle`'s branching, mapping every destination to one of the
+ *  Search Everywhere content categories (plus the content-pane-only ones:
+ *  `notifications`, `thread-queue`, `web`). The bare menu items already share
+ *  their names with the category icons, so the no-overlay case returns the
+ *  menu item verbatim; anything unmapped falls through to the icon's default. */
+export function navEntryCategory(entry: NavEntry): string {
+  const overlay = entry.overlay;
+  if (overlay?.type === 'form') {
+    switch (overlay.form.type) {
+      case 'trigger': return 'triggers';
+      case 'app-edit':
+      case 'new-app': return 'apps';
+      case 'credential':
+      case 'email-confirm':
+      case 'plugin-install':
+      case 'plugin-uninstall': return 'settings';
+    }
+  }
+  if (overlay?.type === 'app-ui') return 'apps';
+  if (overlay?.type === 'file-preview') return 'files';
+  if (overlay?.type === 'url-preview') return 'web';
+  if (overlay?.type === 'notification-detail') return 'notifications';
+  // No overlay → the active menu item is the destination; its name is also the
+  // category icon's key (files / apps / triggers / thread-queue / settings /
+  // changes / notifications).
+  return entry.menuItem;
 }
 
 export function getDiffDescription(): string | null {

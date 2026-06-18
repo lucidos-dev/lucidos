@@ -20,6 +20,8 @@ use super::lucidos_cli::path_with_prefix;
 /// Stamp the agent-independent Lucidos env contract onto `cmd`.
 ///
 /// Covers, in order:
+/// - User-managed env vars (`args.user_env_vars`) — applied first so every
+///   engine-owned var below wins a collision. See `SpawnArgs::user_env_vars`.
 /// - `LUCIDOS_WORKSPACE` — workspace resolution for the `lucidos` CLI.
 /// - Host-process protection (`LUCIDOS_HOST_PID` + friends) — see
 ///   `api::actor::host_protection_env_vars`.
@@ -38,6 +40,12 @@ pub(super) fn apply_lucidos_env(
     cli_dir: Option<&Path>,
     log_label: &str,
 ) {
+    // User-managed env vars FIRST so every engine-owned var below overrides on
+    // collision (e.g. a user `LUCIDOS_REPO` is replaced by the spawn's repo
+    // context). The pairs are already reserved-name-filtered by `env_pairs`.
+    for (key, value) in args.user_env_vars {
+        cmd.env(key, value);
+    }
     cmd.env("LUCIDOS_WORKSPACE", args.workspace_path);
     for (key, value) in crate::api::actor::host_protection_env_vars(args.workspace_path) {
         cmd.env(key, value);

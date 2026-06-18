@@ -1,5 +1,5 @@
-import { test, expect, Page, Locator } from '@playwright/test';
-import { navigateToApp, assertHealthy, clickVisibleElement, isMobileViewport } from './helpers';
+import { test, expect, Page, Locator } from './fixtures';
+import { navigateToApp, assertHealthy, addTriggerCard, openTriggersPanel } from './helpers';
 
 /** The trigger form's "Allowed side-effects" round-trip (ADR 0002, Phase 5).
  *  Ticking a couple of side-effect checkboxes, saving, then reloading and
@@ -13,41 +13,10 @@ const EMAIL_LABEL = 'Send email or messages';
 const CLOUD_LABEL = 'Cloud CLI mutations (gh / aws / gcloud)';
 const EXTERNAL_LABEL = 'Call external APIs (mutating HTTP)';
 
-/** Navigate to the Triggers panel. The nav drawer (with the menu items) is
- *  hidden by default on BOTH layouts and opened via the `.hamburger-panel`
- *  toggle, so open it first, then click 'Triggers'. On mobile the hamburger
- *  lives on the content pane, so swipe there first. Finally waits for the
- *  panel's "Add Trigger" card so callers never click a still-loading list. */
-async function openTriggersPanel(page: Page): Promise<void> {
-  if (isMobileViewport(page)) {
-    await page.evaluate(() => {
-      const dot = document.querySelector('button.mobile-dot[aria-label="content view"]');
-      if (dot) (dot as HTMLElement).click();
-    });
-    await page.waitForTimeout(300);
-  }
-  await clickVisibleElement(page, '.hamburger-panel');
-  await page.waitForFunction(() => {
-    const items = document.querySelectorAll('.drawer-item');
-    return Array.from(items).some(el => {
-      const rect = el.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0;
-    });
-  }, undefined, { timeout: 5_000 });
-  await clickVisibleElement(page, '.drawer-item', 'Triggers');
-  // The Add Trigger card only renders once the triggers list has loaded — wait
-  // for it so the create flow doesn't race the projection fetch.
-  await expect(addTriggerCard(page)).toBeVisible({ timeout: 10_000 });
-}
-
 /** The visible copy of the inline trigger form (ContentPane renders one for
  *  desktop + one for mobile; only one is on-screen at a time). */
 function visibleForm(page: Page): Locator {
   return page.locator('.inline-form:visible').first();
-}
-
-function addTriggerCard(page: Page): Locator {
-  return page.locator('.list-row-add-card:visible', { hasText: 'Add Trigger' }).first();
 }
 
 /** The label row for a side-effect identified by its text. */

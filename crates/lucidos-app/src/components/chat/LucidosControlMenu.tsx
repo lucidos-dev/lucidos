@@ -4,7 +4,8 @@ import { currentModel, reasoningEffort, chatModels, showToast } from '../../stor
 import { chatModelOptions, loadChatModels } from '../../store/actions/models';
 import { availableReasoningLevels } from '../../store/models';
 import { setCurrentModel, setReasoningEffort } from '../../store/actions/preferences';
-import { LUCIDOS_AGENT_ICON, LUCIDOS_AGENT_LABEL, displayModelName } from '../../store/thread-events';
+import { LUCIDOS_AGENT_LABEL, displayModelName } from '../../store/thread-events';
+import { LucidosMark } from '../shared/LucidosMark';
 import { Overlay } from '../shared/Overlay';
 import { focusIfNeeded } from './promptFocus';
 
@@ -189,6 +190,11 @@ export function LucidosControlMenu() {
   return (
     <div class="control-menu" data-row-item ref={menuRef}>
       <button
+        // `lucidos-commands-btn` is the marker that distinguishes the Lucidos
+        // Agent model picker from the coding-agent control button (both share
+        // the `commands-btn` base style). Surfaces that need only the
+        // coding-agent control — e.g. the `.commands-btn:not(.lucidos-commands-btn)`
+        // e2e selector — rely on it, so keep it on this button.
         class="icon-btn commands-btn lucidos-commands-btn"
         data-tooltip={`${LUCIDOS_AGENT_LABEL} model`}
         aria-label={`${LUCIDOS_AGENT_LABEL} model`}
@@ -197,7 +203,7 @@ export function LucidosControlMenu() {
           else openMenu();
         }}
       >
-        <span class="lucidos-agent-glyph" aria-hidden="true">{LUCIDOS_AGENT_ICON}</span>
+        <span class="lucidos-agent-glyph"><LucidosMark size="var(--icon-size-md)" /></span>
       </button>
       <Overlay
         open={open.value}

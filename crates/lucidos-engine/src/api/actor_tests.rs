@@ -650,6 +650,55 @@ fn host_protection_env_vars_omits_api_port_when_engine_has_none() {
 }
 
 #[test]
+fn host_protection_env_vars_adds_loopback_base_url_under_gateway() {
+    // Under the workspace gateway (ADR 0013) the engine binds a LOOPBACK port
+    // and serves plain HTTP — the gateway terminates TLS and routes the
+    // workspace under `/ws/<id>/`. A subprocess that builds its URL from
+    // `.lucidos/ports` (the gateway port, no `/ws/<id>/` prefix) gets the
+    // picker's SPA HTML back instead of JSON. The engine hands same-host
+    // subprocesses the exact loopback base URL so the `lucidos` CLI and scripts
+    // reach the engine directly.
+    let _guard = API_PORT_ENV_LOCK.lock().unwrap();
+    let workspace = tempfile::tempdir().expect("tempdir");
+    // SAFETY: process-wide env mutation gated by API_PORT_ENV_LOCK.
+    unsafe {
+        std::env::set_var("LUCIDOS_API_PORT", "62072");
+        std::env::set_var("LUCIDOS_BIND_LOOPBACK", "1");
+    }
+    let vars = host_protection_env_vars(workspace.path());
+    unsafe {
+        std::env::remove_var("LUCIDOS_API_PORT");
+        std::env::remove_var("LUCIDOS_BIND_LOOPBACK");
+    }
+    assert_eq!(
+        host_pid_var(&vars, "LUCIDOS_API_BASE_URL"),
+        Some("http://127.0.0.1:62072"),
+        "loopback engine base URL must be handed to subprocesses under the gateway"
+    );
+}
+
+#[test]
+fn host_protection_env_vars_omits_base_url_without_gateway() {
+    // Legacy / Tauri / production: the engine listens on the user-facing port
+    // and the `.lucidos/ports` file resolves it correctly, so no override is
+    // handed down. `LUCIDOS_BIND_LOOPBACK` is set ONLY by the gateway.
+    let _guard = API_PORT_ENV_LOCK.lock().unwrap();
+    let workspace = tempfile::tempdir().expect("tempdir");
+    unsafe {
+        std::env::set_var("LUCIDOS_API_PORT", "5173");
+        std::env::remove_var("LUCIDOS_BIND_LOOPBACK");
+    }
+    let vars = host_protection_env_vars(workspace.path());
+    unsafe {
+        std::env::remove_var("LUCIDOS_API_PORT");
+    }
+    assert!(
+        host_pid_var(&vars, "LUCIDOS_API_BASE_URL").is_none(),
+        "no base-URL override outside the gateway (the ports file resolves the engine)"
+    );
+}
+
+#[test]
 fn build_origin_subprocess_overrides_human_to_agent_api() {
     // The actual incident: agent shells out `curl -X POST /api/v1/changes/X/apply`.
     // No body, no `mode` field — handler defaults to ActorMode::Human.

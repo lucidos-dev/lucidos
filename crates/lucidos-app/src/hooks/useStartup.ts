@@ -33,6 +33,8 @@ import {
 import { dispatchDeepLink } from '../store/actions/in-app-notification-toast';
 import { setupHashDeeplinkRouting } from '../store/actions/hash-deeplink-router';
 import { reportStartupKind, startLivenessTracking } from '../utils/liveness';
+import { isKnownAppFrame } from '../utils/appFrame';
+import { withBase, SCOPE_PATH } from '../utils/basePath';
 
 const CONNECTION_POLL_INTERVAL = 5000;
 // Catches Chrome's idle-SW LRU eviction (Chromium issue #370536109:
@@ -199,7 +201,10 @@ export function useStartup(): void {
       // controller, so after register() this would always be true.
       const hadController = !!navigator.serviceWorker.controller;
 
-      navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' })
+      // Base-path aware (ADR 0014): behind the gateway the SW is served at
+      // /<slug>/sw.js and scoped to /<slug>/, so each workspace is an
+      // independent PWA cache + push scope.
+      navigator.serviceWorker.register(withBase('/sw.js'), { scope: SCOPE_PATH, updateViaCache: 'none' })
         .then((reg) => {
           refreshPushSubscription(reg);
         })
@@ -360,10 +365,7 @@ export function useStartup(): void {
       // Reject messages from any iframe that isn't a current app iframe,
       // so nested iframes (embeds, ads) can't trigger host modals.
       const source = event.source as Window | null;
-      if (!source) return;
-      const frames = document.querySelectorAll<HTMLIFrameElement>('iframe[data-role="app-ui-frame"]');
-      const known = Array.from(frames).some((f) => f.contentWindow === source);
-      if (!known) return;
+      if (!source || !isKnownAppFrame(source)) return;
 
       const title = typeof payload.title === 'string' ? payload.title : undefined;
       const okLabel = typeof payload.okLabel === 'string' && payload.okLabel.length > 0 ? payload.okLabel : 'Confirm';

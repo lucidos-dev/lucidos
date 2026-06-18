@@ -42,7 +42,7 @@ describe('CC thread follow-up: channel detection', () => {
     map.set('cc-1', ccThread);
 
     // The frontend's sendMessage checks existingThread?.meta.channel === 'claude_code'
-    // to decide whether to set use_claude_code: true on follow-up messages
+    // to decide whether to set use_coding_agent: true on follow-up messages
     const existingThread = map.get('cc-1');
     expect(existingThread?.meta.channel).toBe('claude_code');
 
