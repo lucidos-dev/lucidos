@@ -1,8 +1,8 @@
 import { useEffect, useCallback, useMemo } from 'preact/hooks';
 import type { DiffFile, RepoDiff } from '../../store/store';
-import { selectedLines, repoDiff, repoPending, filePreviewSource, openImagePopup, repoSelectedChangeId } from '../../store/store';
+import { selectedLines, repoDiff, repoPending, filePreviewSource, diffWholeFile, openImagePopup, repoSelectedChangeId } from '../../store/store';
 import type { Loadable } from '../../store/types';
-import { getRepoFileContent } from '../../api/client';
+import { getRepoFileContent, getChangeFileContent } from '../../api/client';
 import { loadChangeContextById } from '../../store/actions/repositories';
 import { highlightFileLines, CODE_EXTS } from '../../utils/syntaxHighlight';
 import { escapeHtml } from '../../utils/escapeHtml';
@@ -47,6 +47,17 @@ export function shouldRenderMarkdownDiff(opts: {
   if (opts.ext !== 'md') return false;
   if (opts.fileStatus === 'deleted') return false;
   return !!opts.activeChangeId || !!opts.branchRef;
+}
+
+/** Whether the diff preview should show the whole merged end-state file instead
+ *  of the unified hunks. A deletion has no end state, so the whole-file view is
+ *  suppressed for deleted files even when the toggle is on. */
+export function shouldShowWholeFile(opts: {
+  wholeFileOn: boolean;
+  fileStatus: DiffFile['status'];
+}): boolean {
+  if (!opts.wholeFileOn) return false;
+  return opts.fileStatus !== 'deleted';
 }
 
 /** `hidden` covers both not-loaded and loaded-with-zero-files — the inner
@@ -132,6 +143,17 @@ function RepoFilePreview({ repoId, mode, path, changeId, layout }: Props) {
     const ext = path.split('.').pop()?.toLowerCase() || '';
     const activeChangeId = changeId ?? repoSelectedChangeId.value;
     const branchRef = repoPending.value?.branch_name ?? null;
+
+    // Whole-file mode: show the file as it would be once merged (end state),
+    // rendered like the All Files view. A deletion has no end state.
+    const wholeFileOn = diffWholeFile.value;
+    if (wholeFileOn) {
+      if (shouldShowWholeFile({ wholeFileOn, fileStatus: file.status })) {
+        return <RepoFileContent repoId={repoId} path={path} changeId={activeChangeId ?? undefined} />;
+      }
+      return <div class="empty-state">File is deleted in this change — no end state to show</div>;
+    }
+
     if (shouldRenderMarkdownDiff({
       ext,
       fileStatus: file.status,
@@ -147,11 +169,16 @@ function RepoFilePreview({ repoId, mode, path, changeId, layout }: Props) {
   return <RepoFileContent repoId={repoId} path={path} />;
 }
 
-function RepoFileContent({ repoId, path }: { repoId: string; path: string }) {
+function RepoFileContent({ repoId, path, changeId }: { repoId: string; path: string; changeId?: string }) {
   const gitRef = repoPending.value?.branch_name;
+  // With a Lucidos/app change row, fetch the end state via /changes/:id/file —
+  // the correct ref for both pending (branch) and applied (post_merge_sha). Without
+  // one (external-repo CC), fall back to the branch ref. Mirrors RenderedDiff.
   const { loadable, showLoading } = useLoadableFetch<string>(
-    () => getRepoFileContent(repoId, path, gitRef ?? undefined),
-    [repoId, path, gitRef],
+    () => changeId
+      ? getChangeFileContent(changeId, path)
+      : getRepoFileContent(repoId, path, gitRef ?? undefined),
+    [repoId, path, changeId, gitRef],
   );
 
   const handleLineClick = useCallback((lineNum: number, shiftKey: boolean) => {

@@ -49,6 +49,11 @@ export interface ChangesState {
   restart_groups: ApiRestartGroup[];
   client_update_available: boolean;
   has_more_applied: boolean;
+  /** True when an Apply All batch is live on the engine. Lets a reloaded page
+   *  rehydrate the sticky "Applying changes…" toast — the driving
+   *  `applyAllInProgress` signal resets on reload and the ApplyAllBatch* SSE
+   *  events aren't replayed. */
+  apply_all_in_progress: boolean;
 }
 
 export async function fetchChanges(params?: {

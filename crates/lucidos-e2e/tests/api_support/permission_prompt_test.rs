@@ -3,9 +3,10 @@
 //!
 //! Drives the endpoint with HTTP only — no MCP subprocess required. The
 //! handler:
-//!   1. Registers a oneshot in `Engine.pending_mcp_consent` keyed by request_id.
+//!   1. Registers a deduped entry in `Engine.pending_cc_permission` keyed by
+//!      request_id (and `(thread, tool, input)` for dedup).
 //!   2. Emits `CodingAgentPermissionRequest` (persisted) with that request_id.
-//!   3. Blocks until POST /api/v1/mcp/consent resolves the oneshot, then emits
+//!   3. Blocks until POST /api/v1/mcp/consent resolves the entry, then emits
 //!      `CodingAgentPermissionResolved` and returns `{ allowed, reason? }`.
 
 use crate::support::{base_url, db_url, http_client, seed_cc_thread_summary};

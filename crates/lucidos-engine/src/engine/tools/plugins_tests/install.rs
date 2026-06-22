@@ -353,6 +353,76 @@ async fn install_omits_setup_section_when_manifest_has_no_setup() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+// ---- Pure setup-change detection (drives confirm's spawn gate) --------
+
+#[test]
+fn normalize_setup_trims_and_collapses_empty() {
+    assert_eq!(normalize_setup(None), None);
+    assert_eq!(normalize_setup(Some("")), None);
+    assert_eq!(normalize_setup(Some("   \n\t ")), None);
+    assert_eq!(normalize_setup(Some("  do x  ")), Some("do x".to_string()));
+}
+
+#[test]
+fn setup_is_new_skips_when_new_version_has_no_setup() {
+    // No setup in the new version → never spawn, regardless of prior.
+    assert!(!setup_is_new(None, None));
+    assert!(!setup_is_new(None, Some("wire up the key")));
+    assert!(!setup_is_new(Some("   "), Some("wire up the key")));
+}
+
+#[test]
+fn setup_is_new_spawns_on_fresh_install_with_setup() {
+    // Fresh install (no prior) or prior had no setup → new setup work.
+    assert!(setup_is_new(Some("wire up the key"), None));
+    assert!(setup_is_new(Some("wire up the key"), Some("   ")));
+}
+
+#[test]
+fn setup_is_new_skips_unchanged_update_but_spawns_on_change() {
+    // Identical setup (incl. whitespace-only diffs) → no re-run on update.
+    assert!(!setup_is_new(Some("wire up the key"), Some("wire up the key")));
+    assert!(!setup_is_new(
+        Some("  wire up the key  "),
+        Some("wire up the key")
+    ));
+    // Genuinely-changed setup → spawn.
+    assert!(setup_is_new(
+        Some("wire up the key AND the secret"),
+        Some("wire up the key")
+    ));
+}
+
+#[test]
+fn setup_thread_request_is_a_subthread_bound_to_the_advertised_id() {
+    // Regression: the setup thread must be a SubThread (so the queue's
+    // `prepare` step eager-emits MessageReceived and the thread materializes
+    // before confirm returns) bound to the SAME id recorded in PluginInstalled
+    // / returned to the frontend — NOT an AgentChat (which never materialized
+    // the thread and paired a Device origin with ActorMode::Agent, panicking
+    // make_message_received). The bound id is what the frontend navigates to.
+    let tid = uuid::Uuid::new_v4();
+    let req = build_setup_thread_request(tid, "Super Slides", "0.3.1", "Wire up the API key.");
+    match req {
+        crate::engine::thread_queue::ThreadQueueRequest::SubThread {
+            child_thread_id,
+            title,
+            prompt,
+            pre_emitted_origin,
+            ..
+        } => {
+            assert_eq!(child_thread_id, tid, "must bind the advertised setup_thread_id");
+            assert_eq!(title.as_deref(), Some("Set up Super Slides"));
+            assert!(pre_emitted_origin.is_none());
+            assert!(
+                prompt.contains("Wire up the API key.") && prompt.contains("v0.3.1"),
+                "prompt must carry the verbatim setup text + version, got: {prompt:?}"
+            );
+        }
+        other => panic!("setup thread must be a SubThread, got: {other:?}"),
+    }
+}
+
 // ---- DB-backed regression + lifecycle tests --------------------------
 //
 // These exercise the live `EventBus` + `latest_install` path that the four

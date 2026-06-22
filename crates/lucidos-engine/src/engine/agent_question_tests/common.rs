@@ -31,6 +31,7 @@ pub(crate) fn make_session(process_exited: bool) -> AgentSession {
         requires_restart: false,
         pending_stop: None,
         cancel_actor: None,
+        redirect_followup: false,
         stop: Arc::new(tokio::sync::Notify::new()),
         interrupt: Arc::new(tokio::sync::Notify::new()),
         idle_notify: Arc::new(tokio::sync::Notify::new()),

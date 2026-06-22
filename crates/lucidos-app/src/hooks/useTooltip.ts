@@ -391,8 +391,20 @@ export function useTooltip() {
 
       if (touchMoved) return; // Swipe, not tap — ignore.
 
-      // Tap on an already-visible tooltip dismisses it.
-      if (currentTarget) { hide(); return; }
+      // Tap while a tooltip is showing dismisses it — and, like a modal/overlay
+      // dismiss, swallows the same tap so it doesn't ALSO activate whatever sits
+      // under the finger (open the thread, fire a row action). The tooltip was
+      // revealed by an explicit long-press, so the next tap means "close this",
+      // not "close it AND press what's behind it".
+      //
+      // Two swallows are needed because targets activate on different events:
+      //   - stopPropagation() here (we run at the document CAPTURE phase, before
+      //     the target's own bubble-phase onTouchEnd) kills buttons that act on
+      //     touchend and preventDefault() the synthetic click — everything using
+      //     composeHandlers (the compose icon), which a click-only swallow misses.
+      //   - armClickSwallow() catches the synthetic click for the remaining,
+      //     click-activated targets (plain thread rows, links).
+      if (currentTarget) { e.stopPropagation(); hide(); armClickSwallow(); return; }
 
       // Elements with data-tooltip-tap opt into tap-to-show on touch devices.
       const target = findTarget(e.target);

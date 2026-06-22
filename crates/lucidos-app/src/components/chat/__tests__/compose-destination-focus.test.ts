@@ -13,7 +13,6 @@ function destinationDeps() {
   return {
     apply: vi.fn(),
     focusPrompt: vi.fn(),
-    focusCodingAgent: vi.fn(),
     switchMenuItem: vi.fn(),
     openSettingsSubview: vi.fn(),
   };
@@ -27,18 +26,16 @@ describe('compose destination final selection focus', () => {
 
     expect(deps.apply).toHaveBeenCalledWith('thread-1', { kind: 'lucidos-agent' });
     expect(deps.focusPrompt).toHaveBeenCalledOnce();
-    expect(deps.focusCodingAgent).not.toHaveBeenCalled();
     expect(deps.switchMenuItem).not.toHaveBeenCalled();
   });
 
-  it('focuses the coding-agent picker after selecting a coding destination', () => {
+  it('focuses the prompt after selecting a coding destination', () => {
     const deps = destinationDeps();
 
     handleComposeDestinationSelection(null, 'code:lucidos', deps);
 
     expect(deps.apply).toHaveBeenCalledWith(null, { kind: 'coding', scope: { kind: 'lucidos' } });
-    expect(deps.focusPrompt).not.toHaveBeenCalled();
-    expect(deps.focusCodingAgent).toHaveBeenCalledOnce();
+    expect(deps.focusPrompt).toHaveBeenCalledOnce();
   });
 
   it('does not focus the prompt for the register-repository action row', () => {
@@ -48,7 +45,6 @@ describe('compose destination final selection focus', () => {
 
     expect(deps.apply).not.toHaveBeenCalled();
     expect(deps.focusPrompt).not.toHaveBeenCalled();
-    expect(deps.focusCodingAgent).not.toHaveBeenCalled();
     expect(deps.switchMenuItem).toHaveBeenCalledWith('settings');
     expect(deps.openSettingsSubview).toHaveBeenCalledWith('repositories');
   });

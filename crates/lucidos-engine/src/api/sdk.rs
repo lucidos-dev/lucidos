@@ -15,11 +15,29 @@ pub(super) async fn serve_sdk_js() -> Response {
     ([(header::CONTENT_TYPE, "application/javascript")], sdk_js).into_response()
 }
 
-/// Lucidos iframe theme stylesheet — design tokens (dark/light), defaults, scrollbars.
+/// Iframe-specific CSS: design tokens (dark/light), element defaults, the themed
+/// `lucidos.ui.Select`, the iframe-only `.action-btn-secondary`, and scrollbars.
 /// Apps include via `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">`.
 /// Theme switching is driven by `lucidos.ui.applyPreferences()` setting
 /// `data-theme` on `<html>`.
-pub(super) const SDK_IFRAME_CSS: &str = include_str!("sdk_iframe.css");
+const SDK_IFRAME_BASE_CSS: &str = include_str!("sdk_iframe.css");
+
+/// Lucidos's shared component layer — the SINGLE SOURCE OF TRUTH, shared with
+/// the host bundle. The host imports this exact file via `global.css`
+/// (`@import './global/shared-components.css'`); the engine appends it to the
+/// iframe CSS so apps render `.action-btn` / `.list-row` / `.markdown-content` /
+/// … identically to the host shell with no copy to keep in sync. `include_str!`
+/// bakes it into the engine binary at compile time (cross-crate path), so the
+/// packaged build carries it with no runtime file dependency.
+const SHARED_COMPONENTS_CSS: &str =
+    include_str!("../../../lucidos-app/src/styles/global/shared-components.css");
+
+/// The served `/api/v1/sdk-iframe.css` body — iframe tokens/defaults followed by
+/// the shared component layer. Concatenated once and cached.
+fn sdk_iframe_css() -> &'static str {
+    static CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CSS.get_or_init(|| format!("{SDK_IFRAME_BASE_CSS}\n{SHARED_COMPONENTS_CSS}"))
+}
 
 /// Audio unlock shim — monkey-patches `AudioContext` so app code reuses a
 /// shared, gesture-unlocked instance and survives iOS PWA background cycles.
@@ -27,11 +45,12 @@ pub(super) const SDK_IFRAME_CSS: &str = include_str!("sdk_iframe.css");
 /// it via `<script src="/api/v1/sdk-iframe-audio.js"></script>` early in `<head>`.
 pub(super) const SDK_IFRAME_AUDIO_JS: &str = include_str!("sdk_iframe_audio.js");
 
-/// GET /api/v1/sdk-iframe.css — serve the iframe theme stylesheet.
+/// GET /api/v1/sdk-iframe.css — serve the iframe stylesheet (iframe tokens/
+/// defaults + the shared component layer).
 pub(super) async fn serve_sdk_iframe_css() -> Response {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        SDK_IFRAME_CSS,
+        sdk_iframe_css(),
     )
         .into_response()
 }
@@ -118,6 +137,13 @@ pub(super) async fn ui_navigate(
         }
     }
     let payload = serde_json::Value::Object(payload);
+    log!(
+        @sdk,
+        "ui.navigate target={:?} app_id={:?} id={:?} (app-iframe, nil thread)",
+        payload.get("target").and_then(|v| v.as_str()),
+        payload.get("app_id").and_then(|v| v.as_str()),
+        payload.get("id").and_then(|v| v.as_str())
+    );
 
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
     if let Err(e) = state

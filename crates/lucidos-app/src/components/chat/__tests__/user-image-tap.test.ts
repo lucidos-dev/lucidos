@@ -21,10 +21,19 @@ const chatExchangeSource = readFileSync(resolve(here, '../ChatExchange.tsx'), 'u
  * nothing (broken on every platform, mobile just made it obvious).
  */
 describe('user-image-thumb tap opens popup', () => {
-  it('the <img class="user-image-thumb"> element has its own onClick attached', () => {
-    const match = source.match(/<img[\s\S]*?class="user-image-thumb"[\s\S]*?\/>/);
-    expect(match, 'user-image-thumb img element not found in chat-exchange-parts.tsx').not.toBeNull();
+  it('the <BlobImage class="user-image-thumb"> element has its own onClick attached', () => {
+    const match = source.match(/<BlobImage[\s\S]*?class="user-image-thumb"[\s\S]*?\/>/);
+    expect(match, 'user-image-thumb BlobImage element not found in chat-exchange-parts.tsx').not.toBeNull();
     expect(match![0]).toMatch(/onClick=/);
+  });
+
+  // Inline thumbnails render through BlobImage, not a bare <img>: a bare <img>
+  // that fails a transient load (engine restart / iOS PWA wake) stays broken
+  // forever, while BlobImage self-heals by re-requesting. The popup creating a
+  // fresh element is why "opening it works" but the inline preview didn't.
+  it('uses BlobImage (self-healing) for the inline user-image-thumb, not a bare <img>', () => {
+    expect(source).toMatch(/<BlobImage[\s\S]*?class="user-image-thumb"/);
+    expect(source).not.toMatch(/<img[\s\S]*?class="user-image-thumb"/);
   });
 
   it('handleLinkClick no longer references .user-image-thumb (dead delegation)', () => {
@@ -38,8 +47,8 @@ describe('user-image-thumb tap opens popup', () => {
   // The collector matches via `el.src` (absolute). `blobPreviewUrl` returns a
   // relative path, so passing the closure value misses every match.
   it('user-image-thumb passes e.currentTarget.src (absolute) to the collector, not the closure src (relative)', () => {
-    const match = source.match(/<img[\s\S]*?class="user-image-thumb"[\s\S]*?\/>/);
-    expect(match, 'user-image-thumb img element not found').not.toBeNull();
+    const match = source.match(/<BlobImage[\s\S]*?class="user-image-thumb"[\s\S]*?\/>/);
+    expect(match, 'user-image-thumb BlobImage element not found').not.toBeNull();
     expect(match![0]).toMatch(/openImagePopupFromGroup\(\s*e\.currentTarget\.src/);
     expect(match![0]).not.toMatch(/openImagePopupFromGroup\(\s*src\b/);
   });

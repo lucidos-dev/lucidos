@@ -1,5 +1,5 @@
 import { computed } from '@preact/signals';
-import { effectiveThreadStatus, getThreadDisplaySection, threadMap, threadNeedsAttention } from '../../store/store';
+import { effectiveThreadStatus, getThreadDisplaySection, threadMap, threadNeedsAttention, threadInReview, threadIsRunning } from '../../store/store';
 import { byRecent, byCreated, recencyKey, reviewTier, isExcludedFromSections } from '../../store/thread-events';
 import type { ThreadState } from '../../store/thread-events';
 import type { DisplaySection } from '../../generated/thread-lifecycle';
@@ -378,16 +378,16 @@ export function draftThreads(threads: ReadonlyMap<string, ThreadState>): ThreadS
     return out;
 }
 
-/** Attention-filter view rows: every Current/Saved thread that needs the user
- *  (awaiting answer/permission, failed, or a change ready to apply; see
+/** Needs-attention view rows: every Current/Saved thread where the agent is
+ *  stuck waiting on the user — awaiting answer/permission or a failed turn (see
  *  `threadNeedsAttention`). Mirrors `draftThreads`: bypasses the
  *  channel/trigger/repo filters and the lifecycle section grouping. Ordered by
  *  `reviewTier` first — a User Q / permission request (tier 0, the agent is
- *  stalled until the user answers) floats above a change ready to apply or a
- *  failed turn (tier 1) — then most-recent-first within each tier. The tier is
- *  read with `effectiveThreadStatus` to match the `threadNeedsAttention`
- *  predicate that selected these rows. Shares that predicate with the
- *  filter-badge count (`attentionThreadCount`) so the two can never disagree. */
+ *  stalled until the user answers) floats above a failed turn (tier 1) — then
+ *  most-recent-first within each tier. The tier is read with
+ *  `effectiveThreadStatus` to match the `threadNeedsAttention` predicate that
+ *  selected these rows. Shares that predicate with the selector's badge count
+ *  (`attentionThreadCount`) so the two can never disagree. */
 export function attentionThreads(threads: ReadonlyMap<string, ThreadState>): ThreadState[] {
     const out: ThreadState[] = [];
     for (const t of threads.values()) {
@@ -399,6 +399,36 @@ export function attentionThreads(threads: ReadonlyMap<string, ThreadState>): Thr
         if (ta !== tb) return ta - tb;
         return byRecent(a, b);
     });
+    return out;
+}
+
+/** Review view rows: every Current/Saved thread carrying a change ready to apply
+ *  (see `threadInReview`). Mirrors `draftThreads`/`attentionThreads`: bypasses
+ *  the channel/trigger/repo filters and the lifecycle section grouping. Single
+ *  tier (all proposed), so ordered purely most-recent-first. Shares its
+ *  predicate with the selector's badge count (`reviewThreadCount`) so the two
+ *  can never disagree. */
+export function reviewThreads(threads: ReadonlyMap<string, ThreadState>): ThreadState[] {
+    const out: ThreadState[] = [];
+    for (const t of threads.values()) {
+        if (threadInReview(t)) out.push(t);
+    }
+    out.sort(byRecent);
+    return out;
+}
+
+/** Running view rows: every Current/Saved thread actively working on a response
+ *  (see `threadIsRunning`). Mirrors `attentionThreads`/`reviewThreads`: bypasses
+ *  the channel/trigger/repo filters and the lifecycle section grouping. Single
+ *  tier (all running), so ordered purely most-recent-first. Shares its predicate
+ *  with the selector's badge count (`runningThreadCount`) so the two can never
+ *  disagree. */
+export function runningThreads(threads: ReadonlyMap<string, ThreadState>): ThreadState[] {
+    const out: ThreadState[] = [];
+    for (const t of threads.values()) {
+        if (threadIsRunning(t)) out.push(t);
+    }
+    out.sort(byRecent);
     return out;
 }
 

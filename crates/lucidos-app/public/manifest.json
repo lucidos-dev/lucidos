@@ -5,7 +5,7 @@
   "start_url": ".",
   "scope": ".",
   "display": "standalone",
-  "background_color": "#0b2342",
+  "background_color": "#07172e",
   "theme_color": "#0969da",
   "launch_handler": {
     "client_mode": "navigate-existing"

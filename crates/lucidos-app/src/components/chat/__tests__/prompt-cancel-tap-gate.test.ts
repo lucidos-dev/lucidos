@@ -55,4 +55,23 @@ describe('send-cancel-morph button has tap-gate scroll protection', () => {
     expect(btn).toMatch(/onClick=/);
     expect(btn).toMatch(/\.isTap\(\)/);
   });
+
+  it('does not open a confirmation dialog before canceling', () => {
+    expect(findMorphButton()).not.toMatch(/showConfirm\(/);
+  });
+});
+
+// During `waiting_for_user_answer` the prompt row swaps the morph button for
+// the answer control (Submit-default; lone Cancel when nothing's submittable),
+// so the destructive one-tap Cancel — and the lone Submit — must carry the SAME
+// scroll-vs-tap gate. Without it the iOS scroll-tap turn-abort regression simply
+// moves to the relocated button.
+describe('answer control Cancel/Submit have tap-gate scroll protection', () => {
+  it('gates the lone Cancel onClick on isTap() before aborting', () => {
+    expect(promptSource).toMatch(/if\s*\(!morphGate\.isTap\(\)\)\s*return;\s*cancelExchangeForTarget\(\)/);
+  });
+
+  it('gates the lone Submit onClick on isTap() before sending', () => {
+    expect(promptSource).toMatch(/if\s*\(!morphGate\.isTap\(\)\)\s*return;\s*void submit\(\)/);
+  });
 });

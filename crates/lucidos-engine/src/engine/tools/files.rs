@@ -144,7 +144,123 @@ pub(crate) fn json_set_value(
     }
 }
 
+/// The app id a `data/`-relative path belongs to, if it lives under `apps/<id>/`.
+/// `None` for non-app paths or a bare `apps/` with no id segment.
+fn data_path_app_id(data_path: &str) -> Option<&str> {
+    data_path
+        .strip_prefix("apps/")?
+        .split('/')
+        .next()
+        .filter(|s| !s.is_empty())
+}
+
+/// The app id iff `data_path` is *exactly* an app's manifest — `apps/<id>/manifest.json`.
+/// We only fire `App*` lifecycle events on the manifest, because the apps list
+/// renders solely manifest-derived fields (`id`/`name`/`description`/`icon`):
+/// an app becomes real when its manifest appears (`AppCreated`), its list row
+/// changes only when the manifest is edited (`AppUpdated`), and it leaves the
+/// list when the manifest is gone (`AppDeleted`). Edits to `index.html` /
+/// scripts / other files change nothing the list shows, so they emit nothing —
+/// which also avoids a burst of `AppUpdated` per file while an app is built.
+fn data_path_app_manifest_id(data_path: &str) -> Option<&str> {
+    let rest = data_path.strip_prefix("apps/")?;
+    let (id, file) = rest.split_once('/')?;
+    (!id.is_empty() && file == "manifest.json").then_some(id)
+}
+
+/// Pure decision: which `App*` *birth/death* event (if any) a manifest file op
+/// implies, from the manifest's presence before/after the op. `name` is read
+/// lazily (only when an event needs it). Kept separate from the emit so the
+/// matrix is unit-testable without a live engine.
+///
+/// The file tools own only `AppCreated` (manifest newly appears) and
+/// `AppDeleted` (manifest removed) — the precise, immediate birth/death
+/// signals. `AppUpdated` is NOT emitted here: edits are coalesced into one
+/// per-app `AppUpdated` at END OF TURN by the agentic loop's `modified_app_uis`
+/// post-loop pass (`agentic_loop/run.rs`), so iterating on an app doesn't spray
+/// an `AppUpdated` per keystroke. An edit to an existing manifest therefore
+/// returns `None` here.
+fn app_lifecycle_event(
+    app_id: &str,
+    name: impl FnOnce() -> Option<String>,
+    exists_now: bool,
+    existed_before: bool,
+    is_delete: bool,
+) -> Option<SystemEvent> {
+    match (exists_now, is_delete, existed_before) {
+        // Manifest just appeared → the app was born.
+        (true, false, false) => Some(SystemEvent::AppCreated {
+            app_id: app_id.to_string(),
+            name: name(),
+            actor: None,
+        }),
+        // Manifest removed (and it was there before) → the app is gone.
+        (false, true, true) => Some(SystemEvent::AppDeleted {
+            app_id: app_id.to_string(),
+            actor: None,
+        }),
+        // Edit of an existing manifest, or anything else → handled at end of
+        // turn (AppUpdated) or not list-relevant.
+        _ => None,
+    }
+}
+
 impl LucidosEngine {
+    /// If `data_path` is an app's `manifest.json`, emit the matching `App*`
+    /// lifecycle event so the disk-backed apps list refreshes live (mirrors the
+    /// `artifacts/` emission the file tools already do). Only the manifest is
+    /// instrumented — see `data_path_app_manifest_id`.
+    ///
+    /// Without this, an app *created* via the raw file tools
+    /// (`write_file`/`copy_file`) instead of `create_app` is committed to disk
+    /// but emits no `AppCreated` — so no open page's `appsList` (a disk-scan
+    /// projection refreshed by these events) learns about it until a full
+    /// reload. That was the "App no longer exists" toast for a live app: the
+    /// creating thread scaffolded with `write_file` (no `create_app`), no
+    /// `AppCreated` fired, and a viewing page's stale list reported it gone.
+    /// `AppCreated` is the load-bearing case; `AppDeleted` covers removal.
+    /// `AppUpdated` is deliberately NOT emitted here — manifest *edits* are
+    /// coalesced into one per-app `AppUpdated` at end of turn by the agentic
+    /// loop's `modified_app_uis` pass, so iterating doesn't spray an event per
+    /// write. This is the chat-file-tool channel of the per-channel refresh-hint
+    /// model — it does NOT cover apps written via `run_bash` / `run_python` (no
+    /// chokepoint to instrument); those need a reload, but creating an app that
+    /// way is a deep deviation from the documented `create_app` workflow
+    /// (`system-knowhow/building-an-app.md`).
+    ///
+    /// `existed_before` = whether the manifest was present before this op,
+    /// snapshotted by the caller BEFORE touching disk. `is_delete` flips the
+    /// post-op reading: a delete that removed the manifest is `AppDeleted`.
+    /// `actor: None` matches the artifact emits (agent-driven file ops).
+    async fn emit_app_event_for_data_path(
+        &self,
+        data_path: &str,
+        existed_before: bool,
+        is_delete: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(app_id) = data_path_app_manifest_id(data_path) else {
+            return Ok(());
+        };
+        let exists_now = self.app_manager.app_exists(app_id);
+        let Some(event) = app_lifecycle_event(
+            app_id,
+            || self.app_manager.app_name(app_id),
+            exists_now,
+            existed_before,
+            is_delete,
+        ) else {
+            return Ok(());
+        };
+        log!(
+            "[Apps] file tool emitting {} for app '{}' (path {})",
+            event.event_type(),
+            app_id,
+            data_path
+        );
+        self.event_bus.emit(BusEvent::System(event)).await?;
+        Ok(())
+    }
+
     /// Commit a file change via the appropriate manager: shared user dir, app, or workspace artifact.
     async fn commit_file_change(
         &self,
@@ -244,6 +360,10 @@ impl LucidosEngine {
             return Err("Provide either json_path + new_value or old_string + new_string".into());
         };
 
+        let app_existed_before = data_path_app_id(path)
+            .map(|id| self.app_manager.app_exists(id))
+            .unwrap_or(false);
+
         let _repo_guard = self.lock_workspace_repo().await;
 
         std::fs::write(&full_path, &new_content)
@@ -271,6 +391,10 @@ impl LucidosEngine {
                 *self.user_profile.write().await = new_content;
             }
         }
+
+        self.emit_app_event_for_data_path(path, app_existed_before, false)
+            .await
+            .map_err(|e| format!("Failed to emit app event: {}", e))?;
 
         let sha_short = &commit_sha[..commit_sha.floor_char_boundary(7)];
         Ok(FileEditResult {
@@ -635,6 +759,11 @@ impl LucidosEngine {
                 }
 
                 let file_exists = full_path.exists();
+                // Snapshot before writing: did the app already exist? Decides
+                // AppCreated vs AppUpdated for apps/<id>/ writes (no-op otherwise).
+                let app_existed_before = data_path_app_id(path)
+                    .map(|id| self.app_manager.app_exists(id))
+                    .unwrap_or(false);
 
                 // SAFEGUARD: Only block overwrites of binary imports (PDFs, images, etc.)
                 // Text files can always be edited since we have git versioning
@@ -688,6 +817,9 @@ impl LucidosEngine {
                         *self.user_profile.write().await = content.to_string();
                     }
                 }
+
+                self.emit_app_event_for_data_path(path, app_existed_before, false)
+                    .await?;
 
                 let result_action = if file_exists { "UPDATED" } else { "CREATED" };
                 let sha_short = &commit_sha[..commit_sha.floor_char_boundary(7)];
@@ -841,6 +973,9 @@ impl LucidosEngine {
                 }
 
                 let file_exists = dst_path.exists();
+                let app_existed_before = data_path_app_id(&dst_data_path)
+                    .map(|id| self.app_manager.app_exists(id))
+                    .unwrap_or(false);
 
                 let _repo_guard = self.lock_workspace_repo().await;
 
@@ -878,6 +1013,9 @@ impl LucidosEngine {
                         )))
                         .await?;
                 }
+
+                self.emit_app_event_for_data_path(&dst_data_path, app_existed_before, false)
+                    .await?;
 
                 let result_action = if file_exists { "OVERWRITTEN" } else { "COPIED" };
                 let sha_short = &commit_sha[..commit_sha.floor_char_boundary(7)];
@@ -924,6 +1062,10 @@ and emits the PluginUninstalled event so the registry stays in sync.",
                     }
                 }
 
+                let app_existed_before = data_path_app_id(path)
+                    .map(|id| self.app_manager.app_exists(id))
+                    .unwrap_or(false);
+
                 let _repo_guard = self.lock_workspace_repo().await;
 
                 // Delete and commit via appropriate manager
@@ -951,6 +1093,9 @@ and emits the PluginUninstalled event so the registry stays in sync.",
                         }))
                         .await?;
                 }
+
+                self.emit_app_event_for_data_path(path, app_existed_before, true)
+                    .await?;
 
                 let sha_short = &commit_sha[..commit_sha.floor_char_boundary(7)];
                 Ok(format!(

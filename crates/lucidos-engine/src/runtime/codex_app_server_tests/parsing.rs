@@ -1,7 +1,11 @@
 use crate::runtime::agent_runtime::AgentEvent;
 use crate::runtime::codex_app_server_parse::*;
 
-fn note(tracker: &mut AppServerTracker, method: &str, params: serde_json::Value) -> Vec<AgentEvent> {
+fn note(
+    tracker: &mut AppServerTracker,
+    method: &str,
+    params: serde_json::Value,
+) -> Vec<AgentEvent> {
     tracker.map_notification(method, &params, 42)
 }
 
@@ -90,7 +94,11 @@ fn agent_message_deltas_stream_and_completed_emits_only_remainder() {
         matches!(&evs[..], [AgentEvent::Message { text, .. }] if text == "!"),
         "completed agentMessage must emit only the remainder; got {evs:?}"
     );
-    assert_eq!(t.turn_text(), "Hello!", "Result.text carries the full message");
+    assert_eq!(
+        t.turn_text(),
+        "Hello!",
+        "Result.text carries the full message"
+    );
 }
 
 #[test]
@@ -184,6 +192,87 @@ fn declined_command_maps_to_error_status() {
         &evs[..],
         [AgentEvent::ToolResult { status, .. }] if status == "error"
     ));
+}
+
+#[test]
+fn approval_gated_command_started_waits_until_acceptance() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn();
+    t.note_approval_request(&ApprovalRequest {
+        item_id: "i7".into(),
+        tool_name: "command_execution".into(),
+        input: serde_json::json!({"command": "sudo ls", "cwd": "/wt"}),
+    });
+
+    let evs = note(
+        &mut t,
+        "item/started",
+        serde_json::json!({"item": {
+            "id": "i7", "type": "commandExecution", "command": "sudo ls",
+            "commandActions": [], "cwd": "/wt", "status": "inProgress"
+        }}),
+    );
+    assert!(
+        evs.is_empty(),
+        "approval-gated command must not render a working step before acceptance"
+    );
+
+    let evs = t.note_approval_resolved("i7", true);
+    assert!(matches!(
+        &evs[..],
+        [AgentEvent::ToolUse { name, id, input }]
+            if name == "command_execution" && id == "i7" && input["command"] == "sudo ls"
+    ));
+
+    let evs = note(
+        &mut t,
+        "item/completed",
+        serde_json::json!({"item": {
+            "id": "i7", "type": "commandExecution", "command": "sudo ls",
+            "commandActions": [], "cwd": "/wt", "status": "completed",
+            "aggregatedOutput": "ok\n", "exitCode": 0
+        }}),
+    );
+    assert!(matches!(
+        &evs[..],
+        [AgentEvent::ToolResult { id, status, output }]
+            if id == "i7" && status == "success" && output == "ok\n"
+    ));
+}
+
+#[test]
+fn approval_gated_command_decline_suppresses_deferred_step_and_result() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn();
+    t.note_approval_request(&ApprovalRequest {
+        item_id: "i8".into(),
+        tool_name: "command_execution".into(),
+        input: serde_json::json!({"command": "rm -rf /", "cwd": "/wt"}),
+    });
+
+    let evs = note(
+        &mut t,
+        "item/started",
+        serde_json::json!({"item": {
+            "id": "i8", "type": "commandExecution", "command": "rm -rf /",
+            "commandActions": [], "cwd": "/wt", "status": "inProgress"
+        }}),
+    );
+    assert!(evs.is_empty());
+    assert!(t.note_approval_resolved("i8", false).is_empty());
+
+    let evs = note(
+        &mut t,
+        "item/completed",
+        serde_json::json!({"item": {
+            "id": "i8", "type": "commandExecution", "command": "rm -rf /",
+            "commandActions": [], "cwd": "/wt", "status": "declined"
+        }}),
+    );
+    assert!(
+        evs.is_empty(),
+        "declined approval should not create a dangling failed tool step"
+    );
 }
 
 #[test]
@@ -300,7 +389,12 @@ fn token_usage_maps_to_uncached_input_convention() {
     // the uncached portion (Anthropic convention the consumer re-totals).
     assert!(matches!(
         &evs[..],
-        [AgentEvent::Usage { input_tokens: 40, cache_read_tokens: 60, output_tokens: 5, .. }]
+        [AgentEvent::Usage {
+            input_tokens: 40,
+            cache_read_tokens: 60,
+            output_tokens: 5,
+            ..
+        }]
     ));
 }
 

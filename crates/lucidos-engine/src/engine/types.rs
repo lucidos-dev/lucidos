@@ -246,6 +246,16 @@ pub struct AgentSession {
     /// actor upstream). Drained on read so a stale device can't carry into the
     /// next turn on a resumed session.
     pub cancel_actor: Option<crate::engine::thread_events::MessageOrigin>,
+    /// Set by `arm_codex_redirect` when a follow-up interrupts a mid-turn Codex
+    /// turn (the redirect path) — the redirect analog of `cancel_actor`. The
+    /// run_session interrupt arm drains it (`take_session_redirect_followup`)
+    /// alongside `cancel_actor` and feeds it to `classify_result` so the
+    /// interrupted turn's `ResponseCanceled` carries
+    /// `CancelCause::SupersededByFollowup` (rendered neutrally) instead of
+    /// `UserStop` (rendered "Canceled ✕"). A real Stop click via `interrupt_agent`
+    /// leaves it `false`. Drained on read so a stale flag can't relabel the next
+    /// turn on a resumed session.
+    pub redirect_followup: bool,
     /// Generic stop signal for the run_session loop. Fired by `stop_agent` for
     /// every user-driven termination (Cancel, Apply, Discard, Archive) and by
     /// the engine shutdown timeout. The stop arm reads `pending_stop` and

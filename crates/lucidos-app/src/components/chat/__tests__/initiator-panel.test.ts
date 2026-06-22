@@ -63,7 +63,8 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
   });
 
   it('ContinuationStarted (no actor): label falls back to engine, summary "Resumed after engine restart"', () => {
-    // Legacy DB rows / auto-resume case carry no actor; chip falls back to ⬡ Engine.
+    // Legacy DB rows / auto-resume case carry no actor; chip falls back to the
+    // Lucidos-mark Engine chip.
     const ex = exchangeWith({ type: 'ContinuationStarted' });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.label).toBe(ENGINE_LABEL);

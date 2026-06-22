@@ -9,12 +9,20 @@ import { randomUUID } from 'crypto';
 import type { Page } from './fixtures';
 
 /**
- * Verifies the WaitingBanner Diff button reacts to `coding_agent_has_diff` flips
- * driven by the projection. The button SHOWS only when there is a diff — no
- * diff means no button at all (not a greyed/disabled one):
+ * Desktop-scoped (`-desktop` suffix → chromium only): this verifies the backend
+ * projection→SSE→banner reactivity, which is layout-independent — one project is
+ * enough. The mobile rendering of the same split button is covered by
+ * `change-actions-split-mobile.spec.ts`.
  *
- *   - CC thread, no diff     → Diff button hidden.
- *   - ChangeProposed lands   → projection flips coding_agent_has_diff=TRUE → SSE → Diff appears.
+ * Verifies the WaitingBanner Diff affordance reacts to `coding_agent_has_diff`
+ * flips driven by the projection. Diff SHOWS only when there is a diff — no diff
+ * means no Diff affordance at all (not a greyed/disabled one). Note the Diff
+ * affordance lives inside the change-action split button's caret menu whenever
+ * the thread has a pending change (an Apply action), so `diffVisible()` opens the
+ * menu to look; with no Apply it's a top-level button.
+ *
+ *   - CC thread, no diff     → Diff hidden.
+ *   - ChangeProposed lands   → projection flips coding_agent_has_diff=TRUE → SSE → Diff appears (in the caret menu).
  *   - ChangeApplied lands    → projection flips coding_agent_has_diff=FALSE → SSE → Diff disappears.
  *
  * The seed step uses `POST /api/v1/internal/seed-change-for-test`, which emits
@@ -26,8 +34,25 @@ import type { Page } from './fixtures';
  * `ChangeApplied` through the EventBus on success.
  */
 
-function diffButton(page: Page) {
-  return page.locator('.thread-action-buttons:visible button:has-text("Diff")').first();
+/** Whether the Diff affordance is currently available, across both banner
+ *  shapes. When the thread has a pending change the banner is a split button and
+ *  Diff lives in the caret menu (open it to look, then close it again); when
+ *  there is no Apply action (e.g. an idle CC thread with a diff but no pending
+ *  change) Diff is a top-level button. Used inside `expect.poll` so it converges
+ *  as SSE settles the projection. */
+async function diffVisible(page: Page): Promise<boolean> {
+  const direct = page.locator('.thread-action-buttons:visible button:has-text("Diff")').first();
+  if (await direct.isVisible().catch(() => false)) return true;
+  const caret = page.locator('.thread-action-buttons:visible .split-button-caret').first();
+  if (!(await caret.isVisible().catch(() => false))) return false;
+  await caret.click();
+  const inMenu = await page.locator('.split-button-menu:visible button:has-text("Diff")').first()
+    .isVisible({ timeout: 1_000 }).catch(() => false);
+  // Leave the menu closed so the next poll iteration starts from a clean state.
+  await page.keyboard.press('Escape').catch(() => {});
+  await page.locator('.split-button-menu:visible').first()
+    .waitFor({ state: 'hidden', timeout: 1_000 }).catch(() => {});
+  return inMenu;
 }
 
 /** Seed a CC thread in the 'waiting' state with NO changes (so initial
@@ -111,9 +136,9 @@ test.describe('WaitingBanner Diff button reacts to coding_agent_has_diff', () =>
       await navigateToApp(page);
 
       // The banner renders (Archive is offered) but with no diff there is no
-      // Diff button at all — not a disabled one.
+      // Diff affordance at all — not a disabled one.
       await expect(archiveButton(page)).toBeVisible({ timeout: 15_000 });
-      await expect(diffButton(page)).toBeHidden();
+      expect(await diffVisible(page)).toBe(false);
     } finally {
       cleanupCCThread(threadId);
     }
@@ -131,9 +156,9 @@ test.describe('WaitingBanner Diff button reacts to coding_agent_has_diff', () =>
       }, threadId);
       await navigateToApp(page);
 
-      // No diff yet → no Diff button.
+      // No diff yet → no Diff affordance.
       await expect(archiveButton(page)).toBeVisible({ timeout: 15_000 });
-      await expect(diffButton(page)).toBeHidden();
+      expect(await diffVisible(page)).toBe(false);
 
       await seedChangeProposed(page, {
         changeId, threadId, branch, file,
@@ -141,8 +166,10 @@ test.describe('WaitingBanner Diff button reacts to coding_agent_has_diff', () =>
       });
 
       // SSE delivers the new aggregate → coding_agent_has_diff=TRUE → the Diff
-      // button appears. Generous timeout to cover slow CI without masking flakes.
-      await expect(diffButton(page)).toBeVisible({ timeout: 10_000 });
+      // affordance appears (now inside the split button's caret menu, since the
+      // pending change brings an Apply action). Generous timeout to cover slow
+      // CI without masking flakes.
+      await expect.poll(() => diffVisible(page), { timeout: 10_000 }).toBe(true);
     } finally {
       cleanupCCThread(threadId, changeId, branch, file);
     }
@@ -167,14 +194,14 @@ test.describe('WaitingBanner Diff button reacts to coding_agent_has_diff', () =>
         changeId, threadId, branch, file,
         description: `E2E diff disable ${suffix}`,
       });
-      await expect(diffButton(page)).toBeVisible({ timeout: 10_000 });
+      await expect.poll(() => diffVisible(page), { timeout: 10_000 }).toBe(true);
 
       // Apply via the real API → ChangeApplied → projection clears coding_agent_has_diff.
       const applyResp = await page.request.post(`/api/v1/changes/${changeId}/apply`);
       expect(applyResp.ok(), `apply failed: ${applyResp.status()} ${await applyResp.text()}`).toBeTruthy();
       appliedToMain = true;
 
-      await expect(diffButton(page)).toBeHidden({ timeout: 10_000 });
+      await expect.poll(() => diffVisible(page), { timeout: 10_000 }).toBe(false);
     } finally {
       if (appliedToMain) cleanupFileFromMain(file, suffix);
       cleanupCCThread(threadId, changeId, branch, file);

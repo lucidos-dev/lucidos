@@ -28,6 +28,10 @@ pub(crate) struct LiveSessionInfo {
     pub worktree_path: PathBuf,
     pub idle_notify: Arc<tokio::sync::Notify>,
     pub msg_tx: tokio::sync::mpsc::UnboundedSender<crate::engine::AgentUserInput>,
+    /// Last-activity clock for the session (epoch millis), used by the async
+    /// in-place conflict-merge task as its liveness source — the same signal
+    /// `apply_now` polls to abort a wedged (alive-but-silent) CC merge.
+    pub last_event_at: Arc<std::sync::atomic::AtomicI64>,
 }
 
 /// Inputs for proposing (or updating) a pending change.
@@ -61,7 +65,6 @@ pub(crate) struct ProposeChangeInput<'a> {
 /// engine-internal abstraction over the operations `change_ops` needs to
 /// invoke on a coding-agent runtime (apply, hardening, merge, resume).
 pub(crate) trait CodingAgentChangeOps: Send + Sync {
-    async fn is_running_for(&self, thread_id: Uuid) -> bool;
     /// `actor` carries the user who initiated the apply that triggered hardening.
     /// When `auto_apply_change_id` is `Some` and hardening completes successfully,
     /// the agent re-enters `apply_change(change_id, actor)` so the resulting
@@ -76,15 +79,6 @@ pub(crate) trait CodingAgentChangeOps: Send + Sync {
         actor: Option<MessageOrigin>,
     );
     async fn live_session_info(&self, thread_id: Uuid) -> Option<LiveSessionInfo>;
-    async fn merge_via_session(
-        &self,
-        thread_id: Uuid,
-        change_id: Uuid,
-        wt_path: &Path,
-        branch_name: &str,
-        repo_root: &Path,
-        session: &LiveSessionInfo,
-    ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>>;
     fn spawn_merge_session(&self, thread_id: Uuid, change_id: Uuid, description: &str);
     async fn lookup_session_id_for_resume(&self, thread_id: Uuid) -> Option<String>;
     /// Resume an in-progress merge session via this agent.

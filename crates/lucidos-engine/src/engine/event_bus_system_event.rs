@@ -1145,12 +1145,18 @@ impl SystemEvent {
 
     pub fn to_payload(&self) -> serde_json::Value {
         match self {
-            Self::TriggerCreated { payload, .. }
-            | Self::TriggerUpdated { payload, .. }
-            | Self::TriggerDeleted { payload, .. }
-            | Self::TriggerEnabled { payload, .. }
-            | Self::TriggerDisabled { payload, .. }
-            | Self::TriggerExecuted { payload, .. } => payload.clone(),
+            // TriggerExecuted is engine-driven and carries no actor field, so
+            // its raw payload is the wire shape. The CRUD variants below DO
+            // carry an `actor` (stamped by the HTTP handlers via
+            // `emit_user_system`); they must merge it in so the persisted row
+            // and SSE frame attribute the change — same contract as the
+            // TriggerGroup* variants.
+            Self::TriggerExecuted { payload, .. } => payload.clone(),
+            Self::TriggerCreated { payload, actor, .. }
+            | Self::TriggerUpdated { payload, actor, .. }
+            | Self::TriggerDeleted { payload, actor, .. }
+            | Self::TriggerEnabled { payload, actor, .. }
+            | Self::TriggerDisabled { payload, actor, .. } => merge_actor(payload.clone(), actor),
             Self::TriggerGroupCreated { payload, actor, .. }
             | Self::TriggerGroupRenamed { payload, actor, .. }
             | Self::TriggerGroupReordered { payload, actor, .. }

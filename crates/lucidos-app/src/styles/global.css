@@ -1,2 +1,13 @@
 @import './global/base.css';
+/* Shared component layer — SINGLE SOURCE shared with app iframes (the engine
+   serves this same file appended to /api/v1/sdk-iframe.css). Imported right
+   after base.css so it inherits base.css's :root tokens + theme blocks, exactly
+   as it did when these rules lived inside base.css. */
+@import './global/shared-components.css';
+/* Host-chrome components (custom <Dropdown>, send→cancel morph, icon-btn
+   header/filter variants, list-row FLIP) — host bundle ONLY, never served to
+   apps. Imported AFTER shared-components.css so host rules that extend a shared
+   base class by source order (e.g. .send-cancel-morph vs .action-btn) keep
+   winning. */
+@import './global/host-components.css';
 @import './global/modal-overlay.css';

@@ -727,6 +727,88 @@ pub(crate) fn is_bad_image_description(desc: &str) -> bool {
 /// prompt tells the model the same.
 pub(crate) const MAX_ITERATIONS: usize = 500;
 
+/// How many times a single response may reject a prose answer and force the
+/// model to re-call `ask_user_question` after a failed ask. Bounds the re-ask
+/// guard so a persistently-broken question path (e.g. the DB is down and every
+/// `walk_question_batch` errors) or a model that refuses to comply can never
+/// trap the loop — after this many forces the turn finalizes normally with
+/// prose. Far below `MAX_ITERATIONS`, which remains the outer backstop.
+pub(crate) const MAX_QUESTION_REASK: usize = 2;
+
+/// The forcing instruction appended as a user message when the model abandons a
+/// rejected `ask_user_question` and answers in prose instead. Pushes it back to
+/// the tool with the full question text — the interactive card is the whole
+/// point of the call, and a prose fallback silently degrades it into a
+/// typed-reply menu the user can't click.
+pub(crate) const QUESTION_REASK_INSTRUCTION: &str = "Your previous `ask_user_question` call was \
+    rejected because a question object had no `question` text (the `header` chip-label is not a \
+    substitute). Do NOT answer in prose or inline the options as a typed-reply menu — the user \
+    needs the clickable question card. Re-call `ask_user_question` now with the full question \
+    text filled in on every question object.";
+
+/// Decide whether the no-tool-calls termination branch must force a re-ask
+/// instead of finalizing the turn. True only when the previous iteration's
+/// `ask_user_question` call errored AND the per-response force budget isn't
+/// spent. Pure so the bound is unit-testable without driving the whole loop.
+pub(crate) fn should_force_question_reask(
+    ask_failed_last_iter: bool,
+    reask_forced: usize,
+) -> bool {
+    ask_failed_last_iter && reask_forced < MAX_QUESTION_REASK
+}
+
+/// What the generic consecutive-call circuit breaker should do given the
+/// current consecutive-*failure* streak length for one `(tool, call_key)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BreakerAction {
+    /// Streak below threshold — execute the proposed call normally.
+    None,
+    /// 3-4 consecutive failures of the same call: feed a STOP message back
+    /// to the model and skip executing the proposed (repeat) call.
+    Warn,
+    /// 5+ consecutive failures: terminate the turn with a force-break.
+    Break,
+}
+
+/// Update the consecutive-*failure* streak for the generic circuit breaker.
+///
+/// Unlike the raw repeat counter (`consecutive_same_call`, which the
+/// content-deterministic `read_file` / `list_files` breakers still use), this
+/// streak only grows when the model repeats the SAME `(tool, call_key)` AND the
+/// previous identical call actually FAILED. A successful call mid-streak, or a
+/// switch to a different call, resets the streak to 1 — because successful
+/// repetition is by definition not a stuck loop, and only a run of failures is
+/// the genuine "stuck" signal worth breaking.
+///
+/// `is_repeat` — the current call matches the previous `(tool, call_key)`.
+/// `prev_call_failed` — the previous identical call returned an error.
+/// `prev_streak` — the streak value carried from the last iteration.
+pub(crate) fn next_failure_streak(
+    is_repeat: bool,
+    prev_call_failed: bool,
+    prev_streak: usize,
+) -> usize {
+    if is_repeat && prev_call_failed {
+        prev_streak + 1
+    } else {
+        1
+    }
+}
+
+/// Map a consecutive-failure streak length onto the breaker action. Warn at
+/// 3-4 (give the model a STOP nudge with the results it already has), hard
+/// break at 5+ (it ignored the warnings). Both thresholds stay far below
+/// `MAX_ITERATIONS`, the outer backstop.
+pub(crate) fn generic_breaker_action(failure_streak: usize) -> BreakerAction {
+    if failure_streak >= 5 {
+        BreakerAction::Break
+    } else if failure_streak >= 3 {
+        BreakerAction::Warn
+    } else {
+        BreakerAction::None
+    }
+}
+
 /// Build the `ProcessResult` every terminal path in `run_agentic_loop`
 /// returns. All eight return sites — pre-iter cancel, iteration cap, mid-LLM
 /// cancel, success, empty completion, and the three circuit-breaker

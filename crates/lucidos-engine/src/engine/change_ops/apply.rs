@@ -2,9 +2,10 @@ use super::*;
 use crate::engine::git_ops::{
     auto_commit_safe_files_if_dirty, auto_commit_worktree, catchup_and_ff_to_main, commits_in_range,
     ff_main_to, files_have_client_update, find_branch_merge_in_main, find_worktree_for_branch,
-    has_branch_commits, is_harden_marker_present, is_plan_marker_present, push_main_in_background,
+    has_branch_commits, is_harden_marker_present, push_main_in_background,
     recover_no_commits_branch, worktree_add, worktrees_dir, NoCommitsRecovery, MERGE_MUTEX,
 };
+use crate::engine::agent_session::InPlaceMergeStart;
 use crate::engine::{ApplyResult, ApplyStatus};
 
 impl LucidosEngine {
@@ -169,41 +170,54 @@ impl LucidosEngine {
             }
         }
 
-        // Implementation-plan floor (Lucidos-source only). A Planned marker —
-        // a real plan recorded by the `implementation-plan` skill, or an
-        // explicit `lucidos planned mark --simple` acknowledgment — MUST exist
-        // before a Lucidos-source change can apply. The Claude-Code
-        // `cc-plan-gate` PreToolUse hook and the prompt rule are meant to make
-        // a marker-less branch unreachable; this is the hard backstop (and the
-        // ONLY enforcement for Codex, which has no PreToolUse hook). App and
-        // external-repo changes are exempt — neither uses the `docs/plans/`
-        // convention or the marker. Per the resolved design decision: if the
-        // marker is somehow Missing here, refuse the apply (no auto-recovery).
-        if kind_ctx.is_lucidos_source()
-            && !is_plan_marker_present(
-                &self.pool,
-                &std::path::PathBuf::from(&change.repo_root),
-                &change.branch_name,
-            )
-            .await
-        {
-            let msg = "No implementation-plan marker on this branch. Before applying, the coding \
-                       agent must run the `implementation-plan` skill (records a plan) or \
-                       `lucidos planned mark --simple \"<reason>\"` (acknowledges a local fix). \
-                       Re-run the session to set the marker, then apply.";
-            log!(
-                "[Changes] Apply blocked — no plan marker for branch {} (change {})",
-                change.branch_name,
-                change_id
-            );
-            self.emit_apply_failed(
-                change.thread_id.unwrap_or(change_id),
-                change_id,
-                msg,
-                actor.clone(),
-            )
-            .await;
-            return Err(msg.into());
+        // Implementation-plan floor (Lucidos-source only). A gate-satisfying
+        // marker — an APPROVED plan (`planned`), or an explicit
+        // `lucidos planned mark --simple` acknowledgment — MUST exist before a
+        // Lucidos-source change can apply. A `proposed` (awaiting-approval)
+        // marker does NOT satisfy the floor: the human hasn't approved the plan
+        // yet. The Claude-Code `cc-plan-gate` PreToolUse hook and the prompt
+        // rule are meant to make a non-satisfying branch unreachable; this is
+        // the hard backstop (and the ONLY enforcement for Codex, which has no
+        // PreToolUse hook). App and external-repo changes are exempt — neither
+        // uses the `docs/plans/` convention or the marker. Per the resolved
+        // design decision: if the marker is Missing/Proposed here, refuse the
+        // apply (no auto-recovery).
+        // App and external-repo changes are exempt — neither uses the
+        // `docs/plans/` convention or the marker, so don't even query.
+        if kind_ctx.is_lucidos_source() {
+            let plan_state = self
+                .plan_marker_state(
+                    &std::path::PathBuf::from(&change.repo_root),
+                    &change.branch_name,
+                )
+                .await;
+            if !plan_state.satisfies_gate() {
+                let msg = if plan_state.is_present() {
+                    // Present but not satisfying => Proposed (awaiting approval).
+                    "The implementation plan on this branch is awaiting approval. The user must \
+                     approve the plan, after which the coding agent runs `lucidos planned approve` \
+                     to unblock implementation. Approve the plan, then apply."
+                } else {
+                    "No implementation-plan marker on this branch. Before applying, the coding \
+                     agent must run the `implementation-plan` skill (records a plan for the user to \
+                     approve) or `lucidos planned mark --simple \"<reason>\"` (acknowledges a local \
+                     fix). Re-run the session to set the marker, then apply."
+                };
+                log!(
+                    "[Changes] Apply blocked — plan marker not satisfying ({:?}) for branch {} (change {})",
+                    plan_state,
+                    change.branch_name,
+                    change_id
+                );
+                self.emit_apply_failed(
+                    change.thread_id.unwrap_or(change_id),
+                    change_id,
+                    msg,
+                    actor.clone(),
+                )
+                .await;
+                return Err(msg.into());
+            }
         }
 
         // App threads skip the /harden gate entirely — apps own their own
@@ -454,85 +468,115 @@ impl LucidosEngine {
             }
         }
 
-        // Tier 1: If a live agent session exists for this thread, merge main into its worktree
-        // instead of creating a temp worktree. The original agent has full context and
-        // can resolve conflicts intelligently.
+        // Tier 1: If a live agent session exists for this thread, merge main
+        // into its worktree instead of creating a temp worktree. The original
+        // agent has full context and can resolve conflicts intelligently.
+        //
+        // A clean fast-forward merge runs inline (sub-second) and returns
+        // `applied`. When `main` has diverged and CC-assisted conflict
+        // resolution is needed, that runs in a background task and we return
+        // `Conflict` immediately — the caller's turn (the parent chat thread's
+        // `apply_change` tool call) is not held open for the potentially
+        // many-minute resolution. The eventual `ChangeApplied` plus the EventBus
+        // parent-callback fan-out's `ChildThreadCompleted` give the parent a
+        // fresh follow-up turn instead of one turn frozen the whole time.
         if let Some(thread_id) = change.thread_id {
-            if CodingAgentChangeOps::is_running_for(self.as_ref(), thread_id).await {
-                if let Some(session) =
-                    CodingAgentChangeOps::live_session_info(self.as_ref(), thread_id).await
-                {
+            match self.begin_in_place_merge(thread_id).await {
+                InPlaceMergeStart::Ready(session) => {
                     log!(
                         "[Changes] Live agent session found for thread {} — merging in-place",
                         thread_id
                     );
 
-                    // Auto-commit any uncommitted work before merging
+                    // Auto-commit any uncommitted work before merging.
                     auto_commit_worktree(
                         &session.worktree_path,
                         "Coding agent changes (pre-merge auto-commit)",
                     )
                     .await;
 
-                    match CodingAgentChangeOps::merge_via_session(
-                        self.as_ref(),
-                        thread_id,
-                        change_id,
+                    // Fast path: clean fast-forward — finalize synchronously.
+                    if let Ok((pre_sha, post_sha)) = catchup_and_ff_to_main(
+                        &repo_root,
                         &session.worktree_path,
                         &change.branch_name,
-                        &repo_root,
-                        &session,
                     )
                     .await
                     {
-                        Ok((pre_sha, post_sha)) => {
-                            // apply_now_success emits ChangeApplied, the
-                            // entity-cache events (App*/Artifact*), AND
-                            // AppUiRefreshRequested (for app threads)
-                            // internally — no sibling emit needed here.
-                            let commits = self
-                                .apply_now_success(
-                                    thread_id,
-                                    change_id,
-                                    effective_requires_restart,
-                                    files_have_client_update(&change.files),
-                                    &pre_sha,
-                                    &post_sha,
-                                    &session.worktree_path,
-                                    &repo_root,
-                                    &change.branch_name,
-                                    actor.clone(),
-                                )
-                                .await;
-                            return Ok(ApplyResult::applied_with_merge(
-                                change_id,
-                                Some(thread_id),
-                                effective_requires_restart,
-                                pre_sha,
-                                post_sha,
-                                &commits,
-                                change.files.len(),
-                            ));
-                        }
-                        Err(e) => {
-                            // Agent stays alive for retry — keep the session as the conflict thread.
-                            log!("[Changes] In-place merge failed for {}: {} — agent stays alive for retry", change_id, e);
-                            self.emit_apply_failed(
+                        log!(
+                            "[Changes] Fast-forward merge succeeded for {} (Tier 1)",
+                            change.branch_name
+                        );
+                        // We claimed the in-progress flag in `begin_in_place_merge`;
+                        // clear it since we're finalizing inline (no spawned task).
+                        self.clear_apply_now_in_progress(thread_id).await;
+                        // apply_now_success emits ChangeApplied, the entity-cache
+                        // events (App*/Artifact*), AND AppUiRefreshRequested (for
+                        // app threads) internally — no sibling emit needed here.
+                        let commits = self
+                            .apply_now_success(
                                 thread_id,
                                 change_id,
-                                &e.to_string(),
+                                effective_requires_restart,
+                                files_have_client_update(&change.files),
+                                &pre_sha,
+                                &post_sha,
+                                &session.worktree_path,
+                                &repo_root,
+                                &change.branch_name,
                                 actor.clone(),
                             )
                             .await;
-                            return Ok(ApplyResult::conflict(
-                                change_id,
-                                thread_id,
-                                change.files.len(),
-                                format!("Merge failed: {} — session preserved, try again.", e),
-                            ));
-                        }
+                        return Ok(ApplyResult::applied_with_merge(
+                            change_id,
+                            Some(thread_id),
+                            effective_requires_restart,
+                            pre_sha,
+                            post_sha,
+                            &commits,
+                            change.files.len(),
+                        ));
                     }
+
+                    // `main` diverged — hand the CC-assisted resolution to a
+                    // background task and return immediately. The task clears
+                    // the in-progress flag and emits the terminal event.
+                    log!(
+                        "[Changes] main diverged for {} — spawning async in-place conflict recovery",
+                        change.branch_name
+                    );
+                    self.spawn_in_place_conflict_recovery(
+                        thread_id,
+                        change_id,
+                        session,
+                        change.branch_name.clone(),
+                        repo_root.clone(),
+                        effective_requires_restart,
+                        files_have_client_update(&change.files),
+                        actor.clone(),
+                    );
+                    return Ok(ApplyResult::conflict(
+                        change_id,
+                        thread_id,
+                        change.files.len(),
+                        "Merge conflict — the coding-agent session is resolving it. \
+                         The change will apply automatically when resolution completes.",
+                    ));
                 }
+                InPlaceMergeStart::AlreadyInProgress => {
+                    log!(
+                        "[Changes] Apply already in progress for thread {} — returning conflict",
+                        thread_id
+                    );
+                    return Ok(ApplyResult::conflict(
+                        change_id,
+                        thread_id,
+                        change.files.len(),
+                        "An apply is already in progress for this thread — it will finish on its own.",
+                    ));
+                }
+                // No live session — fall through to the dead-session tiers below.
+                InPlaceMergeStart::NoLiveSession => {}
             }
         }
 

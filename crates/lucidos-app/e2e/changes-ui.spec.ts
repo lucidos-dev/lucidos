@@ -1,6 +1,6 @@
 import { test, expect } from './fixtures';
 import {
-  navigateToApp, uniqueMessage, assertHealthy, gotoWithRetry,
+  navigateToApp, uniqueMessage, assertHealthy, gotoWithRetry, clickChangeAction,
 } from './helpers';
 import {
   createCCThreadWithChange, cleanupCCThread, cleanupFileFromMain, psql, WORKSPACE,
@@ -66,9 +66,12 @@ test.describe('Claude Code changes - apply and discard via UI', () => {
       }, threadId);
       await navigateToApp(page);
 
-      const discardBtn = page.locator('.thread-action-buttons:visible button.action-btn-danger:has-text("Discard")').first();
-      await expect(discardBtn).toBeVisible({ timeout: 15_000 });
-      await discardBtn.click();
+      // Wait for the banner to render (Apply face is always present), then
+      // discard — layout-aware so it works whether Discard is its own button
+      // (desktop) or behind the mobile split-button menu.
+      await expect(page.locator('.thread-action-buttons:visible button:has-text("Apply")').first())
+        .toBeVisible({ timeout: 15_000 });
+      await clickChangeAction(page, 'Discard');
 
       // Handle confirmation dialog if present
       const confirmBtn = page.locator('.confirm-btn-ok:visible, .confirm-btn-ok-default:visible').first();

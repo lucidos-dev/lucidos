@@ -73,6 +73,7 @@ pub struct PushSubscription {
     pub p256dh: String,
     pub auth: String,
     pub device_id: Option<String>,
+    pub scope_url: Option<String>,
 }
 
 /// VAPID key pair for Web Push authentication
@@ -99,11 +100,15 @@ impl PushSubscriptionStore {
                 endpoint TEXT PRIMARY KEY,
                 p256dh TEXT NOT NULL,
                 auth TEXT NOT NULL,
+                scope_url TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )",
         )
         .execute(pool)
         .await?;
+        sqlx::query("ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS scope_url TEXT")
+            .execute(pool)
+            .await?;
 
         Ok(())
     }
@@ -123,14 +128,15 @@ impl PushSubscriptionStore {
                 .await?;
         }
         sqlx::query(
-            "INSERT INTO push_subscriptions (endpoint, p256dh, auth, device_id)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (endpoint) DO UPDATE SET p256dh = $2, auth = $3, device_id = $4",
+            "INSERT INTO push_subscriptions (endpoint, p256dh, auth, device_id, scope_url)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (endpoint) DO UPDATE SET p256dh = $2, auth = $3, device_id = $4, scope_url = COALESCE($5, push_subscriptions.scope_url)",
         )
         .bind(&sub.endpoint)
         .bind(&sub.p256dh)
         .bind(&sub.auth)
         .bind(&sub.device_id)
+        .bind(&sub.scope_url)
         .execute(pool)
         .await?;
         Ok(())
@@ -158,29 +164,41 @@ impl PushSubscriptionStore {
         pool: &PgPool,
     ) -> Result<Vec<(PushSubscription, Option<String>)>, Box<dyn std::error::Error + Send + Sync>>
     {
-        let rows =
-            sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>)>(
-                "SELECT ps.endpoint, ps.p256dh, ps.auth, ps.device_id, d.user_agent
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
+            "SELECT ps.endpoint, ps.p256dh, ps.auth, ps.device_id, ps.scope_url, d.user_agent
                  FROM push_subscriptions ps
                  LEFT JOIN devices d ON ps.device_id = d.id
                  WHERE ps.device_id IS NULL OR d.push_enabled = true",
-            )
-            .fetch_all(pool)
-            .await?;
+        )
+        .fetch_all(pool)
+        .await?;
 
         Ok(rows
             .into_iter()
-            .map(|(endpoint, p256dh, auth, device_id, user_agent)| {
-                (
-                    PushSubscription {
-                        endpoint,
-                        p256dh,
-                        auth,
-                        device_id,
-                    },
-                    user_agent,
-                )
-            })
+            .map(
+                |(endpoint, p256dh, auth, device_id, scope_url, user_agent)| {
+                    (
+                        PushSubscription {
+                            endpoint,
+                            p256dh,
+                            auth,
+                            device_id,
+                            scope_url,
+                        },
+                        user_agent,
+                    )
+                },
+            )
             .collect())
     }
 
@@ -193,8 +211,8 @@ impl PushSubscriptionStore {
         pool: &PgPool,
         device_id: &str,
     ) -> Result<Vec<PushSubscription>, Box<dyn std::error::Error + Send + Sync>> {
-        let rows = sqlx::query_as::<_, (String, String, String, Option<String>)>(
-            "SELECT ps.endpoint, ps.p256dh, ps.auth, ps.device_id
+        let rows = sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>)>(
+            "SELECT ps.endpoint, ps.p256dh, ps.auth, ps.device_id, ps.scope_url
              FROM push_subscriptions ps
              LEFT JOIN devices d ON ps.device_id = d.id
              WHERE ps.device_id = $1
@@ -206,12 +224,15 @@ impl PushSubscriptionStore {
 
         Ok(rows
             .into_iter()
-            .map(|(endpoint, p256dh, auth, device_id)| PushSubscription {
-                endpoint,
-                p256dh,
-                auth,
-                device_id,
-            })
+            .map(
+                |(endpoint, p256dh, auth, device_id, scope_url)| PushSubscription {
+                    endpoint,
+                    p256dh,
+                    auth,
+                    device_id,
+                    scope_url,
+                },
+            )
             .collect())
     }
 }
@@ -438,18 +459,25 @@ pub async fn send_push_to_all_with_app(
         return;
     }
 
-    let payload_bytes = build_push_payload(
-        title,
-        body,
-        notification_id,
-        app_id,
-        link_thread_id,
-        link_event_id,
-        &tap,
-    )
-    .to_string();
+    let deliveries: Vec<(PushSubscription, String)> = subscriptions
+        .into_iter()
+        .map(|sub| {
+            let payload_bytes = build_push_payload(
+                title,
+                body,
+                notification_id,
+                app_id,
+                link_thread_id,
+                link_event_id,
+                &tap,
+                sub.scope_url.as_deref(),
+            )
+            .to_string();
+            (sub, payload_bytes)
+        })
+        .collect();
 
-    fan_out_payload(pool, subscriptions, payload_bytes, "notification", notification_id).await;
+    fan_out_payload(pool, deliveries, "notification", notification_id).await;
 
     // Layer 3 of the macOS-Chromium wedge mitigation (see
     // `system-knowhow/notifications.md` §4.5). For every macOS-Chromium
@@ -467,12 +495,7 @@ pub async fn send_push_to_all_with_app(
     // wake without an id has nothing to mirror. Empty `wake_targets`
     // is a no-op inside `schedule_mac_chromium_wakes`.
     if let Some(nid) = notification_id {
-        schedule_mac_chromium_wakes(
-            engine.clone(),
-            wake_targets,
-            nid,
-            MAC_CHROMIUM_WAKE_DELAY,
-        );
+        schedule_mac_chromium_wakes(engine.clone(), wake_targets, nid, MAC_CHROMIUM_WAKE_DELAY);
     }
 }
 
@@ -782,21 +805,20 @@ pub(crate) async fn send_wake_push_to_device(
         return Ok(0);
     }
 
-    let subscriptions =
-        PushSubscriptionStore::get_push_enabled_for_device(pool, device_id).await?;
+    let subscriptions = PushSubscriptionStore::get_push_enabled_for_device(pool, device_id).await?;
     if subscriptions.is_empty() {
         return Ok(0);
     }
 
-    let payload_bytes = build_wake_payload(&notification).to_string();
-    Ok(fan_out_payload(
-        pool,
-        subscriptions,
-        payload_bytes,
-        "wake",
-        Some(notification_id),
-    )
-    .await)
+    let deliveries: Vec<(PushSubscription, String)> = subscriptions
+        .into_iter()
+        .map(|sub| {
+            let payload_bytes =
+                build_wake_payload(&notification, sub.scope_url.as_deref()).to_string();
+            (sub, payload_bytes)
+        })
+        .collect();
+    Ok(fan_out_payload(pool, deliveries, "wake", Some(notification_id)).await)
 }
 
 /// Default notification tag — used when `notification_id` is absent so the
@@ -805,8 +827,8 @@ pub(crate) async fn send_wake_push_to_device(
 const DEFAULT_NOTIFICATION_TAG: &str = "lucidos-notification";
 
 /// Top-level magic that opts the payload into Declarative Web Push parsing
-/// (RFC 8030 homage). Required by Safari 18.5+ to handle the notification
-/// declaratively without running the SW push handler. See
+/// (RFC 8030 homage). Required by Safari 18.5+ to read `notification.navigate`
+/// for the tap path even though the iOS SW `push` handler may still run. See
 /// `system-knowhow/notifications.md` §4.5.
 const DECLARATIVE_WEB_PUSH_MAGIC: i64 = 8030;
 
@@ -814,10 +836,9 @@ const DECLARATIVE_WEB_PUSH_MAGIC: i64 = 8030;
 /// forms (see [`navigate_url_ios`] / [`navigate_url_sw`]). Empty when there's
 /// nothing to deep-link, so the callers can fall back to a bare `/`.
 ///
-/// The Push API base URL for resolving a declarative `navigate` is the push
-/// subscription's scope, so the callers emit a leading-slash relative URL that
-/// resolves to the PWA origin without the engine knowing its own hostname
-/// (Tailscale, localhost, public domain).
+/// The iOS declarative `navigate` field is built from the subscription's stored
+/// scope URL when available, so the engine does not have to guess the gateway
+/// workspace prefix from an APNs/FCM endpoint.
 ///
 /// The `tap` JSON is only emitted for non-modal kinds — modal-kind URLs stay
 /// short, and the page safely demotes a missing `tap` param to the modal
@@ -859,11 +880,43 @@ fn build_navigate_params(
 /// document, so iOS performs a real navigation the page picks up on load /
 /// resume via `parseDeepLinkFromUrl` (which reads query params). See
 /// `system-knowhow/notifications.md` §4.5.
-fn navigate_url_ios(params: &str) -> String {
-    if params.is_empty() {
-        "/".to_string()
+///
+/// `scope_url` is the concrete service-worker scope captured by the page at
+/// subscription time, e.g. `https://host/dev/`. When it is present we emit an
+/// absolute URL (`https://host/dev/?notification=...`) instead of relying on
+/// WebKit/APNs to resolve a query-only relative value. Existing legacy rows that
+/// lack `scope_url` keep the relative fallback until the next page load refreshes
+/// their subscription.
+fn navigate_url_ios(params: &str, scope_url: Option<&str>) -> String {
+    let relative = if params.is_empty() {
+        ".".to_string()
     } else {
-        format!("/?{params}")
+        format!("?{params}")
+    };
+    let Some(scope) = scope_url.and_then(normalize_scope_url) else {
+        return relative;
+    };
+    if params.is_empty() {
+        scope
+    } else {
+        format!("{scope}?{params}")
+    }
+}
+
+fn normalize_scope_url(scope_url: &str) -> Option<String> {
+    let trimmed = scope_url.trim();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return None;
+    }
+    let no_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+    let no_query = no_fragment.split('?').next().unwrap_or(no_fragment);
+    if no_query.is_empty() {
+        return None;
+    }
+    if no_query.ends_with('/') {
+        Some(no_query.to_string())
+    } else {
+        Some(format!("{no_query}/"))
     }
 }
 
@@ -877,11 +930,15 @@ fn navigate_url_ios(params: &str) -> String {
 /// to the page (see `routeToDeepLink` in `sw.js` and
 /// `system-knowhow/notifications.md` §4.5). The query-vs-hash split with
 /// [`navigate_url_ios`] is kept: iOS needs a cross-document (query) URL.
+///
+/// This remains **scope-relative** (no leading slash) so it resolves inside the
+/// gateway `/<slug>/` scope. The Chrome SW always passes it through
+/// `resolveNavigate` in `sw.js` (which resolves against `origin + SCOPE_PATH`).
 fn navigate_url_sw(params: &str) -> String {
     if params.is_empty() {
-        "/".to_string()
+        ".".to_string()
     } else {
-        format!("/#{params}")
+        format!("#{params}")
     }
 }
 
@@ -894,6 +951,7 @@ fn navigate_url_sw(params: &str) -> String {
 /// purely for Chrome's SW.
 fn build_wake_payload(
     notification: &crate::scheduler::notifications::Notification,
+    ios_scope_url: Option<&str>,
 ) -> serde_json::Value {
     let mut payload = build_push_payload(
         &notification.title,
@@ -903,6 +961,7 @@ fn build_wake_payload(
         notification.thread_id,
         notification.event_id,
         &notification.tap,
+        ios_scope_url,
     );
     payload["wake"] = serde_json::Value::Bool(true);
     payload
@@ -920,7 +979,7 @@ fn build_wake_payload(
 ///   "notification": {
 ///     "title": "...",
 ///     "body": "...",
-///     "navigate": "/?notification=...&thread=...&event=...&tap=...",
+///     "navigate": "https://host/<slug>/?notification=...&thread=...&event=...&tap=...",
 ///     "tag": "<notification_id or lucidos-notification>",
 ///     "data": {
 ///       "notification_id": "...",
@@ -928,27 +987,36 @@ fn build_wake_payload(
 ///       "event_id": "...",
 ///       "app_id": "...",
 ///       "tap": { "kind": "modal" | "none" | "navigate", ... },
-///       "navigate": "/#notification=...  (HASH form, for the Chrome SW notificationclick path)"
+///       "navigate": "#notification=...  (HASH form, for the Chrome SW notificationclick path)"
 ///     }
 ///   }
 /// }
 /// ```
 ///
 /// **Two navigate URL forms, same params.** `notification.navigate` (consumed
-/// by iOS Safari) is a **query** URL; `notification.data.navigate` (consumed by
-/// the Chrome SW) is a **hash** URL. They carry identical deep-link params and
-/// differ only in the `?` vs `#` prefix — see [`navigate_url_ios`] /
-/// [`navigate_url_sw`] for why.
+/// by iOS Safari) is an **absolute query** URL when the subscription has a
+/// stored scope; `notification.data.navigate` (consumed by the Chrome SW) is a
+/// **hash** URL. They carry identical deep-link params — see
+/// [`navigate_url_ios`] / [`navigate_url_sw`] for why.
 ///
-/// **iOS Safari 18.5+** sees the `web_push: 8030` magic and handles the
-/// notification declaratively — `showNotification` / `notificationclick` are
-/// bypassed entirely. On tap the OS navigates the existing top-level
-/// traversable to `notification.navigate` (resolved against the subscription's
-/// scope, hence the relative URL). It MUST be a cross-document (query) URL: a
-/// same-document (hash-only) navigation is not applied to an already-open PWA
-/// window — WebKit just focuses it — so a hash URL silently no-ops the deep
-/// link. The page's `handleHashLocation` → `dispatchDeepLink` chain reads the
-/// query params on load/resume and marks-read + routes.
+/// **iOS Safari 18.5+** sees the `web_push: 8030` magic. NOTE: the SW `push`
+/// handler still FIRES on iOS (confirmed via the `[Client/sw] push` breadcrumb)
+/// — the earlier claim that iOS "bypasses the SW entirely" was wrong, and the
+/// SW's `showNotification` is what renders the visible banner on iOS. (We tested
+/// skipping `showNotification` on iOS so the OS would render the declarative
+/// notification natively + dodge the `notificationclick` deep-link bug — it
+/// showed NO banner at all, because iOS only uses the declarative fallback when
+/// the SW handler errors/times out, not when it cleanly resolves without showing.
+/// Reverted; the SW always displays. See notifications.md §4.5 seventeenth
+/// iteration — do not retry.) On tap the OS navigates the existing top-level
+/// traversable to `notification.navigate`. We build that URL from the stored
+/// service-worker scope (`https://host/<slug>/`) so the gateway prefix is
+/// preserved and WebKit does not have to accept a query-only relative URL. It
+/// MUST be a cross-document (query) URL: a same-document (hash-only) navigation
+/// is not applied to an already-open PWA window — WebKit just focuses it — so a
+/// hash URL silently no-ops the deep link. The page's `handleHashLocation` →
+/// `dispatchDeepLink` chain reads the query params on load/resume and marks-read
+/// + routes.
 ///
 /// **Chrome / Firefox** don't recognize the magic, so the SW `push` handler
 /// fires as usual, reads `data.notification.*` to populate `showNotification`,
@@ -971,9 +1039,10 @@ fn build_push_payload(
     link_thread_id: Option<uuid::Uuid>,
     link_event_id: Option<uuid::Uuid>,
     tap: &crate::scheduler::notifications::Tap,
+    ios_scope_url: Option<&str>,
 ) -> serde_json::Value {
     let params = build_navigate_params(notification_id, link_thread_id, link_event_id, tap);
-    let navigate_ios = navigate_url_ios(&params);
+    let navigate_ios = navigate_url_ios(&params, ios_scope_url);
     let navigate_sw = navigate_url_sw(&params);
     let tag = notification_id
         .map(|id| id.to_string())
@@ -1009,10 +1078,7 @@ fn build_push_payload(
     // read the engine-built URL straight off `event.notification.data` for the
     // cold `clients.openWindow()` path (no tab open) instead of rebuilding it.
     // Warm taps route via postMessage, not this URL — see `navigate_url_sw`.
-    data.insert(
-        "navigate".into(),
-        serde_json::Value::String(navigate_sw),
-    );
+    data.insert("navigate".into(), serde_json::Value::String(navigate_sw));
 
     serde_json::json!({
         "web_push": DECLARATIVE_WEB_PUSH_MAGIC,
@@ -1035,27 +1101,25 @@ fn build_push_payload(
 /// waiting on APNs/FCM.
 async fn fan_out_payload(
     pool: &PgPool,
-    subscriptions: Vec<PushSubscription>,
-    payload_bytes: String,
+    deliveries: Vec<(PushSubscription, String)>,
     kind: &str,
     notification_id: Option<uuid::Uuid>,
 ) -> usize {
     #[cfg(feature = "e2e-test-hooks")]
     {
-        fan_out_to_push_log(pool, subscriptions, &payload_bytes, kind, notification_id).await
+        fan_out_to_push_log(pool, deliveries, kind, notification_id).await
     }
     #[cfg(not(feature = "e2e-test-hooks"))]
     {
         let _ = notification_id;
-        fan_out_to_web_push(pool, subscriptions, payload_bytes, kind).await
+        fan_out_to_web_push(pool, deliveries, kind).await
     }
 }
 
 #[cfg(not(feature = "e2e-test-hooks"))]
 async fn fan_out_to_web_push(
     pool: &PgPool,
-    subscriptions: Vec<PushSubscription>,
-    payload_bytes: String,
+    deliveries: Vec<(PushSubscription, String)>,
     kind: &str,
 ) -> usize {
     let keys = match get_or_create_vapid_keys(pool).await {
@@ -1077,7 +1141,7 @@ async fn fan_out_to_web_push(
     let mut stale_endpoints: Vec<String> = Vec::new();
     let mut delivered = 0usize;
 
-    for sub in &subscriptions {
+    for (sub, payload_bytes) in &deliveries {
         let endpoint_label = &sub.endpoint[..sub.endpoint.floor_char_boundary(60)];
         let sub_info = web_push::SubscriptionInfo::new(&sub.endpoint, &sub.p256dh, &sub.auth);
 
@@ -1135,7 +1199,12 @@ async fn fan_out_to_web_push(
                     );
                     stale_endpoints.push(sub.endpoint.clone());
                 } else {
-                    log!("[Push] Failed to send {} to {}: {}", kind, endpoint_label, e);
+                    log!(
+                        "[Push] Failed to send {} to {}: {}",
+                        kind,
+                        endpoint_label,
+                        e
+                    );
                 }
             }
         }
@@ -1153,8 +1222,7 @@ async fn fan_out_to_web_push(
 #[cfg(feature = "e2e-test-hooks")]
 async fn fan_out_to_push_log(
     pool: &PgPool,
-    subscriptions: Vec<PushSubscription>,
-    payload: &str,
+    deliveries: Vec<(PushSubscription, String)>,
     kind: &str,
     notification_id: Option<uuid::Uuid>,
 ) -> usize {
@@ -1164,7 +1232,7 @@ async fn fan_out_to_push_log(
         return 0;
     };
     let mut delivered = 0usize;
-    for sub in &subscriptions {
+    for (sub, payload) in &deliveries {
         let endpoint_label = &sub.endpoint[..sub.endpoint.floor_char_boundary(60)];
         // Legacy rows without a device_id can't be attributed; skip so the
         // test log only contains rows tests will actually assert against.

@@ -225,6 +225,23 @@ export async function postCommandConsent(
   await throwIfNotOk(resp);
 }
 
+// --- Chat MCP permission consent — chat mirror of MCP consent for MCP tools ---
+
+export async function postMcpPermissionConsent(
+  requestId: string,
+  allowed: boolean,
+  persistScope?: PersistScope,
+): Promise<void> {
+  const body: Record<string, unknown> = { request_id: requestId, allowed };
+  if (persistScope) body.persist_scope = persistScope;
+  const resp = await mutatingFetch(`${API}/mcp-permission/consent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  await throwIfNotOk(resp);
+}
+
 // --- Command-guard checkpoint undo (ADR 0002, Phase 4) ---
 
 export async function postCommandCheckpointUndo(checkpointId: string): Promise<void> {

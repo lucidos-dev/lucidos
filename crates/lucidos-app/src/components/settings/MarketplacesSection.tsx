@@ -7,6 +7,7 @@ import {
   loadPluginCatalog,
   removePluginMarketplaceAction,
 } from '../../store/actions/plugin-marketplaces';
+import { AddOfficialMarketplaceButton } from '../apps/AddOfficialMarketplaceButton';
 
 /** Settings → Marketplaces. Add/remove the git repositories (plugin
  *  marketplaces) the Store scans for installable plugins. Moved here out of the
@@ -69,7 +70,10 @@ export function MarketplacesSection() {
       ) : loadable.status !== 'loaded' ? (
         showLoading ? <div class="loading-spinner" /> : null
       ) : loadable.data.marketplaces.length === 0 ? (
-        <div class="app-store-muted-row">No marketplaces registered.</div>
+        <div class="app-store-empty-suggest app-store-empty-suggest-settings">
+          <div class="app-store-muted-row">No marketplaces registered.</div>
+          <AddOfficialMarketplaceButton />
+        </div>
       ) : (
         <div class="list-rows app-store-marketplaces">
           {loadable.data.marketplaces.map((marketplace) => (

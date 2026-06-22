@@ -1,7 +1,8 @@
 import { effect, untracked } from '@preact/signals';
-import { pageTitle, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, filePreviewEditing, previewFile, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, SELECTED_CHANGE_KEY, MOBILE_VIEW_KEY } from './store';
+import { pageTitle, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, diffWholeFile, filePreviewEditing, previewFile, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY, MOBILE_VIEW_KEY } from './store';
 import { clientRefreshing } from '../hooks/sw-update';
 import { cancelApplyAllBatch } from './actions/chat-changes';
+import { handleRestartTimeout } from './actions/connection';
 
 // Sync page title with unread count
 effect(() => {
@@ -78,6 +79,11 @@ effect(() => {
   localStorage.setItem('lucidos-file-preview-source', String(filePreviewSource.value));
 });
 
+// Persist diff-vs-whole-file toggle (whole merged end-state file in the diff preview)
+effect(() => {
+  localStorage.setItem('lucidos-diff-whole-file', String(diffWholeFile.value));
+});
+
 // Drop inline edit mode whenever the previewed file changes (or the preview
 // closes). Restore-from-history (navigation.restoreState) sets panelOverlay
 // directly without going through openFilePreview, so resetting here — keyed on
@@ -150,5 +156,33 @@ effect(() => {
   } else if (!active && applyAllToastShown) {
     applyAllToastShown = false;
     untracked(() => dismissToast('apply-all-batch'));
+  }
+});
+
+// Engine-restart safety timeout. The initiating tab no longer mounts the
+// UiBlockingOverlay during a restart (the gateway boot splash + GET-gate + SSE
+// reconnect handle recovery), but the GET-gate `awaitEngineReady` still blocks
+// reads on `engineRestarting` — so if the engine never comes back, something must
+// clear the flag or reads hang forever. This effect carries the timeout the
+// overlay used to own: arm it on the false→true edge, cancel on the true→false
+// edge (reconnect via started_at, or a restart spawn-failure that reverts the
+// flag). handleRestartTimeout probes health before declaring a timeout, so a
+// frozen timer firing on iOS PWA resume (engine already restarted) doesn't show a
+// false error — see its doc comment in connection.ts. The effect's only
+// dependency is `engineRestarting`; handleRestartTimeout runs async (out of the
+// tracking scope) so flipping the flag inside it can't form a cycle.
+const RESTART_TIMEOUT_MS = 300_000;
+let restartTimer: ReturnType<typeof setTimeout> | null = null;
+effect(() => {
+  if (engineRestarting.value) {
+    if (restartTimer === null) {
+      restartTimer = setTimeout(() => {
+        restartTimer = null;
+        void handleRestartTimeout();
+      }, RESTART_TIMEOUT_MS);
+    }
+  } else if (restartTimer !== null) {
+    clearTimeout(restartTimer);
+    restartTimer = null;
   }
 });

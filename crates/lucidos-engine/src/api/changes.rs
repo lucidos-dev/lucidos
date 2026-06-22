@@ -75,17 +75,25 @@ pub(super) async fn list_changes(
 
     let pool = state.engine.pool();
     let proj = state.engine.changes();
-    // Fetch limit+1 on applied to detect has_more.
-    let (pending_r, applied_r, client_update_r, restart_groups_r) = tokio::join!(
+    // Fetch limit+1 on applied to detect has_more. The durable `apply_all_batches`
+    // mirror holds a row only while a batch is in flight (inserted on start,
+    // deleted on complete/cancel/recovery), so its non-emptiness is the
+    // cross-reload truth for the "Applying changes…" toast — the driving
+    // `applyAllInProgress` signal resets on reload and the ApplyAllBatch* SSE
+    // events aren't replayed. Joined with the other reads — independent query.
+    let (pending_r, applied_r, client_update_r, restart_groups_r, apply_all_r) = tokio::join!(
         proj.list_pending(),
         proj.list_recently_applied(limit + 1, before_ts),
         proj.client_update_since(state.started_at),
         proj.restart_groups_since(state.started_at),
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM apply_all_batches)")
+            .fetch_one(pool),
     );
     let mut pending = pending_r.map_err(ApiError::db)?;
     let mut applied = applied_r.map_err(ApiError::db)?;
     let client_update = client_update_r.map_err(ApiError::db)?;
     let mut restart_groups = restart_groups_r.map_err(ApiError::db)?;
+    let apply_all_in_progress = apply_all_r.map_err(ApiError::db)?;
     let has_more_applied = applied.len() as i64 > limit;
     if has_more_applied {
         applied.truncate(limit as usize);
@@ -115,6 +123,7 @@ pub(super) async fn list_changes(
         "restart_groups": restart_groups,
         "client_update_available": client_update,
         "has_more_applied": has_more_applied,
+        "apply_all_in_progress": apply_all_in_progress,
     })))
 }
 

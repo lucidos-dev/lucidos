@@ -4,7 +4,8 @@ import './utils/workspaceStorage.install';
 import { render } from 'preact';
 import { App } from './App';
 import { WorkspacePicker } from './components/picker/WorkspacePicker';
-import { IS_PICKER } from './utils/basePath';
+import { IS_PICKER, WORKSPACE_ID } from './utils/basePath';
+import { rememberLastWorkspace } from './utils/lastWorkspace';
 import { updateAvailable } from './store/store';
 import { installActionBtnBlurListener } from './components/chat/promptFocus';
 import { isTouchDevice } from './utils/viewport';
@@ -58,6 +59,11 @@ installActionBtnBlurListener();
 // old root-path ambiguity (gateway picker vs. legacy engine, both at `/`) is
 // gone because they now carry different base hrefs.
 const appRoot = document.getElementById('app')!;
+// Remember the workspace the user is in, so the gateway's smart root (`/`) can
+// auto-open it next time (see lastWorkspace.ts / WorkspacePicker). Only inside a
+// real workspace — never the picker (IS_PICKER) or legacy direct-engine root
+// (WORKSPACE_ID null).
+if (!IS_PICKER && WORKSPACE_ID) rememberLastWorkspace(WORKSPACE_ID);
 render(IS_PICKER ? <WorkspacePicker /> : <App />, appRoot);
 
 if (import.meta.hot) {

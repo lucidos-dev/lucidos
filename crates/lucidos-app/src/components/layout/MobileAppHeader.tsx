@@ -3,8 +3,7 @@ import { ConnectionStatus } from './ConnectionStatus';
 import { unfocusThread } from '../../store/actions/threads';
 import { composeHandlers } from '../chat/promptFocus';
 import { scrolledFromTop } from '../chat/scrollState';
-import { ComposeIcon, SearchIcon, FilterIcon } from '../shared/icons';
-import { AltViewToggles } from '../shared/AltViewToggles';
+import { ComposeIcon, SearchIcon } from '../shared/icons';
 import { CopyThreadRefButton } from '../shared/CopyThreadRefButton';
 import { ExportThreadButton } from '../shared/ExportThreadButton';
 import { ThreadNav } from '../shared/ThreadNav';
@@ -12,9 +11,9 @@ import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './PanelNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
 import { ControlPanel, controlPanelBadgeCount, controlPanelBadgeTooltip, toggleControlPanelAtClick } from './ControlPanel';
-import { ThreadFilterDropdown } from './ThreadFilterDropdown';
+import { ThreadFilterDropdown, viewIcon } from './ThreadFilterDropdown';
 import { getContentTitle, getDiffDescription } from './headerHelpers';
-import { threadSearchQuery, mobileView, MOBILE_VIEWS, focusedThreadId, threadMap, draftsViewActive, attentionViewActive, type MobileView } from '../../store/store';
+import { threadSearchQuery, mobileView, MOBILE_VIEWS, focusedThreadId, threadMap, drawerView, attentionThreadCount, type MobileView } from '../../store/store';
 import { navigateToPane } from '../../store/actions/pane';
 import { useThreadsHeaderState } from '../../hooks/useThreadsHeaderState';
 import { ThreadTitleEditor } from '../chat/ThreadTitleEditor';
@@ -45,9 +44,13 @@ function MobileThreadsHeader() {
   const { filterOpen, setFilterOpen, toggleRef, closeFilter, filterActive,
           searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadsHeaderState();
 
-  // The channel/trigger/repo filter is unavailable while an alternate filter
-  // view (drafts or attention) is running — both deliberately bypass it.
-  const altViewActive = draftsViewActive.value || attentionViewActive.value;
+  // The unified Filter control is active when a non-default drawer view is
+  // selected OR a channel filter is set. The needs-attention badge rides on the
+  // same button (attention-only).
+  const filterButtonActive = drawerView.value !== 'all' || filterActive;
+  const attentionCount = attentionThreadCount.value;
+  // The button glyph reflects the selected view (funnel for `all`).
+  const ViewIcon = viewIcon(drawerView.value);
 
   return (
     <div class={`mobile-threads-header${searchOpen ? ' search-active' : ''}`}>
@@ -69,25 +72,23 @@ function MobileThreadsHeader() {
             </svg>
           </button>
         </div>
-        <div style={{ position: 'relative' }}>
+        {/* Single unified Filter control — opens the merged View + Show
+            dropdown (see ThreadFilterDropdown). Packed left in the same slot the
+            channel filter + view selector used to share. */}
+        <div class="view-selector-slot">
           <button
             ref={toggleRef}
-            class={`icon-btn header-icon${filterActive ? ' filter-active' : ''}`}
+            class={`icon-btn header-icon${filterButtonActive ? ' view-selector-active' : ''}`}
             onClick={() => setFilterOpen(!filterOpen)}
-            disabled={altViewActive}
             aria-label="Filter threads"
-            data-tooltip={altViewActive ? 'Filter unavailable in this view' : 'Filter threads'}
-            style={altViewActive ? 'pointer-events: auto;' : undefined}
+            aria-haspopup="menu"
+            aria-expanded={filterOpen}
           >
-            <FilterIcon />
+            <ViewIcon />
+            {attentionCount > 0 && <span class="badge">{attentionCount}</span>}
           </button>
-          {filterOpen && !altViewActive && <ThreadFilterDropdown onClose={closeFilter} toggleRef={toggleRef} />}
+          {filterOpen && <ThreadFilterDropdown onClose={closeFilter} toggleRef={toggleRef} />}
         </div>
-        {/* Needs-attention + drafts toggles, in the slot the prev/next thread
-            arrows used to occupy. Shared scheme with desktop (see
-            AltViewToggles): shown only when non-empty, packed left, attention
-            first. */}
-        <AltViewToggles />
         <span class="pane-header-title mobile-header-title">Threads</span>
         <div class="pane-header-spacer" />
         <button

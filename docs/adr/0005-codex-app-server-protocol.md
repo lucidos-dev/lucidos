@@ -129,6 +129,14 @@ engine-internal child-wake. Decision + arming are pure functions
 (`should_redirect_codex_followup` / `arm_codex_redirect` in
 `engine/chat/process_helpers.rs`) with unit tests.
 
-**Deferred.** The interrupted turn reuses `CancelCause::UserStop`; a dedicated
-`SupersededByFollowup` cause (for a clearer "Redirected" label) was deferred to
-avoid a `ThreadEvent`/frontend-union surface change the core fix doesn't need.
+**Labeling (2026-06-21 follow-up).** The interrupted turn now carries a dedicated
+`CancelCause::SupersededByFollowup` instead of `UserStop`. The user steered, they
+didn't Stop, so the frontend renders it **neutrally** — the interrupted turn reads
+a plain "Done", with no "Canceled ✕" badge and no standalone "Response canceled"
+panel, exactly like a chat/CC follow-up. The cancel is still emitted (it's what
+suppresses a spurious `ResponseGenerated` / change proposal); only the cause and
+its rendering changed. `arm_codex_redirect` flags the session; the run_session
+interrupt arm drains the flag into `classify_result` (and the escalation
+fallback). `CancelCause` is not part of the generated TS contract, so this needed
+only the hand-maintained frontend `CancelCause` union — no `ThreadEvent` variant
+change. See `docs/plans/2026-06-21-codex-followup-redirect-label.md`.

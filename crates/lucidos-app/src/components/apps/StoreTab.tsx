@@ -5,9 +5,10 @@ import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
 import { installMarketplacePlugin, refreshPluginCatalog } from '../../store/actions/plugin-marketplaces';
 import { openAppById } from '../../store/actions/apps';
-import { focusThreadOrBootstrap } from '../../store/actions/threads';
+import { focusThread } from '../../store/actions/threads';
 import { uninstallMarketplacePlugin } from '../../store/actions/plugin-uninstall';
 import { openSettingsSubview, switchMenuItem } from '../../store/actions/menu';
+import { AddOfficialMarketplaceButton } from './AddOfficialMarketplaceButton';
 
 /** Jump to Settings → Marketplaces from anywhere. `switchMenuItem` sets the
  *  Settings panel as the active menu item (resetting the subview to main);
@@ -126,16 +127,21 @@ export function StoreTab() {
     return (
       <div class="empty-state app-store-empty">
         {!hasMarketplaces ? (
-          <p>
-            <button
-              type="button"
-              class="accent-link"
-              onClick={openMarketplaceSettings}
-            >
-              Register a marketplace
-            </button>
-            {' '}to load plugins.
-          </p>
+          <div class="app-store-empty-suggest">
+            <p>Add a marketplace to discover and install plugins.</p>
+            <AddOfficialMarketplaceButton />
+            <p class="app-store-empty-alt">
+              or{' '}
+              <button
+                type="button"
+                class="accent-link"
+                onClick={openMarketplaceSettings}
+              >
+                register your own marketplace
+              </button>
+              .
+            </p>
+          </div>
         ) : query ? (
           <p>No plugins match "{appSearchQuery.value.trim()}".</p>
         ) : (
@@ -163,7 +169,14 @@ export function StoreTab() {
             break;
           case 'setup':
             label = 'Setup';
-            onPrimary = () => focusThreadOrBootstrap(action.threadId);
+            // focusThread (not …OrBootstrap): the setup thread may be spawned but
+            // not yet materialized as a thread_summaries row (queued in the
+            // Thread Queue), so a bootstrap fetch would 404 → "Thread not found".
+            // focusThread sets focus and lets the row + events stream in over
+            // SSE — same rationale as the confirm-navigation path in
+            // plugin-install.ts. The catalog only surfaces this button for a
+            // present-or-queued setup thread (a gone one resolves to Open).
+            onPrimary = () => focusThread(action.threadId);
             break;
           case 'open':
             label = 'Open';

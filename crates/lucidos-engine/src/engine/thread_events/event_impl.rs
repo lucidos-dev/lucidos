@@ -142,6 +142,8 @@ impl ThreadEvent {
             Self::CodingAgentPermissionResolved { .. } => "CodingAgentPermissionResolved",
             Self::CommandPermissionRequested { .. } => "CommandPermissionRequested",
             Self::CommandPermissionResolved { .. } => "CommandPermissionResolved",
+            Self::McpPermissionRequested { .. } => "McpPermissionRequested",
+            Self::McpPermissionResolved { .. } => "McpPermissionResolved",
             Self::CommandCheckpointed { .. } => "CommandCheckpointed",
             Self::CommandCheckpointReverted { .. } => "CommandCheckpointReverted",
             Self::WorktreeCleaned { .. } => "WorktreeCleaned",
@@ -157,7 +159,6 @@ impl ThreadEvent {
             Self::PluginUninstallRequested { .. } => "PluginUninstallRequested",
             Self::EmailConfirmRequested { .. } => "EmailConfirmRequested",
             Self::PushNotificationRequested => "PushNotificationRequested",
-            Self::McpConsentPromptRequested { .. } => "McpConsentPromptRequested",
             Self::FileRefreshRequested { .. } => "FileRefreshRequested",
             Self::AppUiRefreshRequested { .. } => "AppUiRefreshRequested",
             Self::AppUiCaptureRequested { .. } => "AppUiCaptureRequested",
@@ -196,7 +197,6 @@ impl ThreadEvent {
                 | Self::PluginUninstallRequested { .. }
                 | Self::EmailConfirmRequested { .. }
                 | Self::PushNotificationRequested
-                | Self::McpConsentPromptRequested { .. }
                 | Self::FileRefreshRequested { .. }
                 | Self::AppUiRefreshRequested { .. }
                 | Self::AppUiCaptureRequested { .. }

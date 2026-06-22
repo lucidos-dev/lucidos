@@ -9,6 +9,22 @@ export function isMeaningfulText(e: ResponseEvent): boolean {
   return e.type === 'text' && e.md.trim().length > 0;
 }
 
+/** True when an in-progress step is actually rendered on screen — steps are
+ *  expanded, the response panel is NOT collapsed, AND the visible set holds a
+ *  pending step (`success === null`, the one that carries the `.running-shimmer`
+ *  "live" affordance).
+ *
+ *  Drives the "exactly one running-text shimmer at a time" rule: when a live
+ *  step is on screen its own shimmer is the live signal, so the status label
+ *  ("Working") stays plain; otherwise the label itself shimmers as the sole
+ *  affordance. The `collapsed` guard is load-bearing — a collapsed panel hides
+ *  the steps body entirely (only the header status shows), so a pending step in
+ *  the data is NOT on screen; without this, the label shimmer was suppressed
+ *  while the step shimmer was hidden, leaving a working turn with no shimmer. */
+export function hasVisibleLiveStep(showSteps: boolean, collapsed: boolean, visibleEvents: ResponseEvent[]): boolean {
+  return showSteps && !collapsed && visibleEvents.some(e => e.type === 'step' && e.success === null);
+}
+
 /** Determine which toggles (More/Less, Show/Hide steps) to show for an exchange. */
 export function getEventToggleState(events: ResponseEvent[]): {
   showMoreToggle: boolean;

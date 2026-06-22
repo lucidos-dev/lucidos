@@ -260,6 +260,12 @@ function AddRepositoryForm() {
     );
   }
 
+  function cancel() {
+    setAdding(false);
+    setName('');
+    setPath('');
+  }
+
   async function save() {
     const trimmedName = name.trim();
     const trimmedPath = path.trim();
@@ -272,9 +278,7 @@ function AddRepositoryForm() {
         body: JSON.stringify({ name: trimmedName, path: trimmedPath }),
       });
       await throwIfNotOk(res);
-      setAdding(false);
-      setName('');
-      setPath('');
+      cancel();
       void loadRepositories();
     } catch (e) {
       showToast(`Failed to add repository: ${errorDetail(e)}`, 'error');
@@ -283,35 +287,38 @@ function AddRepositoryForm() {
     }
   }
 
+  const onFieldKeyDown = (e: KeyboardEvent) => {
+    if (e.key === 'Enter') void save();
+    if (e.key === 'Escape') cancel();
+  };
+
   return (
-    <div class="list-row repo-add-form">
-      <div class="list-row-info" style={{ gap: '0.5rem' }}>
+    <div class="repo-add-card">
+      <input
+        class="repo-add-input"
+        type="text"
+        placeholder="Name"
+        value={name}
+        onInput={(e) => setName((e.target as HTMLInputElement).value)}
+        onKeyDown={onFieldKeyDown}
+        autoFocus
+      />
+      <div class="repo-add-path-row">
         <input
-          class="device-name-input"
+          class="repo-add-input"
           type="text"
-          placeholder="Name"
-          value={name}
-          onInput={(e) => setName((e.target as HTMLInputElement).value)}
-          onKeyDown={(e) => { if (e.key === 'Enter') void save(); if (e.key === 'Escape') setAdding(false); }}
-          autoFocus
+          placeholder="Path (e.g. /Users/me/projects/myrepo)"
+          value={path}
+          onInput={(e) => setPath((e.target as HTMLInputElement).value)}
+          onKeyDown={onFieldKeyDown}
         />
-        <div class="repo-path-row">
-          <input
-            class="device-name-input"
-            type="text"
-            placeholder="Path (e.g. /Users/me/projects/myrepo)"
-            value={path}
-            onInput={(e) => setPath((e.target as HTMLInputElement).value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') void save(); if (e.key === 'Escape') setAdding(false); }}
-          />
-          <button class="action-btn" onClick={() => setShowPicker(true)}>Browse</button>
-        </div>
+        <button class="action-btn repo-add-browse" onClick={() => setShowPicker(true)}>Browse</button>
       </div>
-      <div class="list-row-actions">
+      <div class="repo-add-actions">
+        <button class="action-btn" onClick={cancel}>Cancel</button>
         <button class="action-btn action-btn-confirm" disabled={saving || !name.trim() || !path.trim()} onClick={save}>
-          {saving ? 'Saving...' : 'Save'}
+          {saving ? 'Saving…' : 'Save'}
         </button>
-        <button class="action-btn" onClick={() => { setAdding(false); setName(''); setPath(''); }}>Cancel</button>
       </div>
       {showPicker && (
         <DirectoryPicker

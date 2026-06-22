@@ -22,7 +22,9 @@ impl LucidosEngine {
         agent_session::external_watchdog::ExternalWatchdog::new(
             self.agent_sessions.clone(),
             Arc::new(self.event_bus.clone()),
+            self.pool.clone(),
             agent_session::external_watchdog::EXTERNAL_WATCHDOG_LIMIT_MS,
+            agent_session::WATCHDOG_HUNG_TOOL_CEILING_MS,
         )
         .spawn()
     }
@@ -790,11 +792,13 @@ impl LucidosEngine {
             cc_startup_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             workspace_repo_lock: Arc::new(tokio::sync::Mutex::new(())),
             mcp_manager,
-            pending_mcp_consent: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_cc_permission: Arc::new(std::sync::Mutex::new(
                 cc_permission::PermissionState::default(),
             )),
             pending_command_permission: Arc::new(std::sync::Mutex::new(
+                cc_permission::PermissionState::default(),
+            )),
+            pending_mcp_permission: Arc::new(std::sync::Mutex::new(
                 cc_permission::PermissionState::default(),
             )),
             question_wait_registry: cc_question_wait::QuestionWaitRegistry::new(),

@@ -80,8 +80,31 @@ export function openEditTrigger(triggerId: string): void {
   revealContentPane();
 }
 
-export async function navigateToTrigger(triggerId: string): Promise<void> {
+export async function navigateToTrigger(triggerId: string, source?: string): Promise<void> {
+  // `source` names where the navigate originated (e.g. a thread label) so a
+  // genuine-miss toast says where it came from instead of swallowing it.
+  const from = source ? ` (requested by ${source})` : '';
+
+  // Defense-in-depth on a cache miss, mirroring openAppById: `triggers` is a
+  // cached projection refreshed by Trigger* SSE events, so a sibling thread
+  // that just created the trigger leaves it momentarily stale. Re-fetch the
+  // source of truth before concluding the trigger is gone — a stale-cache
+  // pre-check would report a live trigger as "no longer exists" and swallow
+  // the real cause.
   if (triggers.value.status !== 'loaded') await loadTriggers();
+  if (triggers.value.status === 'loaded' && !triggers.value.data.some((t) => t.id === triggerId)) {
+    await loadTriggers();
+    if (triggers.value.status === 'loaded' && !triggers.value.data.some((t) => t.id === triggerId)) {
+      showToast(`Trigger "${triggerId}" no longer exists${from}`, 'error');
+      return;
+    }
+  }
+  if (triggers.value.status === 'failed') {
+    // loadTriggers stamped the failure on the Loadable, but the user who
+    // clicked the link isn't on the triggers panel — surface it directly.
+    showToast(`Couldn't open trigger "${triggerId}"${from} — triggers failed to load`, 'error');
+    return;
+  }
   setActiveMenu('triggers', { type: 'form', form: { type: 'trigger', triggerId } });
   pushNavState();
   // Canonical helper: mobile swipe to content pane AND desktop expand of

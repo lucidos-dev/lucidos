@@ -25,7 +25,7 @@ import type {
 } from './types';
 import { MENU_ITEMS } from './types';
 import type { ThreadState, ThreadStatus, Exchange } from './thread-events';
-import { computeExchanges, isExcludedFromSections, reviewTier } from './thread-events';
+import { computeExchanges, isExcludedFromSections } from './thread-events';
 import { getThreadEventsBump } from './threadActivity';
 import { DEFAULT_CHAT_MODEL } from './models';
 import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
@@ -76,6 +76,12 @@ export const previewFile = computed(() => {
 
 /** When true, file preview shows raw source instead of rendered output (for md, html, csv, svg). */
 export const filePreviewSource = signal(localStorage.getItem('lucidos-file-preview-source') === 'true');
+
+/** When true, a diff preview shows the whole file in its merged end state instead
+ *  of the unified hunks. Orthogonal to filePreviewSource (which still toggles
+ *  source-vs-rendered within the whole-file view). Sticky/persisted, default off
+ *  (the diff stays the default), matching the filePreviewSource pattern. */
+export const diffWholeFile = signal(localStorage.getItem('lucidos-diff-whole-file') === 'true');
 
 /** When true, the data-file preview shows an editable textarea instead of the
  *  rendered/source view. Reset to false whenever the previewed file changes
@@ -198,67 +204,40 @@ export const isProcessing = computed(() => {
 export const threadDrawerOpen = signal(
   localStorage.getItem('lucidos-thread-drawer-open') === 'true'
 );
-/** The active alternate drawer view, persisted across reloads. The toggle icons
- *  and their badge counts are already backend-derived (recomputed from the
- *  rehydrated `threadMap`), so they reappear on their own — only this *active
- *  selection* (being filtered into the view) was session-only and dropped on
- *  reload. At most one alternate view is active (the toggles are mutually
- *  exclusive), so a single tri-state key both persists the choice and encodes
- *  that invariant. */
+/** The active drawer view, picked from the single drawer view selector and
+ *  persisted across reloads. Four mutually-exclusive views:
+ *    - `all`       — the default sectioned list (Current/Saved/Archive).
+ *    - `attention` — Current/Saved threads where the agent is stuck and the user
+ *                    must act: awaiting an answer/permission or a failed turn
+ *                    (see `threadNeedsAttention`).
+ *    - `review`    — Current/Saved threads carrying a change ready to apply
+ *                    (see `threadInReview`).
+ *    - `running`   — Current/Saved threads actively working on a response
+ *                    (see `threadIsRunning`).
+ *    - `drafts`    — threads with an unsent draft (`draftThreads`).
+ *  The selector and its badge counts are backend-derived (recomputed from the
+ *  rehydrated `threadMap`), so only this *active selection* needs persisting; a
+ *  single key both stores the choice and encodes the one-active invariant.
+ *  Legacy `'attention'`/`'drafts'` values still restore; the retired `'none'`
+ *  and any unknown value fall back to `all`. */
 const ALT_VIEW_KEY = 'lucidos-alt-view';
-type AltView = 'none' | 'attention' | 'drafts';
+export type DrawerView = 'all' | 'attention' | 'review' | 'running' | 'drafts';
 
-function restoreAltView(): AltView {
+function restoreDrawerView(): DrawerView {
   const saved = localStorage.getItem(ALT_VIEW_KEY);
-  return saved === 'attention' || saved === 'drafts' ? saved : 'none';
+  return saved === 'attention' || saved === 'review' || saved === 'running' || saved === 'drafts' ? saved : 'all';
 }
 
-const initialAltView = restoreAltView();
+export const drawerView = signal<DrawerView>(restoreDrawerView());
 
-/** Drawer-as-drafts-filter toggle. When true, the thread list collapses to a
- *  single "Drafts" section showing every thread with an unsent draft (composing
- *  threads + existing threads with composeText/composeImages). Persisted via
- *  `ALT_VIEW_KEY` — restored on reload so the user lands back in the view they
- *  left (an empty restored view shows its own empty-state, with the toggle right
- *  there to exit — same as when the view empties mid-session). */
-export const draftsViewActive = signal(initialAltView === 'drafts');
-/** Drawer-as-attention-filter toggle. When true, the thread list collapses to a
- *  single "Needs attention" section showing every Current/Saved thread that
- *  needs the user — awaiting an answer/permission, a failed turn, or a change
- *  ready to apply (see `threadNeedsAttention`). Mirrors `draftsViewActive`:
- *  persisted across reload, opt-in, and mutually exclusive with it (one
- *  alternate filter view at a time). */
-export const attentionViewActive = signal(initialAltView === 'attention');
-
-/** Persist whichever alternate view is active (or clear the key when none is) so
- *  the next reload restores it. Called from the two toggles — the only mutators
- *  of these signals. */
-function persistAltView(): void {
-  const view: AltView = attentionViewActive.value
-    ? 'attention'
-    : draftsViewActive.value
-      ? 'drafts'
-      : 'none';
-  if (view === 'none') localStorage.removeItem(ALT_VIEW_KEY);
+/** Select a drawer view (the sole mutator of `drawerView`). Persists the choice
+ *  — clearing the key for `all` so a pristine state restores to the default —
+ *  and switches the drawer to that view. Shared by the desktop and mobile
+ *  threads headers via the drawer view selector. */
+export function setDrawerView(view: DrawerView): void {
+  drawerView.value = view;
+  if (view === 'all') localStorage.removeItem(ALT_VIEW_KEY);
   else localStorage.setItem(ALT_VIEW_KEY, view);
-}
-
-/** Toggle the drafts filter view. Mutually exclusive with the attention view —
- *  turning drafts on clears attention so the drawer only ever runs one alternate
- *  filter at a time. Shared by the desktop and mobile threads headers. */
-export function toggleDraftsView(): void {
-  const next = !draftsViewActive.value;
-  draftsViewActive.value = next;
-  if (next) attentionViewActive.value = false;
-  persistAltView();
-}
-
-/** Toggle the needs-attention filter view. Mutually exclusive with drafts. */
-export function toggleAttentionView(): void {
-  const next = !attentionViewActive.value;
-  attentionViewActive.value = next;
-  if (next) draftsViewActive.value = false;
-  persistAltView();
 }
 export const DEFAULT_DRAWER_WIDTH = 300;
 // Floor: the drawer header's icon row needs 216px (5 × 2.25rem buttons +
@@ -401,6 +380,22 @@ export function setSelectedAppIds(next: Set<string>): void {
   localStorage.setItem(SELECTED_APP_IDS_KEY, JSON.stringify([...next]));
 }
 
+// Whether the filter dropdown lists deleted trigger/repo/app options (those
+// whose underlying entity is gone but threads still reference it, shown with a
+// `(deleted)` / `(until <date>)` suffix). Default OFF — deleted entries are
+// excluded unless the user opts in. A *selected* deleted option always stays
+// visible regardless, so a filter restored from localStorage is clearable.
+const INCLUDE_DELETED_FILTERS_KEY = 'lucidos-filter-include-deleted';
+
+export const includeDeletedFilterOptions = signal<boolean>(
+  localStorage.getItem(INCLUDE_DELETED_FILTERS_KEY) === 'true'
+);
+
+export function setIncludeDeletedFilterOptions(next: boolean): void {
+  includeDeletedFilterOptions.value = next;
+  localStorage.setItem(INCLUDE_DELETED_FILTERS_KEY, String(next));
+}
+
 // Complete set of selectable filter facets (every trigger/repo/app that has a
 // thread), fetched from /api/v1/threads/filter-facets. Seeds the drawer "Show"
 // dropdown so it lists ALL session-having triggers/repos/apps, not just those
@@ -515,36 +510,83 @@ export function getCurrentThreads(): ThreadState[] {
 }
 
 /** Whether a thread needs the user's attention: it sits in the Current or Saved
- *  section AND the user must actively respond or fix something — answer a
- *  question or grant permission (both surface as `waiting_for_user_answer`),
- *  address a failed turn, or apply/discard a change ready to apply
- *  (`codingAgentProposed`). A mid-turn (`running`) thread is the agent's turn,
- *  not the user's: a proposed change whose follow-up turn is still in flight is
- *  not yet *ready* to apply (its WaitingBanner shows Cancel, not Apply), so it
- *  is excluded — mirroring `getCodingAgentWaitingInfo`'s running guard so the
- *  badge can't claim a thread whose Apply button isn't even showing. Otherwise
- *  this is `reviewTier < 2` — tier 0 (awaiting answer) plus tier 1 (failed OR
- *  proposed change). Composing/discarded threads never qualify. Shared by
- *  `attentionThreadCount` (the needs-attention filter badge) and
- *  `attentionThreads` (the filter view), so the count and the filtered list can
- *  never disagree. */
+ *  section AND the agent is stuck waiting on the user — a question or permission
+ *  request (both surface as `waiting_for_user_answer`) or a failed turn the user
+ *  must address. This is the "you must act, nothing progresses until you do"
+ *  subset; a change merely *ready to apply* is `threadInReview`, a separate
+ *  view. (`waiting_for_user_answer`/`failed` are mutually exclusive with
+ *  `running`, so no running guard is needed here.) Composing/discarded threads
+ *  never qualify. Shared by `attentionThreadCount` (the selector's
+ *  needs-attention badge) and `attentionThreads` (the view), so the count and
+ *  the filtered list can never disagree. */
 export function threadNeedsAttention(thread: ThreadState): boolean {
   if (isExcludedFromSections(thread)) return false;
   const section = getThreadDisplaySection(thread);
   if (section !== 'current' && section !== 'saved') return false;
   const status = effectiveThreadStatus(thread);
-  if (status === 'running') return false;
-  return reviewTier(thread, status) < 2;
+  return status === 'waiting_for_user_answer' || status === 'failed';
 }
 
-/** Count of threads needing the user's attention — awaiting answer/permission,
- *  failed, or carrying a change ready to apply (see `threadNeedsAttention`) —
- *  across the Current and Saved sections. Drives the badge on the needs-attention
- *  filter toggle: the global "you have N to handle". */
+/** Whether a thread is ready for review: it sits in the Current or Saved section
+ *  AND carries a coding-agent change ready to apply (`codingAgentProposed`). A
+ *  mid-turn (`running`) thread is excluded — a proposed change whose follow-up
+ *  turn is still in flight is not yet *ready* to apply (its WaitingBanner shows
+ *  Cancel, not Apply), mirroring `getCodingAgentWaitingInfo`'s running guard so
+ *  the badge can't claim a thread whose Apply button isn't even showing.
+ *  Independent of `threadNeedsAttention`: a thread that is both awaiting an
+ *  answer AND carrying a proposed change legitimately surfaces in both views.
+ *  Shared by `reviewThreadCount` and `reviewThreads`. */
+export function threadInReview(thread: ThreadState): boolean {
+  if (isExcludedFromSections(thread)) return false;
+  const section = getThreadDisplaySection(thread);
+  if (section !== 'current' && section !== 'saved') return false;
+  if (effectiveThreadStatus(thread) === 'running') return false;
+  return thread.meta.codingAgentProposed;
+}
+
+/** Count of threads where the agent is stuck waiting on the user — awaiting
+ *  answer/permission or a failed turn (see `threadNeedsAttention`) — across the
+ *  Current and Saved sections. Drives the selector's needs-attention badge. */
 export const attentionThreadCount = computed(() => {
   let count = 0;
   for (const thread of threadMap.value.values()) {
     if (threadNeedsAttention(thread)) count++;
+  }
+  return count;
+});
+
+/** Count of threads carrying a change ready to apply (see `threadInReview`)
+ *  across the Current and Saved sections. Drives the selector's review badge. */
+export const reviewThreadCount = computed(() => {
+  let count = 0;
+  for (const thread of threadMap.value.values()) {
+    if (threadInReview(thread)) count++;
+  }
+  return count;
+});
+
+/** Whether a thread is actively working: it sits in the Current or Saved section
+ *  AND its effective status is `running` (the agent is producing a response — the
+ *  same state the status dot labels "Running"). A `running` thread always routes
+ *  to Current/Saved (see `displaySection`), so the section gate never drops one;
+ *  it only keeps the excluded (composing/discarded) carve-out in lockstep with
+ *  the sibling predicates. Independent of `threadNeedsAttention`/`threadInReview`
+ *  — those exclude `running`, so the three views never claim the same thread.
+ *  Shared by `runningThreadCount` (the selector's running badge) and
+ *  `runningThreads` (the view) so the count and the filtered list can't disagree. */
+export function threadIsRunning(thread: ThreadState): boolean {
+  if (isExcludedFromSections(thread)) return false;
+  const section = getThreadDisplaySection(thread);
+  if (section !== 'current' && section !== 'saved') return false;
+  return effectiveThreadStatus(thread) === 'running';
+}
+
+/** Count of threads actively working on a response (see `threadIsRunning`)
+ *  across the Current and Saved sections. Drives the selector's running badge. */
+export const runningThreadCount = computed(() => {
+  let count = 0;
+  for (const thread of threadMap.value.values()) {
+    if (threadIsRunning(thread)) count++;
   }
   return count;
 });
@@ -1153,8 +1195,6 @@ export function resetCodingAgentPendingPreferences(): void {
 // --- Apps ---
 export const appsList = signal<Loadable<App[]>>({ status: 'not-loaded' });
 export const marketplaceCatalog = signal<Loadable<MarketplaceCatalog>>({ status: 'not-loaded' });
-/** When set, the app UI iframe renders at this historical commit. null = live/latest. */
-export const appCommit = signal<string | null>(null);
 /** Incremented to force-refresh app UI iframes. Used as a cache-busting key in the
  *  iframe src so Preact naturally propagates the reload to ALL iframe instances
  *  (desktop + mobile). 0 = initial load (no cache-buster needed). */
@@ -1234,7 +1274,10 @@ export function showToast(message: string, type: ToastType = 'info', opts?: { ke
     }
   }
   const id = ++toastIdCounter;
-  toasts.value = [...toasts.value, { id, message, type, key, action, secondaryAction, onClick, spinning, dismissable }];
+  // Prepend so the newest toast renders at the top of the column-stacked
+  // container and pushes existing ones down (the container is pinned to the
+  // top of the viewport, so array order is top→bottom).
+  toasts.value = [{ id, message, type, key, action, secondaryAction, onClick, spinning, dismissable }, ...toasts.value];
   if (key) {
     scheduleAutoDismiss(key, autoDismissMs);
     return;
@@ -1277,11 +1320,13 @@ export function dismissToast(idOrKey: number | string) {
 
 /** True when a toast already on screen offers the user a way to pick up a new
  *  build — i.e. it carries an action button. Every action-bearing toast in the
- *  app is a refresh/restart prompt ("Applied …"/"Engine restarted" with a
- *  Refresh button, "Engine restart required" with a Restart button, or the
- *  "New version available" toast itself), so the presence of `action` is a
- *  sufficient signal. Used to suppress the redundant "New version available"
- *  toast when one of those is already visible. */
+ *  app is a refresh/restart prompt ("Engine restarted" with a Refresh button,
+ *  "Engine restart required" with a Restart button, or the "New version
+ *  available" toast itself), so the presence of `action` is a sufficient signal.
+ *  Used to suppress the redundant "New version available" toast when one of those
+ *  is already visible. (The "Applied …" toast deliberately carries no Refresh
+ *  button — the rebuilt frontend isn't ready at apply time — so it never trips
+ *  this guard.) */
 export function hasRefreshToast(): boolean {
   return toasts.value.some((t) => t.action !== undefined);
 }

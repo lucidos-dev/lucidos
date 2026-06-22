@@ -1,3 +1,4 @@
+pub(crate) mod agent_context;
 pub(crate) mod agent_question;
 pub mod agent_recovery;
 pub(crate) mod agent_session;
@@ -14,6 +15,7 @@ pub(crate) mod command_guard;
 pub(crate) mod command_judge;
 pub mod command_permission;
 mod context;
+pub mod mcp_permission;
 pub mod event_bus;
 pub(crate) mod loaded_knowhow;
 pub(crate) mod git_ops;
@@ -273,10 +275,6 @@ pub struct LucidosEngine {
     workspace_repo_lock: Arc<tokio::sync::Mutex<()>>,
     /// MCP server manager — handles lifecycle, tool discovery, and tool calls
     pub mcp_manager: crate::mcp::McpManager,
-    /// Pending MCP consent requests. Key: request_id, Value: oneshot sender (true=allow, false=deny).
-    pub pending_mcp_consent: Arc<
-        std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
-    >,
     /// Pending CC permission prompts, deduped by `(thread, tool, input)` so
     /// CC's parallel/repeat tool calls collapse onto one card. See
     /// `cc_permission` module docs.
@@ -286,6 +284,11 @@ pub struct LucidosEngine {
     /// The chat agent's loop blocks in-process on the entry's broadcast rather
     /// than over MCP. See `command_permission` + `command_guard`.
     pub pending_command_permission: Arc<std::sync::Mutex<cc_permission::PermissionState>>,
+    /// Pending MCP permission prompts (chat) — the chat mirror of
+    /// `pending_command_permission` for MCP server tool calls, using the same
+    /// dedup / session-allow mechanism. The chat agent's loop blocks in-process
+    /// on the entry's broadcast. See `mcp_permission`.
+    pub pending_mcp_permission: Arc<std::sync::Mutex<cc_permission::PermissionState>>,
     /// Rendezvous map for the AskUserQuestion PreToolUse hook — the hook's
     /// long-poll handler waits on a receiver here; `answer_pending_question`
     /// notifies it when the user picks an answer. See `cc_question_wait` docs.

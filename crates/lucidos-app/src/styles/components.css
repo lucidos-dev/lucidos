@@ -681,89 +681,12 @@
 
 /* ── Lucidos mark (brand glyph) ─────────────────────────────────────────────
    The reusable inline-SVG mark (components/shared/LucidosMark.tsx). Sized via
-   the inline `width/height` the component sets from its `size` prop; these
-   rules only own layout alignment + the optional reveal animation. */
+   the inline `width/height` the component sets from its `size` prop; these rules
+   only own layout alignment. (The boot splash no longer uses this component — it
+   is inlined in index.html so it paints before the bundle loads; see
+   utils/bootSplash.ts.) */
 .lucidos-mark {
     display: inline-block;
     vertical-align: middle;
     flex-shrink: 0;
-}
-
-/* Reveal animation — plays ONCE on mount (no iteration count), landing on the
-   static mark: the gradient tile fades/scales in, the three "L" tiles build in
-   bottom-up with a slight overshoot, then the spark twinkles in. `both` fill
-   mode holds the from-state before each element's delay so nothing flashes at
-   full opacity first. With no `.lucidos-mark-animated` the shapes carry no
-   animation and render at their natural (final) state. */
-@keyframes lucidos-bg-in {
-    from { opacity: 0; transform: scale(0.9); }
-    to   { opacity: 1; transform: scale(1); }
-}
-@keyframes lucidos-tile-in {
-    from { opacity: 0; transform: scale(0.3); }
-    60%  { opacity: 1; transform: scale(1.08); }
-    to   { opacity: 1; transform: scale(1); }
-}
-@keyframes lucidos-spark-in {
-    from { opacity: 0; transform: scale(0) rotate(-60deg); }
-    70%  { opacity: 1; transform: scale(1.2) rotate(8deg); }
-    to   { opacity: 1; transform: scale(1) rotate(0); }
-}
-.lucidos-mark-animated .lmk-bg {
-    transform-box: fill-box;
-    transform-origin: center;
-    animation: lucidos-bg-in 0.35s ease-out both;
-}
-.lucidos-mark-animated .lmk-tile {
-    transform-box: fill-box; /* scale about each tile's own centre, not 0,0 */
-    transform-origin: center;
-    animation: lucidos-tile-in 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) both;
-}
-.lucidos-mark-animated .lmk-tile-1 { animation-delay: 0.15s; }
-.lucidos-mark-animated .lmk-tile-2 { animation-delay: 0.28s; }
-.lucidos-mark-animated .lmk-tile-3 { animation-delay: 0.41s; }
-.lucidos-mark-animated .lmk-spark {
-    transform-box: fill-box;
-    transform-origin: center;
-    animation: lucidos-spark-in 0.55s cubic-bezier(0.34, 1.56, 0.64, 1) 0.6s both;
-}
-@media (prefers-reduced-motion: reduce) {
-    .lucidos-mark-animated .lmk-bg,
-    .lucidos-mark-animated .lmk-tile,
-    .lucidos-mark-animated .lmk-spark {
-        animation: none;
-    }
-}
-
-/* ── Boot splash ────────────────────────────────────────────────────────────
-   One-time, full-screen brand-gradient wash with the white mark centred
-   (components/shared/BootSplash.tsx). Sits at --z-boot-splash so it covers
-   every overlay (modals 2300, toasts 2400) AND the floating header chrome
-   (--z-control-panel = 2200) — the thread-side header (brand / control panel /
-   collapsed actions) is absolutely positioned at 2200+ in the root stacking
-   context and would otherwise punch through the splash. The gradient matches
-   the generator's CSS equivalent. */
-.boot-splash {
-    position: fixed;
-    inset: 0;
-    z-index: var(--z-boot-splash);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%);
-    /* Purely decorative (aria-hidden) — the app shell loads and is interactive
-       behind it the whole time it's up, so the splash must never intercept
-       pointer events. Without this, a click or divider drag during the ~1.45s
-       reveal hits the splash instead of the UI underneath. */
-    pointer-events: none;
-}
-.boot-splash-leaving {
-    animation: boot-splash-out 0.45s ease forwards;
-}
-@keyframes boot-splash-out {
-    to { opacity: 0; visibility: hidden; }
-}
-@media (prefers-reduced-motion: reduce) {
-    /* No reveal to wait on — dismiss promptly without the fade tween. */
-    .boot-splash-leaving { animation-duration: 0.15s; }
 }

@@ -6,12 +6,10 @@ import { applyChange as apiApply, discardChange as apiDiscard, applyAllChanges a
 import { isTauri } from '../../utils/platform';
 import { invoke } from '../../utils/tauri';
 import { isNewerVersion } from '../../utils/version';
-import { refreshClient } from '../../hooks/sw-update';
-import { errorDetail } from '../../utils/errorDetail';
+import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { focusThread } from './threads';
 import { formatThreadLabel } from './thread-label';
 import type { Change } from '../../api/client';
-import type { ToastAction } from '../types';
 
 export const RESTART_TOAST_KEY = 'restart-required';
 export const RESTART_LS_KEY = 'lucidos-restart-required';
@@ -26,19 +24,6 @@ export const RESTART_DISMISSED_FP_LS_KEY = 'lucidos-restart-dismissed-fp';
 const PAGE_LOADED_AT = Date.now();
 
 const CLIENT_FILE_RE = /\.(ts|tsx|css|html|js|jsx)$/;
-
-/** Restart-required changes reload on reconnect; offering Refresh too would race. */
-export function appliedToastRefreshAction(
-  requiresRestart: boolean,
-  clientUpdate: boolean,
-): ToastAction | undefined {
-  if (!clientUpdate || requiresRestart) return undefined;
-  // SW-aware refresh: a bare reload keeps the current service worker, so it
-  // won't pick up the new sw.js (and the cache-first /assets/* graph can serve
-  // stale code). refreshClient() checks for the new sw.js and reloads once it
-  // controls the page.
-  return { label: 'Refresh', onClick: () => refreshClient() };
-}
 
 /** Check if any applied change with frontend files was resolved after the page loaded.
  *  This replaces the backend's `client_update_available` flag which checks "since engine
@@ -105,6 +90,15 @@ function persistRestartGroups(): void {
  *  long sessions. */
 const RESTART_TOAST_MESSAGE = 'Engine restart required to apply changes.';
 
+/** Two-phase progress text for the in-flight restart status toast. A dev
+ *  restart rebuilds the engine (cargo build) while the old engine is still up,
+ *  then kills + respawns it — so the toast starts on the build phase and
+ *  advances to the swap phase (in connection.ts) the moment the old engine
+ *  goes unreachable. A packaged restart has no build step (launchd kickstart),
+ *  so it starts directly on the swap phase. */
+export const RESTART_BUILD_MESSAGE = 'Building the new version…';
+export const RESTART_SWAP_MESSAGE = 'Starting and swapping to new engine…';
+
 /** Set restarting state, show info toast, and trigger the engine restart.
  *
  *  Routing by mode (the `packaged` signal comes from /health):
@@ -119,11 +113,19 @@ const RESTART_TOAST_MESSAGE = 'Engine restart required to apply changes.';
  *  `engineRestarting` on reconnect (started_at change). */
 export async function initiateEngineRestart(): Promise<void> {
   engineRestarting.value = true;
-  // dismissable: false — see ToastItem.dismissable.
-  // showDuringRestart: true — this is the one toast allowed while engineRestarting
-  // is set; without it the central suppression in showToast would eat its own
-  // status banner.
-  showToast('Restarting engine...', 'info', { key: RESTART_TOAST_KEY, spinning: true, dismissable: false, showDuringRestart: true });
+  // Light, dismissible status toast — the UI is NOT deactivated during a restart
+  // anymore (the gateway boot splash + GET-gate + SSE reconnect make it a
+  // recoverable non-event), so this is just a "why is it briefly unresponsive"
+  // hint the user can dismiss. It carries a spinner (spinning: true) to signal
+  // ongoing work, and reports progress in two phases — this build phase, then
+  // the swap phase advanced from checkConnection() when the old engine goes
+  // unreachable. Packaged restarts have no build step, so they start on the
+  // swap phase. showDuringRestart: true keeps it visible past the central
+  // suppression in showToast (which still eats read-path / SW-update noise
+  // during the window); the key de-dupes and lets started_at detection dismiss
+  // it on reconnect.
+  const initialMessage = enginePackaged.value ? RESTART_SWAP_MESSAGE : RESTART_BUILD_MESSAGE;
+  showToast(initialMessage, 'info', { key: RESTART_TOAST_KEY, showDuringRestart: true, spinning: true });
   try {
     if (enginePackaged.value && isTauri()) {
       // Drive launchd directly from the desktop shell — works even if the
@@ -194,6 +196,13 @@ export function dismissRestartToast(): void {
 export function syncRestartToast(): void {
   if (restartRequired.value) {
     localStorage.setItem(RESTART_LS_KEY, 'true');
+    // A restart is already in flight: the "Restarting engine..." status toast
+    // (initiateEngineRestart) owns RESTART_TOAST_KEY. restartRequired stays true
+    // until reconnect clears engineRestarting, so re-running this (SSE reconnect,
+    // a freshly-applied ChangeApplied → addRestartGroup) would otherwise clobber
+    // that status toast with the "restart required" warning + Restart button —
+    // nagging the user to start something already underway. Leave the key alone.
+    if (engineRestarting.value) return;
     const dismissedFp = localStorage.getItem(RESTART_DISMISSED_FP_LS_KEY);
     const currentFp = currentRestartFingerprint();
     if (dismissedFp !== null && dismissedFp === currentFp) {
@@ -241,8 +250,12 @@ export function restoreRestartToast(): void {
  *  On TimeoutError (10s client timeout) we retry once before bothering the user:
  *  the iOS PWA fires this from `runResumeSync` after every visibilitychange,
  *  and the cellular/Wi-Fi radio just-waking case can hang the first request
- *  past the timeout even when the engine is responding fast. A manual
- *  AbortError (no such caller today) intentionally does NOT retry. */
+ *  past the timeout even when the engine is responding fast.
+ *
+ *  A browser-cancelled AbortError is swallowed silently (see the final catch):
+ *  this path has no manual AbortController, so an AbortError means the browser
+ *  killed the in-flight fetch on an iOS PWA freeze / radio handoff — transient
+ *  page-lifecycle noise the next runResumeSync re-syncs, not a real failure. */
 export function refreshChangesState(): void {
   apiFetchChanges({ limit: 15 })
     .catch(e => {
@@ -265,10 +278,23 @@ export function refreshChangesState(): void {
         threadTitle: g.thread_title ?? 'unknown',
         commits: g.commits,
       }));
+      // Backend is the source of truth across page reloads for the Apply All
+      // batch too: the ApplyAllBatchStarted SSE that set this isn't replayed,
+      // so without this the sticky "Applying changes…" toast vanishes on reload
+      // while the batch is still running. The effects.ts edge-guard shows/hides
+      // the toast off this signal.
+      applyAllInProgress.value = state.apply_all_in_progress ?? false;
       if (hasClientUpdateSincePageLoad(applied)) updateAvailable.value = true;
       syncRestartToast();
     })
     .catch(e => {
+      // Browser-cancelled fetch (iOS PWA freeze / radio handoff): no manual
+      // AbortController on this path, so an AbortError is page-lifecycle noise,
+      // not an outage. Leave the already-loaded list intact (don't paint a
+      // spurious "Failed to fetch changes: request cancelled" or flip the view
+      // to a failed state) — the next runResumeSync re-syncs, and SSE keeps the
+      // list live while connected.
+      if (isAbortError(e)) return;
       changes.value = toFailed<Change[]>(e);
       appliedChanges.value = toFailed<Change[]>(e);
       showToast(`Failed to fetch changes: ${errorDetail(e)}`, 'error');

@@ -33,13 +33,15 @@ export async function confirmPluginInstallAction(installId: string, pluginName: 
       'success',
     );
     void refreshPluginCatalog();
-    // When the plugin shipped `setup` instructions the engine spawns a Lucidos
-    // Agent thread to walk the user through them. Drop the user straight into it
-    // so setup happens in front of them instead of silently in the background.
-    // Use focusThread (not …OrBootstrap): the thread was spawned via the Thread
-    // Queue and its summary row may not exist yet, so a bootstrap fetch would
-    // 404 → "Thread not found". focusThread just sets focus and lets the row +
-    // events stream in over SSE as the spawn runs.
+    // When the plugin shipped NEW `setup` instructions the engine spawns a
+    // Lucidos Agent thread to walk the user through them. Drop the user straight
+    // into it so setup happens in front of them. The engine spawns it as a
+    // SubThread, whose queue `prepare` step eager-emits MessageReceived — on the
+    // common immediate-admit path the thread_summaries row exists before this
+    // response returns, so the thread is real and already running when we focus.
+    // Use focusThread (not …OrBootstrap): if the spawn is briefly queued (no row
+    // yet) a bootstrap fetch would 404 → "Thread not found"; focusThread just
+    // sets focus and lets the row + events stream in over SSE.
     if (result.setup_thread_id) {
       focusThread(result.setup_thread_id);
     }

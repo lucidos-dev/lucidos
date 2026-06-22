@@ -2,6 +2,7 @@ import type { ComponentChildren } from 'preact';
 import { threadMap, focusedThreadId, applyingNowThreadIds, applyingChangeThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, effectiveThreadStatus, isMidTurn } from '../../store/store';
 import { resolveThreadActions, type TaggedAction } from '../../store/actions/threadActions';
 import { viewThreadCcDiff } from '../../store/actions/repositories';
+import { SplitButton, type SplitButtonMenuItem } from '../shared/SplitButton';
 
 /** The close-set kinds the banner renders. Discard-draft (a compose-draft
  *  action resolved by the close-cascade shortcut, not the banner) and the
@@ -138,6 +139,29 @@ export function getBannerSlots(state: BannerState): BannerSlots {
     };
   }
 
+  // When the close set has a primary Apply action, collapse the whole cluster
+  // into a split button — a one-tap "Apply (& Restart)" face plus a caret menu
+  // holding Diff and every other action (Discard, Archive). One compact control
+  // instead of two or three buttons that overflowed the prompt row and forced
+  // the Diff lift. The separate-button + liftable-Diff path below still runs for
+  // the no-Apply states (e.g. an idle CC thread with a diff but no pending
+  // change → Archive + Diff).
+  const applyAction = state.actions.find((a) => a.kind === 'apply');
+  if (applyAction) {
+    const menuActions = state.actions.filter((a) => a !== applyAction);
+    return {
+      liftable: null,
+      primary: (
+        <ChangeActionSplitButton
+          primary={applyAction}
+          menuActions={menuActions}
+          showDiff={state.showDiff}
+          threadId={state.threadId}
+        />
+      ),
+    };
+  }
+
   // Diff always opens the thread-level branch diff. The historical
   // change-row Diff buttons (ChatExchange, ChangesView) call viewChangeDiff
   // for a specific Change; the WaitingBanner's affordance is "show me what
@@ -149,6 +173,49 @@ export function getBannerSlots(state: BannerState): BannerSlots {
     liftable: state.showDiff ? renderDiffButton(state.threadId) : null,
     primary: <>{actionButtons}</>,
   };
+}
+
+/** Change-action split button: a one-tap primary face (Apply / Apply & Restart)
+ *  plus a caret menu holding Diff (when the branch has a diff) and the remaining
+ *  close-set actions (Discard, Archive). Built on the generic `SplitButton` (the
+ *  same control the prompt's multi-select answer Submit uses), so the caret /
+ *  Overlay-dismiss / inert-primary contract lives in one place. Labels,
+ *  tooltips, and handlers all come from the same TaggedActions the desktop
+ *  buttons use, so there's no enablement drift. */
+function ChangeActionSplitButton({
+  primary,
+  menuActions,
+  showDiff,
+  threadId,
+}: {
+  primary: TaggedAction;
+  menuActions: TaggedAction[];
+  showDiff: boolean;
+  threadId: string;
+}) {
+  const menuItems: SplitButtonMenuItem[] = [
+    ...(showDiff
+      ? [{ key: 'diff', label: 'Diff' as ComponentChildren, className: 'action-btn', onClick: () => void viewThreadCcDiff(threadId) }]
+      : []),
+    ...menuActions.map((action) => ({
+      key: action.kind,
+      label: action.label,
+      className: action.kind === 'discard' ? 'action-btn action-btn-danger' : 'action-btn',
+      tooltip: action.tooltip,
+      onClick: () => void action.invoke(),
+    })),
+  ];
+  return (
+    <SplitButton
+      primaryLabel={primary.label}
+      primaryClassName="action-btn action-btn-confirm"
+      primaryTooltip={primary.tooltip}
+      onPrimary={() => void primary.invoke()}
+      caretClassName="action-btn action-btn-confirm"
+      caretAriaLabel="More change actions"
+      menuItems={menuItems}
+    />
+  );
 }
 
 /** Shared Diff-button JSX. Rendered in two places: inside the banner via

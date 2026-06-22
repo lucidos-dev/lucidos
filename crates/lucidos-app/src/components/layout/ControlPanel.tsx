@@ -1,7 +1,12 @@
 import { createPortal } from 'preact/compat';
 import { useState, useEffect, useRef } from 'preact/hooks';
-import { signal } from '@preact/signals';
+import { signal, useSignal } from '@preact/signals';
 import { connectionStatus, restartRequired, updateAvailable, workspaceName } from '../../store/store';
+import { initiateEngineRestart } from '../../store/actions/chat-changes';
+import { refreshClient } from '../../hooks/sw-update';
+import { useLongPress } from '../../hooks/useLongPress';
+import { installPairedSwallow } from '../../hooks/useAnchoredPopover';
+import { CheckIcon, ReloadIcon } from '../shared/icons';
 import { fetchWorkspaces } from '../../api/client';
 import type { WorkspaceInfo } from '../../api/client';
 import { listWorkspaces, openWorkspace, type WorkspaceStatus } from '../../api/client/control';
@@ -145,10 +150,79 @@ function closeControlPanel(): void {
 }
 
 function ManageWorkspacesItem() {
+  // `?pick` suppresses the picker's auto-open-last-workspace so this link always
+  // lands on the list (see WorkspacePicker `autoOpening`).
   return (
-    <a class="control-panel-workspace-row control-panel-manage-row accent-link" href="/~/">
+    <a class="control-panel-workspace-row control-panel-manage-row accent-link" href="/~/?pick">
         <span class="control-panel-ws-name">Manage workspaces</span>
     </a>
+  );
+}
+
+/** Trailing control on the current workspace's row: a refresh button.
+ *  A normal tap refreshes the app (reloads the client); a long-press reveals an
+ *  inline Restart confirm that restarts this workspace's engine. The confirm is
+ *  rendered inside the picker panel on purpose — clicking it neither dismisses
+ *  the picker nor gets swallowed by the outside-click contract (a global
+ *  confirm modal would be treated as "outside" and eat the click). When a
+ *  restart is already pending (changes applied / engine outdated) the button is
+ *  highlighted. */
+function CurrentWorkspaceControls() {
+  const confirming = useSignal(false);
+  const pending = restartRequired.value;
+
+  const longPress = useLongPress(
+    () => {
+      confirming.value = true;
+      // The refresh button unmounts as the confirm buttons render in its place
+      // under the still-down pointer, so useLongPress's own (button-bound) click
+      // swallow can't run. This document-level one-shot eats the click/touchend
+      // the browser pairs with the long-press release, so it can't activate a
+      // confirm button without a deliberate fresh tap.
+      installPairedSwallow();
+    },
+    () => { refreshClient(); },
+  );
+
+  const doRestart = (e: Event) => {
+    e.preventDefault();
+    e.stopPropagation();
+    confirming.value = false;
+    closeControlPanel();
+    void initiateEngineRestart();
+  };
+  const cancel = (e: Event) => {
+    e.preventDefault();
+    e.stopPropagation();
+    confirming.value = false;
+  };
+
+  if (confirming.value) {
+    return (
+      <span class="control-panel-ws-restart-confirm">
+        <button type="button" class="control-panel-ws-cancel" onClick={cancel}>Cancel</button>
+        <button type="button" class="control-panel-ws-confirm" onClick={doRestart}>Restart</button>
+      </span>
+    );
+  }
+
+  const tooltip = pending ? 'Refresh · hold to restart & apply changes' : 'Refresh · hold to restart';
+  return (
+    <button
+      type="button"
+      class={`control-panel-ws-refresh${pending ? ' is-pending' : ''}`}
+      aria-label={tooltip}
+      data-tooltip={tooltip}
+      onPointerDown={longPress.onPointerDown}
+      onPointerMove={longPress.onPointerMove}
+      onPointerUp={longPress.onPointerUp}
+      onPointerLeave={longPress.onPointerLeave}
+      onPointerCancel={longPress.onPointerCancel}
+      onContextMenu={longPress.onContextMenu}
+      onClick={longPress.onClick}
+    >
+      <ReloadIcon />
+    </button>
   );
 }
 
@@ -241,16 +315,30 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
               {gatewayPeers.length === 0 && <EmptyItem>No workspaces running</EmptyItem>}
               {gatewayPeers.map(ws => {
                 const active = ws.id === WORKSPACE_ID;
+                // The current row is a non-interactive container (not a button)
+                // so its refresh control is a real, un-nested <button>.
+                if (active) {
+                  return (
+                    <div
+                      class="control-panel-workspace-row is-active control-panel-current-row"
+                      key={ws.id}
+                      aria-current="page"
+                    >
+                      <span class={`ws-picker-dot ${gatewayDotClass(ws)}`} />
+                      <span class="control-panel-ws-name control-panel-ws-name-current">{ws.name}</span>
+                      <CheckIcon className="control-panel-ws-check" />
+                      <CurrentWorkspaceControls />
+                    </div>
+                  );
+                }
                 return (
                   <button
-                    class={`control-panel-workspace-row${active ? ' is-active' : ''}`}
+                    class="control-panel-workspace-row"
                     key={ws.id}
-                    aria-current={active ? 'page' : undefined}
-                    onClick={() => active ? closeControlPanel() : openWorkspace(ws.id)}
+                    onClick={() => openWorkspace(ws.id)}
                   >
                     <span class={`ws-picker-dot ${gatewayDotClass(ws)}`} />
                     <span class="control-panel-ws-name">{ws.name}</span>
-                    {active && <span class="control-panel-ws-current">Current</span>}
                   </button>
                 );
               })}
@@ -271,24 +359,33 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
               )}
               {legacyPeers.map(ws => {
                 const active = !!workspaceName.value && ws.name === workspaceName.value;
+                // The current row is a non-interactive container (not an <a>)
+                // so its refresh control is a real, un-nested <button>.
+                if (active) {
+                  return (
+                    <div
+                      class="control-panel-workspace-row is-active control-panel-current-row"
+                      key={ws.path}
+                      aria-current="page"
+                    >
+                      <span class="ws-picker-dot ws-picker-dot-healthy" />
+                      <span class="control-panel-ws-name control-panel-ws-name-current">{ws.name}</span>
+                      <CheckIcon className="control-panel-ws-check" />
+                      <CurrentWorkspaceControls />
+                    </div>
+                  );
+                }
                 return (
                   <a
-                    class={`control-panel-workspace-row${active ? ' is-active' : ''}`}
+                    class="control-panel-workspace-row"
                     key={ws.path}
-                    aria-current={active ? 'page' : undefined}
-                    href={active ? undefined : ws.port ? `https://localhost:${ws.port}` : undefined}
-                    target={active ? undefined : '_blank'}
-                    rel={active ? undefined : 'noopener'}
-                    onClick={(e) => {
-                      if (active) {
-                        e.preventDefault();
-                        closeControlPanel();
-                      }
-                    }}
+                    href={ws.port ? `https://localhost:${ws.port}` : undefined}
+                    target="_blank"
+                    rel="noopener"
                   >
                     <span class="ws-picker-dot ws-picker-dot-healthy" />
                     <span class="control-panel-ws-name">{ws.name}</span>
-                    {active ? <span class="control-panel-ws-current">Current</span> : ws.port && <span class="control-panel-ws-port">:{ws.port}</span>}
+                    {ws.port && <span class="control-panel-ws-port">:{ws.port}</span>}
                   </a>
                 );
               })}

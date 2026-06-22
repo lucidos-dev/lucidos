@@ -1,5 +1,5 @@
 import { computed } from '@preact/signals';
-import { triggers, historicalTriggers, threadMap, selectedTriggerIds, setSelectedTriggerIds, threadChannelFilter, THREAD_CHANNEL_FILTER_KEY, filterFacets } from './store';
+import { triggers, historicalTriggers, threadMap, selectedTriggerIds, setSelectedTriggerIds, threadChannelFilter, THREAD_CHANNEL_FILTER_KEY, filterFacets, includeDeletedFilterOptions } from './store';
 import type { ThreadChannel } from './store';
 import { loadedOr } from './types';
 
@@ -70,17 +70,23 @@ export const triggerFilterOptions = computed<TriggerFilterOption[]>(() => {
   }
   for (const id of selectedTriggerIds.value) push(id);
 
-  return result.sort((a, b) => {
-    if (a.deleted !== b.deleted) return a.deleted ? 1 : -1;
-    if (a.deleted) {
-      // Within the deleted group, most-recent first so the user's eye lands
-      // on the trigger they were most likely running last.
-      const aTime = a.lastActivity ?? '';
-      const bTime = b.lastActivity ?? '';
-      if (aTime !== bTime) return bTime.localeCompare(aTime);
-    }
-    return a.label.localeCompare(b.label);
-  });
+  // Deleted entries are hidden unless the user opts in — but a *selected*
+  // deleted entry always stays visible so the filter remains clearable.
+  const includeDeleted = includeDeletedFilterOptions.value;
+  const selected = selectedTriggerIds.value;
+  return result
+    .filter(o => includeDeleted || !o.deleted || selected.has(o.id))
+    .sort((a, b) => {
+      if (a.deleted !== b.deleted) return a.deleted ? 1 : -1;
+      if (a.deleted) {
+        // Within the deleted group, most-recent first so the user's eye lands
+        // on the trigger they were most likely running last.
+        const aTime = a.lastActivity ?? '';
+        const bTime = b.lastActivity ?? '';
+        if (aTime !== bTime) return bTime.localeCompare(aTime);
+      }
+      return a.label.localeCompare(b.label);
+    });
 });
 
 export function toggleTriggerId(id: string): void {

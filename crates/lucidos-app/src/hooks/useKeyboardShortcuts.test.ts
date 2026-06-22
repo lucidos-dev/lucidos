@@ -7,7 +7,7 @@ vi.mock('../utils/dom', async (importOriginal) => {
   return { ...actual, isTextInput: vi.fn(() => false) };
 });
 
-import { dispatchEscape, classifyForwardedChord, dispatchForwardedChord } from './useKeyboardShortcuts';
+import { dispatchEscape, classifyForwardedChord, dispatchForwardedChord, shouldTypeToFocusPrompt } from './useKeyboardShortcuts';
 import { isTextInput } from '../utils/dom';
 import { pushOverlay, _resetOverlayStackForTesting } from '../store/overlayStack';
 import { focusedPane, splitRatio } from '../store/store';
@@ -47,6 +47,43 @@ describe('dispatchEscape (non-destructive Escape policy)', () => {
 
   it('no-ops when nothing is open and focus is not a text input (never touches the thread)', () => {
     expect(dispatchEscape(null)).toBe('noop');
+  });
+});
+
+describe('shouldTypeToFocusPrompt (bare-typing → prompt textarea)', () => {
+  const ev = (over: Partial<{ isComposing: boolean; metaKey: boolean; ctrlKey: boolean; altKey: boolean; key: string }> = {}) => ({
+    isComposing: false, metaKey: false, ctrlKey: false, altKey: false, key: 'a', target: null, ...over,
+  });
+
+  it('focuses the prompt for a bare printable key on desktop with no overlay', () => {
+    expect(shouldTypeToFocusPrompt(ev(), { mobile: false, overlayOpen: false })).toBe(true);
+  });
+
+  it('does NOT steal the keystroke while an overlay is open — typing must search the dropdown', () => {
+    // The reported bug: opening a dropdown and typing wrote into the prompt
+    // textarea behind it instead of filtering the dropdown.
+    expect(shouldTypeToFocusPrompt(ev(), { mobile: false, overlayOpen: true })).toBe(false);
+  });
+
+  it('is disabled on mobile (no type-to-focus there)', () => {
+    expect(shouldTypeToFocusPrompt(ev(), { mobile: true, overlayOpen: false })).toBe(false);
+  });
+
+  it('skips when a text input already owns focus', () => {
+    vi.mocked(isTextInput).mockReturnValue(true);
+    expect(shouldTypeToFocusPrompt(ev(), { mobile: false, overlayOpen: false })).toBe(false);
+  });
+
+  it('skips modifier chords and non-printable keys', () => {
+    expect(shouldTypeToFocusPrompt(ev({ metaKey: true }), { mobile: false, overlayOpen: false })).toBe(false);
+    expect(shouldTypeToFocusPrompt(ev({ ctrlKey: true }), { mobile: false, overlayOpen: false })).toBe(false);
+    expect(shouldTypeToFocusPrompt(ev({ altKey: true }), { mobile: false, overlayOpen: false })).toBe(false);
+    expect(shouldTypeToFocusPrompt(ev({ key: 'Enter' }), { mobile: false, overlayOpen: false })).toBe(false);
+    expect(shouldTypeToFocusPrompt(ev({ key: 'ArrowDown' }), { mobile: false, overlayOpen: false })).toBe(false);
+  });
+
+  it('skips while an IME composition is active', () => {
+    expect(shouldTypeToFocusPrompt(ev({ isComposing: true }), { mobile: false, overlayOpen: false })).toBe(false);
   });
 });
 

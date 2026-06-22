@@ -39,6 +39,10 @@ function installPermissionStubs() {
 describe('push.ts uses api/client helpers (not raw fetch)', () => {
   beforeEach(() => {
     localStorage.setItem('lucidos-device-id', 'dev-test-vapid');
+    Object.defineProperty(window, 'location', {
+      value: { origin: 'https://lucidos.test' },
+      configurable: true,
+    });
   });
   afterEach(() => {
     globalThis.fetch = originalFetch;
@@ -149,5 +153,7 @@ describe('push.ts uses api/client helpers (not raw fetch)', () => {
       'newly-created subscription must be POSTed to /api/v1/push/subscribe',
     ).toBeDefined();
     expect(subscribePost!.body).toContain('self-heal');
+    const subscribePayload = JSON.parse(subscribePost!.body!) as Record<string, string>;
+    expect(subscribePayload.scope_url).toBe('https://lucidos.test/');
   });
 });

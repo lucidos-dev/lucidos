@@ -104,6 +104,28 @@ export function openWorkspace(id: string): void {
   window.location.href = `/${encodeURIComponent(id)}/`;
 }
 
+// ── Gateway self-update (picker reload control) ────────────────────────────
+
+/** The running gateway's build id plus whether a rebuilt binary is waiting on
+ *  disk. Mirrors the Rust `gateway_status` handler. */
+export interface GatewayStatus {
+  build_id: string;
+  update_available: boolean;
+}
+
+/** Build id of the running gateway + whether a newer binary is on disk (the dev
+ *  picker's "new gateway available" badge). */
+export async function getGatewayStatus(): Promise<GatewayStatus> {
+  return controlJson<GatewayStatus>('/gateway/status');
+}
+
+/** Adopt the rebuilt gateway binary: the gateway re-execs itself (same PID). The
+ *  call resolves on the 202; the gateway then briefly drops while the new image
+ *  binds and the picker's poll reconnects. */
+export async function reloadGateway(): Promise<void> {
+  await controlJson<void>('/gateway/reload', { method: 'POST' });
+}
+
 // ── Restore from backup (picker) ───────────────────────────────────────────
 
 /** State of the gateway's restore-from-backup flow. Mirrors the Rust

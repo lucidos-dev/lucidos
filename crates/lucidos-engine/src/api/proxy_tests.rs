@@ -118,20 +118,43 @@ fn has_traversal_flags_backslashes() {
 // ---- Redirect helpers --------------------------------------------
 
 #[test]
-fn host_of_extracts_lowercased_host() {
+fn origin_of_extracts_lowercased_scheme_host_and_default_port() {
     assert_eq!(
-        host_of("https://API.Example.com/path"),
-        Some("api.example.com".to_string())
+        origin_of("https://API.Example.com/path"),
+        Some(("https".to_string(), "api.example.com".to_string(), Some(443)))
     );
     assert_eq!(
-        host_of("http://localhost:8080/x"),
-        Some("localhost".to_string())
+        origin_of("http://localhost:8080/x"),
+        Some(("http".to_string(), "localhost".to_string(), Some(8080)))
     );
 }
 
 #[test]
-fn host_of_returns_none_for_unparseable_url() {
-    assert!(host_of("not a url").is_none());
+fn origin_of_returns_none_for_unparseable_url() {
+    assert!(origin_of("not a url").is_none());
+}
+
+#[test]
+fn origin_of_treats_explicit_default_port_as_equal_to_implicit() {
+    // `https://h` and `https://h:443` are the same origin — port_or_known_default
+    // normalizes both to 443 so a redirect that only restates the default port
+    // isn't spuriously refused.
+    assert_eq!(origin_of("https://h"), origin_of("https://h:443"));
+}
+
+#[test]
+fn origin_of_distinguishes_scheme_downgrade() {
+    // The security-critical case: a `https → http` redirect to the SAME host is
+    // a different origin, so the auth pipeline must refuse to re-sign (the
+    // credential would otherwise go out over plaintext).
+    assert_ne!(origin_of("https://h/x"), origin_of("http://h/x"));
+}
+
+#[test]
+fn origin_of_distinguishes_port() {
+    // Same host, different port (e.g. an internal admin service) is a different
+    // origin — credentials bound to :443 must not follow a redirect to :8080.
+    assert_ne!(origin_of("https://h:443/x"), origin_of("https://h:8080/x"));
 }
 
 #[test]

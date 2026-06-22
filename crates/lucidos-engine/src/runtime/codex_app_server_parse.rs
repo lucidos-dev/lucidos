@@ -14,6 +14,7 @@
 //! the handshake state machine, and the approval round-trips.
 
 use super::agent_runtime::AgentEvent;
+use std::collections::HashMap;
 
 /// One decoded line of `codex app-server` stdout.
 #[derive(Debug, Clone, PartialEq)]
@@ -58,28 +59,35 @@ pub(super) fn parse_app_server_line(line: &str) -> AppServerLine {
         (Some(id), Some(method)) => AppServerLine::ServerRequest {
             id: id.clone(),
             method: method.to_string(),
-            params: val.get("params").cloned().unwrap_or(serde_json::Value::Null),
+            params: val
+                .get("params")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
         },
         (None, Some(method)) => AppServerLine::Notification {
             method: method.to_string(),
-            params: val.get("params").cloned().unwrap_or(serde_json::Value::Null),
+            params: val
+                .get("params")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
         },
         (Some(id), None) => {
             // Responses to our requests — we only ever send integer ids.
             let Some(id) = id.as_u64() else {
                 return AppServerLine::Other;
             };
-            let error = val
-                .get("error")
-                .map(|e| {
-                    e.get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("unknown JSON-RPC error")
-                        .to_string()
-                });
+            let error = val.get("error").map(|e| {
+                e.get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown JSON-RPC error")
+                    .to_string()
+            });
             AppServerLine::Response {
                 id,
-                result: val.get("result").cloned().unwrap_or(serde_json::Value::Null),
+                result: val
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
                 error,
             }
         }
@@ -188,7 +196,7 @@ pub(super) struct AppServerTracker {
     /// Per-item text already emitted via `item/agentMessage/delta`, so the
     /// final `item/completed` only emits the (normally empty) remainder
     /// instead of duplicating the whole message.
-    streamed: std::collections::HashMap<String, String>,
+    streamed: HashMap<String, String>,
     /// Last error notification — promoted to a failed `Result` only when the
     /// process dies without a turn terminal.
     pub last_error: Option<String>,
@@ -196,6 +204,23 @@ pub(super) struct AppServerTracker {
     pub turn_terminal_seen: bool,
     /// Tool-use ids emitted without a matching result yet.
     open_tool_ids: Vec<String>,
+    /// Approval-gated command/file items whose visible `ToolUse` must wait
+    /// until the user accepts the permission card.
+    approval_gates: HashMap<String, ApprovalGate>,
+}
+
+#[derive(Debug)]
+enum ApprovalGate {
+    Pending { tool: Option<DeferredToolUse> },
+    Accepted,
+    Declined,
+}
+
+#[derive(Debug)]
+struct DeferredToolUse {
+    name: String,
+    input: serde_json::Value,
+    id: String,
 }
 
 impl AppServerTracker {
@@ -214,6 +239,7 @@ impl AppServerTracker {
         self.turn_terminal_seen = false;
         self.current_turn_id = None;
         self.open_tool_ids.clear();
+        self.approval_gates.clear();
     }
 
     pub fn turn_text(&self) -> String {
@@ -252,6 +278,69 @@ impl AppServerTracker {
                 id,
             })
             .collect()
+    }
+
+    /// Called when Codex asks Lucidos for approval before it runs a command or
+    /// file-change item. The later `item/started` notification is still not
+    /// real execution while this gate is pending, so the visible tool step is
+    /// deferred until [`note_approval_resolved`] reports acceptance.
+    pub fn note_approval_request(&mut self, approval: &ApprovalRequest) {
+        self.approval_gates
+            .entry(approval.item_id.clone())
+            .or_insert(ApprovalGate::Pending { tool: None });
+    }
+
+    /// Called after the user answered the permission card and the JSON-RPC
+    /// response has been sent back to Codex. If the item already announced
+    /// `item/started`, acceptance flushes that deferred tool step now.
+    pub fn note_approval_resolved(&mut self, item_id: &str, allowed: bool) -> Vec<AgentEvent> {
+        if !allowed {
+            self.approval_gates
+                .insert(item_id.to_string(), ApprovalGate::Declined);
+            return Vec::new();
+        }
+
+        match self.approval_gates.remove(item_id) {
+            Some(ApprovalGate::Pending { tool: Some(tool) }) => self.emit_tool_use(tool),
+            Some(ApprovalGate::Pending { tool: None }) | None => {
+                self.approval_gates
+                    .insert(item_id.to_string(), ApprovalGate::Accepted);
+                Vec::new()
+            }
+            Some(ApprovalGate::Accepted | ApprovalGate::Declined) => Vec::new(),
+        }
+    }
+
+    fn emit_tool_use(&mut self, tool: DeferredToolUse) -> Vec<AgentEvent> {
+        self.open_tool_ids.push(tool.id.clone());
+        vec![AgentEvent::ToolUse {
+            name: tool.name,
+            input: tool.input,
+            id: tool.id,
+        }]
+    }
+
+    fn maybe_emit_tool_use(&mut self, tool: DeferredToolUse) -> Vec<AgentEvent> {
+        match self.approval_gates.remove(&tool.id) {
+            Some(ApprovalGate::Pending { .. }) => {
+                self.approval_gates
+                    .insert(tool.id.clone(), ApprovalGate::Pending { tool: Some(tool) });
+                Vec::new()
+            }
+            Some(ApprovalGate::Accepted) | None => self.emit_tool_use(tool),
+            Some(ApprovalGate::Declined) => {
+                self.approval_gates.insert(tool.id, ApprovalGate::Declined);
+                Vec::new()
+            }
+        }
+    }
+
+    fn should_drop_declined_result(&mut self, id: &str) -> bool {
+        if !matches!(self.approval_gates.get(id), Some(ApprovalGate::Declined)) {
+            return false;
+        }
+        self.approval_gates.remove(id);
+        !self.open_tool_ids.iter().any(|open| open == id)
     }
 
     /// Fold one notification into zero or more canonical events.
@@ -312,8 +401,7 @@ impl AppServerTracker {
                     .and_then(|u| u.get("last"))
                     .cloned()
                     .unwrap_or_default();
-                let u64_field =
-                    |key: &str| last.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+                let u64_field = |key: &str| last.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
                 let clamp = |v: u64| crate::llm::clamp_provider_token_count(v, "Codex");
                 // Same convention as the exec tracker: codex reports TOTAL
                 // input with the cached share inside it; `Usage.input_tokens`
@@ -401,12 +489,17 @@ impl AppServerTracker {
             }
             "commandExecution" => {
                 if completed {
+                    if self.should_drop_declined_result(&id) {
+                        return Vec::new();
+                    }
                     self.open_tool_ids.retain(|open| open != &id);
                     let aggregated = str_field(item, "aggregatedOutput");
                     let output = if aggregated.is_empty() {
                         format!(
                             "exit_code: {}",
-                            item.get("exitCode").and_then(|v| v.as_i64()).unwrap_or_default()
+                            item.get("exitCode")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or_default()
                         )
                     } else {
                         aggregated
@@ -417,12 +510,11 @@ impl AppServerTracker {
                         id,
                     }]
                 } else {
-                    self.open_tool_ids.push(id.clone());
-                    vec![AgentEvent::ToolUse {
+                    self.maybe_emit_tool_use(DeferredToolUse {
                         name: "command_execution".to_string(),
                         input: serde_json::json!({ "command": str_field(item, "command") }),
                         id,
-                    }]
+                    })
                 }
             }
             "fileChange" => {
@@ -443,6 +535,9 @@ impl AppServerTracker {
                     })
                     .unwrap_or_default();
                 if completed {
+                    if self.should_drop_declined_result(&id) {
+                        return Vec::new();
+                    }
                     self.open_tool_ids.retain(|open| open != &id);
                     let status = str_field(item, "status");
                     vec![AgentEvent::ToolResult {
@@ -451,12 +546,11 @@ impl AppServerTracker {
                         id,
                     }]
                 } else {
-                    self.open_tool_ids.push(id.clone());
-                    vec![AgentEvent::ToolUse {
+                    self.maybe_emit_tool_use(DeferredToolUse {
                         name: "file_change".to_string(),
                         input: serde_json::json!({ "changes": changes }),
                         id,
-                    }]
+                    })
                 }
             }
             "mcpToolCall" => {
@@ -488,7 +582,10 @@ impl AppServerTracker {
                     self.open_tool_ids.push(id.clone());
                     vec![AgentEvent::ToolUse {
                         name,
-                        input: item.get("arguments").cloned().unwrap_or(serde_json::Value::Null),
+                        input: item
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
                         id,
                     }]
                 }

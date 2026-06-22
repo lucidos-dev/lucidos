@@ -31,9 +31,6 @@ const SPARK_D =
 export interface LucidosMarkProps {
   /** CSS length for the (square) mark. Default `1.25rem`. */
   size?: string;
-  /** Play the reveal animation once on mount, then land on the static mark.
-   *  Default `false`. Honors `prefers-reduced-motion` (renders static). */
-  animated?: boolean;
   /** Render the gradient rounded-rect tile behind the mark (the standalone
    *  glyph / tile look). Default `true`. Set `false` to render only the white
    *  mark shapes on a transparent background — e.g. on the boot splash, where
@@ -48,7 +45,6 @@ export interface LucidosMarkProps {
 
 export function LucidosMark({
   size = '1.25rem',
-  animated = false,
   background = true,
   title,
   class: className,
@@ -61,10 +57,7 @@ export function LucidosMark({
   const a11y = title
     ? { role: 'img' as const, 'aria-label': title }
     : { 'aria-hidden': true as const };
-  const cls =
-    'lucidos-mark' +
-    (animated ? ' lucidos-mark-animated' : '') +
-    (className ? ` ${className}` : '');
+  const cls = 'lucidos-mark' + (className ? ` ${className}` : '');
   // Sized via inline style only (not SVG width/height attributes): `size` may
   // be a CSS expression — var(), min() — that isn't valid as an SVG attribute.
   return (
@@ -107,9 +100,11 @@ export function LucidosMark({
   );
 }
 
-/** The Lucidos Agent brand glyph — the mark at the chat actor-chip icon size.
- *  Single source for the "Lucidos Agent" icon across the executor/initiator
- *  chips and the control menu (replaces the former ✨ placeholder). */
-export function LucidosAgentGlyph({ size = 'var(--icon-size-sm)' }: { size?: string }) {
+/** The Lucidos brand glyph at the chat actor-chip icon size. Single source for
+ *  the icon shared by both Lucidos actors — the *Lucidos Agent* (LLM work) and
+ *  the *Lucidos Engine* (deterministic engine work) — across the
+ *  executor/initiator chips and the control menu. The chip label
+ *  ("Lucidos Agent" vs "Lucidos Engine") is what tells the two apart. */
+export function LucidosGlyph({ size = 'var(--icon-size-sm)' }: { size?: string }) {
   return <LucidosMark size={size} />;
 }

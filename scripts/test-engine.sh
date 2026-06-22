@@ -21,6 +21,12 @@
 # "Never kill broadly".) It only ever touches its own `lucidos-pg-test`
 # container by exact name.
 #
+# Cleanup: tests DROP their throwaway `lucidos_test_*` database in
+# teardown_test_db, but a PANICKING test exits first and leaks its database.
+# An EXIT trap (`sweep_orphan_test_dbs`) drops every leftover `lucidos_test_*`
+# DB after the run, so mem/disk inside the container is reclaimed after every
+# invocation regardless of how individual tests ended.
+#
 # Usage:
 #   ./scripts/test-engine.sh                  # cargo test -p lucidos-engine --lib
 #   ./scripts/test-engine.sh --full           # whole crate (lib + integration + doctests)
@@ -119,7 +125,51 @@ ensure_test_pg() {
     exit 1
 }
 
+# Drop leaked throwaway test databases. Each test does
+# `CREATE DATABASE lucidos_test_<uuid>` in setup_test_db and is supposed to DROP
+# it in teardown_test_db — but teardown is a plain call at the END of the test
+# body, so any test that PANICS (an assertion failure) exits before teardown
+# runs and leaks its database forever. Left unswept they pile up inside the
+# container across runs (disk + idle backends). Sweeping reclaims that mem/disk
+# after every invocation, regardless of how individual tests ended.
+#
+# Concurrency-safe: `lucidos-pg-test` is a single machine-global container
+# (fixed name + port) shared by every worktree and CC session, so another
+# session may be running its tests against it right now. We therefore (a) target
+# ONLY databases with zero live connections — a leaked DB's process has exited
+# so it has none, while an in-use DB from a concurrent run still has backends —
+# and (b) never pg_terminate_backend, so we can't sever a live run's
+# connections. A DROP that races a fresh connection simply errors and is skipped.
+sweep_orphan_test_dbs() {
+    local dbs
+    dbs="$(docker exec "$PG_CONTAINER" psql -U lucidos -d postgres -tAc \
+        "SELECT d.datname FROM pg_database d
+         WHERE d.datname LIKE 'lucidos_test_%'
+           AND NOT EXISTS (
+             SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname
+           )" 2>/dev/null || true)"
+    [ -z "$dbs" ] && return 0
+    local count=0 db
+    while IFS= read -r db; do
+        [ -z "$db" ] && continue
+        # DROP DATABASE cannot run inside a transaction block, so it gets its own
+        # psql -c (a multi-statement -c string is wrapped in one implicit tx).
+        if docker exec "$PG_CONTAINER" psql -U lucidos -d postgres -tAc \
+            "DROP DATABASE IF EXISTS \"$db\"" >/dev/null 2>&1; then
+            count=$((count + 1))
+        fi
+    done <<< "$dbs"
+    [ "$count" -gt 0 ] && echo "[test-db] swept $count orphaned lucidos_test_* database(s)"
+    return 0
+}
+
 ensure_test_pg
+
+# Reclaim leaked test databases after the run completes (covers normal exit plus
+# SIGINT/SIGTERM); a previous run hard-killed before its trap fired is caught by
+# the next invocation's sweep. Registered after ensure_test_pg so the container
+# is guaranteed to exist when the trap fires.
+trap sweep_orphan_test_dbs EXIT
 
 export TEST_DATABASE_URL="postgres://lucidos:lucidos@localhost:$PG_PORT/postgres"
 echo "[test-db] TEST_DATABASE_URL=postgres://lucidos:lucidos@localhost:$PG_PORT/postgres"

@@ -188,9 +188,20 @@ fn splash_page_html(label: &str) -> String {
 <title>Starting…</title>
 <style>
 html,body{margin:0;height:100%}
+/* Paint the gradient on the root with a solid fallback + fixed attachment so it
+covers the whole viewport — including the iOS standalone-PWA bottom safe-area /
+overscroll region, which a body-only background (sized to 100vh) leaves uncovered
+(it fell back to a different color — the lighter strip at the bottom). The solid
+#0a4ea8 fallback matches the gradient's dark end and the theme-color. */
+html{background:#0a4ea8 radial-gradient(125% 125% at 30% 22%,#2d83e0 0%,#0a4ea8 100%) no-repeat fixed}
 body{display:flex;flex-direction:column;min-height:100vh;align-items:center;justify-content:center;
-text-align:center;color:#fff;font-family:system-ui,-apple-system,sans-serif;
-background:radial-gradient(125% 125% at 30% 22%,#2d83e0 0%,#0a4ea8 100%)}
+text-align:center;color:#fff;
+/* Fixed all-system monospace stack — inlined because the splash renders before
+any engine can serve the app stylesheet, and deliberately NOT the workspace
+font preference (a web font would swap-jank). Same stack the frontend boot
+splash status uses (crates/lucidos-app/index.html `.boot-splash-status`) so the
+status renders the same across the cold-boot→workspace seam. Keep in sync. */
+font-family:ui-monospace,SFMono-Regular,'SF Mono',Menlo,'Fira Code','JetBrains Mono',Monaco,Consolas,monospace}
 .mark{width:min(46vmin,15rem);height:min(46vmin,15rem)}
 .mark-label{margin-top:1.25rem;font-size:.95rem;letter-spacing:.02em;opacity:.85}
 .lmk-tile,.lmk-spark{transform-box:fill-box;transform-origin:center}

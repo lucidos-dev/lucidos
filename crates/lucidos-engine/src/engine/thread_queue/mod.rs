@@ -291,11 +291,13 @@ fn affects_user_running(event: &ThreadEvent) -> bool {
             | ThreadEvent::UserQuestionAnswered { .. }
             | ThreadEvent::CodingAgentPermissionResolved { .. }
             | ThreadEvent::CommandPermissionResolved { .. }
+            | ThreadEvent::McpPermissionResolved { .. }
             | ThreadEvent::CodingAgentPromptSent { .. }
             // → waiting_for_user_answer (parked on the user).
             | ThreadEvent::UserQuestionAsked { .. }
             | ThreadEvent::CodingAgentPermissionRequest { .. }
             | ThreadEvent::CommandPermissionRequested { .. }
+            | ThreadEvent::McpPermissionRequested { .. }
             // → idle / waiting / failed (terminal or back-to-idle).
             | ThreadEvent::ResponseGenerated { .. }
             | ThreadEvent::ResponseCanceled { .. }

@@ -1,7 +1,7 @@
 import type { ComponentChildren } from 'preact';
 import { useSignal } from '@preact/signals';
 import { showToast } from '../../store/store';
-import { resolveCodingAgentPermission, resolveCommandPermission } from '../../store/actions/permissions';
+import { resolveCodingAgentPermission, resolveCommandPermission, resolveMcpPermission } from '../../store/actions/permissions';
 import type { PersistScope } from '../../store/thread-events';
 import { errorDetail } from '../../utils/errorDetail';
 
@@ -487,6 +487,107 @@ export function renderCommandQuestion(command: string, summary: string) {
   return (
     <>
       The Lucidos Agent wants to run <code>{command}</code>. {summary} Allow?
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// MCP permission card — the chat mirror of the above for MCP server tool calls.
+// Different event shape (a server + tool identity and an args summary, not a
+// command or a structured tool input) and a different consent endpoint, but the
+// same buttons + answered-state machinery. The "Always allow" scopes persist to
+// ~/.lucidos/mcp-allowed-tools: narrow → Mcp(server:tool), broad → Mcp(server:*).
+// ---------------------------------------------------------------------------
+
+interface McpPermissionEvent {
+  request_id: string;
+  tool_use_id: string;
+  server_id: string;
+  server_name: string;
+  tool_name: string;
+  arguments_summary: string;
+}
+
+interface McpPermissionBodyProps {
+  event: McpPermissionEvent;
+  resolved?: { allowed: boolean; reason?: string; persist_scope?: PersistScope };
+  terminated?: boolean;
+}
+
+/** Body of an `McpPermissionRequested` divider exchange. */
+export function McpPermissionBody({ event, resolved, terminated }: McpPermissionBodyProps) {
+  const { pending, decide } = usePermissionDecide(event.request_id, resolveMcpPermission);
+
+  const effective = resolved ?? pending.value;
+  const selected = effective ? resolvedChoice(effective) : null;
+  const answered = selected !== null;
+
+  const buttons: ButtonSpec[] = [
+    {
+      choice: 'deny',
+      btnClass: 'action-btn action-btn-danger',
+      label: 'Deny',
+      ariaLabel: `Deny calling ${event.tool_name} on ${event.server_name}`,
+      row: 'primary',
+      onClick: () => void decide(false),
+    },
+    {
+      choice: 'allow',
+      btnClass: 'action-btn action-btn-confirm',
+      label: 'Allow once',
+      ariaLabel: 'Allow this MCP tool call once',
+      row: 'primary',
+      onClick: () => void decide(true),
+    },
+    {
+      choice: 'session',
+      btnClass: 'action-btn action-btn-confirm',
+      label: 'Allow for this thread',
+      ariaLabel: `Allow ${event.tool_name} for the rest of this thread`,
+      row: 'secondary',
+      onClick: () => void decide(true, 'session'),
+    },
+    {
+      choice: 'narrow',
+      btnClass: 'action-btn action-btn-confirm',
+      label: <>Always allow <code>{event.tool_name}</code></>,
+      ariaLabel: `Always allow ${event.tool_name} on ${event.server_name}`,
+      row: 'secondary',
+      onClick: () => void decide(true, 'narrow'),
+    },
+    {
+      choice: 'broad',
+      btnClass: 'action-btn',
+      label: <>Always allow <strong>{event.server_name}</strong></>,
+      ariaLabel: `Always allow any tool on ${event.server_name}`,
+      row: 'secondary',
+      onClick: () => void decide(true, 'broad'),
+    },
+  ];
+
+  return (
+    <PermissionBodyShell
+      requestId={event.request_id}
+      question={renderMcpQuestion(event.server_name, event.tool_name, event.arguments_summary)}
+      buttons={buttons}
+      selected={selected}
+      answered={answered}
+      terminated={!!terminated}
+    />
+  );
+}
+
+/** The question line for an MCP permission card: which tool on which server,
+ *  plus the (truncated) arguments the agent wants to call it with. */
+export function renderMcpQuestion(serverName: string, toolName: string, argsSummary: string) {
+  const trimmed = argsSummary.trim();
+  // `{}` / empty args carry no signal — omit the args block so the card reads
+  // cleanly for argument-less tool calls.
+  const showArgs = trimmed.length > 0 && trimmed !== '{}';
+  return (
+    <>
+      The Lucidos Agent wants to call <strong>{toolName}</strong> on <strong>{serverName}</strong>. Allow?
+      {showArgs && <pre class="permission-mcp-args"><code>{trimmed}</code></pre>}
     </>
   );
 }

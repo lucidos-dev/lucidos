@@ -1,8 +1,8 @@
-import { connectionStatus, dismissToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, TOAST_AUTO_DISMISS_MS } from '../store';
+import { connectionStatus, dismissToast, showToast, toasts, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, TOAST_AUTO_DISMISS_MS } from '../store';
 import { checkHealth, API_BASE } from '../../api/client';
 import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearForcedRetries } from './thread-loading';
-import { refreshChangesState, RESTART_LS_KEY } from './chat-changes';
+import { refreshChangesState, RESTART_LS_KEY, RESTART_TOAST_KEY, RESTART_SWAP_MESSAGE } from './chat-changes';
 import { loadUnreadNotifications } from './notifications';
 import { isNewerVersion } from '../../utils/version';
 import { refreshClient } from '../../hooks/sw-update';
@@ -185,6 +185,19 @@ export async function checkConnection(): Promise<boolean> {
 
   if (healthOk) {
     consecutiveFailures = 0;
+  }
+
+  // Advance the in-flight restart status toast from the build phase to the swap
+  // phase the moment the old engine actually goes unreachable: the rebuild
+  // finished and the engine is being killed + respawned. Guarded on the current
+  // toast message so we only re-render the toast on the transition, not on every
+  // poll the engine stays down. showDuringRestart keeps it past the central
+  // suppression; the spinner persists until reconnect dismisses the toast.
+  if (engineRestarting.value && !healthOk) {
+    const current = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
+    if (current && current.message !== RESTART_SWAP_MESSAGE) {
+      showToast(RESTART_SWAP_MESSAGE, 'info', { key: RESTART_TOAST_KEY, showDuringRestart: true, spinning: true });
+    }
   }
 
   // When disconnected, require multiple consecutive successes before showing connected.

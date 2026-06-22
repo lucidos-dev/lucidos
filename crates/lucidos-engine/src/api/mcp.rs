@@ -50,14 +50,13 @@ pub(super) struct McpConsentResponse {
     pub persist_scope: Option<AllowScope>,
 }
 
-/// POST /api/v1/mcp/consent — Respond to an MCP tool consent request.
+/// POST /api/v1/mcp/consent — Respond to a coding-agent (Claude Code / Codex)
+/// permission prompt. Resolves the deduped, multi-listener entry in
+/// `pending_cc_permission` and owns the paired `CodingAgentPermissionResolved`
+/// event so it fires once per click rather than once per deduped HTTP listener.
 ///
-/// Two distinct flows share this endpoint:
-///   1. CC permission prompts (deduped, multi-listener) — `pending_cc_permission`
-///   2. Legacy agentic-loop MCP consent (single oneshot)   — `pending_mcp_consent`
-///
-/// CC's flow also owns the paired `CodingAgentPermissionResolved` event so it
-/// fires once per click rather than once per deduped HTTP listener.
+/// The chat MCP permission lane has its own endpoint
+/// (`/api/v1/mcp-permission/consent`); this one is coding-agent-only.
 pub(super) async fn submit_mcp_consent(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -67,53 +66,42 @@ pub(super) async fn submit_mcp_consent(
         let mut pending = state.engine.pending_cc_permission.lock().unwrap();
         pending.take(&body.request_id)
     };
-    if let Some(entry) = cc_entry {
-        let _ = entry.tx.send(body.allowed);
-        let reason = if body.allowed {
-            None
-        } else {
-            Some(DENIAL_REASON.to_string())
-        };
-        let persist_scope = if body.allowed { body.persist_scope } else { None };
-        if let Some(scope) = persist_scope {
-            record_allow_grant(&state, &entry, scope);
-        }
-        let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-        state
-            .engine
-            .event_bus
-            .emit_or_log(
-                BusEvent::Thread {
-                    thread_id: entry.thread_id,
-                    event: ThreadEvent::CodingAgentPermissionResolved {
-                        request_id: body.request_id,
-                        allowed: body.allowed,
-                        reason,
-                        persist_scope,
-                    },
-                    meta: EventMeta::with_actor(actor),
-                },
-                "[MCP] CodingAgentPermissionResolved",
-            )
-            .await;
-        return StatusCode::OK.into_response();
-    }
-
-    let sender = {
-        let mut pending = state.engine.pending_mcp_consent.lock().unwrap();
-        pending.remove(&body.request_id)
-    };
-    match sender {
-        Some(tx) => {
-            let _ = tx.send(body.allowed);
-            StatusCode::OK.into_response()
-        }
-        None => (
+    let Some(entry) = cc_entry else {
+        return (
             StatusCode::NOT_FOUND,
             "No pending consent request with that ID",
         )
-            .into_response(),
+            .into_response();
+    };
+    let _ = entry.tx.send(body.allowed);
+    let reason = if body.allowed {
+        None
+    } else {
+        Some(DENIAL_REASON.to_string())
+    };
+    let persist_scope = if body.allowed { body.persist_scope } else { None };
+    if let Some(scope) = persist_scope {
+        record_allow_grant(&state, &entry, scope);
     }
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    state
+        .engine
+        .event_bus
+        .emit_or_log(
+            BusEvent::Thread {
+                thread_id: entry.thread_id,
+                event: ThreadEvent::CodingAgentPermissionResolved {
+                    request_id: body.request_id,
+                    allowed: body.allowed,
+                    reason,
+                    persist_scope,
+                },
+                meta: EventMeta::with_actor(actor),
+            },
+            "[MCP] CodingAgentPermissionResolved",
+        )
+        .await;
+    StatusCode::OK.into_response()
 }
 
 #[derive(Deserialize)]

@@ -1,4 +1,4 @@
-import { API, postMcpConsent } from '../../api/client';
+import { API } from '../../api/client';
 import type { Change } from '../../api/client';
 import { threadMap, focusedThreadId, changes, appliedChanges, changesHasMore, updateAvailable, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
 import { memoryRebuildProgress, backupProgress, backupStatusVersion, recoveryProgress, showConfirm, showToast, dismissToast, toasts, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
@@ -15,7 +15,7 @@ import {
   handleNativePushRequested,
   type NativePushRequestedPayload,
 } from './native-push';
-import { addRestartGroup, appliedToastRefreshAction } from './chat-changes';
+import { addRestartGroup } from './chat-changes';
 import { scheduleServiceWorkerUpdateChecks } from '../../hooks/sw-update';
 import { loadPreferences } from './preferences';
 import { loadArtifacts } from './artifacts';
@@ -40,7 +40,12 @@ import { removeThreadNavEntries } from './thread-navigation';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
 import { formatBytes } from '../../utils/formatBytes';
 import { errorDetail } from '../../utils/errorDetail';
-import { handleNavigationRequest } from './navigation-request';
+import { handleNavigationRequest, describeNavTarget } from './navigation-request';
+
+/** The nil UUID the engine stamps on a thread-less `NavigationRequested` —
+ *  emitted by the SDK `lucidos.ui.navigate` app-iframe bridge (api/sdk.rs),
+ *  which is user-initiated and not bound to any thread. */
+const NIL_THREAD_ID = '00000000-0000-0000-0000-000000000000';
 
 let eventSource: EventSource | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -337,7 +342,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     // events (with seq) justify creating a new thread entry. Side effects
     // (e.g. CodingAgentThreadSpawned creating a child thread) still run.
     if (seq === null) {
-      handleTransientSideEffects(event);
+      handleTransientSideEffects(event, threadId);
       return;
     }
     // Infer source from event type — coding-agent events mean claude_code, not chat
@@ -502,7 +507,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   // No auto-read on focus — user must explicitly click Archive, Apply, or Discard.
 
   // Dispatch side effects for transient events
-  handleTransientSideEffects(event);
+  handleTransientSideEffects(event, threadId);
 
   // Manage optimistic "Apply Now" phase transitions.
   // 'requesting' → 'applying' on ChangeProposed (backend started the merge).
@@ -539,11 +544,16 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     const requiresRestart = !!event.requires_restart;
     const clientUpdate = !!event.client_update;
     const applyKey = `applying-${threadId}`;
-    const refreshAction = appliedToastRefreshAction(requiresRestart, clientUpdate);
+    // No Refresh button here: at ChangeApplied time the rebuilt frontend isn't
+    // ready yet (in --built mode the build-watch runs `vite build` over the next
+    // few seconds), so a Refresh now would just reload the OLD build. The genuine
+    // "ready to refresh" affordance is the "New version available → Refresh" toast
+    // surfaced by `surfaceUpdateToast` (store/actions/client-update.ts), driven by
+    // the build-id check once the rebuilt sw.js is actually served — fired on the
+    // new worker's activation and nudged promptly by scheduleServiceWorkerUpdateChecks().
     showToast(changeToastMessage('Applied', threadId, desc), 'success', {
       key: applyKey,
       onClick: () => focusThread(threadId),
-      action: refreshAction,
       autoDismissMs: TOAST_AUTO_DISMISS_MS,
     });
     // Set restart toast immediately from the thread event — don't wait for
@@ -596,6 +606,31 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
         });
       } else {
         dismissToast(conflictKey);
+      }
+    }
+  }
+
+  // The "hardening required — change will apply automatically after hardening"
+  // banner is a sticky warning (no auto-dismiss). The change applies
+  // automatically once hardening finishes, so a ChangeApplied for this thread
+  // IS the "done" signal — transition the banner in place to "applied". Guarded
+  // on the toast already existing so a plain (non-hardening) apply never spawns
+  // a spurious "Hardening applied" toast. ChangeApplyFailed / ChangeDiscarded
+  // just dismiss it — the terminal toast above already carries that outcome.
+  // Keyed by thread (no change_id — a thread hardens one change at a time),
+  // matching the MissingHardeningDetected emit below. Mirrors the merge-conflict
+  // "resolved" transition above.
+  if (event.type === 'ChangeApplied' || event.type === 'ChangeApplyFailed' || event.type === 'ChangeDiscarded') {
+    const hardeningKey = `missing-hardening-${threadId}`;
+    if (toasts.value.some((t) => t.key === hardeningKey)) {
+      if (event.type === 'ChangeApplied') {
+        showToast(`Hardening applied for ${formatThreadLabel(threadId)}.`, 'success', {
+          key: hardeningKey,
+          onClick: () => focusThread(threadId),
+          autoDismissMs: TOAST_AUTO_DISMISS_MS,
+        });
+      } else {
+        dismissToast(hardeningKey);
       }
     }
   }
@@ -914,8 +949,12 @@ function clearComposeIfUnfocused(threadId: string): void {
   clearDraft(threadId);
 }
 
-/** Handle transient ThreadEvent types that trigger side effects (modals, refreshes). */
-function handleTransientSideEffects(event: ThreadEvent | TransientEvent): void {
+/** Handle transient ThreadEvent types that trigger side effects (modals, refreshes).
+ *
+ *  `sourceThreadId` is the thread the event was emitted on — used to scope
+ *  `NavigationRequested` so a navigate from a background/sibling thread can't
+ *  hijack the page the user is actually viewing. */
+function handleTransientSideEffects(event: ThreadEvent | TransientEvent, sourceThreadId: string): void {
   switch (event.type) {
     case 'CredentialPromptRequested':
       try {
@@ -972,19 +1011,9 @@ function handleTransientSideEffects(event: ThreadEvent | TransientEvent): void {
       })();
       break;
 
-    case 'McpConsentPromptRequested':
-      void (async () => {
-        try {
-          const { request_id, server_name, tool_name, arguments_summary } = JSON.parse((event as { payload: string }).payload);
-          const msg = `**${server_name}** wants to call **${tool_name}**\n\n\`\`\`json\n${arguments_summary}\n\`\`\``;
-          const ok = await showConfirm(msg, 'Allow', { variant: 'default' });
-          await postMcpConsent(request_id, ok);
-        } catch (e) {
-          console.error('[SSE] Failed to handle MCP consent request:', e);
-          showToast('Failed to send MCP consent response', 'error');
-        }
-      })();
-      break;
+    // Chat MCP consent moved to the persisted in-thread `McpPermissionRequested`
+    // permission card (rendered in ChatExchange via PermissionCard), replacing
+    // the old transient `McpConsentPromptRequested` + showConfirm modal.
 
     case 'FileRefreshRequested':
       // loadArtifacts sets `artifacts` to `failed` via toFailed on error.
@@ -1007,15 +1036,50 @@ function handleTransientSideEffects(event: ThreadEvent | TransientEvent): void {
       break;
     }
 
-    case 'NavigationRequested':
+    case 'NavigationRequested': {
+      let nav;
       try {
-        const nav = JSON.parse((event as { payload: string }).payload);
-        handleNavigationRequest(nav);
+        nav = JSON.parse((event as { payload: string }).payload);
       } catch (e) {
         console.error('[SSE] Failed to parse navigation request:', e);
         showToast('Failed to handle navigation request from engine', 'error');
+        break;
       }
+      // Scope: a navigate acts on this page directly only when it originates
+      // from the thread the user is currently viewing (LLM navigate_ui in the
+      // focused thread) OR from an app iframe — the SDK `lucidos.ui.navigate`
+      // path emits on the nil thread (api/sdk.rs), which is user-initiated and
+      // not thread-bound, so it always applies.
+      const focused = focusedThreadId.value;
+      const fromApp = sourceThreadId === NIL_THREAD_ID;
+      if (fromApp || sourceThreadId === focused) {
+        // Source label for any "couldn't open" toast downstream: which thread
+        // asked, or the app iframe — so the error says where it came from
+        // instead of swallowing it.
+        const source = fromApp ? 'an app' : formatThreadLabel(sourceThreadId);
+        handleNavigationRequest(nav, { source });
+        break;
+      }
+      // Off-focus: a navigate from a thread the user isn't viewing must NOT
+      // hijack the page. Offer to jump instead of silently dropping it — this
+      // preserves "open X when you're done" from a background/sibling/trigger
+      // thread. Tapping Open lands on BOTH the source thread (the context that
+      // asked) and the navigate target. Keyed per source thread so repeated
+      // navigates refresh one offer instead of stacking.
+      const label = formatThreadLabel(sourceThreadId);
+      showToast(`${label} wants to open ${describeNavTarget(nav)}`, 'info', {
+        key: `nav-offer-${sourceThreadId}`,
+        action: {
+          label: 'Open',
+          onClick: () => {
+            dismissToast(`nav-offer-${sourceThreadId}`);
+            focusThread(sourceThreadId);
+            handleNavigationRequest(nav, { source: label });
+          },
+        },
+      });
       break;
+    }
 
     case 'CodingAgentThreadSpawned': {
       const e = event as { cc_thread_id: string; title: string };

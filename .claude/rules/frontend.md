@@ -59,6 +59,9 @@ Errors must propagate to the frontend — never silently skip, swallow, or log-o
 - **Rust:** Use `?` to propagate. `catch { log; return empty }` and `catch { /* ignore */ }` are bugs.
 - **TypeScript:** Use `showToast(msg, 'error')` or `Loadable` failed state. No fire-and-forget `promise.then(...)` without `.catch()`. Avoid dynamic `import()` for actions (circular deps cause silent failures).
 - **The chain:** Backend error → HTTP → `ApiError` → `Loadable` failed → visible to user. No link may drop the error.
+- **Error messages must name the entity and the origin — never a bare generic.** A user-facing error has to say *what* failed (the id/name/path — `App "demo-director" no longer exists`, not `App no longer exists`) and, when the action wasn't a direct click, *where it came from* (`… (requested by thread "X")` / `… (requested by an app)`). A generic message with the identity stripped out is a swallowed error: the user can't tell what's missing or who asked. Thread the originating context to the error site rather than dropping it. (Regression that motivated this: a `NavigationRequested` from a sibling thread toasted "App no longer exists" with no id and no source, for an app that existed on disk.)
+- **Never conclude "X doesn't exist" from a cached projection — reconfirm against the source of truth first.** Disk- or DB-backed lists (`appsList`, `artifacts`, …) are caches refreshed by SSE events; they go momentarily stale when a sibling thread mutates state. A definitive "gone" verdict (and its toast) must come *after* a re-fetch that re-reads the source (e.g. `openAppById` re-scans disk on a cache miss), not from a `list.some(...)` pre-check against the possibly-stale cache. A stale-cache pre-check that short-circuits the re-fetch is a swallowed error — it reports live entities as deleted.
+- **A disk-/DB-backed list whose freshness depends on a refresh event ⇒ EVERY mutation path must emit that event.** The list is loaded by re-scanning the source (e.g. `loadApps()` → `/apps` scans `data/apps/`); the cache only updates live because something emits the `App*`/`Artifact*`/… SSE event that the frontend's `entityReferences` arm reloads on. If you add a code path that mutates the underlying store (a new tool, endpoint, or write site) and *don't* emit the matching refresh event, every open page silently shows stale data until a full reload. When you touch a mutation site, check it emits the event the list listens on. (Regression: the chat `write_file` tool emitted `App*` only for `artifacts/` paths, so apps created via raw file writes never refreshed the list.)
 
 ### Carve-out: best-effort telemetry
 
@@ -96,7 +99,7 @@ Frontend live: `wasInterrupted: !wasIdle`. Reload: uses `completed === false` fr
 
 ## Circuit Breakers
 
-Tool called 3+ times on same target → force-break with error.
+Generic breaker: same tool+target **failed** 3+ times in a row → warn the model; 5+ → force-break with error. It gates on consecutive *failure*, not consecutive call, so productive repetition (e.g. distinct `psql` queries) never trips. `read_file`/`list_files` keep their own content-deterministic breakers (identical re-reads block regardless of success). All bounded by `MAX_ITERATIONS`.
 
 ## Navigation That Lands Content Must Call `revealContentPane()`
 
@@ -181,8 +184,14 @@ The older `ModalOverlay` (backdrop-`onClick`) component has been **deleted** —
 - **Tab title**: `(count) Lucidos` (count first for narrow tabs)
 - **No system dialogs**: Use `showToast(msg, type)` / `await showConfirm(msg, okLabel)`
 - **No native tooltips**: Use `data-tooltip="text"`. Desktop-only.
-- **List rows**: `.list-row` / `.list-row-info` / `.list-row-actions` from `global.css`
-- **Action buttons**: `.action-btn` from `global.css`. Variants are additive: `class="action-btn action-btn-confirm"`.
+- **Component CSS is split three ways by audience — put each rule in the right file:**
+  - **Reusable (host + apps)** → `styles/global/shared-components.css` (the `.action-btn` family, `.icon-btn`, `.label`, `.title`, `.list-row*`, `.segmented-control`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`, `h1`–`h6`). This is a SINGLE SOURCE OF TRUTH: the engine `include_str!`s this exact file and appends it to `/api/v1/sdk-iframe.css` (`crates/lucidos-engine/src/api/sdk.rs`), so a class added/changed here ships to the host AND every app iframe at once. **Never copy these rules into `sdk_iframe.css` — edit the shared file.**
+  - **Host-chrome only (host bundle, NEVER served to apps)** → `styles/global/host-components.css` (the custom `<Dropdown>` + `.nav-history-*`, `.send-cancel-*` morph, `.icon-btn.header-icon`/`.filter-active`/`.pinned` variants, `.list-row.flip-animating`). Imported by `global.css` AFTER `shared-components.css` so source-order overrides of a shared base class still win.
+  - **Iframe-only (apps, not the host)** → the engine's `crates/lucidos-engine/src/api/sdk_iframe.css` (e.g. `.action-btn-secondary`, the `lucidos.ui.Select` `.lucidos-select` styles) — keeps them out of the host bundle as dead code.
+  - Structural host chrome (`#tooltip`, `#app`, `body`, the `:root`/theme token blocks) stays in `base.css`.
+  - When you add an app-facing class to `shared-components.css`, also add it to the component-class table in `system-knowhow/js-sdk.md` (it's the app-author-facing contract).
+- **List rows**: `.list-row` / `.list-row-info` / `.list-row-actions` (in `shared-components.css`)
+- **Action buttons**: `.action-btn` (in `shared-components.css`). Variants are additive: `class="action-btn action-btn-confirm"`.
   - `.action-btn` — default (blue). Neutral: Edit, Open, Restart, Prev/Next, Retry.
   - `.action-btn-confirm` — green. Positive: Apply, Accept, Confirm.
   - `.action-btn-danger` — red. Destructive: Delete, Discard, Remove, Cancel.

@@ -43,7 +43,12 @@ describe('initiateEngineRestart surfaces spawn failures', () => {
     expect(engineRestarting.value).toBe(true);
     const toast = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
     expect(toast!.type).toBe('info');
-    expect(toast!.message).toBe('Restarting engine...');
+    // Dev (non-packaged) starts on the build phase, with a spinner to signal
+    // ongoing work. It stays dismissible — the UI is no longer deactivated
+    // during a restart, so the status banner is just a hint the user can close.
+    expect(toast!.message).toBe('Building the new version…');
+    expect(toast!.spinning).toBe(true);
+    expect(toast!.dismissable).not.toBe(false);
   });
 
   // Network rejection after a successful 2xx: engine accepted the restart and

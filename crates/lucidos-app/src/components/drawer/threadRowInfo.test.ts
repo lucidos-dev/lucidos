@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { threadContextName, threadRowTooltip, type TooltipRow } from './threadRowInfo';
+import { threadContextName, threadRowTooltip, draftRowTooltip, type TooltipRow } from './threadRowInfo';
 import type { ThreadMeta } from '../../store/thread-events';
 
 describe('threadContextName', () => {
@@ -57,5 +57,30 @@ describe('threadRowTooltip', () => {
     expect(byLabel(rows, 'Exchanges')?.value).toBe('1');
     expect(byLabel(rows, 'Status')?.value).toBe('Running');
     expect(byLabel(rows, 'Status')?.tone).toBe('running');
+  });
+});
+
+describe('draftRowTooltip', () => {
+  const createdAt = new Date(Date.now() - 60_000).toISOString();
+  const byLabel = (rows: TooltipRow[], label: string) =>
+    rows.find((r) => r.label === label);
+
+  it('emits Status / Context / Created rows with a Draft status', () => {
+    const rows = draftRowTooltip('claude_code', { kind: 'external', repoId: 'r1' }, 'my-repo', createdAt);
+    expect(rows.map((r) => r.label)).toEqual(['Status', 'Repository', 'Created']);
+    expect(byLabel(rows, 'Status')?.value).toBe('Draft');
+    expect(byLabel(rows, 'Status')?.tone).toBe('idle');
+    expect(byLabel(rows, 'Repository')?.value).toBe('my-repo');
+    expect(byLabel(rows, 'Created')?.value).toMatch(/ago$/);
+  });
+
+  it('names the app for an app-scope coding draft', () => {
+    const rows = draftRowTooltip('claude_code', { kind: 'app', appId: 'notes' }, 'notes', createdAt);
+    expect(byLabel(rows, 'App')?.value).toBe('notes');
+  });
+
+  it('is a Chat type for a plain (non-coding) draft', () => {
+    const rows = draftRowTooltip('lucidos', { kind: 'lucidos' }, undefined, createdAt);
+    expect(byLabel(rows, 'Type')?.value).toBe('Chat');
   });
 });

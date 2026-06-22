@@ -84,23 +84,29 @@ const HARDENING_RULE: &str = "HARDENING: Once your implementation is complete an
 /// base — NOT in a backend section — so it reaches BOTH Claude Code (via
 /// `--append-system-prompt`) and Codex (via `developerInstructions`). It is the
 /// soft, prospective half of enforcement; the hard halves are the Claude-Code
-/// `cc-plan-gate` PreToolUse hook (blocks the first source edit until a marker
-/// exists) and the Apply floor (refuses a marker-less Lucidos-source change).
-/// Codex has no PreToolUse hook, so for Codex this rule + the Apply floor are
-/// the whole enforcement. Keep in sync with the `implementation-plan` skill
+/// `cc-plan-gate` PreToolUse hook (blocks the first source edit until a
+/// gate-satisfying — recorded AND approved — marker exists) and the Apply floor
+/// (refuses a missing-or-unapproved Lucidos-source change). Codex has no
+/// PreToolUse hook, so for Codex this rule + the Apply floor are the whole
+/// enforcement. Keep in sync with the `implementation-plan` skill
 /// (`.claude/skills/implementation-plan/SKILL.md`) and `lucidos planned`.
 const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST code edit, decide \
     whether this is complex work — ADR- or design-thread-backed, cross-layer, any routing / \
     topology / storage / security / migration / process change, or anything beyond a local bug \
     fix. If it is, produce an implementation plan FIRST: run the `implementation-plan` skill \
     (`.claude/skills/implementation-plan/SKILL.md`) — it turns the prompt, any grill/design \
-    thread, ADRs, and code reconnaissance into `docs/plans/<date>-<slug>.md` and records the \
-    plan marker for you via `lucidos planned mark --plan <path>`. If this is genuinely a local \
-    fix, acknowledge that instead with `lucidos planned mark --simple \"<one-line reason>\"`. \
-    Either way a Planned marker MUST exist before the change can be applied: Claude Code blocks \
-    your first source edit until one is set, and Apply refuses a marker-less change. Writing the \
-    plan file itself under `docs/plans/` is never blocked. Keep the plan's load-bearing \
-    invariants in view while you edit; do not defer their first appearance to `/harden`.";
+    thread, ADRs, and code reconnaissance into `docs/plans/<date>-<slug>.md` and records a \
+    PROPOSED plan marker via `lucidos planned mark --plan <path>`. A proposed plan does NOT \
+    unblock editing: present the plan to the user and wait for their approval. Once the user \
+    approves, run `lucidos planned approve` to flip the marker to gate-satisfying — only then do \
+    source edits and Apply unblock. If the user requests changes, revise the plan file, re-commit, \
+    and present it again (the marker stays proposed until approved). If this is genuinely a local \
+    fix, acknowledge that instead with `lucidos planned mark --simple \"<one-line reason>\"` (no \
+    approval needed). A gate-satisfying marker MUST exist before the change can be applied: Claude \
+    Code blocks your first source edit until one is set and approved, and Apply refuses a \
+    marker-less or unapproved change. Writing the plan file itself under `docs/plans/` is never \
+    blocked. Keep the plan's load-bearing invariants in view while you edit; do not defer their \
+    first appearance to `/harden`.";
 
 /// Tell CC that "Task not found" / "task already completed" after a task ends
 /// is expected — the engine evicts the bg-bash registry record on completion,
@@ -892,6 +898,7 @@ mod tests {
                 "IMPLEMENTATION PLAN:",
                 "implementation-plan",
                 "lucidos planned mark --simple",
+                "lucidos planned approve",
                 "docs/plans/",
             ] {
                 assert!(

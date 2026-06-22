@@ -25,6 +25,9 @@ pub fn router() -> Router<GatewayState> {
             post(restore).layer(DefaultBodyLimit::disable()),
         )
         .route("/restore-status", get(restore_status).delete(clear_restore))
+        // Gateway self-update: is a rebuilt binary waiting, and adopt it (re-exec).
+        .route("/gateway/status", get(gateway_status))
+        .route("/gateway/reload", post(gateway_reload))
         .route("/workspaces/:id/rename", post(rename))
         .route("/workspaces/:id/restart", post(restart))
         .route("/workspaces/:id/stop", post(stop))
@@ -195,6 +198,26 @@ impl Drop for TempFileGuard {
 /// completed / failed).
 async fn restore_status(State(state): State<GatewayState>) -> Json<RestoreStatus> {
     Json(state.restore_status())
+}
+
+/// Gateway self-update status for the picker's reload control: this process's
+/// build id, and whether a newer gateway binary is on disk waiting to be adopted.
+async fn gateway_status(State(state): State<GatewayState>) -> Json<Value> {
+    Json(json!({
+        "build_id": state.build_id(),
+        "update_available": state.gateway_update_available().await,
+    }))
+}
+
+/// Adopt the on-disk gateway binary by re-exec'ing this process onto it (same
+/// PID, supervisor untouched, running engines re-adopted on boot). Returns 202
+/// before the re-exec so the picker's request resolves; the gateway then briefly
+/// drops while the new image binds, and the picker's poll reconnects.
+async fn gateway_reload(State(state): State<GatewayState>) -> Result<StatusCode, ApiError> {
+    state
+        .reload_gateway()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 /// Dismiss a terminal restore result (back to Idle). 409 while one is running.

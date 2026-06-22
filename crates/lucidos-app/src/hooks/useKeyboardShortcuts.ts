@@ -3,7 +3,7 @@ import { unfocusThread } from '../store/actions/threads';
 import { focusPromptNow } from '../components/chat/promptFocus';
 import { searchEverywhereOpen, focusedPane } from '../store/store';
 import { isTextInput } from '../utils/dom';
-import { dismissTopOverlay } from '../store/overlayStack';
+import { dismissTopOverlay, overlayStack } from '../store/overlayStack';
 import { runCloseCascade } from '../store/actions/threadActions';
 import { matchShortcut } from '../store/actions/keybindings';
 import type { ShortcutId } from '../utils/shortcuts';
@@ -77,6 +77,25 @@ const FORWARDED_KEYDOWN_TYPE = 'lucidos:keydown';
 
 type ChordLike = Pick<KeyboardEvent, 'metaKey' | 'ctrlKey' | 'shiftKey' | 'altKey' | 'key'>;
 
+/** Whether a bare keydown that bubbled to <body> should type-to-focus the prompt
+ *  textarea (desktop convenience: start typing anywhere → land in the prompt).
+ *  False when an overlay is open — a dropdown / modal / popover owns keystrokes
+ *  while up, so typing must search the dropdown (its auto-focused filter), never
+ *  leak into the prompt textarea behind the inert UI. Also false on mobile, for
+ *  IME composition, when a text input already has focus, with a modifier held,
+ *  or for non-printable keys. Pure — exported for unit testing. */
+export function shouldTypeToFocusPrompt(
+  e: Pick<KeyboardEvent, 'isComposing' | 'metaKey' | 'ctrlKey' | 'altKey' | 'key' | 'target'>,
+  opts: { mobile: boolean; overlayOpen: boolean },
+): boolean {
+  return !opts.mobile
+    && !opts.overlayOpen
+    && !e.isComposing
+    && !isTextInput(e.target)
+    && !e.metaKey && !e.ctrlKey && !e.altKey
+    && e.key.length === 1;
+}
+
 /** Classify a chord forwarded from an app iframe (its keydowns never reach the
  *  host document, so the SDK forwards shortcut-shaped chords via postMessage).
  *  Returns the matching shortcut id, `'escape'` for the Escape policy, or `null`
@@ -136,9 +155,11 @@ export function useKeyboardShortcuts(): void {
       }
 
       // Auto-focus prompt on typing (desktop only, printable characters).
+      // Skipped while an overlay is open so typing searches the dropdown /
+      // modal instead of leaking into the prompt textarea behind it.
       // The keydown targeted <body>, so the browser won't insert the char
       // into the newly-focused textarea — insert it manually.
-      if (!isMobile() && !e.isComposing && !isTextInput(e.target) && !e.metaKey && !e.ctrlKey && !e.altKey && e.key.length === 1) {
+      if (shouldTypeToFocusPrompt(e, { mobile: isMobile(), overlayOpen: overlayStack.value.length > 0 })) {
         focusPromptNow();
         e.preventDefault();
         document.execCommand('insertText', false, e.key);

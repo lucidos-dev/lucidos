@@ -418,5 +418,139 @@ mod startup_sweep_coding_agent_has_diff {
     }
 }
 
+// -- Phase C: orphaned-running coding-agent settle sweep -----------------------
+//
+// `settle_orphaned_running_coding_agent_threads` is the boot-recovery floor that
+// would have caught thread-72120ca6: a coding-agent thread left `running` after
+// a restart (the worktree-recovery skip paths drop it without settling) is a
+// permanent zombie, since the in-memory watchdogs only scan live sessions.
+mod settle_orphaned_running_sweep {
+    use crate::engine::agent_recovery::recovery::settle_orphaned_running_coding_agent_threads;
+    use crate::engine::event_bus::{BusEvent, EventBus};
+    use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
+    use crate::test_support::{setup_test_db, start_cc_session, teardown_test_db};
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    async fn status_of(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<String> {
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn aborted_count(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE aggregate_id = $1 AND event_type = 'ResponseAborted'",
+        )
+        .bind(thread_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Emit a chat-channel MessageReceived → is_coding_agent=false, status=running.
+    async fn seed_running_chat_thread(bus: &EventBus, thread_id: Uuid) {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::MessageReceived {
+                text: "hi".into(),
+                user_image_hashes: vec![],
+                device_id: None,
+                device: None,
+                image_description: None,
+                parent_thread_id: None,
+                spawning_event_id: None,
+                mode: ActorMode::Agent,
+                model: None,
+                reasoning_effort: None,
+                origin: None,
+            },
+            meta: EventMeta {
+                channel: Some(EventChannel::Chat),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The fix: a running coding-agent thread that recovery did NOT pick up
+    /// (empty `recovering` set) is settled — exactly the thread-72120ca6 case.
+    #[tokio::test]
+    async fn settles_orphaned_running_cc_thread() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        start_cc_session(&bus, thread_id, "claude-code/orphan", None).await;
+        assert_eq!(status_of(&pool, thread_id).await.as_deref(), Some("running"));
+
+        settle_orphaned_running_coding_agent_threads(&pool, &bus, &HashSet::new()).await;
+
+        assert_ne!(
+            status_of(&pool, thread_id).await.as_deref(),
+            Some("running"),
+            "orphaned running CC thread must be settled out of `running`"
+        );
+        assert_eq!(
+            aborted_count(&pool, thread_id).await,
+            1,
+            "settle must emit exactly one ResponseAborted"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A thread the recovery loop already owns (in `recovering`) is left for
+    /// that path to resume/settle — the sweep must not double-handle it.
+    #[tokio::test]
+    async fn skips_thread_in_recovering_set() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        start_cc_session(&bus, thread_id, "claude-code/recovering", None).await;
+
+        let recovering: HashSet<Uuid> = [thread_id].into_iter().collect();
+        settle_orphaned_running_coding_agent_threads(&pool, &bus, &recovering).await;
+
+        assert_eq!(
+            status_of(&pool, thread_id).await.as_deref(),
+            Some("running"),
+            "a thread owned by recovery must not be settled by the sweep"
+        );
+        assert_eq!(aborted_count(&pool, thread_id).await, 0);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Chat threads are out of scope — they're settled by
+    /// `recover_orphaned_threads`, and a chat thread blocked on a child sits
+    /// `running` pending parent-resume. The `is_coding_agent` filter excludes them.
+    #[tokio::test]
+    async fn skips_running_chat_thread() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        seed_running_chat_thread(&bus, thread_id).await;
+        assert_eq!(status_of(&pool, thread_id).await.as_deref(), Some("running"));
+
+        settle_orphaned_running_coding_agent_threads(&pool, &bus, &HashSet::new()).await;
+
+        assert_eq!(
+            status_of(&pool, thread_id).await.as_deref(),
+            Some("running"),
+            "the sweep must not touch chat threads (is_coding_agent=false)"
+        );
+        assert_eq!(aborted_count(&pool, thread_id).await, 0);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+}
+
 // -- end_stale_waiting_session branch-deletion regression ----------------------
 

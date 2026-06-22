@@ -36,6 +36,7 @@ async function subscribePush(subscription: PushSubscription): Promise<void> {
       p256dh: json.keys?.p256dh || '',
       auth: json.keys?.auth || '',
       device_id: getDeviceId(),
+      scope_url: new URL(SCOPE_PATH, window.location.origin).toString(),
     }),
   });
   await throwIfNotOk(res);
@@ -180,4 +181,3 @@ export async function initPushSubscription(): Promise<boolean> {
     return false;
   }
 }
-

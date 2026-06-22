@@ -6,7 +6,6 @@ import { AppHeader } from './components/layout/AppHeader';
 import { Drawer } from './components/layout/Drawer';
 import { MobileSwipeContainer } from './components/layout/MobileSwipeContainer';
 import { ConfirmDialog } from './components/shared/ConfirmDialog';
-import { BootSplash } from './components/shared/BootSplash';
 import { LandscapeLock } from './components/shared/LandscapeLock';
 import { ThreadDrawer } from './components/drawer/ThreadDrawer';
 import { DrawerDivider } from './components/layout/DrawerDivider';
@@ -14,6 +13,7 @@ import { DropZone } from './components/files/DropZone';
 import { UiBlockingOverlay } from './components/layout/UiBlockingOverlay';
 import { Toast } from './components/shared/Toast';
 import { useStartup } from './hooks/useStartup';
+import { useBootSplashReady } from './hooks/useBootSplashReady';
 import { useTooltip } from './hooks/useTooltip';
 import { useScrollLock } from './hooks/useScrollLock';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
@@ -58,6 +58,7 @@ function SearchEverywhereSlot()  { return searchEverywhereEverOpen.value ? <Sear
 
 export function App() {
   useStartup();
+  useBootSplashReady();
   useTooltip();
   useScrollLock();
   useKeyboardShortcuts();
@@ -101,7 +102,6 @@ export function App() {
       <NotificationsModalSlot />
       <SearchEverywhereSlot />
       <UiBlockingOverlay />
-      <BootSplash />
     </>
   );
 }

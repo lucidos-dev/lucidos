@@ -18,7 +18,6 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod ask_user_question_hook;
 mod cc_bash_guard;
-mod cc_edit_preread;
 mod cc_plan_gate;
 mod cc_read_coerce;
 mod cc_stop_reminder;
@@ -121,14 +120,6 @@ enum Command {
     /// well-shaped. Hidden; not for direct invocation.
     #[command(name = "cc-read-coerce", hide = true)]
     CcReadCoerce,
-    /// PreToolUse hook subcommand invoked by Claude Code via .lucidos/cc-settings.json
-    /// for every Edit tool call. Asks the engine whether the target file has
-    /// been Read in this thread; if not, returns `permissionDecision: "deny"`
-    /// with an instruction to Read first. Prevents the "File has not been read
-    /// yet" loop the model otherwise gets stuck in. Hidden; not for direct
-    /// invocation.
-    #[command(name = "cc-edit-preread", hide = true)]
-    CcEditPreread,
     /// PreToolUse hook subcommand invoked by Claude Code via .lucidos/cc-settings.json
     /// for every Edit/Write tool call. Asks the engine whether this branch has a
     /// Planned marker; if not (and the worktree ships the implementation-plan
@@ -463,20 +454,28 @@ enum HardenedCmd {
 enum PlannedCmd {
     /// Record a Planned marker for the current branch (in $PWD). Pass exactly
     /// one of `--plan <docs/plans/file>` (a real implementation plan was
-    /// written — the `implementation-plan` skill calls this) or
-    /// `--simple "<reason>"` (this change is a local fix needing no plan).
+    /// written — the `implementation-plan` skill calls this; records the
+    /// awaiting-approval `proposed` state) or `--simple "<reason>"` (this
+    /// change is a local fix needing no plan; records `acknowledged_simple`).
     /// POSTs to the parent engine's `/api/v1/internal/mark-planned`.
     Mark(PlannedMarkArgs),
+    /// Approve the proposed plan on the current branch (in $PWD), flipping the
+    /// marker to gate-satisfying `planned` so edits and Apply unblock. Run by
+    /// the coding agent AFTER the user approves the plan in chat. POSTs to the
+    /// parent engine's `/api/v1/internal/approve-plan`.
+    Approve,
     /// Print the Planned-marker state of the current branch (in $PWD):
-    /// `PRESENT` or `MISSING`. GETs `/api/v1/internal/planned-state`. Used by
-    /// the `cc-plan-gate` hook (allow edits iff `PRESENT`).
+    /// `SATISFIED`, `PROPOSED`, or `MISSING`. GETs
+    /// `/api/v1/internal/planned-state`. Used by the `cc-plan-gate` hook (allow
+    /// edits iff `SATISFIED`).
     State,
 }
 
 #[derive(Args)]
 pub(crate) struct PlannedMarkArgs {
     /// Relative path of the implementation plan that was written
-    /// (e.g. `docs/plans/2026-06-18-my-change.md`). Records state `planned`.
+    /// (e.g. `docs/plans/2026-06-18-my-change.md`). Records state `proposed`
+    /// (awaiting the user's approval).
     #[arg(long, conflicts_with = "simple")]
     pub(crate) plan: Option<String>,
     /// One-line reason this change is a local fix needing no plan. Records
@@ -680,6 +679,7 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     };
                     planned::cmd_mark(&ws, kind)?;
                 }
+                PlannedCmd::Approve => planned::cmd_approve(&ws)?,
                 PlannedCmd::State => planned::cmd_state(&ws)?,
             }
             Ok(0)
@@ -699,10 +699,6 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         Command::CcBashGuard => cc_bash_guard::run(),
         Command::CcReadCoerce => {
             cc_read_coerce::run()?;
-            Ok(0)
-        }
-        Command::CcEditPreread => {
-            cc_edit_preread::run()?;
             Ok(0)
         }
         Command::CcPlanGate => {

@@ -161,34 +161,13 @@ export function writeAppSourceApi(
 
 export function appUrl(
   appId: string,
-  commit?: string,
   threadId?: string,
 ): string {
   const base = `${API_BASE}/app/${encodeURIComponent(appId)}/`;
-  const params = new URLSearchParams();
-  if (commit) params.set('commit', commit);
   // `thread_id` triggers the engine's WIP-preview branch (see
   // `api/apps.rs::serve_app_ui`) — content comes from the open
   // coding-agent thread's worktree instead of the live workspace data.
-  if (threadId) params.set('thread_id', threadId);
-  const qs = params.toString();
-  return qs ? `${base}?${qs}` : base;
-}
-
-export interface AppVersion {
-  commit: string;
-  message: string;
-  timestamp: number;
-  author: string;
-}
-
-export interface AppVersionsPage {
-  versions: AppVersion[];
-  has_more: boolean;
-}
-
-export async function getAppVersions(appId: string, limit = 10, skip = 0): Promise<AppVersionsPage> {
-  return json<AppVersionsPage>(`${API}/app/versions?id=${encodeURIComponent(appId)}&limit=${limit}&skip=${skip}`);
+  return threadId ? `${base}?thread_id=${encodeURIComponent(threadId)}` : base;
 }
 
 // --- App Capture ---

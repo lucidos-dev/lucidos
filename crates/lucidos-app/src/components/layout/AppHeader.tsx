@@ -1,10 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
 import { ConnectionStatus } from './ConnectionStatus';
-import { panelOverlay, panelUrl, splitRatio, threadDrawerOpen, threadSearchQuery, mobileView, recoveryProgress, draftsViewActive, attentionViewActive } from '../../store/store';
+import { panelOverlay, panelUrl, splitRatio, threadDrawerOpen, threadSearchQuery, mobileView, recoveryProgress, drawerView, attentionThreadCount } from '../../store/store';
 import { useHideOnScroll } from '../../hooks/useHideOnScroll';
 import { ThreadToggleButton } from '../shared/ThreadToggleButton';
-import { ComposeIcon, SearchIcon, FilterIcon } from '../shared/icons';
-import { AltViewToggles } from '../shared/AltViewToggles';
+import { ComposeIcon, SearchIcon } from '../shared/icons';
 import { ThreadNav } from '../shared/ThreadNav';
 import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
 import { unfocusThread } from '../../store/actions/threads';
@@ -15,7 +14,7 @@ import { SwipeTouch } from '../../utils/swipe';
 import { PanelNav } from './PanelNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
 import { ControlPanel, controlPanelBadgeCount, controlPanelBadgeTooltip, toggleControlPanelAtClick } from './ControlPanel';
-import { ThreadFilterDropdown } from './ThreadFilterDropdown';
+import { ThreadFilterDropdown, viewIcon } from './ThreadFilterDropdown';
 import { getContentTitle, getDiffDescription } from './headerHelpers';
 import { resolveHeaderDblClick } from './headerDblClick';
 import { createDblClickGate } from '../../utils/dblClickGate';
@@ -28,9 +27,14 @@ function ThreadsHeader() {
   const { filterOpen, setFilterOpen, toggleRef, closeFilter, filterActive,
           searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadsHeaderState();
 
-  // The channel/trigger/repo filter is unavailable while an alternate filter
-  // view (drafts or attention) is running — both deliberately bypass it.
-  const altViewActive = draftsViewActive.value || attentionViewActive.value;
+  // The unified Filter control is active when a non-default drawer view is
+  // selected OR a channel filter is set. The needs-attention badge rides on the
+  // same button (attention-only — review/running/drafts stay per-row counts in
+  // the menu).
+  const filterButtonActive = drawerView.value !== 'all' || filterActive;
+  const attentionCount = attentionThreadCount.value;
+  // The button glyph reflects the selected view (funnel for `all`).
+  const ViewIcon = viewIcon(drawerView.value);
 
   return (
     <div class={`threads-header${searchOpen ? ' search-active' : ''}`}
@@ -52,21 +56,21 @@ function ThreadsHeader() {
           </svg>
         </button>
       </div>
-      <div style={{ position: 'relative' }}>
+      <div class="view-selector-slot">
         <button
           ref={toggleRef}
-          class={`icon-btn header-icon threads-header-btn${filterActive ? ' filter-active' : ''}`}
+          class={`icon-btn header-icon threads-header-btn${filterButtonActive ? ' view-selector-active' : ''}`}
           onClick={() => setFilterOpen(!filterOpen)}
-          disabled={altViewActive}
           aria-label="Filter threads"
-          data-tooltip={altViewActive ? 'Filter unavailable in this view' : 'Filter threads'}
-          style={altViewActive ? 'pointer-events: auto;' : undefined}
+          aria-haspopup="menu"
+          aria-expanded={filterOpen}
+          data-tooltip="Filter threads"
         >
-          <FilterIcon />
+          <ViewIcon />
+          {attentionCount > 0 && <span class="badge">{attentionCount}</span>}
         </button>
-        {filterOpen && !altViewActive && <ThreadFilterDropdown onClose={closeFilter} toggleRef={toggleRef} />}
+        {filterOpen && <ThreadFilterDropdown onClose={closeFilter} toggleRef={toggleRef} />}
       </div>
-      <AltViewToggles showTooltip />
       <span class="threads-header-title">Threads</span>
       <button
         class="icon-btn header-icon threads-header-btn"

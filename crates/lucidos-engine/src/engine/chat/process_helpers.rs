@@ -42,6 +42,21 @@ pub(super) struct TriggerContext {
 /// `Status of Authentication Migration` thread).
 pub(super) const ENGINE_RESTART_RULE: &str = "ENGINE RESTARTS INTERRUPT IN-FLIGHT WORK, NOT THREAD MEMORY:\nThe thread itself survives engine restarts — every message, tool call, and response is persisted in the event store, and your next turn after a restart loads the full history. The user can return to THIS thread (don't tell them to start a new one) and re-prompt to wake you up; you will see what was discussed. What does NOT survive is in-flight work: a streaming response, a child thread you were waiting on a callback from, an autonomous loop, or a `sleep N minutes then check back` intent. The LLM (you) is not running between turns; once a restart cuts off a response, no continuation fires automatically. So: never promise to do something \"after the restart\", \"once it comes back up\", \"in a minute when it's live\", or to \"check back later\" — those promises require a process that no longer exists. If a restart is about to happen, tell the user to come back to this same thread and re-prompt.";
 
+/// Stops the chat agent from bouncing yes/no "did you apply it? / did you
+/// restart?" confirmations back at the user during the apply→restart loop.
+/// The agent owns `list_changes`/`apply_change` and can probe served assets, so
+/// it must inspect and verify state itself rather than asking. Motivated by a
+/// font-fix session where, after applying a backend change, the agent kept
+/// asking the user to confirm they'd applied/restarted and "does it match
+/// now?" instead of checking. Pairs with `ENGINE_RESTART_RULE` (the agent
+/// CANNOT restart the engine — only the user triggers the rebuild) and the
+/// `ASK_USER_QUESTION_RULE` carve-out (ask only for genuine decisions). The
+/// served-asset probe note records the gateway routing gotcha: bundled SDK /
+/// static assets live under the workspace-prefixed route. The rule also
+/// reinforces that the user works on Lucidos constantly and knows the
+/// apply/restart/reload dance — so the agent must not re-explain it.
+pub(super) const APPLY_VERIFY_RULE: &str = "APPLYING & VERIFYING CHANGES — ACT AND VERIFY, DON'T ASK:\nYou have `list_changes` and `apply_change` — you can inspect and apply *changes* (coding-agent-proposed branches awaiting Apply) yourself, so NEVER bounce a yes/no question back to the user about state you can check. The user works on Lucidos constantly and knows the apply/restart/reload dance cold — do not re-explain it, and do not ask them to confirm they did it.\n- NEVER ask \"have you applied it?\" / \"did you apply the change?\" — call `list_changes` and read whether it is `pending` or `applied`. If the user asked for it to be applied, call `apply_change` directly; don't ask permission for the thing they just told you to do.\n- NEVER ask \"did you restart?\" / \"is the engine back up yet?\". You CANNOT restart the engine yourself — only the user can trigger the rebuild/restart, and Lucidos shows them the restart toast. So for a change that touches Rust/backend files (`requires_restart: true`): (a) apply it, (b) state plainly that a restart is required and that the USER must trigger it (don't promise the change is live immediately), then (c) VERIFY whether the new build is live by probing the served asset or behavior YOURSELF — e.g. `curl` the served file — rather than asking. If the probe still shows the old output, say so factually (\"the engine is still serving the pre-restart build\") instead of asking \"did you restart?\".\n- PROBE SERVED ASSETS UNDER THE WORKSPACE-PREFIXED ROUTE: bundled SDK / static assets are served under the workspace route, e.g. `https://<host>/<workspace>/api/v1/sdk-iframe.css` — NOT a bare `/api/v1/...` path. A bare path makes the gateway resolve the first segment (`api`) as a workspace name and 404 with \"unknown workspace 'api'\".\n- NEVER end an apply/restart loop with a confirmation question like \"does it look right now?\" or \"does it match?\". State what you verified, objectively. Reserve `ask_user_question` for a genuine decision the user has to make — not to confirm a step you could check yourself.";
+
 /// Build the TriggerStarted thread-event + meta for a scheduler-fired trigger
 /// run. Extracted as a pure function so the wiring rule "the `config.id`
 /// passed in is what gets stamped into both `TriggerStarted.trigger_id` and
@@ -312,6 +327,7 @@ pub(super) fn should_redirect_codex_followup(
 ///      arm drains it onto `ResponseCanceled.actor`.
 ///   3. **Fires the interrupt** so the live turn ends as a resumable `Canceled`
 ///      boundary.
+///
 /// Returns the session's `idle_notify` so the caller can wait for the turn to
 /// wind down before emitting the follow-up's `MessageReceived` (correct event
 /// ordering). Returns `None` when no redirect applies (CC, idle Codex,
@@ -347,6 +363,11 @@ pub(super) fn arm_codex_redirect(
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
     s.cancel_actor = origin.clone();
+    // Mark this interrupt as a redirect (not a Stop click) so the run_session
+    // interrupt arm classifies the interrupted turn as
+    // `CancelCause::SupersededByFollowup` — rendered neutrally — instead of
+    // `UserStop`. Drained by `take_session_redirect_followup`.
+    s.redirect_followup = true;
     s.interrupt.notify_one();
     Some(s.idle_notify.clone())
 }

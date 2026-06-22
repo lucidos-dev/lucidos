@@ -26,15 +26,24 @@ fn nav_app(app_id: &str) -> Tap {
 #[test]
 fn declarative_envelope_has_web_push_magic_and_notification_object() {
     // Top-level shape must opt in to declarative parsing per the Push API
-    // spec — Safari 18.5+ keys off `web_push: 8030` to bypass the SW and
-    // handle the tap natively. Without this, Safari falls back to legacy
-    // SW dispatch (which is what regressed iOS push tap → thread nav).
-    let payload = build_push_payload("Hi", "There", None, None, None, None, &Tap::Modal);
+    // spec — Safari 18.5+ keys off `web_push: 8030` to read the declarative
+    // `notification.navigate` tap target. The iOS SW `push` handler may still
+    // run to render the visible banner, so the declarative URL has to be right.
+    let payload = build_push_payload("Hi", "There", None, None, None, None, &Tap::Modal, None);
     assert_eq!(payload["web_push"], 8030);
     assert!(payload["notification"].is_object());
-    assert!(payload.get("title").is_none(), "title must be inside notification, not top-level");
-    assert!(payload.get("body").is_none(), "body must be inside notification, not top-level");
-    assert!(payload.get("data").is_none(), "data must be inside notification, not top-level");
+    assert!(
+        payload.get("title").is_none(),
+        "title must be inside notification, not top-level"
+    );
+    assert!(
+        payload.get("body").is_none(),
+        "body must be inside notification, not top-level"
+    );
+    assert!(
+        payload.get("data").is_none(),
+        "data must be inside notification, not top-level"
+    );
 }
 
 #[test]
@@ -42,7 +51,7 @@ fn payload_minimal_has_title_body_and_modal_tap() {
     // Hard cut: `tap` is always present in `notification.data` — the SW
     // routes off it and the wake-push payload must match byte-for-byte
     // for tag-replace to dedupe cleanly.
-    let payload = build_push_payload("Hi", "There", None, None, None, None, &Tap::Modal);
+    let payload = build_push_payload("Hi", "There", None, None, None, None, &Tap::Modal, None);
     assert_eq!(payload["notification"]["title"], "Hi");
     assert_eq!(payload["notification"]["body"], "There");
     let data = &payload["notification"]["data"];
@@ -56,16 +65,36 @@ fn payload_minimal_has_title_body_and_modal_tap() {
 #[test]
 fn payload_includes_thread_id_for_deep_link() {
     let tid = uuid::Uuid::parse_str("12345678-1234-5678-1234-567812345678").unwrap();
-    let payload =
-        build_push_payload("Claude is asking", "Pick one", None, None, Some(tid), None, &Tap::Modal);
-    assert_eq!(payload["notification"]["data"]["thread_id"], tid.to_string());
+    let payload = build_push_payload(
+        "Claude is asking",
+        "Pick one",
+        None,
+        None,
+        Some(tid),
+        None,
+        &Tap::Modal,
+        None,
+    );
+    assert_eq!(
+        payload["notification"]["data"]["thread_id"],
+        tid.to_string()
+    );
 }
 
 #[test]
 fn payload_omits_thread_id_when_link_absent() {
     // Regression guard: the SW relies on `if (data.thread_id)` — never emit
     // the key as a literal string "null" or empty value.
-    let payload = build_push_payload("Hi", "There", None, Some("app-x"), None, None, &Tap::Modal);
+    let payload = build_push_payload(
+        "Hi",
+        "There",
+        None,
+        Some("app-x"),
+        None,
+        None,
+        &Tap::Modal,
+        None,
+    );
     let data = &payload["notification"]["data"];
     assert!(data.get("thread_id").is_none());
     assert_eq!(data["app_id"], "app-x");
@@ -84,6 +113,7 @@ fn payload_carries_all_fields_when_provided() {
         Some(tid),
         Some(eid),
         &Tap::Modal,
+        None,
     );
     let data = &payload["notification"]["data"];
     assert_eq!(data["notification_id"], nid.to_string());
@@ -105,6 +135,7 @@ fn payload_includes_event_id_when_set() {
         Some(tid),
         Some(eid),
         &tap,
+        None,
     );
     let data = &payload["notification"]["data"];
     assert_eq!(data["event_id"], eid.to_string());
@@ -115,14 +146,13 @@ fn payload_includes_event_id_when_set() {
 fn payload_omits_event_id_when_not_provided() {
     let tid = uuid::Uuid::new_v4();
     let tap = nav_thread(&tid.to_string(), None);
-    let payload =
-        build_push_payload("Hi", "There", None, None, Some(tid), None, &tap);
+    let payload = build_push_payload("Hi", "There", None, None, Some(tid), None, &tap, None);
     assert!(payload["notification"]["data"].get("event_id").is_none());
 }
 
 #[test]
 fn payload_always_includes_tap_even_when_modal_default() {
-    let payload = build_push_payload("Hi", "There", None, None, None, None, &Tap::Modal);
+    let payload = build_push_payload("Hi", "There", None, None, None, None, &Tap::Modal, None);
     assert_eq!(
         payload["notification"]["data"]["tap"],
         serde_json::json!({"kind": "modal"})
@@ -133,47 +163,48 @@ fn payload_always_includes_tap_even_when_modal_default() {
 fn payload_includes_navigate_tap_for_cta_app() {
     let nid = uuid::Uuid::new_v4();
     let tap = nav_app("habit-tracker");
-        let payload = build_push_payload(
-            "Time to check in",
+    let payload = build_push_payload(
+        "Time to check in",
         "Log today's habits",
         Some(nid),
         Some("habit-tracker"),
-            None,
-            None,
-            &tap,
-        );
-        let tap_val = &payload["notification"]["data"]["tap"];
+        None,
+        None,
+        &tap,
+        None,
+    );
+    let tap_val = &payload["notification"]["data"]["tap"];
     assert_eq!(tap_val["kind"], "navigate");
     assert_eq!(tap_val["to"]["target"], "app");
     assert_eq!(tap_val["to"]["app_id"], "habit-tracker");
-    }
+}
 
-    #[test]
-    fn wake_payload_carries_wake_flag_plus_original_content() {
-        // Layer 3 of the macOS-Chrome partial-wedge mitigation (see
-        // system-knowhow/notifications.md §4.5). The `wake: true` flag sits
-        // at TOP LEVEL (sibling to `web_push`/`notification`), NOT inside the
-        // notification object — Safari ignores unknown top-level fields, and
-        // wake pushes never reach Safari anyway (filtered by is_mac_chromium).
-        // The SW gates on `data.wake` to skip the visible re-pop while still
-        // calling showNotification so Chrome counts the push as user-visible.
-        use crate::scheduler::notifications::Notification;
-        let nid = uuid::Uuid::new_v4();
-        let tid = uuid::Uuid::new_v4();
-        let eid = uuid::Uuid::new_v4();
-        let n = Notification {
-            id: nid,
-            task_id: None,
-            app_id: Some("habit-tracker".into()),
-            thread_id: Some(tid),
-            event_id: Some(eid),
-            title: "Claude is asking".into(),
+#[test]
+fn wake_payload_carries_wake_flag_plus_original_content() {
+    // Layer 3 of the macOS-Chrome partial-wedge mitigation (see
+    // system-knowhow/notifications.md §4.5). The `wake: true` flag sits
+    // at TOP LEVEL (sibling to `web_push`/`notification`), NOT inside the
+    // notification object — Safari ignores unknown top-level fields, and
+    // wake pushes never reach Safari anyway (filtered by is_mac_chromium).
+    // The SW gates on `data.wake` to skip the visible re-pop while still
+    // calling showNotification so Chrome counts the push as user-visible.
+    use crate::scheduler::notifications::Notification;
+    let nid = uuid::Uuid::new_v4();
+    let tid = uuid::Uuid::new_v4();
+    let eid = uuid::Uuid::new_v4();
+    let n = Notification {
+        id: nid,
+        task_id: None,
+        app_id: Some("habit-tracker".into()),
+        thread_id: Some(tid),
+        event_id: Some(eid),
+        title: "Claude is asking".into(),
         message: "Pick one".into(),
         read: false,
         created_at: chrono::Utc::now(),
         tap: nav_thread(&tid.to_string(), Some(&eid.to_string())),
     };
-    let payload = build_wake_payload(&n);
+    let payload = build_wake_payload(&n, None);
     assert_eq!(payload["wake"], true);
     assert_eq!(payload["web_push"], 8030);
     let notif = &payload["notification"];
@@ -182,7 +213,7 @@ fn payload_includes_navigate_tap_for_cta_app() {
     let data = &notif["data"];
     assert_eq!(data["notification_id"], nid.to_string());
     assert_eq!(data["app_id"], "habit-tracker");
-        assert_eq!(data["thread_id"], tid.to_string());
+    assert_eq!(data["thread_id"], tid.to_string());
     assert_eq!(data["event_id"], eid.to_string());
     assert_eq!(data["tap"]["kind"], "navigate");
     assert_eq!(data["tap"]["to"]["target"], "thread");
@@ -203,6 +234,7 @@ fn payload_includes_navigate_tap_for_cta_thread() {
         Some(tid),
         None,
         &tap,
+        None,
     );
     let tap_val = &payload["notification"]["data"]["tap"];
     assert_eq!(tap_val["kind"], "navigate");
@@ -211,7 +243,7 @@ fn payload_includes_navigate_tap_for_cta_thread() {
 }
 
 #[test]
-fn declarative_navigate_is_cross_document_query_url_for_ios() {
+fn declarative_navigate_falls_back_to_scope_relative_query_when_scope_missing() {
     // The iOS-consumed `notification.navigate` field MUST be a cross-document
     // (query-string) URL, NOT a hash-only one. iOS Safari's declarative-push
     // handler reuses the already-open PWA window and a same-document (hash-only)
@@ -221,25 +253,78 @@ fn declarative_navigate_is_cross_document_query_url_for_ios() {
     // document, forcing a real navigation iOS actually performs. See
     // system-knowhow/notifications.md §4.5.
     //
-    // Per W3C Push API "Receiving a Push Message" (PR #385), the base URL for
-    // resolving `navigate` is the subscription's scope — a leading-slash
-    // relative URL means the engine doesn't have to track each device's origin
-    // (Tailscale / localhost / public-domain mix).
+    // Legacy subscriptions created before scope_url was recorded still fan out.
+    // The next page load refreshes them with scope_url; until then keep the
+    // previous relative fallback instead of breaking delivery.
     let nid = uuid::Uuid::new_v4();
     let tid = uuid::Uuid::new_v4();
     let eid = uuid::Uuid::new_v4();
     let tap = nav_thread(&tid.to_string(), Some(&eid.to_string()));
-    let payload = build_push_payload("T", "B", Some(nid), None, Some(tid), Some(eid), &tap);
+    let payload = build_push_payload("T", "B", Some(nid), None, Some(tid), Some(eid), &tap, None);
     let nav = payload["notification"]["navigate"].as_str().unwrap();
     assert!(
-        nav.starts_with("/?"),
-        "iOS navigate must be a cross-document (query) URL so Safari navigates \
-         an already-open PWA window, got: {nav}"
+        nav.starts_with('?') && !nav.starts_with('/'),
+        "legacy iOS navigate fallback must remain a scope-relative query URL, got: {nav}"
     );
     assert!(nav.contains(&format!("notification={}", nid)));
     assert!(nav.contains(&format!("thread={}", tid)));
     assert!(nav.contains(&format!("event={}", eid)));
-    assert!(nav.contains("tap="), "navigate must carry encoded tap for non-modal kinds");
+    assert!(
+        nav.contains("tap="),
+        "navigate must carry encoded tap for non-modal kinds"
+    );
+}
+
+#[test]
+fn declarative_navigate_uses_absolute_scope_url_for_ios() {
+    // The regression that made hot AND cold iOS taps consistently no-op:
+    // WebKit/APNs may not apply a bare query-only `notification.navigate`.
+    // Persist the SW scope when subscribing and emit the concrete absolute URL.
+    let nid = uuid::Uuid::new_v4();
+    let tid = uuid::Uuid::new_v4();
+    let eid = uuid::Uuid::new_v4();
+    let tap = nav_thread(&tid.to_string(), Some(&eid.to_string()));
+    let payload = build_push_payload(
+        "T",
+        "B",
+        Some(nid),
+        None,
+        Some(tid),
+        Some(eid),
+        &tap,
+        Some("https://lucidos.test/dev/"),
+    );
+    let nav = payload["notification"]["navigate"].as_str().unwrap();
+    assert!(
+        nav.starts_with("https://lucidos.test/dev/?"),
+        "iOS navigate must be absolute and preserve the gateway workspace scope, got: {nav}"
+    );
+    assert!(nav.contains(&format!("notification={}", nid)));
+    assert!(nav.contains(&format!("thread={}", tid)));
+    assert!(nav.contains(&format!("event={}", eid)));
+    assert!(
+        nav.contains("tap="),
+        "navigate must carry encoded tap for non-modal kinds"
+    );
+}
+
+#[test]
+fn declarative_navigate_normalizes_scope_url_before_query_append() {
+    let nid = uuid::Uuid::new_v4();
+    let payload = build_push_payload(
+        "T",
+        "B",
+        Some(nid),
+        None,
+        None,
+        None,
+        &Tap::Modal,
+        Some("https://lucidos.test/dev?stale=1#frag"),
+    );
+    assert_eq!(
+        payload["notification"]["navigate"],
+        format!("https://lucidos.test/dev/?notification={nid}")
+    );
 }
 
 #[test]
@@ -248,21 +333,44 @@ fn declarative_navigate_omits_tap_param_for_modal_kind() {
     // `notification=…`, but the `tap=` param is redundant: the page-side
     // dispatcher defaults missing tap to modal. Keeps URLs short.
     let nid = uuid::Uuid::new_v4();
-    let payload = build_push_payload("T", "B", Some(nid), None, None, None, &Tap::Modal);
+    let payload = build_push_payload("T", "B", Some(nid), None, None, None, &Tap::Modal, None);
     let nav = payload["notification"]["navigate"].as_str().unwrap();
     assert!(nav.contains(&format!("notification={}", nid)));
-    assert!(!nav.contains("tap="), "modal taps must NOT include tap= in nav URL");
+    assert!(
+        !nav.contains("tap="),
+        "modal taps must NOT include tap= in nav URL"
+    );
 }
 
 #[test]
 fn declarative_navigate_root_when_no_params() {
     // Defensive: a push with no notification_id / thread_id / event_id and
-    // modal tap has nothing to deep-link. Both navigate URLs fall back to "/"
-    // (no bare "/?" or "/#" — those would be cosmetically odd and the page
-    // treats them the same, but "/" is the clean form).
-    let payload = build_push_payload("T", "B", None, None, None, None, &Tap::Modal);
-    assert_eq!(payload["notification"]["navigate"], "/");
-    assert_eq!(payload["notification"]["data"]["navigate"], "/");
+    // modal tap has nothing to deep-link. Both navigate URLs fall back to "."
+    // — a scope-relative ref that resolves to the workspace (`/<slug>/`) root
+    // on iOS. A bare "/" would escape to the origin root (the gateway picker),
+    // the same multi-workspace trap the parametrized URLs avoid.
+    let payload = build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None);
+    assert_eq!(payload["notification"]["navigate"], ".");
+    assert_eq!(payload["notification"]["data"]["navigate"], ".");
+}
+
+#[test]
+fn declarative_navigate_scope_root_when_no_params_and_scope_present() {
+    let payload = build_push_payload(
+        "T",
+        "B",
+        None,
+        None,
+        None,
+        None,
+        &Tap::Modal,
+        Some("https://lucidos.test/dev/"),
+    );
+    assert_eq!(
+        payload["notification"]["navigate"],
+        "https://lucidos.test/dev/"
+    );
+    assert_eq!(payload["notification"]["data"]["navigate"], ".");
 }
 
 #[test]
@@ -272,7 +380,7 @@ fn declarative_notification_tag_carries_notification_id_for_dedup() {
     // duplicates. Engine produces the tag now so Safari's declarative path
     // gets the same dedup as the SW path.
     let nid = uuid::Uuid::new_v4();
-    let payload = build_push_payload("T", "B", Some(nid), None, None, None, &Tap::Modal);
+    let payload = build_push_payload("T", "B", Some(nid), None, None, None, &Tap::Modal, None);
     assert_eq!(payload["notification"]["tag"], nid.to_string());
 }
 
@@ -281,7 +389,7 @@ fn declarative_notification_tag_falls_back_to_default_when_no_id() {
     // Legacy callers without a notification_id still need a tag — the
     // engine fills in "lucidos-notification" so the OS dedup channel
     // exists.
-    let payload = build_push_payload("T", "B", None, None, None, None, &Tap::Modal);
+    let payload = build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None);
     assert_eq!(payload["notification"]["tag"], "lucidos-notification");
 }
 
@@ -294,19 +402,41 @@ fn declarative_notification_data_carries_hash_navigate_url_for_chrome_sw() {
     //
     // The two URLs are deliberately DIFFERENT forms: `data.navigate` (Chrome
     // SW `client.navigate()`) stays a HASH URL so a warm tap is a same-document
-    // change (no reload), while `notification.navigate` (iOS declarative) is a
-    // QUERY URL so iOS actually navigates an already-open window. Same params,
-    // different prefix. See system-knowhow/notifications.md §4.5.
+    // change (no reload), while `notification.navigate` (iOS declarative) is an
+    // absolute QUERY URL so iOS cold/hot launches do not depend on WebKit/APNs
+    // accepting a query-only relative string. Same params, different carrier.
+    // See system-knowhow/notifications.md §4.5.
     let nid = uuid::Uuid::new_v4();
     let tid = uuid::Uuid::new_v4();
     let tap = nav_thread(&tid.to_string(), None);
-    let payload = build_push_payload("T", "B", Some(nid), None, Some(tid), None, &tap);
+    let payload = build_push_payload(
+        "T",
+        "B",
+        Some(nid),
+        None,
+        Some(tid),
+        None,
+        &tap,
+        Some("https://lucidos.test/dev/"),
+    );
     let nav_ios = payload["notification"]["navigate"].as_str().unwrap();
-    let nav_sw = payload["notification"]["data"]["navigate"].as_str().unwrap();
-    assert!(nav_ios.starts_with("/?"), "iOS navigate must be a query URL, got: {nav_ios}");
-    assert!(nav_sw.starts_with("/#"), "Chrome SW navigate must be a hash URL, got: {nav_sw}");
-    // Same deep-link params either side of the prefix — only `?` vs `#` differs.
-    assert_eq!(nav_ios.trim_start_matches("/?"), nav_sw.trim_start_matches("/#"));
+    let nav_sw = payload["notification"]["data"]["navigate"]
+        .as_str()
+        .unwrap();
+    assert!(
+        nav_ios.starts_with("https://lucidos.test/dev/?"),
+        "iOS navigate must be an absolute scoped query URL, got: {nav_ios}"
+    );
+    assert!(
+        nav_sw.starts_with('#') && !nav_sw.starts_with('/'),
+        "Chrome SW navigate must be a scope-relative hash URL, got: {nav_sw}"
+    );
+    // Same deep-link params despite the different URL carriers.
+    let ios_query = nav_ios
+        .split_once('?')
+        .map(|(_, query)| query)
+        .expect("absolute iOS navigate must carry query params");
+    assert_eq!(ios_query, nav_sw.trim_start_matches('#'));
     assert!(nav_sw.contains(&format!("notification={}", nid)));
     assert!(nav_sw.contains(&format!("thread={}", tid)));
 }
@@ -456,6 +586,7 @@ fn sub_with_device(device_id: &str) -> PushSubscription {
         p256dh: "p256dh-test".into(),
         auth: "auth-test".into(),
         device_id: Some(device_id.into()),
+        scope_url: None,
     }
 }
 
@@ -465,6 +596,7 @@ fn sub_without_device() -> PushSubscription {
         p256dh: "p256dh-test".into(),
         auth: "auth-test".into(),
         device_id: None,
+        scope_url: None,
     }
 }
 
@@ -482,8 +614,14 @@ fn s4_5_pick_wake_targets_empty_input() {
 #[test]
 fn s4_5_pick_wake_targets_only_mac_chromium() {
     let subs = vec![
-        (sub_with_device("dev-chrome"), Some(CHROME_MAC_UA.to_string())),
-        (sub_with_device("dev-safari"), Some(SAFARI_MAC_UA.to_string())),
+        (
+            sub_with_device("dev-chrome"),
+            Some(CHROME_MAC_UA.to_string()),
+        ),
+        (
+            sub_with_device("dev-safari"),
+            Some(SAFARI_MAC_UA.to_string()),
+        ),
     ];
     let targets = pick_mac_chromium_wake_targets(&subs);
     assert_eq!(targets, vec!["dev-chrome".to_string()]);
@@ -516,8 +654,14 @@ fn s4_5_pick_wake_targets_dedupes_multi_tab() {
     // only spawn once — otherwise the same SW gets two wakes 3s apart
     // for the same notification, wasting half the budget.
     let subs = vec![
-        (sub_with_device("dev-chrome"), Some(CHROME_MAC_UA.to_string())),
-        (sub_with_device("dev-chrome"), Some(CHROME_MAC_UA.to_string())),
+        (
+            sub_with_device("dev-chrome"),
+            Some(CHROME_MAC_UA.to_string()),
+        ),
+        (
+            sub_with_device("dev-chrome"),
+            Some(CHROME_MAC_UA.to_string()),
+        ),
     ];
     let targets = pick_mac_chromium_wake_targets(&subs);
     assert_eq!(targets, vec!["dev-chrome".to_string()]);
@@ -597,22 +741,19 @@ async fn s3_deadline_long_enough_for_realistic_ios_cellular_pong() {
         tracker_clone.record(PresencePongRequest {
             notification_id: nid,
             device_id: "ios-cellular".into(),
-                is_active: true,
-                focused_thread_id: None,
-                event_in_viewport: false,
-            });
+            is_active: true,
+            focused_thread_id: None,
+            event_in_viewport: false,
         });
+    });
 
-        let _ = tokio::time::timeout(
-            Duration::from_millis(DEADLINE_MS as u64),
-            notify.notified(),
-        )
-        .await;
+    let _ =
+        tokio::time::timeout(Duration::from_millis(DEADLINE_MS as u64), notify.notified()).await;
 
-        let pongs = tracker.collect(nid);
-        assert!(
-            !decide_push_allowed(&pongs),
-            "DEADLINE_MS={} is too short for a {} ms iOS-cellular pong — \
+    let pongs = tracker.collect(nid);
+    assert!(
+        !decide_push_allowed(&pongs),
+        "DEADLINE_MS={} is too short for a {} ms iOS-cellular pong — \
          engine times out before the page can answer, so push fires \
          on top of the in-app toast. Got pongs={:?}",
         DEADLINE_MS,

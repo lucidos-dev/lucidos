@@ -226,6 +226,92 @@ async fn apply_unplanned_change_is_blocked() {
     pool.close().await;
 }
 
+/// The plan-approval round-trip over the internal HTTP surface: recording a
+/// plan lands the awaiting-approval `proposed` state (gate NOT satisfied), and
+/// only `approve-plan` flips it to `SATISFIED`. Exercises the three-way
+/// `planned-state` wire contract the cc-plan-gate hook depends on.
+#[tokio::test]
+async fn plan_marker_proposed_then_approved_round_trip() {
+    let client = http_client();
+    let ws = workspace_path();
+    let repo_root = ws.to_str().unwrap();
+
+    let suffix = Uuid::new_v4().as_simple().to_string()[..8].to_string();
+    let branch = format!("e2e-test/plan-approve-{}", suffix);
+
+    let state_url = format!("{}/api/v1/internal/planned-state", base_url());
+    let read_state = |branch: String| {
+        let client = client.clone();
+        let state_url = state_url.clone();
+        let repo_root = repo_root.to_string();
+        async move {
+            let resp = client
+                .get(&state_url)
+                .query(&[("repo_root", repo_root.as_str()), ("branch_name", branch.as_str())])
+                .send()
+                .await
+                .expect("planned-state GET failed");
+            let body: serde_json::Value = resp.json().await.expect("planned-state non-JSON");
+            body["state"].as_str().unwrap_or_default().to_string()
+        }
+    };
+
+    // No marker yet.
+    assert_eq!(read_state(branch.clone()).await, "MISSING");
+
+    // The skill records `proposed` — present but NOT gate-satisfying.
+    let mark = client
+        .post(format!("{}/api/v1/internal/mark-planned", base_url()))
+        .json(&json!({
+            "repo_root": repo_root,
+            "branch_name": branch,
+            "head_sha": "deadbeef",
+            "state": "proposed",
+            "plan_path": "docs/plans/2026-06-19-e2e.md",
+        }))
+        .send()
+        .await
+        .expect("mark-planned POST failed");
+    assert_eq!(mark.status(), 204, "mark-planned must return 204");
+    assert_eq!(read_state(branch.clone()).await, "PROPOSED");
+
+    // Approve flips proposed -> planned (SATISFIED).
+    let approve = client
+        .post(format!("{}/api/v1/internal/approve-plan", base_url()))
+        .json(&json!({ "repo_root": repo_root, "branch_name": branch }))
+        .send()
+        .await
+        .expect("approve-plan POST failed");
+    assert!(approve.status().is_success());
+    let approve_body: serde_json::Value = approve.json().await.expect("approve-plan non-JSON");
+    assert_eq!(approve_body["approved"], json!(true));
+    assert_eq!(read_state(branch.clone()).await, "SATISFIED");
+
+    // Re-approving an already-planned branch is a no-op (approved: false).
+    let reapprove = client
+        .post(format!("{}/api/v1/internal/approve-plan", base_url()))
+        .json(&json!({ "repo_root": repo_root, "branch_name": branch }))
+        .send()
+        .await
+        .expect("approve-plan POST failed");
+    let reapprove_body: serde_json::Value = reapprove.json().await.expect("non-JSON");
+    assert_eq!(reapprove_body["approved"], json!(false));
+
+    // Cleanup the marker row (keyed on canonical repo_root).
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+    let canonical = std::fs::canonicalize(repo_root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| repo_root.to_string());
+    let _ = sqlx::query("DELETE FROM planned_branches WHERE repo_root = $1 AND branch_name = $2")
+        .bind(&canonical)
+        .bind(&branch)
+        .execute(&pool)
+        .await;
+    pool.close().await;
+}
+
 /// Sequential apply of two changes must both succeed.
 /// Regression test: after applying the first change, the working tree was left
 /// dirty (detached HEAD caused `reset --hard HEAD` to target the wrong commit),

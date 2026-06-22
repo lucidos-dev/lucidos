@@ -253,13 +253,32 @@ fn setup_status_is_complete(status: &str) -> bool {
     !matches!(status, "running" | "waiting_for_user_answer")
 }
 
-/// Fill `MarketplacePlugin::setup_complete` from each setup thread's current
-/// `thread_summaries.status`. The pure `scan_catalog` can't reach the DB, so it
-/// leaves the flag `false`; this enriches the scanned catalog before it ships.
-/// An unknown thread id (projection lag right after spawn, or a deleted thread)
-/// stays `false` so the card shows "Setup" rather than flicker to "Open" before
-/// the agent has run. A lookup failure is logged, not fatal — the catalog still
-/// renders, just pinned to "Setup".
+/// Resolve a setup thread's completion for the App Store card from the two
+/// signals we can observe: `summary_status` is its `thread_summaries.status`
+/// (`Some` once the thread has a row), `in_queue` is whether a live
+/// `thread_queue` entry still exists for it.
+/// - present → done once it's neither `running` nor `waiting_for_user_answer`.
+/// - absent but queued → still pending (not complete) → card keeps "Setup"
+///   through the brief post-spawn lag before the agent's first event lands.
+/// - absent and not queued → the thread is *gone* (lost spawn, deleted, or a
+///   stale catalog id) → complete, so the card falls through to "Open" instead
+///   of a "Setup" button that 404s on click.
+/// Pure, so the present/pending/gone boundaries are unit-testable.
+fn resolve_setup_complete(summary_status: Option<&str>, in_queue: bool) -> bool {
+    match summary_status {
+        Some(status) => setup_status_is_complete(status),
+        None => !in_queue,
+    }
+}
+
+/// Fill `MarketplacePlugin::setup_complete` from each setup thread's state. The
+/// pure `scan_catalog` can't reach the DB, so it leaves the flag `false`; this
+/// enriches the scanned catalog before it ships, routing each id through
+/// [`resolve_setup_complete`] (present → lifecycle status; queued → pending;
+/// gone → complete). A summary-lookup failure is logged, not fatal — the
+/// catalog still renders, just pinned to "Setup". A queue-lookup failure falls
+/// back to treating unknown ids as still-queued (pending), so a transient error
+/// can never flip a real pending setup to "Open".
 async fn mark_setup_complete(pool: &sqlx::PgPool, catalog: &mut MarketplaceCatalog) {
     let ids: Vec<Uuid> = catalog
         .plugins
@@ -270,30 +289,46 @@ async fn mark_setup_complete(pool: &sqlx::PgPool, catalog: &mut MarketplaceCatal
     if ids.is_empty() {
         return;
     }
-    let rows: Vec<(Uuid, String)> = match sqlx::query_as(
+    let status_by_id: std::collections::HashMap<Uuid, String> = match sqlx::query_as::<_, (Uuid, String)>(
         "SELECT thread_id, status FROM thread_summaries WHERE thread_id = ANY($1)",
     )
     .bind(&ids)
     .fetch_all(pool)
     .await
     {
-        Ok(rows) => rows,
+        Ok(rows) => rows.into_iter().collect(),
         Err(e) => {
-            log!(@Plugins, "setup-complete lookup failed (leaving cards on Setup): {}", e);
+            log!(@Plugins, "setup-complete summary lookup failed (leaving cards on Setup): {}", e);
             return;
         }
     };
-    let status_by_id: std::collections::HashMap<Uuid, String> = rows.into_iter().collect();
+    // A setup thread that has been spawned but hasn't emitted its first event
+    // yet has no `thread_summaries` row — only a live `thread_queue` entry. On a
+    // queue-lookup error we treat every unknown id as still-queued so we never
+    // flip a genuinely-pending thread to "Open" (gone) on a transient hiccup.
+    let (queued_ids, queue_lookup_failed): (std::collections::HashSet<Uuid>, bool) =
+        match sqlx::query_scalar::<_, Uuid>(
+            "SELECT thread_id FROM thread_queue WHERE thread_id = ANY($1)",
+        )
+        .bind(&ids)
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => (rows.into_iter().collect(), false),
+            Err(e) => {
+                log!(@Plugins, "setup-complete queue lookup failed (treating unknown threads as pending): {}", e);
+                (std::collections::HashSet::new(), true)
+            }
+        };
     for plugin in &mut catalog.plugins {
         if let Some(tid) = plugin
             .setup_thread_id
             .as_deref()
             .and_then(|s| Uuid::parse_str(s).ok())
         {
-            plugin.setup_complete = status_by_id
-                .get(&tid)
-                .map(|s| setup_status_is_complete(s))
-                .unwrap_or(false);
+            let in_queue = queue_lookup_failed || queued_ids.contains(&tid);
+            plugin.setup_complete =
+                resolve_setup_complete(status_by_id.get(&tid).map(String::as_str), in_queue);
         }
     }
 }
@@ -547,7 +582,7 @@ pub(super) fn router() -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
-    use super::{mark_setup_complete, setup_status_is_complete};
+    use super::{mark_setup_complete, resolve_setup_complete, setup_status_is_complete};
     use crate::core::plugin_marketplaces::{
         MarketplaceCatalog, MarketplacePlugin, MarketplacePluginStatus,
     };
@@ -637,14 +672,56 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// An unknown setup thread id (projection lag right after spawn, or a
-    /// deleted thread) must leave the card on "Setup", not flip to "Open".
+    #[test]
+    fn resolve_setup_complete_present_pending_gone() {
+        // Present → lifecycle status decides.
+        assert!(!resolve_setup_complete(Some("running"), false));
+        assert!(!resolve_setup_complete(Some("waiting_for_user_answer"), false));
+        assert!(resolve_setup_complete(Some("idle"), false));
+        // Absent but queued → still pending (card keeps Setup, no flicker).
+        assert!(!resolve_setup_complete(None, true));
+        // Absent and not queued → gone → complete (card falls through to Open).
+        assert!(resolve_setup_complete(None, false));
+    }
+
+    /// A setup thread that is *gone* — no `thread_summaries` row and no live
+    /// `thread_queue` entry (lost spawn, deleted thread, or a stale catalog id)
+    /// — must resolve to complete so the card falls through to "Open" instead
+    /// of a "Setup" button that 404s on click.
     #[tokio::test]
-    async fn mark_setup_complete_unknown_thread_stays_incomplete() {
+    async fn mark_setup_complete_gone_thread_falls_through_to_open() {
         let (pool, db_name) = setup_test_db().await;
         let mut catalog = empty_catalog(installed_plugin_with_setup_thread(Uuid::new_v4()));
         mark_setup_complete(&pool, &mut catalog).await;
-        assert!(!catalog.plugins[0].setup_complete);
+        assert!(
+            catalog.plugins[0].setup_complete,
+            "a setup thread with no row and no queue entry must be treated as complete"
+        );
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A setup thread spawned but not yet materialized (a live `thread_queue`
+    /// entry, no `thread_summaries` row) is genuinely pending — keep the card on
+    /// "Setup" through the post-spawn lag.
+    #[tokio::test]
+    async fn mark_setup_complete_queued_thread_stays_incomplete() {
+        let (pool, db_name) = setup_test_db().await;
+        let tid = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO thread_queue (id, kind, thread_id, request) \
+             VALUES ($1, 'sub-thread', $2, '{}'::jsonb)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(tid)
+        .execute(&pool)
+        .await
+        .expect("seed thread_queue row");
+        let mut catalog = empty_catalog(installed_plugin_with_setup_thread(tid));
+        mark_setup_complete(&pool, &mut catalog).await;
+        assert!(
+            !catalog.plugins[0].setup_complete,
+            "a queued-but-not-yet-materialized setup thread must keep the card on Setup"
+        );
         teardown_test_db(&db_name).await;
     }
 }

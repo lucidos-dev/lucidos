@@ -221,6 +221,14 @@ impl LucidosEngine {
         // Outer batch id `ask_user_question` keys its per-question wait
         // registry sub_ids on (see `synth_question_id`).
         tool_use_id: &str,
+        // Per-turn event meta — carries the channel (`Some(Trigger)` for a
+        // scheduled trigger, `None` for chat) so the MCP permission gate can
+        // auto-approve silently in unattended trigger threads, and the actor for
+        // the permission card. Cloned onto any emitted event.
+        meta: &EventMeta,
+        // Cancel token for the response — lets a blocking MCP permission card
+        // resolve as canceled when the user clicks Stop, instead of dangling.
+        cancel_token: &tokio_util::sync::CancellationToken,
     ) -> Option<String> {
         if tool_name == tn::ASK_USER_QUESTION {
             return Some(
@@ -597,6 +605,8 @@ impl LucidosEngine {
         } else if let Some((server_id, mcp_tool_name)) =
             crate::mcp::McpManager::parse_mcp_tool_name(tool_name)
         {
+            use crate::engine::mcp_permission::{mcp_gate, McpAsk, McpGate};
+
             let (auto_approve, server_name) = {
                 let statuses = self.mcp_manager.list_servers().await.unwrap_or_default();
                 let server = statuses.iter().find(|s| s.id == server_id);
@@ -608,16 +618,11 @@ impl LucidosEngine {
                 )
             };
 
-            let approved = if auto_approve {
-                true
-            } else {
-                let consent_request_id = uuid::Uuid::new_v4().to_string();
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                {
-                    let mut pending = self.pending_mcp_consent.lock().unwrap();
-                    pending.insert(consent_request_id.clone(), tx);
-                }
-
+            // Pre-authorization gate: the server's `auto_approve` flag or a
+            // non-interactive trigger thread proceeds with no card; otherwise
+            // ask the user (in-thread `McpPermissionRequested` card), which also
+            // honors a prior session / `mcp-allowed-tools` grant.
+            if let McpGate::Ask = mcp_gate(auto_approve, meta.channel) {
                 let args_summary = serde_json::to_string_pretty(tool_args)
                     .unwrap_or_else(|_| tool_args.to_string());
                 let args_summary = if args_summary.len() > 500 {
@@ -629,37 +634,26 @@ impl LucidosEngine {
                     args_summary
                 };
 
-                self.event_bus
-                    .emit_or_log(
-                        BusEvent::Thread {
-                            thread_id,
-                            event: ThreadEvent::McpConsentPromptRequested {
-                                payload: serde_json::json!({
-                                    "request_id": consent_request_id,
-                                    "server_name": server_name,
-                                    "tool_name": mcp_tool_name,
-                                    "arguments_summary": args_summary,
-                                })
-                                .to_string(),
-                            },
-                            meta: EventMeta::NONE,
-                        },
-                        "[AgenticLoop] McpConsentPromptRequested",
+                if let McpAsk::Refuse(refusal) = self
+                    .ask_mcp_permission(
+                        &server_id,
+                        &server_name,
+                        &mcp_tool_name,
+                        tool_name,
+                        tool_args,
+                        &args_summary,
+                        thread_id,
+                        tool_use_id,
+                        meta,
+                        cancel_token,
                     )
-                    .await;
-
-                match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-                    Ok(Ok(allowed)) => allowed,
-                    Ok(Err(_)) => false,
-                    Err(_) => {
-                        let mut pending = self.pending_mcp_consent.lock().unwrap();
-                        pending.remove(&consent_request_id);
-                        false
-                    }
+                    .await
+                {
+                    return Some(refusal);
                 }
-            };
+            }
 
-            Some(if approved {
+            Some(
                 match self
                     .mcp_manager
                     .call_tool(&server_id, &mcp_tool_name, tool_args.clone())
@@ -667,13 +661,8 @@ impl LucidosEngine {
                 {
                     Ok((result, _, _)) => result,
                     Err(e) => format!("Error: MCP tool call failed: {}", e),
-                }
-            } else {
-                format!(
-                    "Error: User denied MCP tool call '{}' on '{}'",
-                    mcp_tool_name, server_name
-                )
-            })
+                },
+            )
         } else {
             None
         }
@@ -958,6 +947,11 @@ impl LucidosEngine {
                         device_id,
                         tool_called_event_id,
                         &tc.id,
+                        // Intent sub-loops expose only `build_intent_tools()`
+                        // (no dynamically-discovered MCP tools), so the MCP
+                        // permission branch is unreachable here — NONE is safe.
+                        &EventMeta::NONE,
+                        cancel_token,
                     )
                     .await
                 {

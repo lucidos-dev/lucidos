@@ -347,8 +347,8 @@
 .error {
     color: var(--accent-red);
     padding: 0.75rem;
-    background: rgba(248, 81, 73, 0.1);
-    border: 1px solid rgba(248, 81, 73, 0.4);
+    background: color-mix(in srgb, var(--accent-red) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent-red) 40%, transparent);
     border-radius: 0.375rem;
     font-size: 0.8125rem;
 }
@@ -690,6 +690,25 @@
     font-weight: 500;
     line-height: 1.5;
     word-break: break-word;
+}
+
+/* MCP permission card — the tool arguments the agent wants to call with.
+   Monospace, dimmed, scrollable when long so a big args blob doesn't blow out
+   the card height. */
+.permission-mcp-args {
+    margin: 0.5rem 0 0;
+    padding: 0.5rem 0.625rem;
+    background: var(--bg-secondary, rgba(127, 127, 127, 0.1));
+    border-radius: 0.375rem;
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+    font-size: 0.8125rem;
+    line-height: 1.45;
+    font-weight: 400;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 12rem;
+    overflow: auto;
 }
 
 .permission-actions {

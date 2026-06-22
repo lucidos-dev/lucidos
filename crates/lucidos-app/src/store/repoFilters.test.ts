@@ -4,6 +4,7 @@ import {
   threadMap,
   selectedRepoIds,
   filterFacets,
+  includeDeletedFilterOptions,
 } from './store';
 import { repoFilterOptions } from './repoFilters';
 import type { ThreadState } from './thread-events';
@@ -20,6 +21,9 @@ describe('repoFilterOptions — only repos with CC sessions', () => {
     threadMap.value = new Map();
     selectedRepoIds.value = new Set();
     filterFacets.value = { status: 'not-loaded' };
+    // These cases assert deleted-entry labeling/sorting, which is independent
+    // of the include-deleted toggle — opt in so deleted rows are listed.
+    includeDeletedFilterOptions.value = true;
   });
 
   it('returns [] until the registry loads', () => {
@@ -101,5 +105,33 @@ describe('repoFilterOptions — only repos with CC sessions', () => {
       ['t1', { meta: { channel: 'chat', repoId: 'r1' } } as unknown as ThreadState],
     ]);
     expect(repoFilterOptions.value).toEqual([]);
+  });
+});
+
+describe('repoFilterOptions — include-deleted toggle', () => {
+  beforeEach(() => {
+    repositories.value = { status: 'loaded', data: [{ id: 'r1', name: 'Repo 1', path: '/r1' }] };
+    threadMap.value = new Map([
+      ['t1', ccThread('r1')],
+      ['t2', ccThread('gone', 'Gone Repo')],
+    ]);
+    selectedRepoIds.value = new Set();
+    filterFacets.value = { status: 'not-loaded' };
+  });
+
+  it('excludes deleted repos when the toggle is off (default)', () => {
+    includeDeletedFilterOptions.value = false;
+    expect(repoFilterOptions.value.map(o => o.id)).toEqual(['r1']);
+  });
+
+  it('includes deleted repos when the toggle is on', () => {
+    includeDeletedFilterOptions.value = true;
+    expect(repoFilterOptions.value.map(o => o.id)).toEqual(['r1', 'gone']);
+  });
+
+  it('keeps a selected deleted repo visible even when the toggle is off (stays clearable)', () => {
+    includeDeletedFilterOptions.value = false;
+    selectedRepoIds.value = new Set(['gone']);
+    expect(repoFilterOptions.value.map(o => o.id)).toEqual(['r1', 'gone']);
   });
 });

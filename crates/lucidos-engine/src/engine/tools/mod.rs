@@ -213,6 +213,13 @@ impl LucidosEngine {
             Some(t) if !t.is_empty() => t,
             _ => return Err("Error: target is required".to_string()),
         };
+        log!(
+            "[Navigate] navigate_ui thread={} target={} app_id={:?} id={:?}",
+            thread_id,
+            target,
+            args.get("app_id").and_then(|v| v.as_str()),
+            args.get("id").and_then(|v| v.as_str())
+        );
         if let Err(e) = self
             .event_bus
             .emit(crate::engine::event_bus::BusEvent::Thread {

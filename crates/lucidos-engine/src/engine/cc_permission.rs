@@ -80,8 +80,7 @@ pub struct PermissionState {
 impl PermissionState {
     /// Resolve and remove the entry for `request_id`, returning the broadcast
     /// sender so the caller can fan the answer out to all listeners. Returns
-    /// `None` if no permission entry matches (the CC consent endpoint then
-    /// falls back to the legacy `pending_mcp_consent` map).
+    /// `None` if no permission entry matches (the consent endpoint then 404s).
     pub fn take(&mut self, request_id: &str) -> Option<PermissionEntry> {
         let key = self.by_request_id.remove(request_id)?;
         self.by_dedup_key.remove(&key)

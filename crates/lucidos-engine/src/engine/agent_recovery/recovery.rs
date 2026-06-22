@@ -990,6 +990,78 @@ impl LucidosEngine {
                 .await;
         }
 
+        // Catch-all (defense-in-depth): settle any coding-agent thread the
+        // projection still shows `running` that this pass neither resumed nor
+        // settled — the floor that would have caught thread-72120ca6. See
+        // `settle_orphaned_running_coding_agent_threads`.
+        settle_orphaned_running_coding_agent_threads(
+            self.pool(),
+            &self.event_bus,
+            &recovering_threads,
+        )
+        .await;
+
         recovering_threads.into_iter().collect()
+    }
+}
+
+/// Settle any coding-agent thread still `running` in the projection that boot
+/// recovery neither resumed (in `recovering`) nor settled. After a restart
+/// there are NO live subprocesses, so a `running` coding-agent thread with no
+/// recovery is a permanent zombie — the in-memory watchdogs only scan live
+/// `agent_sessions` (empty at boot), so nothing else would ever clear it. This
+/// is the floor that would have caught thread-72120ca6: it stayed `running`
+/// across the restart because the skip paths in `recover_orphaned_worktrees`
+/// (`continue` on already-has-pending-change / no-in-flight-signal / duplicate /
+/// no-originating-thread) drop a worktree WITHOUT settling the projection.
+///
+/// Scoped to coding-agent threads on purpose: chat orphans are settled by
+/// `recover_orphaned_threads`, and a chat thread blocked on a child legitimately
+/// sits `running` pending parent-resume — settling it here would break that. A
+/// coding-agent thread, by contrast, exits its subprocess at every turn
+/// boundary, so at boot a `running` one has no live session.
+/// `settle_stuck_running_thread` re-checks `running` per thread (idempotent), so
+/// a thread settled by another path in the meantime is a no-op.
+pub(crate) async fn settle_orphaned_running_coding_agent_threads(
+    pool: &sqlx::PgPool,
+    bus: &crate::engine::event_bus::EventBus,
+    recovering: &std::collections::HashSet<Uuid>,
+) {
+    let running: Vec<Uuid> = match sqlx::query_scalar::<_, Uuid>(
+        "SELECT thread_id FROM thread_summaries \
+         WHERE is_coding_agent = true AND status = 'running'",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            log!("[Recovery] orphaned-running settle sweep query failed: {}", e);
+            return;
+        }
+    };
+    for tid in running {
+        if recovering.contains(&tid) {
+            continue;
+        }
+        match crate::engine::claude_code::settle_stuck_running_thread(
+            pool,
+            bus,
+            tid,
+            Some(MessageOrigin::system()),
+        )
+        .await
+        {
+            Ok(true) => log!(
+                "[Recovery] Settled orphaned `running` coding-agent thread {} — no live session after restart and not picked up by recovery",
+                tid
+            ),
+            Ok(false) => {}
+            Err(e) => log!(
+                "[Recovery] Failed to settle orphaned running thread {}: {}",
+                tid,
+                e
+            ),
+        }
     }
 }

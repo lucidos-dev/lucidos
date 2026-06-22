@@ -155,6 +155,17 @@ impl InstalledRecord {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
     }
+    /// The installed version's raw manifest `setup` instructions (the nested
+    /// `manifest/manifest/setup`, i.e. as the author wrote them — one level
+    /// below the payload map that holds `setup_thread_id`). Read at confirm
+    /// time to decide whether an update introduces *new* setup work or just
+    /// re-runs identical instructions. `None` when the installed version
+    /// shipped no `setup` field.
+    pub(crate) fn setup(&self) -> Option<&str> {
+        self.payload
+            .pointer("/data/manifest/manifest/setup")
+            .and_then(|v| v.as_str())
+    }
 }
 
 /// The app a plugin's "Open" button should launch: the first `apps/<app-id>/`
@@ -351,6 +362,35 @@ pub(crate) async fn find_plugin_owning_file(
     for (id, payload) in project_installs(pool).await? {
         let rec = InstalledRecord { payload };
         if rec.files().iter().any(|f| f == data_relative) {
+            let plugin_name = rec.name().unwrap_or(&id).to_string();
+            return Ok(Some(PluginOwner {
+                plugin_id: id,
+                plugin_name,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Find the currently-installed plugin (if any) that installed the app
+/// `app_id` — i.e. recorded any `apps/<app_id>/...` path in its
+/// `PluginInstalled.files` list. The app-deletion mirror of
+/// [`find_plugin_owning_file`]: the HTTP `delete_app` handler calls this to
+/// refuse a raw delete of a plugin-installed app and route the user to the
+/// plugin uninstall confirm panel — the single removal authority — instead of
+/// `rm -rf`-ing the app dir and orphaning the plugin record. Standalone apps
+/// (no `PluginInstalled` record) resolve to `None` and delete as before.
+pub(crate) async fn find_plugin_owning_app(
+    pool: &sqlx::PgPool,
+    app_id: &str,
+) -> Result<Option<PluginOwner>, Box<dyn std::error::Error + Send + Sync>> {
+    if app_id.is_empty() {
+        return Ok(None);
+    }
+    let prefix = format!("apps/{}/", app_id);
+    for (id, payload) in project_installs(pool).await? {
+        let rec = InstalledRecord { payload };
+        if rec.files().iter().any(|f| f.starts_with(&prefix)) {
             let plugin_name = rec.name().unwrap_or(&id).to_string();
             return Ok(Some(PluginOwner {
                 plugin_id: id,

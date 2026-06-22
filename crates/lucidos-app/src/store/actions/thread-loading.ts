@@ -7,7 +7,7 @@ import { fetchThreads, fetchThreadEvents, fetchOlderThreads, fetchFilterFacets, 
 import type { ThreadSummary, ThreadEventRow } from '../../api/threads';
 import { isTransportError } from '../../api/client';
 import { toFailed } from '../types';
-import { errorDetail } from '../../utils/errorDetail';
+import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { postClientLog } from '../../utils/liveness';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
 import { pendingComposePuts, composeEditedAt } from './compose';
@@ -525,7 +525,7 @@ export async function refreshThreadEvents(threadId: string): Promise<void> {
     // thread) re-syncs via handleThreadEvent, or the next resync cycle (engine
     // wake-up, SSE reconnect) refreshes successfully once the connection has
     // settled. Genuine errors (5xx, parse, TimeoutError) still toast.
-    if ((err instanceof DOMException && err.name === 'AbortError') || isTransportError(err)) {
+    if (isAbortError(err) || isTransportError(err)) {
       console.warn(`[ThreadLoading] refresh failed transiently for ${threadId} (iOS PWA wake / engine restart); SSE will recover`, err);
       return;
     }

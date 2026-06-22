@@ -420,35 +420,25 @@
         display: flex;
         align-items: center;
         flex-shrink: 0;
-        /* Same two-button + inner-gap footprint as .altview-slot (2 × 1.75rem +
-           0.25rem = 3.75rem) so the thread header's nav slot lines up with the
-           threads header's needs-attention/drafts slot — the two "secondary"
-           control clusters then reserve identical width. Without the gap the nav
-           slot is only 3.5rem and the "Threads" title sits 4px to the right. */
         gap: 0.25rem;
     }
 
-    /* The threads header leads with a filter button before its altview-slot; the
-       thread (brand) header now leads with the hamburger menu (same 1.75rem
-       header icon + 0.25rem row gap = 2rem leading slot), so the nav slot aligns
-       with the altview-slot and the "Lucidos" brand starts at the same x as
-       "Threads" — no padding stand-in needed. The content header leads with the
-       same hamburger, keeping all three mobile headers in lockstep. */
+    /* Cross-header title alignment: the thread (brand) and content headers lead
+       with a hamburger + nav slot before their title; the threads header leads
+       with the single Filter button. Reserve a fixed leading width on the Filter
+       button's slot so the "Threads" title starts at the same x as "Lucidos" /
+       the content title (the three mobile headers stack as you swipe, so their
+       titles must line up). The lone Filter button packs to the left edge; the
+       reserved width parks the freed space toward the title. */
+    .mobile-threads-header .view-selector-slot {
+        width: 5.75rem;
+    }
 
     .mobile-nav-slot .content-back-btn,
     .mobile-nav-slot .content-forward-btn,
     .mobile-nav-slot .thread-nav-btn {
         width: 1.375rem;
         height: 1.75rem;
-    }
-
-    /* Reserve the two 1.75rem header icons + their inner gap. Hidden toggles
-       collapse via the shared `.altview-hidden { display: none }` rule in
-       shell.css, so a single visible toggle packs to the first slot (right of
-       the filter) and this reserved width parks the freed space toward the
-       title, keeping it put regardless of how many toggles show. */
-    .mobile-threads-header .altview-slot {
-        width: 3.75rem;
     }
 
     .mobile-content-title {

@@ -45,10 +45,20 @@ pub(super) const EXTERNAL_WATCHDOG_TICK_SECS: u64 = 30;
 /// Outcome of one external-watchdog evaluation for a single session.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ExternalWatchdogDecision {
-    /// Session is healthy, already exited, or otherwise should not be touched.
+    /// Session is healthy, exited-and-still-being-cleaned-up, or otherwise
+    /// should not be touched.
     Skip,
-    /// Session is stuck — drop from `agent_sessions` and emit `ContinuationRequested`.
+    /// Session is stuck mid-turn with no tool in flight — drop from
+    /// `agent_sessions` and emit `ContinuationRequested` unconditionally.
     Resume,
+    /// Recover ONLY after a projection re-check confirms the thread is still
+    /// `running`. Covers two cases the pure gate can't fully judge:
+    ///   - hung tool past the ceiling (`tools_in_flight > 0`) — could be a
+    ///     genuine hang OR a pending question/permission card the user hasn't
+    ///     answered (`waiting_for_user_answer`); only the former is recoverable.
+    ///   - process exited but the session is still stale past the limit — the
+    ///     in-loop cleanup is wedged / never settled the projection.
+    ResumeIfRunning,
 }
 
 pub(super) struct ExternalWatchdogInput {
@@ -58,27 +68,38 @@ pub(super) struct ExternalWatchdogInput {
     pub process_exited: bool,
     pub now_ms: i64,
     pub limit_ms: i64,
+    pub ceiling_ms: i64,
 }
 
-/// Pure decision. Skip already-exited sessions (the in-loop has handled or is
-/// handling them — re-firing would race the cleanup). Otherwise reuse
-/// `watchdog_gate`: `Fire` → `Resume`, everything else → `Skip`. Keeping the
-/// gate shared with the in-loop guarantees the two watchdogs agree on what
+/// Pure decision. For an exited session the in-loop normally owns cleanup, so
+/// skip — UNLESS it is still stale past the limit, which means the in-loop
+/// cleanup is wedged / never ran (`ResumeIfRunning`, gated on a still-running
+/// re-check at the call site). Otherwise reuse `watchdog_gate`: `Fire` →
+/// `Resume`, `FirePastCeiling` → `ResumeIfRunning`, everything else → `Skip`.
+/// Sharing the gate with the in-loop guarantees the two watchdogs agree on what
 /// "stuck" means; only the timeout differs.
 pub(super) fn external_watchdog_decision(
     input: ExternalWatchdogInput,
 ) -> ExternalWatchdogDecision {
     if input.process_exited {
-        return ExternalWatchdogDecision::Skip;
+        let stale = input.last_event_at_ms > 0
+            && input.now_ms.saturating_sub(input.last_event_at_ms) > input.limit_ms;
+        return if stale {
+            ExternalWatchdogDecision::ResumeIfRunning
+        } else {
+            ExternalWatchdogDecision::Skip
+        };
     }
     match watchdog_gate(
         input.is_waiting,
         input.last_event_at_ms,
         input.now_ms,
         input.limit_ms,
+        input.ceiling_ms,
         input.tools_in_flight,
     ) {
         WatchdogGate::Fire => ExternalWatchdogDecision::Resume,
+        WatchdogGate::FirePastCeiling(_) => ExternalWatchdogDecision::ResumeIfRunning,
         _ => ExternalWatchdogDecision::Skip,
     }
 }
@@ -88,19 +109,29 @@ pub(super) fn external_watchdog_decision(
 pub(crate) struct ExternalWatchdog {
     agent_sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
     event_bus: Arc<EventBus>,
+    /// Used by the `ResumeIfRunning` re-check (`thread_is_running`) so a hung
+    /// tool past the ceiling, or an exited-but-wedged session, is only recovered
+    /// when the projection still shows `running` (not `waiting_for_user_answer`,
+    /// not already settled).
+    pool: sqlx::PgPool,
     limit_ms: i64,
+    ceiling_ms: i64,
 }
 
 impl ExternalWatchdog {
     pub(crate) fn new(
         agent_sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
         event_bus: Arc<EventBus>,
+        pool: sqlx::PgPool,
         limit_ms: i64,
+        ceiling_ms: i64,
     ) -> Self {
         Self {
             agent_sessions,
             event_bus,
+            pool,
             limit_ms,
+            ceiling_ms,
         }
     }
 
@@ -135,7 +166,7 @@ impl ExternalWatchdog {
         // lock, then emit OUTSIDE the lock. Holding the mutex across the
         // `event_bus.emit` await would block every `agent_session` insert
         // for the duration of a DB write.
-        let stuck: Vec<StuckSession> = {
+        let mut candidates: Vec<StuckSession> = {
             let sessions = self.agent_sessions.lock().await;
             sessions
                 .iter()
@@ -153,19 +184,51 @@ impl ExternalWatchdog {
                         process_exited: s.process_exited,
                         now_ms,
                         limit_ms: self.limit_ms,
+                        ceiling_ms: self.ceiling_ms,
                     });
-                    match decision {
-                        ExternalWatchdogDecision::Resume => Some(StuckSession {
-                            thread_id: *tid,
-                            elapsed_ms: now_ms.saturating_sub(last_ms),
-                            external_terminal: s.external_terminal_emitted.clone(),
-                            idle_notify: s.idle_notify.clone(),
-                        }),
-                        ExternalWatchdogDecision::Skip => None,
-                    }
+                    let needs_running_check = match decision {
+                        ExternalWatchdogDecision::Resume => false,
+                        ExternalWatchdogDecision::ResumeIfRunning => true,
+                        ExternalWatchdogDecision::Skip => return None,
+                    };
+                    Some(StuckSession {
+                        thread_id: *tid,
+                        elapsed_ms: now_ms.saturating_sub(last_ms),
+                        external_terminal: s.external_terminal_emitted.clone(),
+                        idle_notify: s.idle_notify.clone(),
+                        needs_running_check,
+                    })
                 })
                 .collect()
         };
+
+        // `ResumeIfRunning` candidates (hung tool past ceiling, or exited-but-
+        // wedged) recover ONLY if the projection still shows `running` — a
+        // pending question/permission card (`waiting_for_user_answer`) or an
+        // already-settled thread must not be euthanized. The DB read is rare
+        // (only at the ceiling / for an exited stale session) and runs outside
+        // the `agent_sessions` lock.
+        if candidates.iter().any(|c| c.needs_running_check) {
+            let mut keep: Vec<StuckSession> = Vec::with_capacity(candidates.len());
+            for c in candidates.into_iter() {
+                if c.needs_running_check {
+                    let still_running =
+                        crate::engine::claude_code::thread_is_running(&self.pool, c.thread_id)
+                            .await
+                            .unwrap_or(false);
+                    if !still_running {
+                        log!(
+                            "[ExternalWatchdog] thread={} past ceiling / exited-stale but no longer `running` (awaiting user answer / already settled) — not recovering",
+                            c.thread_id,
+                        );
+                        continue;
+                    }
+                }
+                keep.push(c);
+            }
+            candidates = keep;
+        }
+        let stuck = candidates;
 
         if stuck.is_empty() {
             return;
@@ -214,6 +277,9 @@ struct StuckSession {
     elapsed_ms: i64,
     external_terminal: Arc<std::sync::atomic::AtomicBool>,
     idle_notify: Arc<tokio::sync::Notify>,
+    /// `true` for `ResumeIfRunning` candidates — recover only after a
+    /// `thread_is_running` re-check. `false` for unconditional `Resume`.
+    needs_running_check: bool,
 }
 
 #[cfg(test)]
@@ -230,6 +296,11 @@ mod tests {
     /// small.
     const NOW: i64 = 2_000_000_000_000;
 
+    /// Hung-tool ceiling for these decision tests. Larger than
+    /// `EXTERNAL_WATCHDOG_LIMIT_MS` so "stale past the limit" (12 min) and
+    /// "stale past the ceiling" (45 min) are distinct regimes.
+    const CEILING: i64 = 45 * 60 * 1000;
+
     fn input(
         now: i64,
         last: i64,
@@ -244,16 +315,35 @@ mod tests {
             process_exited: exited,
             now_ms: now,
             limit_ms: EXTERNAL_WATCHDOG_LIMIT_MS,
+            ceiling_ms: CEILING,
         }
     }
 
-    /// process_exited=true means the in-loop cleanup is in flight (or done).
-    /// External tick must not double-emit a ContinuationRequested — the spawn
-    /// dispatcher would create two competing sessions.
+    /// Phase B: an exited session whose projection is still stale past the
+    /// limit means the in-loop cleanup is wedged / never settled — recover it
+    /// (after a `thread_is_running` re-check at the call site). `ResumeIfRunning`
+    /// (not `Resume`) so an already-settled thread isn't double-terminated.
     #[test]
-    fn exited_session_is_skipped_even_when_stale() {
+    fn exited_session_stale_resumes_if_running() {
         let stale = NOW - 15 * 60 * 1000;
         let out = external_watchdog_decision(input(NOW, stale, false, 0, true));
+        assert_eq!(out, ExternalWatchdogDecision::ResumeIfRunning);
+    }
+
+    /// An exited session that is NOT yet stale is left to the in-loop cleanup —
+    /// recovering here would race it (the original `process_exited` skip).
+    #[test]
+    fn exited_session_fresh_is_skipped() {
+        let fresh = NOW - 60 * 1000;
+        let out = external_watchdog_decision(input(NOW, fresh, false, 0, true));
+        assert_eq!(out, ExternalWatchdogDecision::Skip);
+    }
+
+    /// An exited session with an uninitialized heartbeat (last=0) is not stale
+    /// (defensive) — skip, don't recover on a 0 read.
+    #[test]
+    fn exited_session_zero_heartbeat_is_skipped() {
+        let out = external_watchdog_decision(input(NOW, 0, false, 0, true));
         assert_eq!(out, ExternalWatchdogDecision::Skip);
     }
 
@@ -319,6 +409,25 @@ mod tests {
     #[test]
     fn zero_last_event_skips() {
         let out = external_watchdog_decision(input(NOW, 0, false, 0, false));
+        assert_eq!(out, ExternalWatchdogDecision::Skip);
+    }
+
+    /// Phase A (the root-cause fix): a tool in flight past the hung-tool ceiling
+    /// no longer skips forever — `ResumeIfRunning` so the tick recovers it after
+    /// confirming the thread is still `running` (not a pending user card).
+    #[test]
+    fn tools_in_flight_past_ceiling_resumes_if_running() {
+        let past_ceiling = NOW - CEILING - 1;
+        let out = external_watchdog_decision(input(NOW, past_ceiling, false, 3, false));
+        assert_eq!(out, ExternalWatchdogDecision::ResumeIfRunning);
+    }
+
+    /// Within the ceiling, tools in flight remain a legitimate skip even though
+    /// past the 12-min limit (this is the prior `tools_in_flight_skips` regime).
+    #[test]
+    fn tools_in_flight_within_ceiling_skips() {
+        let within_ceiling = NOW - CEILING + 60 * 1000; // 1 min shy of ceiling
+        let out = external_watchdog_decision(input(NOW, within_ceiling, false, 3, false));
         assert_eq!(out, ExternalWatchdogDecision::Skip);
     }
 }

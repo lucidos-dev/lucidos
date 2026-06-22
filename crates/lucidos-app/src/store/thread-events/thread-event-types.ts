@@ -65,14 +65,12 @@ export type MessageOrigin =
    *  engine-deliberate actions (hardening retrigger, scheduler, merge conflict). */
   | { kind: 'system' };
 
-/** Display label for engine-deliberate work (hardening, merging, scheduler). */
+/** Display label for engine-deliberate work (hardening, merging, scheduler).
+ *  Its actor-chip icon is the Lucidos brand mark — the SAME glyph as the
+ *  *Lucidos Agent* — resolved in the view layer (`<LucidosGlyph/>` in
+ *  `ChatExchange.tsx`), so this store module stays free of UI components. The
+ *  label is what distinguishes the two Lucidos actors at a glance. */
 export const ENGINE_LABEL = 'Lucidos Engine';
-
-/** Icon paired with `ENGINE_LABEL` — a hexagon ("system module"), deliberately
- *  NOT the ⚙ gear, which reads as Settings. Kept distinct from `SYSTEM_ICON`
- *  (the gear) so engine-deliberate work and host-killed processes are
- *  distinguishable at a glance. */
-export const ENGINE_ICON = '⬡';
 
 /** Display label for process killed by the host system (engine shutdown,
  *  safety-net catch, OS signal). Distinct from `ENGINE_LABEL`: the engine
@@ -80,8 +78,8 @@ export const ENGINE_ICON = '⬡';
 export const SYSTEM_LABEL = 'System';
 
 /** Icon paired with `SYSTEM_LABEL` — the ⚙ gear, reserved for the host system
- *  killing a process (shutdown, OS signal, crash). Distinct from `ENGINE_ICON`
- *  (the hexagon) used for engine-deliberate work. */
+ *  killing a process (shutdown, OS signal, crash). Distinct from the Lucidos
+ *  brand mark used for engine-deliberate work. */
 export const SYSTEM_ICON = '⚙';
 
 /** Display label for work kicked off by a Lucidos LLM agent in another thread
@@ -119,10 +117,13 @@ export function originMode(origin: MessageOrigin | undefined): ActorMode {
 
 /** Mirrors Rust's `CancelCause` (snake_case). User-driven termination of a
  *  *real* in-flight response — `EventMeta.actor` identifies the user, this
- *  enum identifies what they did. `unknown` covers legacy DB rows persisted
- *  before the field existed and any retired cause string (e.g. `stale_settle`,
- *  which moved to `AbortCause`). */
-export type CancelCause = 'user_stop' | 'user_action' | 'unknown';
+ *  enum identifies what they did. `superseded_by_followup` is the Codex
+ *  mid-turn follow-up redirect: the user steered (didn't Stop), so it renders
+ *  neutrally — like the chat/CC follow-up — instead of "Canceled ✕" (see
+ *  `exchangeStatus` and `exchange-grouping`). `unknown` covers legacy DB rows
+ *  persisted before the field existed and any retired cause string (e.g.
+ *  `stale_settle`, which moved to `AbortCause`). */
+export type CancelCause = 'user_stop' | 'user_action' | 'superseded_by_followup' | 'unknown';
 
 /** Mirrors Rust's `AbortCause` (snake_case). System-driven cleanup — the
  *  engine or OS terminated the process, or the engine settled a projection
@@ -305,6 +306,10 @@ export type ThreadEvent =
   // Carries the inspected `command` text instead of CC's structured tool `input`.
   | { type: 'CommandPermissionRequested'; request_id: string; tool_use_id: string; tool_name: string; command: string; summary: string }
   | { type: 'CommandPermissionResolved'; request_id: string; allowed: boolean; reason?: string; persist_scope?: PersistScope; actor?: MessageOrigin }
+  // Chat MCP permission card — the chat mirror of the command-guard pair for MCP
+  // server tool calls. Carries the MCP server + tool identity and an args summary.
+  | { type: 'McpPermissionRequested'; request_id: string; tool_use_id: string; server_id: string; server_name: string; tool_name: string; arguments_summary: string }
+  | { type: 'McpPermissionResolved'; request_id: string; allowed: boolean; reason?: string; persist_scope?: PersistScope; actor?: MessageOrigin }
   // Command guard checkpoint/undo (ADR 0002, Phase 4) — a ReversibleDanger
   // command was snapshotted before running; the user can one-click Undo.
   | { type: 'CommandCheckpointed'; checkpoint_id: string; command: string; summary: string }
@@ -402,6 +407,8 @@ const THREAD_EVENT_TYPE_FLAGS = {
   CodingAgentPermissionResolved: true,
   CommandPermissionRequested: true,
   CommandPermissionResolved: true,
+  McpPermissionRequested: true,
+  McpPermissionResolved: true,
   CommandCheckpointed: true,
   CommandCheckpointReverted: true,
   ChildThreadCompleted: true,
@@ -475,7 +482,6 @@ export type TransientEvent =
   | { type: 'PluginUninstallRequested'; payload: string }
   | { type: 'EmailConfirmRequested'; payload: string }
   | { type: 'PushNotificationRequested' }
-  | { type: 'McpConsentPromptRequested'; payload: string }
   | { type: 'FileRefreshRequested'; path: string }
   | { type: 'AppUiRefreshRequested'; app_id: string }
   | { type: 'AppUiCaptureRequested'; app_id: string; request_id: string }

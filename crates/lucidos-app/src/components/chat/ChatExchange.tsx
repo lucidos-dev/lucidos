@@ -5,8 +5,8 @@ import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import type { Exchange, ThreadEvent, MessageOrigin } from '../../store/thread-events';
-import { ENGINE_LABEL, ENGINE_ICON, SYSTEM_ICON, SYSTEM_LABEL, API_CALLER_ICON, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, isEmptyContinuedExchange, isCanceledQuestionDivider, changePanelHasContinuation, findCommandPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
-import { LucidosAgentGlyph } from '../shared/LucidosMark';
+import { ENGINE_LABEL, SYSTEM_ICON, SYSTEM_LABEL, API_CALLER_ICON, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, isEmptyContinuedExchange, isCanceledQuestionDivider, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, openImagePopupFromGroup, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { removeQueuedMessage } from '../../store/actions/chat';
 import { preserveOnToggle } from './scrollState';
@@ -14,9 +14,9 @@ import { openFilePreview } from '../../store/actions/artifacts';
 import { openApp } from '../../store/actions/apps';
 import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
-import { CommandPermissionBody, PermissionBody } from './PermissionCard';
+import { CommandPermissionBody, McpPermissionBody, PermissionBody } from './PermissionCard';
 import { ChildCompletionCard } from './ChildCompletionCard';
-import { getEventToggleState, getCollapsedVisibleEvents, splitEventSections } from '../../store/event-rendering';
+import { getEventToggleState, getCollapsedVisibleEvents, splitEventSections, hasVisibleLiveStep } from '../../store/event-rendering';
 import { statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated } from '../../store/exchange-status';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
@@ -270,6 +270,13 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     return { visibleEvents: visible, collapsedFallbackText: fallback };
   }, [hasEvents, showDetails, showMoreToggle, events, responseHtmlCombined]);
 
+  // Exactly one running-text shimmer at a time: if an in-progress step is
+  // visible on screen, its own shimmer is the "live" affordance, so the
+  // "Working" status label below drops to a plain, static label. Otherwise —
+  // steps hidden, this exchange collapsed (steps body hidden), or expanded with
+  // no pending step — the label shimmers as the sole affordance.
+  const liveStepOnScreen = hasVisibleLiveStep(showSteps, isCollapsed, visibleEvents);
+
   // Memoize linkified HTML — linkifyPaths builds 15+ regex batches per call when
   // the workspace has many artifacts. Without memoization, every re-render of
   // this exchange (signal fire from threadMap/artifacts/appsList during SSE
@@ -407,9 +414,13 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
           hasBody={hasResponse || hasEvents}
           status={showStatus && shouldShowResponseStatusBadge(exchange.userEvent.type, statusClass) ? (
             <span class={`exchange-status-label exchange-status-${statusClass}`}>
-              {statusLabelText}
+              {/* The active status label — Working / Requesting / Canceling —
+                  shimmers as the AI running-text affordance, which replaces the
+                  spinner (no mini-spinner in the 'working' state). Suppressed
+                  when a live step is already shimmering on screen, so only one
+                  running-text affordance moves at a time (see liveStepOnScreen). */}
+              <span class={statusClass === 'working' && !liveStepOnScreen ? 'running-shimmer' : undefined}>{statusLabelText}</span>
               {statusClass === 'queued' && <span class="exchange-status-queued">{'○'}</span>}
-              {statusClass === 'working' && <span class="mini-spinner" aria-hidden="true" />}
               {statusClass === 'waiting' && <span class="progress-dot progress-dot-waiting" />}
               {statusClass === 'done' && status !== 'interrupted' && <span class="exchange-status-check">{'✓'}</span>}
               {status === 'interrupted' && <span class="exchange-status-continued">{'↳'}</span>}
@@ -610,8 +621,9 @@ function actorVariant(actor: Parameters<typeof actorInitiator>[0]): InitiatorVar
  *  decided this" with one of the closed set of known actors: **You** (a real
  *  browser device), **Lucidos Agent** (LLM acting on behalf of the user —
  *  rendered as the Lucidos mark), **Lucidos Engine** (deterministic engine
- *  work), **System** (host killed the process), or **API caller** (external
- *  HTTP caller that did NOT self-identify as one of the above).
+ *  work — rendered as the SAME Lucidos mark; the label is what tells it apart
+ *  from the agent), **System** (host killed the process), or **API caller**
+ *  (external HTTP caller that did NOT self-identify as one of the above).
  *
  *  "You" is reserved for `kind: device` — a browser session bound to a known
  *  device row. Any other human-mode origin (anonymous API client, cross-workspace
@@ -619,16 +631,16 @@ function actorVariant(actor: Parameters<typeof actorInitiator>[0]): InitiatorVar
  *  impersonate the user in the timeline. The popover still discloses the
  *  origin kind, user-agent, and workspace name underneath.
  *
- *  Lives in the view layer (not the store) because the agent icon is a brand
- *  component (`<LucidosAgentGlyph/>`), matching how `describeExecutor` resolves
- *  the same glyph — the store model stays free of UI components. */
+ *  Lives in the view layer (not the store) because both Lucidos actor icons are
+ *  a brand component (`<LucidosGlyph/>`), matching how `describeExecutor`
+ *  resolves the same glyph — the store model stays free of UI components. */
 export function actorInitiator(actor: MessageOrigin | undefined): { icon: ComponentChildren; label: string } {
   if (actor?.kind === 'system') return { icon: SYSTEM_ICON, label: SYSTEM_LABEL };
   if (actor?.kind === 'device') return { icon: '\u{1F464}', label: 'You' };
   switch (originMode(actor)) {
     case 'human':  return { icon: API_CALLER_ICON, label: API_CALLER_LABEL };
-    case 'agent':  return { icon: <LucidosAgentGlyph />, label: LUCIDOS_AGENT_LABEL };
-    case 'engine': return { icon: ENGINE_ICON, label: ENGINE_LABEL };
+    case 'agent':  return { icon: <LucidosGlyph />, label: LUCIDOS_AGENT_LABEL };
+    case 'engine': return { icon: <LucidosGlyph />, label: ENGINE_LABEL };
   }
 }
 
@@ -640,11 +652,11 @@ function youInitiator(rest: Partial<InitiatorDescriptor> = {}): InitiatorDescrip
   return { variant: 'user', icon: '\u{1F464}', label: 'You', ...rest };
 }
 
-/** Build a `'system'`-variant descriptor with the engine chip (⬡ + Lucidos
- *  Engine). Shared by every arm where the engine narrates its own action
+/** Build a `'system'`-variant descriptor with the engine chip (Lucidos mark +
+ *  Lucidos Engine). Shared by every arm where the engine narrates its own action
  *  (hardening / merge-conflict detection, legacy bare CC prompt). */
 function engineInitiator(summary: string, details?: ComponentChildren): InitiatorDescriptor {
-  return { variant: 'system', icon: ENGINE_ICON, label: ENGINE_LABEL, summary, details };
+  return { variant: 'system', icon: <LucidosGlyph />, label: ENGINE_LABEL, summary, details };
 }
 
 /** Build a descriptor in the "Response canceled" style: no icon, the action
@@ -700,7 +712,7 @@ export function describeInitiator(
       // ContinuationStarted carries an actor (device when triggered by Continue,
       // engine if auto-resume returns). A device-driven continue is a user
       // action → render it in the iconless ResponseCanceled style (action AS the
-      // label); engine auto-resume keeps the ⬡ chip.
+      // label); engine auto-resume keeps the Lucidos-mark chip.
       if (ev.actor?.kind === 'device') {
         return actionInitiator(summary, <ResumeNoteBody exchange={exchange} />);
       }
@@ -714,7 +726,7 @@ export function describeInitiator(
       // Exchange boundary — let the actor drive the chip (engine for crashes,
       // device for restarts and user-triggered stale-settle cleanups). A
       // device-driven abort (you hit Restart) renders iconless like a cancel;
-      // engine/system aborts keep their ⬡/⚙ chip.
+      // engine/system aborts keep their Lucidos-mark/⚙ chip.
       if (ev.actor?.kind === 'device') {
         return actionInitiator(summary);
       }
@@ -786,13 +798,14 @@ export function describeInitiator(
     case 'ChildThreadCompleted':
       // The EventBus fan-in path raises this on the parent when a child thread
       // reaches a terminal event — deterministic engine plumbing, not LLM work
-      // — so attribute it to the engine (⬡ Lucidos Engine), consistent with
-      // every other engine-injected event (trigger fired, hardening, merge).
-      // The child agent's authored summary lives in the card body; the chip is
-      // non-clickable because the title-link is the origin affordance.
+      // — so attribute it to the engine (Lucidos mark + Lucidos Engine),
+      // consistent with every other engine-injected event (trigger fired,
+      // hardening, merge). The child agent's authored summary lives in the card
+      // body; the chip is non-clickable because the title-link is the origin
+      // affordance.
       return {
         variant: 'system',
-        icon: ENGINE_ICON,
+        icon: <LucidosGlyph />,
         label: ENGINE_LABEL,
         actorClickable: false,
         details: (
@@ -887,6 +900,38 @@ export function describeInitiator(
               tool_name: ev.tool_name,
               command: ev.command,
               summary: ev.summary,
+            }}
+            resolved={resolved}
+            terminated={responseTerminated}
+          />
+        ),
+      };
+    }
+    case 'McpPermissionRequested': {
+      const resolvedStep = findMcpPermissionResolution(exchange, ev.request_id);
+      const resolved = resolvedStep
+        ? {
+            allowed: resolvedStep.allowed,
+            reason: resolvedStep.reason,
+            persist_scope: resolvedStep.persist_scope,
+          }
+        : undefined;
+      // The chat MCP permission lane only fires on chat threads → Lucidos Agent.
+      const agent = describeExecutor(false);
+      return {
+        variant: 'lucidos',
+        icon: agent.icon,
+        label: agent.label,
+        status: dividerStatus(!!resolvedStep, responseTerminated, 'Resolved'),
+        details: (
+          <McpPermissionBody
+            event={{
+              request_id: ev.request_id,
+              tool_use_id: ev.tool_use_id,
+              server_id: ev.server_id,
+              server_name: ev.server_name,
+              tool_name: ev.tool_name,
+              arguments_summary: ev.arguments_summary,
             }}
             resolved={resolved}
             terminated={responseTerminated}

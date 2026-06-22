@@ -23,6 +23,8 @@
  * `workspaceStorage.install.ts`, imported on the first line of `main.tsx`.
  */
 
+import { LAST_WORKSPACE_KEY } from './lastWorkspace';
+
 /** Prefix for every namespaced key: `ws:<workspaceId>:<originalKey>`. */
 const NAMESPACE_PREFIX = 'ws:';
 
@@ -37,6 +39,9 @@ const MIGRATION_MARKER = '__migrated';
  *     the same device.
  *   • service-worker / build keys — they track the checkout-shared `dist/` build,
  *     which is byte-identical across workspaces.
+ *   • `lucidos-last-workspace` — the last-active workspace slug, written from
+ *     inside a workspace and read by the picker; it spans workspaces by design,
+ *     so it must stay raw on both ends (see `lastWorkspace.ts`).
  */
 export const GLOBAL_KEYS: ReadonlySet<string> = new Set([
   'lucidos-device-id',
@@ -46,6 +51,7 @@ export const GLOBAL_KEYS: ReadonlySet<string> = new Set([
   'lucidos-animation-speed-slider',
   'lucidos-sw-update-dismissed',
   'lucidos-chunk-reload-at',
+  LAST_WORKSPACE_KEY,
 ]);
 
 /**
@@ -109,28 +115,58 @@ export function migrateUnprefixedKeys(storage: Storage, ws: string): void {
   storage.setItem(marker, '1');
 }
 
+/** Marks a `Storage` prototype as already wrapped, so a second install (HMR, or
+ *  `sessionStorage` sharing `Storage.prototype` with `localStorage`) is a no-op
+ *  instead of double-prefixing every key. */
+const INSTALLED = Symbol.for('lucidos.workspaceStorage.installed');
+
 /**
  * Install the per-workspace namespacing on `storage`. No-op when `ws` is null
  * (picker / legacy root / tests). Runs the one-time migration first, then
  * overrides `getItem`/`setItem`/`removeItem` to prefix non-global keys. Wrapped
  * in try/catch so a hostile storage environment degrades to raw behaviour rather
  * than breaking the app.
+ *
+ * The overrides MUST go on the PROTOTYPE (`Object.getPrototypeOf(storage)` —
+ * `Storage.prototype` for the real `localStorage`/`sessionStorage`), never the
+ * instance. A native `Storage` object implements WebIDL `[LegacyOverrideBuiltIns]`
+ * with a named-property setter, so BOTH `storage.getItem = fn` AND
+ * `Object.defineProperty(storage, 'getItem', …)` are intercepted by that setter
+ * and swallowed as `setItem('getItem', fn)` — the method is never replaced and
+ * the namespacing silently no-ops (the original instance-assignment version of
+ * this function did exactly that in every real browser, while passing the unit
+ * tests because their mock was a plain object). The prototype is an ordinary
+ * object where assignment works normally, and a `storage.getItem` lookup resolves
+ * to it because no stored item is ever named "getItem". Overriding the shared
+ * prototype also transparently covers `sessionStorage`.
  */
 export function installWorkspaceStorage(storage: Storage, ws: string | null): void {
   if (!ws) return; // picker, legacy direct-engine root, or unit tests — pass through
 
   try {
+    // Migrate using the current (still-raw) methods, before the override lands.
     migrateUnprefixedKeys(storage, ws);
 
-    const rawGet = storage.getItem.bind(storage);
-    const rawSet = storage.setItem.bind(storage);
-    const rawRemove = storage.removeItem.bind(storage);
+    const proto = Object.getPrototypeOf(storage) as Storage &
+      Partial<Record<typeof INSTALLED, boolean>>;
+    if (proto[INSTALLED]) return; // already wrapped (HMR / shared prototype)
+
+    const rawGet = proto.getItem;
+    const rawSet = proto.setItem;
+    const rawRemove = proto.removeItem;
     const mapKey = (key: string): string =>
       isGlobalKey(key) ? key : namespacedKey(key, ws);
 
-    storage.getItem = (key: string) => rawGet(mapKey(key));
-    storage.setItem = (key: string, value: string) => rawSet(mapKey(key), value);
-    storage.removeItem = (key: string) => rawRemove(mapKey(key));
+    proto.getItem = function (this: Storage, key: string) {
+      return rawGet.call(this, mapKey(key));
+    };
+    proto.setItem = function (this: Storage, key: string, value: string) {
+      return rawSet.call(this, mapKey(key), value);
+    };
+    proto.removeItem = function (this: Storage, key: string) {
+      return rawRemove.call(this, mapKey(key));
+    };
+    Object.defineProperty(proto, INSTALLED, { value: true, configurable: true });
   } catch (err) {
     // Runs at module-init with no UI to toast and no user intent — a hostile
     // localStorage (non-extensible / disabled) must degrade to raw storage so the

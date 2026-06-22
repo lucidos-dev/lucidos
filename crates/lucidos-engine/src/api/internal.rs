@@ -242,9 +242,11 @@ struct QueryHardenedResponse {
     state: &'static str,
 }
 
-/// Body for `POST /api/v1/internal/mark-planned`. `state` is `"planned"` or
-/// `"acknowledged_simple"`; `plan_path` accompanies the former, `reason` the
-/// latter (both optional and ignored for the other kind).
+/// Body for `POST /api/v1/internal/mark-planned`. `state` is `"proposed"` (a
+/// plan was written and awaits the user's approval — what the skill records),
+/// `"planned"` (legacy/approved), or `"acknowledged_simple"` (local fix);
+/// `plan_path` accompanies the plan states, `reason` the simple one (both
+/// optional and ignored for the other kind).
 #[derive(Deserialize)]
 pub(super) struct MarkPlannedRequest {
     pub repo_root: String,
@@ -299,15 +301,20 @@ pub(super) async fn mark_planned(
 
 /// GET /api/v1/internal/planned-state?repo_root=...&branch_name=... — invoked by
 /// `lucidos planned state` (printing) and the `cc-plan-gate` hook (deciding).
-/// Returns `{ state: "PRESENT" | "MISSING", kind: "planned" | "acknowledged_simple" | null }`.
+/// Returns `{ state: "SATISFIED" | "PROPOSED" | "MISSING", kind: "planned" |
+/// "acknowledged_simple" | "proposed" | null }`. The three-way `state` lets the
+/// hook distinguish an awaiting-approval `PROPOSED` marker (deny: "get approval,
+/// then run `planned approve`") from a `MISSING` one (deny: "run the skill").
 pub(super) async fn query_planned(
     State(state): State<AppState>,
     Query(q): Query<QueryHardenedQuery>,
 ) -> impl IntoResponse {
     use crate::engine::git_ops::PlanMarkerState;
     let repo_root = std::path::PathBuf::from(&q.repo_root);
-    let (label, kind) = match state.engine.plan_marker_state(&repo_root, &q.branch_name).await {
-        PlanMarkerState::Present(k) => ("PRESENT", Some(k.as_db())),
+    let marker = state.engine.plan_marker_state(&repo_root, &q.branch_name).await;
+    let (label, kind) = match marker {
+        PlanMarkerState::Present(k) if k.satisfies_gate() => ("SATISFIED", Some(k.as_db())),
+        PlanMarkerState::Present(k) => ("PROPOSED", Some(k.as_db())),
         PlanMarkerState::Missing => ("MISSING", None),
     };
     Json(QueryPlannedResponse { state: label, kind }).into_response()
@@ -317,6 +324,47 @@ pub(super) async fn query_planned(
 struct QueryPlannedResponse {
     state: &'static str,
     kind: Option<&'static str>,
+}
+
+/// Body for `POST /api/v1/internal/approve-plan`.
+#[derive(Deserialize)]
+pub(super) struct ApprovePlanRequest {
+    pub repo_root: String,
+    pub branch_name: String,
+}
+
+#[derive(Serialize)]
+struct ApprovePlanResponse {
+    /// Whether a `proposed` row was flipped to `planned`. `false` means there
+    /// was nothing to approve (no row, or it was already planned / simple).
+    approved: bool,
+}
+
+/// POST /api/v1/internal/approve-plan — invoked by `lucidos planned approve`
+/// after the user approves a proposed plan in chat. Flips the branch's marker
+/// from `proposed` to `planned` so the cc-plan-gate hook and the Apply floor
+/// pass. Idempotent: re-approving an already-`planned` (or `simple`) branch is a
+/// no-op that reports `approved: false`.
+pub(super) async fn approve_plan(
+    State(state): State<AppState>,
+    Json(body): Json<ApprovePlanRequest>,
+) -> impl IntoResponse {
+    let repo_root = std::path::PathBuf::from(&body.repo_root);
+    match state.engine.approve_plan(&repo_root, &body.branch_name).await {
+        Ok(approved) => Json(ApprovePlanResponse { approved }).into_response(),
+        Err(e) => {
+            crate::log!(
+                "[Internal] approve_plan failed for {}: {}",
+                body.branch_name,
+                e
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("approve_plan: {}", e),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// GET /api/v1/internal/hardened-state?repo_root=...&branch_name=... — invoked by
@@ -338,104 +386,6 @@ pub(super) async fn query_hardened(
         HardenMarkerState::Missing => "MISSING",
     };
     Json(QueryHardenedResponse { state: label }).into_response()
-}
-
-#[derive(Deserialize)]
-pub(super) struct CcEditPrereadQuery {
-    pub thread_id: String,
-    pub file_path: String,
-    /// Tool being checked — `"Edit"` or `"Write"`. Distinguishes the
-    /// deny-message wording and the diagnostic log so failures can be
-    /// attributed to the responsible matcher.
-    #[serde(default)]
-    pub tool: Option<String>,
-    /// Opaque CC-process identifier from the PreToolUse hook payload's
-    /// `session_id` field. Diagnostic-only: lets the log correlate
-    /// hook-allows-then-CC-rejects events with the CC process whose
-    /// in-memory read-tracking drifted.
-    #[serde(default)]
-    pub cc_session_id: Option<String>,
-}
-
-#[derive(Serialize)]
-struct CcEditPrereadResponse {
-    /// True iff this thread has a prior `CodingAgentToolCalled` for `Read`
-    /// or `Write` against `file_path`. The hook treats this as "CC's
-    /// internal Edit pre-read tracking will accept this Edit" and allows
-    /// the call through. False means the next Edit will be rejected by CC
-    /// — the hook then preempts that with a clearer deny.
-    has_recent_read: bool,
-}
-
-/// GET /api/v1/internal/cc-edit-preread?thread_id=<uuid>&file_path=<abs-path>
-///                                  &tool=<Edit|Write>&cc_session_id=<id>
-///
-/// Invoked by the lucidos-cli `cc-edit-preread` PreToolUse hook from inside
-/// a Claude Code subprocess every time CC's Edit or Write tool fires. The hook
-/// turns a `false` response into a `permissionDecision: "deny"` with an
-/// explicit "Read first, then retry" reason so the model is forced into
-/// the correct loop instead of bouncing off CC's internal `<tool_use_error>
-/// File has not been read yet</tool_use_error>` message.
-///
-/// Read state lives in the events table (every CC tool call is persisted
-/// as `CodingAgentToolCalled`), so the lookup survives engine restart and
-/// session resume — same boundary as CC's own session tracking. `Write`
-/// is included because CC accepts an Edit on a file it just Wrote.
-/// `Edit` itself is NOT included: a prior failed Edit would otherwise
-/// satisfy the check and bypass the loop the hook exists to break.
-pub(super) async fn cc_edit_preread_check(
-    State(state): State<AppState>,
-    Query(q): Query<CcEditPrereadQuery>,
-) -> impl IntoResponse {
-    let thread_id = match Uuid::parse_str(&q.thread_id) {
-        Ok(id) => id,
-        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid thread_id").into_response(),
-    };
-    let tool = q.tool.as_deref().unwrap_or("Edit");
-
-    let row: Result<Option<bool>, sqlx::Error> = sqlx::query_scalar(
-        "SELECT EXISTS( \
-             SELECT 1 FROM events \
-             WHERE thread_id = $1 \
-               AND event_type = 'CodingAgentToolCalled' \
-               AND payload->>'name' IN ('Read', 'Write') \
-               AND payload->'args'->>'file_path' = $2 \
-         )",
-    )
-    .bind(thread_id)
-    .bind(&q.file_path)
-    .fetch_optional(state.engine.pool())
-    .await;
-
-    let has_recent_read = match row {
-        Ok(Some(b)) => b,
-        Ok(None) => false,
-        Err(e) => {
-            crate::log!(
-                "[CcEditPreread] DB lookup failed for thread {} path {}: {} — falling back to allow to avoid blocking on engine error",
-                thread_id,
-                q.file_path,
-                e
-            );
-            // Fail open: don't turn a transient DB error into a hard deny
-            // for every Edit. CC's own internal check is still authoritative.
-            true
-        }
-    };
-
-    crate::log!(
-        "[CcEditPreread] check tool={} thread={} path={} cc_session={} has_recent_read={}",
-        tool,
-        thread_id,
-        q.file_path,
-        q.cc_session_id
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("<unset>"),
-        has_recent_read,
-    );
-
-    Json(CcEditPrereadResponse { has_recent_read }).into_response()
 }
 
 #[derive(Deserialize)]
@@ -711,10 +661,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/internal/hardened-state", get(query_hardened))
         .route("/internal/mark-planned", post(mark_planned))
         .route("/internal/planned-state", get(query_planned))
-        .route(
-            "/internal/cc-edit-preread",
-            get(cc_edit_preread_check),
-        )
+        .route("/internal/approve-plan", post(approve_plan))
         .route("/internal/client-log", post(client_log))
         .route(
             "/internal/seed-change-for-test",

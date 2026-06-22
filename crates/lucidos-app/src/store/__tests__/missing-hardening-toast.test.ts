@@ -112,4 +112,75 @@ describe('MissingHardeningDetected SSE toast', () => {
     const matches = toasts.value.filter(t => t.message.toLowerCase().includes('hardening required'));
     expect(matches).toHaveLength(1);
   });
+
+  it('transitions the banner to "applied" once the change applies after hardening', () => {
+    // The change applies automatically once hardening finishes, so a
+    // ChangeApplied for this thread is the "done" signal — the sticky warning
+    // must transition in place to a success "applied" toast, not keep claiming
+    // hardening is still pending.
+    const KEY = 'missing-hardening-thread-A';
+    seedThread('thread-A', 'Run /harden-project on Lucidos project');
+
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 1,
+      event: { type: 'MissingHardeningDetected' },
+      created: '2026-01-01T00:00:00Z',
+    });
+    expect(toasts.value.find(t => t.key === KEY)!.type).toBe('warning');
+
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 2,
+      event: { type: 'ChangeApplied', change_id: 'change-1' },
+      created: '2026-01-01T00:00:30Z',
+    });
+
+    const t = toasts.value.find(t => t.key === KEY);
+    expect(t).toBeTruthy();
+    expect(t!.message).toBe('Hardening applied for “Run /harden-project on Lucidos project”.');
+    expect(t!.type).toBe('success');
+    // The "hardening required" wording is gone — transitioned in place, not stacked.
+    expect(toasts.value.some(t => t.message.toLowerCase().includes('hardening required'))).toBe(false);
+  });
+
+  it('does not spawn a hardening toast on a plain apply with no pending hardening', () => {
+    // Guard: a normal Apply (no MissingHardeningDetected first) must not create a
+    // spurious "Hardening applied" toast — the transition only refreshes an
+    // existing banner.
+    seedThread('thread-A', 'Some Thread');
+
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 1,
+      event: { type: 'ChangeApplied', change_id: 'change-1' },
+      created: '2026-01-01T00:00:00Z',
+    });
+
+    expect(toasts.value.some(t => t.message.toLowerCase().includes('hardening'))).toBe(false);
+  });
+
+  it('dismisses the hardening banner when the change is discarded instead', () => {
+    // A discard is a terminal outcome carried by its own toast; the sticky
+    // "hardening required" warning must not linger claiming it's still pending.
+    const KEY = 'missing-hardening-thread-A';
+    seedThread('thread-A', 'Some Thread');
+
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 1,
+      event: { type: 'MissingHardeningDetected' },
+      created: '2026-01-01T00:00:00Z',
+    });
+    expect(toasts.value.some(t => t.key === KEY)).toBe(true);
+
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 2,
+      event: { type: 'ChangeDiscarded', change_id: 'change-1' },
+      created: '2026-01-01T00:00:30Z',
+    });
+
+    expect(toasts.value.some(t => t.key === KEY)).toBe(false);
+  });
 });

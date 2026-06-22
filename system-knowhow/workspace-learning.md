@@ -47,7 +47,7 @@ Friction signals to pull:
 | Signal | Event types |
 |---|---|
 | Tool failures | `ToolResult` payloads with errors; repeated `ToolCalled` to the same target without success. HTTP-tool failures surface here too — there is no dedicated HTTP event. |
-| Circuit-breaker trips | LLM force-broken on the same target ≥3 times in one thread (see `.claude/rules/frontend.md` § Circuit Breakers) |
+| Circuit-breaker trips | LLM warned (3 consecutive failures) or force-broken (5) on the same failing target in one thread — the generic breaker gates on repeated *failure*, not repeated call (see `.claude/rules/frontend.md` § Circuit Breakers) |
 | Failed responses | `ResponseFailed` payloads — model errors, timeouts, parsing failures. Group by error reason. |
 | Aborts / cancels | `ResponseAborted` (system) and `ResponseCanceled` (user) — both worth grouping. |
 | Trigger failures | `TriggerCompleted` payloads whose `result_summary` carries an error. Note: the engine guarantees a non-empty `result_summary` — a run that produced nothing falls back to `"<name> completed (no output)"` or `"<name> completed (exit <code>, no output)"`. Those deterministic no-op lines are an **expected** idle-detector outcome (broad subscription + cheap internal gate), **not** friction — do not flag them as "produced no useful output". |

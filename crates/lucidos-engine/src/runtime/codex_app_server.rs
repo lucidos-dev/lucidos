@@ -32,10 +32,10 @@ use tokio_util::sync::CancellationToken;
 use super::agent_runtime::{AgentEvent, AgentInput, AgentPermissionRequest, ControlRequest};
 use super::claude_code::format_exit_status;
 use super::codex::{
-    CONTINUATION_PROMPT, CodexConfig, lucidos_mcp_server_config_json, write_image_files,
+    lucidos_mcp_server_config_json, write_image_files, CodexConfig, CONTINUATION_PROMPT,
 };
 use super::codex_app_server_parse::{
-    AppServerLine, AppServerTracker, parse_app_server_line, parse_approval_request,
+    parse_app_server_line, parse_approval_request, AppServerLine, AppServerTracker,
 };
 
 /// How long the handshake (initialize → thread established) may take before
@@ -51,6 +51,15 @@ enum PendingRequest {
     Thread,
     TurnStart,
     TurnInterrupt,
+}
+
+enum DriverAction {
+    SendLine(String),
+    ApprovalResolved {
+        line: String,
+        item_id: String,
+        allowed: bool,
+    },
 }
 
 /// Serialize one outbound JSON-RPC frame as a newline-terminated string.
@@ -280,9 +289,9 @@ pub(super) async fn app_server_driver_task(
         });
     }
 
-    // Outbound write queue — approval-response tasks and the main loop share
-    // it so all stdin writes happen in one place.
-    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<String>();
+    // Driver action queue — approval-response tasks and the main loop share it
+    // so stdin writes and approval-state updates stay ordered in one place.
+    let (driver_action_tx, mut driver_action_rx) = mpsc::unbounded_channel::<DriverAction>();
     // Approval waiter tasks live in a JoinSet so driver wind-down ABORTS
     // them: aborting drops their `respond_rx`, which fires the engine
     // waiter's `respond.closed()` arm, which drops the broadcast receiver,
@@ -548,15 +557,33 @@ pub(super) async fn app_server_driver_task(
                                     &method,
                                     &params,
                                     &permission_tx,
-                                    &outbound_tx,
+                                    &driver_action_tx,
                                     &mut approval_tasks,
+                                    &mut tracker,
                                 );
                             }
                             AppServerLine::Other => {}
                 }
             }
-            Some(line) = outbound_rx.recv() => {
-                send_frame!(line);
+            Some(action) = driver_action_rx.recv() => {
+                match action {
+                    DriverAction::SendLine(line) => {
+                        send_frame!(line);
+                    }
+                    DriverAction::ApprovalResolved { line, item_id, allowed } => {
+                        send_frame!(line);
+                        let events = tracker.note_approval_resolved(&item_id, allowed);
+                        for ev in events {
+                            if events_tx.send(ev).is_err() {
+                                shutdown = true;
+                                break;
+                            }
+                        }
+                        if shutdown {
+                            break 'session;
+                        }
+                    }
+                }
             }
             input = input_rx.recv() => {
                 match input {
@@ -764,7 +791,7 @@ fn fail_session(
 /// Answer one server→client request. Approvals bridge to the engine's
 /// permission machinery via `permission_tx`; a per-request waiter task
 /// (spawned into the driver's JoinSet so wind-down aborts it) awaits the
-/// user's decision and queues the JSON-RPC response on `outbound_tx` so the
+/// user's decision and queues the JSON-RPC response on `driver_action_tx` so the
 /// driver loop never blocks on the user. Unknown methods get a JSON-RPC
 /// error immediately — leaving them unanswered would wedge codex.
 fn handle_server_request(
@@ -772,20 +799,23 @@ fn handle_server_request(
     method: &str,
     params: &serde_json::Value,
     permission_tx: &mpsc::UnboundedSender<AgentPermissionRequest>,
-    outbound_tx: &mpsc::UnboundedSender<String>,
+    driver_action_tx: &mpsc::UnboundedSender<DriverAction>,
     approval_tasks: &mut tokio::task::JoinSet<()>,
+    tracker: &mut AppServerTracker,
 ) {
     let Some(approval) = parse_approval_request(method, params) else {
         log!("[CodexAppServer] unsupported server request: {}", method);
-        let _ = outbound_tx.send(error_response_line(
+        let _ = driver_action_tx.send(DriverAction::SendLine(error_response_line(
             &id,
             -32601,
             &format!("Method not supported by Lucidos: {method}"),
-        ));
+        )));
         return;
     };
+    tracker.note_approval_request(&approval);
 
     let (respond_tx, respond_rx) = tokio::sync::oneshot::channel::<bool>();
+    let item_id = approval.item_id.clone();
     let forwarded = permission_tx.send(AgentPermissionRequest {
         id: approval.item_id,
         tool_name: approval.tool_name,
@@ -795,23 +825,25 @@ fn handle_server_request(
     if forwarded.is_err() {
         // Engine side gone (session loop ended) — decline so codex can wind
         // the item down instead of hanging.
-        let _ = outbound_tx.send(response_line(
-            &id,
-            serde_json::json!({ "decision": "decline" }),
-        ));
+        let _ = driver_action_tx.send(DriverAction::ApprovalResolved {
+            line: response_line(&id, serde_json::json!({ "decision": "decline" })),
+            item_id,
+            allowed: false,
+        });
         return;
     }
 
-    let outbound_tx = outbound_tx.clone();
+    let driver_action_tx = driver_action_tx.clone();
     approval_tasks.spawn(async move {
         // A dropped sender (engine loop ended without answering) reads as
         // deny — same default the engine's own broadcast path uses.
         let allowed = respond_rx.await.unwrap_or(false);
         let decision = if allowed { "accept" } else { "decline" };
-        let _ = outbound_tx.send(response_line(
-            &id,
-            serde_json::json!({ "decision": decision }),
-        ));
+        let _ = driver_action_tx.send(DriverAction::ApprovalResolved {
+            line: response_line(&id, serde_json::json!({ "decision": decision })),
+            item_id,
+            allowed,
+        });
     });
 }
 

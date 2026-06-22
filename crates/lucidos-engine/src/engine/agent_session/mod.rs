@@ -1,3 +1,4 @@
+mod applied_changes;
 mod apply_now;
 mod cc_spawn_coalesce;
 pub(crate) mod coding_agent_kind;
@@ -22,7 +23,10 @@ pub(crate) use coding_agent_kind::{
     classify_resolved_folder, resolve_folder_input, CodingAgentKind, FolderClassification,
 };
 
-pub(crate) use apply_now::probe_merge_conflicts;
+pub(crate) use apply_now::{probe_merge_conflicts, InPlaceMergeStart};
+// Engine construction passes the hung-tool ceiling to the external watchdog;
+// `lifecycle` is private, so re-export it here.
+pub(crate) use lifecycle::WATCHDOG_HUNG_TOOL_CEILING_MS;
 pub(crate) use external_edits::git_head_sha as external_edits_for_recovery_head_sha;
 pub(crate) use parsing::{parse_ask_user_question_inputs, question_text};
 pub(crate) use prompts::build_merge_prompt;

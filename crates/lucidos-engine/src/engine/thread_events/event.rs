@@ -805,8 +805,9 @@ pub enum ThreadEvent {
 
     /// CC requested permission for a tool call (e.g. Edit/Write/Bash on a path
     /// outside cwd or under `.claude/`). Renders as a `PermissionCard` in the
-    /// thread; the user's answer resolves the oneshot keyed by `request_id`
-    /// in `Engine.pending_mcp_consent`. Persisted so the card survives reload.
+    /// thread; the user's answer resolves the deduped entry keyed by
+    /// `request_id` in `Engine.pending_cc_permission`. Persisted so the card
+    /// survives reload.
     CodingAgentPermissionRequest {
         request_id: String,
         tool_use_id: String,
@@ -855,6 +856,42 @@ pub enum ThreadEvent {
     /// reproduces the answered card. `None` covers Allow-once, Deny, and the
     /// engine-emitted superseded/orphan resolutions.
     CommandPermissionResolved {
+        request_id: String,
+        allowed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persist_scope: Option<crate::engine::claude_code::AllowScope>,
+    },
+
+    /// The Lucidos Agent (chat) paused an MCP server tool call to ask the user
+    /// for permission — the chat counterpart of `CommandPermissionRequested` for
+    /// MCP tools. Renders the same `PermissionCard`; the agentic loop blocks
+    /// in-process on `Engine.pending_mcp_permission` until the user resolves it.
+    /// `server_id` is the MCP server registry key (stable, used to derive the
+    /// persisted `Mcp(server:tool)` / `Mcp(server:*)` grant pattern);
+    /// `server_name` is the human label shown on the card; `tool_name` is the
+    /// bare MCP tool; `arguments_summary` is the pretty-printed (truncated) args.
+    /// Persisted so the card survives reload. Replaces the legacy transient
+    /// `McpConsentPromptRequested` + `showConfirm` modal. Auto-approved silently
+    /// (no event) in non-interactive trigger threads and when the server's
+    /// `auto_approve` flag is set.
+    McpPermissionRequested {
+        request_id: String,
+        tool_use_id: String,
+        server_id: String,
+        server_name: String,
+        tool_name: String,
+        arguments_summary: String,
+    },
+    /// User resolved an `McpPermissionRequested` (or the engine resolved it as
+    /// superseded / orphaned). Chat counterpart of `CommandPermissionResolved`;
+    /// `persist_scope` records the "Always allow this tool" (`narrow` →
+    /// `Mcp(server:tool)`) / "Always allow this server" (`broad` →
+    /// `Mcp(server:*)`) / "Allow for this thread" (`session`) choice the user
+    /// picked so reload reproduces the answered card. `None` covers Allow-once,
+    /// Deny, and the engine-emitted superseded/orphan resolutions.
+    McpPermissionResolved {
         request_id: String,
         allowed: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -973,10 +1010,11 @@ pub enum ThreadEvent {
     #[serde(alias = "PreambleCompleting")]
     PreambleCompleted,
     // Request events — trigger frontend modals/actions. Past-tense framing
-    // (a request was made; the frontend chooses whether to act). The
-    // persisted siblings `CredentialRequested` / `McpConsentRequested` are
-    // distinct audit-log entries; these transient ones carry the JSON
-    // payload that drives the modal.
+    // (a request was made; the frontend chooses whether to act). The persisted
+    // sibling `CredentialRequested` is a distinct audit-log entry; this
+    // transient one carries the JSON payload that drives the modal. (Chat MCP
+    // consent moved off this pattern to the persisted in-thread
+    // `McpPermissionRequested` permission card.)
     #[serde(alias = "CredentialRequest")]
     CredentialPromptRequested {
         payload: String,
@@ -1004,15 +1042,6 @@ pub enum ThreadEvent {
     },
     #[serde(alias = "PushNotificationRequest")]
     PushNotificationRequested,
-    #[serde(alias = "McpConsentRequest")]
-    McpConsentPromptRequested {
-        // Field is `payload` to match the sibling request events
-        // (CredentialPromptRequested / PluginInstallRequested /
-        // EmailConfirmRequested / NavigationRequested). `data` alias kept for
-        // any pre-rename row, though this transient event is never persisted.
-        #[serde(alias = "data")]
-        payload: String,
-    },
     #[serde(alias = "RefreshFile")]
     FileRefreshRequested {
         path: String,

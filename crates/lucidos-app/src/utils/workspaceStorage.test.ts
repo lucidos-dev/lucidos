@@ -8,17 +8,43 @@ import {
   installWorkspaceStorage,
 } from './workspaceStorage';
 
-/** In-memory Storage matching the browser contract (and the test-setup stub). */
+/**
+ * In-memory Storage faithful to the native `Storage` contract — the previous mock
+ * was a plain object literal, which let the buggy instance-assignment install
+ * "work" in tests while silently no-opping in every real browser.
+ *
+ * Two faithful properties matter here:
+ *   1. The methods live on a dedicated PROTOTYPE (like `Storage.prototype`), so a
+ *      correct install must override them there. `Object.getPrototypeOf(storage)`
+ *      returns that prototype.
+ *   2. The instance models WebIDL `[LegacyOverrideBuiltIns]` + named-property
+ *      setter: assigning OR `Object.defineProperty`-ing any property on the
+ *      instance is swallowed as a stored item, NOT a real own property — so the
+ *      old `storage.getItem = fn` technique fails here exactly as it does on a
+ *      native `Storage`. This is the regression guard: reverting to instance
+ *      assignment breaks the namespacing tests below.
+ */
 function makeStorage(seed: Record<string, string> = {}): Storage {
   const store: Record<string, string> = { ...seed };
-  return {
-    getItem: (key: string) => (key in store ? store[key] : null),
-    setItem: (key: string, val: string) => { store[key] = String(val); },
-    removeItem: (key: string) => { delete store[key]; },
-    clear: () => { for (const k of Object.keys(store)) delete store[k]; },
+  const proto = {
+    getItem(key: string) { return key in store ? store[key] : null; },
+    setItem(key: string, val: string) { store[key] = String(val); },
+    removeItem(key: string) { delete store[key]; },
+    clear() { for (const k of Object.keys(store)) delete store[k]; },
+    key(i: number) { return Object.keys(store)[i] ?? null; },
     get length() { return Object.keys(store).length; },
-    key: (i: number) => Object.keys(store)[i] ?? null,
   };
+  const instance = Object.create(proto) as Storage;
+  return new Proxy(instance, {
+    // Native named-property setter: plain assignment stores an item, it never
+    // creates an own property that shadows the prototype method.
+    set(_target, prop, value) { store[String(prop)] = String(value); return true; },
+    // [[DefineOwnProperty]] routes through the named setter too.
+    defineProperty(_target, prop, desc) {
+      store[String(prop)] = String((desc as PropertyDescriptor).value);
+      return true;
+    },
+  });
 }
 
 /** Read a key bypassing any installed override (raw storage). */

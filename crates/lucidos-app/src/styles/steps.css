@@ -142,13 +142,11 @@
     color: var(--accent-red);
 }
 
+/* In-progress step shows no leading icon — the shimmering description
+   (.running-shimmer) is the "live" affordance, so hide the empty icon slot to
+   keep the text flush-left rather than leaving its inter-item gap. */
 .inline-step.pending .step-icon {
-    color: var(--text-muted);
-}
-
-.inline-step.pending .step-icon .mini-spinner {
-    width: 0.4375rem;
-    height: 0.4375rem;
+    display: none;
 }
 
 

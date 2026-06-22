@@ -23,14 +23,14 @@ import { refreshChangesState, restoreRestartToast } from '../store/actions/chat-
 import { restoreRepoSelectionFromStorage } from '../store/actions/repositories';
 import { openThreadAcrossWorkspaces } from '../store/actions/cross-workspace';
 import { CHECK_ICON, COPY_ICON } from '../utils/markedConfig';
-import { activeMenuItem, settingsSubview, updateAvailable, serviceWorkerBuildId, threadsLoaded, showToast, showConfirm, hasRefreshToast, FOCUSED_THREAD_KEY, setFocusedThread } from '../store/store';
-import { shouldShowSwUpdateToast, markSwUpdateDismissed, requestServiceWorkerBuildId, refreshClient } from './sw-update';
+import { activeMenuItem, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, showConfirm, FOCUSED_THREAD_KEY, setFocusedThread } from '../store/store';
+import { requestServiceWorkerBuildId } from './sw-update';
 import { syncClientUpdateFromBuild } from '../store/actions/client-update';
 import {
   parseDeepLinkFromSwMessage,
   hasDeepLinkParams,
 } from '../store/actions/notification-deeplink';
-import { dispatchDeepLink } from '../store/actions/in-app-notification-toast';
+import { dispatchDeepLink, surfaceResumeNotificationAffordance } from '../store/actions/in-app-notification-toast';
 import { setupHashDeeplinkRouting } from '../store/actions/hash-deeplink-router';
 import { reportStartupKind, startLivenessTracking } from '../utils/liveness';
 import { isKnownAppFrame } from '../utils/appFrame';
@@ -64,7 +64,11 @@ export function useStartup(): void {
         connectThreadEvents();
       }
     }).catch(() => { /* checkConnection swallows internally; satisfy fail-fast rule */ });
-    loadUnreadNotifications();
+    // Cold-start: after the unread set loads, surface a best-effort in-app
+    // affordance for any recent unread navigate-notification (the iOS PWA push
+    // tap may have just opened the app and dropped its deep link — see
+    // surfaceResumeNotificationAffordance / plan 2026-06-19-ios-native-apns-app).
+    void loadUnreadNotifications().then(surfaceResumeNotificationAffordance);
     loadPreferences().then(() => {
       // Notifications must load after preferences so the persisted filter is applied
       if (activeMenuItem.value === 'notifications') loadNotifications();
@@ -196,11 +200,14 @@ export function useStartup(): void {
     // Register/update the service worker on every load so the browser
     // picks up new sw.js versions (skipWaiting activates them immediately).
     // Also re-subscribe push to keep the endpoint fresh.
+    // Captured once `serviceWorker.ready` resolves so the cleanup can detach the
+    // `updatefound` listener symmetrically with every other listener below — an
+    // HMR remount would otherwise stack a duplicate on the same registration.
+    // `onUpdateFound` is block-scoped to the `if` below, so the handler ref is
+    // hoisted here for the cleanup to reach.
+    let updateFoundReg: ServiceWorkerRegistration | null = null;
+    let updateFoundHandler: ((this: ServiceWorkerRegistration) => void) | null = null;
     if ('serviceWorker' in navigator) {
-      // Capture BEFORE register() — clients.claim() in sw.js sets the
-      // controller, so after register() this would always be true.
-      const hadController = !!navigator.serviceWorker.controller;
-
       // Base-path aware (ADR 0014): behind the gateway the SW is served at
       // /<slug>/sw.js and scoped to /<slug>/, so each workspace is an
       // independent PWA cache + push scope.
@@ -210,41 +217,26 @@ export function useStartup(): void {
         })
         .catch(() => showToast('Service worker registration failed — push notifications may not work', 'error'));
 
-      // Show update toast when the browser finds a genuinely new service worker.
-      // `updatefound` fires on BOTH first install and genuine updates. We only
-      // want the toast for genuine updates (when there was already a controller).
-      // A sessionStorage flag prevents re-showing after the user dismisses or
-      // clicks Refresh (consumed on next check so future updates still show).
+      // When the browser activates a new service worker, surface the badge + the
+      // "New version available" toast through the SINGLE reliable build-id check
+      // (syncClientUpdateFromBuild) rather than deciding here. The check compares
+      // the LOADED bundle against the served /sw.js, so it's correct regardless
+      // of whether this worker has claimed the page yet, and it can't disagree
+      // with the badge (which is driven by the same check on startup/resume).
+      // This same path also fires via controllerchange below — both routes are
+      // idempotent (the toast is keyed + dedup-guarded). A fresh first install is
+      // naturally a no-op: CLIENT_BUILD_ID equals the served id it just loaded.
       function onUpdateFound(this: ServiceWorkerRegistration) {
         const newWorker = this.installing;
         if (!newWorker) return;
         newWorker.addEventListener('statechange', () => {
-          if (newWorker.state === 'activated' && shouldShowSwUpdateToast(hadController)) {
-            updateAvailable.value = true;
-            // Don't stack a second refresh prompt. After a frontend-affecting
-            // apply the user already sees the "Applied …"/"Engine restarted"
-            // (Refresh) or "Engine restart required" (Restart) toast — each is
-            // a way to pick up this exact build, so the "New version available"
-            // toast would be a redundant duplicate. `updateAvailable` stays set
-            // so the ControlPanel badge still reflects the available update.
-            if (hasRefreshToast()) return;
-            showToast('New version available', 'info', {
-              key: 'update-available',
-              action: {
-                label: 'Refresh',
-                onClick: () => {
-                  markSwUpdateDismissed();
-                  // SW-aware: a bare reload keeps the current service worker, so
-                  // it won't pick up the new sw.js. refreshClient swaps to the new
-                  // worker (or busts the shell cache if it won't), so the badge clears.
-                  refreshClient();
-                },
-              },
-            });
-          }
+          if (newWorker.state === 'activated') void syncClientUpdateFromBuild();
         });
       }
+      updateFoundHandler = onUpdateFound;
       navigator.serviceWorker.ready.then(reg => {
+        if (unmounted) return; // a remount (HMR) tore us down before ready resolved
+        updateFoundReg = reg;
         reg.addEventListener('updatefound', onUpdateFound);
       }).catch(() => { /* SW not ready in this environment — update toast is best-effort */ });
 
@@ -391,6 +383,13 @@ export function useStartup(): void {
       // the sync to the 5s health poll (which calls checkConnection, which
       // picks up the deferred resume once the engine is back).
       handleResume();
+      // Best-effort iOS PWA deep-link rescue: reload the unread set and surface a
+      // tappable in-app affordance for any recent unread navigate-notification.
+      // If the push tap actually deep-linked (worked), that notification is read
+      // and excluded; if the WebKit bug swallowed the tap, this is the one-tap
+      // in-app path to the target. Non-hijacking (never auto-navigates). See
+      // surfaceResumeNotificationAffordance / plan 2026-06-19-ios-native-apns-app.
+      void loadUnreadNotifications().then(surfaceResumeNotificationAffordance);
       // Check for SW updates on resume — iOS PWA never reloads, so this is the
       // only chance to detect new versions after the initial page load.
       navigator.serviceWorker?.getRegistration().then(reg => reg?.update()).catch(() => {});
@@ -455,6 +454,9 @@ export function useStartup(): void {
       stopHashRouting();
       navigator.serviceWorker?.removeEventListener('message', onServiceWorkerMessage);
       navigator.serviceWorker?.removeEventListener('controllerchange', requestServiceWorkerBuildId);
+      if (updateFoundReg && updateFoundHandler) {
+        updateFoundReg.removeEventListener('updatefound', updateFoundHandler);
+      }
       disconnectThreadEvents();
       stopDevicePresence();
       nativeTapCanceled = true;

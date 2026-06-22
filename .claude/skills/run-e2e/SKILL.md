@@ -9,6 +9,22 @@ Run `./scripts/e2e.sh` — this runs the full e2e suite in four phases.
 Iterate to green; never bypass a failing test. Zero failed AND zero
 skipped is the bar.
 
+## Never run e2e on top of itself
+
+Do NOT launch a second e2e run while one may still be alive — not
+concurrently, and not by re-spawning over a believed-dead prior run. The
+shared e2e-test workspace OOMs the host when two sets of Playwright/WebKit
+browsers stack (2026-04-19 reboot; 2026-06-21 nightly pile-up to 23.5 GB +
+14 GB swap). This is enforced structurally by the lock in
+`scripts/lib/e2e_lock.sh`, which every entry point acquires before any
+workspace/browser work: a second run with a live owner **hard-fails (exit 1)**,
+and a stale lock left by an interrupted run is reclaimed only after its
+orphaned browsers/engine are swept — if they can't be swept it **refuses**
+rather than stack. So if `./scripts/e2e.sh` exits non-zero with an
+"another e2e run is in progress" or "orphaned processes" message, that is the
+lock doing its job — investigate/clean up the prior run; do NOT retry-loop to
+force a launch.
+
 ## Four phases
 
 1. **API** — `cargo test -p lucidos-e2e --test api`.

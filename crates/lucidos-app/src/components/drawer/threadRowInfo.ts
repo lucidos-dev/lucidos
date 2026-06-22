@@ -1,4 +1,5 @@
-import type { ThreadMeta } from '../../store/thread-events';
+import type { ThreadMeta, ComposeChannelMode } from '../../store/thread-events';
+import type { Scope } from '../../store/store';
 import type { ThreadStatus } from '../../generated/thread-lifecycle';
 import { appIdFromFolder } from '../../utils/appIdFromFolder';
 import { formatChannel } from '../../utils/formatChannel';
@@ -97,5 +98,35 @@ export function threadRowTooltip(meta: ThreadMeta, status: ThreadStatus): Toolti
     threadContextRow(meta),
     { label: 'Exchanges', value: String(meta.messageCount) },
     { label: 'Started', value: formatTimeAgo(new Date(meta.createdAt)) },
+  ];
+}
+
+/** Context row for a compose draft. A draft hasn't bound its meta to a backend
+ *  yet (see `sendCompose`), so its destination is read live from the compose
+ *  `mode` + `scope` rather than the thread meta — mirroring `threadContextRow`
+ *  and the chip the draft row paints. `contextName` is the already-resolved
+ *  name (see `composeDraftContextName`). */
+function draftContextRow(mode: ComposeChannelMode, scope: Scope, contextName: string | undefined): TooltipRow {
+  if (mode !== 'claude_code') return { label: 'Type', value: 'Chat' };
+  if (scope.kind === 'app') return contextName ? { label: 'App', value: contextName } : { label: 'Type', value: 'App' };
+  return contextName ? { label: 'Repository', value: contextName } : { label: 'Type', value: 'Repository' };
+}
+
+/** Structured tooltip rows for a compose draft row, the draft counterpart of
+ *  `threadRowTooltip`. A draft has no agent activity or exchanges yet, so the
+ *  tooltip is the meaningful subset: its Draft status, where it's headed, and
+ *  when it was created. A draft is "Created" but never "Started" — being
+ *  started is the first send, which is exactly the moment it stops being a
+ *  draft (so `threadRowTooltip` says "Started" and this says "Created"). */
+export function draftRowTooltip(
+  mode: ComposeChannelMode,
+  scope: Scope,
+  contextName: string | undefined,
+  createdAt: string,
+): TooltipRow[] {
+  return [
+    { label: 'Status', value: 'Draft', tone: 'idle' },
+    draftContextRow(mode, scope, contextName),
+    { label: 'Created', value: formatTimeAgo(new Date(createdAt)) },
   ];
 }

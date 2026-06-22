@@ -18,6 +18,7 @@ import {
   displayModelName,
   displayReasoningEffort,
   findCommandPermissionResolution,
+  findMcpPermissionResolution,
   findPermissionResolution,
   findQuestionAnswer,
   isChangeLifecycleEvent,
@@ -51,6 +52,9 @@ export function resolveOrigin(exchange: Exchange): MessageOrigin | undefined {
   }
   if (userEvent.type === 'CommandPermissionRequested') {
     return findCommandPermissionResolution(exchange, userEvent.request_id)?.actor;
+  }
+  if (userEvent.type === 'McpPermissionRequested') {
+    return findMcpPermissionResolution(exchange, userEvent.request_id)?.actor;
   }
   // CredentialRequested / McpConsentRequested have no user-side answer event
   // today — the initiator row carries the disclosure on its own.
@@ -311,6 +315,7 @@ function initiatorRowText(userEvent: StoredEvent): string | null {
     case 'UserQuestionAsked':            return userEvent.cc_session_id ? 'Claude Code' : 'Lucidos Agent';
     case 'CodingAgentPermissionRequest': return 'Claude Code (permission gate)';
     case 'CommandPermissionRequested':   return 'Lucidos Agent (command gate)';
+    case 'McpPermissionRequested':       return 'Lucidos Agent (MCP gate)';
     case 'CredentialRequested':          return 'Lucidos (credential request)';
     case 'McpConsentRequested':          return 'Lucidos (tool consent)';
     default:                             return null;

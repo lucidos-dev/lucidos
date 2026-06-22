@@ -1,5 +1,5 @@
 import { test, expect, type Page, type Locator } from './fixtures';
-import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer, waitForVisibleInput, ensureOnThreadPane, clickVisibleElement, isMobileViewport, REAL_THREAD_ROW } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer, openDrawerView, waitForVisibleInput, ensureOnThreadPane, clickVisibleElement, isMobileViewport, REAL_THREAD_ROW } from './helpers';
 import { clearAllThreads } from './db-helpers';
 
 /** Send a first message, then click Compose and type a draft. Returns the
@@ -252,8 +252,7 @@ test.describe('Per-thread drafts', () => {
     if (isMobileViewport(page)) {
       // Mobile hides the textarea from the threads pane, so a focused thread's
       // follow-up draft only surfaces in the dedicated Drafts view.
-      const clicked = await clickVisibleElement(page, 'button[aria-label="Toggle drafts view"]');
-      if (!clicked) throw new Error('Toggle drafts view button not visible');
+      await openDrawerView(page, 'Drafts');
       const draftsSection = page.locator('.list-section-title:visible', { hasText: 'Drafts' });
       await expect(draftsSection).toBeVisible({ timeout: 5_000 });
     } else {
@@ -366,7 +365,7 @@ test.describe('Per-thread drafts', () => {
     await expect(page.locator('.toast-error')).toHaveCount(0, { timeout: 1_000 });
 
     // User stays on the active thread — placeholder is the follow-up one,
-    // not the compose-view "What can I help with today?". Asserting placeholder also avoids
+    // not the compose-view "What can I help with?". Asserting placeholder also avoids
     // the dual-layout-render trap (desktop and mobile copies coexist in DOM).
     await expect(cleared).toHaveAttribute('placeholder', 'Post a follow up…');
 
@@ -542,17 +541,19 @@ test.describe('Per-thread drafts', () => {
     await expect(page.getByText('Empty draft')).toHaveCount(0);
   });
 
-  test('drafts toggle is hidden with no drafts on both viewports', async ({ page }) => {
-    // beforeEach cleared all threads, so there are zero drafts. The shared slot
-    // scheme (AltViewToggles) keeps both toggles mounted but marks an empty one
-    // `altview-hidden` — display:none on both viewports (shell.css) — so the
-    // toggle is present in the DOM but never visible or interactive when it has
-    // no content.
+  test('Filter control is always present and opens an empty Drafts view with no drafts', async ({ page }) => {
+    // beforeEach cleared all threads, so there are zero drafts. Unlike the old
+    // per-view toggles (which hid when empty), the unified Filter control is
+    // always present; picking the Drafts view opens it to its own empty state.
     await navigateToApp(page);
     await openThreadDrawer(page);
 
     const headerSel = isMobileViewport(page) ? '.mobile-threads-header' : '.threads-header';
-    const toggle = page.locator(`${headerSel} button[aria-label="Toggle drafts view"]`);
-    await expect(toggle).toBeHidden({ timeout: 5_000 });
+    const filterBtn = page.locator(`${headerSel} button[aria-label="Filter threads"]`);
+    await expect(filterBtn).toBeVisible({ timeout: 5_000 });
+
+    await openDrawerView(page, 'Drafts');
+    await expect(page.locator('.empty-state:visible', { hasText: 'No drafts' }))
+      .toBeVisible({ timeout: 5_000 });
   });
 });

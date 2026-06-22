@@ -138,7 +138,24 @@ export function renderExchanges(
       advance(ex);
     }
     nodes.push(
-      <details class="queued-message-group" key={`queued-${queuedOrder.join('-')}`}>
+      <details
+        class="queued-message-group"
+        key={`queued-${queuedOrder.join('-')}`}
+        onToggle={(e) => {
+          // Expanding the group reveals the queued bubbles below the active
+          // turn — at the bottom of the thread. Snap to the bottom so they're
+          // actually in view instead of off-screen under the fold.
+          //
+          // Defer to the next frame: the native <details> reflow that unfolds
+          // the bubbles can land AFTER this toggle event fires, so a synchronous
+          // scroll measures the pre-expand height and stops short (the
+          // "doesn't scroll on reopen" glitch). By the next frame the expanded
+          // height is settled, so scrollToBottom()'s first read is correct; its
+          // re-pin loop then absorbs any remaining reflow.
+          if (!(e.currentTarget as HTMLDetailsElement).open) return;
+          requestAnimationFrame(() => scrollToBottom());
+        }}
+      >
         <summary class="queued-message-group-summary">
           <span class="queued-message-group-label">{`Queued (${queuedCount})`}</span>
           <span class="exchange-status-queued">{'○'}</span>

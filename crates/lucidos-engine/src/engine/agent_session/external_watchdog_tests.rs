@@ -12,6 +12,11 @@ use crate::test_support::{setup_test_db, teardown_test_db};
 
 use super::ExternalWatchdog;
 
+/// Hung-tool ceiling for the integration ticks. Larger than every `limit_ms`
+/// used below so "stale past the limit" and "stale past the ceiling" stay
+/// distinct regimes.
+const CEILING_MS: i64 = 10 * 60 * 1000;
+
 /// Without this seed, every CC-only emit (`ContinuationRequested`) fails with
 /// "is not valid for Chat threads" — the lifecycle projection needs a
 /// prior CC-channel event to classify the thread.
@@ -47,6 +52,7 @@ fn make_session(last_event_at_ms: i64) -> AgentSession {
         requires_restart: false,
         pending_stop: None,
         cancel_actor: None,
+        redirect_followup: false,
         stop: Arc::new(tokio::sync::Notify::new()),
         interrupt: Arc::new(tokio::sync::Notify::new()),
         idle_notify: Arc::new(tokio::sync::Notify::new()),
@@ -100,7 +106,8 @@ async fn tick_fires_for_stuck_session_emits_continuation_requested_and_drops_ent
         .await
         .insert(thread_id, make_session(stale_for(limit_ms)));
 
-    let watchdog = ExternalWatchdog::new(sessions.clone(), bus.clone(), limit_ms);
+    let watchdog =
+        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
     watchdog.tick().await;
 
     let count = count_continuation_requests(&pool, thread_id).await;
@@ -133,7 +140,8 @@ async fn tick_leaves_healthy_session_alone() {
         .await
         .insert(thread_id, make_session(now_epoch_millis() - 1000));
 
-    let watchdog = ExternalWatchdog::new(sessions.clone(), bus.clone(), limit_ms);
+    let watchdog =
+        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
     watchdog.tick().await;
 
     assert_eq!(count_continuation_requests(&pool, thread_id).await, 0);
@@ -143,27 +151,144 @@ async fn tick_leaves_healthy_session_alone() {
     teardown_test_db(&db_name).await;
 }
 
-/// Double-fire here means two `SpawnRequest::Continue` dispatches and two
-/// competing `--resume` sessions on the same worktree.
+/// Phase B: an exited session whose projection is still `running` and stale
+/// past the limit means the in-loop cleanup is wedged / never settled — the
+/// external watchdog recovers it (the prior unconditional `process_exited` skip
+/// left it a zombie). `external_terminal_emitted` + the `thread_is_running`
+/// re-check prevent a double-fire with the in-loop.
 #[tokio::test]
-async fn tick_leaves_exited_session_alone() {
+async fn tick_recovers_exited_stale_session_when_running() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let bus = Arc::new(bus);
 
     let limit_ms = 50;
     let thread_id = Uuid::new_v4();
-    seed_cc_thread(&bus, thread_id).await;
+    seed_cc_thread(&bus, thread_id).await; // SessionStarted → status='running'
     let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let mut session = make_session(stale_for(limit_ms));
     session.process_exited = true;
     sessions.lock().await.insert(thread_id, session);
 
-    let watchdog = ExternalWatchdog::new(sessions.clone(), bus.clone(), limit_ms);
+    let watchdog =
+        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
+    watchdog.tick().await;
+
+    assert_eq!(
+        count_continuation_requests(&pool, thread_id).await,
+        1,
+        "exited + stale + still `running` (wedged in-loop cleanup) must be recovered"
+    );
+    assert!(
+        !sessions.lock().await.contains_key(&thread_id),
+        "recovered session's entry must be dropped"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// An exited session that is NOT yet stale (within the limit) is left to the
+/// in-loop cleanup — recovering here would race it. This is the case the
+/// original unconditional `process_exited` skip protected, now narrowed to
+/// "still being cleaned up".
+#[tokio::test]
+async fn tick_leaves_fresh_exited_session_alone() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let limit_ms = 10 * 60 * 1000; // 10 min — the session below is fresh
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let mut session = make_session(now_epoch_millis() - 1000); // 1 s ago
+    session.process_exited = true;
+    sessions.lock().await.insert(thread_id, session);
+
+    let watchdog =
+        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
     watchdog.tick().await;
 
     assert_eq!(count_continuation_requests(&pool, thread_id).await, 0);
-    // We don't assert presence — the in-loop owns removal on exit.
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Phase A (the root-cause fix): a tool in flight past the hung-tool ceiling on
+/// a still-`running` thread is recovered — the prior unbounded `tools_in_flight`
+/// skip would have left it stuck forever (the thread-72120ca6 incident).
+#[tokio::test]
+async fn tick_recovers_hung_tool_past_ceiling_when_running() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let limit_ms = 50;
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await; // status='running'
+    let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let session = make_session(stale_for(CEILING_MS)); // past the ceiling
+    session
+        .tools_in_flight
+        .store(3, std::sync::atomic::Ordering::Relaxed);
+    sessions.lock().await.insert(thread_id, session);
+
+    let watchdog =
+        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
+    watchdog.tick().await;
+
+    assert_eq!(
+        count_continuation_requests(&pool, thread_id).await,
+        1,
+        "hung tool past the ceiling on a running thread must be recovered"
+    );
+    assert!(!sessions.lock().await.contains_key(&thread_id));
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The user-answer protection: a tool in flight past the ceiling on a thread
+/// that is NOT `running` (here settled to idle; in production a pending
+/// question/permission card sits at `waiting_for_user_answer`) must NOT be
+/// euthanized — the `thread_is_running` re-check guards it.
+#[tokio::test]
+async fn tick_skips_hung_tool_past_ceiling_when_not_running() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let limit_ms = 50;
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await; // status='running'…
+    // …then settle it so the projection is no longer `running` (stands in for
+    // `waiting_for_user_answer`, which `thread_is_running` also treats as not-running).
+    crate::engine::claude_code::settle_stuck_running_thread(&pool, &bus, thread_id, None)
+        .await
+        .expect("settle");
+
+    let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let session = make_session(stale_for(CEILING_MS));
+    session
+        .tools_in_flight
+        .store(3, std::sync::atomic::Ordering::Relaxed);
+    sessions.lock().await.insert(thread_id, session);
+
+    let watchdog =
+        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
+    watchdog.tick().await;
+
+    assert_eq!(
+        count_continuation_requests(&pool, thread_id).await,
+        0,
+        "a not-running thread (pending user answer / settled) must not be euthanized"
+    );
+    assert!(
+        sessions.lock().await.contains_key(&thread_id),
+        "entry must be left intact when the re-check declines to recover"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -185,7 +310,8 @@ async fn tick_leaves_session_with_tool_in_flight_alone() {
         .store(2, std::sync::atomic::Ordering::Relaxed);
     sessions.lock().await.insert(thread_id, session);
 
-    let watchdog = ExternalWatchdog::new(sessions.clone(), bus.clone(), limit_ms);
+    let watchdog =
+        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
     watchdog.tick().await;
 
     assert_eq!(count_continuation_requests(&pool, thread_id).await, 0);
@@ -209,7 +335,8 @@ async fn tick_leaves_waiting_session_alone() {
     session.is_waiting = true;
     sessions.lock().await.insert(thread_id, session);
 
-    let watchdog = ExternalWatchdog::new(sessions.clone(), bus.clone(), limit_ms);
+    let watchdog =
+        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
     watchdog.tick().await;
 
     assert_eq!(count_continuation_requests(&pool, thread_id).await, 0);
@@ -226,7 +353,7 @@ async fn tick_with_empty_sessions_is_noop() {
     let bus = Arc::new(bus);
 
     let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let watchdog = ExternalWatchdog::new(sessions, bus, 50);
+    let watchdog = ExternalWatchdog::new(sessions, bus, pool.clone(), 50, CEILING_MS);
     watchdog.tick().await; // must not panic / hang
 
     pool.close().await;
@@ -258,7 +385,8 @@ async fn tick_flips_external_terminal_emitted_before_dropping_stuck_session() {
         "precondition: flag starts unset"
     );
 
-    let watchdog = ExternalWatchdog::new(sessions.clone(), bus.clone(), limit_ms);
+    let watchdog =
+        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
     watchdog.tick().await;
 
     assert!(

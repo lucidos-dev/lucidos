@@ -5,6 +5,7 @@ import {
   selectedAppIds,
   setSelectedAppIds,
   filterFacets,
+  includeDeletedFilterOptions,
 } from './store';
 import { appIdFromFolder } from '../utils/appIdFromFolder';
 import { loadedOr } from './types';
@@ -56,15 +57,21 @@ export const appFilterOptions = computed<AppFilterOption[]>(() => {
   }
   for (const id of selectedAppIds.value) push(id);
 
-  return result.sort((a, b) => {
-    if (a.deleted !== b.deleted) return a.deleted ? 1 : -1;
-    if (a.deleted) {
-      const aTime = a.lastActivity ?? '';
-      const bTime = b.lastActivity ?? '';
-      if (aTime !== bTime) return bTime.localeCompare(aTime);
-    }
-    return a.label.localeCompare(b.label);
-  });
+  // Deleted entries are hidden unless the user opts in — but a *selected*
+  // deleted entry always stays visible so the filter remains clearable.
+  const includeDeleted = includeDeletedFilterOptions.value;
+  const selected = selectedAppIds.value;
+  return result
+    .filter(o => includeDeleted || !o.deleted || selected.has(o.id))
+    .sort((a, b) => {
+      if (a.deleted !== b.deleted) return a.deleted ? 1 : -1;
+      if (a.deleted) {
+        const aTime = a.lastActivity ?? '';
+        const bTime = b.lastActivity ?? '';
+        if (aTime !== bTime) return bTime.localeCompare(aTime);
+      }
+      return a.label.localeCompare(b.label);
+    });
 });
 
 export function toggleAppId(id: string): void {

@@ -103,8 +103,22 @@ function buttonNodes(node: ComponentChildren): VNode<{ disabled?: boolean }>[] {
   return buttonNodes(v.props.children);
 }
 
+// The split button is a function-component VNode; with no DOM/render harness
+// here we assert the props it is handed (the same data the desktop buttons
+// render from), not the rendered menu. The component's interaction contract is
+// covered by the Overlay contract tests + e2e.
+type SplitProps = {
+  primary: TaggedAction;
+  menuActions: TaggedAction[];
+  showDiff: boolean;
+  threadId: string;
+};
+function splitProps(node: ComponentChildren): SplitProps {
+  return (node as VNode<SplitProps>).props;
+}
+
 describe('getBannerSlots', () => {
-  it('actions state with Diff puts Diff alone in liftable; actions in primary', () => {
+  it('actions state with an Apply action collapses into a split button (Diff folds into its menu)', () => {
     const slots = getBannerSlots({
       type: 'actions',
       actions: DISCARD_APPLY,
@@ -113,8 +127,13 @@ describe('getBannerSlots', () => {
       showDiff: true,
     });
 
-    expect(buttonLabels(slots.liftable)).toEqual(['Diff']);
-    expect(buttonLabels(slots.primary)).toEqual(['Discard', 'Apply']);
+    // No separate liftable Diff — it folds into the split button's caret menu.
+    expect(slots.liftable).toBeNull();
+    const props = splitProps(slots.primary);
+    expect(props.primary.kind).toBe('apply');
+    expect(props.menuActions.map((a) => a.kind)).toEqual(['discard']);
+    expect(props.showDiff).toBe(true);
+    expect(props.threadId).toBe('tid');
   });
 
   it('actions state on a non-CC thread hides the Diff button', () => {
@@ -143,16 +162,19 @@ describe('getBannerSlots', () => {
     expect(buttonLabels(slots.primary)).toEqual(['Archive']);
   });
 
-  it('CC thread with showDiff uses the thread-level diff click', () => {
+  it('no-Apply actions state with showDiff puts a clickable Diff in liftable', () => {
+    // Archive-only (no Apply) keeps the separate-button path, so the Diff lifts
+    // into its own slot instead of folding into a split menu.
     const slots = getBannerSlots({
       type: 'actions',
-      actions: DISCARD_APPLY,
+      actions: ARCHIVE_ONLY,
       threadId: 'tid',
       isArchiving: false,
       showDiff: true,
     });
 
     expect(buttonLabels(slots.liftable)).toEqual(['Diff']);
+    expect(buttonLabels(slots.primary)).toEqual(['Archive']);
     const [diffBtn] = buttonNodes(slots.liftable);
     expect(diffBtn.props.disabled).toBeFalsy();
     expect(typeof (diffBtn.props as { onClick?: unknown }).onClick).toBe('function');
@@ -182,6 +204,19 @@ describe('getBannerSlots', () => {
     const slots = getBannerSlots({ type: 'discarding' });
     expect(slots.liftable).toBeNull();
     expect(buttonLabels(slots.primary)).toEqual(['Discard...']);
+  });
+
+  it('no Apply action keeps the plain button row (nothing to make a primary face)', () => {
+    const slots = getBannerSlots({
+      type: 'actions',
+      actions: ARCHIVE_ONLY,
+      threadId: 'tid',
+      isArchiving: false,
+      showDiff: false,
+    });
+
+    expect(slots.liftable).toBeNull();
+    expect(buttonLabels(slots.primary)).toEqual(['Archive']);
   });
 });
 
@@ -287,10 +322,12 @@ describe('showDiff is driven by codingAgentHasDiff alone', () => {
     // identity from the historical Change-row Diff buttons: it always asks
     // "show me the diff for this thread's branch", never "show me what this
     // specific Change contained". viewChangeDiff stays for ChatExchange and
-    // ChangesView; the WaitingBanner does not call it anymore.
+    // ChangesView; the WaitingBanner does not call it anymore. Uses the
+    // no-Apply (liftable Diff) path — when an Apply action is present the Diff
+    // folds into the split-button menu, whose inline onClick is the same call.
     const slots = getBannerSlots({
       type: 'actions',
-      actions: DISCARD_APPLY,
+      actions: ARCHIVE_ONLY,
       threadId: 'tid',
       isArchiving: false,
       showDiff: true,

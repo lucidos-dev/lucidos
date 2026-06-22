@@ -52,7 +52,7 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
     // must update the inline value to match the SSE-resolved theme so the
     // body's `var(--bg-primary, ...)` paints the right color even though
     // inline styles win over the stylesheet cascade.
-    const inlineProps: Record<string, string> = { '--bg-primary': '#0b2342' };
+    const inlineProps: Record<string, string> = { '--bg-primary': '#07172e' };
     const realStyle = (document as any).documentElement.style;
     (document as any).documentElement.style = {
       setProperty: (k: string, v: string) => { inlineProps[k] = v; },
@@ -91,5 +91,135 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
     }
 
     expect(styleMock.background).toBe('#ffffff');
+  });
+});
+
+// The systemic theme bug: `applyPreferences()` ran AFTER sdk-prefs.js (which
+// synchronously seeds data-theme/--font-ui/--user-ui-scale from localStorage),
+// then overwrote that correct value with a hard default whenever the active
+// device had no server-scoped pref. The iPhone-PWA case (only `ui-scale` stored
+// server-side, no `theme`) flipped every app iframe to dark even though the
+// host shell stayed light. The invariant these tests pin: a MISSING server
+// value must never clobber the client value sdk-prefs.js already resolved.
+//
+// The node test env stubs <html> with a no-op setAttribute and an always-''
+// style (src/test-setup.ts has no real DOM), so we record what applyPreferences
+// writes — mirroring the existing --bg-primary test's style swap above.
+describe('lucidos.ui.applyPreferences — client value wins when the server lacks the key', () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  function mockPrefs(prefs: Record<string, string>) {
+    globalThis.fetch = vi.fn(async () => new Response(
+      JSON.stringify({ preferences: prefs }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    )) as unknown as typeof globalThis.fetch;
+  }
+
+  function captureWrites(initialDataTheme?: string) {
+    const attrs: Record<string, string> = {};
+    if (initialDataTheme !== undefined) attrs['data-theme'] = initialDataTheme;
+    const props: Record<string, string> = {};
+    const el = document.documentElement as any;
+    const real = { setAttribute: el.setAttribute, getAttribute: el.getAttribute, style: el.style };
+    el.setAttribute = (k: string, v: string) => { attrs[k] = v; };
+    el.getAttribute = (k: string) => (k in attrs ? attrs[k] : null);
+    el.style = {
+      setProperty: (k: string, v: string) => { props[k] = v; },
+      getPropertyValue: (k: string) => props[k] ?? '',
+      removeProperty: (k: string) => { delete props[k]; },
+      background: '',
+    };
+    return {
+      attrs,
+      props,
+      restore() {
+        el.setAttribute = real.setAttribute;
+        el.getAttribute = real.getAttribute;
+        el.style = real.style;
+      },
+    };
+  }
+
+  async function applyWithCapture(initialDataTheme?: string) {
+    const cap = captureWrites(initialDataTheme);
+    try {
+      await lucidos.ui.applyPreferences();
+    } finally {
+      cap.restore();
+    }
+    return cap;
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it('keeps the localStorage theme when the server has no device-scoped theme', async () => {
+    // The reported iPhone-PWA case: only ui-scale stored server-side, no theme.
+    localStorage.setItem('lucidos-theme', 'light');
+    mockPrefs({ 'ui-scale': '125' });
+
+    const cap = await applyWithCapture();
+
+    expect(cap.attrs['data-theme']).toBe('light');
+  });
+
+  it('does not flip to dark when the server returns no theme at all', async () => {
+    localStorage.setItem('lucidos-theme', 'light');
+    mockPrefs({});
+
+    const cap = await applyWithCapture();
+
+    expect(cap.attrs['data-theme']).toBe('light');
+  });
+
+  it('falls back to the data-theme attribute sdk-prefs.js applied when localStorage is empty', async () => {
+    mockPrefs({});
+
+    // sdk-prefs.js already resolved + applied data-theme=light synchronously.
+    const cap = await applyWithCapture('light');
+
+    expect(cap.attrs['data-theme']).toBe('light');
+  });
+
+  it('still lets a present server theme win over a stale localStorage value', async () => {
+    localStorage.setItem('lucidos-theme', 'dark');
+    mockPrefs({ theme: 'light' });
+
+    const cap = await applyWithCapture();
+
+    expect(cap.attrs['data-theme']).toBe('light');
+  });
+
+  it('ignores an invalid localStorage theme and falls back to the default', async () => {
+    localStorage.setItem('lucidos-theme', 'chartreuse');
+    mockPrefs({});
+
+    const cap = await applyWithCapture();
+
+    expect(cap.attrs['data-theme']).toBe('dark');
+  });
+
+  it('keeps the localStorage font when the server has no font-family', async () => {
+    localStorage.setItem('lucidos-font-family', 'system');
+    mockPrefs({});
+
+    const cap = await applyWithCapture();
+
+    expect(cap.props['--font-ui']).toContain('system-ui');
+  });
+
+  it('keeps the localStorage ui-scale when the server has none', async () => {
+    localStorage.setItem('lucidos-ui-scale', '125');
+    mockPrefs({});
+
+    const cap = await applyWithCapture();
+
+    expect(cap.props['--user-ui-scale']).toBe('125%');
   });
 });

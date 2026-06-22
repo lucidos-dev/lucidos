@@ -37,7 +37,7 @@ vi.mock('../thread-events', () => ({
   PENDING_TITLE_PLACEHOLDER: '',
 }));
 vi.mock('./notifications', () => ({ handleNotificationSSE: vi.fn() }));
-vi.mock('./chat-changes', () => ({ addRestartGroup: vi.fn(), appliedToastRefreshAction: vi.fn() }));
+vi.mock('./chat-changes', () => ({ addRestartGroup: vi.fn() }));
 vi.mock('./preferences', () => ({ loadPreferences: vi.fn() }));
 vi.mock('./artifacts', () => ({
   loadArtifacts: vi.fn(),

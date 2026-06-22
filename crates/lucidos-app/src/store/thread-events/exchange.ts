@@ -57,6 +57,10 @@ export type ResolvedPermission = Extract<ThreadEvent, { type: 'CodingAgentPermis
  *  command-guard counterpart of `ResolvedPermission`. */
 export type ResolvedCommandPermission = Extract<ThreadEvent, { type: 'CommandPermissionResolved' }>;
 
+/** The narrowed `McpPermissionResolved` variant — the chat MCP counterpart of
+ *  `ResolvedPermission`. */
+export type ResolvedMcpPermission = Extract<ThreadEvent, { type: 'McpPermissionResolved' }>;
+
 /** Find the matching `UserQuestionAnswered` step in a divider exchange.
  *  Returns the typed event (with `answer` narrowed and the optional `actor`
  *  stamped by `EventMeta`) or undefined when the question is still pending. */
@@ -86,6 +90,18 @@ export function findCommandPermissionResolution(
 ): ResolvedCommandPermission | undefined {
   for (const { event } of exchange.steps) {
     if (event.type === 'CommandPermissionResolved' && event.request_id === requestId) return event;
+  }
+  return undefined;
+}
+
+/** Find the matching `McpPermissionResolved` step in a chat MCP permission
+ *  divider exchange. Returns the typed event or undefined when still pending. */
+export function findMcpPermissionResolution(
+  exchange: Exchange,
+  requestId: string,
+): ResolvedMcpPermission | undefined {
+  for (const { event } of exchange.steps) {
+    if (event.type === 'McpPermissionResolved' && event.request_id === requestId) return event;
   }
   return undefined;
 }

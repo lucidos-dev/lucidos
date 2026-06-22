@@ -12,13 +12,19 @@ const promptSource = readFileSync(resolve(here, '../PromptInput.tsx'), 'utf-8');
 const storeSource = readFileSync(resolve(here, '../../../store/imagePopup.ts'), 'utf-8');
 
 describe('image-preview-thumb tap opens popup with strip traversal', () => {
-  const stripImgs = promptSource.match(/<img[\s\S]*?class="image-preview-thumb"[\s\S]*?\/>/g) ?? [];
+  // Strip thumbnails render through BlobImage (self-healing) so a transiently
+  // failed preview load re-fetches instead of staying a broken box.
+  const stripImgs = promptSource.match(/<BlobImage[\s\S]*?class="image-preview-thumb"[\s\S]*?\/>/g) ?? [];
 
-  it('every <img class="image-preview-thumb"> in PromptInput has an onClick', () => {
-    expect(stripImgs.length, 'no image-preview-thumb img elements found').toBeGreaterThan(0);
+  it('every <BlobImage class="image-preview-thumb"> in PromptInput has an onClick', () => {
+    expect(stripImgs.length, 'no image-preview-thumb BlobImage elements found').toBeGreaterThan(0);
     for (const tag of stripImgs) {
       expect(tag, 'image-preview-thumb missing onClick').toMatch(/onClick=/);
     }
+  });
+
+  it('strip thumbnails use BlobImage (self-healing), not a bare <img>', () => {
+    expect(promptSource).not.toMatch(/<img[\s\S]*?class="image-preview-thumb"/);
   });
 
   it('image-preview-thumb onClick routes through the group collector, not the single opener', () => {

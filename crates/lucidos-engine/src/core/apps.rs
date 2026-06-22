@@ -142,6 +142,21 @@ impl AppManager {
         self.load_app(&app_dir)
     }
 
+    /// Whether the app exists as far as the apps list is concerned: a
+    /// `manifest.json` is present under `data/apps/<id>/`. Matches `list_apps`,
+    /// which skips directories without a readable manifest — so this is the
+    /// honest "would this id appear in the list?" check used to decide
+    /// AppCreated vs AppUpdated when the raw file tools touch an app.
+    pub fn app_exists(&self, app_id: &str) -> bool {
+        self.apps_path.join(app_id).join("manifest.json").exists()
+    }
+
+    /// The app's display name from its manifest, or `None` if it can't be read.
+    /// Used to populate the `name` field on `AppCreated`/`AppUpdated`.
+    pub fn app_name(&self, app_id: &str) -> Option<String> {
+        self.get_app(app_id).ok().map(|a| a.name)
+    }
+
     /// Create a new app directory with manifest.json + index.html and commit to git.
     pub fn create_app(
         &self,

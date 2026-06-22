@@ -11,7 +11,7 @@ The SDK is available as `lucidos` in app UIs. Import from `@anthropic/lucidos-sd
 
 ## Setup
 
-App HTML is served as static content — the engine doesn't inject anything (except `?commit=X` rewriting on historical-version requests). Apps opt into each piece they want.
+App HTML is served as static content — the engine doesn't inject anything (except `?thread_id=` rewriting on WIP-preview requests). Apps opt into each piece they want.
 
 The standard Lucidos app boilerplate:
 
@@ -42,7 +42,7 @@ What each piece does — include only what you need:
 |---|---|---|
 | `<title>` | Tab title | (always include — browsers require it) |
 | `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script — reads the user's theme/font/scale from `localStorage` (shared with the parent shell via same-origin sandboxing) and sets `data-theme`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible — before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
-| `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling | App ships its own complete stylesheet and doesn't want Lucidos theming |
+| `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`) — use these class names and the app's buttons/lists/etc. render identically to the host shell. The body inherits the root font-size (the user's UI scale), matching Lucidos. | App ships its own complete stylesheet and doesn't want Lucidos theming |
 | `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance, survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
 | `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs two iframe-only side effects: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.navigate()`) and a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus — iframe keydowns otherwise never reach the host). Only modifier-bearing chords and Escape are forwarded; plain typing stays in the app. | App doesn't use `lucidos.*` |
 | `lucidos.ui.applyPreferences()` | Reads the user's theme/font/scale (resolving a `system` preference to the live OS light/dark) and sets `data-theme` + CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | **Don't skip if you include `sdk-iframe.css`** — without it the app ignores the user's light/system setting and stays on the default dark palette. Skip only when opting out of Lucidos theming entirely. |
@@ -61,7 +61,23 @@ What each piece does — include only what you need:
 | Border | `--border-color` |
 | Accents | `--accent`, `--accent-light`, `--accent-green`, `--accent-yellow`, `--accent-red` |
 | Shadows | `--shadow-sm`, `--shadow-md`, `--shadow-lg` |
-| Layout (theme-independent) | `--font-ui`, `--font-mono`, `--space-{xs,sm,md,lg,xl}`, `--radius-{sm,md,lg}`, `--transition`, `--user-ui-scale` |
+| Layout (theme-independent) | `--font-ui`, `--font-mono`, `--transition`, `--user-ui-scale` — plus the spacing / radius / motion scales below |
+
+The spacing, radius, motion, and icon scales are theme-independent and have
+fixed values — **use the token, not a magic number, and never a `px` fallback
+that disagrees with the real value** (`var(--space-xl, 28px)` is a latent bug —
+`--space-xl` is `1.5rem` = 24px). When you include `sdk-iframe.css` these are
+always defined, so a fallback is dead noise at best:
+
+| Token | Value | | Token | Value |
+|---|---|---|---|---|
+| `--space-xs` | `0.25rem` (4px) | | `--radius-sm` | `0.25rem` (4px) |
+| `--space-sm` | `0.5rem` (8px) | | `--radius-md` | `0.375rem` (6px) |
+| `--space-md` | `0.75rem` (12px) | | `--radius-lg` | `0.5rem` (8px) |
+| `--space-lg` | `1rem` (16px) | | `--icon-size-sm` | `0.875rem` (14px) |
+| `--space-xl` | `1.5rem` (24px) | | `--icon-size-md` | `1rem` (16px) |
+| `--duration-fast` | `0.15s` | | `--icon-size-lg` | `1.25rem` (20px) |
+| `--duration-normal` | `0.2s` | | `--duration-slow` | `0.3s` |
 
 ```css
 .card {
@@ -73,6 +89,48 @@ What each piece does — include only what you need:
 }
 .card a { color: var(--accent); }
 ```
+
+#### Respect the user's font size — size in `rem`, never `px`
+
+The user's UI-scale preference is applied as the **root font-size**
+(`html { font-size: var(--user-ui-scale, 100%) }`), so **only `rem`/`em` units
+scale with it.** An app that sizes text, padding, gaps, and radii in `px`
+renders at a fixed size and silently ignores the user's font-size setting — the
+single most common "the app doesn't respect my font size" bug. Size everything
+in `rem` (divide px by 16: 14px → `0.875rem`, 24px → `1.5rem`), and prefer the
+`--space-*` / `--radius-*` tokens above for spacing and corners. Match Lucidos's
+type scale — body text ≈ `0.8125rem`–`0.875rem`, small/meta ≈ `0.6875rem`,
+headings via the `h1`–`h6` defaults `sdk-iframe.css` already ships. (`1px`
+borders are the one acceptable `px` exception, same as the host shell.)
+
+### Component classes
+
+`sdk-iframe.css` also ships Lucidos's shared component layer — literally the
+**same CSS the host shell uses, from one source**: the engine appends
+`crates/lucidos-app/src/styles/global/shared-components.css` (which the host
+itself imports via `global.css`) to the served stylesheet. There is no copy and
+nothing to keep in sync — apply these class names and your app's controls render
+exactly like the rest of Lucidos (and track the theme + UI scale for free). The
+one exception is the app-facing `.action-btn-secondary` below, which lives in the
+engine's `sdk-iframe.css` (the host has no equivalent, so it isn't in the shared
+file). The class names are the contract:
+
+| Class | Use for |
+|---|---|
+| `.action-btn` (+ `.action-btn-confirm` green, `.action-btn-danger` red) | The filled primary CTA button — blue, with the confirm/danger variants additive (`class="action-btn action-btn-danger"`) |
+| `.action-btn-secondary` | A neutral, outlined secondary button for a lower-emphasis action beside a primary CTA — additive: `class="action-btn action-btn-secondary"`. **Use this instead of hand-rolling an off-palette outlined button.** |
+| `.icon-btn` | A small borderless icon button (wrap an SVG sized via `--icon-size-sm`) |
+| `.accent-link` | An inline text link/button in the accent color |
+| `.label` | A small uppercase badge |
+| `.title` | A list/panel/modal title |
+| `.segmented-control` + `.segmented-btn` (`.active`) | A toggle button group |
+| `.list-rows`, `.list-row`, `.list-row-info`, `.list-row-name`, `.list-row-actions`, `.list-section-title`, … | List/row layouts |
+| `.markdown-content` | A container for rendered markdown (headings, tables, code, blockquotes) |
+| `.progress-bar` + `.progress-bar-fill`, `.progress-label` | A progress indicator |
+| `.empty-state`, `.error-text` | Empty/error placeholders |
+
+Prefer these over hand-rolling buttons and rows — a plain unclassed `<button>`
+gets a neutral default that does **not** match Lucidos's primary blue button.
 
 Apps using `lucidos._capture()` don't need to include `html2canvas` — the SDK loads it on demand from `/api/v1/static/html2canvas.min.js`. `html2canvas` can't rasterize CSS Color 4 functions (`color()`, `oklab()`, `oklch()`, `color-mix()`); when the screenshot fails for any reason the capture degrades to **DOM-only** — it returns an empty `screenshot` plus a `dom` layout snapshot (element positions + classes) prefixed with the failure reason, rather than throwing. The agent still sees the rendered layout instead of going blind.
 
@@ -166,7 +224,7 @@ const src = lucidos.data.url('artifacts/screenshots/latest.png');
 
 ### `url` and app-bundled assets
 
-`lucidos.data.url(path)` normally returns a `/data/...` URL, which always serves from the live workspace. When the SDK is loaded inside an app iframe (`/app/<id>/...`) and `path` points at the app's own bundled folder (`apps/<id>/<rest>`), it instead returns a `/app/<id>/<rest>` URL and carries over `?thread_id=` or `?commit=` from the iframe. This makes JS-set asset URLs (e.g. `img.src = lucidos.data.url('apps/my-app/icon.png')`) load correctly in WIP-preview and historical views — without it, the engine's HTML rewriter only covers markup `src` / `href` attributes and JS-set sources silently 404 against the live workspace. Cross-app references (`apps/<other>/...`) and non-app paths (`artifacts/...`, `knowhow/...`) keep the `/data/` route unchanged.
+`lucidos.data.url(path)` normally returns a `/data/...` URL, which always serves from the live workspace. When the SDK is loaded inside an app iframe (`/app/<id>/...`) and `path` points at the app's own bundled folder (`apps/<id>/<rest>`), it instead returns a `/app/<id>/<rest>` URL and carries over `?thread_id=` from the iframe. This makes JS-set asset URLs (e.g. `img.src = lucidos.data.url('apps/my-app/icon.png')`) load correctly in WIP-preview — without it, the engine's HTML rewriter only covers markup `src` / `href` attributes and JS-set sources silently 404 against the live workspace. Cross-app references (`apps/<other>/...`) and non-app paths (`artifacts/...`, `knowhow/...`) keep the `/data/` route unchanged.
 
 ## lucidos.events — Event Store
 
@@ -720,7 +778,7 @@ lucidos.ui.Select.create(opts: SelectCreateOptions): SelectInstance
 lucidos.ui.enhanceSelects(root?: ParentNode): SelectInstance[]
 ```
 
-`applyPreferences()` fetches user preferences and applies theme, font, and scale as CSS variables (resolving a `system` theme to the live OS light/dark). Call once on app load, and style your app with the theme variables (§ Theme variables, under Setup) so it follows the user's appearance — don't hardcode colors.
+`applyPreferences()` fetches user preferences and applies theme, font, and scale as CSS variables (resolving a `system` theme to the live OS light/dark). Call once on app load, and style your app with the theme variables (§ Theme variables, under Setup) so it follows the user's appearance — don't hardcode colors. For each setting it prefers the server value, then the value the synchronous `sdk-prefs.js` script already applied from the parent shell's `localStorage`, and only then a default — so a device with no server-scoped value (e.g. only `ui-scale` stored, no `theme`) keeps the user's appearance instead of resetting to dark.
 
 `watchPreferences()` subscribes to live preference changes (SSE `PreferencesChanged`) and re-applies them automatically. Call it once alongside `applyPreferences()` so the app reacts when the user toggles light/dark — or when the OS appearance changes under a `system` preference — without a reload.
 

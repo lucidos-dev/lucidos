@@ -11,12 +11,22 @@ export { SwipeTouch } from '../../utils/swipe';
 // Rubber band factor at edges (0 = no movement, 1 = full movement)
 const RUBBER_BAND = 0.3;
 
-/** Width of the screen-edge strip (px) where a touch is treated as a potential
- *  iOS back/forward navigation swipe and suppressed. Narrow so vertical
- *  scrolling and content taps (content carries its own horizontal padding)
- *  outside the strip are unaffected. iOS's interactive pop gesture activates
- *  from roughly the outermost ~20pt, so this comfortably covers it. */
-export const EDGE_NAV_GUARD_PX = 24;
+/** Width of the LEFT screen-edge strip (px) treated as a potential iOS *back*
+ *  navigation swipe and suppressed. It MUST cover the full `.edge-swipe-left`
+ *  zone (2.5rem ≈ 40px in mobile.css): over an app iframe in the content pane,
+ *  the ONLY place a pane swipe can begin is that edge zone (the iframe captures
+ *  every other touch), so an app→thread back-swipe is forced to start there
+ *  every time. With the old 24px guard, a swipe beginning in the 24–40px band
+ *  reached the in-app handler but did NOT preventDefault — so WebKit's native
+ *  pop gesture fired and the PWA navigated out to the workspace gateway picker.
+ *  Matching the zone width closes that band. iOS's interactive pop activates
+ *  from roughly the outermost ~20pt, well within 40px. */
+export const EDGE_NAV_GUARD_LEFT_PX = 40;
+
+/** Width of the RIGHT screen-edge strip — the *forward* navigation gesture.
+ *  Covers the `.edge-swipe-right` zone (1.25rem ≈ 20px) with a little margin.
+ *  Kept narrower than the left strip so it stays clear of content/scrolling. */
+export const EDGE_NAV_GUARD_RIGHT_PX = 24;
 
 /** Pure decision: should a touchstart at `clientX` call preventDefault() to
  *  suppress iOS's native back/forward navigation swipe?
@@ -25,8 +35,9 @@ export const EDGE_NAV_GUARD_PX = 24;
  *  and WebKit's edge recognizer commits before our in-app 8px horizontal lock
  *  (SwipeTouch) — so preventing the default in onTouchMove runs too late. The
  *  only reliable suppression is preventDefault on the touchstart itself. Scoped
- *  to the screen-edge strip and to non-interactive, non-text-input targets so
- *  taps on edge controls and vertical scrolling elsewhere survive. */
+ *  to the screen-edge strips (sized to the `.edge-swipe-*` zones) and to
+ *  non-interactive, non-text-input targets so taps on edge controls and
+ *  vertical scrolling elsewhere survive. */
 export function shouldSuppressEdgeNavigation(args: {
   clientX: number;
   viewportWidth: number;
@@ -35,7 +46,7 @@ export function shouldSuppressEdgeNavigation(args: {
 }): boolean {
   const { clientX, viewportWidth, targetIsInteractive, textInputFocused } = args;
   if (targetIsInteractive || textInputFocused) return false;
-  return clientX <= EDGE_NAV_GUARD_PX || clientX >= viewportWidth - EDGE_NAV_GUARD_PX;
+  return clientX <= EDGE_NAV_GUARD_LEFT_PX || clientX >= viewportWidth - EDGE_NAV_GUARD_RIGHT_PX;
 }
 
 /** Pure decision: what value should `--app-height` be written to, given the

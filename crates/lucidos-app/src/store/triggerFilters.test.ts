@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { triggers, historicalTriggers, threadMap, selectedTriggerIds } from './store';
+import { triggers, historicalTriggers, threadMap, selectedTriggerIds, includeDeletedFilterOptions } from './store';
 import { triggerFilterOptions } from './triggerFilters';
 import { makeOptimisticThreadState } from './thread-events';
 import { makeTrigger } from './__tests__/fixtures';
@@ -23,6 +23,9 @@ describe('triggerFilterOptions', () => {
     historicalTriggers.value = { status: 'not-loaded' };
     threadMap.value = new Map();
     selectedTriggerIds.value = new Set();
+    // These cases assert deleted-entry labeling/sorting, which is independent
+    // of the include-deleted toggle — opt in so deleted rows are listed.
+    includeDeletedFilterOptions.value = true;
   });
 
   it('returns empty list while the registry is still loading', () => {
@@ -173,5 +176,33 @@ describe('triggerFilterOptions', () => {
       { id: 'new-uuid', label: 'Nightly Build', deleted: false },
       { id: 'old-uuid', label: 'Nightly Build', deleted: true, lastActivity: '2026-04-25T00:00:00Z' },
     ]);
+  });
+});
+
+describe('triggerFilterOptions — include-deleted toggle', () => {
+  beforeEach(() => {
+    triggers.value = { status: 'loaded', data: [makeTrigger({ id: 'live-1', name: 'Live One' })] };
+    historicalTriggers.value = {
+      status: 'loaded',
+      data: [{ id: 'gone-1', name: 'Old Trigger', last_activity: '2026-04-15T00:00:00Z' }],
+    };
+    threadMap.value = new Map();
+    selectedTriggerIds.value = new Set();
+  });
+
+  it('excludes deleted triggers when the toggle is off (default)', () => {
+    includeDeletedFilterOptions.value = false;
+    expect(triggerFilterOptions.value.map(o => o.id)).toEqual(['live-1']);
+  });
+
+  it('includes deleted triggers when the toggle is on', () => {
+    includeDeletedFilterOptions.value = true;
+    expect(triggerFilterOptions.value.map(o => o.id)).toEqual(['live-1', 'gone-1']);
+  });
+
+  it('keeps a selected deleted trigger visible even when the toggle is off (stays clearable)', () => {
+    includeDeletedFilterOptions.value = false;
+    selectedTriggerIds.value = new Set(['gone-1']);
+    expect(triggerFilterOptions.value.map(o => o.id)).toEqual(['live-1', 'gone-1']);
   });
 });

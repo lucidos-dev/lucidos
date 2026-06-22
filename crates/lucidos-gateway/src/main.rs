@@ -76,6 +76,16 @@ fn main() -> Result<(), BoxError> {
         return Ok(());
     }
 
+    // `--build-id` — print the baked build id and exit, BEFORE any runtime/port/PG
+    // touch. A running gateway spawns `current_exe --build-id` to learn the on-disk
+    // binary's id for the picker's "new gateway available" badge, so this must be a
+    // single bare line on stdout (no log prefix), like `--version`. See
+    // `server::gateway_build_id` and `docs/plans/2026-06-18-gateway-reload-control.md`.
+    if std::env::args().skip(1).any(|a| a == "--build-id") {
+        println!("{}", server::GATEWAY_BUILD_ID);
+        return Ok(());
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(WORKER_THREAD_STACK_SIZE)

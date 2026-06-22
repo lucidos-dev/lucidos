@@ -2,7 +2,6 @@ import { signal } from '@preact/signals';
 import { focusedThreadId, isMidTurn } from '../../store/store';
 import { computeExchanges, findQuestionAnswer } from '../../store/thread-events';
 import type { ThreadState, ThreadStatus } from '../../store/thread-events';
-import type { BannerState } from './WaitingBanner';
 
 // Pure prompt-input logic + the optimistic-send signal. Extracted from
 // PromptInput.tsx (re-exported there); imported directly by *.test.ts.
@@ -100,9 +99,9 @@ export function composeHasContent(
 // The button is always rendered EXCEPT in 'hidden' mode so Send↔Cancel keeps
 // its color morph without a DOM swap; the leave path snap-unmounts like the
 // sibling section buttons — no fade-out, no position:absolute jump.
-//   send        — visible, blue, click=submit
-//   cancel      — visible, red,  click=cancel exchange
-//   canceling   — visible, red,  disabled, label "Cancel..."
+//   send        — visible, blue, click=submit          (up-arrow icon)
+//   cancel      — visible, red,  click=cancel exchange  (stop-square icon)
+//   canceling   — visible, red,  disabled               (stop-square icon, dimmed)
 //   placeholder — invisible (visibility:hidden, takes space) to keep row height
 //   hidden      — not rendered; banner or section buttons own the slot
 type MorphMode = 'send' | 'cancel' | 'canceling' | 'placeholder' | 'hidden';
@@ -117,6 +116,30 @@ export function computeMorphMode(args: {
   if (args.cancelTargetId !== null) return args.isCanceling ? 'canceling' : 'cancel';
   if (args.hasBannerOrSectionButtons) return 'hidden';
   return 'placeholder';
+}
+
+// What the prompt-row action shows while the thread is `waiting_for_user_answer`
+// (a pending user question OR permission). The morph button (computeMorphMode)
+// is NOT used in this state — this control replaces it so "Stop" is never the
+// prominent default while the agent is waiting on the user.
+//   canceling — disabled "Canceling…" (a Cancel is in flight)
+//   multi     — split button: Submit (N) primary + caret → red Cancel menu.
+//               Multi-select always shows Submit (disabled at zero selections),
+//               so the caret is the only place a Cancel fits — hence the split.
+//   submit    — lone green Submit: a freetext/custom answer has been typed.
+//   cancel    — lone red Cancel: nothing to submit (single-select / permission /
+//               empty freetext); the forward action lives in the card above.
+export type AnswerActionMode = 'canceling' | 'multi' | 'submit' | 'cancel';
+
+export function computeAnswerActionMode(args: {
+  pendingMultiQ: boolean;
+  hasContent: boolean;
+  isCanceling: boolean;
+}): AnswerActionMode {
+  if (args.isCanceling) return 'canceling';
+  if (args.pendingMultiQ) return 'multi';
+  if (args.hasContent) return 'submit';
+  return 'cancel';
 }
 
 // Stamp cancelTargetId BEFORE invoking send. sendCompose's sync prefix
@@ -203,22 +226,4 @@ export function shouldClearCanceling(
 ): boolean {
   if (!isMidTurn(status)) return true;
   return canceledQuestionId !== undefined && latestPendingQuestionId !== canceledQuestionId;
-}
-
-// Apply & Restart is the only case where the bottom sub-row
-// [Save][Discard][Apply & Restart] still overflows a phone-width
-// .prompt-actions-subrow (no flex-wrap) after Diff lifts. Lift Save too so
-// [Discard][Apply & Restart] stays on a row that fits.
-export function shouldLiftSectionButtons(
-  isStacked: boolean,
-  bannerState: BannerState | null,
-): boolean {
-  return Boolean(
-    isStacked
-      && bannerState?.type === 'actions'
-      // "Apply & Restart" is the only label wide enough to overflow the
-      // phone-width sub-row after Diff lifts. The restart state is carried on
-      // the Apply TaggedAction's label (single-sourced from the selector).
-      && bannerState.actions.some((a) => a.kind === 'apply' && a.label === 'Apply & Restart'),
-  );
 }

@@ -71,11 +71,11 @@ export const data = {
     // asks for the app's *own* bundled asset (`apps/<id>/foo.png`), route
     // through `/app/<id>/foo.png?<carried>` instead of `/data/...`. The
     // `/app/:app_id/*path` route honours `?thread_id=` (WIP preview from a
-    // coding-agent worktree) and `?commit=` (historical view) — the static
-    // `/data/` mount does not, so a JS-set src would 404 in WIP-preview even
-    // when the asset exists on the agent's branch. The engine's HTML rewriter
-    // (api/app_ui.rs) handles markup `<img src="…">` but skips `<script>`
-    // bodies, leaving JS-set src as the remaining footgun this closes.
+    // coding-agent worktree) — the static `/data/` mount does not, so a JS-set
+    // src would 404 in WIP-preview even when the asset exists on the agent's
+    // branch. The engine's HTML rewriter (api/app_ui.rs) handles markup
+    // `<img src="…">` but skips `<script>` bodies, leaving JS-set src as the
+    // remaining footgun this closes.
     if (typeof window !== 'undefined') {
       const appUrl = buildAppLocalUrl(
         path,
@@ -116,10 +116,10 @@ function encodePathSegments(path: string): string {
  * If the SDK is loaded inside `/app/<currentAppId>/...` and `path` refers to
  * an asset under the same app's folder (`apps/<currentAppId>/<rest>`), build
  * the equivalent `/app/<currentAppId>/<rest>?<carried>` URL — carrying over
- * `?thread_id=` or `?commit=` from the iframe so the asset request lands on
- * the same WIP / historical / live branch as the iframe itself. Returns
- * `null` for every other case so the caller falls through to the default
- * `/data/...` mount (which serves from the live workspace).
+ * `?thread_id=` from the iframe so the asset request lands on the same WIP /
+ * live branch as the iframe itself. Returns `null` for every other case so the
+ * caller falls through to the default `/data/...` mount (which serves from the
+ * live workspace).
  *
  * Exported for unit testing — the production call site reads `pathname` /
  * `search` / `baseUrl` from `window` + `getBaseUrl()`.
@@ -140,9 +140,7 @@ export function buildAppLocalUrl(
   const params = new URLSearchParams(search);
   const carry = new URLSearchParams();
   const threadId = params.get('thread_id');
-  const commit = params.get('commit');
   if (threadId) carry.set('thread_id', threadId);
-  else if (commit) carry.set('commit', commit);
   const qs = carry.toString();
 
   const encodedAppId = encodeURIComponent(appId);

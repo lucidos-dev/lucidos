@@ -1,17 +1,20 @@
 import { useEffect, useRef } from 'preact/hooks';
-import { engineRestarting } from '../../store/store';
 import { clientRefreshing } from '../../hooks/sw-update';
-import { handleRestartTimeout } from '../../store/actions/connection';
 
-const RESTART_TIMEOUT_MS = 300_000;
-
-/** Full-screen blocker shown while the UI must be locked: during an engine
- *  restart (`engineRestarting`) or a client refresh (`clientRefreshing`). Both
- *  cover the screen, drop focus, swallow keystrokes, and mark every sibling
- *  inert so no click, focus, or input lands mid-transition. The toast container
- *  stays interactive so the restart status toast remains visible/dismissible. */
+/** Full-screen blocker shown while a client refresh (`clientRefreshing`) swaps
+ *  the service worker and reloads: it covers the screen, drops focus, swallows
+ *  keystrokes, and marks every sibling inert so no click, focus, or input lands
+ *  mid-reload. The toast container stays interactive so the "Refreshing…" status
+ *  toast remains visible.
+ *
+ *  Engine restart deliberately does NOT block here: the gateway boot splash, the
+ *  GET-gate (`awaitEngineReady`), and SSE auto-reconnect make a restart a
+ *  recoverable non-event, so the initiating tab stays interactive and only shows
+ *  a light dismissible "Restarting engine…" toast. The restart safety-timeout
+ *  that used to live in this effect now rides `engineRestarting` directly in
+ *  `store/effects.ts`. */
 export function UiBlockingOverlay() {
-  const active = engineRestarting.value || clientRefreshing.value;
+  const active = clientRefreshing.value;
   const overlayRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -53,21 +56,15 @@ export function UiBlockingOverlay() {
       }
     }
 
-    // Safety timeout — restart only. If the engine never comes back, unblock the
-    // UI; handleRestartTimeout probes health before declaring a timeout so a
-    // frozen timer firing on iOS PWA resume (engine already restarted) doesn't
-    // show a false error — see its doc comment in connection.ts. A refresh needs
-    // no fallback: it always ends in a page reload that tears the overlay down.
-    const timer = engineRestarting.value
-      ? setTimeout(() => { void handleRestartTimeout(); }, RESTART_TIMEOUT_MS)
-      : null;
+    // No safety timeout here — a client refresh always ends in a page reload that
+    // tears this overlay down. (The engine-restart safety timeout lives in
+    // store/effects.ts, keyed on `engineRestarting`.)
 
     return () => {
       document.removeEventListener('keydown', block, true);
       document.removeEventListener('keyup', block, true);
       inerted.forEach((el) => el.removeAttribute('inert'));
       document.documentElement.removeAttribute('data-ui-blocked');
-      if (timer) clearTimeout(timer);
     };
   }, [active]);
 

@@ -270,6 +270,14 @@ This is NOT the user typing into a coding agent. User-typed input fires `CodingA
 
 Distinguishable on the wire by `origin: Some(MessageOrigin::Engine { reason: ... })`. Workspaces should generally not need to subscribe to this — it's an audit trail event, not a lifecycle signal.
 
+## Resume-time notes prepended to the next prompt
+
+When a coding-agent thread resumes (`--resume` replays the prior conversation but NOT what changed on disk or in `main` since), the engine reconciles the gap by prepending up to three short `[Note from engine: …]` blocks to the user's next message. These are NOT persisted events — they ride only on the in-memory prompt text handed to the agent, assembled once in `build_resume_prompt_text` (the single injection point for both Claude Code and Codex), and only when the user's message is non-empty:
+
+- **External edits** — the user committed or modified files in the worktree between turns. Detected by diffing the worktree against the `worktree_head_sha` recorded on the last `CodingAgentIdled`.
+- **Branch adoption** — the worktree was switched to a new branch holding the agent's prior work; the engine adopts it and says so.
+- **Applied change** — the user clicked **Apply**, merging the agent's proposed change into `main` and resetting the worktree to match. The replayed conversation still believes the change is "pending, awaiting Apply", so without the note the agent would wrongly tell the user it's still waiting, or re-propose already-merged work. The note lists the merged commit subjects (with the short post-merge `main` SHA) and instructs the agent to treat `main` as already containing the work. It is **stateless and self-clearing**: it surfaces every `ChangeApplied` whose `sequence` falls between the *previous* turn boundary and the *current* turn's triggering message. The current turn's `MessageReceived` is persisted before the agent is resumed, so it's excluded by id (making the threshold the previous boundary); the boundary set is `MessageReceived` (the real user-message event on coding-agent threads), `CodingAgentUserMessageSent` (legacy), and `CodingAgentPromptSent` (engine-synthesized prompts). Because every turn has a `MessageReceived`, this turn's message becomes the next turn's boundary, so an apply is surfaced exactly once and never re-fires — no per-turn engine prompt required. No new event, projection column, or migration backs it; the `events` table is the cursor.
+
 ## Recipe-shaped guidance
 
 For the trigger config field reference (cron format, the `on` subscription list, per-entry `condition` operators), see `system-knowhow/building-a-trigger.md`. The condition language is `$eq` / `$ne` / `$lt` / `$lte` / `$gt` / `$gte` / `$in` over top-level payload fields (a bare value is `$eq`); see `crates/lucidos-engine/src/triggers/condition.rs` for the full operator set.

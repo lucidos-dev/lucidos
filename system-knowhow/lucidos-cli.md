@@ -363,22 +363,26 @@ curl -k -X POST \
 
 Use `$LUCIDOS_API_BASE_URL` (set by the engine on every spawned subprocess) rather than building the URL from `$LUCIDOS_API_PORT` yourself: under the workspace gateway (ADR 0014) the engine binds a **loopback HTTP** port and the user-facing port belongs to the gateway, which routes the workspace under `/<slug>/` — a bare `https://localhost:$LUCIDOS_API_PORT/api/v1/...` request there never reaches the engine (the gateway resolves the first path segment as a workspace slug). `$LUCIDOS_API_BASE_URL` is the exact base the engine answers on (loopback `http://` under the gateway; `https://` self-signed in the legacy single-engine model, which `-k` / `_create_unverified_context()` accepts). The fallback to `$LUCIDOS_API_PORT` covers older engines that predate the var. The token env var is process-local secret state set by the engine on every spawned subprocess; the thread id is set when the subprocess has a spawning thread. See `docs/apply-change-api.md` for the response shape and the full apply workflow.
 
-### `lucidos planned mark (--plan <path> | --simple "<reason>")` / `lucidos planned state`
+### `lucidos planned mark (--plan <path> | --simple "<reason>")` / `lucidos planned approve` / `lucidos planned state`
 
-Record or query the *plan marker* — the durable enforcement that the `implementation-plan` skill (or an explicit local-fix acknowledgment) ran before a *Lucidos-source* coding-agent branch is edited and applied. A marker MUST exist on the branch or Claude Code's first source edit is blocked (the `cc-plan-gate` PreToolUse hook) and Apply is refused (the engine's plan floor). Wraps `POST /api/v1/internal/mark-planned` / `GET /api/v1/internal/planned-state`.
+Record, approve, or query the *plan marker* — the durable enforcement that the `implementation-plan` skill ran AND the human approved its plan (or that a local fix was acknowledged) before a *Lucidos-source* coding-agent branch is edited and applied. A **gate-satisfying** marker MUST exist on the branch or Claude Code's first source edit is blocked (the `cc-plan-gate` PreToolUse hook) and Apply is refused (the engine's plan floor). Wraps `POST /api/v1/internal/mark-planned` / `POST /api/v1/internal/approve-plan` / `GET /api/v1/internal/planned-state`.
 
 ```bash
-# Complex work: the implementation-plan skill writes the plan, then records this for you:
-lucidos planned mark --plan docs/plans/2026-06-18-my-change.md
+# Complex work: the implementation-plan skill writes the plan, then records this for you.
+# This records the AWAITING-APPROVAL `proposed` state — it does NOT unblock editing:
+lucidos planned mark --plan docs/plans/2026-06-19-my-change.md
 
-# Genuinely local fix that doesn't warrant a plan — acknowledge instead:
+# Present the plan to the user. Once the user APPROVES in chat, flip it to gate-satisfying:
+lucidos planned approve
+
+# Genuinely local fix that doesn't warrant a plan — acknowledge instead (no approval needed):
 lucidos planned mark --simple "rename a misspelled variable"
 
-# Inspect the current branch's marker (PRESENT or MISSING):
+# Inspect the current branch's marker (SATISFIED, PROPOSED, or MISSING):
 lucidos planned state
 ```
 
-`mark` resolves repo_root / branch / HEAD from `$PWD`'s git worktree (like `lucidos hardened mark`). Pass exactly one of `--plan` / `--simple`. Both recorded states satisfy every gate; only the absence of a marker blocks. App coding-agent threads and external repos are exempt (the gate is a no-op there). Normally you don't call `mark --plan` by hand — the `implementation-plan` skill does — but `mark --simple` is the agent's escape hatch for a change too small to plan. (`lucidos cc-plan-gate` is the hidden PreToolUse hook that enforces this; it is not invoked directly.)
+`mark` / `approve` resolve repo_root / branch / HEAD from `$PWD`'s git worktree (like `lucidos hardened mark`). Pass exactly one of `--plan` / `--simple`. **`mark --plan` records `proposed` (awaiting approval) — it does NOT satisfy the gate.** The agent must present the plan to the user and, only after the user approves in chat, run `lucidos planned approve` to flip `proposed`→`planned` (gate-satisfying). If the user requests changes, revise the plan file, re-commit, and re-present (the marker stays `proposed`). `mark --simple` records `acknowledged_simple` directly — local fixes need no approval. `planned` and `acknowledged_simple` satisfy every gate; `proposed` and the absence of a marker both block. App coding-agent threads and external repos are exempt (the gate is a no-op there). Normally you don't call `mark --plan` / `approve` by hand — the `implementation-plan` skill drives them — but `mark --simple` is the agent's escape hatch for a change too small to plan. (`lucidos cc-plan-gate` is the hidden PreToolUse hook that enforces this; it is not invoked directly.)
 
 ### `lucidos knowhow list`
 

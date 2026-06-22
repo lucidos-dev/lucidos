@@ -315,10 +315,6 @@ export async function createBackup(provider: string): Promise<void> {
   });
 }
 
-export async function listBackups(provider: string): Promise<BackupEntry[]> {
-  return json(`${API}/backup/list?provider=${encodeURIComponent(provider)}`);
-}
-
 /** Persisted outcome of the last backup run — survives engine restarts. */
 export interface BackupLastRun {
   status: 'success' | 'failure';

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { connectionStatus, toasts, restartRequired, restartGroups, engineStartedAt, updateAvailable, latestTauriAppVersion, engineVersion, latestEngineVersion, engineRestarting } from '../store';
+import { connectionStatus, toasts, showToast, restartRequired, restartGroups, engineStartedAt, updateAvailable, latestTauriAppVersion, engineVersion, latestEngineVersion, engineRestarting } from '../store';
 import { syncRestartToast, RESTART_LS_KEY } from '../actions/chat-changes';
 
 // Mock dependencies so checkConnection can run in isolation
@@ -137,6 +137,39 @@ describe('restart toast survives network reconnect', () => {
     // Toast must be dismissed
     expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)).toBeFalsy();
     expect(localStorage.getItem(RESTART_LS_KEY)).toBeNull();
+  });
+
+  it('advances the restart status toast to the swap phase when the old engine goes unreachable', async () => {
+    await establishConnection();
+
+    // Restart in flight: the build-phase status toast is up (initiateEngineRestart).
+    engineRestarting.value = true;
+    toasts.value = [];
+    showToast('Building the new version…', 'info', { key: RESTART_TOAST_KEY, showDuringRestart: true, spinning: true });
+
+    // Build finished, old engine killed → first /health failure flips the toast
+    // to the swap phase even before the dot debounce trips (advance is gated on
+    // the raw health result, not the displayed connection status).
+    mockCheckHealth.mockResolvedValueOnce(unreachable);
+    await checkConnection();
+
+    const toast = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
+    expect(toast).toBeTruthy();
+    expect(toast!.message).toBe('Starting and swapping to new engine…');
+    expect(toast!.spinning).toBe(true);
+  });
+
+  it('does not advance the restart toast on a transient blip when no restart is in flight', async () => {
+    await establishConnection();
+
+    // No restart underway — a one-off health failure must not invent a swap toast.
+    engineRestarting.value = false;
+    toasts.value = [];
+
+    mockCheckHealth.mockResolvedValueOnce(unreachable);
+    await checkConnection();
+
+    expect(toasts.value.find(t => t.message === 'Starting and swapping to new engine…')).toBeUndefined();
   });
 
   it('does not set updateAvailable on engine restart when the frontend bundle is unchanged', async () => {

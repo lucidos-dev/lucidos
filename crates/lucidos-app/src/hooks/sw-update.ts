@@ -12,33 +12,44 @@ import { withBase } from '../utils/basePath';
  *  avoid a store ↔ sw-update import cycle. */
 export const clientRefreshing = signal(false);
 
-/** Guards against showing the SW update toast spuriously.
+/** Build-id-aware dismiss for the "New version available" toast.
  *
- *  Two checks prevent false positives:
- *  1. `hadControllerAtStartup` — false on the very first install (no prior SW),
- *     which means `updatefound` is not a genuine update.
- *  2. sessionStorage dismiss flag — set when the user dismisses the toast or
- *     clicks Refresh. Consumed on next check so a genuinely new update still
- *     shows the toast.
- */
-
+ *  The toast is surfaced by `syncClientUpdateFromBuild` (store/actions/
+ *  client-update.ts) — the reliable check that compares the LOADED bundle's
+ *  `CLIENT_BUILD_ID` against the served `/sw.js` BUILD_ID. That check re-runs on
+ *  every resume, so a plain "dismissed" boolean would either re-nag the user on
+ *  the next tab refocus or, if made sticky, permanently swallow a genuinely
+ *  NEWER build's toast. So we remember the EXACT served build id the user
+ *  dismissed: the toast stays gone for that build, but a different (newer) served
+ *  build re-surfaces it.
+ *
+ *  `noteUpdateBuildId` records which served build the live toast is offering, so
+ *  a dismiss that only knows the toast key (the Toast close button →
+ *  `dismissToast('update-available')` in store.ts) can still pin the right id. */
 const SW_DISMISSED_KEY = 'lucidos-sw-update-dismissed';
 
-export function shouldShowSwUpdateToast(hadControllerAtStartup: boolean): boolean {
-  if (!hadControllerAtStartup) return false;
-  try {
-    if (sessionStorage.getItem(SW_DISMISSED_KEY)) {
-      sessionStorage.removeItem(SW_DISMISSED_KEY);
-      return false;
-    }
-  } catch { /* sessionStorage unavailable (e.g. opaque origin) */ }
-  return true;
+/** The served BUILD_ID the currently-shown update toast is offering. Set by
+ *  `surfaceUpdateToast` so `markSwUpdateDismissed` (no-arg, called from the
+ *  store's keyed dismiss) can record THIS build as dismissed. */
+let pendingUpdateBuildId: string | null = null;
+
+export function noteUpdateBuildId(servedBuildId: string): void {
+  pendingUpdateBuildId = servedBuildId;
 }
 
 export function markSwUpdateDismissed(): void {
+  if (pendingUpdateBuildId === null) return; // nothing to pin
   try {
-    sessionStorage.setItem(SW_DISMISSED_KEY, 'true');
-  } catch { /* sessionStorage unavailable */ }
+    sessionStorage.setItem(SW_DISMISSED_KEY, pendingUpdateBuildId);
+  } catch { /* sessionStorage unavailable (e.g. opaque origin) */ }
+}
+
+export function wasSwUpdateDismissed(servedBuildId: string): boolean {
+  try {
+    return sessionStorage.getItem(SW_DISMISSED_KEY) === servedBuildId;
+  } catch {
+    return false; // sessionStorage unavailable — surfacing the toast is the safe default
+  }
 }
 
 /** Spread of delays (ms) over which we re-check the service worker for a new

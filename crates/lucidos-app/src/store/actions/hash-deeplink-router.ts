@@ -27,15 +27,30 @@ import {
   stripDeepLinkFromUrl,
 } from './notification-deeplink';
 import { dispatchDeepLink } from './in-app-notification-toast';
+import { postClientLog } from '../../utils/liveness';
 
 export function handleHashLocation(): void {
   const hashMatch = THREAD_HASH_RE.exec(window.location.hash);
   if (hashMatch) {
+    // Diagnostic breadcrumb (best-effort telemetry, no user intent): records that
+    // the bare cross-workspace `#thread=` channel routed. Lets a "push tap opened
+    // the app but went nowhere" report be traced to the exact router branch.
+    postClientLog('deeplink', 'route_thread_hash', { thread: hashMatch[1] });
     window.history.replaceState({}, '', window.location.pathname + window.location.search);
     focusThreadOrBootstrap(hashMatch[1]);
     return;
   }
   const target = parseDeepLinkFromUrl(window.location);
+  // Diagnostic breadcrumb: did the router find deep-link params, and what tap?
+  // The iOS declarative-push deep-link path is otherwise silent — this is how we
+  // see whether the reload landed the params and which action was dispatched.
+  postClientLog('deeplink', 'handle_hash_location', {
+    found: hasDeepLinkParams(target),
+    has_notification: !!target.notification,
+    has_thread: !!target.thread,
+    tap_kind: target.tap?.kind ?? null,
+    search: (() => { try { return window.location.search.slice(0, 200); } catch { return ''; } })(),
+  });
   if (!hasDeepLinkParams(target)) return;
   const cleaned = stripDeepLinkFromUrl(new URL(window.location.href));
   window.history.replaceState({}, '', cleaned.toString());

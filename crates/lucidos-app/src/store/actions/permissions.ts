@@ -1,4 +1,4 @@
-import { postCommandConsent, postMcpConsent } from '../../api/client';
+import { postCommandConsent, postMcpConsent, postMcpPermissionConsent } from '../../api/client';
 import type { PersistScope } from '../thread-events';
 import { scrollToBottom } from '../../components/chat/scrollState';
 
@@ -10,9 +10,8 @@ import { scrollToBottom } from '../../components/chat/scrollState';
  *  bottom — the same contract `answerThreadQuestion` gives the question card.
  *
  *  Throws on a failed POST; the card's optimistic `decide` rolls back its
- *  pending state and toasts. Deliberately NOT used by the modal MCP-server
- *  consent flow (`thread-sync` `McpConsentPromptRequested`), which is a
- *  `showConfirm` dialog with no transcript to pin. */
+ *  pending state and toasts. Used by all three in-thread permission cards
+ *  (coding-agent, command guard, chat MCP). */
 async function resolveAndPin(
   consent: (id: string, allowed: boolean, persist?: PersistScope) => Promise<void>,
   requestId: string,
@@ -40,4 +39,13 @@ export function resolveCommandPermission(
   persist?: PersistScope,
 ): Promise<void> {
   return resolveAndPin(postCommandConsent, requestId, allowed, persist);
+}
+
+/** Resolve a chat MCP permission card (MCP server tool call). */
+export function resolveMcpPermission(
+  requestId: string,
+  allowed: boolean,
+  persist?: PersistScope,
+): Promise<void> {
+  return resolveAndPin(postMcpPermissionConsent, requestId, allowed, persist);
 }

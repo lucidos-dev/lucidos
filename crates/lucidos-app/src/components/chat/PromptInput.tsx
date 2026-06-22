@@ -1,10 +1,9 @@
 import { useRef, useEffect, useState, useMemo } from 'preact/hooks';
 import { Overlay } from '../shared/Overlay';
 import { signal, useSignalEffect } from '@preact/signals';
-import { pendingChatMessage, showToast, showConfirm, openImagePopupFromGroup, focusedThreadId, threadMap, panelUrl, panelTitle, cancelingThreadIds, answeringThreadIds, clearThreadAnswering, effectiveThreadStatus, isMidTurn, currentApp, wipPreviewThreadId, selectedCodingAgent } from '../../store/store';
+import { pendingChatMessage, showToast, openImagePopupFromGroup, focusedThreadId, threadMap, panelUrl, panelTitle, cancelingThreadIds, answeringThreadIds, clearThreadAnswering, effectiveThreadStatus, isMidTurn, currentApp, wipPreviewThreadId, selectedCodingAgent } from '../../store/store';
 import { sendMessage, handleCancelExchange } from '../../store/actions/chat';
 import { currentChatContext, type ChatContext } from '../../store/actions/chatContext';
-import { handleSaveThread, handleUnsaveThread } from '../../store/actions/threads';
 import { answerThreadQuestion } from '../../store/actions/chat-claude-code';
 import { type AnswerKind, type ThreadState } from '../../store/thread-events';
 import {
@@ -22,12 +21,14 @@ import { pushNavState } from '../../store/actions/navigation';
 import { getDraft } from '../../store/composeDrafts';
 import { ComposeDestinationRow } from './ComposeDestinationRow';
 import { scrollToBottom, preserveAtBottom } from './scrollState';
-import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon } from '../shared/icons';
+import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon, PinIcon } from '../shared/icons';
+import { BlobImage } from '../shared/BlobImage';
 import { CodingAgentControlMenu, codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
 import { LucidosControlMenu } from './LucidosControlMenu';
 import { TodoListIndicator } from './TodoListPanel';
 import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton, type BannerState } from './WaitingBanner';
-import { composeHasContent, computeMorphMode, dispatchSend, computeSubmitMultiCount, findPendingMultiSelectQuestion, findLatestPendingQuestion, shouldClearCanceling, shouldLiftSectionButtons, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, type UploadSendIntent } from './prompt-input-helpers';
+import { composeHasContent, computeMorphMode, computeAnswerActionMode, dispatchSend, computeSubmitMultiCount, findPendingMultiSelectQuestion, findLatestPendingQuestion, shouldClearCanceling, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, type UploadSendIntent } from './prompt-input-helpers';
+import { SplitButton } from '../shared/SplitButton';
 import { resolveThreadActions } from '../../store/actions/threadActions';
 export * from './prompt-input-helpers';
 import { useFitsInOneRow } from '../../hooks/useFitsInOneRow';
@@ -119,36 +120,28 @@ function CameraCapture() {
 }
 
 // Pending uploads count as content: while a pasted/picked image is still
-// uploading, treat the prompt as actively composing so the section buttons
-// (Save/Archive) and waiting banner yield to Send. Without this, the Save
-// chip briefly appears in place of Send during the upload window for any
-// thread in the review section.
+// uploading, treat the prompt as actively composing so the waiting banner
+// yields to the Send button (computeMorphMode reads composeHasContent, which
+// includes pending uploads). Without this, the banner's actions briefly show in
+// place of Send during the upload window for any thread in the review section.
 
-function SavePromptButton({ threadId }: { threadId: string }) {
+// Pin toggle — saves/unsaves the focused thread. Lives among the left header
+// icons (not the right action cluster) and reads as a pin rather than a Save
+// text button: a filled pin means saved, an outline pin means not saved.
+// `saved` and `onToggle` come from the save-category TaggedAction so this can
+// never drift from resolveThreadActions (the same selector the close cascade
+// and server-side guards consult). The unsave path confirms internally.
+function PinThreadButton({ saved, onToggle }: { saved: boolean; onToggle: () => void }) {
   return (
     <button
-      class="action-btn action-btn-confirm save-thread-btn"
-      onClick={() => void handleSaveThread(threadId)}
-      aria-label="Save thread"
+      class={`icon-btn header-icon pin-thread-btn${saved ? ' active' : ''}`}
+      onClick={onToggle}
+      aria-pressed={saved}
+      aria-label={saved ? 'Remove thread from Saved section' : 'Save thread'}
+      data-tooltip={saved ? 'Saved — click to unsave' : 'Save thread'}
       data-row-item
     >
-      Save
-    </button>
-  );
-}
-
-// Mid-turn replacement for Archive in the Saved section. Click confirms then
-// drops the thread out of Saved without canceling — once it idles it routes
-// to Active → Review like any other running thread.
-function UnsaveSavedPromptButton({ threadId }: { threadId: string }) {
-  return (
-    <button
-      class="action-btn action-btn-confirm save-thread-btn"
-      onClick={() => void handleUnsaveThread(threadId)}
-      aria-label="Remove thread from Saved section"
-      data-row-item
-    >
-      ✓ Saved
+      <PinIcon filled={saved} />
     </button>
   );
 }
@@ -165,11 +158,18 @@ export function PromptInput() {
   // dense rows. When false, the secondary candidate (the Diff button, in the
   // banner or standalone while composing) lifts to a row above the icons.
   const fitsInOneRow = useFitsInOneRow(promptActionsAreaRef);
-  // Scroll-vs-tap gate for the morph Send→Cancel button. Without it, an iOS
-  // PWA touch that stays under iOS's ~10 px native cancel threshold during a
-  // scroll lands a `click` on whatever sits under the finger — and the morph
-  // button in `waiting_for_user_answer` is a destructive Cancel that aborts
-  // the turn and stamps the pending question as `Canceled`.
+  // Scroll-vs-tap gate for the one-tap prompt buttons — the morph Send→Cancel
+  // and the answer control's Submit / Cancel. Without it, an iOS PWA touch that
+  // stays under iOS's ~10 px native cancel threshold during a scroll lands a
+  // `click` on whatever sits under the finger — worst case the destructive
+  // Cancel that aborts the turn (and stamps any pending question as `Canceled`),
+  // but a stray Submit firing mid-scroll is unwanted too. The morph and the
+  // answer control are mutually exclusive (isAnsweringQuestion switches between
+  // them), so they can share one gate instance. (The multi-select split-button
+  // Submit needs no gate — its caret menu makes the action deliberate.) The
+  // down/move/cancel handlers are wired inline on each gated button rather than
+  // spread from a shared object — `prompt-cancel-tap-gate.test.ts` is a
+  // source-text guard that greps for the literal wiring, so keep it visible.
   const morphGate = useMemo(() => createTapGate(), []);
   // Watch for pending messages from other modules (e.g. new app modal)
   useSignalEffect(() => {
@@ -513,27 +513,24 @@ export function PromptInput() {
       ? waitingState
       : null;
 
-  // sectionButtonNodes carries ONLY the save/unsave toggle — Archive and the
+  // The pin toggle carries ONLY the save/unsave action — Archive and the
   // change actions are rendered by WaitingBanner from the same selector. The
-  // save-category action (Save vs ✓ Saved) is derived from
-  // resolveThreadActions so this button can never drift from the selector that
-  // the close cascade and the server-side guards also consult.
+  // save-category action (save vs unsave) is derived from resolveThreadActions
+  // so the pin can never drift from the selector that the close cascade and the
+  // server-side guards also consult. It renders among the left header icons
+  // rather than the right action cluster.
   const saveAction = tid && focusedThread
     ? resolveThreadActions(tid).find((a) => a.category === 'save')
     : undefined;
-  const sectionButtonNodes = saveAction && tid
-    ? [
-        saveAction.kind === 'unsave'
-          ? <UnsaveSavedPromptButton key="unsave" threadId={tid} />
-          : <SavePromptButton key="save" threadId={tid} />,
-      ]
+  const pinButtonNode = saveAction
+    ? <PinThreadButton saved={saveAction.kind === 'unsave'} onToggle={saveAction.invoke} />
     : null;
 
   const morphMode = computeMorphMode({
     hasContent: morphHasContent,
     cancelTargetId,
     isCanceling,
-    hasBannerOrSectionButtons: !!bannerState || !!sectionButtonNodes,
+    hasBannerOrSectionButtons: !!bannerState,
   });
 
   // Release the optimistic canceling flag once the cancel has landed. The set
@@ -646,23 +643,99 @@ export function PromptInput() {
 
   const submitMultiCount = computeSubmitMultiCount(multiSelectedIds.length, composeText);
   const submitMultiDisabled = submitMultiCount === 0;
-  const submitMultiButton = pendingMultiQ ? (
+
+  // Cancel the current exchange (abort the turn / stamp the pending question
+  // Canceled). Shared by the morph button (running-turn Stop) and the answer
+  // control's Cancel. Snapshots the targeted question id so the cleanup effect
+  // can release the optimistic `cancelingThreadIds` flag even when the agent
+  // answers the cancel by re-asking (thread stays mid-turn). A queued
+  // upload-send is dropped instead — there's no live turn to interrupt yet.
+  function cancelExchangeForTarget() {
+    const targetId = cancelTargetId;
+    if (!targetId) return;
+    const targetQuestionId = findLatestPendingQuestion(focusedThread)?.toolUseId;
+    if (queuedUploadSends.value.has(targetId)) {
+      clearQueuedUploadSend(targetId);
+      setCanceledQuestion(targetId, undefined);
+      return;
+    }
+    setCanceledQuestion(targetId, targetQuestionId);
+    void handleCancelExchange(targetId);
+  }
+
+  // While the thread is `waiting_for_user_answer` (pending question OR
+  // permission) the prompt row swaps the morph Send/Stop for a Submit-default
+  // control (computeAnswerActionMode). Multi-select is the only state that needs
+  // the split button — its Submit is always present, so Cancel lives behind the
+  // caret. Every other state is a lone Submit (while a freetext/custom answer is
+  // typed) or a lone red Cancel (nothing to submit — the forward action lives in
+  // the card above).
+  const answerMode = isAnsweringQuestion
+    ? computeAnswerActionMode({
+        pendingMultiQ: hasPendingMultiQ,
+        hasContent: morphHasContent,
+        isCanceling,
+      })
+    : null;
+  // The three lone-button states share ONE key ("answer-lone") so crossing the
+  // empty↔typed boundary morphs Cancel↔Submit in place rather than
+  // unmounting/remounting the node — the same no-mobile-blink contract the morph
+  // button keeps. Multi-select uses the SplitButton (its own node).
+  const answerControl = answerMode === 'multi' ? (
+    <SplitButton
+      primaryLabel={submitMultiCount > 0 ? `Submit (${submitMultiCount})` : 'Submit'}
+      primaryClassName="action-btn action-btn-confirm"
+      primaryAriaLabel="Submit answer"
+      primaryDisabled={submitMultiDisabled}
+      onPrimary={() => void submitMultiAnswer()}
+      caretClassName="action-btn action-btn-confirm"
+      caretAriaLabel="Cancel this question"
+      menuItems={[{
+        key: 'cancel',
+        label: 'Cancel',
+        className: 'action-btn action-btn-danger',
+        tooltip: 'Stop',
+        onClick: cancelExchangeForTarget,
+      }]}
+    />
+  ) : answerMode === 'canceling' ? (
+    <button key="answer-lone" type="button" class="action-btn action-btn-danger" disabled aria-label="Canceling" data-row-item>
+      Canceling…
+    </button>
+  ) : answerMode === 'submit' ? (
     <button
-      key="submit-multi"
+      key="answer-lone"
       type="button"
       class="action-btn action-btn-confirm"
-      disabled={submitMultiDisabled}
-      onClick={submitMultiAnswer}
+      onPointerDown={e => morphGate.down(e.clientX, e.clientY)}
+      onPointerMove={e => morphGate.move(e.clientX, e.clientY)}
+      onPointerCancel={() => morphGate.cancel()}
+      onClick={() => { if (!morphGate.isTap()) return; void submit(); }}
       aria-label="Submit answer"
+      data-tooltip={uploadsBlocking ? 'Send after image upload' : 'Send answer'}
       data-row-item
     >
-      {submitMultiCount > 0 ? `Submit (${submitMultiCount})` : 'Submit'}
+      Submit
+    </button>
+  ) : answerMode === 'cancel' ? (
+    // Lone destructive Cancel — keep the scroll-vs-tap gate so an iOS PWA scroll
+    // can't land a one-tap abort (the concern that drove the morph gate).
+    <button
+      key="answer-lone"
+      type="button"
+      class="action-btn action-btn-danger"
+      onPointerDown={e => morphGate.down(e.clientX, e.clientY)}
+      onPointerMove={e => morphGate.move(e.clientX, e.clientY)}
+      onPointerCancel={() => morphGate.cancel()}
+      onClick={() => { if (!morphGate.isTap()) return; cancelExchangeForTarget(); }}
+      aria-label="Cancel"
+      data-tooltip="Stop"
+      data-row-item
+    >
+      Cancel
     </button>
   ) : null;
 
-  // sectionButtons (Save / ✓ Saved) are rendered separately below so they
-  // anchor to the bottom row instead of lifting alongside Diff when the row
-  // stacks.
   // When the banner is suppressed (mid-turn 'canceling', or composing without
   // any waiting actions), the in-banner Diff disappears too. The standalone
   // Diff button fills that gap so "branch has commits → Diff visible" holds
@@ -675,8 +748,7 @@ export function PromptInput() {
     <button
       key="send-cancel-morph"
       class={
-        'action-btn send-cancel-morph'
-        + (morphMode === 'cancel' || morphMode === 'canceling' ? ' action-btn-danger' : '')
+        'action-btn send-cancel-morph send-cancel-round'
         + (morphMode === 'placeholder' ? ' morph-placeholder' : '')
       }
       onPointerDown={e => morphGate.down(e.clientX, e.clientY)}
@@ -685,29 +757,7 @@ export function PromptInput() {
       onClick={() => {
         if (!morphGate.isTap()) return;
         if (morphMode === 'send') void submit();
-        else if (morphMode === 'cancel') {
-          // Snapshot the target thread and the question this cancel targets (if
-          // any) BEFORE the async confirm — the user can switch focus or the
-          // question can resolve while the dialog is open, and we must not
-          // cancel the wrong thread. The captured question id lets the cleanup
-          // effect release the optimistic flag once it resolves — even when the
-          // agent answers the cancel by re-asking (thread stays mid-turn).
-          const targetId = cancelTargetId!;
-          const targetQuestionId = findLatestPendingQuestion(focusedThread)?.toolUseId;
-          void (async () => {
-            if (!(await showConfirm('Cancel this response?', 'Cancel response', {
-              cancelLabel: 'Keep going',
-              variant: 'danger',
-            }))) return;
-            if (queuedUploadSends.value.has(targetId)) {
-              clearQueuedUploadSend(targetId);
-              setCanceledQuestion(targetId, undefined);
-              return;
-            }
-            setCanceledQuestion(targetId, targetQuestionId);
-            void handleCancelExchange(targetId);
-          })();
-        }
+        else if (morphMode === 'cancel') cancelExchangeForTarget();
       }}
       aria-label={morphMode === 'cancel' || morphMode === 'canceling' ? 'Cancel' : 'Send message'}
       aria-hidden={morphMode === 'placeholder' ? 'true' : undefined}
@@ -717,12 +767,21 @@ export function PromptInput() {
         : morphMode === 'cancel' ? false
         : true
       }
-      data-tooltip={morphMode === 'send' && uploadsBlocking ? 'Send after image upload' : undefined}
+      data-tooltip={
+        morphMode === 'cancel' ? 'Stop'
+        : morphMode === 'canceling' ? 'Stopping…'
+        : morphMode === 'send' && uploadsBlocking ? 'Send after image upload'
+        : morphMode === 'send' ? 'Send'
+        : undefined
+      }
       data-row-item
     >
-      {morphMode === 'canceling' ? 'Cancel...'
-        : morphMode === 'cancel' ? 'Cancel'
-        : 'Send'}
+      {/* Icon-only: an up-arrow for send, a stop-square while a turn is
+          running/canceling. One stable element swaps only its glyph +
+          aria-label/title between states — no unmount, so no mobile blink. */}
+      {morphMode === 'cancel' || morphMode === 'canceling'
+        ? <StopIcon />
+        : <SendArrowIcon />}
     </button>
   ) : null;
   // .thread-action-buttons is the e2e-test hook for "the banner is visible
@@ -737,7 +796,6 @@ export function PromptInput() {
   // "Apply..." spinner during an apply turn) renders inline anyway, so the
   // is-stacked column layout would be wrong there.
   const isStacked = stacked && !!slots.liftable;
-  const liftSection = shouldLiftSectionButtons(isStacked, bannerState);
   const rightClass = isStacked
     ? 'prompt-actions-right is-stacked'
     : 'prompt-actions-right';
@@ -748,7 +806,7 @@ export function PromptInput() {
         <div key="images" class="image-preview-strip">
           {images.map((img, i) => (
             <div class="image-preview-item" key={`hash-${img.hash}`}>
-              <img
+              <BlobImage
                 src={img.previewUrl}
                 class="image-preview-thumb"
                 onClick={(e) => openImagePopupFromGroup(e.currentTarget.src, e.currentTarget)}
@@ -758,7 +816,7 @@ export function PromptInput() {
           ))}
           {pending.map((p) => (
             <div class={`image-preview-item image-preview-pending image-preview-pending-${p.status}`} key={`pending-${p.localId}`}>
-              <img
+              <BlobImage
                 src={p.previewUrl}
                 class="image-preview-thumb"
                 onClick={(e) => openImagePopupFromGroup(e.currentTarget.src, e.currentTarget)}
@@ -793,7 +851,7 @@ export function PromptInput() {
             class="prompt-textarea"
             data-role="prompt-input"
             data-thread-id={tid ?? ''}
-            placeholder={focusedThreadId.value ? 'Post a follow up…' : 'What can I help with today?'}
+            placeholder={focusedThreadId.value ? 'Post a follow up…' : 'What can I help with?'}
             rows={1}
             onInput={handleInput}
             onKeyDown={handleKeyDown}
@@ -944,27 +1002,23 @@ export function PromptInput() {
               </Overlay>
             </div>
           )}
+          {pinButtonNode}
           <div class={rightClass}>
             {isStacked ? (
               <>
                 <div class="prompt-actions-subrow">
-                  {liftSection ? sectionButtonNodes : null}
                   {slots.liftable}
                 </div>
                 <div class="prompt-actions-subrow">
-                  {liftSection ? null : sectionButtonNodes}
                   {slots.primary}
-                  {sendButton}
-                  {submitMultiButton}
+                  {isAnsweringQuestion ? answerControl : sendButton}
                 </div>
               </>
             ) : (
               <>
-                {sectionButtonNodes}
                 {slots.liftable}
                 {slots.primary}
-                {sendButton}
-                {submitMultiButton}
+                {isAnsweringQuestion ? answerControl : sendButton}
               </>
             )}
           </div>

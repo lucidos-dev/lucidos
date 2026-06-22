@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { shouldRenderMarkdownDiff } from './RepoFilePreview';
+import { shouldRenderMarkdownDiff, shouldShowWholeFile } from './RepoFilePreview';
 
 describe('shouldRenderMarkdownDiff', () => {
   it('renders for an internal Lucidos change (changeId present)', () => {
@@ -40,5 +40,23 @@ describe('shouldRenderMarkdownDiff', () => {
     expect(shouldRenderMarkdownDiff({
       ext: 'md', fileStatus: 'modified', activeChangeId: 'change-1', branchRef: null, filePreviewSourceOn: true,
     })).toBe(false);
+  });
+});
+
+describe('shouldShowWholeFile', () => {
+  it('shows the whole file when the toggle is on for a modified file', () => {
+    expect(shouldShowWholeFile({ wholeFileOn: true, fileStatus: 'modified' })).toBe(true);
+  });
+
+  it('shows the whole file for an added file', () => {
+    expect(shouldShowWholeFile({ wholeFileOn: true, fileStatus: 'added' })).toBe(true);
+  });
+
+  it('stays on the diff when the toggle is off', () => {
+    expect(shouldShowWholeFile({ wholeFileOn: false, fileStatus: 'modified' })).toBe(false);
+  });
+
+  it('suppresses the whole-file view for a deleted file (no end state)', () => {
+    expect(shouldShowWholeFile({ wholeFileOn: true, fileStatus: 'deleted' })).toBe(false);
   });
 });

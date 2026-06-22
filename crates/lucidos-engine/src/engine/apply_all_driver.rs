@@ -24,6 +24,34 @@ use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::LucidosEngine;
 
+/// Failure reason recorded for a batch member that was discarded or whose change
+/// row vanished before the batch finished — so recovery can mark it terminal and
+/// let the batch reach `is_complete()` instead of stalling on a member that can
+/// never apply.
+const DISCARDED_MEMBER_REASON: &str = "Change was discarded or removed before the batch finished";
+
+/// How recovery should treat a batch member, derived from its `changes.status`.
+/// `Terminal` covers `discarded`, a missing row, and any unknown status — all
+/// must become a terminal `Failed` so the batch can complete; leaving such a
+/// member `Pending` would re-drive it into an `apply_change` `Noop` that never
+/// emits a terminal event, stalling the batch forever.
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveredMember {
+    Applied,
+    Pending,
+    Terminal,
+}
+
+/// Pure mapping from a member's `changes.status` to its recovery classification.
+/// `None` = the change row is gone (treated as terminal).
+fn classify_recovered_member(status: Option<&str>) -> RecoveredMember {
+    match status {
+        Some("applied") => RecoveredMember::Applied,
+        Some("pending") => RecoveredMember::Pending,
+        _ => RecoveredMember::Terminal,
+    }
+}
+
 /// Messages from `emit_change_applied` / `emit_apply_failed` to the
 /// apply-all driver task.
 #[derive(Debug, Clone)]
@@ -106,10 +134,48 @@ impl LucidosEngine {
                 "[ApplyAll] ApplyAllBatchStarted",
             )
             .await;
+        // Durable mirror of the in-memory registry (see the
+        // `apply_all_batches` table migration). Membership only — per-member
+        // resolution is reconstructed from `changes.status` on recovery. A
+        // failed INSERT degrades to the pre-table behavior (in-memory only, lost
+        // on restart) rather than blocking the apply, so log and continue.
+        let actor_json = serde_json::to_value(&actor).ok();
+        if let Err(e) = sqlx::query(
+            "INSERT INTO apply_all_batches (batch_id, change_ids, actor) \
+             VALUES ($1, $2, $3) ON CONFLICT (batch_id) DO NOTHING",
+        )
+        .bind(batch_id)
+        .bind(&change_ids)
+        .bind(actor_json)
+        .execute(self.pool())
+        .await
+        {
+            log!(
+                "[ApplyAll] failed to persist batch {} membership: {}",
+                batch_id,
+                e
+            );
+        }
         let progress = BatchProgress::new(batch_id, change_ids, actor);
         self.apply_all_batches.lock().await.insert(progress);
         log!("[ApplyAll] batch {} seeded", batch_id);
         batch_id
+    }
+
+    /// Delete a batch's durable membership row. Called wherever the batch is
+    /// removed from the in-memory registry (driver completion, cancel, startup
+    /// recovery) so the table stays a faithful mirror — a leftover row would be
+    /// re-recovered on the next boot. Best-effort: a failed DELETE only risks a
+    /// harmless re-recovery (which re-emits an idempotent `ApplyAllBatchCompleted`
+    /// the frontend already tolerates), so log and move on.
+    async fn persist_batch_removed(&self, batch_id: Uuid) {
+        if let Err(e) = sqlx::query("DELETE FROM apply_all_batches WHERE batch_id = $1")
+            .bind(batch_id)
+            .execute(self.pool())
+            .await
+        {
+            log!("[ApplyAll] failed to delete batch {} row: {}", batch_id, e);
+        }
     }
 
     /// Cancel every in-flight Apply All batch — the user clicked Cancel on the
@@ -190,9 +256,142 @@ impl LucidosEngine {
                     "[ApplyAll] ApplyAllBatchCompleted (canceled)",
                 )
                 .await;
+            self.persist_batch_removed(final_state.batch_id()).await;
         }
         self.broadcast_changes_updated().await;
         count
+    }
+
+    /// Rebuild the Apply-All registry from the durable `apply_all_batches`
+    /// table after a restart and resolve any batch the previous process
+    /// abandoned. Without this, a batch interrupted by an engine restart
+    /// (an earlier member required a restart, or a conflict-resolution apply
+    /// landed a restart-requiring change) was lost — the in-memory registry came
+    /// back empty, so the eventual `ChangeApplied` / `ChangeApplyFailed` found no
+    /// batch in `advance_apply_all_batch`, `ApplyAllBatchCompleted` was never
+    /// emitted, and the frontend's "Applying changes…" toast stuck forever.
+    ///
+    /// Per-member resolution is NOT persisted; it's reconstructed from the
+    /// authoritative `changes.status`: `applied` → applied; `discarded` / row
+    /// gone → terminal (so the batch can complete); `pending` → re-drive. A
+    /// fully-resolved batch emits the missing `ApplyAllBatchCompleted` now; an
+    /// in-progress one is re-seeded into the live registry (so any auto-resuming
+    /// session's terminal event advances it) and its next pending member is
+    /// driven through the idempotent `apply_change` — unless that member's thread
+    /// already has a running agent session (its terminal event will advance the
+    /// re-seeded batch, so re-driving would risk a double apply).
+    ///
+    /// MUST run after agent/CC recovery so a member with an auto-resuming session
+    /// is observed as running rather than re-driven.
+    pub async fn recover_apply_all_batches(self: &std::sync::Arc<Self>) {
+        let rows: Vec<(Uuid, Vec<Uuid>, Option<serde_json::Value>)> = match sqlx::query_as(
+            "SELECT batch_id, change_ids, actor FROM apply_all_batches ORDER BY created_at",
+        )
+        .fetch_all(self.pool())
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log!("[ApplyAll] recovery query failed: {}", e);
+                return;
+            }
+        };
+        if rows.is_empty() {
+            return;
+        }
+        log!(
+            "[ApplyAll] recovering {} unfinished batch(es) from previous process",
+            rows.len()
+        );
+
+        for (batch_id, change_ids, actor_json) in rows {
+            let actor: Option<MessageOrigin> =
+                actor_json.and_then(|v| serde_json::from_value(v).ok());
+            let mut progress = BatchProgress::new(batch_id, change_ids.clone(), actor.clone());
+
+            // Reconstruct per-member state from the authoritative changes.status.
+            for &change_id in &change_ids {
+                let status = match self.changes().get_by_id(change_id).await {
+                    Ok(Some(c)) => Some(c.status),
+                    Ok(None) => None, // row gone → treat as terminal
+                    Err(e) => {
+                        log!(
+                            "[ApplyAll] recovery: changes lookup for {} failed: {} — \
+                             treating as pending (will re-drive)",
+                            change_id,
+                            e
+                        );
+                        Some("pending".to_string())
+                    }
+                };
+                match classify_recovered_member(status.as_deref()) {
+                    RecoveredMember::Applied => {
+                        progress.record_applied(change_id);
+                    }
+                    RecoveredMember::Pending => { /* leave pending — re-drive below */ }
+                    RecoveredMember::Terminal => {
+                        progress.record_failed(change_id, DISCARDED_MEMBER_REASON.to_string());
+                    }
+                }
+            }
+
+            if progress.is_complete() {
+                log!(
+                    "[ApplyAll] recovered batch {} already resolved — emitting ApplyAllBatchCompleted",
+                    batch_id
+                );
+                self.event_bus
+                    .emit_or_log(
+                        BusEvent::System(SystemEvent::ApplyAllBatchCompleted {
+                            batch_id,
+                            applied: progress.applied_ids(),
+                            failed: progress.failures(),
+                        }),
+                        "[ApplyAll] ApplyAllBatchCompleted (recovery)",
+                    )
+                    .await;
+                self.persist_batch_removed(batch_id).await;
+                self.broadcast_changes_updated().await;
+                continue;
+            }
+
+            // Still in progress — re-seed the live registry, then kick the next
+            // pending member (serial, exactly like the driver's ApplyNext arm).
+            let next = progress.next_pending();
+            self.apply_all_batches.lock().await.insert(progress);
+            let Some(change_id) = next else {
+                continue;
+            };
+            let thread_id = match self.changes().get_by_id(change_id).await {
+                Ok(Some(c)) => c.thread_id,
+                _ => None,
+            };
+            if let Some(tid) = thread_id {
+                if self.is_agent_running_for(tid).await {
+                    log!(
+                        "[ApplyAll] recovery: batch {} member {} has a running session — \
+                         waiting for its terminal event to advance",
+                        batch_id,
+                        change_id
+                    );
+                    continue;
+                }
+            }
+            log!(
+                "[ApplyAll] recovery: driving pending member {} of batch {}",
+                change_id,
+                batch_id
+            );
+            let engine = self.clone_arc();
+            tokio::spawn(async move {
+                if let Err(e) = engine.apply_change(change_id, actor).await {
+                    log!(
+                        "[ApplyAll] recovery: apply_change({change_id}) returned Err: {e} — \
+                         waiting for ChangeApplyFailed to advance the batch",
+                    );
+                }
+            });
+        }
     }
 
     /// Update the registry for one resolved change and decide what to do
@@ -271,6 +470,7 @@ impl LucidosEngine {
                         "[ApplyAll] ApplyAllBatchCompleted",
                     )
                     .await;
+                self.persist_batch_removed(batch_id).await;
                 self.broadcast_changes_updated().await;
             }
             NextStep::ApplyNext {
@@ -311,4 +511,75 @@ enum NextStep {
         next_change: Uuid,
         actor: Option<MessageOrigin>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The load-bearing classification: a discarded / removed member MUST be
+    /// terminal so the batch can complete; only an explicitly `pending` member
+    /// stays pending (and gets re-driven). Misclassifying `discarded` as
+    /// `pending` re-drives it into an `apply_change` `Noop` that never emits a
+    /// terminal event — the batch stalls and the toast sticks forever.
+    #[test]
+    fn classify_member_status_mapping() {
+        assert_eq!(
+            classify_recovered_member(Some("applied")),
+            RecoveredMember::Applied
+        );
+        assert_eq!(
+            classify_recovered_member(Some("pending")),
+            RecoveredMember::Pending
+        );
+        assert_eq!(
+            classify_recovered_member(Some("discarded")),
+            RecoveredMember::Terminal
+        );
+        // Missing row (None) and any unexpected status are terminal.
+        assert_eq!(classify_recovered_member(None), RecoveredMember::Terminal);
+        assert_eq!(
+            classify_recovered_member(Some("weird-future-status")),
+            RecoveredMember::Terminal
+        );
+    }
+
+    /// Reconstructing a batch where every member resolved (applied or
+    /// discarded) yields a complete batch — recovery emits the missing
+    /// `ApplyAllBatchCompleted` for it.
+    #[test]
+    fn fully_resolved_batch_reconstructs_as_complete() {
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        let mut progress = BatchProgress::new(Uuid::new_v4(), ids.clone(), None);
+        // applied, applied, discarded → all terminal.
+        for (i, &id) in ids.iter().enumerate() {
+            match classify_recovered_member(if i < 2 { Some("applied") } else { None }) {
+                RecoveredMember::Applied => {
+                    progress.record_applied(id);
+                }
+                RecoveredMember::Terminal => {
+                    progress.record_failed(id, DISCARDED_MEMBER_REASON.to_string());
+                }
+                RecoveredMember::Pending => unreachable!(),
+            }
+        }
+        assert!(progress.is_complete());
+        assert_eq!(progress.applied_ids(), vec![ids[0], ids[1]]);
+        assert_eq!(progress.failures().len(), 1);
+        assert_eq!(progress.failures()[0].error, DISCARDED_MEMBER_REASON);
+    }
+
+    /// A batch with a still-`pending` member reconstructs as incomplete, and
+    /// `next_pending` points at the first pending member — the one recovery
+    /// drives through `apply_change`.
+    #[test]
+    fn batch_with_pending_member_reconstructs_incomplete_and_drives_next() {
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        let mut progress = BatchProgress::new(Uuid::new_v4(), ids.clone(), None);
+        // applied, pending, pending.
+        progress.record_applied(ids[0]);
+        // ids[1], ids[2] left pending.
+        assert!(!progress.is_complete());
+        assert_eq!(progress.next_pending(), Some(ids[1]));
+    }
 }

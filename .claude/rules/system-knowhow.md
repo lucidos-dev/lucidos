@@ -11,6 +11,9 @@ globs:
   - "crates/lucidos-engine/src/engine/agent_session/prompts.rs"
   - "crates/lucidos-engine/src/api/history.rs"
   - "crates/lucidos-engine/src/api/app_ui.rs"
+  - "crates/lucidos-engine/src/api/sdk.rs"
+  - "crates/lucidos-engine/src/api/sdk_iframe.css"
+  - "crates/lucidos-app/src/styles/global/shared-components.css"
   - "crates/lucidos-engine/src/api/proxy_pipeline_config.rs"
   - "crates/lucidos-engine/src/api/proxy.rs"
   - "crates/lucidos-engine/src/api/proxy_migration.rs"
@@ -55,6 +58,7 @@ When you touch any of the surfaces in the left column, you MUST update the file 
 | `crates/lucidos-engine/src/engine/event_bus.rs` (`SystemEvent` enum — variant added/removed/renamed, aggregate name changed, persistence/projection routing changed) | `.claude/rules/db.md` § Key event types, AND any `system-knowhow/*.md` that references that event by name (grep first — workspace-learning + thread-events + coding-agent-events all index events by name) |
 | `ThreadEvent::is_per_token_streaming` in `crates/lucidos-engine/src/engine/thread_events.rs`, or the scheduler trigger gate in `crates/lucidos-engine/src/scheduler/mod.rs` that consumes it (adding/removing a blocklisted variant, changing the trigger matcher routing) | `system-knowhow/thread-events.md` "Triggerable" column + "Today the scheduler uses a blocklist" section, AND `system-knowhow/coding-agent-events.md` "Triggerability: blocklist semantics" section, AND `system-knowhow/building-a-trigger.md` if the change opens a new "you can now `on_event:` X" path |
 | `packages/lucidos-sdk/**` (the `window.lucidos.*` JS surface — new/changed method, signature change, namespace addition) | `system-knowhow/js-sdk.md` § matching `lucidos.<namespace>` heading (also see `.claude/rules/sdk.md` for the same rule from the SDK side) |
+| `crates/lucidos-app/src/styles/global/shared-components.css` (the app-facing shared component layer — the engine `include_str!`s it into `/api/v1/sdk-iframe.css` via `crates/lucidos-engine/src/api/sdk.rs`, so any class here ships to every opted-in app) — OR the iframe-only `crates/lucidos-engine/src/api/sdk_iframe.css` (tokens served to apps, `.action-btn-secondary`) | `system-knowhow/js-sdk.md` § "Component classes" + § "Theme variables" (the app-author contract — add/rename the class or token row, and keep documented token VALUES matching the CSS). Also keep the three-file split honest (reusable → `shared-components.css`; host-chrome → `host-components.css`; iframe-only → `sdk_iframe.css`) per `.claude/rules/frontend.md`. |
 | `crates/lucidos-cli/**` (the `lucidos` CLI — new subcommand, flag change, output shape change) | `system-knowhow/lucidos-cli.md` |
 | `crates/lucidos-engine/src/{api,core}/plugins.rs` + `crates/lucidos-engine/src/engine/tools/plugins.rs` (plugin manifest schema, install / uninstall / list flow, plugin LLM tools) | `system-knowhow/building-a-plugin.md`, AND `docs/taxonomy.md` § plugins if the layout / install semantics changed |
 | `crates/lucidos-engine/src/llm/tools.rs` + `crates/lucidos-engine/src/engine/tools/**` (LLM tool added/removed/renamed, args schema changed) | `crates/lucidos-engine/src/engine/agent_session/prompts.rs` (system prompts advertise tools), AND `system-knowhow/best-practices.md` / `system-knowhow/intent-registry.md` if the tool's intent maps there |

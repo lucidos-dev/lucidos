@@ -335,6 +335,86 @@ async fn find_plugin_owning_file_returns_none_after_uninstall() {
     teardown_test_db(&db_name).await;
 }
 
+#[tokio::test]
+async fn find_plugin_owning_app_returns_owner_for_installed_app() {
+    // The app-delete mirror of the file guard: the fixture's app folder is
+    // `anti-sycophancy-critique`, installed by plugin `no-role-playing`.
+    // Deleting that app must resolve to the owning plugin so the handler 409s.
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let scratch = fresh_workspace();
+    install_app_fixture(&scratch, &bus).await;
+
+    let owner = super::find_plugin_owning_app(&pool, "anti-sycophancy-critique")
+        .await
+        .expect("query must succeed")
+        .expect("owner must be found for an installed app");
+    assert_eq!(owner.plugin_id, "no-role-playing");
+    assert_eq!(owner.plugin_name, "No role playing");
+
+    let _ = std::fs::remove_dir_all(&scratch);
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn find_plugin_owning_app_returns_none_for_standalone_app() {
+    // A standalone app (no PluginInstalled record) must NOT resolve to an
+    // owner — it deletes directly, no 409.
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let scratch = fresh_workspace();
+    install_app_fixture(&scratch, &bus).await;
+
+    let owner = super::find_plugin_owning_app(&pool, "some-standalone-app")
+        .await
+        .expect("query must succeed");
+    assert!(owner.is_none(), "standalone apps must not resolve to an owner");
+
+    // Prefix-boundary: the trailing slash in `apps/<id>/` means a strict
+    // prefix of an owned folder must NOT match. The plugin owns
+    // `apps/anti-sycophancy-critique/...`; `anti-sycophancy` is a prefix but a
+    // different app and must delete directly (no 409).
+    let owner = super::find_plugin_owning_app(&pool, "anti-sycophancy")
+        .await
+        .expect("query must succeed");
+    assert!(
+        owner.is_none(),
+        "a strict prefix of an owned app folder must not resolve to an owner"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn find_plugin_owning_app_returns_none_after_uninstall() {
+    // Once the plugin is uninstalled, its app is no longer guarded.
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let scratch = fresh_workspace();
+    install_app_fixture(&scratch, &bus).await;
+
+    let pending: std::sync::Arc<PendingUninstallsMap> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let _ = super::prepare_uninstall_plugin(&scratch, &pool, &pending, "no-role-playing").await;
+    let uninstall_id = pending.lock().unwrap().keys().next().cloned().unwrap();
+    let entry = pending.lock().unwrap().remove(&uninstall_id).unwrap();
+    super::uninstall_with_bus(&scratch, &bus, &entry, None)
+        .await
+        .expect("uninstall must succeed");
+
+    let owner = super::find_plugin_owning_app(&pool, "anti-sycophancy-critique")
+        .await
+        .expect("query must succeed");
+    assert!(
+        owner.is_none(),
+        "uninstalled plugin's app must no longer be guarded"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+    teardown_test_db(&db_name).await;
+}
+
 #[test]
 fn normalize_plugin_query_collapses_case_whitespace_and_dashes() {
     use super::registry::normalize_plugin_query as n;

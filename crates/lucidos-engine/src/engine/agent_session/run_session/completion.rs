@@ -439,16 +439,24 @@ impl LucidosEngine {
                     log!("[AgentSession] {}", e);
                 }
 
-                // A user cancel (Stop = Esc) is a resumable turn boundary, not a
-                // terminator: keep the branch even with no commits so the next
-                // message can `--resume` this session, and never propose
-                // half-finished work. Specifically `Canceled(UserStop)` —
+                // A user cancel is a resumable turn boundary, not a terminator:
+                // keep the branch even with no commits so the next message can
+                // `--resume` this session, and never propose half-finished work.
+                // Both real-cancel causes qualify: `UserStop` (Stop = Esc) and
+                // `SupersededByFollowup` (a follow-up interrupted a mid-turn Codex
+                // turn — the redirected-away partial work must NOT be proposed,
+                // and the branch is kept so the follow-up turn resumes on it).
+                // Normally the follow-up turn's own terminal overwrites this, but
+                // if the follow-up never ran (routing failure / subprocess death
+                // after the interrupt) the redirect cancel is the final terminal,
+                // and it must still get the keep-branch/no-propose semantics.
                 // Apply/Discard/Archive carry their own terminators and never
                 // surface here as the turn's terminal kind.
                 let user_canceled = matches!(
                     last_terminal_kind,
                     Some(TerminalKind::Canceled(
                         crate::engine::thread_events::CancelCause::UserStop
+                            | crate::engine::thread_events::CancelCause::SupersededByFollowup
                     ))
                 );
 

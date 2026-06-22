@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { isTauri } from '../../utils/platform';
+import { isMobile } from '../../utils/viewport';
 import { hidePanelWebview, showPanelWebview } from '../../utils/tauri';
 import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { Overlay } from './Overlay';
@@ -26,13 +27,33 @@ interface DropdownProps {
   disabled?: boolean;
   placeholder?: string;
   class?: string;
-  filterable?: boolean;
   /** Allow typing a custom value not in the options list */
   freeText?: boolean;
   /** Keyboard selection usually restores focus to the trigger for accessibility.
    *  Callers that synchronously focus a follow-up input from onChange can opt
    *  out so the trigger does not steal focus back. */
   restoreFocusOnSelect?: boolean;
+}
+
+/** Filter options by a case-insensitive label substring. Empty query → the full
+ *  list unchanged. Pure — exported for unit testing the type-to-search behavior. */
+export function filterDropdownOptions(options: DropdownOption[], query: string): DropdownOption[] {
+  const q = query.trim().toLowerCase();
+  return q ? options.filter(o => o.label.toLowerCase().includes(q)) : options;
+}
+
+/** Whether a keydown should START type-to-search (reveal + seed the filter box)
+ *  rather than navigate/select: a single printable char (not Space), no
+ *  modifiers, on a non-freeText dropdown that isn't already searching. Once
+ *  searching, the focused filter input owns subsequent input, so this returns
+ *  false and the keystroke flows into it natively. Pure — exported for testing. */
+export function isTypeaheadSeedKey(
+  e: Pick<KeyboardEvent, 'key' | 'metaKey' | 'ctrlKey' | 'altKey'>,
+  opts: { freeText: boolean; searching: boolean },
+): boolean {
+  return !opts.freeText && !opts.searching
+    && e.key.length === 1 && e.key !== ' '
+    && !e.metaKey && !e.ctrlKey && !e.altKey;
 }
 
 /** Walk `options` from `start` in direction `step` (±1), skipping any
@@ -58,7 +79,6 @@ export function Dropdown({
   disabled,
   placeholder,
   class: className,
-  filterable,
   freeText,
   restoreFocusOnSelect = true,
 }: DropdownProps) {
@@ -70,6 +90,10 @@ export function Dropdown({
   // placement direction).
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const [filter, setFilter] = useState('');
+  // Latches true on the first printable keystroke while open and resets on
+  // close. Gates the filter box: it stays hidden (and unfocused — no blinking
+  // caret) until the user actually types, then appears and owns input.
+  const [searching, setSearching] = useState(false);
   const [focusedIndex, setFocusedIndex] = useState(-1);
   const [draft, setDraft] = useState(value);
   const ref = useRef<HTMLDivElement>(null);
@@ -80,7 +104,6 @@ export function Dropdown({
   const draftRef = useRef(value);
   const lastCommittedRef = useRef(value);
   const selected = options.find((o) => o.value === value);
-  const showFilter = filterable || freeText;
   const open = anchor !== null;
   const pos = useAnchoredPosition(anchor, menuRef);
 
@@ -114,14 +137,24 @@ export function Dropdown({
     return () => showPanelWebview();
   }, [open]);
 
+  // Focus management while open. For freeText the trigger IS the text input, so
+  // focus it on open (existing behavior). For a normal dropdown, focus stays on
+  // the trigger button until the user types — so there's no empty filter box and
+  // no blinking caret on open. Once `searching` latches, move focus into the now-
+  // visible filter box (desktop only — auto-focusing on mobile would pop the
+  // on-screen keyboard; and only once `pos` is computed, since the panel is
+  // `visibility: hidden` — and unfocusable — until then).
   useEffect(() => {
-    if (open && showFilter) {
+    if (!open) return;
+    if (freeText) {
       requestAnimationFrame(() => {
-        if (freeText) inputRef.current?.focus();
-        else filterRef.current?.focus();
+        if (inputRef.current && document.activeElement !== inputRef.current) inputRef.current.focus();
       });
+    } else if (searching && pos && !isMobile() && filterRef.current
+      && document.activeElement !== filterRef.current) {
+      filterRef.current.focus();
     }
-  }, [open, showFilter]);
+  }, [open, searching, pos, freeText]);
 
   useEffect(() => {
     if (!open || focusedIndex < 0 || !menuRef.current) return;
@@ -129,14 +162,38 @@ export function Dropdown({
     el?.scrollIntoView({ block: 'nearest' });
   }, [focusedIndex, open]);
 
-  const filtered = showFilter && filter
-    ? options.filter(o => o.label.toLowerCase().includes(filter.toLowerCase()))
-    : options;
+  // Every dropdown is searchable: typing while open filters the option list by
+  // label (case-insensitive substring) via the shared `filterDropdownOptions`.
+  const filterOptions = (query: string) => filterDropdownOptions(options, query);
+  const filtered = filterOptions(filter);
 
   function closeDropdown() {
     setAnchor(null);
     setFilter('');
+    setSearching(false);
     setFocusedIndex(-1);
+  }
+
+  /** Commit the focused option (or the typed freeText draft) and close. Returns
+   *  true iff something was selected — Tab uses this and falls back to a plain
+   *  close when there's nothing valid to pick. */
+  function selectFocusedAndClose(): boolean {
+    if (focusedIndex >= 0 && focusedIndex < filtered.length) {
+      const focused = filtered[focusedIndex];
+      if (focused.disabled) return false;
+      if (freeText) commit(focused.value); else onChange(focused.value);
+      closeDropdown();
+      inputRef.current?.blur();
+      if (restoreFocusOnSelect) buttonRef.current?.focus();
+      return true;
+    }
+    if (freeText && draftRef.current.trim()) {
+      commit();
+      closeDropdown();
+      inputRef.current?.blur();
+      return true;
+    }
+    return false;
   }
 
   function openDropdown() {
@@ -161,40 +218,55 @@ export function Dropdown({
       inputRef.current?.blur();
       return;
     }
+    // Tab on an open menu commits the highlighted option and closes — and is
+    // swallowed so it neither tabs focus away nor reaches the global Tab trap.
+    // freeText keeps its native Tab (move on; its onBlur commits the draft).
+    if (e.key === 'Tab' && open && !freeText) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!selectFocusedAndClose()) closeDropdown();
+      return;
+    }
     if (e.key === 'ArrowDown') {
       e.preventDefault();
-      if (!open) {
-        openDropdown();
-      } else {
-        setFocusedIndex(i => nextEnabledIndex(filtered, i, +1));
-      }
-    } else if (e.key === 'ArrowUp') {
+      if (!open) openDropdown();
+      else setFocusedIndex(i => nextEnabledIndex(filtered, i, +1));
+      return;
+    }
+    if (e.key === 'ArrowUp') {
       e.preventDefault();
-      if (!open) {
-        openDropdown();
-      } else {
-        setFocusedIndex(i => nextEnabledIndex(filtered, i, -1));
-      }
-    } else if (e.key === 'Enter' || (e.key === ' ' && !showFilter)) {
-      if (!open) {
-        e.preventDefault();
-        openDropdown();
-        return;
-      }
+      if (!open) openDropdown();
+      else setFocusedIndex(i => nextEnabledIndex(filtered, i, -1));
+      return;
+    }
+    if (e.key === 'Enter') {
       e.preventDefault();
-      if (focusedIndex >= 0 && focusedIndex < filtered.length) {
-        const focused = filtered[focusedIndex];
-        if (focused.disabled) return;
-        const picked = focused.value;
-        if (freeText) commit(picked); else onChange(picked);
-        closeDropdown();
-        inputRef.current?.blur();
-        if (restoreFocusOnSelect) buttonRef.current?.focus();
-      } else if (freeText && draftRef.current.trim()) {
-        commit();
-        closeDropdown();
-        inputRef.current?.blur();
-      }
+      if (!open) openDropdown();
+      else selectFocusedAndClose();
+      return;
+    }
+    if (e.key === ' ' && !freeText) {
+      // Space opens a closed menu (like a native <select>/button). While open
+      // but not yet searching, swallow it so the trigger button's default
+      // space→click doesn't close the menu; once searching it falls through to
+      // the focused filter box as a literal space. (freeText is exempt — its
+      // trigger is a text input and must accept spaces, e.g. cron expressions.)
+      if (!open) { e.preventDefault(); openDropdown(); return; }
+      if (!searching) e.preventDefault();
+      return;
+    }
+    // Typeahead: a printable key while not yet searching (focus is on the
+    // trigger button, not the filter box) opens the menu if needed, reveals the
+    // filter box, and seeds it. stopPropagation keeps this first keystroke from
+    // the global type-to-focus handler (which would write it into the prompt).
+    // Once searching, the focused filter input owns subsequent keystrokes.
+    if (isTypeaheadSeedKey(e, { freeText: !!freeText, searching })) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!open) openDropdown();
+      setSearching(true);
+      setFilter(e.key);
+      setFocusedIndex(nextEnabledIndex(filterOptions(e.key), -1, +1));
     }
   }
 
@@ -232,6 +304,8 @@ export function Dropdown({
           type="button"
           class="dropdown-trigger"
           disabled={disabled}
+          aria-haspopup="listbox"
+          aria-expanded={open}
           onClick={() => {
             if (disabled) return;
             if (open) closeDropdown(); else openDropdown();
@@ -265,13 +339,18 @@ export function Dropdown({
             }
           : { visibility: 'hidden' }}
       >
-          {filterable && !freeText && (
+          {!freeText && searching && (
             <input
               ref={filterRef}
               class="dropdown-filter"
               type="text"
               value={filter}
-              onInput={(e) => { setFilter((e.target as HTMLInputElement).value); setFocusedIndex(-1); }}
+              onInput={(e) => {
+                const v = (e.target as HTMLInputElement).value;
+                setFilter(v);
+                // Highlight the first match so Enter picks the top result.
+                setFocusedIndex(nextEnabledIndex(filterOptions(v), -1, +1));
+              }}
               onKeyDown={handleKeyDown}
               placeholder="Filter..."
             />

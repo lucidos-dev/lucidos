@@ -10,12 +10,15 @@
     animation: modal-in var(--duration-fast) ease;
 }
 
-/* UI-blocking overlay — blocks interaction while the engine restarts or the
-   client refreshes.
+/* UI-blocking overlay — blocks interaction while the client refreshes (swaps
+   the service worker and reloads). Engine restart no longer blocks here: the
+   gateway boot splash + GET-gate + SSE reconnect make it a recoverable
+   non-event, so the tab stays interactive and shows only a light dismissible
+   "Restarting engine…" toast.
    z-index above --z-control-panel so the header (.pane-header-brand,
    .collapsed-thread-actions, .message-route-panel all sit at 2200) is
    covered by the dim overlay and its buttons aren't clickable through.
-   .toast-container sits a step higher so the restart toast stays visible. */
+   .toast-container sits a step higher so the "Refreshing…" toast stays visible. */
 .ui-blocking-overlay {
     position: fixed;
     inset: 0;
@@ -98,6 +101,57 @@
     animation: loading-pulse 1.4s ease-in-out infinite;
 }
 
+/* AI running-text shimmer — the standard "actively working" affordance: a
+ * highlight band sweeps across the text itself (clipped to the glyphs) instead
+ * of a separate spinner. Applied to text that should read as "live" — the
+ * in-progress step description and a drawer section header that contains a
+ * running thread. Reuses the same 200%→-200% sweep direction as the skeleton
+ * `shimmer` keyframe. `color` is the no-clip fallback (and the reduced-motion
+ * resting color). */
+@keyframes running-shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+.running-shimmer {
+    background: linear-gradient(
+        90deg,
+        var(--text-muted) 0%,
+        var(--text-muted) 35%,
+        var(--text-primary) 50%,
+        var(--text-muted) 65%,
+        var(--text-muted) 100%
+    );
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: var(--text-secondary);
+    animation: running-shimmer 2.6s linear infinite;
+}
+
+/* Inverted running-text shimmer — the section-header variant. The resting text
+ * stays full-strength (`--text-primary`, so the bold section label reads
+ * normally) and a MUTED band sweeps across instead of a bright one. Used on the
+ * drawer section header that holds a running thread, where the standard
+ * dim-base + bright-sweep competed with the bold label and read as "dimmed"
+ * rather than "live". The in-thread step/status shimmer keeps the standard
+ * direction. Overrides only the gradient + resting color; the text-clip,
+ * `background-size`, and animation are inherited from `.running-shimmer` (apply
+ * both). Must use `background-image` (not the `background` shorthand) — the
+ * shorthand would reset `background-size` to `auto`, collapsing the 200%-wide
+ * gradient the sweep animation needs and freezing it static. */
+.running-shimmer-invert {
+    background-image: linear-gradient(
+        90deg,
+        var(--text-primary) 0%,
+        var(--text-primary) 35%,
+        var(--text-muted) 50%,
+        var(--text-primary) 65%,
+        var(--text-primary) 100%
+    );
+    color: var(--text-primary);
+}
+
 /* Mini spinner — small inline spinning ring for "in progress" indicators */
 .mini-spinner {
     --spinner-color: var(--text-secondary);
@@ -152,5 +206,20 @@
     .mini-spinner,
     .loading-spinner::after {
         animation: none;
+    }
+
+    /* Drop the sweep AND the text-clip so the glyphs fall back to a solid,
+     * visible color (a clipped-but-unanimated gradient would freeze mid-sweep). */
+    .running-shimmer {
+        animation: none;
+        background: none;
+        -webkit-text-fill-color: currentColor;
+        color: var(--text-secondary);
+    }
+
+    /* The inverted variant rests at the full-strength label color, not the
+     * dimmed `--text-secondary` the standard shimmer falls back to. */
+    .running-shimmer-invert {
+        color: var(--text-primary);
     }
 }

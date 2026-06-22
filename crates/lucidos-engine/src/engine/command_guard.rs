@@ -178,7 +178,7 @@ pub struct JudgedClassification {
 ///   * catastrophic deny-list → `Settled(Catastrophic)` (hard-block),
 ///   * obviously read-only / in-workspace-write shapes → `Settled(Safe)`,
 ///   * everything else → `NeedsJudge` (the judge classifies it, or the static
-///     fallback does when the judge is off — see [`fallback_lane`]).
+///     fallback does when the judge is off — see [`fallback_classify`]).
 ///
 /// Catastrophic wins over everything (checked first), so a command that is both
 /// catastrophic and side-effect-shaped is hard-blocked rather than judged.

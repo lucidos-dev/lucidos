@@ -11,7 +11,7 @@ use crate::runtime::BrowserLogins;
 use chrono::Utc;
 
 use super::super::process_helpers::{
-    build_system_knowhow_section, build_trigger_knowhow_section, TriggerContext,
+    build_system_knowhow_section, build_trigger_knowhow_section, TriggerContext, APPLY_VERIFY_RULE,
     ENGINE_RESTART_RULE,
 };
 
@@ -543,6 +543,8 @@ For pipelines where step N depends on step N-1's outcome, spawn one child thread
 
 __ENGINE_RESTART_RULE__
 
+__APPLY_VERIFY_RULE__
+
 ENGINE INTERNALS YOU CANNOT OBSERVE:
 You cannot count your own tool calls, detect a per-turn cap, or measure any internal engine budget. The only real per-turn cap is at __MAX_TOOL_CALLS__ tool calls; when it fires the engine prepends "[ENGINE-LIMIT]" to its message — that prefix is the only signal the cap was hit. Never claim you "hit a tool-call cap", "tool-call limit", "tool-call budget", "per-turn limit", or any similar made-up engine internal. If you stop mid-task, give the real reason or just keep going. Do NOT cite specific numbers (e.g. "~25 calls", "agentic_loop.rs", "MAX_ITERATIONS") about the agent loop — those numbers are not visible to you and inventing them poisons long-term memory for future turns.
 
@@ -565,6 +567,7 @@ VERIFICATION: Before saying "done", check that write_file returned "Created:" or
 
         let system_prompt_base = system_prompt_base
             .replace("__ENGINE_RESTART_RULE__", ENGINE_RESTART_RULE)
+            .replace("__APPLY_VERIFY_RULE__", APPLY_VERIFY_RULE)
             .replace("__ASK_USER_QUESTION_RULE__", ASK_USER_QUESTION_RULE)
             .replace(
                 "__MAX_TOOL_CALLS__",

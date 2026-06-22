@@ -70,6 +70,13 @@ control API, health) lives behind the reserved **sigil namespace `/~/`**; `/`
 smart-redirects into the sole workspace, or serves the picker when there are
 several. The picker lists **every workspace ever launched** (durable membership);
 a stopped one stays listed and **lazy-starts** on a proxy hit / explicit open.
+**Probing a served asset through the gateway needs the workspace prefix.** To
+curl a served file (SDK bundle, static asset, an API route) you MUST hit
+`https://<host>/<slug>/api/v1/...`, NOT a bare `https://<host>/api/v1/...` — the
+gateway resolves the FIRST path segment as a workspace slug, so a bare
+`/api/v1/...` is read as workspace `api` and 404s with `unknown workspace 'api'`.
+(Hitting an engine directly on its own port is base `/`, so `…:<port>/api/v1/…`
+works there — the prefix gotcha is gateway-only.)
 More workspaces are also created from the picker (the gateway provisions their
 Docker Postgres itself, container `lucidos-pg-gw-<id>`). `stop.sh -w <ws>` does
 **NOT** kill the shared gateway — it POSTs
@@ -95,6 +102,25 @@ listed) and leaves the gateway up for peers. Stop the gateway itself with
   stops the gateway (it re-adopts running peers) so the rebuilt gateway binary is
   used. The engine's `/api/v1/restart` handler spawns `web-dev.sh --engine-only`
   in dev so the rebuild happens (packaged POSTs the gateway control API directly).
+- **Gateway self-reload (picker reload control):** because the `--engine-only`
+  Apply restart leaves the shared gateway running its already-compiled binary, a
+  change to `crates/lucidos-gateway/**` (e.g. the boot-splash HTML) is rebuilt on
+  disk but NOT served until the gateway itself restarts. The workspace picker
+  surfaces this: `GET /~/api/v1/control/gateway/status` returns
+  `{build_id, update_available}` — the running process's baked `GATEWAY_BUILD_ID`
+  (git short SHA + a hash of any uncommitted gateway-source diff, baked by
+  `crates/lucidos-gateway/build.rs`; printable via `lucidos-gateway --build-id`)
+  and whether the on-disk binary's id differs (checked behind a cheap
+  `current_exe` mtime gate so the picker's 2s poll doesn't fork per tick). The
+  picker shows a reload icon, badged when `update_available`. `POST
+  /~/api/v1/control/gateway/reload` makes the gateway **re-exec itself** onto the
+  on-disk binary (`execv(current_exe, argv)`): SAME PID, so the supervisor keeps
+  `wait`ing on it (no respawn) and `gateway.pid` stays valid; the fresh `main()`
+  re-adopts the running engines on boot. This is the ONLY in-place gateway
+  restart — note it is distinct from the supervisor's SIGUSR1, which is the
+  gateway's *permanent* stop (clean exit → supervisor stops, see
+  `scripts/lib/gateway_supervisor.sh`), not a restart. The endpoint returns 202
+  before the (short-delayed) exec so the picker's request still resolves.
 - **Auto-start + boot (ADR 0014):** the registry's per-workspace `autostart` flag
   (picker toggle → `POST /~/api/v1/control/workspaces/<id>/autostart {enabled}`)
   governs gateway boot — it **re-adopts** already-running engines, **spawns** the

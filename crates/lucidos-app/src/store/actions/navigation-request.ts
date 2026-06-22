@@ -7,7 +7,7 @@ import { pushNavState } from './navigation';
 import { revealContentPane } from './pane';
 import { ensureFocusedComposeThread, updateCompose } from './compose';
 import { focusPromptNow } from '../../components/chat/promptFocus';
-import { showToast, appsList, triggers, panelOverlay } from '../store';
+import { showToast, panelOverlay } from '../store';
 import type { MenuItem } from '../types';
 
 /** Handle a NavigationRequested event — dispatches to the correct UI action based on target.
@@ -21,6 +21,49 @@ import type { MenuItem } from '../types';
  *  Each branch checks for the target it needs to navigate to and surfaces
  *  a "<destination> no longer exists" toast when it's gone. Targets without
  *  an id-based lookup (panels, creation forms, raw urls) trust their inputs. */
+/** Short human phrase for a navigation destination — used by the off-focus
+ *  "Thread X wants to open …" jump offer so the toast names where it'd go. */
+export function describeNavTarget(nav: {
+  target: string;
+  app_id?: string;
+  file_path?: string;
+  settings_view?: string;
+}): string {
+  switch (nav.target) {
+    case 'app':
+    case 'app-ui':
+      return nav.app_id ? `app "${nav.app_id}"` : 'an app';
+    case 'thread':
+      return 'a thread';
+    case 'file':
+      return nav.file_path ? `file "${nav.file_path}"` : 'a file';
+    case 'trigger':
+      return 'a trigger';
+    case 'url':
+      return 'a link';
+    case 'new-app':
+      return 'the new-app form';
+    case 'new-trigger':
+      return 'the new-trigger form';
+    case 'new-chat':
+      return 'a new chat';
+    case 'settings':
+      return nav.settings_view ? `${nav.settings_view} settings` : 'settings';
+    case 'app-store':
+      return 'the App Store';
+    case 'thread-queue':
+      return 'the Thread Queue';
+    case 'files':
+    case 'apps':
+    case 'triggers':
+    case 'changes':
+    case 'notifications':
+      return `the ${nav.target} panel`;
+    default:
+      return 'a page';
+  }
+}
+
 export function handleNavigationRequest(nav: {
   target: string;
   settings_view?: string;
@@ -30,7 +73,7 @@ export function handleNavigationRequest(nav: {
   id?: string;
   event_id?: string;
   prompt?: string;
-}): void {
+}, opts?: { source?: string }): void {
   const navAppId = nav.app_id;
   switch (nav.target) {
     case 'files':
@@ -59,22 +102,18 @@ export function handleNavigationRequest(nav: {
       // `app-ui` is a historical alias of `app` — current producers (LLM
       // tool, structured Tap) only emit `app`, but old NavigationRequested
       // events and stale notification rows may still carry `app-ui`.
-      // openAppById lazy-loads the list and surfaces its own "Couldn't open
-      // app — no app with id …" toast on miss. We pre-check here so a
-      // known-bad id reports as the canonical "App no longer exists".
       if (!navAppId) {
         showToast('Navigation target missing app_id', 'error');
         break;
       }
-      {
-        const apps = appsList.value;
-        if (apps.status === 'loaded' && !apps.data.some((a) => a.id === navAppId)) {
-          showToast('App no longer exists', 'error');
-        } else {
-          // openAppById toasts on failure itself (load-apps miss, unknown id).
-          void openAppById(navAppId);
-        }
-      }
+      // Delegate straight to openAppById — do NOT pre-check the cached
+      // `appsList`. That list is a disk-backed projection refreshed by App*
+      // SSE events; a sibling thread that just created the app via raw file
+      // writes leaves it momentarily stale, and the old pre-check reported a
+      // live app as "App no longer exists" — swallowing the real cause.
+      // openAppById re-scans disk on a cache miss before erroring, and its
+      // miss toast names the app id + where the navigate came from.
+      void openAppById(navAppId, opts?.source);
       break;
     case 'file':
       // file_path existence is server-checked at preview time; the API surface
@@ -90,16 +129,15 @@ export function handleNavigationRequest(nav: {
         showToast('Navigation target missing trigger id', 'error');
         break;
       }
-      {
-        const list = triggers.value;
-        if (list.status === 'loaded' && !list.data.some((t) => t.id === nav.id)) {
-          showToast('Trigger no longer exists', 'error');
-        } else {
-          // navigateToTrigger awaits loadTriggers internally on cold-load;
-          // loadTriggers surfaces failures via Loadable failed.
-          void navigateToTrigger(nav.id);
-        }
-      }
+      // Delegate straight to navigateToTrigger — do NOT pre-check the cached
+      // `triggers` list. That list is a projection refreshed by Trigger* SSE
+      // events; a sibling thread that just created the trigger leaves it
+      // momentarily stale, and a pre-check would report a live trigger as
+      // "no longer exists" — swallowing the real cause. navigateToTrigger
+      // re-fetches the source of truth on a cache miss before erroring, and
+      // its miss toast names the trigger id + where the navigate came from.
+      // (Mirrors the `app` branch above.)
+      void navigateToTrigger(nav.id, opts?.source);
       break;
     case 'thread':
       // focusThreadOrBootstrap (not focusThread): the thread may live outside

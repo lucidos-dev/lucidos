@@ -48,6 +48,14 @@ use tower_http::set_header::SetResponseHeaderLayer;
 /// the box. Override with `LUCIDOS_API_PORT`.
 const DEFAULT_GATEWAY_PORT: u16 = 5251;
 
+/// Build id baked in by `build.rs` (git short SHA + a hash of any uncommitted
+/// gateway-source diff). A running gateway compares this against the on-disk
+/// binary's id — obtained by spawning `current_exe --build-id` — to drive the
+/// picker's "new gateway available" badge. Deterministic for identical source so
+/// a no-op rebuild does not raise the badge. See
+/// `docs/plans/2026-06-18-gateway-reload-control.md`.
+pub const GATEWAY_BUILD_ID: &str = env!("GATEWAY_BUILD_ID");
+
 /// In-memory state of the picker's "restore from backup" flow. Single-slot (one
 /// restore at a time, like the engine's old `RestoreState`): the POST flips it to
 /// `Running`, the spawned task advances `phase` and then sets the terminal
@@ -141,6 +149,22 @@ struct GatewayInner {
     /// Single-slot state of the picker's restore-from-backup flow (see
     /// [`RestoreStatus`]). Polled via the control API; never persisted.
     restore: RwLock<RestoreStatus>,
+    /// Path of the binary this process was launched from (`current_exe`), used by
+    /// the reload control to re-exec onto the rebuilt binary and to stat for the
+    /// "new gateway available" check.
+    exe_path: Option<PathBuf>,
+    /// Cached result of the on-disk-binary update check, so the picker's 2s poll
+    /// doesn't fork `current_exe --build-id` on every tick — re-checked only when
+    /// the binary's mtime moves. See [`GatewayState::gateway_update_available`].
+    update_check: Mutex<UpdateCheck>,
+}
+
+/// Memoized "is a newer gateway binary on disk?" verdict, keyed by the binary's
+/// last-seen mtime. A `None` mtime means "not yet checked".
+#[derive(Default)]
+struct UpdateCheck {
+    last_mtime: Option<std::time::SystemTime>,
+    update_available: bool,
 }
 
 impl GatewayState {
@@ -215,6 +239,86 @@ impl GatewayState {
             }
         }
         out
+    }
+
+    // ── Self-update (reload onto a rebuilt binary) ─────────────────────────────
+
+    /// This process's baked build id.
+    pub fn build_id(&self) -> &'static str {
+        GATEWAY_BUILD_ID
+    }
+
+    /// Whether the on-disk gateway binary has a different build id than this
+    /// running process — i.e. a rebuild is waiting to be adopted via
+    /// [`Self::reload_gateway`]. Cheap on the steady path: it only forks
+    /// `current_exe --build-id` when the binary's mtime has moved since the last
+    /// check (the picker polls this every 2s). A dev `--engine-only` Apply rebuilds
+    /// the gateway binary while leaving the running gateway up, which is exactly the
+    /// state this detects (see `docs/plans/2026-06-18-gateway-reload-control.md`).
+    pub async fn gateway_update_available(&self) -> bool {
+        let Some(exe) = self.inner.exe_path.clone() else {
+            return false;
+        };
+        let mtime = std::fs::metadata(&exe).and_then(|m| m.modified()).ok();
+        // Fast path: mtime unchanged since the last check → reuse the verdict.
+        {
+            let cache = self.inner.update_check.lock().unwrap();
+            if cache.last_mtime == mtime {
+                return cache.update_available;
+            }
+        }
+        // mtime moved (or first check): ask the on-disk binary for its build id.
+        let disk_id = match tokio::process::Command::new(&exe)
+            .arg("--build-id")
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            }
+            // Can't read the on-disk id (binary mid-rewrite, spawn failure) — treat
+            // as "no update" and let the next poll retry once the mtime settles.
+            _ => return false,
+        };
+        let update_available = !disk_id.is_empty() && disk_id != GATEWAY_BUILD_ID;
+        let mut cache = self.inner.update_check.lock().unwrap();
+        cache.last_mtime = mtime;
+        cache.update_available = update_available;
+        update_available
+    }
+
+    /// Re-exec this process onto the on-disk binary — same PID, so the supervisor
+    /// keeps `wait`ing on us and the pidfile stays valid; the fresh `main()`
+    /// re-adopts the running engines on boot (see [`Self::boot_all`]). This is the
+    /// ONLY in-place gateway restart: signalling the supervisor (SIGUSR1) is its
+    /// *permanent* stop, not a restart (see `scripts/lib/gateway_supervisor.sh`).
+    ///
+    /// Returns after scheduling the exec so the HTTP caller still gets its
+    /// response; the actual `execv` happens on a short delay. `execv` only returns
+    /// on failure, in which case we log and keep running the current image.
+    pub fn reload_gateway(&self) -> Result<(), BoxError> {
+        let exe = self
+            .inner
+            .exe_path
+            .clone()
+            .ok_or("current_exe unavailable — cannot reload")?;
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        crate::log!(
+            "[Gateway] reload requested — re-exec {} (build id {})",
+            exe.display(),
+            GATEWAY_BUILD_ID
+        );
+        tokio::spawn(async move {
+            // Give the 202 response time to flush before we replace the image.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            use std::os::unix::process::CommandExt;
+            // `.exec()` replaces this process image and never returns on success.
+            // Env is inherited; argv mirrors the original launch. CLOEXEC on the
+            // listening socket (Rust default) frees the port for the new image.
+            let err = std::process::Command::new(&exe).args(&args).exec();
+            crate::log!("[Gateway] reload re-exec failed, staying on current image: {err}");
+        });
+        Ok(())
     }
 
     // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -1103,8 +1207,11 @@ pub async fn run() -> Result<(), BoxError> {
             starting: AsyncMutex::new(HashSet::new()),
             routes: RwLock::new(HashMap::new()),
             restore: RwLock::new(RestoreStatus::default()),
+            exe_path: std::env::current_exe().ok(),
+            update_check: Mutex::new(UpdateCheck::default()),
         }),
     };
+    crate::log!("[Gateway] build id: {}", GATEWAY_BUILD_ID);
 
     // First run: an empty registry auto-creates `default` (auto-start, so a fresh
     // install opens straight into a running workspace, ADR 0014 §10) and drops
@@ -1259,6 +1366,18 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
                     format!("workspace '{slug}' is stopped"),
                 )
                     .into_response();
+            }
+            // Unknown (never-registered / deleted) slug. On a document navigation,
+            // send the browser to the picker list (`/~/?pick`) rather than a raw
+            // 404 dead-end: the PWA cold-start head redirect (index.html) opens
+            // the remembered workspace optimistically without an existence check,
+            // so a since-deleted last-workspace must land somewhere recoverable.
+            // `?pick` also makes that head redirect stand down, so the picker
+            // renders its list (and forgets the stale workspace) instead of
+            // bouncing straight back here — no redirect loop. Non-document traffic
+            // (API/SSE/assets/SW retries) still gets a 404.
+            if is_document_navigation(&req) {
+                return redirect(&format!("/{SIGIL}/?pick"));
             }
             (StatusCode::NOT_FOUND, format!("unknown workspace '{slug}'")).into_response()
         }
@@ -1599,6 +1718,24 @@ mod tests {
     fn sse_reconnect_does_not_wake_stopped_workspace() {
         let req = request_with_headers(&[(header::ACCEPT.as_str(), "text/event-stream")]);
         assert!(!is_document_navigation(&req));
+    }
+
+    /// An unknown (deleted/stale) workspace slug on a document navigation must
+    /// send the browser to the picker list (`/~/?pick`), not a 404 dead-end — the
+    /// PWA cold-start head redirect opens the remembered workspace without an
+    /// existence check, and `?pick` makes that head redirect stand down so the
+    /// picker renders (no redirect loop). This locks the exact target (SIGIL +
+    /// `?pick`) the frontend guard depends on.
+    #[test]
+    fn unknown_slug_document_nav_redirects_to_picker_list() {
+        let resp = redirect(&format!("/{SIGIL}/?pick"));
+        assert!(resp.status().is_redirection());
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap();
+        assert_eq!(location, "/~/?pick");
     }
 
     /// The bug: the bundled manifest's relative `scope: "."` would scope the

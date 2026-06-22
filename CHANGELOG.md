@@ -1,10 +1,32 @@
 # Changelog
 
+## v0.12.0 — 2026-06-22
+
+### Added
+- **In-thread MCP permission cards** — MCP tool calls in regular chat now prompt with an inline permission card (remember-per-thread, silenced for triggers), replacing the old consent-prompt flow.
+- **Official Lucidos marketplace suggestion** — the App Store suggests the official marketplace when none is registered.
+- **Gateway reload control** — reload the gateway from the workspace picker with a new-build badge and status/reload endpoints, plus a refresh/restart control on the current workspace row.
+- **Whole-file end-state diff toggle** — toggle any diff to view the full merged end-state of a file, not just the change hunks.
+- **Plugin-ownership-aware app delete** — deleting a plugin-owned app is blocked and redirects you to uninstall the plugin.
+- **"Include deleted" thread filter** and a dedicated **Running** view in the thread drawer.
+
+### Changed
+- Thread drawer consolidated — view selector + channel filter merged into one **Filter** dropdown (Lucidos / Coding Agent / Triggers icons), attention-only badging, a unified running spinner, and section-header icons.
+- Compose flow refined — auto-open the coding-agent dropdown after picking a coding destination, a round Send/Stop button, and a mobile split button for change actions.
+- Engine-restart UX softened — no more full-UI deactivation; a light, dismissible toast driven by a reliable build-id check instead of the fragile service-worker event.
+- Dual Submit/Cancel control for a pending question or permission; the Lucidos brand mark now represents the Lucidos Engine actor.
+
+### Fixed
+- Large hardening wave — 110+ fixes across iOS-PWA boot splash and push deep-linking, the gateway cold-start picker redirect (deep-link query+hash preserved, per-workspace localStorage via the Storage prototype), drawer / compose / mobile layout, MCP permission-denial accounting, trigger-CRUD actor preservation, zombie-thread recovery, Apply-All batch-toast rehydration, light-theme token drift, and dropdown / filter interactions.
+
+### Removed
+- App-UI time-travel (serving, versions/restore endpoints, and the frontend), the cc-edit-preread Read-before-Edit guard, and the prompt cancel confirmation.
+
 ## v0.11.0 — 2026-06-18
 
-**Added**
+### Added
 - **Multi-workspace gateway** — standalone `lucidos-gateway` crate plus `lucidos-engine --gateway` mode, `/<slug>/` + `/~/` routing, engine-served frontend with base-path awareness, one shared dev gateway with per-workspace auto-start, and a brand-blue card-less workspace picker with animated mark, in-app switcher, and management UI (ADR 0013/0014).
-- **Self-contained macOS desktop app** — single `.app` bundling PostgreSQL 18 + engine + JS SDK, `build-dmg.sh` packaging, signed + notarized DMG + updater artifacts, auto-update from GitHub Releases, always-on LaunchAgent service + Tailscale mobile access, `File → New Window` (Cmd+N), one-click `curl | sh` installer.
+- **Self-contained macOS desktop app** — single `.app` bundling PostgreSQL 18 + engine + JS SDK, `build-dmg.sh` packaging, signed + notarized DMG + updater artifacts, auto-update from GitHub Releases, always-on LaunchAgent service + Tailscale mobile access, `File -> New Window` (Cmd+N), one-click `curl | sh` installer.
 - **DB-backed environment variables** — store, API, injection, and `request_credential` LLM tool with custom env-var-name pre-fill; Settings subview, nav router, and live SSE updates.
 - **Restore-from-backup in the workspace picker** + `restore-archive` engine subcommand (old Settings restore surface removed).
 - **App Store folded into Apps** — Installed/Store tabs, marketplaces, and auto-update for marketplace installs.
@@ -13,17 +35,16 @@
 - **OpenRouter (GLM 5.2) + local OpenAI-compatible LLM backends.**
 - **Pane/keyboard focus system** — focus panel on header click, prompt-focus drives thread pane, per-pane Tab trap, focused-pane Back/Forward nav.
 - **Nav-history dropdowns** — history list on long-press / right-click of the Back/Forward chevrons, with thread-type and content-category icons.
-- **Event-driven release pipeline** — `build-dmg.sh` emits its own `ReleaseStep*` events stage by stage (consumed read-only by the Release Cockpit), with a version-stamp guard and errtrace/ERR trap so failed stages always report.
 
-**Changed**
+### Changed
 - Codex mid-turn follow-ups interrupt-and-redirect the live turn.
 - Tighter coding-agent commit cadence + post-commit diff display.
 - Thread drawer toggle is now a plain show/hide (not a focus stage); Current threads sorted by creation time.
-- Bundled PostgreSQL 17 → 18 with automatic data migration; shared Postgres `max_connections` raised to 500.
+- Bundled PostgreSQL 17 -> 18 with automatic data migration; shared Postgres `max_connections` raised to 500.
 - Brand-blue header bar with light foreground inversion; dark theme retinted to very dark blue.
 - Markdown parsing cached so a re-render doesn't re-parse the whole thread.
 
-**Fixed**
+### Fixed
 - macOS notarization — sign loose bundled PostgreSQL Mach-O binaries inside-out so the notary accepts the DMG.
 - PWA shows the gateway boot/stopped (503) splash instead of the stale cached shell.
 - Queued-message trash icon rendered inline within the status label.

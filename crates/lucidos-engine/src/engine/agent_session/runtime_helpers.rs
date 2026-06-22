@@ -169,6 +169,7 @@ impl LucidosEngine {
         is_waiting: bool,
         is_shutdown: bool,
         suppress_user_terminal: bool,
+        interrupt_is_redirect: bool,
         agent_cancel: &tokio_util::sync::CancellationToken,
         claude_text_buf: &str,
         last_text_persisted_len: usize,
@@ -188,7 +189,7 @@ impl LucidosEngine {
             coding_agent,
         )
         .await;
-        let Some(kind) = stop_terminal_kind(is_shutdown, is_waiting, suppress_user_terminal)
+        let Some(mut kind) = stop_terminal_kind(is_shutdown, is_waiting, suppress_user_terminal)
         else {
             crate::log!(
                 "[AgentSession] {} arm: session {} stopped without a terminal event \
@@ -198,6 +199,14 @@ impl LucidosEngine {
             );
             return;
         };
+        // Refine a real-Cancel into a redirect cancel when this stop came from a
+        // Codex mid-turn follow-up redirect that escalated (CC ignored the
+        // graceful interrupt) — neutral render instead of "Canceled ✕".
+        if interrupt_is_redirect {
+            if let TerminalKind::Canceled(cause) = &mut kind {
+                *cause = crate::engine::thread_events::CancelCause::SupersededByFollowup;
+            }
+        }
         let is_aborted = matches!(kind, TerminalKind::Aborted(_));
         // Dedup BOTH Aborted and Canceled — eviction-path pre-emits set the
         // flag with actor=System, so a follow-up Canceled here would mask the

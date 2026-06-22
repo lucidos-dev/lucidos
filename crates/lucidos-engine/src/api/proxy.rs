@@ -444,13 +444,22 @@ fn is_redirect_status(status: StatusCode) -> bool {
     )
 }
 
-/// Lowercased host of the URL, or `None` if the URL doesn't parse / has
-/// no host. Used to decide whether a redirect target is "the same host"
-/// the original request was bound to.
-fn host_of(url: &str) -> Option<String> {
-    reqwest::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+/// The full origin a signed request is bound to: `(scheme, host, port)`.
+/// Used to refuse re-signing after a redirect that crosses the origin —
+/// host-only matching would re-send the credential after a `https → http`
+/// scheme downgrade (credential over plaintext) or a hop to a *different
+/// port* on the same host (e.g. an internal admin service). `None` when
+/// the URL doesn't parse or has no host. Scheme and host are lowercased;
+/// port falls back to the scheme's default so `https://h` and
+/// `https://h:443` compare equal.
+fn origin_of(url: &str) -> Option<(String, String, Option<u16>)> {
+    let u = reqwest::Url::parse(url).ok()?;
+    let host = u.host_str()?.to_ascii_lowercase();
+    Some((
+        u.scheme().to_ascii_lowercase(),
+        host,
+        u.port_or_known_default(),
+    ))
 }
 
 /// Resolve a `Location` header value (relative or absolute) against the
@@ -578,10 +587,13 @@ async fn forward_with_redirects(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<(Response, crate::api::proxy_pipeline::PipelineOutcome), (StatusCode, String)> {
-    // Auth is bound to the initial host — cross-host redirects later are
-    // refused with 502.
+    // Auth is bound to the initial origin (scheme + host + port) — a
+    // redirect that crosses ANY of those later is refused with 502.
+    // Host-only binding would re-sign + re-send the credential after a
+    // `https → http` scheme downgrade (credential over plaintext) or a
+    // hop to a different port on the same host.
     let initial_url = build_target_url(base_url, initial_path, initial_query);
-    let initial_host = host_of(&initial_url).ok_or_else(|| {
+    let initial_origin = origin_of(&initial_url).ok_or_else(|| {
         (
             StatusCode::BAD_GATEWAY,
             format!("proxy '{name}' base_url has no host (cannot bind auth to upstream)"),
@@ -654,25 +666,31 @@ async fn forward_with_redirects(
                 format!("proxy '{name}' upstream returned redirect with unparseable Location: {location}"),
             )
         })?;
-        let target_host = target
-            .host_str()
-            .map(|h| h.to_ascii_lowercase())
-            .ok_or_else(|| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    format!("proxy '{name}' upstream redirected to a Location with no host: {location}"),
-                )
-            })?;
-        if target_host != initial_host {
+        let target_origin = origin_of(target.as_str()).ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("proxy '{name}' upstream redirected to a Location with no host: {location}"),
+            )
+        })?;
+        if target_origin != initial_origin {
+            // Names only — no full URLs in the log (a Location can carry a
+            // credential in its query string).
             log!(
-                "[Proxy] {} returned redirect to {} but auth was bound to {} — refused",
+                "[Proxy] {} returned redirect to origin {}://{}:{:?} but auth was bound to {}://{}:{:?} — refused",
                 name,
-                target_host,
-                initial_host
+                target_origin.0,
+                target_origin.1,
+                target_origin.2,
+                initial_origin.0,
+                initial_origin.1,
+                initial_origin.2
             );
             return Err((
                 StatusCode::BAD_GATEWAY,
-                format!("proxy '{name}' redirected to a different host ({target_host}); refusing to re-sign for an unconfigured upstream"),
+                format!(
+                    "proxy '{name}' redirected to a different origin ({}://{}); refusing to re-sign for an unconfigured upstream",
+                    target_origin.0, target_origin.1
+                ),
             ));
         }
         current_path = target.path().trim_start_matches('/').to_string();

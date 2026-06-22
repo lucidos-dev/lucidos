@@ -203,6 +203,7 @@ pub(super) const EMPTY_RESPONSE_ERROR: &str =
 pub(super) fn classify_result(
     is_silent_resume: bool,
     user_hit_stop: bool,
+    interrupt_is_redirect: bool,
     is_shutdown: bool,
     cc_error: Option<String>,
     text_is_empty: bool,
@@ -214,7 +215,14 @@ pub(super) fn classify_result(
     let terminal = if is_shutdown {
         TerminalKind::Aborted(AbortCause::EngineShutdown)
     } else if user_hit_stop {
-        TerminalKind::Canceled(CancelCause::UserStop)
+        // A Codex mid-turn follow-up redirect is a cancel mechanically (no
+        // ResponseGenerated, no change proposal) but NOT a user Stop — render it
+        // neutrally via SupersededByFollowup.
+        TerminalKind::Canceled(if interrupt_is_redirect {
+            CancelCause::SupersededByFollowup
+        } else {
+            CancelCause::UserStop
+        })
     } else if let Some(error) = cc_error {
         TerminalKind::Failed { error }
     } else if text_is_empty {
@@ -341,6 +349,11 @@ pub(super) fn is_stale_resume_signal(
 /// terminator. An idle CC means the previous turn's `ResponseGenerated`
 /// already terminated it, so even a real Cancel click that races in
 /// emits nothing — labeling a finished turn "Canceled" would lie.
+///
+/// This decides *whether* a terminal fires and its base cause (`UserStop` for a
+/// real Cancel). The redirect refinement to `SupersededByFollowup` is applied by
+/// `emit_stop_terminal` (its only redirect-capable caller, the escalation arm),
+/// so this pure function stays a 3-input truth table.
 pub(super) fn stop_terminal_kind(
     is_shutdown: bool,
     is_waiting: bool,
@@ -434,17 +447,20 @@ pub(super) fn classify_session_end_action(
 /// (`should_auto_commit_on_cleanup`) must reflect THIS turn's outcome,
 /// not whatever the previous turn happened to leave behind.
 ///
-/// `cancel_actor` is reset in lockstep with `user_hit_stop`: the interrupt
-/// arm sets both together (cancelling device → `meta.actor`), so a new turn
-/// must clear both. Without this, a follow-up arriving on `msg_rx` during the
-/// cancel+follow-up race clears the latch but leaves the prior turn's device
-/// on `meta`, leaking it onto the follow-up's `CodingAgentPromptSent` and
-/// `ResponseGenerated`.
+/// `cancel_actor` and `interrupt_is_redirect` are reset in lockstep with
+/// `user_hit_stop`: the interrupt arm sets all three together (cancelling device
+/// → `meta.actor`; redirect provenance → the cancel cause), so a new turn must
+/// clear them together. Without this, a follow-up arriving on `msg_rx` during the
+/// cancel+follow-up race clears the latch but leaves the prior turn's device on
+/// `meta` (leaking it onto the follow-up's `CodingAgentPromptSent` /
+/// `ResponseGenerated`) or a stale redirect flag that could mislabel a later
+/// real Stop as `SupersededByFollowup`.
 pub(super) fn reset_per_turn_flags(
     is_waiting: &mut bool,
     last_emitted_idle: &mut bool,
     emitted_terminal_event: &mut bool,
     user_hit_stop: &mut bool,
+    interrupt_is_redirect: &mut bool,
     last_terminal_kind: &mut Option<TerminalKind>,
     cancel_actor: &mut Option<crate::engine::thread_events::MessageOrigin>,
 ) {
@@ -452,6 +468,7 @@ pub(super) fn reset_per_turn_flags(
     *last_emitted_idle = false;
     *emitted_terminal_event = false;
     *user_hit_stop = false;
+    *interrupt_is_redirect = false;
     *last_terminal_kind = None;
     *cancel_actor = None;
 }
@@ -475,6 +492,27 @@ pub(super) fn reset_per_turn_flags(
 /// case.
 pub(super) const WATCHDOG_INACTIVITY_LIMIT_MS: i64 = 10 * 60 * 1000;
 
+/// Hard ceiling for the `tools_in_flight > 0` carve-out. The normal limit
+/// (`WATCHDOG_INACTIVITY_LIMIT_MS` / `EXTERNAL_WATCHDOG_LIMIT_MS`) skips while a
+/// tool is mid-execution because tool runtime is legitimate silence. But that
+/// skip is otherwise *unbounded*: a tool call that never returns — e.g. a hung
+/// `/harden` sub-agent (`Agent`/Task) or a wedged subprocess that stops emitting
+/// without exiting — pins `tools_in_flight > 0` forever and neuters both
+/// watchdogs (the 2026-06-22 thread-72120ca6 incident: 3 parallel harden
+/// sub-agents never returned, thread stuck `running` for 3.5h). Past this
+/// ceiling the watchdog fires *regardless* of `tools_in_flight` — but ONLY when
+/// the caller confirms the thread is still `running` (genuine tool execution),
+/// never when it is `waiting_for_user_answer` (a pending question/permission
+/// card is deliberately counted in `tools_in_flight`, and the user may take
+/// arbitrarily long to answer — see `WatchdogGate::FirePastCeiling`). 45 min is
+/// deliberately longer than the longest legit single tool (a full `cargo`
+/// release build + test suite), and the fire is non-destructive (auto-resume via
+/// `--resume`), so a falsely-flagged slow tool costs at most a resume.
+///
+/// `pub(crate)` (not `pub(super)`) so engine construction (`engine_impl`) can
+/// pass it to the external watchdog.
+pub(crate) const WATCHDOG_HUNG_TOOL_CEILING_MS: i64 = 45 * 60 * 1000;
+
 /// How often the agentic loop's `select!` re-evaluates the watchdog. Coarse
 /// granularity (30s) — the limit is 10 min, so detection latency on a hung
 /// subprocess is at most `WATCHDOG_INACTIVITY_LIMIT_MS + WATCHDOG_TICK`.
@@ -492,6 +530,12 @@ pub(super) const WATCHDOG_DIAG_LOG_THRESHOLD_MS: i64 = WATCHDOG_INACTIVITY_LIMIT
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum WatchdogGate {
     Fire,
+    /// Past the hung-tool ceiling with tools still in flight. The caller MUST
+    /// re-confirm the thread is still `running` (not `waiting_for_user_answer`,
+    /// where a pending question/permission card is legitimately counted in
+    /// `tools_in_flight`) before actually firing — the pure gate can't read the
+    /// projection. Inner count surfaces in the diagnostic log.
+    FirePastCeiling(i32),
     NotStale,
     SkipIsWaiting,
     SkipBadHeartbeat,
@@ -506,6 +550,7 @@ impl WatchdogGate {
     pub(super) fn diag_tag(&self) -> &'static str {
         match self {
             Self::Fire => "fire",
+            Self::FirePastCeiling(_) => "fire_past_ceiling",
             Self::NotStale => "not_stale",
             Self::SkipIsWaiting => "skip_is_waiting",
             Self::SkipBadHeartbeat => "skip_bad_heartbeat",
@@ -586,15 +631,24 @@ pub(super) fn safety_net_action(
     SafetyNetAction::EmitAbortedSafetyNet
 }
 
-/// Pure tick outcome. Fires only when CC is mid-turn (`!is_waiting`), no
-/// tool is in flight (tool execution is legitimate silence — CC owns
-/// timing out the tool), and the last event is past `limit_ms`. A zero
-/// `last_event_at_ms` defensively skips (heartbeat uninitialized / race).
+/// Pure tick outcome. Fires (`Fire`) when CC is mid-turn (`!is_waiting`), no
+/// tool is in flight (tool execution is legitimate silence — CC owns timing out
+/// the tool), and the last event is past `limit_ms`. A zero `last_event_at_ms`
+/// defensively skips (heartbeat uninitialized / race).
+///
+/// The `tools_in_flight > 0` skip is bounded by `ceiling_ms`: past the ceiling
+/// it returns `FirePastCeiling` instead of `SkipToolsInFlight`, so a tool call
+/// that never returns can't neuter the watchdog forever. `FirePastCeiling` is
+/// advisory — the impure caller must confirm the thread is still `running`
+/// (genuine tool execution) and not `waiting_for_user_answer` (a pending
+/// question/permission card, legitimately counted in `tools_in_flight`, that
+/// the user may take arbitrarily long to answer) before actually firing.
 pub(super) fn watchdog_gate(
     is_waiting: bool,
     last_event_at_ms: i64,
     now_ms: i64,
     limit_ms: i64,
+    ceiling_ms: i64,
     tools_in_flight: i32,
 ) -> WatchdogGate {
     if is_waiting {
@@ -603,10 +657,17 @@ pub(super) fn watchdog_gate(
     if last_event_at_ms <= 0 {
         return WatchdogGate::SkipBadHeartbeat;
     }
+    let elapsed = now_ms.saturating_sub(last_event_at_ms);
     if tools_in_flight > 0 {
+        // Past the ceiling, a stuck tool no longer earns an unbounded skip —
+        // hand the caller a `FirePastCeiling` to act on after a projection
+        // re-check. Below the ceiling, tool runtime is legitimate silence.
+        if elapsed > ceiling_ms {
+            return WatchdogGate::FirePastCeiling(tools_in_flight);
+        }
         return WatchdogGate::SkipToolsInFlight(tools_in_flight);
     }
-    if now_ms.saturating_sub(last_event_at_ms) > limit_ms {
+    if elapsed > limit_ms {
         WatchdogGate::Fire
     } else {
         WatchdogGate::NotStale

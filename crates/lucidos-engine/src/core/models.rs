@@ -22,7 +22,8 @@ pub struct Model {
     /// "claude-opus-4-8@default[1m]"). Primary key.
     pub id: String,
     pub label: String,
-    /// Backend that serves the model: "vertex" | "anthropic" | "openai".
+    /// Backend that serves the model:
+    /// "vertex" | "anthropic" | "openai" | "openrouter" | "local".
     pub provider: String,
     pub sort_order: i32,
     /// [`SOURCE_BUILTIN`] or [`SOURCE_USER`].

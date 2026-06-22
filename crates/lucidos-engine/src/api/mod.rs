@@ -18,6 +18,7 @@ mod images;
 pub(crate) mod internal;
 mod knowhow;
 mod mcp;
+mod mcp_permission;
 mod memory;
 mod notifications;
 mod plugins;
@@ -538,7 +539,8 @@ pub struct ModelsListResponse {
 pub struct CreateModelRequest {
     pub id: String,
     pub label: String,
-    /// Backend that serves the model: "vertex" | "anthropic" | "openai".
+    /// Backend that serves the model: "vertex" | "anthropic" | "openai" |
+    /// "openrouter" | "local". Validated by `settings::valid_provider`.
     pub provider: String,
     /// Display order; omitted user models sort after the builtins.
     #[serde(default)]
@@ -686,6 +688,8 @@ pub struct PushSubscribeRequest {
     pub p256dh: String,
     pub auth: String,
     pub device_id: Option<String>,
+    #[serde(default)]
+    pub scope_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -774,19 +778,6 @@ struct EventQuery {
 #[derive(Deserialize)]
 struct SessionMessagesQuery {
     id: String,
-}
-
-#[derive(Deserialize)]
-struct AppVersionsQuery {
-    id: String,
-    limit: Option<usize>,
-    skip: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct AppRestoreQuery {
-    id: String,
-    commit: String,
 }
 
 /// Git version information for an app commit
@@ -946,6 +937,7 @@ pub fn create_router(
         .merge(command_permission::router())
         .merge(command_checkpoint::router())
         .merge(mcp::router())
+        .merge(mcp_permission::router())
         .merge(internal::router())
         .merge(backup::router())
         .merge(disk_usage::router())

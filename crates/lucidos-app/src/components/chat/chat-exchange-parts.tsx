@@ -5,7 +5,8 @@ import { ensureChangeLoaded, revertChange } from '../../store/actions/chat-chang
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDetailModal } from '../../store/store';
 import { LUCIDOS_AGENT_LABEL, resumeEngineNote, stepStatus } from '../../store/thread-events';
-import { LucidosAgentGlyph } from '../shared/LucidosMark';
+import { LucidosGlyph } from '../shared/LucidosMark';
+import { BlobImage } from '../shared/BlobImage';
 import type { Exchange } from '../../store/thread-events';
 import type { Loadable, ResponseEvent } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
@@ -54,7 +55,7 @@ export function UserMessageBody({ html, imageHashes }: { html: string; imageHash
           {imageHashes.map((hash, i) => {
             const src = getSessionBlobUrlForHash(hash) ?? blobPreviewUrl(hash);
             return (
-              <img
+              <BlobImage
                 key={hash + ':' + i}
                 src={src}
                 class="user-image-thumb"
@@ -300,7 +301,7 @@ export function describeExecutor(
 ): { icon: ComponentChildren; label: string } {
   if (isCC && codingAgent === 'codex') return { icon: <CodexIcon />, label: 'Codex' };
   if (isCC) return { icon: <ClaudeIcon />, label: 'Claude Code' };
-  return { icon: <LucidosAgentGlyph />, label: LUCIDOS_AGENT_LABEL };
+  return { icon: <LucidosGlyph />, label: LUCIDOS_AGENT_LABEL };
 }
 
 interface ResponsePanelProps {
@@ -380,10 +381,12 @@ export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 's
       data-role="inline-step"
       onClick={() => { stepDetailModal.value = event; }}
     >
+      {/* In-progress step: no leading icon — the shimmering description is the
+          "live" affordance (the step-icon is hidden via CSS for `.pending`). */}
       <span class="step-icon">
-        {event.success === null ? <span class="mini-spinner" /> : event.success ? '✓' : '⚠'}
+        {event.success === null ? null : event.success ? '✓' : '⚠'}
       </span>
-      <span class="step-description">{highlightEllipsis(event.description)}</span>
+      <span class={`step-description${event.success === null ? ' running-shimmer' : ''}`}>{highlightEllipsis(event.description)}</span>
       {event.detail && <span class="step-detail">{highlightEllipsis(event.detail)}</span>}
       {hasContext && (
         <span class={`step-context${trimmed ? ' trimmed' : ''}`}>

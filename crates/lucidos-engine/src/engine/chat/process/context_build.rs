@@ -74,6 +74,7 @@ struct LabeledSection<'a> {
 pub(crate) fn build_capture_sections(
     system_prompt: &str,
     profile_context: &str,
+    device_preferences_context: &str,
     file_list_context: &str,
     credentials_context: &str,
     email_accounts_context: &str,
@@ -108,7 +109,7 @@ pub(crate) fn build_capture_sections(
         })
     };
 
-    let labeled: [LabeledSection; 15] = [
+    let labeled: [LabeledSection; 16] = [
         LabeledSection {
             name: "System Instructions",
             content: system_prompt,
@@ -118,6 +119,12 @@ pub(crate) fn build_capture_sections(
         LabeledSection {
             name: "User Profile",
             content: profile_context,
+            role: ContextRole::User,
+            group: Some("Identity & profile"),
+        },
+        LabeledSection {
+            name: "Device & Preferences",
+            content: device_preferences_context,
             role: ContextRole::User,
             group: Some("Identity & profile"),
         },

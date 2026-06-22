@@ -12,6 +12,41 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
+/// Outcome of `begin_in_place_merge`'s atomic claim on a thread's live session.
+pub(crate) enum InPlaceMergeStart {
+    /// No live, non-exited session with a worktree — caller falls through to the
+    /// dead-session / temp-worktree merge tiers.
+    NoLiveSession,
+    /// A merge is already running for this thread (`apply_now_in_progress`).
+    AlreadyInProgress,
+    /// Session claimed; `apply_now_in_progress` is now set. Caller owns clearing it.
+    Ready(crate::engine::change_ops::LiveSessionInfo),
+}
+
+/// Pure decision core of `begin_in_place_merge` — split out so the claim state
+/// machine is unit-testable without standing up a full engine. A session is
+/// claimable for an in-place merge only when it exists, its process is alive,
+/// it has a worktree, and no apply is already running on it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InPlaceMergeClaim {
+    NoLiveSession,
+    AlreadyInProgress,
+    Claim,
+}
+
+pub(crate) fn decide_in_place_merge_claim(
+    session: Option<&crate::engine::AgentSession>,
+) -> InPlaceMergeClaim {
+    match session {
+        None => InPlaceMergeClaim::NoLiveSession,
+        Some(s) if s.process_exited || s.worktree_path.is_none() => {
+            InPlaceMergeClaim::NoLiveSession
+        }
+        Some(s) if s.apply_now_in_progress => InPlaceMergeClaim::AlreadyInProgress,
+        Some(_) => InPlaceMergeClaim::Claim,
+    }
+}
+
 impl LucidosEngine {
     /// Apply Now: keep the existing Claude Code session alive and use it for review/conflict resolution.
     /// Only kills CC after the merge succeeds. Falls back to stale session handling if no live session.
@@ -511,6 +546,35 @@ impl LucidosEngine {
             return Ok(shas);
         }
 
+        self.cc_assisted_merge_then_ff(
+            thread_id,
+            change_id,
+            worktree_path,
+            branch_name,
+            repo_root,
+            idle_notify,
+            msg_tx,
+        )
+        .await
+    }
+
+    /// The CC-assisted (slow) half of `merge_via_cc_session`: `main` has
+    /// diverged, so drive the live session through a merge + conflict
+    /// resolution, then ff main to the branch. Split out so the `apply_change`
+    /// Tier-1 path can run the fast ff inline (synchronous, sub-second) and
+    /// hand only this slow half to a background task — keeping the parent
+    /// thread's turn free instead of blocking it for the whole resolution.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn cc_assisted_merge_then_ff(
+        &self,
+        thread_id: Uuid,
+        change_id: Uuid,
+        worktree_path: &Path,
+        branch_name: &str,
+        repo_root: &Path,
+        idle_notify: &tokio::sync::Notify,
+        msg_tx: &tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
+    ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
         // Main has diverged — CC handles the merge. Files are populated by a
         // probe merge so the panel can list which files actually conflict
         // (empty list = clean merge that just needs a merge commit).
@@ -581,6 +645,167 @@ impl LucidosEngine {
         catchup_and_ff_to_main(repo_root, worktree_path, branch_name)
             .await
             .map_err(|e| format!("ff-merge to main failed after CC merge: {}", e).into())
+    }
+
+    /// Atomically claim a thread's live session for an in-place merge.
+    ///
+    /// Locks `agent_sessions` once so the "is there a live session?" check and
+    /// the `apply_now_in_progress` claim can't race a concurrent apply — the
+    /// `apply_change` Tier-1 path used to do `is_running_for` then a separate
+    /// `live_session_info`, a TOCTOU window where two apply calls (e.g. the LLM
+    /// calling `apply_change` twice in quick succession) could both start an
+    /// in-place merge on the same session and corrupt it by sending two merge
+    /// prompts down `msg_tx`. Returns `Ready` with the flag already set; the
+    /// caller MUST clear `apply_now_in_progress` when the merge finishes
+    /// (`spawn_in_place_conflict_recovery` does this in all arms).
+    pub(crate) async fn begin_in_place_merge(&self, thread_id: Uuid) -> InPlaceMergeStart {
+        let mut guard = self.agent_sessions.lock().await;
+        match decide_in_place_merge_claim(guard.get(&thread_id)) {
+            InPlaceMergeClaim::NoLiveSession => InPlaceMergeStart::NoLiveSession,
+            InPlaceMergeClaim::AlreadyInProgress => InPlaceMergeStart::AlreadyInProgress,
+            InPlaceMergeClaim::Claim => {
+                // Re-fetch mutably to set the claim flag; presence + worktree
+                // were validated by `decide_in_place_merge_claim` above under the
+                // same lock, so the unwraps cannot fire.
+                let s = guard
+                    .get_mut(&thread_id)
+                    .expect("session present (checked under lock)");
+                s.apply_now_in_progress = true;
+                InPlaceMergeStart::Ready(crate::engine::change_ops::LiveSessionInfo {
+                    worktree_path: s
+                        .worktree_path
+                        .clone()
+                        .expect("worktree present (checked under lock)"),
+                    idle_notify: s.idle_notify.clone(),
+                    msg_tx: s.msg_tx.clone(),
+                    last_event_at: s.last_event_at.clone(),
+                })
+            }
+        }
+    }
+
+    /// Clear the `apply_now_in_progress` claim for a thread. Used by the
+    /// `apply_change` Tier-1 fast path, which claims the session via
+    /// `begin_in_place_merge` then finalizes a clean fast-forward inline (no
+    /// background task to clear it). Idempotent — a missing session is a no-op.
+    pub(crate) async fn clear_apply_now_in_progress(&self, thread_id: Uuid) {
+        let mut guard = self.agent_sessions.lock().await;
+        if let Some(s) = guard.get_mut(&thread_id) {
+            s.apply_now_in_progress = false;
+        }
+    }
+
+    /// Run the CC-assisted conflict merge as a guarded background task and
+    /// finalize, then return immediately. This is the async counterpart of the
+    /// `apply_now` spawn: same liveness-timeout (abort if CC goes silent for 10
+    /// minutes), panic guard, and always-clear of `apply_now_in_progress`.
+    ///
+    /// The caller (`apply_change` Tier 1) has already claimed the session via
+    /// `begin_in_place_merge` and run the fast-forward inline; this handles only
+    /// the slow divergent-`main` path. On success it emits `ChangeApplied` (via
+    /// `apply_now_success`); on failure it emits `ChangeApplyFailed` and leaves
+    /// the session alive for retry. Either way, when the session reaches its
+    /// terminal event the EventBus parent-callback fan-out wakes the parent
+    /// thread with a `ChildThreadCompleted` — so the parent gets a fresh
+    /// follow-up turn instead of a turn frozen for the whole resolution.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_in_place_conflict_recovery(
+        self: &Arc<Self>,
+        thread_id: Uuid,
+        change_id: Uuid,
+        session: crate::engine::change_ops::LiveSessionInfo,
+        branch_name: String,
+        repo_root: std::path::PathBuf,
+        requires_restart: bool,
+        client_update: bool,
+        actor: Option<MessageOrigin>,
+    ) {
+        use std::sync::atomic::Ordering;
+        let engine = self.clone_arc();
+        tokio::spawn(async move {
+            let crate::engine::change_ops::LiveSessionInfo {
+                worktree_path,
+                idle_notify,
+                msg_tx,
+                last_event_at,
+            } = session;
+
+            // Liveness-based timeout mirrors `apply_now`: abort only if CC has
+            // emitted no events for 10 minutes (not wall-clock — an active
+            // conflict resolution can run as long as it keeps producing output).
+            let panic_result = std::panic::AssertUnwindSafe(async {
+                let inactivity_limit_ms: i64 = 600_000;
+                let inner_fut = engine.cc_assisted_merge_then_ff(
+                    thread_id,
+                    change_id,
+                    &worktree_path,
+                    &branch_name,
+                    &repo_root,
+                    &idle_notify,
+                    &msg_tx,
+                );
+                tokio::pin!(inner_fut);
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(30), &mut inner_fut).await {
+                        Ok(result) => break result,
+                        Err(_) => {
+                            let last_ms = last_event_at.load(Ordering::Relaxed);
+                            let idle_ms = now_epoch_millis() - last_ms;
+                            if idle_ms > inactivity_limit_ms {
+                                break Err(format!(
+                                    "Conflict resolution timed out — no CC activity for {} minutes",
+                                    idle_ms / 60_000,
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                }
+            });
+
+            let result: Result<(String, String), Box<dyn std::error::Error + Send + Sync>> =
+                match futures::FutureExt::catch_unwind(panic_result).await {
+                    Ok(inner) => inner,
+                    Err(_) => Err("cc_assisted_merge_then_ff panicked".into()),
+                };
+
+            // Always clear the in-progress claim — normal, timeout, error, panic.
+            {
+                let mut guard = engine.agent_sessions.lock().await;
+                if let Some(s) = guard.get_mut(&thread_id) {
+                    s.apply_now_in_progress = false;
+                }
+            }
+
+            match result {
+                Ok((pre_sha, post_sha)) => {
+                    engine
+                        .apply_now_success(
+                            thread_id,
+                            change_id,
+                            requires_restart,
+                            client_update,
+                            &pre_sha,
+                            &post_sha,
+                            &worktree_path,
+                            &repo_root,
+                            &branch_name,
+                            actor,
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    log!(
+                        "[Changes] Async in-place merge failed for {}: {} — session stays alive for retry",
+                        change_id,
+                        e
+                    );
+                    engine
+                        .emit_apply_failed(thread_id, change_id, &e.to_string(), actor)
+                        .await;
+                }
+            }
+        });
     }
 
     /// Helper: kill Claude Code session and clean up after a successful apply.
@@ -774,6 +999,97 @@ pub(crate) async fn probe_merge_conflicts(worktree_path: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::AgentSession;
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32};
+    use tokio::sync::{mpsc, Notify};
+
+    /// Build a minimal `AgentSession` for claim-decision tests. `worktree` and
+    /// `process_exited` / `apply_now_in_progress` are the fields the claim state
+    /// machine reads; everything else is inert defaults.
+    fn claim_test_session(
+        process_exited: bool,
+        worktree: Option<&str>,
+        apply_now_in_progress: bool,
+    ) -> AgentSession {
+        let (msg_tx, _msg_rx) = mpsc::unbounded_channel::<AgentUserInput>();
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        AgentSession {
+            msg_tx,
+            is_waiting: !process_exited,
+            has_changes: false,
+            requires_restart: false,
+            pending_stop: None,
+            cancel_actor: None,
+            redirect_followup: false,
+            stop: Arc::new(Notify::new()),
+            interrupt: Arc::new(Notify::new()),
+            idle_notify: Arc::new(Notify::new()),
+            apply_now_in_progress,
+            process_exited,
+            worktree_path: worktree.map(std::path::PathBuf::from),
+            branch_name: None,
+            repo_root: None,
+            cc_session_id: None,
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            external_terminal_emitted: Arc::new(AtomicBool::new(false)),
+            control_tx,
+            builtin_commands: vec![],
+            skill_commands: vec![],
+            current_model: None,
+            current_reasoning_effort: None,
+            last_event_at: Arc::new(AtomicI64::new(0)),
+            pending_followups: Arc::new(AtomicU32::new(0)),
+            tools_in_flight: Arc::new(AtomicI32::new(0)),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        }
+    }
+
+    #[test]
+    fn claim_none_when_no_session() {
+        assert_eq!(
+            decide_in_place_merge_claim(None),
+            InPlaceMergeClaim::NoLiveSession
+        );
+    }
+
+    #[test]
+    fn claim_none_when_process_exited() {
+        let s = claim_test_session(true, Some("/wt"), false);
+        assert_eq!(
+            decide_in_place_merge_claim(Some(&s)),
+            InPlaceMergeClaim::NoLiveSession
+        );
+    }
+
+    #[test]
+    fn claim_none_when_no_worktree() {
+        let s = claim_test_session(false, None, false);
+        assert_eq!(
+            decide_in_place_merge_claim(Some(&s)),
+            InPlaceMergeClaim::NoLiveSession
+        );
+    }
+
+    #[test]
+    fn claim_already_in_progress_when_flag_set() {
+        // A live session already mid-apply must not be claimed again — this is
+        // the guard against the LLM calling `apply_change` twice and starting
+        // two in-place merges on one session.
+        let s = claim_test_session(false, Some("/wt"), true);
+        assert_eq!(
+            decide_in_place_merge_claim(Some(&s)),
+            InPlaceMergeClaim::AlreadyInProgress
+        );
+    }
+
+    #[test]
+    fn claim_ok_when_live_idle_with_worktree() {
+        let s = claim_test_session(false, Some("/wt"), false);
+        assert_eq!(
+            decide_in_place_merge_claim(Some(&s)),
+            InPlaceMergeClaim::Claim
+        );
+    }
 
     /// Liveness-based timeout: a future that keeps emitting events should not
     /// be killed, but one that goes silent should time out.

@@ -70,19 +70,6 @@
     font-size: 0.6875rem;
 }
 
-.compose-handoff-hint {
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
-    color: var(--text-muted);
-    font-size: 0.6875rem;
-    font-style: italic;
-}
-
-.compose-handoff-hint-dismiss {
-    flex-shrink: 0;
-}
-
 .prompt-input-container {
     width: 100%;
     max-width: var(--content-max-width);
@@ -255,9 +242,21 @@
 
 .prompt-actions-right {
     display: flex;
-    align-items: flex-end;
+    align-items: center;
     gap: 0.5rem;
     margin-left: auto;
+    /* Safety net: when the measurement-driven `is-stacked` lift can't engage
+     * (no liftable slot — e.g. a question-answer thread showing
+     * Save / Cancel / Submit), the buttons must wrap onto another row instead
+     * of overflowing the prompt row off-screen. flex-shrink (default 1) lets
+     * this group give up width under the row's auto margin when free space goes
+     * negative, so wrapping engages. `wrap-reverse` keeps the default position
+     * the BOTTOM row (the first/primary buttons stay anchored at the bottom)
+     * and lifts only the overflow UP onto a new row above — matching the
+     * `is-stacked` lift, so a button like Save isn't needlessly pushed to the
+     * top. Right-aligned via justify-content. */
+    flex-wrap: wrap-reverse;
+    justify-content: flex-end;
 }
 
 /* Stacked variant — useFitsInOneRow detected overflow, so the secondary
@@ -273,12 +272,17 @@
 
 .prompt-actions-subrow {
     display: flex;
-    align-items: flex-end;
+    align-items: center;
     gap: 0.5rem;
 }
 
-.save-thread-btn {
-    padding-right: 1rem;
+/* Saved pin: the icon is already filled (PinIcon filled) — accent color +
+ * tinted background make the saved state unmistakable next to the other left
+ * header icons. */
+.pin-thread-btn.active {
+    color: var(--accent);
+    background: var(--bg-tertiary);
+    border-radius: 0.375rem;
 }
 
 .changes-bulk-actions {
@@ -937,23 +941,16 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     flex-wrap: wrap;
 }
 
-/* Shared with .response-header-clickable below — both collapse the turn's body
-   when clicked. Hover-out is delayed so brief cursor exits from the collapse-
-   driven layout shift don't flash the base back in before the cursor re-enters. */
+/* Both the initiator and response headers collapse the turn's body when clicked
+   — cursor: pointer is the affordance. Neither lights up the whole row on hover:
+   the hover highlight lives on the chips INSIDE the header (the actor/executor
+   chip — button.initiator-actor / .response-executor — and the timestamp/summary
+   buttons), so only the "[icon] Claude Code" chip tints, never the edge-to-edge
+   row. A full-row tint read as a heavy affordance stacked on the chip's own. */
 .initiator-header-clickable,
 .response-header-clickable {
     cursor: pointer;
     user-select: none;
-    border-radius: 0.25rem;
-    transition: background var(--duration-normal) ease 80ms;
-}
-
-@media (hover: hover) {
-    .initiator-header-clickable:hover,
-    .response-header-clickable:hover {
-        background: var(--bg-hover);
-        transition-delay: 0s;
-    }
 }
 
 .initiator-icon {
@@ -1085,6 +1082,9 @@ button.initiator-actor,
    small accent-tinted stub bubble on the right for a user message. */
 .turn-collapsed {
     cursor: pointer;
+    /* Match the header/body left inset so the folded "⋯" lines up with the
+       rest of the turn content instead of sitting flush against the edge. */
+    padding-left: var(--turn-body-inset);
 }
 .turn-collapsed-bubble {
     display: flex;

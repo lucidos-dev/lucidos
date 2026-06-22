@@ -1,33 +1,44 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { shouldShowSwUpdateToast, markSwUpdateDismissed, scheduleServiceWorkerUpdateChecks, requestServiceWorkerBuildId, refreshClient, clientRefreshing, getServedBuildId, shouldReloadForStaleChunk } from './sw-update';
+import { markSwUpdateDismissed, wasSwUpdateDismissed, noteUpdateBuildId, scheduleServiceWorkerUpdateChecks, requestServiceWorkerBuildId, refreshClient, clientRefreshing, getServedBuildId, shouldReloadForStaleChunk } from './sw-update';
 
-describe('SW update toast guard', () => {
+describe('SW update dismiss (build-id aware)', () => {
   beforeEach(() => {
     sessionStorage.clear();
+    noteUpdateBuildId(''); // reset the module-level pending id between tests
   });
 
-  it('skips toast on initial install (no prior controller)', () => {
-    expect(shouldShowSwUpdateToast(false)).toBe(false);
+  it('a served build is not dismissed by default', () => {
+    expect(wasSwUpdateDismissed('server999')).toBe(false);
   });
 
-  it('shows toast on genuine update (had controller at startup)', () => {
-    expect(shouldShowSwUpdateToast(true)).toBe(true);
-  });
-
-  it('skips toast after dismiss flag is set', () => {
+  it('marks the noted served build as dismissed', () => {
+    noteUpdateBuildId('server999');
     markSwUpdateDismissed();
-    expect(shouldShowSwUpdateToast(true)).toBe(false);
+    expect(wasSwUpdateDismissed('server999')).toBe(true);
   });
 
-  it('consumes dismiss flag (one-time guard)', () => {
+  it('does NOT suppress a genuinely newer build after an earlier dismiss', () => {
+    noteUpdateBuildId('server999');
     markSwUpdateDismissed();
-    expect(shouldShowSwUpdateToast(true)).toBe(false); // consumed
-    expect(shouldShowSwUpdateToast(true)).toBe(true);  // flag gone, next genuine update shows
+    // The badge/toast check passes the CURRENTLY served id; a newer one re-surfaces.
+    expect(wasSwUpdateDismissed('server1000')).toBe(false);
   });
 
-  it('dismiss flag has no effect on initial install', () => {
+  it('markSwUpdateDismissed is a no-op when no build was noted', () => {
     markSwUpdateDismissed();
-    expect(shouldShowSwUpdateToast(false)).toBe(false); // still blocked by hadController
+    expect(wasSwUpdateDismissed('server999')).toBe(false);
+  });
+
+  it('returns false (surface the toast) when sessionStorage is unavailable', () => {
+    noteUpdateBuildId('server999');
+    const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+      throw new Error('opaque origin');
+    });
+    try {
+      expect(wasSwUpdateDismissed('server999')).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

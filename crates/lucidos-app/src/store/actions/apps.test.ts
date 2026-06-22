@@ -328,7 +328,9 @@ describe('openAppById', () => {
     expect(panelOverlay.value).toBeNull();
     const errors = toasts.value.filter((t) => t.type === 'error');
     expect(errors).toHaveLength(1);
-    expect(errors[0].message).toMatch(/no app with id/i);
+    // After the disk re-scan still misses, the toast names the id + that it's gone.
+    expect(errors[0].message).toMatch(/trip-planner-2026/);
+    expect(errors[0].message).toMatch(/no longer exists/i);
   });
 
   it('opens the app when found', async () => {

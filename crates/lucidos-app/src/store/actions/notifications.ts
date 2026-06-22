@@ -17,7 +17,7 @@ import {
   markNotificationRead,
   markAllNotificationsRead,
 } from '../../api/client';
-import { errorDetail } from '../../utils/errorDetail';
+import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { createFailureCounter } from '../../utils/failureCounter';
 
 const PAGE_SIZE = 15;
@@ -163,7 +163,15 @@ export async function loadUnreadNotifications(): Promise<void> {
       unreadNotifications.value = { status: 'loaded', data: data.notifications || [] };
     }
     unreadLoadFailures.recordSuccess();
-  } catch {
+  } catch (e) {
+    // A browser-cancelled fetch (iOS PWA freeze / radio handoff) rejects with
+    // AbortError — there's no manual AbortController here, so it carries no
+    // reachability signal. Don't count it toward the escalation threshold, or a
+    // few background-resume cancellations falsely trip "Unread count is stale —
+    // couldn't reach the engine". A genuine unreachable engine fires
+    // TimeoutError / a transport TypeError, which still counts. The next resume
+    // re-syncs the badge.
+    if (isAbortError(e)) return;
     unreadLoadFailures.recordFailure();
   }
 }

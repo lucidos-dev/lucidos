@@ -3,6 +3,8 @@ import {
   listWorkspaces,
   createWorkspace,
   restoreBackup,
+  getGatewayStatus,
+  reloadGateway,
   slugifyWorkspaceName,
   parseWorkspaceNameFromArchive,
 } from './control';
@@ -60,6 +62,23 @@ describe('control client', () => {
     // Multipart: the body is FormData (browser sets the boundary), not JSON.
     expect(mock.mock.calls[0][1]?.body).toBeInstanceOf(FormData);
     expect(started.id).toBe('personal');
+  });
+
+  it('reads gateway self-update status from the sigil control route', async () => {
+    const mock = withFetch(() =>
+      Promise.resolve(new Response('{"build_id":"abc123","update_available":true}', { status: 200 })),
+    );
+    const status = await getGatewayStatus();
+    expect(String(mock.mock.calls[0][0])).toBe('/~/api/v1/control/gateway/status');
+    expect(status.update_available).toBe(true);
+    expect(status.build_id).toBe('abc123');
+  });
+
+  it('reloads the gateway via POST to the sigil control route (202, bodyless)', async () => {
+    const mock = withFetch(() => Promise.resolve(new Response(null, { status: 202 })));
+    await reloadGateway();
+    expect(String(mock.mock.calls[0][0])).toBe('/~/api/v1/control/gateway/reload');
+    expect(mock.mock.calls[0][1]?.method).toBe('POST');
   });
 
   it('surfaces a 409 collision as an Error carrying the server message', async () => {

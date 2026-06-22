@@ -101,7 +101,11 @@
     --header-fg-muted: rgba(255, 255, 255, 0.72);
     --header-control-hover-bg: rgba(255, 255, 255, 0.12);
     --header-control-active-bg: rgba(255, 255, 255, 0.22);
-    --header-divider: rgba(255, 255, 255, 0.24);
+    /* Header divider: a very faint translucent white tint over the brand-blue
+       bar — barely-there, so it reads as a hint of a seam rather than the stark
+       light-gray line --border-color would draw in light mode. Full-height
+       geometry still matches the pane .split-divider. */
+    --header-divider: rgba(255, 255, 255, 0.1);
     --header-badge-bg: #ffffff;
     --header-badge-fg: var(--brand-blue-deep);
     /* Base bar color: any inherited text / currentColor glyph (e.g. the
@@ -291,23 +295,17 @@
     position: relative;
 }
 
-/* Slot holding the needs-attention / drafts toggles (AltViewToggles), placed
-   immediately right of the filter icon. The slot reserves a fixed two-toggle
-   width per viewport (see the media queries) so the Threads title and adjacent
-   controls do not move when a count appears or clears. */
-.altview-slot {
+/* Slot holding the single unified Filter button (opens the merged View + Show
+   dropdown — see ThreadFilterDropdown). Sizes to the button; `position: relative`
+   is the positioning context for the anchored dropdown. The needs-attention
+   badge is absolutely positioned, so it never changes the slot's width and the
+   Threads title beside it holds its place as the count appears/clears. */
+.view-selector-slot {
     display: flex;
     align-items: center;
     flex-shrink: 0;
     gap: 0.25rem;
-}
-
-/* A toggle with no content collapses so the remaining toggle packs to the
-   first slot — immediately right of the filter, with no empty gap between
-   them. The slot's reserved width parks the freed space on the right, toward
-   the title. attention first, drafts second (DOM order in AltViewToggles). */
-.altview-slot .altview-hidden {
-    display: none;
+    position: relative;
 }
 
 /* Desktop: position burger, brand, and panel title to track the split layout */
@@ -333,17 +331,19 @@
         position: relative;
     }
 
-    /* Subtle divider between chat and panel header areas — centered on the split bar */
+    /* Divider between chat and panel header areas — centered on the split bar.
+       Full-height + same width as the pane .split-divider below it, so the two
+       read as one continuous divider; tinted (--header-divider) to blend with
+       the blue bar rather than standing out like the opaque pane divider. */
     .app-header::after {
         content: '';
         position: absolute;
         left: var(--divider-x);
-        top: 20%;
-        bottom: 20%;
+        top: 0;
+        bottom: 0;
         width: var(--divider-width);
-        border-radius: calc(var(--divider-width) / 2);
         background: var(--header-divider);
-        opacity: 0.4;
+        opacity: 1;
         pointer-events: none;
         transition: opacity 0.3s, left var(--duration-slow) ease;
     }
@@ -353,10 +353,9 @@
         content: '';
         position: absolute;
         left: var(--co);
-        top: 20%;
-        bottom: 20%;
+        top: 0;
+        bottom: 0;
         width: var(--divider-width);
-        border-radius: calc(var(--divider-width) / 2);
         background: var(--header-divider);
         opacity: 0;
         pointer-events: none;
@@ -364,7 +363,7 @@
     }
 
     :root[data-thread-drawer-open] .app-header::before {
-        opacity: 0.4;
+        opacity: 1;
     }
 
     /* Hide header dividers when either pane is collapsed */
@@ -397,13 +396,6 @@
         overflow: clip;
         transition: left var(--duration-slow) ease,
                     opacity var(--duration-slow) ease, visibility var(--duration-slow);
-    }
-
-    /* TimeTravelDropdown opens below the header from inside this region —
-       lift the clip while it's open (same pattern as the control-panel
-       exemption on .pane-header-brand). */
-    .app-header .content-header-elements:has(.time-travel-menu) {
-        overflow: visible;
     }
 
     .app-header .panel-nav,
@@ -482,27 +474,18 @@
         pointer-events: none;
     }
 
-    /* Reserve both desktop toggle positions (two 2.25rem icons + 0.25rem gap)
-       so the Threads title holds its place as counts appear/clear; a single
-       visible toggle packs to the left edge, right of the filter. */
-    .threads-header .altview-slot {
-        width: 4.75rem;
-    }
-
-    /* Title fills the space after the toggle slot (flex:1, so the search icon
-       stays pinned right) but its text packs to the LEFT edge — i.e. directly
-       beside the needs-attention/drafts toggles — rather than centering in that
-       gap and drifting toward the search icon. The toggles are anchored left
-       (next to the filter), so "right beside the toggles" is as far left as the
-       title can sit without overlapping them; the slot's reserved width keeps
-       that left edge fixed as counts appear/clear. */
+    /* Title fills the space after the Filter button (flex:1, so the search icon
+       stays pinned right) and CENTERS in that gap — i.e. midway between the
+       Filter button on its left and the Search icon on its right. The
+       needs-attention badge is absolutely positioned so it can't shift the
+       title as the count appears/clears. */
     .threads-header-title {
         flex: 1;
         font-size: 0.875rem;
         font-weight: 600;
         color: var(--text-primary);
         white-space: nowrap;
-        text-align: left;
+        text-align: center;
         overflow: hidden;
         text-overflow: ellipsis;
     }
@@ -854,11 +837,105 @@
     flex-shrink: 0;
 }
 
-.control-panel-ws-current {
-    color: var(--text-muted);
-    font-size: 0.6875rem;
+/* The current workspace row is a static container (not a button/link); its
+   only interactive affordance is the refresh button. */
+.control-panel-current-row {
+    cursor: default;
+}
+
+/* On the current row the name only takes its content width so the checkmark
+   sits right behind it (rather than the name growing to fill the row). */
+.control-panel-ws-name-current {
+    flex: 0 1 auto;
+}
+
+.control-panel-ws-check {
+    width: 0.875rem;
+    height: 0.875rem;
+    color: var(--accent);
+    flex-shrink: 0;
+}
+
+/* Refresh button + the inline restart-confirm both sit at the trailing edge. */
+.control-panel-ws-refresh,
+.control-panel-ws-restart-confirm {
     margin-left: auto;
     flex-shrink: 0;
+}
+
+.control-panel-ws-refresh {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.5rem;
+    height: 1.5rem;
+    padding: 0;
+    border: none;
+    background: transparent;
+    border-radius: 0.25rem;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background var(--duration-fast), color var(--duration-fast);
+    touch-action: none;
+}
+
+.control-panel-ws-refresh svg {
+    width: 0.875rem;
+    height: 0.875rem;
+}
+
+.control-panel-ws-refresh:hover {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+}
+
+.control-panel-ws-refresh:focus-visible {
+    outline: none;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+}
+
+/* A restart is pending — draw attention to the refresh button. */
+.control-panel-ws-refresh.is-pending {
+    color: var(--accent);
+}
+
+.control-panel-ws-restart-confirm {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.control-panel-ws-cancel,
+.control-panel-ws-confirm {
+    border: none;
+    border-radius: 0.25rem;
+    padding: 0.1875rem 0.5rem;
+    font: inherit;
+    font-size: 0.75rem;
+    font-weight: 600;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background var(--duration-fast), color var(--duration-fast);
+}
+
+.control-panel-ws-cancel {
+    background: transparent;
+    color: var(--text-muted);
+}
+
+.control-panel-ws-cancel:hover {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+}
+
+.control-panel-ws-confirm {
+    background: var(--accent-action);
+    color: var(--text-on-accent);
+}
+
+.control-panel-ws-confirm:hover {
+    background: color-mix(in srgb, var(--accent-action) 80%, #fff);
 }
 
 .control-panel-manage-row {
@@ -890,7 +967,7 @@
    is the same element, .pane-header.app-header).
 
    Popout panels that render *inside* the header subtree (filter dropdown,
-   anchored dropdowns, time-travel menu) are NOT part of the blue bar:
+   anchored dropdowns) are NOT part of the blue bar:
    they reset the --header-* tokens to the normal dark-on-light values at the
    bottom of this block, so the same selectors render them conventionally. */
 
@@ -900,8 +977,7 @@
 
 .app-header .icon-btn.pinned,
 .app-header .icon-btn.filter-active,
-.app-header .icon-btn.drafts-active,
-.app-header .icon-btn.attention-active {
+.app-header .icon-btn.view-selector-active {
     color: var(--header-fg);
     background: var(--header-control-active-bg);
 }
@@ -917,8 +993,7 @@
     }
 
     .app-header .icon-btn.filter-active:hover,
-    .app-header .icon-btn.drafts-active:hover,
-    .app-header .icon-btn.attention-active:hover {
+    .app-header .icon-btn.view-selector-active:hover {
         color: var(--header-fg);
         background: rgba(255, 255, 255, 0.3);
     }
@@ -979,8 +1054,7 @@
    the default token values so the selectors above render dark-on-light there. */
 .app-header .thread-filter-dropdown,
 .app-header .dropdown-menu,
-.app-header .nav-history-menu,
-.app-header .time-travel-menu {
+.app-header .nav-history-menu {
     --header-fg: var(--text-primary);
     --header-fg-muted: var(--text-secondary);
     --header-control-hover-bg: var(--bg-hover);

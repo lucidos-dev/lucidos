@@ -333,8 +333,10 @@ fn read_knowhow_file(path: &Path, id: &str) -> Option<Knowhow> {
 
 /// Same path-traversal guard as [`KnowhowStore::load`]; ids that fail this
 /// can never resolve to a real file regardless of which dir we look in.
+/// Delegates to the canonical [`super::is_path_traversal`] so the rule can
+/// never drift from the engine-wide guard.
 fn is_safe_id(id: &str) -> bool {
-    !id.contains("..") && !id.starts_with('/') && !id.starts_with('\\')
+    !super::is_path_traversal(id)
 }
 
 /// Resolve `<app_id>/<rest>` to `<apps>/<app_id>/knowhow/<rest>.md`. Returns

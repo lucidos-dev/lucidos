@@ -150,8 +150,8 @@ test.describe('Resume after restart — boundary panels', () => {
       await navigateToApp(page);
 
       // The abort boundary opens its own exchange whose initiator label is
-      // the engine label (⬡ Lucidos Engine). The Continue button sits in the
-      // initiator footer.
+      // the engine label ("Lucidos Engine", with the Lucidos mark glyph). The
+      // Continue button sits in the initiator footer.
       const exchanges = page.locator('.chat-exchange:visible');
       await expect(exchanges).toHaveCount(2, { timeout: 10_000 });
       const abortExchange = exchanges.nth(1);

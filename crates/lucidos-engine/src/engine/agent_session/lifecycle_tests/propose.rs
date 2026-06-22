@@ -108,6 +108,7 @@ fn reset_per_turn_flags_clears_all_flags() {
     let mut last_emitted_idle = true;
     let mut emitted_terminal_event = true;
     let mut user_hit_stop = true;
+    let mut interrupt_is_redirect = true;
     let mut last_terminal_kind = Some(TerminalKind::Generated);
     let mut cancel_actor = Some(crate::engine::thread_events::MessageOrigin::Device {
         device_id: "ios-1".into(),
@@ -119,6 +120,7 @@ fn reset_per_turn_flags_clears_all_flags() {
         &mut last_emitted_idle,
         &mut emitted_terminal_event,
         &mut user_hit_stop,
+        &mut interrupt_is_redirect,
         &mut last_terminal_kind,
         &mut cancel_actor,
     );
@@ -133,6 +135,11 @@ fn reset_per_turn_flags_clears_all_flags() {
     assert!(
         !user_hit_stop,
         "stop applies to the prior turn's response, not the next one"
+    );
+    assert!(
+        !interrupt_is_redirect,
+        "must clear in lockstep with user_hit_stop — else a stale redirect flag \
+         could mislabel a later real Stop as SupersededByFollowup"
     );
     assert!(
         last_terminal_kind.is_none(),

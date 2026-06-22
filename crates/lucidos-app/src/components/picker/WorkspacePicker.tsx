@@ -19,6 +19,9 @@
 import { useSignal } from '@preact/signals';
 import { useEffect } from 'preact/hooks';
 import type { Loadable } from '../../store/types';
+import { Overlay } from '../shared/Overlay';
+import { dismissBootSplash } from '../../utils/bootSplash';
+import { recallLastWorkspace, forgetLastWorkspace } from '../../utils/lastWorkspace';
 import {
   listWorkspaces,
   createWorkspace,
@@ -33,8 +36,11 @@ import {
   clearRestoreStatus,
   slugifyWorkspaceName,
   parseWorkspaceNameFromArchive,
+  getGatewayStatus,
+  reloadGateway,
   type WorkspaceStatus,
   type GwRestoreStatus,
+  type GatewayStatus,
 } from '../../api/client/control';
 
 /** Derived display state — collapses health + last_error into one status the row
@@ -115,11 +121,10 @@ function PlayIcon() {
   );
 }
 
-function PauseIcon() {
+function StopIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-      <rect x="6.5" y="5" width="4" height="14" rx="1.2" />
-      <rect x="13.5" y="5" width="4" height="14" rx="1.2" />
+      <rect x="6" y="6" width="12" height="12" rx="2" />
     </svg>
   );
 }
@@ -133,11 +138,32 @@ function ClockIcon() {
   );
 }
 
+function ReloadIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 12a9 9 0 0 1 15.5-6.2L21 8" />
+      <path d="M21 3v5h-5" />
+      <path d="M21 12a9 9 0 0 1-15.5 6.2L3 16" />
+      <path d="M3 21v-5h5" />
+    </svg>
+  );
+}
+
 function PencilIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <path d="M12 20h9" />
       <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
+    </svg>
+  );
+}
+
+function MoreIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <circle cx="12" cy="5" r="1.8" />
+      <circle cx="12" cy="12" r="1.8" />
+      <circle cx="12" cy="19" r="1.8" />
     </svg>
   );
 }
@@ -169,6 +195,35 @@ export function WorkspacePicker() {
   const restoreKey = useSignal('');
   const restoreName = useSignal('');
   const restoreStatus = useSignal<GwRestoreStatus | null>(null);
+  // Gateway self-update: drives the header reload control + "new gateway
+  // available" badge. Null until the first poll lands (legacy non-gateway mode
+  // never resolves it, so the control stays hidden).
+  const gatewayStatus = useSignal<GatewayStatus | null>(null);
+  const reloading = useSignal(false);
+  // Confirm step before re-execing the gateway (the reload re-execs the running
+  // process). Anchored to the header reload icon.
+  const reloadConfirmOpen = useSignal(false);
+  const reloadAnchor = useSignal<HTMLElement | null>(null);
+  // Per-row overflow menu (autostart / rename / delete). Only one open at a time;
+  // anchor is the ⋯ button that opened it.
+  const menuOpenId = useSignal<string | null>(null);
+  const menuAnchor = useSignal<HTMLElement | null>(null);
+  // Confirm step before stopping a running workspace (stopping it makes the
+  // workspace unreachable until restarted). Anchored to the row's stop button.
+  const stopConfirmId = useSignal<string | null>(null);
+  const stopAnchor = useSignal<HTMLElement | null>(null);
+  // Auto-open the last-active workspace whenever the picker loads — the smart
+  // root (`/`) AND the sigil (`/~/`), since the installed PWA launches at the
+  // picker manifest's `start_url` (`/~/`), not `/`. The ONLY escape is an
+  // explicit `?pick`: the in-app "Manage workspaces" link carries it so the list
+  // stays reachable for switching. Shows a brief "Opening…" splash while we
+  // confirm the remembered workspace still exists; if it's gone we forget it and
+  // fall through to the picker.
+  const autoOpening = useSignal(
+    typeof window !== 'undefined' &&
+      !new URLSearchParams(window.location.search).has('pick') &&
+      recallLastWorkspace() !== null,
+  );
 
   async function fetchWorkspaces(): Promise<void> {
     const list = await listWorkspaces();
@@ -178,6 +233,14 @@ export function WorkspacePicker() {
 
   async function fetchRestoreStatus(): Promise<void> {
     restoreStatus.value = await getRestoreStatus();
+  }
+
+  async function fetchGatewayStatus(): Promise<void> {
+    const status = await getGatewayStatus();
+    gatewayStatus.value = status;
+    // After a reload, the running gateway IS the on-disk binary, so the update
+    // clears — that's our signal the new image is up; drop the "Reloading…" state.
+    if (reloading.value && !status.update_available) reloading.value = false;
   }
 
   // Initial load + user-initiated actions: a failure surfaces the error screen.
@@ -207,14 +270,48 @@ export function WorkspacePicker() {
     } catch (e) {
       console.warn('[picker] restore-status poll failed; keeping last-good', e);
     }
+    // Best-effort gateway self-update check (drives the reload control + badge).
+    // Absent in legacy non-gateway mode and during a reload re-exec window; a
+    // blip keeps the last-good status and the next tick recovers.
+    try {
+      await fetchGatewayStatus();
+    } catch (e) {
+      console.warn('[picker] gateway-status poll failed; keeping last-good', e);
+    }
+  }
+
+  function onReloadGateway() {
+    reloadConfirmOpen.value = false;
+    void withBusy(async () => {
+      reloading.value = true;
+      await reloadGateway();
+      // The gateway re-execs (~300ms delay server-side) and briefly drops; the
+      // 2s poll reconnects and clears `reloading` once the new image answers.
+    });
   }
 
   useEffect(() => {
     workspaces.value = { status: 'loading' };
-    void refresh();
+    void (async () => {
+      await refresh();
+      if (!autoOpening.value) return;
+      const list = workspaces.value;
+      const remembered = recallLastWorkspace();
+      if (list.status === 'loaded' && remembered) {
+        if (list.data.some((w) => w.id === remembered)) {
+          openWorkspace(remembered); // navigates away; splash holds until unload
+          return;
+        }
+        forgetLastWorkspace(); // remembered workspace was deleted — stop retrying
+      }
+      autoOpening.value = false; // nothing to open / load failed → show the picker
+    })();
     // Seed the restore banner so a reload mid-restore re-attaches to the live
     // phase (the gateway holds the authoritative single-slot status).
     void fetchRestoreStatus().catch(() => { /* no banner until the poll lands */ });
+    // Seed the gateway self-update status so the reload control appears without
+    // waiting for the first 2s tick (absent in legacy non-gateway mode).
+    void fetchGatewayStatus().catch(() => { /* no control until the poll lands */ });
     // Poll the full list so a workspace launched (or stopped) while the picker
     // is open appears on its own — not only while something is already
     // "Starting…" (that gate left a freshly-launched workspace invisible until a
@@ -224,6 +321,17 @@ export function WorkspacePicker() {
     }, 2000);
     return () => clearInterval(timer);
   }, []);
+
+  // Drive the inline boot splash (index.html). While auto-opening, leave it up
+  // untouched — it keeps its baked "Opening your workspace…" status (do NOT
+  // re-set it here: the workspace document bakes the SAME text, so leaving it
+  // alone keeps the status byte-identical across the cross-document hop, with no
+  // wording swap at the seam). It stays on screen straight through the navigation
+  // (the workspace's own inline splash continues it), so there is no picker-grid
+  // "blink". When we instead show the list, fade it.
+  useEffect(() => {
+    if (!autoOpening.value) dismissBootSplash();
+  }, [autoOpening.value]);
 
   async function withBusy(fn: () => Promise<void>) {
     busy.value = true;
@@ -313,10 +421,59 @@ export function WorkspacePicker() {
     restoreFile.value != null && restoreKey.value.trim() !== '' && restoreName.value.trim() !== '' && !restoreCollision;
   const restore = restoreStatus.value;
 
+  // Smart-root auto-open in progress: render nothing so the inline boot splash
+  // (index.html, kept up by the effect above) stays the only thing on screen —
+  // the picker grid never flashes before the redirect to the last-active
+  // workspace, and the splash carries straight through the navigation.
+  if (autoOpening.value) return null;
+
   return (
     <div class="ws-picker">
       <div class="ws-picker-shell">
         <header class="ws-picker-header">
+          {gatewayStatus.value && (
+            <>
+              <button
+                class={`ws-picker-reload${gatewayStatus.value.update_available ? ' has-update' : ''}${reloading.value ? ' is-reloading' : ''}`}
+                disabled={busy.value || reloading.value}
+                title={
+                  reloading.value
+                    ? 'Reloading gateway…'
+                    : gatewayStatus.value.update_available
+                      ? 'New gateway build available — reload to adopt it'
+                      : 'Reload gateway'
+                }
+                aria-label="Reload gateway"
+                onClick={(e) => {
+                  const btn = e.currentTarget as HTMLElement;
+                  if (reloadConfirmOpen.value) {
+                    reloadConfirmOpen.value = false;
+                  } else {
+                    reloadAnchor.value = btn;
+                    reloadConfirmOpen.value = true;
+                  }
+                }}
+              >
+                <ReloadIcon />
+              </button>
+              <Overlay
+                open={reloadConfirmOpen.value}
+                onClose={() => (reloadConfirmOpen.value = false)}
+                anchor={reloadAnchor.value}
+                backdrop={false}
+                panelClass="ws-picker-confirm ws-picker-confirm-reload"
+              >
+                <p class="ws-picker-confirm-text">
+                  Reload the gateway? Every running workspace stays up; the gateway
+                  process re-execs and briefly drops.
+                </p>
+                <div class="ws-picker-confirm-actions">
+                  <button class="ws-picker-btn" onClick={() => (reloadConfirmOpen.value = false)}>Cancel</button>
+                  <button class="ws-picker-btn ws-picker-btn-confirm" disabled={busy.value} onClick={onReloadGateway}>Reload</button>
+                </div>
+              </Overlay>
+            </>
+          )}
           <div class="ws-picker-brand">
             <LucidosMark />
             <h1>Lucidos</h1>
@@ -394,28 +551,57 @@ export function WorkspacePicker() {
                       <span class={`ws-picker-dot ws-picker-dot-${state}`} title={w.last_error || STATE_LABEL[state]} />
                       <span class="ws-picker-name">{w.name}</span>
                       <div class="ws-picker-actions" onClick={(e) => e.stopPropagation()}>
-                        <button
-                          class={`ws-picker-icon ws-picker-icon-toggle${w.autostart ? ' is-on' : ''}`}
-                          disabled={busy.value}
-                          title={w.autostart ? 'Starts when the gateway opens' : 'Start only when opened'}
-                          aria-label={`${w.autostart ? 'Disable' : 'Enable'} start with gateway for ${w.name}`}
-                          aria-pressed={w.autostart}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void withBusy(() => setAutostart(w.id, !w.autostart).then(refresh));
-                          }}
-                        ><ClockIcon /></button>
                         {running ? (
-                          <button
-                            class="ws-picker-icon ws-picker-icon-play"
-                            disabled={busy.value}
-                            title="Stop"
-                            aria-label={`Stop ${w.name}`}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              void withBusy(() => stopWorkspace(w.id).then(refresh));
-                            }}
-                          ><PauseIcon /></button>
+                          <div class="ws-picker-stop-wrap">
+                            <button
+                              class="ws-picker-icon ws-picker-icon-play ws-picker-icon-stop"
+                              disabled={busy.value}
+                              title="Stop"
+                              aria-label={`Stop ${w.name}`}
+                              aria-haspopup="dialog"
+                              aria-expanded={stopConfirmId.value === w.id}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                const btn = e.currentTarget as HTMLElement;
+                                if (stopConfirmId.value === w.id) {
+                                  stopConfirmId.value = null;
+                                } else {
+                                  stopAnchor.value = btn;
+                                  stopConfirmId.value = w.id;
+                                }
+                              }}
+                            ><StopIcon /></button>
+                            <Overlay
+                              open={stopConfirmId.value === w.id}
+                              onClose={() => (stopConfirmId.value = null)}
+                              anchor={stopAnchor.value}
+                              backdrop={false}
+                              panelClass="ws-picker-confirm ws-picker-confirm-stop"
+                            >
+                              <p class="ws-picker-confirm-text">
+                                Stop “{w.name}”? It shuts down and becomes unreachable
+                                until you start it again.
+                              </p>
+                              <div class="ws-picker-confirm-actions">
+                                <button
+                                  class="ws-picker-btn"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    stopConfirmId.value = null;
+                                  }}
+                                >Cancel</button>
+                                <button
+                                  class="ws-picker-btn ws-picker-btn-danger"
+                                  disabled={busy.value}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    stopConfirmId.value = null;
+                                    void withBusy(() => stopWorkspace(w.id).then(refresh));
+                                  }}
+                                >Stop</button>
+                              </div>
+                            </Overlay>
+                          </div>
                         ) : (
                           <button
                             class="ws-picker-icon ws-picker-icon-play"
@@ -428,18 +614,74 @@ export function WorkspacePicker() {
                             }}
                           ><PlayIcon /></button>
                         )}
-                        <button
-                          class="ws-picker-icon ws-picker-icon-secondary"
-                          title="Rename"
-                          aria-label={`Rename ${w.name}`}
-                          onClick={(e) => { e.stopPropagation(); renamingId.value = w.id; renameValue.value = w.name; }}
-                        ><PencilIcon /></button>
-                        <button
-                          class="ws-picker-icon ws-picker-icon-secondary ws-picker-icon-danger"
-                          title="Delete"
-                          aria-label={`Delete ${w.name}`}
-                          onClick={(e) => { e.stopPropagation(); deletingId.value = w.id; deleteConfirm.value = ''; }}
-                        ><TrashIcon /></button>
+                        <div class="ws-picker-menu-wrap">
+                          <button
+                            class="ws-picker-icon ws-picker-icon-more"
+                            disabled={busy.value}
+                            title="More"
+                            aria-label={`More actions for ${w.name}`}
+                            aria-haspopup="menu"
+                            aria-expanded={menuOpenId.value === w.id}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const btn = e.currentTarget as HTMLElement;
+                              if (menuOpenId.value === w.id) {
+                                menuOpenId.value = null;
+                              } else {
+                                menuAnchor.value = btn;
+                                menuOpenId.value = w.id;
+                              }
+                            }}
+                          ><MoreIcon /></button>
+                          <Overlay
+                            open={menuOpenId.value === w.id}
+                            onClose={() => (menuOpenId.value = null)}
+                            anchor={menuAnchor.value}
+                            backdrop={false}
+                            panelClass="ws-picker-menu"
+                            panelRole="menu"
+                          >
+                            <button
+                              class={`ws-picker-menu-item${w.autostart ? ' is-on' : ''}`}
+                              role="menuitem"
+                              disabled={busy.value}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                menuOpenId.value = null;
+                                void withBusy(() => setAutostart(w.id, !w.autostart).then(refresh));
+                              }}
+                            >
+                              <ClockIcon />
+                              <span>{w.autostart ? 'Starts with gateway' : 'Does not start with gateway'}</span>
+                            </button>
+                            <button
+                              class="ws-picker-menu-item"
+                              role="menuitem"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                menuOpenId.value = null;
+                                renamingId.value = w.id;
+                                renameValue.value = w.name;
+                              }}
+                            >
+                              <PencilIcon />
+                              <span>Rename</span>
+                            </button>
+                            <button
+                              class="ws-picker-menu-item ws-picker-menu-item-danger"
+                              role="menuitem"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                menuOpenId.value = null;
+                                deletingId.value = w.id;
+                                deleteConfirm.value = '';
+                              }}
+                            >
+                              <TrashIcon />
+                              <span>Delete</span>
+                            </button>
+                          </Overlay>
+                        </div>
                       </div>
                     </div>
                   )}

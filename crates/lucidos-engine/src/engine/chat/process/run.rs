@@ -24,6 +24,24 @@ use super::super::process_helpers::{
 };
 use super::context_build::{build_capture_sections, build_loaded_knowhow_block};
 
+pub(super) async fn resolve_route_overrides(
+    pool: &sqlx::PgPool,
+    use_coding_agent: Option<bool>,
+    model_override: Option<&str>,
+    reasoning_effort: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if use_coding_agent == Some(true) {
+        return (None, reasoning_effort.map(str::to_string));
+    }
+
+    PreferenceStore::resolve_chat_overrides(
+        pool,
+        model_override.map(str::to_string),
+        reasoning_effort.map(str::to_string),
+    )
+    .await
+}
+
 /// Whether a typed-instead-of-clicked message is eligible to answer a pending
 /// `UserQuestionAsked` via the FreeText fast-path.
 ///
@@ -89,14 +107,16 @@ impl LucidosEngine {
 
         let is_trigger = trigger.is_some();
 
-        // `None` here means "use the user's chat defaults", not "use
-        // `LlmProvider::default_model()`" — which strips the `[1m]` suffix and
-        // doesn't carry an effort, so without this resolve the stamp drifts
-        // away from the user's selection on every internal re-entry path.
-        let (resolved_model, resolved_effort) = PreferenceStore::resolve_chat_overrides(
+        // For chat turns, `None` means "use the user's Lucidos chat defaults",
+        // not `LlmProvider::default_model()` (which drops `[1m]` and carries no
+        // effort). For coding-agent turns, `None` must stay unset so the agent
+        // path falls through to live/thread/backend settings instead of
+        // inheriting the unrelated Lucidos chat reasoning preference.
+        let (resolved_model, resolved_effort) = resolve_route_overrides(
             &self.pool,
-            model_override.map(str::to_string),
-            reasoning_effort.map(str::to_string),
+            use_coding_agent,
+            model_override,
+            reasoning_effort,
         )
         .await;
         let model_override = resolved_model.as_deref();
@@ -268,6 +288,18 @@ impl LucidosEngine {
                 self.pool(),
                 &self.event_bus,
                 &self.pending_command_permission,
+                thread_id,
+                origin.clone(),
+            )
+            .await;
+            // Same supersede for the chat MCP permission lane: a thread parked on
+            // an `McpPermissionRequested` whose user types a new message instead
+            // of clicking resolves the card as denied (and unblocks the parked
+            // agentic loop). Chat-only, same as the command lane.
+            crate::engine::mcp_permission::resolve_pending_mcp_permissions_as_superseded(
+                self.pool(),
+                &self.event_bus,
+                &self.pending_mcp_permission,
                 thread_id,
                 origin.clone(),
             )
@@ -601,9 +633,11 @@ impl LucidosEngine {
 
         // Wait for any in-progress request on this thread to finish, then register.
         // This queues follow-up messages instead of cancelling in-progress work.
-        // The _guard ensures the thread is automatically unregistered on all exit
-        // paths (normal return, error, or panic) via its Drop impl.
-        let (cancel_token, mut injection_rx, _guard) = self.register_thread_queued(thread_id).await;
+        // `guard` ensures the thread is unregistered on every exit path: the
+        // normal path drops it explicitly via `finalize_turn_and_drain_injections`
+        // (remove-then-drain, see below), and the error/panic paths fall back to
+        // its Drop impl.
+        let (cancel_token, mut injection_rx, guard) = self.register_thread_queued(thread_id).await;
 
         // Trigger-driven runs hand the scheduler's per-trigger cancel down here.
         // Forward it onto the per-thread token so deleting/disabling/updating the
@@ -847,6 +881,7 @@ impl LucidosEngine {
         let super::context_sections::ChatContextSections {
             file_list_context,
             profile_context,
+            device_preferences_context,
             credentials_context,
             email_accounts_context,
             oauth_context,
@@ -855,14 +890,16 @@ impl LucidosEngine {
             url_context_section,
             thread_depth_context,
         } = self
-            .build_chat_context_sections(
-                &classification,
-                &user_profile,
-                app_context.as_ref(),
-                file_context.as_deref(),
-                url_context.as_ref(),
+            .build_chat_context_sections(super::context_sections::ChatContextInputs {
+                classification: &classification,
+                user_profile: &user_profile,
+                device_id,
+                event_device: device_name.as_deref(),
+                app_context: app_context.as_ref(),
+                file_context: file_context.as_deref(),
+                url_context: url_context.as_ref(),
                 parent_thread_id,
-            )
+            })
             .await;
 
         let mut tools = get_default_tools();
@@ -906,6 +943,7 @@ impl LucidosEngine {
 
         // Trim expendable context sections if the initial message would exceed budget
         let fixed_size = profile_context.len()
+            + device_preferences_context.len()
             + file_list_context.len()
             + credentials_context.len()
             + email_accounts_context.len()
@@ -940,6 +978,9 @@ impl LucidosEngine {
         let mut user_message_parts: Vec<&str> = Vec::new();
         if !profile_context.is_empty() {
             user_message_parts.push(&profile_context);
+        }
+        if !device_preferences_context.is_empty() {
+            user_message_parts.push(&device_preferences_context);
         }
         if !memory_context.is_empty() {
             user_message_parts.push(&memory_context);
@@ -1037,6 +1078,7 @@ impl LucidosEngine {
         let capture_sections = build_capture_sections(
             &system_prompt,
             &profile_context,
+            &device_preferences_context,
             &file_list_context,
             &credentials_context,
             &email_accounts_context,
@@ -1133,11 +1175,16 @@ impl LucidosEngine {
         }
 
         // Recover messages that the fast-path send (above) landed on
-        // `injection_tx` after the loop's last try_recv() but before the
-        // guard dropped — without this they'd be silently lost when
-        // injection_rx is dropped on function return. Attach to the result
-        // so chat_submit can re-submit them as regular follow-ups.
-        let orphans = Self::drain_orphaned_injections(&mut injection_rx);
+        // `injection_tx` after the loop's last try_recv() but before the turn
+        // went idle — without this they'd be silently lost when injection_rx
+        // is dropped on function return. `finalize_turn_and_drain_injections`
+        // drops the guard FIRST (removing the handle from active_threads under
+        // the same lock the fast-path send takes) and only THEN drains, so a
+        // follow-up racing this teardown is either buffered-and-recovered here
+        // or rejected → caller's slow path. It is never acknowledged into a
+        // channel nobody drains. Attach to the result so chat_submit can
+        // re-submit the orphans as regular follow-ups (= the next turn).
+        let orphans = Self::finalize_turn_and_drain_injections(guard, &mut injection_rx);
         let orphans =
             crate::engine::filter_removed_queued_prompts(&self.pool, thread_id, orphans).await;
         if !orphans.is_empty() {

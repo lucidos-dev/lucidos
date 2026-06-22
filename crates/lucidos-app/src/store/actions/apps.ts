@@ -6,7 +6,6 @@ import {
   pendingChatMessage,
   showToast,
   showConfirm,
-  appCommit,
   appPseudoFullscreen,
   appRefreshKey,
   wipPreviewThreadId,
@@ -21,13 +20,16 @@ import { toFailed, setLoadingIfFresh } from '../types';
 import type { App } from '../types';
 import { revealContentPane } from './pane';
 import {
+  ApiError,
   listAppsApi,
   deleteAppApi,
   updateAppApi,
+  stagePluginUninstall,
   appUrl,
   postAppCapture,
 } from '../../api/client';
 import { pushNavState } from './navigation';
+import { openPluginUninstallRequest } from './plugin-uninstall';
 import { isElementVisible } from '../../components/chat/scrollState';
 import { errorDetail } from '../../utils/errorDetail';
 
@@ -82,17 +84,25 @@ export function openApp(app: App): void {
 /** Open an app by ID — loads apps first if needed, then opens.
  *
  * Defense-in-depth on cache miss: if the cache is loaded but doesn't contain
- * the requested id, refetch once before erroring. The backend search reads
- * disk directly while `appsList` is a cached projection refreshed by
- * `AppCreated`/`AppUpdated`/`AppDeleted` SSE events; a brief race between
- * Apply landing on disk and the SSE event arriving (or any future event-drop)
- * would otherwise produce "no app with id" for an app the search just found.
+ * the requested id, refetch once (a fresh `/apps` DISK scan) before erroring.
+ * The backend reads disk directly while `appsList` is a cached projection
+ * refreshed by per-channel hints (`AppCreated`/`AppUpdated`/`AppDeleted`,
+ * `PluginInstalled`, …). This re-scan is the WRITER-AGNOSTIC safety net: it
+ * finds an app no matter how it landed on disk — including apps created via
+ * `run_bash`/`run_python` or any channel that emits no refresh hint, and a
+ * brief Apply-vs-SSE race. So the navigate path never falsely reports a live
+ * app as gone, even though the apps LIST panel itself may still lag for those
+ * hint-less writers until reload. Only after this re-scan still misses do we
+ * conclude the app is genuinely gone.
  *
  * The retry must NOT clobber `appsList` if it fails: a transient network blip
  * on the second fetch would otherwise turn the user's loaded list into the
  * `failed` Loadable, deleting cached data for one bad click. Snapshot
  * pre-fetch and restore on transient failure. */
-export async function openAppById(appId: string): Promise<void> {
+export async function openAppById(appId: string, source?: string): Promise<void> {
+  // `source` describes where a navigate originated (e.g. a thread label, or
+  // "an app") so a miss toast says where it came from instead of swallowing it.
+  const from = source ? ` (requested by ${source})` : '';
   let apps = appsList.value;
   if (apps.status !== 'loaded') {
     await loadApps();
@@ -101,7 +111,7 @@ export async function openAppById(appId: string): Promise<void> {
   if (apps.status !== 'loaded') {
     // loadApps stamped the failure on appsList (Loadable failed), but the user
     // who clicked the link is not on the apps tab — they'd see nothing.
-    showToast("Couldn't open app — apps failed to load", 'error');
+    showToast(`Couldn't open app "${appId}"${from} — apps failed to load`, 'error');
     return;
   }
   let app = apps.data.find((s) => s.id === appId);
@@ -120,7 +130,10 @@ export async function openAppById(appId: string): Promise<void> {
   if (app) {
     openApp(app);
   } else {
-    showToast(`Couldn't open app — no app with id "${appId}"`, 'error');
+    // Disk re-scanned and the app genuinely isn't there. Name the id + source
+    // so the user knows what was missing and where the navigate came from.
+    console.warn(`[apps] navigate to missing app "${appId}"${from}`);
+    showToast(`App "${appId}" no longer exists${from}`, 'error');
   }
 }
 
@@ -167,12 +180,28 @@ export async function confirmDeleteApp(
     }
     void loadApps();
   } catch (error) {
+    // A plugin-installed app can't be deleted directly — the engine 409s with
+    // the owning plugin. Route the user to the plugin uninstall confirm panel
+    // (the single removal authority) instead of dead-ending on an error toast.
+    // Nothing is removed until the user confirms in that panel.
+    if (error instanceof ApiError && error.httpCode === 409) {
+      const body = error.body as { plugin_id?: string; plugin_name?: string } | undefined;
+      if (body?.plugin_id) {
+        try {
+          const request = await stagePluginUninstall(body.plugin_id);
+          openPluginUninstallRequest(request);
+        } catch (e) {
+          const label = body.plugin_name ?? body.plugin_id;
+          showToast(`Couldn't open uninstall for plugin "${label}": ${errorDetail(e)}`, 'error');
+        }
+        return;
+      }
+    }
     showToast('Failed to delete app: ' + errorDetail(error), 'error');
   }
 }
 
 function closeAppWindow(): void {
-  appCommit.value = null;
   cancelPendingRefresh();
   if (appRefreshKey.value) appRefreshKey.value = 0;
   panelOverlay.value = null;
@@ -277,11 +306,10 @@ export function submitNewApp(name: string, description: string): void {
 export function getAppFrameSrc(): string | null {
   const app = currentApp.value;
   if (!app) return null;
-  // WIP preview wins over commit pinning — historical commit + live worktree
-  // is nonsense (the worktree IS the current edit). Mutually exclusive at
-  // the UI surface; if both ever co-occur, the WIP wins.
+  // WIP preview (an app coding-agent thread's worktree) vs. the live workspace
+  // copy. When no preview thread is set, serve live.
   const tid = wipPreviewThreadId.value;
-  return appUrl(app.id, tid ? undefined : (appCommit.value ?? undefined), tid ?? undefined);
+  return appUrl(app.id, tid ?? undefined);
 }
 
 export async function captureAppUI(appId: string, requestId: string): Promise<void> {

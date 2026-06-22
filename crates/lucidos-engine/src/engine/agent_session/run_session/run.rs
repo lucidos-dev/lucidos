@@ -11,7 +11,7 @@ use crate::engine::git_ops::{
 use crate::engine::thread_events::{EventChannel, SessionEndReason};
 use crate::engine::{AgentSession, AgentUserInput, LucidosEngine, ProcessResult, StopReason};
 use crate::runtime::{AgentEvent, AgentInput, CodingAgent};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -22,7 +22,7 @@ use crate::engine::agent_session::lifecycle::{
     should_auto_commit_on_cleanup, should_propose_change_at_idle,
     terminal_clears_user_hit_stop, terminate_decision, watchdog_gate, IdleAction, TerminalKind,
     TerminateDecision, WatchdogGate, WATCHDOG_DIAG_LOG_THRESHOLD_MS,
-    WATCHDOG_INACTIVITY_LIMIT_MS, WATCHDOG_TICK_INTERVAL_SECS,
+    WATCHDOG_HUNG_TOOL_CEILING_MS, WATCHDOG_INACTIVITY_LIMIT_MS, WATCHDOG_TICK_INTERVAL_SECS,
 };
 use crate::engine::agent_session::resume::{change_description_fallback, resolve_resume_context, CC_TURN_CLOSER_EVENTS};
 use crate::engine::agent_session::spawn::spawn_or_resume;
@@ -99,6 +99,13 @@ impl LucidosEngine {
                 None => requested_coding_agent.unwrap_or(CodingAgent::ClaudeCode),
             }
         };
+        let user_device_preferences_context =
+            crate::engine::agent_context::build_user_device_preferences_context_for_origin(
+                &self.pool,
+                &self.event_store,
+                origin_id,
+            )
+            .await;
 
         // Pre-spawn app-coding-agent-thread detection: `spawn_agent_thread`
         // stashes the app id here when the LLM picks `folder=data/apps/<id>`;
@@ -186,7 +193,10 @@ impl LucidosEngine {
                         if session
                             .msg_tx
                             .send(AgentUserInput {
-                                text: user_message.to_string(),
+                                text: crate::engine::agent_context::prepend_user_device_preferences_context(
+                                    &user_device_preferences_context,
+                                    user_message,
+                                ),
                                 images,
                                 origin_event_id: Some(origin_id),
                                 kind: crate::engine::AgentInputKind::User,
@@ -359,6 +369,12 @@ impl LucidosEngine {
                 coding_agent,
             )
             .await?;
+
+        let system_prompt = if user_device_preferences_context.is_empty() {
+            system_prompt
+        } else {
+            format!("{}\n\n{}", system_prompt, user_device_preferences_context)
+        };
 
         // Append thread history as context so new coding-agent sessions in an existing thread
         // can see what was discussed/done previously.
@@ -552,33 +568,16 @@ impl LucidosEngine {
             // as-is. Failures inside the helper degrade silently to "no
             // note", matching the rest of the resume code's tolerance for
             // best-effort git introspection.
-            let final_text = if !user_message.is_empty() {
-                let edit_note = match (worktree_path.as_deref(), last_idle_sha.as_deref()) {
-                    (Some(wt), Some(sha)) => {
-                        crate::engine::agent_session::external_edits::compute_external_edit_note(wt, Some(sha)).await
-                    }
-                    _ => None,
-                };
-                let combined = match (adoption_note.as_deref(), edit_note.as_deref()) {
-                    (Some(a), Some(e)) => Some(format!("{}\n{}", a, e)),
-                    (Some(a), None) => Some(a.to_string()),
-                    (None, Some(e)) => Some(e.to_string()),
-                    (None, None) => None,
-                };
-                match combined {
-                    Some(n) => {
-                        log!(
-                            "[AgentSession] Injecting external-edit note for thread {} ({} chars)",
-                            thread_id,
-                            n.len()
-                        );
-                        format!("{}\n\n{}", n, user_message)
-                    }
-                    None => user_message.to_string(),
-                }
-            } else {
-                user_message.to_string()
-            };
+            let final_text = build_resume_prompt_text(
+                &self.pool,
+                thread_id,
+                origin_id,
+                user_message,
+                worktree_path.as_deref(),
+                last_idle_sha.as_deref(),
+                adoption_note.as_deref(),
+            )
+            .await;
 
             if agent_input_tx
                 .send(AgentInput {
@@ -633,6 +632,7 @@ impl LucidosEngine {
                 requires_restart: false,
                 pending_stop: None,
                 cancel_actor: None,
+                redirect_followup: false,
                 stop: stop.clone(),
                 interrupt: interrupt.clone(),
                 idle_notify: idle_notify.clone(),
@@ -776,6 +776,12 @@ impl LucidosEngine {
         // user_hit_stop: when true, the next Result emits ResponseCanceled (exchange:
         // "Canceled") instead of ResponseGenerated. Reset on next user follow-up.
         let mut user_hit_stop = false;
+        // interrupt_is_redirect: set alongside user_hit_stop when the interrupt
+        // came from a Codex mid-turn follow-up redirect (drained from the session
+        // by `arm_codex_redirect`), so the Result classifies as
+        // CancelCause::SupersededByFollowup (neutral render) instead of UserStop.
+        // Cleared at the turn boundary in lockstep with user_hit_stop.
+        let mut interrupt_is_redirect = false;
         // last_emitted_idle: true iff the most recent in-loop event was
         // CodingAgentIdled. The post-loop relies on this flag to decide whether to
         // synthesize an idle event before SessionEnded.
@@ -1325,6 +1331,7 @@ impl LucidosEngine {
                                         let (terminal_kind, emit_idle) = classify_result(
                                             is_silent_resume(user_message.is_empty(), has_user_images),
                                             user_hit_stop,
+                                            interrupt_is_redirect,
                                             is_shutdown,
                                             cc_error,
                                             buffered_text_empty && result_text_empty,
@@ -1345,6 +1352,7 @@ impl LucidosEngine {
                                             let clears = terminal_clears_user_hit_stop(&kind);
                                             if clears {
                                                 user_hit_stop = false;
+                                                interrupt_is_redirect = false;
                                             }
                                             if !Self::external_terminal_already_emitted(&external_terminal_emitted, thread_id, "Result classify") {
                                                 let terminal_event = Self::make_terminal_event(
@@ -1674,6 +1682,7 @@ impl LucidosEngine {
                         &mut last_emitted_idle,
                         &mut emitted_terminal_event,
                         &mut user_hit_stop,
+                        &mut interrupt_is_redirect,
                         &mut last_terminal_kind,
                         &mut meta.actor,
                     );
@@ -1733,6 +1742,14 @@ impl LucidosEngine {
                     // after restart via recover_orphaned_worktrees.
                     if !is_waiting {
                         user_hit_stop = true;
+                        // Distinguish a follow-up redirect (set by
+                        // `arm_codex_redirect`) from a real Stop click: the
+                        // former classifies as SupersededByFollowup (neutral),
+                        // the latter as UserStop ("Canceled ✕"). Drained on read;
+                        // cleared at the Result turn boundary below alongside
+                        // user_hit_stop.
+                        interrupt_is_redirect =
+                            self.take_session_redirect_followup(thread_id).await;
                         // Drain the device that clicked Cancel (stamped by
                         // `interrupt_agent`) onto `meta` so the terminal
                         // `ResponseCanceled` records it — the popover's Device row.
@@ -1771,6 +1788,7 @@ impl LucidosEngine {
                         is_waiting,
                         is_shutdown,
                         suppress_user_terminal,
+                        false, // the stop channel is never a redirect (redirects use `interrupt`)
                         &agent_cancel,
                         &claude_text_buf,
                         last_text_persisted_len,
@@ -1803,7 +1821,11 @@ impl LucidosEngine {
                         thread_id
                     );
                     last_terminal_kind = Some(TerminalKind::Canceled(
-                        crate::engine::thread_events::CancelCause::UserStop,
+                        if interrupt_is_redirect {
+                            crate::engine::thread_events::CancelCause::SupersededByFollowup
+                        } else {
+                            crate::engine::thread_events::CancelCause::UserStop
+                        },
                     ));
                     let is_shutdown = shutting_down.load(std::sync::atomic::Ordering::Relaxed);
                     self.emit_stop_terminal(
@@ -1811,7 +1833,8 @@ impl LucidosEngine {
                         thread_id,
                         is_waiting,
                         is_shutdown,
-                        false, // a real UserStop — not Apply/Discard/Archive
+                        false, // suppress: a real Cancel — not Apply/Discard/Archive
+                        interrupt_is_redirect, // redirect → SupersededByFollowup cause
                         &agent_cancel,
                         &claude_text_buf,
                         last_text_persisted_len,
@@ -1835,6 +1858,7 @@ impl LucidosEngine {
                         is_waiting,
                         is_shutdown,
                         false,
+                        false, // chat_cancel is engine shutdown / request abort, not a redirect
                         &agent_cancel,
                         &claude_text_buf,
                         last_text_persisted_len,
@@ -1876,6 +1900,7 @@ impl LucidosEngine {
                         last_ms,
                         now_ms,
                         WATCHDOG_INACTIVITY_LIMIT_MS,
+                        WATCHDOG_HUNG_TOOL_CEILING_MS,
                         tools_in_flight_snapshot,
                     );
                     // last_ms <= 0 routes to SkipBadHeartbeat (no fire) and
@@ -1898,9 +1923,41 @@ impl LucidosEngine {
                                 gate.diag_tag(),
                             );
                         }
-                        if gate == WatchdogGate::Fire {
+                        let should_fire = match gate {
+                            WatchdogGate::Fire => true,
+                            WatchdogGate::FirePastCeiling(tif) => {
+                                // A tool has been "in flight" past the hung-tool
+                                // ceiling. Distinguish a genuinely hung tool
+                                // (thread still `running`) from a pending
+                                // question/permission card the user simply
+                                // hasn't answered yet — those flip the thread to
+                                // `waiting_for_user_answer` but are deliberately
+                                // counted in `tools_in_flight` to disarm the
+                                // normal watchdog. Only the former is
+                                // euthanizable; the user may take arbitrarily
+                                // long to answer.
+                                let still_running =
+                                    crate::engine::claude_code::thread_is_running(
+                                        self.pool(),
+                                        thread_id,
+                                    )
+                                    .await
+                                    .unwrap_or(false);
+                                if !still_running {
+                                    log!(
+                                        "[AgentSession] Watchdog: thread {} past hung-tool ceiling with {} tool(s) in flight but no longer `running` (awaiting user answer / already settled) — not firing",
+                                        thread_id,
+                                        tif
+                                    );
+                                }
+                                still_running
+                            }
+                            _ => false,
+                        };
+                        if should_fire {
                             log!(
-                                "[AgentSession] Watchdog: no events for {}s while mid-turn AND no tool in flight — killing the coding-agent subprocess for thread {} (suspected network outage / hung API call); will auto-resume via ContinuationRequested once events_rx EOFs",
+                                "[AgentSession] Watchdog ({}): no events for {}s while mid-turn for thread {} (hung subprocess / hung tool) — killing the coding-agent subprocess; will auto-resume via ContinuationRequested once events_rx EOFs",
+                                gate.diag_tag(),
                                 elapsed_ms / 1000,
                                 thread_id
                             );
@@ -1939,4 +1996,73 @@ impl LucidosEngine {
         )
         .await
     }
+}
+
+/// Build the text handed to the resumed agent's input channel: the user's
+/// message, optionally prefixed with up to three resume-time notes that
+/// reconcile what changed while the agent was idle —
+///
+/// 1. **branch adoption** — the worktree was switched to a new branch holding
+///    the agent's work (`try_adopt_renegade_branch`),
+/// 2. **external edits** — the user edited/committed in the worktree
+///    (`external_edits::compute_external_edit_note`),
+/// 3. **applied changes** — the user clicked Apply, merging the agent's
+///    proposed change into `main` and resetting the worktree
+///    (`applied_changes::compute_applied_change_note`).
+///
+/// The notes are folded into one block (joined by `\n`) and prepended to the
+/// message. An empty `user_message` (warm-up/continue-signal resume) is passed
+/// through untouched — notes only ride on a real turn so they can't trigger an
+/// otherwise-empty LLM call.
+///
+/// This single assembly point serves both Claude Code and Codex.
+pub(super) async fn build_resume_prompt_text(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    current_origin_id: Uuid,
+    user_message: &str,
+    worktree_path: Option<&Path>,
+    last_idle_sha: Option<&str>,
+    adoption_note: Option<&str>,
+) -> String {
+    if user_message.is_empty() {
+        return user_message.to_string();
+    }
+
+    let edit_note = match (worktree_path, last_idle_sha) {
+        (Some(wt), Some(sha)) => {
+            crate::engine::agent_session::external_edits::compute_external_edit_note(wt, Some(sha))
+                .await
+        }
+        _ => None,
+    };
+    // Phase 8.4: detect proposed changes the user APPLIED (merged to main +
+    // worktree reset) in the gap before this turn. The agent's --resume replay
+    // still thinks they're pending, so tell it they've landed. `current_origin_id`
+    // bounds the lookup to the previous turn boundary — stateless &
+    // self-clearing, see `compute_applied_change_note`.
+    let applied_note = crate::engine::agent_session::applied_changes::compute_applied_change_note(
+        pool,
+        thread_id,
+        current_origin_id,
+    )
+    .await;
+
+    // Fold the three resume-time notes into one prepended block.
+    let combined: Vec<&str> = [adoption_note, edit_note.as_deref(), applied_note.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+
+    if combined.is_empty() {
+        return user_message.to_string();
+    }
+
+    let block = combined.join("\n");
+    log!(
+        "[AgentSession] Injecting resume note (adoption/external-edit/applied) for thread {} ({} chars)",
+        thread_id,
+        block.len()
+    );
+    format!("{}\n\n{}", block, user_message)
 }

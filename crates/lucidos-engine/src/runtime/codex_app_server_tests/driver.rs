@@ -155,7 +155,12 @@ async fn handshake_turn_streams_deltas_and_results_then_exits_on_close() {
     ));
     assert!(matches!(
         next_event(&mut s.events_rx).await,
-        AgentEvent::Usage { input_tokens: 6, cache_read_tokens: 4, output_tokens: 2, .. }
+        AgentEvent::Usage {
+            input_tokens: 6,
+            cache_read_tokens: 4,
+            output_tokens: 2,
+            ..
+        }
     ));
     assert!(matches!(
         next_event(&mut s.events_rx).await,
@@ -179,7 +184,9 @@ async fn handshake_turn_streams_deltas_and_results_then_exits_on_close() {
     let requests = logged_requests(&s.requests_log);
     assert!(requests[0].contains(r#""method":"initialize""#));
     assert!(
-        requests.iter().any(|r| r.contains(r#""method":"initialized""#)),
+        requests
+            .iter()
+            .any(|r| r.contains(r#""method":"initialized""#)),
         "initialized notification must follow the initialize response"
     );
     let thread_req = requests
@@ -221,7 +228,9 @@ async fn resume_uses_thread_resume_with_stored_id() {
         .expect("resume must use thread/resume");
     assert!(resume_req.contains(r#""threadId":"sid-9""#));
     assert!(
-        !requests.iter().any(|r| r.contains(r#""method":"thread/start""#)),
+        !requests
+            .iter()
+            .any(|r| r.contains(r#""method":"thread/start""#)),
         "resume must not start a fresh thread"
     );
     s.cancel.cancel();
@@ -233,7 +242,10 @@ async fn continuation_starts_turn_without_any_input() {
     // No input sent — the continuation prompt must drive a full turn.
     let mut saw_result = false;
     for _ in 0..5 {
-        if matches!(next_event(&mut s.events_rx).await, AgentEvent::Result { .. }) {
+        if matches!(
+            next_event(&mut s.events_rx).await,
+            AgentEvent::Result { .. }
+        ) {
             saw_result = true;
             break;
         }
@@ -295,6 +307,50 @@ async fn approval_round_trip_accept_reaches_the_child() {
 }
 
 #[tokio::test]
+async fn approval_gated_item_started_does_not_emit_tool_use_until_acceptance() {
+    let turn_body = r#"printf '{"id":100,"method":"item/commandExecution/requestApproval","params":{"threadId":"t-1","turnId":"turn-1","itemId":"i7","command":"sudo ls","cwd":"/wt","startedAtMs":1}}\n'
+      printf '{"method":"item/started","params":{"threadId":"t-1","turnId":"turn-1","startedAtMs":2,"item":{"id":"i7","type":"commandExecution","command":"sudo ls","commandActions":[],"cwd":"/wt","status":"inProgress"}}}\n'"#;
+    let mut s = stub_driver(turn_body, None, false);
+    s.input_tx
+        .send(AgentInput {
+            text: "go".into(),
+            images: vec![],
+        })
+        .unwrap();
+
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Init { .. }
+    ));
+    let req = tokio::time::timeout(std::time::Duration::from_secs(30), s.permission_rx.recv())
+        .await
+        .expect("permission request within 30s")
+        .expect("permission channel open");
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), s.events_rx.recv())
+            .await
+            .is_err(),
+        "item/started while the approval card is pending must not emit ToolUse"
+    );
+
+    req.respond.send(true).expect("driver waits for decision");
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::ToolUse { name, id, .. } if name == "command_execution" && id == "i7"
+    ));
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::ToolResult { status, id, .. } if status == "error" && id == "i7"
+    ));
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Result { error: None, .. }
+    ));
+    s.cancel.cancel();
+}
+
+#[tokio::test]
 async fn approval_deny_sends_decline() {
     let turn_body = r#"printf '{"id":100,"method":"item/commandExecution/requestApproval","params":{"threadId":"t-1","turnId":"turn-1","itemId":"i8","command":"rm -rf /","cwd":"/wt","startedAtMs":1}}\n'"#;
     let mut s = stub_driver(turn_body, None, false);
@@ -313,7 +369,9 @@ async fn approval_deny_sends_decline() {
     let _ = next_event(&mut s.events_rx).await; // Result from the stub's completion
     let requests = logged_requests(&s.requests_log);
     assert!(
-        requests.iter().any(|r| r.contains(r#""decision":"decline""#)),
+        requests
+            .iter()
+            .any(|r| r.contains(r#""decision":"decline""#)),
         "deny must reach the child as decline"
     );
     s.cancel.cancel();
@@ -331,8 +389,14 @@ async fn interrupt_sends_turn_interrupt_and_turn_ends_canceled() {
             images: vec![],
         })
         .unwrap();
-    assert!(matches!(next_event(&mut s.events_rx).await, AgentEvent::Init { .. }));
-    assert!(matches!(next_event(&mut s.events_rx).await, AgentEvent::ToolUse { .. }));
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Init { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::ToolUse { .. }
+    ));
 
     s.control_tx.send(ControlRequest::Interrupt).unwrap();
 
@@ -369,8 +433,14 @@ async fn child_death_mid_turn_synthesizes_failed_result() {
             images: vec![],
         })
         .unwrap();
-    assert!(matches!(next_event(&mut s.events_rx).await, AgentEvent::Init { .. }));
-    assert!(matches!(next_event(&mut s.events_rx).await, AgentEvent::ToolUse { .. }));
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Init { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::ToolUse { .. }
+    ));
     // Closing ToolResult for the abandoned command, then the synthesized
     // failed Result, then Exited.
     assert!(matches!(
@@ -381,14 +451,20 @@ async fn child_death_mid_turn_synthesizes_failed_result() {
         next_event(&mut s.events_rx).await,
         AgentEvent::Result { error: Some(_), .. }
     ));
-    assert!(matches!(next_event(&mut s.events_rx).await, AgentEvent::Exited { .. }));
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Exited { .. }
+    ));
 }
 
 #[tokio::test]
 async fn cancellation_kills_session_and_emits_exited() {
     let mut s = stub_driver(HAPPY_TURN_BODY, None, false);
     s.cancel.cancel();
-    assert!(matches!(next_event(&mut s.events_rx).await, AgentEvent::Exited { .. }));
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Exited { .. }
+    ));
 }
 
 /// A stale Codex thread id (~/.codex pruned, machine moved) must fall back
@@ -485,11 +561,15 @@ done
     ));
     let requests = logged_requests(&requests_log);
     assert!(
-        requests.iter().any(|r| r.contains(r#""method":"thread/resume""#)),
+        requests
+            .iter()
+            .any(|r| r.contains(r#""method":"thread/resume""#)),
         "resume must be attempted first"
     );
     assert!(
-        requests.iter().any(|r| r.contains(r#""method":"thread/start""#)),
+        requests
+            .iter()
+            .any(|r| r.contains(r#""method":"thread/start""#)),
         "fallback must start a fresh thread"
     );
     cancel.cancel();

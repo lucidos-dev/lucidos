@@ -11,7 +11,7 @@ Use this skill to convert settled design intent into an executable implementatio
 
 The output is **always a checked-in plan file** at `docs/plans/YYYY-MM-DD-<slug>.md` (the repo convention; date = today, slug = a short kebab-case description), written and committed before the first code edit. Also surface a brief summary in the conversation, but the committed file is the source of truth.
 
-**Enforcement (the Planned marker).** Lucidos requires a *Planned marker* on the branch before any source edit and before Apply. Running this skill records it for you: after committing the plan file, run `lucidos planned mark --plan docs/plans/YYYY-MM-DD-<slug>.md`. Until a marker exists, Claude Code's first source edit is blocked and Apply is refused. For genuinely local fixes that don't warrant a plan, the agent acknowledges instead with `lucidos planned mark --simple "<one-line reason>"` — that path does not use this skill.
+**Enforcement (the Planned marker) + human approval.** Lucidos requires a gate-satisfying *Planned marker* on the branch before any source edit and before Apply. Running this skill records a **proposed** marker for you (after committing the plan file, run `lucidos planned mark --plan docs/plans/YYYY-MM-DD-<slug>.md`). A proposed plan does **not** unblock editing — it awaits the human's approval. **Present the plan to the user and wait for their approval.** Once the user approves, run `lucidos planned approve` to flip the marker to gate-satisfying; only then are source edits and Apply unblocked. If the user requests changes, revise the plan file, re-commit, and present it again (the marker stays proposed until approved). For genuinely local fixes that don't warrant a plan, the agent acknowledges instead with `lucidos planned mark --simple "<one-line reason>"` (no approval needed) — that path does not use this skill.
 
 ## Workflow
 
@@ -46,7 +46,9 @@ The output is **always a checked-in plan file** at `docs/plans/YYYY-MM-DD-<slug>
 
 ## Required Output
 
-Write the plan to a new file `docs/plans/YYYY-MM-DD-<slug>.md` (date = today, slug = a short kebab-case description of the work) using the structure below, then commit it (`docs(plans): <summary>`) before starting the first phase. Immediately after committing, record the Planned marker so the edit gate and Apply floor pass: `lucidos planned mark --plan docs/plans/YYYY-MM-DD-<slug>.md`. Surface a short summary in the conversation, but the committed file is the source of truth — when an invariant changes mid-implementation, update the file (per Workflow step 5).
+Write the plan to a new file `docs/plans/YYYY-MM-DD-<slug>.md` (date = today, slug = a short kebab-case description of the work) using the structure below, then commit it (`docs(plans): <summary>`) before starting the first phase. Immediately after committing, record the **proposed** marker: `lucidos planned mark --plan docs/plans/YYYY-MM-DD-<slug>.md`. Then **present the plan to the user and ask for approval** — surface a short summary in the conversation (the committed file is the source of truth). Do **not** start editing yet: the edit gate stays closed while the marker is `proposed`.
+
+When the user approves, run `lucidos planned approve` — this flips the marker to gate-satisfying and unblocks source edits and Apply. If the user requests changes, revise the plan file, re-commit, and present it again (the marker stays `proposed` until approved). When an invariant changes mid-implementation, update the file (per Workflow step 5).
 
 ```md
 ## Implementation Plan

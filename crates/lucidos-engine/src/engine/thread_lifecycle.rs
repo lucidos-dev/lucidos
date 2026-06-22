@@ -205,7 +205,8 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         | "ChangeProposed"
         | "UserQuestionAsked"
         | "CodingAgentPermissionRequest"
-        | "CommandPermissionRequested" => EventClass::ActionRequired,
+        | "CommandPermissionRequested"
+        | "McpPermissionRequested" => EventClass::ActionRequired,
         // ContinuationRequested — a continuation request, classified as Start so
         // the recipient thread surfaces the spawn as the beginning of a
         // new exchange. Emitted by Phase 5.3 recovery paths; the spawn
@@ -215,9 +216,10 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // UserQuestionAnswered is a step inside the same exchange as the
         // question — Activity, not Start. The status transition still moves
         // to Running so the resumed CC turn shows as in-progress.
-        "UserQuestionAnswered" | "CodingAgentPermissionResolved" | "CommandPermissionResolved" => {
-            EventClass::Activity
-        }
+        "UserQuestionAnswered"
+        | "CodingAgentPermissionResolved"
+        | "CommandPermissionResolved"
+        | "McpPermissionResolved" => EventClass::Activity,
         // WorktreeCleaned — passive bookkeeping for the background cleanup
         // worker (Phase 10.2). Classified as Metadata so it doesn't disturb
         // the thread's display section or activity timestamps.
@@ -302,6 +304,8 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "CodingAgentPermissionResolved",
         "CommandPermissionRequested",
         "CommandPermissionResolved",
+        "McpPermissionRequested",
+        "McpPermissionResolved",
         "WorktreeCleaned",
         // Phase 4 fan-in / resume bookkeeping.
         "ChildThreadCompleted",
@@ -455,6 +459,20 @@ pub fn resolve_transition(
         "CommandPermissionResolved" => match thread_type {
             ThreadType::Chat => no_change,
             ThreadType::CodingAgent => violation("CommandPermissionResolved is chat-only"),
+        },
+        // MCP permission request — the chat mirror of `CommandPermissionRequested`
+        // for MCP server tool calls. Surfaces the thread in REVIEW so the user
+        // sees the PermissionCard. Emitted by the Lucidos Agent on a Chat thread,
+        // never by CC.
+        "McpPermissionRequested" => match thread_type {
+            ThreadType::Chat => to_inbox,
+            ThreadType::CodingAgent => violation("McpPermissionRequested is chat-only"),
+        },
+        // McpPermissionResolved is a step inside the same exchange — the chat
+        // agent's MCP tool call runs (or is refused) once the answer arrives.
+        "McpPermissionResolved" => match thread_type {
+            ThreadType::Chat => no_change,
+            ThreadType::CodingAgent => violation("McpPermissionResolved is chat-only"),
         },
         // Events legal for both, no section change
         "MessageReceived"
@@ -776,6 +794,8 @@ pub const LAST_ACTIVITY_EVENTS: &[&str] = &[
     "CodingAgentPermissionResolved",
     "CommandPermissionRequested",
     "CommandPermissionResolved",
+    "McpPermissionRequested",
+    "McpPermissionResolved",
     // ContinuationRequested — start event for a CC continuation. Bumps last_activity
     // so the thread surfaces in the recents list as soon as the recovery
     // dispatcher emits one.
@@ -1044,6 +1064,23 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
         ),
         (
             "CommandPermissionResolved",
+            StatusTransition {
+                status: StatusRule::Set(ThreadStatus::Running),
+                cc_flags: CcFlagRule::None,
+            },
+        ),
+        // MCP permission prompt (chat) — pauses the chat agent's MCP server tool
+        // call, surfaces a PermissionCard. Mirrors CommandPermission*: the agent
+        // loop blocks in-process, so the resolution transitions back to Running.
+        (
+            "McpPermissionRequested",
+            StatusTransition {
+                status: StatusRule::Set(ThreadStatus::WaitingForUserAnswer),
+                cc_flags: CcFlagRule::None,
+            },
+        ),
+        (
+            "McpPermissionResolved",
             StatusTransition {
                 status: StatusRule::Set(ThreadStatus::Running),
                 cc_flags: CcFlagRule::None,

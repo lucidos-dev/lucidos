@@ -17,6 +17,7 @@ use super::super::recursion_guard::MAX_THREAD_DEPTH;
 pub(super) struct ChatContextSections {
     pub file_list_context: String,
     pub profile_context: String,
+    pub device_preferences_context: String,
     pub credentials_context: String,
     pub email_accounts_context: String,
     pub oauth_context: String,
@@ -26,18 +27,37 @@ pub(super) struct ChatContextSections {
     pub thread_depth_context: String,
 }
 
+/// Borrowed per-turn inputs to [`LucidosEngine::build_chat_context_sections`].
+/// Bundles the request context so the builder takes one argument instead of
+/// eight (the per-turn counterpart to the [`ChatContextSections`] output).
+pub(super) struct ChatContextInputs<'a> {
+    pub classification: &'a crate::memory::QueryClassification,
+    pub user_profile: &'a str,
+    pub device_id: Option<&'a str>,
+    pub event_device: Option<&'a str>,
+    pub app_context: Option<&'a AppContext>,
+    pub file_context: Option<&'a str>,
+    pub url_context: Option<&'a crate::api::UrlContext>,
+    pub parent_thread_id: Option<Uuid>,
+}
+
 impl LucidosEngine {
     /// Build the per-turn context sections. Verbatim extraction of the inline
     /// blocks from `process_message_with_steps_internal`.
     pub(super) async fn build_chat_context_sections(
         &self,
-        classification: &crate::memory::QueryClassification,
-        user_profile: &str,
-        app_context: Option<&AppContext>,
-        file_context: Option<&str>,
-        url_context: Option<&crate::api::UrlContext>,
-        parent_thread_id: Option<Uuid>,
+        inputs: ChatContextInputs<'_>,
     ) -> ChatContextSections {
+        let ChatContextInputs {
+            classification,
+            user_profile,
+            device_id,
+            event_device,
+            app_context,
+            file_context,
+            url_context,
+            parent_thread_id,
+        } = inputs;
         // Include current file list so LLM doesn't need to call list_files
         let file_list_context = if !classification.needs_file_list {
             log!("[Chat] Skipping file list context (not needed for this query)");
@@ -69,6 +89,14 @@ impl LucidosEngine {
         } else {
             format!("[USER PROFILE - ALREADY IN CONTEXT - NEVER call read_file on user_profile.md]\n{}\n[END PROFILE]", user_profile)
         };
+
+        let device_preferences_context =
+            crate::engine::agent_context::build_user_device_preferences_context(
+                &self.pool,
+                device_id,
+                event_device,
+            )
+            .await;
 
         // Include available API credentials so LLM knows which services are configured
         let credentials_context = if !classification.needs_credentials {
@@ -250,6 +278,7 @@ URL: {}\n\
         ChatContextSections {
             file_list_context,
             profile_context,
+            device_preferences_context,
             credentials_context,
             email_accounts_context,
             oauth_context,

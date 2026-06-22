@@ -484,8 +484,13 @@ impl LucidosEngine {
                                 }
 
                                 if !ids_to_delete.is_empty() {
-                                    let deleted =
-                                        index.delete_many(&ids_to_delete).await.unwrap_or(0);
+                                    let deleted = match index.delete_many(&ids_to_delete).await {
+                                        Ok(n) => n,
+                                        Err(e) => {
+                                            log!(@Memory, "Correction replay: delete_many failed: {}", e);
+                                            0
+                                        }
+                                    };
                                     log!(@Memory, "Correction replay: deleted {} of {} entries matching '{}' (similar to '{}')",
                                         deleted, results.entries.len(), search_query, &wrong_fact[..wrong_fact.floor_char_boundary(60)]);
                                 }
@@ -530,7 +535,13 @@ impl LucidosEngine {
                         ids_to_delete.sort();
                         ids_to_delete.dedup();
                         if !ids_to_delete.is_empty() {
-                            let deleted = index.delete_many(&ids_to_delete).await.unwrap_or(0);
+                            let deleted = match index.delete_many(&ids_to_delete).await {
+                                Ok(n) => n,
+                                Err(e) => {
+                                    log!(@Memory, "Correction replay (legacy): delete_many failed: {}", e);
+                                    0
+                                }
+                            };
                             log!(@Memory, "Correction replay (legacy): deleted {} entries similar to {} wrong facts", deleted, deleted_summaries.len());
                         }
                     }

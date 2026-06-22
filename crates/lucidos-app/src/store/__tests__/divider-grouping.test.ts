@@ -661,6 +661,136 @@ describe('groupIntoExchanges — synthetic ToolResult routing via tool_called_ev
   });
 });
 
+describe('groupIntoExchanges — question after a ChildThreadCompleted whose parent turn already finished', () => {
+  // Real thread 2e98b44a ("Toasts gömda bakom tangentbordet"): the first turn
+  // completes (ResponseGenerated under the MR's id). LATER a spawned sub-thread
+  // is canceled → ChildThreadCompleted lands as a boundary and the engine starts
+  // a FRESH turn anchored on the completion card's OWN id (req_id === ctc id, not
+  // the old MR id). That turn asks a question; the user answers (FreeText), and
+  // the agent's reply completes.
+  //
+  // Bug: when the card was created, the redirect bootstrap set a SPURIOUS
+  // `oldMR.id → card` entry (the card's continuation actually routes by the
+  // card's own id, so that entry is dead). When the question divider was then
+  // created, its redirect loop found+moved that spurious entry, set
+  // `updatedExisting`, and SKIPPED bootstrapping `card.id → divider`. The
+  // post-answer reply (req_id === card id) therefore misrouted back INTO the
+  // card — rendered ABOVE the question — and the divider, left with only
+  // UserQuestionAnswered and no terminal, flashed 'aborted'.
+  it('post-answer reply routes to the question divider, not the child card; divider is done, not aborted', () => {
+    const events = new Map<number, StoredEvent>([
+      // First turn: a normal MR that completes on its own.
+      [1, { type: 'MessageReceived', text: 'toasts under keyboard', _eventId: 'msg-1', created: '2026-06-21T23:34:58Z' } as StoredEvent],
+      [2, { type: 'TextStreamed', text: 'looking into it', request_event_id: 'msg-1', created: '2026-06-21T23:36:02Z' } as StoredEvent],
+      [3, { type: 'ResponseGenerated', text: 'looking into it', request_event_id: 'msg-1', created: '2026-06-21T23:36:08Z' } as StoredEvent],
+      // A spawned sub-thread finishes AFTER the turn completed → fresh turn
+      // anchored on the card's own id (ctc-1).
+      [4, { type: 'ChildThreadCompleted', child_thread_id: 'child-1', child_thread_title: 'Fixing iOS Keyboard Toast Occlusion', status: 'canceled', summary: '', _eventId: 'ctc-1', created: '2026-06-21T23:36:18Z' } as StoredEvent],
+      [5, { type: 'ThoughtStreamed', text: 'thinking', request_event_id: 'ctc-1', created: '2026-06-21T23:36:19Z' } as StoredEvent],
+      [6, { type: 'ToolCalled', name: 'ask_user_question', args: {}, _eventId: 'tc-1', request_event_id: 'ctc-1', created: '2026-06-21T23:36:27Z' } as StoredEvent],
+      [7, { type: 'UserQuestionAsked', tool_use_id: 'tu-1', cc_session_id: '', question: 'proceed?', options: [{ id: 'opt-0', label: 'Restart the agent' }], created: '2026-06-21T23:36:27Z' } as StoredEvent],
+      [8, { type: 'UserQuestionAnswered', tool_use_id: 'tu-1', answer: { kind: 'FreeText', text: 'Nei i handlelisye appen' }, created: '2026-06-21T23:36:32Z' } as StoredEvent],
+      // The question-asking tool's own result pairs back to its ToolCalled
+      // (stays above the card with the spinner), NOT into the divider.
+      [9, { type: 'ToolResult', name: 'ask_user_question', result: 'ok', tool_called_event_id: 'tc-1', request_event_id: 'ctc-1', created: '2026-06-21T23:36:32Z' } as StoredEvent],
+      // The genuine post-answer continuation — must land in the divider (below
+      // the answer), and its terminal must settle the divider to 'done'.
+      [10, { type: 'TextStreamed', text: 'Fixed — it was the Handleliste app.', request_event_id: 'ctc-1', created: '2026-06-21T23:36:40Z' } as StoredEvent],
+      [11, { type: 'ResponseGenerated', text: 'Fixed — it was the Handleliste app.', request_event_id: 'ctc-1', created: '2026-06-21T23:37:16Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map(e => e.userEvent.type)).toEqual([
+      'MessageReceived',
+      'ChildThreadCompleted',
+      'UserQuestionAsked',
+    ]);
+
+    const ctc = exchanges.find(e => e.userEvent.type === 'ChildThreadCompleted')!;
+    const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+
+    // The reply groups UNDER the question card (rendered below the answer),
+    // not back in the child-completion card (which sits above the question).
+    const divTypes = divider.steps.map(s => s.event.type);
+    expect(divTypes).toContain('UserQuestionAnswered');
+    expect(divTypes).toContain('TextStreamed');
+    expect(divTypes).toContain('ResponseGenerated');
+
+    const ctcTypes = ctc.steps.map(s => s.event.type);
+    expect(ctcTypes).not.toContain('TextStreamed');
+    expect(ctcTypes).not.toContain('ResponseGenerated');
+
+    // The divider settles to 'done' on its terminal — never the stale 'aborted'
+    // that the screenshot showed. Worst-case client flags: thread reports idle
+    // (status NOT waiting_for_user_answer) at the last exchange.
+    expect(exchangeStatus(divider, '', /*isLast*/ true, false, false, /*threadIdle*/ true, /*threadAwaitingAnswer*/ false)).toBe('done');
+  });
+});
+
+describe('groupIntoExchanges — question asked while a queued follow-up message is pending', () => {
+  // Real thread 194474de ("Trenger jeg underlag til bassenget"): the user sends
+  // a message ("Trenger vi håv?", msg-1) and, while that turn streams, types a
+  // second follow-up ("Til hva?", msg-2) which QUEUES — it becomes the `current`
+  // exchange but is never ingested (no UserPromptInjected). The first turn then
+  // calls ask_user_question (req_id = msg-1) and parks on the divider. The user
+  // answers; the agent resumes and completes — every continuation event still
+  // carries the turn's req_id (msg-1).
+  //
+  // Bug: when the divider was created, `previousCurrent` was the QUEUED msg-2
+  // exchange (not the turn's msg-1 exchange), so the redirect bootstrap anchored
+  // on msg-2's id instead of the turn's real req_id. The post-answer
+  // TextStreamed / ResponseGenerated (req msg-1) therefore routed back to the
+  // ORIGINAL msg-1 exchange (above the card), leaving the divider with only the
+  // answer and no terminal — which the `threadIdle && !awaiting && hasSteps`
+  // stale-detector renders as a PERSISTENT "Aborted" once the thread idles
+  // (deterministic from history, so it survives reloads — not just a flash).
+  //
+  // Fix: track the turn's real req_id (`lastChatTurnReqId`, set by the
+  // divider-raising tool call) and redirect THAT to the divider, independent of
+  // whatever queued exchange happens to be `current`.
+  it('post-answer reply routes to the divider, not the original message exchange; divider is done, not aborted', () => {
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'Trenger vi håv?', _eventId: 'msg-1', created: '2026-06-22T14:50:00Z' } as StoredEvent],
+      [2, { type: 'ThoughtStreamed', text: 'thinking', request_event_id: 'msg-1', created: '2026-06-22T14:50:01Z' } as StoredEvent],
+      // Queued follow-up typed while the turn streamed — becomes `current`, never ingested.
+      [3, { type: 'MessageReceived', text: 'Til hva?', _eventId: 'msg-2', created: '2026-06-22T14:50:05Z' } as StoredEvent],
+      [4, { type: 'TextStreamed', text: 'Ja, en håv er verdt det.', request_event_id: 'msg-1', created: '2026-06-22T14:50:26Z' } as StoredEvent],
+      [5, { type: 'ToolCalled', name: 'ask_user_question', args: {}, _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-06-22T14:50:26Z' } as StoredEvent],
+      [6, { type: 'UserQuestionAsked', tool_use_id: 'tu-1', cc_session_id: '', question: 'Skal jeg legge til på handlelista?', options: [{ id: 'opt-0', label: 'Håv' }], multi_select: true, channel: 'chat', created: '2026-06-22T14:50:26Z' } as StoredEvent],
+      // User removes the queued follow-up, then answers with custom text only.
+      [7, { type: 'QueuedMessageRemoved', removed_message_id: 'msg-2', created: '2026-06-22T15:07:44Z' } as StoredEvent],
+      [8, { type: 'UserQuestionAnswered', tool_use_id: 'tu-1', answer: { kind: 'MultiSelected', option_ids: [], text: 'Kan jeg bruke presenning som underlag?' }, created: '2026-06-22T15:08:15Z' } as StoredEvent],
+      // The question-asking tool's own result pairs back to its ToolCalled (msg-1 exchange).
+      [9, { type: 'ToolResult', name: 'ask_user_question', result: 'ok', tool_called_event_id: 'tc-1', request_event_id: 'msg-1', created: '2026-06-22T15:08:15Z' } as StoredEvent],
+      // The genuine post-answer continuation — must land in the divider (below the answer).
+      [10, { type: 'ThoughtStreamed', text: 'thinking', request_event_id: 'msg-1', created: '2026-06-22T15:08:33Z' } as StoredEvent],
+      [11, { type: 'TextStreamed', text: 'Ja, en presenning fungerer fint.', request_event_id: 'msg-1', created: '2026-06-22T15:08:33Z' } as StoredEvent],
+      [12, { type: 'ResponseGenerated', text: 'Ja, en presenning fungerer fint.', request_event_id: 'msg-1', created: '2026-06-22T15:08:33Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    const mr1 = exchanges.find(e => e.userEvent.type === 'MessageReceived' && e.userEvent._eventId === 'msg-1')!;
+
+    // The reply groups UNDER the question card (rendered below the answer),
+    // not back in the original message exchange (which sits above the question).
+    const divTypes = divider.steps.map(s => s.event.type);
+    expect(divTypes).toContain('UserQuestionAnswered');
+    expect(divTypes).toContain('TextStreamed');
+    expect(divTypes).toContain('ResponseGenerated');
+
+    // The original message exchange keeps its own pre-question work + the
+    // ask_user_question ToolResult, but NOT the post-answer reply/terminal.
+    const mr1Types = mr1.steps.map(s => s.event.type);
+    expect(mr1Types).toContain('ToolCalled');
+    expect(mr1Types).toContain('ToolResult');
+    expect(mr1Types).not.toContain('ResponseGenerated');
+
+    // The divider settles to 'done' on its terminal — never the persistent
+    // 'aborted' the user reported. Worst-case client flags: thread reports idle
+    // (status NOT waiting_for_user_answer) at the last exchange.
+    expect(exchangeStatus(divider, '', /*isLast*/ true, false, false, /*threadIdle*/ true, /*threadAwaitingAnswer*/ false)).toBe('done');
+  });
+});
+
 describe('exchangeStatus + responseTerminated — UserQuestionAsked exchange aborted by engine restart', () => {
   // The user-facing bug: a chat agent woken from ChildThreadCompleted asks a
   // question, the engine restarts, recovery emits ResponseAborted carrying

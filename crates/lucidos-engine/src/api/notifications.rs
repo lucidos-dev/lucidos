@@ -281,18 +281,52 @@ pub(super) async fn get_vapid_key(
 /// POST /api/v1/push/subscribe — store a browser push subscription
 pub(super) async fn push_subscribe(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<PushSubscribeRequest>,
 ) -> Json<ApiResult> {
+    let scope_url = sanitize_push_scope_url(request.scope_url, &headers);
     let sub = PushSubscription {
         endpoint: request.endpoint,
         p256dh: request.p256dh,
         auth: request.auth,
         device_id: request.device_id,
+        scope_url,
     };
     match PushSubscriptionStore::subscribe(&state.pool, &sub).await {
         Ok(()) => ApiResult::ok(),
         Err(e) => ApiResult::err(format!("Failed to store subscription: {}", e)),
     }
+}
+
+fn sanitize_push_scope_url(raw: Option<String>, headers: &HeaderMap) -> Option<String> {
+    let mut url = reqwest::Url::parse(raw?.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    if !url.path().ends_with('/') {
+        let mut path = url.path().to_string();
+        path.push('/');
+        url.set_path(&path);
+    }
+
+    let expected_path = crate::api::base_path::forwarded_prefix(headers);
+    if url.path() != expected_path {
+        return None;
+    }
+
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        let origin_url = reqwest::Url::parse(origin).ok()?;
+        if url.scheme() != origin_url.scheme()
+            || url.host_str() != origin_url.host_str()
+            || url.port_or_known_default() != origin_url.port_or_known_default()
+        {
+            return None;
+        }
+    }
+
+    Some(url.to_string())
 }
 
 /// POST /api/v1/push/unsubscribe — remove a browser push subscription
@@ -406,4 +440,45 @@ pub(super) fn router() -> Router<AppState> {
     let router = router.route("/_test/push-log", get(get_push_log));
 
     router
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(prefix: &str, origin: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-prefix", HeaderValue::from_str(prefix).unwrap());
+        if let Some(origin) = origin {
+            h.insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn sanitize_push_scope_url_accepts_matching_origin_and_prefix() {
+        let scope = sanitize_push_scope_url(
+            Some("https://lucidos.test/dev/?stale=1#frag".into()),
+            &headers("/dev/", Some("https://lucidos.test")),
+        );
+        assert_eq!(scope.as_deref(), Some("https://lucidos.test/dev/"));
+    }
+
+    #[test]
+    fn sanitize_push_scope_url_rejects_cross_origin_value() {
+        let scope = sanitize_push_scope_url(
+            Some("https://evil.test/dev/".into()),
+            &headers("/dev/", Some("https://lucidos.test")),
+        );
+        assert!(scope.is_none());
+    }
+
+    #[test]
+    fn sanitize_push_scope_url_rejects_wrong_workspace_prefix() {
+        let scope = sanitize_push_scope_url(
+            Some("https://lucidos.test/personal/".into()),
+            &headers("/dev/", Some("https://lucidos.test")),
+        );
+        assert!(scope.is_none());
+    }
 }

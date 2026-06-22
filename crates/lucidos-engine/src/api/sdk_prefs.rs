@@ -37,13 +37,13 @@ const SDK_PREFS_JS: &str = r##"(function() {
     ? (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark")
     : theme;
   d.setAttribute("data-theme", resolved);
-  var bg = resolved === "light" ? "#ffffff" : "#0b2342";
+  var bg = resolved === "light" ? "#ffffff" : "#07172e";
   d.style.setProperty("--bg-primary", bg);
   // iOS PWA: covers the WKWebView-white gap before sdk-iframe.css loads
   // (mirrors the parent's inline FOUC IIFE in index.html).
   d.style.background = bg;
   var FONTS = {
-    monospace: "'SF Mono', 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
+    monospace: "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
     system: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
     inter: "'Inter', system-ui, sans-serif",
     "jetbrains-mono": "'JetBrains Mono', monospace",
@@ -132,7 +132,8 @@ mod tests {
     #[test]
     fn script_defaults_to_dark_for_unknown_theme() {
         // Anything not light/dark/system falls back to dark — matches the
-        // SDK's `prefs['theme'] || 'dark'` behavior.
+        // SDK's `resolveThemePreference()` last-resort default (ui.ts), so the
+        // synchronous FOUC script and the later applyPreferences() agree.
         assert!(SDK_PREFS_JS.contains("? raw : \"dark\""));
     }
 

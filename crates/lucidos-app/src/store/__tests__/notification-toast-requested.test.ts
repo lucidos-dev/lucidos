@@ -330,8 +330,10 @@ describe('NotificationToastRequested → overflow at 5+ individual toasts', () =
 
     const individuals = toasts.value.filter(t => t.key?.startsWith('notification-'));
     expect(individuals).toHaveLength(4);
+    // New toasts prepend (newest at the top of the column-stacked container), so
+    // the kept four are the first four created, listed newest-first.
     expect(individuals.map(t => t.key)).toEqual([
-      'notification-n-1', 'notification-n-2', 'notification-n-3', 'notification-n-4',
+      'notification-n-4', 'notification-n-3', 'notification-n-2', 'notification-n-1',
     ]);
 
     const overflow = toasts.value.find(t => t.key === 'notifications-overflow');

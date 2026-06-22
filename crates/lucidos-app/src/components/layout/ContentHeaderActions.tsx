@@ -2,11 +2,10 @@ import { Fragment } from 'preact';
 import type { ComponentChild } from 'preact';
 import { useState, useEffect } from 'preact/hooks';
 import { NotificationsBell } from '../notifications/NotificationsBell';
-import { TimeTravelDropdown } from '../apps/TimeTravelDropdown';
-import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen } from '../../store/store';
+import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, diffWholeFile, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen } from '../../store/store';
 import { closeUrl, refreshFilePreview } from '../../store/actions/artifacts';
 import { getAppFrameSrc, getVisibleAppFrame, exitPseudoFullscreen, refreshAppUI, toggleAppSearch } from '../../store/actions/apps';
-import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon } from '../shared/icons';
+import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon, FileIcon, DiffIcon } from '../shared/icons';
 import { RENDERABLE_EXTS, isEditableDataFile } from '../files/previewExts';
 import { isTauri, isIOSPwa } from '../../utils/platform';
 import { webviewReload } from '../../utils/tauri';
@@ -120,7 +119,6 @@ export function ContentHeaderActions() {
     // file-source edits still drop WIP — those paths call refreshAppUI()
     // with the default options.
     addAction('refresh', reloadButton(() => void refreshAppUI(undefined, { preserveWip: true })));
-    addAction('time-travel', <TimeTravelDropdown />);
     // iOS standalone PWA cannot open same-origin links in an external browser
     // (all WebKit-based browsers on iOS share this limitation).
     if (!isIOSPwa()) {
@@ -164,6 +162,21 @@ export function ContentHeaderActions() {
         'Refresh',
         isDiff ? 'Diff is fixed to this change' : undefined,
       ));
+      // Diff-only: toggle between the unified hunks and the whole file in its
+      // merged end state. Orthogonal to the source/rendered toggle below.
+      if (isDiff) {
+        const wholeFile = diffWholeFile.value;
+        addAction('diff-whole-file',
+          <button
+            class="icon-btn header-icon diff-whole-file-toggle"
+            onClick={() => { diffWholeFile.value = !wholeFile; }}
+            aria-label={wholeFile ? 'Show diff' : 'Show full file'}
+            data-tooltip={wholeFile ? 'Show diff' : 'Show full file'}
+          >
+            {wholeFile ? <DiffIcon /> : <FileIcon />}
+          </button>,
+        );
+      }
       if (hasRendered) {
         const isSource = filePreviewSource.value;
         addAction('source-toggle',

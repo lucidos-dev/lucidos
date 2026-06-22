@@ -345,7 +345,7 @@ test.describe('Declarative Web Push payload', () => {
     clearNotifications();
   });
 
-  test('push payload is the Declarative Web Push envelope with relative navigate URL', async ({ page }) => {
+  test('push payload is the Declarative Web Push envelope with absolute iOS navigate URL', async ({ page, baseURL }) => {
     // Regression guard for the iOS-PWA push-tap navigation bug:
     // Safari 18.5+ only handles push notifications declaratively (bypassing
     // the SW push handler so it doesn't depend on `notificationclick`) when
@@ -380,6 +380,8 @@ test.describe('Declarative Web Push payload', () => {
     // and suppresses the push. e2e workspace is the right scope for this —
     // Playwright projects run serially against a single workspace DB.
     psql(`DELETE FROM device_presence`);
+    expect(baseURL, 'Playwright baseURL is needed to seed the subscription scope').toBeTruthy();
+    const scopeUrl = new URL('/', baseURL!).toString();
     const subRes = await page.request.post('/api/v1/push/subscribe', {
       headers: { 'content-type': 'application/json' },
       data: {
@@ -387,6 +389,7 @@ test.describe('Declarative Web Push payload', () => {
         p256dh: 'p256dh-test',
         auth: 'auth-test',
         device_id: deviceId,
+        scope_url: scopeUrl,
       },
     });
     expect(subRes.ok(), `POST /api/v1/push/subscribe -> ${subRes.status()}`).toBeTruthy();
@@ -434,16 +437,16 @@ test.describe('Declarative Web Push payload', () => {
     //     as the SW's prior `tag: data.notification_id`.
     expect(notif.tag).toBe(notificationId);
 
-    // (3) iOS navigate URL — a CROSS-DOCUMENT (query) relative URL. Safari's
+    // (3) iOS navigate URL — a CROSS-DOCUMENT absolute query URL built from
+    //     the subscription's stored service-worker scope. Safari's
     //     declarative-push handler reuses an already-open PWA window on tap; a
     //     same-document (hash-only) navigation is NOT applied to it (WebKit just
     //     focuses the window, the URL never updates, the deep link silently
-    //     no-ops — the "tap nav to thread only focuses the app" bug). A query
-    //     string forces a real navigation. Relative per W3C Push API
-    //     §"Receiving a Push Message" (PR #385) — base-resolved against the
-    //     subscription scope so the engine doesn't track each device's origin.
+    //     no-ops). A query string forces a real navigation, and making it
+    //     absolute avoids relying on WebKit/APNs to accept a query-only relative
+    //     value while still preserving the workspace scope.
     const navigateUrl = notif.navigate as string;
-    expect(navigateUrl.startsWith('/?'), `iOS navigate must be a query URL, got ${navigateUrl}`).toBeTruthy();
+    expect(navigateUrl.startsWith(`${scopeUrl}?`), `iOS navigate must be an absolute scoped query URL, got ${navigateUrl}`).toBeTruthy();
     expect(navigateUrl).toContain(`notification=${notificationId}`);
     expect(navigateUrl).toContain(`thread=${fakeThreadId}`);
     expect(navigateUrl).toContain(`event=${fakeEventId}`);
@@ -458,8 +461,8 @@ test.describe('Declarative Web Push payload', () => {
     expect(data.thread_id).toBe(fakeThreadId);
     expect(data.event_id).toBe(fakeEventId);
     const swNavigate = data.navigate as string;
-    expect(swNavigate.startsWith('/#'), `Chrome SW navigate must be a hash URL, got ${swNavigate}`).toBeTruthy();
-    expect(swNavigate.slice(2)).toBe(navigateUrl.slice(2)); // same params, different prefix
+    expect(swNavigate.startsWith('#'), `Chrome SW navigate must be a scope-relative hash URL, got ${swNavigate}`).toBeTruthy();
+    expect(swNavigate.slice(1)).toBe(new URL(navigateUrl).search.slice(1)); // same params, different URL carrier
     expect(data.tap).toEqual({
       kind: 'navigate',
       to: { target: 'thread', id: fakeThreadId, event_id: fakeEventId },

@@ -37,11 +37,17 @@ export function DrawerDivider() {
       const newWidth = Math.min(Math.max(0, e.clientX - rect.left), rect.width - 1);
       threadDrawerWidth.value = newWidth;
 
-      // Adjust split ratio to keep panel pane at the same pixel width
+      // Adjust split ratio to keep panel pane at the same pixel width.
+      // Keep the ratio strictly inside (0, 1) while dragging — same 1px
+      // floor/ceiling the split divider uses (see SplitLayout.onMove): the
+      // collapse-state attributes (data-thread-collapsed / data-content-collapsed)
+      // flip only at the post-release snap, so the header icon groups they swap
+      // can't dance between hosts when a wide drawer drag squeezes the thread
+      // pane to zero. computeSnapRatio still collapses it on release.
       const newSplitWidth = rect.width - newWidth;
-      if (newSplitWidth > 0 && contentPanePx > 0) {
-        const newRatio = Math.max(0, Math.min(1, 1 - contentPanePx / newSplitWidth));
-        splitRatio.value = newRatio;
+      if (newSplitWidth > 1 && contentPanePx > 0) {
+        const threadPx = Math.min(Math.max(newSplitWidth - contentPanePx, 1), newSplitWidth - 1);
+        splitRatio.value = threadPx / newSplitWidth;
       }
     };
 

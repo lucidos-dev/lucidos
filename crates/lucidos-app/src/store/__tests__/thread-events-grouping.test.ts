@@ -457,6 +457,29 @@ describe('groupIntoExchanges', () => {
     expect(exchanges[2].userEvent.type).toBe('ResponseCanceled');
   });
 
+  // Codex mid-turn follow-up redirect: the interrupted turn emits
+  // ResponseCanceled(superseded_by_followup). Unlike a real Stop cancel, this
+  // must NOT open a standalone "Response canceled" boundary exchange — the turn
+  // renders neutrally (like the chat/CC follow-up). The cancel stays a step on
+  // the originating turn so step resolution still sees a terminator.
+  it('Codex: superseded_by_followup ResponseCanceled does NOT open a cancel boundary exchange', () => {
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'A', channel: 'claude_code', _eventId: 'A' }],
+      [2, { type: 'CodingAgentTextStreamed', text: 'working', request_event_id: 'A' } as StoredEvent],
+      [3, { type: 'ResponseCanceled', channel: 'claude_code', request_event_id: 'A', cause: 'superseded_by_followup' } as StoredEvent],
+      [4, { type: 'CodingAgentIdled', request_event_id: 'A' } as StoredEvent],
+      [5, { type: 'MessageReceived', text: 'B follow-up', channel: 'claude_code', _eventId: 'B' }],
+      [6, { type: 'CodingAgentTextStreamed', text: 'on the follow-up', request_event_id: 'A' } as StoredEvent],
+      [7, { type: 'ResponseGenerated', request_event_id: 'A' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    // 1: A's interrupted turn (carries the cancel + idle as steps), 2: B follow-up.
+    // No third "Response canceled" boundary panel.
+    expect(exchanges).toHaveLength(2);
+    expect(exchanges[0].steps.map(s => s.event.type)).toContain('ResponseCanceled');
+    expect(exchanges.some(e => e.userEvent.type === 'ResponseCanceled')).toBe(false);
+  });
+
   // Chat threads still need request_event_id routing (each chat exchange has
   // its own req_id; late events from A must route back to A).
   it('chat: ResponseCanceled with old req_id still routes to the originating exchange', () => {

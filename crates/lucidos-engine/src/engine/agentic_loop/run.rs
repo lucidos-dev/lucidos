@@ -197,6 +197,20 @@ impl LucidosEngine {
         let mut images: Vec<String> = Vec::new(); // Track screenshots created during this request
         let mut last_tool_call: Option<(String, String)> = None; // (tool_name, key) - key derived by derive_call_key
         let mut consecutive_same_call = 0;
+        // Consecutive-*failure* streak for the generic circuit breaker (distinct
+        // from `consecutive_same_call`, which counts ALL repeats and still drives
+        // the content-deterministic read_file / list_files breakers). This grows
+        // only when the model repeats the same `(tool, key)` AND the previous
+        // identical call failed — a successful repeat or a different call resets
+        // it. `last_call_was_error` carries the prior single-call result forward.
+        let mut consecutive_failing_call = 0usize;
+        let mut last_call_was_error = false;
+        // Re-ask guard: set when an iteration's `ask_user_question` call errored
+        // (e.g. the model dropped the required `question` field), read by the
+        // next iteration's no-tool-calls branch so a rejected ask can't silently
+        // degrade into a prose typed-reply menu. `forced` bounds it per response.
+        let mut question_ask_failed_last_iter = false;
+        let mut question_reask_forced = 0usize;
         let mut cached_list_files: Option<String> = None;
         let mut modified_app_uis: std::collections::HashSet<String> =
             std::collections::HashSet::new();
@@ -634,6 +648,66 @@ impl LucidosEngine {
 
             // No more tool calls - we have the final answer
             if response.tool_calls.is_empty() {
+                // Force a re-ask: the previous iteration's `ask_user_question`
+                // call errored (typically the model dropped the required
+                // `question` field and put the text in the optional `header`
+                // chip), and the model has now returned a prose answer instead
+                // of re-calling the tool — collapsing the clickable question
+                // card into a typed-reply menu the user can't tap. The schema
+                // marks `question` required and the runtime check already
+                // rejected the bad call, but provider tool-calling treats
+                // `required` as advisory, so the model can both omit it AND then
+                // abandon the question. Push a forcing instruction and loop so
+                // it re-asks properly. Bounded by `MAX_QUESTION_REASK` so a
+                // persistently-failing question path still finalizes.
+                // Gate on actual prose: this guard targets the "answered in
+                // prose instead of re-asking" degradation, which always has
+                // content. An empty completion after a failed ask is a
+                // different case — let it fall through to the empty-completion
+                // classifier below. Requiring `Some(answer)` also keeps
+                // alternation valid: the assistant message is always pushed
+                // before the forcing user message, never a lone user-after-user.
+                let reask_prose = should_force_question_reask(
+                    question_ask_failed_last_iter,
+                    question_reask_forced,
+                )
+                .then(|| {
+                    response
+                        .content
+                        .as_deref()
+                        .map(|c| self.clean_response(c))
+                        .filter(|c| !c.is_empty())
+                })
+                .flatten();
+                if let Some(answer) = reask_prose {
+                    question_reask_forced += 1;
+                    // Mirror the injection-continue path's message handling.
+                    // Preserve the drafted prose as assistant context so the
+                    // model sees what it just said before re-asking.
+                    messages.push(Message {
+                        role: "assistant".to_string(),
+                        content: MessageContent::Text(answer),
+                    });
+                    messages.push(Message {
+                        role: "user".to_string(),
+                        content: MessageContent::Text(QUESTION_REASK_INSTRUCTION.to_string()),
+                    });
+                    self.event_bus
+                        .emit_or_log(
+                            crate::engine::event_bus::BusEvent::Thread {
+                                thread_id,
+                                event: crate::engine::thread_events::ThreadEvent::LlmCallRetried {
+                                    reason: "ask_user_question had no question text — forcing re-ask"
+                                        .to_string(),
+                                },
+                                meta: crate::engine::thread_events::EventMeta::NONE,
+                            },
+                            "[AgenticLoop] LlmCallRetried (force question re-ask)",
+                        )
+                        .await;
+                    continue;
+                }
+
                 // A user may have sent follow-ups while this LLM call was in
                 // flight. If the model returned a plain final answer (no tool
                 // loop), this is the last chance to ingest them before the
@@ -684,7 +758,14 @@ impl LucidosEngine {
                     }
                 }
 
-                // Refresh any app UIs that were modified during the tool loop
+                // Refresh anything touched during the tool loop, once per app at
+                // end of turn (coalesced — not per write). Two distinct signals:
+                //   - AppUiRefreshRequested → reload the open app iframe.
+                //   - AppUpdated → refresh the disk-backed apps LIST (name/icon/
+                //     description may have changed via a manifest edit). The list
+                //     re-scans disk, so this also surfaces an app freshly created
+                //     this turn via raw write_file. Guard on app_exists so an app
+                //     deleted during the turn doesn't emit a spurious AppUpdated.
                 for app_id in &modified_app_uis {
                     self.event_bus
                         .emit_or_log(
@@ -698,6 +779,20 @@ impl LucidosEngine {
                             "[AgenticLoop] AppUiRefreshRequested (post-loop)",
                         )
                         .await;
+                    if self.app_manager.app_exists(app_id) {
+                        self.event_bus
+                            .emit_or_log(
+                                crate::engine::event_bus::BusEvent::System(
+                                    crate::engine::event_bus::SystemEvent::AppUpdated {
+                                        app_id: app_id.clone(),
+                                        name: self.app_manager.app_name(app_id),
+                                        actor: None,
+                                    },
+                                ),
+                                "[AgenticLoop] AppUpdated (post-loop)",
+                            )
+                            .await;
+                    }
                 }
                 let cleaned = response
                     .content
@@ -830,6 +925,10 @@ impl LucidosEngine {
             // Execute each tool call
             let mut tool_outputs = Vec::new();
             let mut had_errors = false;
+            // Set if an `ask_user_question` call in THIS iteration errored, then
+            // copied into `question_ask_failed_last_iter` after the loop so the
+            // NEXT iteration's no-tool-calls branch can force a re-ask.
+            let mut this_iter_question_ask_failed = false;
             // Set when the command guard blocks a trigger's command because the
             // side-effect isn't in the trigger's grant (ADR 0002, Phase 5). The
             // blocked command is still recorded as a failed ToolResult (so the
@@ -892,12 +991,18 @@ impl LucidosEngine {
                 let call_key = derive_call_key(current_tool, current_args);
 
                 let current_call = (current_tool.clone(), call_key.clone());
-                if Some(&current_call) == last_tool_call.as_ref() {
+                let is_repeat = Some(&current_call) == last_tool_call.as_ref();
+                if is_repeat {
                     consecutive_same_call += 1;
                 } else {
                     consecutive_same_call = 1;
                     last_tool_call = Some(current_call);
                 }
+                // Failure streak for the generic breaker: only grows on a repeat
+                // whose previous identical call FAILED; success or a different
+                // call resets it (see `next_failure_streak`).
+                consecutive_failing_call =
+                    next_failure_streak(is_repeat, last_call_was_error, consecutive_failing_call);
 
                 // If list_files called 2+ times, return cached result with strong stop message
                 if current_tool == tn::LIST_FILES && consecutive_same_call >= 2 {
@@ -992,48 +1097,37 @@ impl LucidosEngine {
                     continue;
                 }
 
-                // Generic circuit breaker: any tool called 3+ times in a row
-                // Excluded: write tools (multiple edits normal), browser tools (multi-step
-                // browsing workflows are normal). All still bounded by MAX_ITERATIONS.
-                //
-                // `run_python` / `run_python_background` were previously excluded under the
-                // rationale "sequential scripts processing different data are normal" — true,
-                // but the bucket key for those tools is the first non-blank non-comment
-                // non-import line of `code` (see `derive_call_key` + `python_call_key`),
-                // so different scripts get different buckets and don't trip. The guard
-                // catches VERBATIM retries (same first actionable line three times in a
-                // row) — e.g. `time.sleep(60)` thrice, or two failing import attempts
-                // copy-pasted with a small tweak past char 80. It does NOT catch
-                // escalating-argument retries (`time.sleep(60)` then `time.sleep(120)`)
-                // — those each bucket separately. The `bash_output(wait_secs)` server-
-                // side block is the structural fix for sleep-poll; this guard is the
-                // last-line defense for the verbatim-retry case.
-                let excluded = matches!(
-                    current_tool.as_str(),
-                    tn::EDIT_FILE
-                        | tn::WRITE_FILE
-                        | tn::WEB_SEARCH
-                        | tn::BROWSER_OPEN
-                        | tn::BROWSER_EXTRACT
-                        | tn::BROWSER_CLICK
-                        | tn::BROWSER_SCREENSHOT
-                        | tn::BROWSER_CLOSE
-                        | tn::BROWSER_FORGET_LOGIN
-                        | tn::BROWSER_CLEAR_DATA
-                );
-                if consecutive_same_call >= 3 && !excluded {
+                // Generic circuit breaker: any tool whose SAME (tool, call_key)
+                // FAILED 3+ times in a row. It keys on consecutive *failure*,
+                // not consecutive call — successful repetition is by definition
+                // not a stuck loop, so productive runs (three distinct `psql`
+                // queries bucketed under `psql`, sequential downloads whose
+                // scripts share a first line) never trip. There is no per-tool
+                // exclusion list: failing repetition of ANY tool (a `run_bash`
+                // that errors, an `edit_file` whose `old_string` never matches,
+                // a `web_search`/`browser_*` that keeps erroring) is a real
+                // stuck loop. read_file / list_files are handled by their own
+                // content-deterministic branches above (they block identical
+                // *successful* re-reads, which this failure gate intentionally
+                // does not). All still bounded by MAX_ITERATIONS, and the
+                // `bash_output(wait_secs)` server-side block remains the
+                // structural fix for the sleep-poll case.
+                let breaker_action = generic_breaker_action(consecutive_failing_call);
+                if breaker_action != BreakerAction::None {
+                    // Human-readable target for the log / STOP / force-break
+                    // message — computed once, only when the breaker fires.
                     let target = if call_key.is_empty() {
                         current_tool.to_string()
                     } else {
                         call_key.clone()
                     };
-
-                    if consecutive_same_call >= 5 {
-                        // Hard break after 5 — the LLM ignored warnings
+                    if breaker_action == BreakerAction::Break {
+                        // Hard break after 5 consecutive failures — the LLM
+                        // ignored the warnings.
                         log!(
-                            "[AgentLoop] Force-breaking loop: {} called {} times on '{}'",
+                            "[AgentLoop] Force-breaking loop: {} failed {} times in a row on '{}'",
                             current_tool,
-                            consecutive_same_call,
+                            consecutive_failing_call,
                             target
                         );
                         let msg = format!("I tried to process `{}` but it failed repeatedly. The error may need to be resolved before retrying.", target);
@@ -1062,17 +1156,19 @@ impl LucidosEngine {
                             *proposed_change,
                         ));
                     }
-
-                    // Soft break at 3-4 — warn the LLM and let it continue
+                    // Soft break at 3-4 consecutive failures — warn the LLM and
+                    // let it continue. The proposed (repeat) call is NOT executed,
+                    // so `last_call_was_error` stays as-is and the failure streak
+                    // survives a continued retry.
                     log!(
-                        "[AgentLoop] Warning LLM: {} called {} times on '{}'",
+                        "[AgentLoop] Warning LLM: {} failed {} times in a row on '{}'",
                         current_tool,
-                        consecutive_same_call,
+                        consecutive_failing_call,
                         target
                     );
                     let stop_msg = format!(
-                        "STOP: You've called {} on '{}' {} times. Do NOT call it again. Use the results you already have and give your final answer now.",
-                        current_tool, target, consecutive_same_call
+                        "STOP: Your call to {} on '{}' has failed {} times in a row. Do NOT call it again the same way. Use the results you already have and give your final answer now, or resolve the underlying error first.",
+                        current_tool, target, consecutive_failing_call
                     );
                     push_circuit_breaker(messages, &response, &stop_msg);
                     continue;
@@ -1080,6 +1176,10 @@ impl LucidosEngine {
             } else {
                 consecutive_same_call = 0;
                 last_tool_call = None;
+                // A multi-tool-call turn breaks any single-call repeat streak —
+                // clear the failure tracking so the next single call starts fresh.
+                consecutive_failing_call = 0;
+                last_call_was_error = false;
             }
 
             for tool_call in &response.tool_calls {
@@ -1163,6 +1263,8 @@ impl LucidosEngine {
                                 device_id,
                                 tool_called_event_id,
                                 &tool_call.id,
+                                &meta,
+                                cancel_token,
                             )
                             .await
                         {
@@ -1203,6 +1305,21 @@ impl LucidosEngine {
                     Ok(text) => (text, false),
                     Err(text) => (text, true),
                 };
+
+                // Carry this single call's outcome to the next iteration so the
+                // generic breaker's failure streak only grows on repeated
+                // *failures*. Only meaningful when the turn had one tool call —
+                // the multi-call `else` branch above already clears the streak.
+                if response.tool_calls.len() == 1 {
+                    last_call_was_error = is_error;
+                }
+
+                // A failed ask_user_question (empty `question`, empty batch, or
+                // non-array `questions`) must force a re-ask next iteration
+                // rather than letting the model degrade to prose — record it.
+                if tool_call.name == tn::ASK_USER_QUESTION && is_error {
+                    this_iter_question_ask_failed = true;
+                }
 
                 // Track app UI modifications for deferred refresh before final response
                 // Path format: apps/{app_id}/{file}
@@ -1371,6 +1488,12 @@ impl LucidosEngine {
                     break;
                 }
             }
+
+            // Carry this iteration's failed-ask signal into the next iteration
+            // so its no-tool-calls branch can force a re-ask. Reassigned every
+            // tool-call iteration, so it self-clears once an ask succeeds (or no
+            // ask was attempted).
+            question_ask_failed_last_iter = this_iter_question_ask_failed;
 
             // A trigger's command was blocked by an ungranted side-effect (ADR
             // 0002, Phase 5). Emit a terminal `ResponseFailed` and return `Err`

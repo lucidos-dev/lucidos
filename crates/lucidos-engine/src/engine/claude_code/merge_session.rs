@@ -3,10 +3,6 @@ use crate::engine::agent_session::probe_merge_conflicts;
 use crate::engine::change_ops::{CodingAgentChangeOps, LiveSessionInfo};
 
 impl CodingAgentChangeOps for LucidosEngine {
-    async fn is_running_for(&self, thread_id: Uuid) -> bool {
-        self.is_agent_running_for(thread_id).await
-    }
-
     fn spawn_hardening(
         &self,
         thread_id: Uuid,
@@ -34,29 +30,9 @@ impl CodingAgentChangeOps for LucidosEngine {
                 worktree_path: s.worktree_path.clone()?,
                 idle_notify: s.idle_notify.clone(),
                 msg_tx: s.msg_tx.clone(),
+                last_event_at: s.last_event_at.clone(),
             })
         })
-    }
-
-    async fn merge_via_session(
-        &self,
-        thread_id: Uuid,
-        change_id: Uuid,
-        wt_path: &Path,
-        branch_name: &str,
-        repo_root: &Path,
-        session: &LiveSessionInfo,
-    ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-        self.merge_via_cc_session(
-            thread_id,
-            change_id,
-            wt_path,
-            branch_name,
-            repo_root,
-            &session.idle_notify,
-            &session.msg_tx,
-        )
-        .await
     }
 
     fn spawn_merge_session(&self, thread_id: Uuid, change_id: Uuid, description: &str) {

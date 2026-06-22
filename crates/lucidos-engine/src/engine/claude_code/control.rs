@@ -98,6 +98,22 @@ impl LucidosEngine {
             .and_then(|s| s.cancel_actor.take())
     }
 
+    /// Read and clear the redirect flag set by `arm_codex_redirect` when a
+    /// follow-up interrupts a mid-turn Codex turn. The run_session interrupt arm
+    /// calls this so the interrupted turn's `ResponseCanceled` carries
+    /// `CancelCause::SupersededByFollowup` (neutral render) rather than
+    /// `UserStop`. Drained on read — a resumed session must not carry a stale
+    /// redirect flag into its next turn. The redirect analog of
+    /// `take_session_cancel_actor`.
+    pub(crate) async fn take_session_redirect_followup(&self, thread_id: Uuid) -> bool {
+        self.agent_sessions
+            .lock()
+            .await
+            .get_mut(&thread_id)
+            .map(|s| std::mem::take(&mut s.redirect_followup))
+            .unwrap_or(false)
+    }
+
     /// Interrupt a running Claude Code session — sends control_request:interrupt to stop
     /// current work without killing the session (like pressing Esc in the CC terminal).
     /// The CC process stays alive and enters waiting state.

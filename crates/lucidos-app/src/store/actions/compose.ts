@@ -19,10 +19,9 @@
 
 import { threadMap, focusedThreadId, inputMode, showToast, setFocusedThread, selectedScope, selectedCodingAgent, resetCodingAgentPendingPreferences, type Scope } from '../store';
 import type { ComposeDestination } from '../composeDestination';
-import { dismissComposeHandoffHint } from './preferences';
 import { makeOptimisticThreadState, type ThreadMeta } from '../thread-events';
 import { clearDraft, composeDrafts, draftIsEmpty, getDraft, patchDraft, setDraft, type ComposeDraft } from '../composeDrafts';
-import { ApiError, ensureThreadStarted, putComposeOnThread, deleteThread } from '../../api/client';
+import { API, ApiError, ensureThreadStarted, putComposeOnThread, deleteThread } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
 import { sendMessage } from './chat';
 import type { ChatContext } from './chatContext';
@@ -431,14 +430,6 @@ export async function sendCompose(
     // with a stale value. Follow-ups (sendFollowup) deliberately don't clear
     // here: their pending is reconciled per-thread by CodingAgentControlMenu.loadCommands.
     resetCodingAgentPendingPreferences();
-    // First send to a coding destination retires the compose view's
-    // "Not sure? Start with the Lucidos Agent" hint — the user has found the
-    // hand-off's explicit sibling on their own. Idempotence lives inside the
-    // helper; savePreference surfaces a failed write via toast, so
-    // fire-and-forget is safe here.
-    if (opts.useCodingAgent) {
-      void dismissComposeHandoffHint();
-    }
   } catch (err) {
     // Roll back state. Restore text/images only if the user hasn't started
     // typing into the now-empty textarea — overwriting fresh keystrokes
@@ -504,7 +495,11 @@ function flushAllPending(): void {
       console.warn(`[compose] keepalive body exceeds 64KB (${body.length}B) for ${threadId}; will retry on next foreground push`);
       continue;
     }
-    fetch(`/api/v1/threads/${encodeURIComponent(threadId)}/compose`, {
+    // `API` carries the gateway base prefix (`/<slug>/api/v1`); a bare
+    // `/api/v1/...` would make the gateway read `api` as a workspace slug and
+    // 404 ("unknown workspace 'api'"), silently dropping the tab-close flush
+    // for every gateway-served workspace.
+    fetch(`${API}/threads/${encodeURIComponent(threadId)}/compose`, {
       method: 'PUT',
       headers,
       body,

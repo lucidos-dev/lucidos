@@ -108,7 +108,7 @@ export function PluginInstallPanel() {
           <section class="plugin-install-section plugin-install-setup">
             <div class="plugin-install-label">Setup instructions</div>
             <div
-              class="plugin-install-setup-body"
+              class="plugin-install-setup-body markdown-content"
               dangerouslySetInnerHTML={{ __html: renderMarkdown(req.setup) }}
             />
           </section>

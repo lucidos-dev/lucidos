@@ -330,6 +330,110 @@ fn drain_orphaned_injections_recovers_multiple_in_order() {
     assert_eq!(orphans[1].mode, thread_events::ActorMode::Agent);
 }
 
+// --- Finalize-window race: teardown must remove-then-drain ---
+
+#[test]
+fn finalize_turn_recovers_followup_that_raced_teardown() {
+    use std::sync::Barrier;
+    // Deterministic reproduction of the finalize-window race. The fast-path
+    // follow-up send takes the active_threads lock, looks up the handle, and
+    // sends WHILE HOLDING that lock. Teardown removes the handle under the
+    // SAME lock. Here we pin the interleaving so the send is acknowledged
+    // *during* teardown — exactly the window that used to drop the message:
+    //
+    //   1. a "sender" thread grabs the active_threads lock (an in-flight send),
+    //   2. the main thread calls finalize → blocks at drop(guard) on the lock,
+    //   3. the sender sends the follow-up (acknowledged) and releases the lock,
+    //   4. finalize's removal proceeds, THEN it drains.
+    //
+    // remove-then-drain recovers the message because the drain runs after the
+    // lock was reacquired (post-send). The old drain-then-remove order drained
+    // BEFORE taking the lock — at step 3-time the buffer was still empty — so
+    // the acknowledged message was lost. This test fails under that order.
+    let threads = make_threads();
+    let tid = Uuid::new_v4();
+    let (_token, mut injection_rx, guard) = register(&threads, tid);
+
+    let lock_ready = Arc::new(Barrier::new(2));
+    let lock_ready_sender = lock_ready.clone();
+    let threads_for_send = threads.clone();
+
+    let sender = std::thread::spawn(move || {
+        // Hold the active_threads lock — models an in-flight fast-path send.
+        let map = threads_for_send.lock().unwrap();
+        lock_ready_sender.wait();
+        // Let the main thread reach drop(guard) and block on the lock.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let ok = map
+            .get(&tid)
+            .expect("handle still present mid-teardown")
+            .injection_tx
+            .send(InjectedPrompt {
+                text: "raced follow-up".to_string(),
+                event_id: Some(Uuid::new_v4()),
+                mode: thread_events::ActorMode::Human,
+                spawning_event_id: None,
+                images: None,
+                origin: None,
+                kind: crate::engine::InjectedPromptKind::UserText,
+            })
+            .is_ok();
+        assert!(ok, "send under the lock must be acknowledged");
+        drop(map); // release — finalize's removal can now proceed
+    });
+
+    lock_ready.wait();
+    // Blocks at drop(guard) until the sender releases the lock above.
+    let orphans = LucidosEngine::finalize_turn_and_drain_injections(guard, &mut injection_rx);
+    sender.join().unwrap();
+
+    assert_eq!(
+        orphans.len(),
+        1,
+        "follow-up acknowledged during teardown must be recovered, not dropped"
+    );
+    assert_eq!(orphans[0].text, "raced follow-up");
+}
+
+#[test]
+fn finalize_turn_closes_the_inject_gate() {
+    // After teardown the handle is gone, so a LATER fast-path send can no
+    // longer be acknowledged into a channel nobody drains — it fails, which
+    // routes the caller to the slow path (a fresh turn) instead of vanishing.
+    let threads = make_threads();
+    let tid = Uuid::new_v4();
+    let (_token, mut injection_rx, guard) = register(&threads, tid);
+
+    let orphans = LucidosEngine::finalize_turn_and_drain_injections(guard, &mut injection_rx);
+    assert!(orphans.is_empty(), "no orphans when nothing raced");
+
+    // Handle removed — the inject gate is closed.
+    assert!(
+        !threads.lock().unwrap().contains_key(&tid),
+        "finalize must remove the thread from active_threads"
+    );
+    let post_teardown_send = {
+        let map = threads.lock().unwrap();
+        map.get(&tid).map(|h| {
+            h.injection_tx
+                .send(InjectedPrompt {
+                    text: "too late".into(),
+                    event_id: None,
+                    mode: thread_events::ActorMode::Human,
+                    spawning_event_id: None,
+                    images: None,
+                    origin: None,
+                    kind: crate::engine::InjectedPromptKind::UserText,
+                })
+                .is_ok()
+        })
+    };
+    assert!(
+        post_teardown_send.is_none(),
+        "post-teardown inject must fail so the caller takes the slow path"
+    );
+}
+
 // --- CC exit / follow-up tests ---
 
 /// With no idle waiting loop, when CC exits the ThreadGuard drops immediately,

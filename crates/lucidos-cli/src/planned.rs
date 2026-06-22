@@ -1,9 +1,12 @@
 //! `lucidos planned` — record/query the durable Planned marker that enforces
 //! the `implementation-plan` skill. Mirrors `hardened.rs` (same `git_context`
-//! + HTTP-to-parent-engine pattern). The marker is set either by the skill
-//! (`mark --plan <docs/plans/file>`) or by the agent acknowledging a local fix
-//! (`mark --simple "<reason>"`). Both states satisfy every gate; only the
-//! absence of a marker blocks.
+//! and HTTP-to-parent-engine pattern). The marker is set by the skill
+//! (`mark --plan <docs/plans/file>` → records the awaiting-approval `proposed`
+//! state), approved by the agent after the user's chat approval
+//! (`approve` → flips `proposed` to gate-satisfying `planned`), or set directly
+//! for a local fix (`mark --simple "<reason>"` → `acknowledged_simple`, no
+//! approval needed). `planned` and `acknowledged_simple` satisfy every gate;
+//! `proposed` and the absence of a marker both block.
 
 use crate::hardened::git_context;
 use crate::http::client as http_client;
@@ -18,18 +21,22 @@ pub(crate) enum MarkKind<'a> {
     Simple(&'a str),
 }
 
-/// Planned-marker presence, mirroring the engine's `PlanMarkerState`. The wire
-/// `state` field is the literal `"PRESENT"` / `"MISSING"`.
+/// Planned-marker gate state, mirroring the engine's three-way wire `state`
+/// field. `Satisfied` = an approved plan or a `--simple` ack (gate passes);
+/// `Proposed` = a plan awaiting the user's approval (gate blocks, but the path
+/// forward is `approve`, not re-planning); `Missing` = no marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlannedState {
-    Present,
+    Satisfied,
+    Proposed,
     Missing,
 }
 
 impl PlannedState {
     pub(crate) fn parse(raw: &str) -> Self {
         match raw.trim() {
-            "PRESENT" => PlannedState::Present,
+            "SATISFIED" => PlannedState::Satisfied,
+            "PROPOSED" => PlannedState::Proposed,
             // Unknown / unreachable engine / empty body => Missing so a
             // transient error doesn't silently let an unplanned edit through.
             _ => PlannedState::Missing,
@@ -38,7 +45,8 @@ impl PlannedState {
 
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
-            PlannedState::Present => "PRESENT",
+            PlannedState::Satisfied => "SATISFIED",
+            PlannedState::Proposed => "PROPOSED",
             PlannedState::Missing => "MISSING",
         }
     }
@@ -49,7 +57,9 @@ pub(crate) fn cmd_mark(ws: &Workspace, kind: MarkKind<'_>) -> Result<(), BoxErro
     let (repo_root, branch, head_sha) = git_context(&cwd)?;
     let url = format!("{}/api/v1/internal/mark-planned", ws.base_url());
     let (state, plan_path, reason) = match kind {
-        MarkKind::Plan(p) => ("planned", Some(p), None),
+        // A written plan starts AWAITING APPROVAL — the skill records `proposed`,
+        // the user approves in chat, then the agent runs `planned approve`.
+        MarkKind::Plan(p) => ("proposed", Some(p), None),
         MarkKind::Simple(r) => ("acknowledged_simple", None, Some(r)),
     };
     let body = serde_json::json!({
@@ -73,8 +83,52 @@ pub(crate) fn cmd_mark(ws: &Workspace, kind: MarkKind<'_>) -> Result<(), BoxErro
         return Err(format!("POST {} returned {}: {}", url, status, text).into());
     }
     match kind {
-        MarkKind::Plan(p) => println!("Plan recorded: {} ({})", branch, p),
+        MarkKind::Plan(p) => println!(
+            "Plan recorded (awaiting approval): {} ({}). Present it to the user; once approved, run `lucidos planned approve`.",
+            branch, p
+        ),
         MarkKind::Simple(r) => println!("Simple change acknowledged: {} ({})", branch, r),
+    }
+    Ok(())
+}
+
+/// Approve the proposed plan on the current branch (in $PWD), flipping the
+/// marker to gate-satisfying `planned` so source edits and Apply unblock. Run
+/// by the coding agent AFTER the user approves the plan in chat. POSTs to the
+/// parent engine's `/api/v1/internal/approve-plan`.
+pub(crate) fn cmd_approve(ws: &Workspace) -> Result<(), BoxError> {
+    let cwd = std::env::current_dir().map_err(|e| format!("Failed to read cwd: {}", e))?;
+    let (repo_root, branch, _head_sha) = git_context(&cwd)?;
+    let url = format!("{}/api/v1/internal/approve-plan", ws.base_url());
+    let body = serde_json::json!({
+        "repo_root": repo_root.to_string_lossy(),
+        "branch_name": branch,
+    });
+    let resp = http_client()?
+        .post(&url)
+        .json(&body)
+        .send()
+        .map_err(|e| format!("POST {} failed: {}", url, e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp
+            .text()
+            .map_err(|e| format!("POST {} returned {}, body read failed: {}", url, status, e))?;
+        return Err(format!("POST {} returned {}: {}", url, status, text).into());
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .map_err(|e| format!("POST {} returned non-JSON body: {}", url, e))?;
+    if body.get("approved").and_then(|v| v.as_bool()) == Some(true) {
+        println!("Plan approved: {}. Implementation is unblocked.", branch);
+    } else {
+        // Nothing to flip — no proposed plan (already approved, a --simple ack,
+        // or no marker at all). Surface it so the agent doesn't assume success.
+        println!(
+            "No proposed plan to approve on {} (already approved, a simple-fix ack, or no marker). \
+             Run `lucidos planned state` to check.",
+            branch
+        );
     }
     Ok(())
 }
@@ -123,20 +177,24 @@ mod tests {
 
     #[test]
     fn parse_round_trips_known_states() {
-        assert_eq!(PlannedState::parse("PRESENT"), PlannedState::Present);
+        assert_eq!(PlannedState::parse("SATISFIED"), PlannedState::Satisfied);
+        assert_eq!(PlannedState::parse("PROPOSED"), PlannedState::Proposed);
         assert_eq!(PlannedState::parse("MISSING"), PlannedState::Missing);
     }
 
     #[test]
     fn parse_falls_back_to_missing_for_unknown_or_empty() {
         // Empty body / unreachable engine must not silently mask an unplanned
-        // branch — treat as Missing so the gate still fires.
+        // branch — treat as Missing so the gate still fires. A drifted/unknown
+        // value must NOT be read as the satisfying state.
         assert_eq!(PlannedState::parse(""), PlannedState::Missing);
         assert_eq!(PlannedState::parse("???"), PlannedState::Missing);
+        assert_eq!(PlannedState::parse("PRESENT"), PlannedState::Missing);
     }
 
     #[test]
     fn parse_strips_trailing_whitespace() {
-        assert_eq!(PlannedState::parse("PRESENT\n"), PlannedState::Present);
+        assert_eq!(PlannedState::parse("SATISFIED\n"), PlannedState::Satisfied);
+        assert_eq!(PlannedState::parse("PROPOSED\n"), PlannedState::Proposed);
     }
 }

@@ -374,10 +374,6 @@ fn t7_legacy_names_deserialize_via_alias() {
             "CredentialPromptRequested",
         ),
         (
-            r#"{"type":"McpConsentRequest","data":"d"}"#,
-            "McpConsentPromptRequested",
-        ),
-        (
             r#"{"type":"PluginInstallRequest","payload":"{}"}"#,
             "PluginInstallRequested",
         ),

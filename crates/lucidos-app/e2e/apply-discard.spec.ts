@@ -2,7 +2,7 @@ import { test, expect } from './fixtures';
 import {
   assertHealthy, uniqueMessage,
 } from './helpers';
-import { git, psql, WORKSPACE, cleanupCCThread, cleanupFileFromMain } from './db-helpers';
+import { git, psql, WORKSPACE, WORKSPACE_CANONICAL, cleanupCCThread, cleanupFileFromMain } from './db-helpers';
 import { execSync } from 'child_process';
 import { writeFileSync } from 'fs';
 import { resolve } from 'path';
@@ -20,7 +20,14 @@ function createTestChange(suffix: string): { id: string; branch: string; file: s
   git(['commit', '-m', `e2e test change ${suffix}`]);
   git(['checkout', 'main']);
 
-  psql(`INSERT INTO changes (id, request_id, branch_name, repo_root, description, file_count, files, requires_restart, hardened) VALUES ('${id}', '${randomUUID()}', '${branch}', '${WORKSPACE}', 'E2E test change ${suffix}', 1, ARRAY['${file}'], false, true)`);
+  psql([
+    `INSERT INTO changes (id, request_id, branch_name, repo_root, description, file_count, files, requires_restart, hardened) VALUES ('${id}', '${randomUUID()}', '${branch}', '${WORKSPACE}', 'E2E test change ${suffix}', 1, ARRAY['${file}'], false, true)`,
+    // The Apply floor (Lucidos-source changes) requires a Planned marker. A
+    // real CC session sets it; this direct seed mirrors that, keyed on the
+    // canonical repo_root the engine looks the marker up by. cleanupCCThread
+    // deletes the row by branch_name on teardown.
+    `INSERT INTO planned_branches (repo_root, branch_name, state, head_sha) VALUES ('${WORKSPACE_CANONICAL}', '${branch}', 'acknowledged_simple', 'seeded') ON CONFLICT (repo_root, branch_name) DO NOTHING`,
+  ].join(';\n'));
 
   return { id, branch, file };
 }

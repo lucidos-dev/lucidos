@@ -77,19 +77,26 @@ describe('refreshChangesState retries once on TimeoutError', () => {
     expect(toast!.type).toBe('error');
   });
 
-  it('does not retry on a manual AbortError', async () => {
-    // A bare controller.abort() is a user cancel, not a timeout — surfacing
-    // immediately is correct (no toast suppression, no retry).
+  it('suppresses the toast (and preserves state) on a browser-cancelled AbortError', async () => {
+    // There is no manual AbortController on this path — an AbortError is the
+    // browser cancelling the in-flight fetch when an iOS PWA freezes/backgrounds
+    // mid-refresh or the connection resets on a radio handoff. That's transient
+    // page-lifecycle noise the next runResumeSync re-syncs, so it must NOT toast
+    // ("Failed to fetch changes: request cancelled" was the spurious mobile
+    // error) and must NOT clobber the already-loaded list with a failed state.
+    changes.value = { status: 'loaded', data: [{ id: 'prev' } as never] };
+    appliedChanges.value = { status: 'loaded', data: [] };
     mockFetchChanges.mockRejectedValueOnce(new DOMException('aborted', 'AbortError'));
 
     refreshChangesState();
-    await vi.waitFor(() =>
-      expect(toasts.value.find(t => t.message?.startsWith('Failed to fetch changes'))).toBeTruthy(),
-    );
+    await vi.waitFor(() => expect(mockFetchChanges).toHaveBeenCalledTimes(1));
+    // Let any errant catch flush before asserting the negative.
+    await Promise.resolve();
 
-    expect(mockFetchChanges).toHaveBeenCalledTimes(1);
-    const toast = toasts.value.find(t => t.message?.startsWith('Failed to fetch changes'));
-    expect(toast!.message).toBe('Failed to fetch changes: request cancelled');
+    expect(toasts.value.find(t => t.message?.startsWith('Failed to fetch changes'))).toBeUndefined();
+    expect(changes.value.status).toBe('loaded');
+    expect(loadedPendingLength()).toBe(1);
+    expect(appliedChanges.value.status).toBe('loaded');
   });
 
   it('does not retry on non-timeout errors', async () => {

@@ -33,4 +33,9 @@ describe('turn header gutter', () => {
     expect(declarationValue(initiatorBody, 'padding-left')).toBe('var(--turn-body-inset)');
     expect(declarationValue(responseContent, 'padding-left')).toBe('var(--turn-body-inset)');
   });
+
+  it('insets the collapsed marker to match the turn body content', () => {
+    const turnCollapsed = getBlock(inputCss, '.turn-collapsed');
+    expect(declarationValue(turnCollapsed, 'padding-left')).toBe('var(--turn-body-inset)');
+  });
 });

@@ -155,13 +155,63 @@
     gap: 0.5rem;
 }
 
-.repo-path-row {
+/* Add-repository form — sleek vertical card: name, path + browse, then a
+   right-aligned action footer (Cancel / Save) so the buttons sit under the
+   fields instead of floating beside the first input. (Distinct class from the
+   no-op `repo-add-form` marker still used by the env-var / mobile-access add
+   forms, which deliberately keep the .list-row layout.) */
+.repo-add-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+    padding: 0.75rem 1rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+}
+
+.repo-add-input {
+    width: 100%;
+    min-width: 0;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+    font-size: 0.8125rem;
+    padding: 0.4375rem 0.625rem;
+    outline: none;
+    transition: border-color var(--duration-fast), box-shadow var(--duration-fast);
+}
+
+.repo-add-input::placeholder {
+    color: var(--text-muted);
+}
+
+.repo-add-input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 0.1875rem color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.repo-add-path-row {
     display: flex;
     gap: 0.5rem;
     align-items: center;
 }
 
-.repo-path-row .device-name-input {
+.repo-add-path-row .repo-add-input {
     flex: 1;
+}
+
+.repo-add-browse {
+    flex-shrink: 0;
+}
+
+.repo-add-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 0.125rem;
 }
 

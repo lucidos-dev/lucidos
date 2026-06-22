@@ -870,7 +870,8 @@ impl EventBus {
             // on the resolution.
             ThreadEvent::UserQuestionAsked { .. }
             | ThreadEvent::CodingAgentPermissionRequest { .. }
-            | ThreadEvent::CommandPermissionRequested { .. } => {
+            | ThreadEvent::CommandPermissionRequested { .. }
+            | ThreadEvent::McpPermissionRequested { .. } => {
                 // The agent asking for input is agent activity (bumps
                 // last_agent_action); the user's resolution below is the user
                 // action.
@@ -885,7 +886,8 @@ impl EventBus {
             }
             ThreadEvent::UserQuestionAnswered { .. }
             | ThreadEvent::CodingAgentPermissionResolved { .. }
-            | ThreadEvent::CommandPermissionResolved { .. } => {
+            | ThreadEvent::CommandPermissionResolved { .. }
+            | ThreadEvent::McpPermissionResolved { .. } => {
                 sqlx::query(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), \
                      status = 'running', last_revived_at = NOW() WHERE thread_id = $1",
@@ -964,7 +966,6 @@ impl EventBus {
             | ThreadEvent::PluginUninstallRequested { .. }
             | ThreadEvent::EmailConfirmRequested { .. }
             | ThreadEvent::PushNotificationRequested
-            | ThreadEvent::McpConsentPromptRequested { .. }
             | ThreadEvent::FileRefreshRequested { .. }
             | ThreadEvent::AppUiRefreshRequested { .. }
             | ThreadEvent::AppUiCaptureRequested { .. }

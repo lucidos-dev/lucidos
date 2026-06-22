@@ -269,6 +269,18 @@ impl LucidosEngine {
         crate::engine::git_ops::plan_marker_state(&self.pool, repo_root, branch_name).await
     }
 
+    /// Approve a `Proposed` plan, flipping it to `Planned` so the gate passes.
+    /// Returns whether a proposed row was flipped. Called by the
+    /// `/api/v1/internal/approve-plan` endpoint that `lucidos planned approve`
+    /// hits after the user approves the plan in chat.
+    pub(crate) async fn approve_plan(
+        &self,
+        repo_root: &std::path::Path,
+        branch_name: &str,
+    ) -> Result<bool, sqlx::Error> {
+        crate::engine::git_ops::approve_plan(&self.pool, repo_root, branch_name).await
+    }
+
     /// Borrow the event store for sharing with read-only handlers.
     pub fn event_store(&self) -> &EventStore {
         &self.event_store

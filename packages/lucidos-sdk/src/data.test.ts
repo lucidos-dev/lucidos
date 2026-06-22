@@ -16,18 +16,7 @@ describe('buildAppLocalUrl', () => {
       ).toBe(`${BASE}/app/habit-tracker/icon.png?thread_id=abc-123`);
     });
 
-    it('preserves commit from iframe URL (historical view)', () => {
-      expect(
-        buildAppLocalUrl(
-          'apps/habit-tracker/icon.png',
-          '/app/habit-tracker/',
-          '?commit=deadbeef',
-          BASE,
-        ),
-      ).toBe(`${BASE}/app/habit-tracker/icon.png?commit=deadbeef`);
-    });
-
-    it('emits no query when iframe is live (no thread_id / commit)', () => {
+    it('emits no query when iframe is live (no thread_id)', () => {
       expect(
         buildAppLocalUrl(
           'apps/habit-tracker/icon.png',
@@ -36,17 +25,6 @@ describe('buildAppLocalUrl', () => {
           BASE,
         ),
       ).toBe(`${BASE}/app/habit-tracker/icon.png`);
-    });
-
-    it('prefers thread_id when both are present (mutually exclusive server-side)', () => {
-      expect(
-        buildAppLocalUrl(
-          'apps/habit-tracker/icon.png',
-          '/app/habit-tracker/',
-          '?thread_id=abc&commit=deadbeef',
-          BASE,
-        ),
-      ).toBe(`${BASE}/app/habit-tracker/icon.png?thread_id=abc`);
     });
 
     it('encodes path segments but preserves the slashes', () => {
@@ -162,7 +140,7 @@ describe('buildAppLocalUrl', () => {
     });
   });
 
-  it('drops unrelated query params (only carries thread_id / commit)', () => {
+  it('drops unrelated query params (only carries thread_id)', () => {
     expect(
       buildAppLocalUrl(
         'apps/habit-tracker/icon.png',

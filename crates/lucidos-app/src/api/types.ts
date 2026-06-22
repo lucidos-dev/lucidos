@@ -116,8 +116,8 @@ export interface EnvVarsListResponse {
 
 /** A chat model in the DB-backed registry (Settings → Models). Mirrors the
  *  engine `core::models::Model`. `provider` is the backend that serves it
- *  ('vertex' | 'anthropic' | 'openai'); `source` is 'builtin' (disable-only) or
- *  'user' (deletable). */
+ *  ('vertex' | 'anthropic' | 'openai' | 'openrouter' | 'local'); `source` is
+ *  'builtin' (disable-only) or 'user' (deletable). */
 export interface ModelInfo {
   id: string;
   label: string;

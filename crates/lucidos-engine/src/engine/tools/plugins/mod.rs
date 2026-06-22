@@ -35,6 +35,9 @@ use source::{copy_atomic, detect_source, fetch_source, SourceType};
 // Named by other modules via the `plugins::` path (`engine::tools::files`
 // routes plugin-owned deletes here), so it stays a re-export.
 pub(crate) use registry::find_plugin_owning_file;
+// The `delete_app` HTTP handler (`api::apps`) routes plugin-owned app deletes
+// to the uninstall panel via this — the app-level mirror of the file guard.
+pub(crate) use registry::find_plugin_owning_app;
 pub(crate) use registry::installed_plugin_summaries;
 
 /// Sentinel prefix on the `install_plugin` / `update_plugin` tool result. The
@@ -314,6 +317,35 @@ pub(crate) async fn stage_uninstall_request(engine: &LucidosEngine, id: &str) ->
     .await
 }
 
+/// Normalize a plugin manifest's `setup` instructions: trimmed, with an empty
+/// (or whitespace-only) value collapsed to `None`. Used at staging time (panel
+/// preview + pending entry) AND at confirm time (comparing the staged setup
+/// against the installed version's), so both sides compare on equal terms.
+pub(crate) fn normalize_setup(setup: Option<&str>) -> Option<String> {
+    setup
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Decide whether confirming an install/update should spawn a setup thread.
+/// `new` is the staged version's `setup`; `prior` is the currently-installed
+/// version's `setup` (`None` on a fresh install). Both are normalized here, so
+/// callers may pass raw or pre-normalized text. Setup runs only when the new
+/// version has setup work the installed version didn't already cover:
+/// - no `setup` in the new version → never.
+/// - fresh install (or the installed version had no setup) with a `setup` → yes.
+/// - update whose `setup` differs from the installed version's → yes.
+/// - update whose `setup` is identical (after normalization) → no (re-running
+///   identical setup on every version bump is noise — the user refinement).
+pub(crate) fn setup_is_new(new: Option<&str>, prior: Option<&str>) -> bool {
+    match (normalize_setup(new), normalize_setup(prior)) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(n), Some(p)) => n != p,
+    }
+}
+
 /// Stage `source_str` into a temp dir, validate the manifest + tree, register
 /// the result in `pending_installs`, and return the
 /// `[PLUGIN_INSTALL_REQUEST]<json>` sentinel. On any failure returns
@@ -344,12 +376,7 @@ pub(crate) fn prepare_install_request(
     // Normalize the author's setup instructions once: trimmed, with empty
     // collapsed to `None`. The same value feeds the panel preview AND the
     // pending entry that decides whether confirm spawns a setup thread.
-    let setup = manifest
-        .setup
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    let setup = normalize_setup(manifest.setup.as_deref());
 
     let preview = serde_json::json!({
         "install_id": install_id,
@@ -786,11 +813,31 @@ pub async fn confirm_pending_install(
             .ok_or_else(|| format!("no pending install with id '{}'", install_id))?
     };
 
-    // Pre-allocate the setup thread id (only when there's setup to run) so it
-    // can be recorded in the `PluginInstalled` event — that's what lets the
-    // App Store card resolve the right thread for its Setup→Open state after a
-    // reload, not just in the session that did the install.
-    let setup_thread_id = pending.setup.as_deref().map(|_| uuid::Uuid::new_v4());
+    // Pre-allocate the setup thread id only when this confirm has *new* setup
+    // work to run: a fresh install with a `setup` field, or an update whose
+    // `setup` instructions differ from the currently-installed version's. A
+    // version bump that left `setup` unchanged re-runs nothing (no thread, no
+    // navigation) — re-doing identical setup on every update is noise. The
+    // recorded id is what lets the App Store card resolve the right thread for
+    // its Setup→Open state after a reload.
+    //
+    // `latest_install` here still sees the *previous* version — the new
+    // `PluginInstalled` event isn't emitted until `install_from_unpacked_with_bus`
+    // below. A read error is non-fatal: fall back to treating the staged setup
+    // as new (spawn) so a transient DB hiccup never silently skips real setup.
+    let prior_setup = match latest_install(&engine.pool, &pending.plugin_id).await {
+        Ok(rec) => rec.and_then(|r| r.setup().map(str::to_string)),
+        Err(e) => {
+            log!(
+                "[Plugins] prior-setup lookup failed for '{}' (treating setup as new): {}",
+                pending.plugin_id,
+                e
+            );
+            None
+        }
+    };
+    let setup_thread_id =
+        setup_is_new(pending.setup.as_deref(), prior_setup.as_deref()).then(uuid::Uuid::new_v4);
 
     let (summary, installed_files) = {
         let _repo_guard = engine.lock_workspace_repo().await;
@@ -834,12 +881,27 @@ pub async fn confirm_pending_install(
 /// Spawn a Lucidos Agent thread seeded with a plugin's `setup` instructions so
 /// the agent walks the user through completing them (asking questions, wiring
 /// config). Submitted through the Thread Queue like any background spawn, so it
-/// respects admission control. `actor` is the device/user who confirmed the
-/// install; it becomes the new thread's origin so the timeline attributes it.
-/// `thread_id` is pre-allocated by the caller (so the same id can be recorded
-/// in the `PluginInstalled` event). The submission never fails for this kind
-/// (overflow is per-trigger only), so the thread is always either admitted
-/// immediately or queued — never dropped.
+/// respects admission control. `thread_id` is pre-allocated by the caller (so
+/// the same id can be recorded in the `PluginInstalled` event). The submission
+/// never fails for this kind (overflow is per-trigger only), so the thread is
+/// always either admitted immediately or queued — never dropped.
+///
+/// Spawned as a [`ThreadQueueRequest::SubThread`], NOT `AgentChat`, for two
+/// reasons:
+/// 1. **Materialize before navigation.** The Thread Queue executor's `prepare`
+///    step emits the seeding `MessageReceived` EAGERLY — synchronously, before
+///    `submit` returns, on the immediate-admit path — so the `thread_summaries`
+///    row exists by the time this confirm responds. The frontend then navigates
+///    into a real, materializing thread instead of an empty view. (`AgentChat`
+///    has no eager prepare, so its thread didn't exist until the agent later ran.)
+/// 2. **No origin/mode panic.** `AgentChat` paired `origin: actor` — a
+///    `MessageOrigin::Device` whose `mode()` is `Human` — with `mode: Agent`.
+///    `make_message_received`'s origin/mode validation rejects that mismatch and
+///    `.expect()`s, so the setup thread's `MessageReceived` panicked and the
+///    thread never materialized. `SubThread` emits with a synthesized Agent-mode
+///    origin (`None` here, since there's no parent), sidestepping the validation.
+///
+/// `actor` still attributes the `ThreadQueued` audit event via `submit`.
 async fn spawn_plugin_setup_thread(
     engine: &LucidosEngine,
     thread_id: uuid::Uuid,
@@ -848,6 +910,20 @@ async fn spawn_plugin_setup_thread(
     setup: &str,
     actor: Option<MessageOrigin>,
 ) {
+    let request = build_setup_thread_request(thread_id, plugin_name, plugin_version, setup);
+    engine.thread_queue.submit(request, actor, None).await;
+}
+
+/// Build the Thread Queue request for a plugin setup thread. Pure (no engine,
+/// no I/O) so the request shape is unit-testable — the `SubThread` choice and
+/// the bound `child_thread_id` are load-bearing (see `spawn_plugin_setup_thread`
+/// for why), and a regression back to `AgentChat` would silently break setup.
+fn build_setup_thread_request(
+    thread_id: uuid::Uuid,
+    plugin_name: &str,
+    plugin_version: &str,
+    setup: &str,
+) -> crate::engine::thread_queue::ThreadQueueRequest {
     let prompt = format!(
         "The \"{plugin_name}\" plugin (v{plugin_version}) was just installed in this workspace. \
 The plugin author left these setup instructions:\n\n---\n{setup}\n---\n\n\
@@ -855,30 +931,23 @@ Walk the user through completing this setup now. Carry out any wiring or \
 configuration steps you can do yourself, and ask the user directly for \
 anything the instructions need from them (credentials, choices, \
 confirmations). When setup is complete, give a short confirmation of what is \
-now ready to use."
+now ready to use.\n\n\
+The user has been brought straight into this thread and is reading it right \
+now, so communicate entirely through your normal replies here. Do NOT call \
+send_notification — the user does not need a toast or push for setup steps \
+they are already watching in this thread."
     );
 
-    let request = crate::engine::thread_queue::ThreadQueueRequest::AgentChat {
-        message: prompt,
-        thread_id,
-        event_id: Some(uuid::Uuid::new_v4().to_string()),
-        image_hashes: Vec::new(),
-        device_id: None,
-        model: None,
-        reasoning_effort: None,
-        use_coding_agent: None,
-        repo_id: None,
-        cc_model: None,
-        coding_agent: None,
-        title: Some(format!("Set up {plugin_name}")),
-        mode: ActorMode::Agent,
-        origin: actor.clone(),
+    crate::engine::thread_queue::ThreadQueueRequest::SubThread {
+        prompt,
+        child_thread_id: thread_id,
         parent_thread_id: None,
         spawning_event_id: None,
-        app_id: None,
-    };
-
-    engine.thread_queue.submit(request, actor, None).await;
+        title: Some(format!("Set up {plugin_name}")),
+        model: None,
+        reasoning_effort: None,
+        pre_emitted_origin: None,
+    }
 }
 
 async fn reload_auth_modules_if_needed(engine: &LucidosEngine, installed_files: &[String]) {

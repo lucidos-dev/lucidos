@@ -15,7 +15,7 @@
 //!     `.claude/commands/harden.md` is absent.
 //!
 //! Wired into `<workspace>/.lucidos/cc-settings.json` via `cc_settings.rs`,
-//! alongside `cc-edit-preread`. Fails OPEN on parse / I/O / engine-unreachable
+//! on the Edit/Write matchers. Fails OPEN on parse / I/O / engine-unreachable
 //! errors so a hook bug can't brick every Edit/Write call. Claude-Code only —
 //! Codex has no PreToolUse hook and is covered by the prompt rule + Apply floor.
 
@@ -58,16 +58,37 @@ pub(crate) fn is_plan_artifact(file_path: &str) -> bool {
     file_path.contains("docs/plans/")
 }
 
+/// Deny reason for a `Missing` marker — no plan recorded yet.
 pub(crate) fn build_deny_json(file_path: &str) -> String {
     let reason = format!(
         "Edit blocked: this branch has no implementation-plan marker yet. Before editing source, \
          decide: if this is complex work (cross-layer, or any routing / topology / storage / \
          security / migration / process change, ADR- or design-backed, or anything beyond a local \
          bug fix), run the `implementation-plan` skill first — it writes docs/plans/<date>-<slug>.md \
-         and records the marker. If this is a genuinely local fix, acknowledge it with \
-         `lucidos planned mark --simple \"<one-line reason>\"`. Then retry your edit to `{path}`.",
+         and records a `proposed` marker for the user to approve. If this is a genuinely local fix, \
+         acknowledge it with `lucidos planned mark --simple \"<one-line reason>\"`. Then retry your \
+         edit to `{path}`.",
         path = file_path,
     );
+    deny_envelope(&reason)
+}
+
+/// Deny reason for a `Proposed` marker — a plan exists but the user hasn't
+/// approved it. The path forward is approval, NOT re-running the skill.
+pub(crate) fn build_awaiting_approval_json(file_path: &str) -> String {
+    let reason = format!(
+        "Edit blocked: the implementation plan on this branch is awaiting the user's approval. \
+         Do NOT re-run the `implementation-plan` skill — the plan is already recorded. Present the \
+         plan to the user and wait for their approval. Once the user approves, run \
+         `lucidos planned approve` to unblock implementation, then retry your edit to `{path}`. \
+         If the user requests changes, revise the plan file under docs/plans/, re-commit, and \
+         present it again (the marker stays `proposed` until approved).",
+        path = file_path,
+    );
+    deny_envelope(&reason)
+}
+
+fn deny_envelope(reason: &str) -> String {
     serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -125,7 +146,14 @@ pub(crate) fn run() -> Result<(), BoxError> {
     };
 
     match query_state(&ws) {
-        Ok(PlannedState::Present) => Ok(()),
+        Ok(PlannedState::Satisfied) => Ok(()),
+        Ok(PlannedState::Proposed) => {
+            println!(
+                "{}",
+                build_awaiting_approval_json(&payload.tool_input.file_path)
+            );
+            Ok(())
+        }
         Ok(PlannedState::Missing) => {
             println!("{}", build_deny_json(&payload.tool_input.file_path));
             Ok(())
@@ -186,6 +214,34 @@ mod tests {
         assert!(
             reason.contains("lucidos planned mark --simple"),
             "reason must offer the local-fix escape: {reason}"
+        );
+    }
+
+    #[test]
+    fn awaiting_approval_json_directs_to_approve_not_replan() {
+        let out = build_awaiting_approval_json("/tmp/x.rs");
+        let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "deny");
+        let reason = parsed["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .expect("reason must be a string");
+        assert!(
+            reason.contains("/tmp/x.rs"),
+            "reason must name the file: {reason}"
+        );
+        assert!(
+            reason.contains("lucidos planned approve"),
+            "awaiting-approval reason must name the approve command: {reason}"
+        );
+        assert!(
+            reason.contains("approval"),
+            "awaiting-approval reason must mention approval: {reason}"
+        );
+        // It must NOT push the agent to re-run the skill — the plan exists.
+        assert!(
+            reason.contains("Do NOT re-run"),
+            "awaiting-approval reason must tell the agent not to re-plan: {reason}"
         );
     }
 

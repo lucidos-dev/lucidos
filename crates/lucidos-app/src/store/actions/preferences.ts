@@ -21,7 +21,7 @@ export const UI_SCALE_STEP = 12.5;
 export const UI_SCALE_DEFAULT = 100;
 
 const FONT_FAMILY_VALUES: Record<FontFamily, string> = {
-  monospace: "'SF Mono', 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
+  monospace: "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
   system: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
   inter: "'Inter', system-ui, sans-serif",
   'jetbrains-mono': "'JetBrains Mono', monospace",
@@ -124,7 +124,7 @@ function resolveTheme(theme: Theme): 'light' | 'dark' {
 
 export function applyTheme(theme: Theme): void {
   const resolved = resolveTheme(theme);
-  const bg = resolved === 'light' ? '#ffffff' : '#0b2342';
+  const bg = resolved === 'light' ? '#ffffff' : '#07172e';
   // Theme-flash telemetry — index.html installs __themeLogEvt as a fetch shim
   // that POSTs to /api/v1/internal/client-log (engine.log breadcrumbs).
   type ThemeLogEvt = (label: string, info: unknown) => void;
@@ -393,28 +393,6 @@ export function setCodingAgentDefault(agent: CodingAgent): Promise<void> {
   return savePreference('coding_agent_default', agent, () => {
     selectedCodingAgent.value = agent;
   });
-}
-
-/** Whether the compose view's "Not sure? Start with the Lucidos Agent" hint
- *  has been retired. Treats not-yet-loaded (and failed) preferences as
- *  dismissed so a user who already retired it never sees a flash during the
- *  preferences fetch — an onboarding hint fails closed. */
-export function composeHandoffHintDismissed(): boolean {
-  if (preferences.value.status !== 'loaded') return true;
-  return preferences.value.data['compose_handoff_hint_dismissed'] === 'true';
-}
-
-/** One-way retire — called on the user's first send to a coding destination
- *  (`sendCompose`) and on explicit ✕ dismiss. Idempotent: skips the write
- *  only when the LOADED preference already says dismissed — while preferences
- *  are still loading the write goes through, so a fast first coding send
- *  can't slip past the retire. */
-export function dismissComposeHandoffHint(): Promise<void> {
-  if (preferences.value.status === 'loaded'
-    && preferences.value.data['compose_handoff_hint_dismissed'] === 'true') {
-    return Promise.resolve();
-  }
-  return savePreference('compose_handoff_hint_dismissed', 'true');
 }
 
 // --- New-workspace welcome + starter suggestions ---

@@ -776,6 +776,7 @@ function canQueueBehind(exchange: Exchange): boolean {
     case 'UserQuestionAsked':
     case 'CodingAgentPermissionRequest':
     case 'CommandPermissionRequested':
+    case 'McpPermissionRequested':
     case 'CredentialRequested':
     case 'McpConsentRequested':
     case 'ChildThreadCompleted':
@@ -919,6 +920,7 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
     userEventType === 'UserQuestionAsked'
     || userEventType === 'CodingAgentPermissionRequest'
     || userEventType === 'CommandPermissionRequested'
+    || userEventType === 'McpPermissionRequested'
   ) {
     isWaitingForAnswer = true;
   }
@@ -927,7 +929,13 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
     const event = exchange.steps[i].event;
     switch (event.type) {
       case 'ResponseGenerated': isComplete = true; wasCompleted = true; break;
-      case 'ResponseCanceled': isCanceled = true; isComplete = true; break;
+      case 'ResponseCanceled':
+        // A Codex mid-turn follow-up redirect is a cancel mechanically but the
+        // user steered, they didn't Stop — render it neutrally (terminal "Done",
+        // no red ✕), exactly like the chat/CC follow-up. Only a real Stop /
+        // user-action cancel sets isCanceled (→ "Canceled ✕").
+        if (event.cause === 'superseded_by_followup') { isComplete = true; break; }
+        isCanceled = true; isComplete = true; break;
       case 'ResponseAborted':
         if (supersededAborts.has(i)) break; // superseded by a later same-id terminal
         if (wasCompleted) completedBeforeAbort = true;
@@ -969,10 +977,12 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
       case 'UserQuestionAsked':
       case 'CodingAgentPermissionRequest':
       case 'CommandPermissionRequested':
+      case 'McpPermissionRequested':
         isWaitingForAnswer = true; break;
       case 'UserQuestionAnswered':
       case 'CodingAgentPermissionResolved':
       case 'CommandPermissionResolved':
+      case 'McpPermissionResolved':
         isWaitingForAnswer = false; break;
     }
   }

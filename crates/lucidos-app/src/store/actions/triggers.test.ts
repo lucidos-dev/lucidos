@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { triggers, historicalTriggers, selectedTriggerIds, panelOverlay } from '../store';
+import { triggers, historicalTriggers, selectedTriggerIds, panelOverlay, toasts } from '../store';
 import { makeTrigger } from '../__tests__/fixtures';
 
 const STORAGE_KEY = 'lucidos-selected-trigger-ids';
@@ -161,5 +161,44 @@ describe('navigateToTrigger pane reveal', () => {
     // nothing happened.
     await navigateToTrigger('t1');
     expect(mockRevealContentPane).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('navigateToTrigger stale-cache reconfirm', () => {
+  beforeEach(() => {
+    mockRevealContentPane.mockClear();
+    mockListTriggers.mockReset();
+    toasts.value = [];
+    historicalTriggers.value = { status: 'loaded', data: [] };
+    panelOverlay.value = null;
+  });
+
+  it('re-fetches the source of truth on a cache miss before navigating (sibling just created the trigger)', async () => {
+    // The cached list is loaded but momentarily stale — a sibling thread just
+    // created `t-new` and the Trigger* SSE refresh hasn't landed. navigateToTrigger
+    // must re-fetch (not conclude "no longer exists") and then navigate.
+    triggers.value = { status: 'loaded', data: [] };
+    mockListTriggers.mockResolvedValue({ triggers: [makeTrigger({ id: 't-new', name: 'Fresh' })] });
+
+    await navigateToTrigger('t-new');
+
+    expect(mockListTriggers).toHaveBeenCalledTimes(1);
+    expect(mockRevealContentPane).toHaveBeenCalledTimes(1);
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  it('toasts a named "no longer exists" error only after a re-fetch still misses', async () => {
+    triggers.value = { status: 'loaded', data: [] };
+    mockListTriggers.mockResolvedValue({ triggers: [] });
+
+    await navigateToTrigger('gone-id', 'thread "X"');
+
+    expect(mockListTriggers).toHaveBeenCalledTimes(1);
+    expect(mockRevealContentPane).not.toHaveBeenCalled();
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].type).toBe('error');
+    // Names the id AND where the navigate came from — never a bare generic.
+    expect(toasts.value[0].message).toContain('gone-id');
+    expect(toasts.value[0].message).toContain('thread "X"');
   });
 });

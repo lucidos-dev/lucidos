@@ -1,5 +1,42 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { ui } from './ui';
+import { ui, resolveThemePreference } from './ui';
+
+describe('resolveThemePreference', () => {
+  it('prefers a valid server value over everything else', () => {
+    expect(resolveThemePreference('light', 'dark', () => 'dark')).toBe('light');
+    expect(resolveThemePreference('system', 'light', () => 'light')).toBe('system');
+  });
+
+  it('falls back to localStorage when the server value is missing or invalid', () => {
+    expect(resolveThemePreference(undefined, 'light', () => null)).toBe('light');
+    expect(resolveThemePreference('', 'light', () => null)).toBe('light');
+    expect(resolveThemePreference('bogus', 'dark', () => null)).toBe('dark');
+  });
+
+  it('falls back to the data-theme attribute when server and localStorage miss', () => {
+    expect(resolveThemePreference(undefined, null, () => 'light')).toBe('light');
+    expect(resolveThemePreference(undefined, '', () => 'dark')).toBe('dark');
+  });
+
+  it('hard-defaults to dark only as a last resort', () => {
+    expect(resolveThemePreference(undefined, null, () => null)).toBe('dark');
+    expect(resolveThemePreference(undefined, null, () => 'bogus')).toBe('dark');
+  });
+
+  it('reads the attribute lazily — never when server or localStorage already answers', () => {
+    const getAttr = vi.fn(() => 'light');
+    resolveThemePreference('dark', null, getAttr);
+    resolveThemePreference(undefined, 'system', getAttr);
+    expect(getAttr).not.toHaveBeenCalled();
+  });
+
+  it('a missing server value never clobbers a present localStorage value (regression)', () => {
+    // The systemic dark-flash bug: the active device had no server-scoped
+    // theme, so `prefs['theme'] || 'dark'` returned 'dark' and overwrote the
+    // light value sdk-prefs.js had already applied from localStorage.
+    expect(resolveThemePreference(undefined, 'light', () => 'light')).toBe('light');
+  });
+});
 
 describe('lucidos.ui.startThread', () => {
   beforeEach(() => {

@@ -20,6 +20,26 @@ function scopeRelative(path) {
   return path.startsWith(SCOPE_PATH) ? '/' + path.slice(SCOPE_PATH.length) : path;
 }
 
+/** Best-effort breadcrumb to the engine's client-log (same channel the page
+ *  uses via postClientLog). Diagnostic only: it answers the otherwise-invisible
+ *  question "does the SW's push / notificationclick run on iOS?" — iOS handles a
+ *  declarative push in the parent process and may bypass the SW entirely, so the
+ *  ABSENCE of these lines on iOS (while they appear on Chrome) is itself the
+ *  signal. Returns the fetch promise so callers can keep the SW alive via
+ *  waitUntil. Never throws (telemetry must not break the handler). */
+function swLog(message, data) {
+  try {
+    return fetch(`${self.location.origin}${SCOPE_PATH}api/v1/internal/client-log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ category: 'sw', message, data: data || {} }),
+      keepalive: true,
+    }).catch(() => {});
+  } catch {
+    return Promise.resolve();
+  }
+}
+
 // Activate new SW immediately and take control of all pages.
 // This triggers Chrome's "site updated" toast when sw.js changes,
 // but only during development — in production SW updates are rare.
@@ -291,10 +311,13 @@ function resolveNavigate(relativeUrl) {
   if (typeof relativeUrl !== 'string' || relativeUrl.length === 0) {
     return self.location.origin + SCOPE_PATH;
   }
-  // The engine builds origin-rooted deep links (`/#thread=…`, `/?notification=…`)
-  // — it doesn't know its `/<slug>` prefix. Resolve them against the SW's
-  // scope so the tap lands in THIS workspace: drop the leading slash so the path
-  // is scope-relative, then resolve against `origin + SCOPE_PATH` (trailing slash).
+  // The engine builds SCOPE-RELATIVE deep links (`#thread=…`, `?notification=…`)
+  // — it doesn't know its `/<slug>` prefix, so it leaves the path off entirely
+  // and lets resolution against the subscription scope supply it. Resolve them
+  // against the SW's scope so the tap lands in THIS workspace: defensively drop
+  // any leading slash (legacy in-flight pushes still ship `/#…` / `/?…`, which
+  // would escape to the origin root), then resolve against `origin + SCOPE_PATH`
+  // (trailing slash).
   try {
     const scopeRelativeUrl = relativeUrl.replace(/^\//, '');
     return new URL(scopeRelativeUrl, self.location.origin + SCOPE_PATH).toString();
@@ -363,11 +386,24 @@ self.addEventListener('push', (event) => {
       };
 
   // Every push must leave a visible notification on screen when waitUntil
-  // resolves — that's the userVisibleOnly:true contract Chrome enforces on
-  // the subscription. Skipping showNotification counts as a "silent push"
-  // against Chrome's per-origin budget; once exhausted Chrome either injects
-  // its generic "site updated in background" notification or stops
-  // delivering pushes entirely.
+  // resolves — the userVisibleOnly:true contract. This applies to iOS too: an
+  // experiment that skipped showNotification on iOS+declarative (betting the OS
+  // would render the declarative notification as a fallback) showed NOTHING —
+  // iOS only uses the declarative fallback when the SW push handler ERRORS/times
+  // out, not when it cleanly resolves without displaying. So we ALWAYS display
+  // here, on every platform. (The iOS running+icon-launched deep-link bug — tap
+  // focuses without navigating — is an unfixed WebKit limitation upstream of
+  // this handler; see system-knowhow/notifications.md §4.5, seventeenth
+  // iteration. Showing the notification but maybe-not-navigating is strictly
+  // better than showing nothing.)
+  // Diagnostic breadcrumb (kept): records that the SW push handler ran — on iOS
+  // it does fire, contrary to the old "iOS bypasses the SW entirely" claim.
+  swLog('push', {
+    declarative: isDeclarative,
+    wake: isWake,
+    has_navigate: !!navigateRelative,
+    notification_id: (data && data.notification_id) || null,
+  });
   event.waitUntil(self.registration.showNotification(title, {
     body,
     icon: SCOPE_PATH + 'favicon.svg',
@@ -384,8 +420,7 @@ self.addEventListener('push', (event) => {
     // the HASH `data.navigate` instead. Combined with
     // `launch_handler: { client_mode: "navigate-existing" }` in manifest.json,
     // the existing PWA window is reused. For Safari this path doesn't run
-    // at all — the OS already handled the push declaratively. See
-    // system-knowhow notifications.md §4.5.
+    // at all — the OS already handled the push declaratively.
     navigate: navigateRelative
       ? resolveNavigate(navigateRelative)
       : self.location.origin + SCOPE_PATH,
@@ -448,7 +483,18 @@ self.addEventListener('notificationclick', (event) => {
       }).catch(() => {})
     : Promise.resolve();
 
-  event.waitUntil(Promise.all([markReadPromise, routeToDeepLink(targetUrl, data)]));
+  // Diagnostic: record that the SW notificationclick fired. The decisive iOS
+  // question — if this line appears for an iPhone UA, iOS DOES run the SW on tap
+  // and we can deliver the deep link via postMessage (the reliable Chrome path)
+  // instead of the flaky declarative navigate; if it never appears on iOS (while
+  // it does on Chrome), iOS is purely declarative and bypasses the SW.
+  const logPromise = swLog('notificationclick', {
+    notification_id: notificationId,
+    has_navigate: !!data.navigate,
+    target_url: targetUrl.slice(0, 200),
+  });
+
+  event.waitUntil(Promise.all([logPromise, markReadPromise, routeToDeepLink(targetUrl, data)]));
 });
 
 // True if a top-level Window client belongs to THIS service worker's scope.

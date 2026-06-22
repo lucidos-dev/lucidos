@@ -10,6 +10,8 @@ export function describeCancelCause(cause: CancelCause | undefined): string {
       return 'You clicked Cancel on the running response.';
     case 'user_action':
       return 'You applied, discarded, or archived a still-running Claude Code session — the action stopped the current turn first.';
+    case 'superseded_by_followup':
+      return 'You posted a follow-up while Codex was mid-turn — the engine interrupted that turn and ran your follow-up next, preserving partial work.';
     case 'unknown':
     case undefined:
       return 'You canceled the response (cause not recorded).';

@@ -81,6 +81,35 @@
     font-size: 0.75rem;
 }
 
+/* Leading channel glyph on the Show-section rows (Lucidos / Coding Agent /
+   Triggers) — mirrors the per-thread source marks (ThreadTypeIcon). Fixed 1rem
+   box so the labels align, matching the View rows' icon column. The Lucidos mark
+   self-sizes via its own inline style; the monochrome line glyphs (CodeIcon, the
+   triggers CategoryIcon) size from this rule and inherit the row color. */
+.thread-filter-channel-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+    flex-shrink: 0;
+}
+
+.thread-filter-channel-icon svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+}
+
+/* The Lucidos mark renders in full brand color (the gradient tile) everywhere
+   else, but in the filter's channel column it reads as a monochrome source glyph
+   alongside the line icons. `channelIcon` drops the tile (`background={false}`);
+   here we override the mark's baked white fill so the squares + spark inherit the
+   row's text color, matching the Coding Agent and Triggers glyphs beside it. */
+.thread-filter-channel-icon .lmk-tile,
+.thread-filter-channel-icon .lmk-spark {
+    fill: currentColor;
+}
+
 .thread-filter-option-deleted {
     color: var(--text-secondary);
 }
@@ -88,6 +117,124 @@
 .thread-filter-deleted {
     font-size: 0.75em;
     font-style: italic;
+}
+
+/* Divider between the unified Filter dropdown's View and Show sections. */
+.thread-filter-divider {
+    height: 1px;
+    background: var(--border-color);
+    margin: 0.375rem 0.25rem;
+}
+
+/* Show (channel) section — a `<fieldset>` so a non-`all` view natively disables
+   every nested checkbox. Reset the fieldset's default chrome; grey + block the
+   whole section (header dims in lockstep, see `.thread-filter-title-disabled`)
+   when a non-`all` view is active. */
+.thread-filter-show {
+    border: none;
+    margin: 0;
+    padding: 0;
+    min-inline-size: 0;
+}
+
+.thread-filter-show:disabled {
+    opacity: 0.45;
+    pointer-events: none;
+}
+
+.thread-filter-title-disabled {
+    opacity: 0.45;
+}
+
+/* Muted caption under the Show header when the channel filter is unavailable
+   (a non-`all` view bypasses it). Replaces the old disabled-button tooltip. */
+.thread-filter-section-note {
+    font-size: 0.6875rem;
+    font-style: italic;
+    color: var(--text-secondary);
+    padding: 0 0.375rem 0.375rem;
+}
+
+/* The unified Filter dropdown's View rows (single-select, one button per view)
+   render inside `.thread-filter-dropdown`, above the divider + Show section. */
+.drawer-view-option {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    padding: 0.375rem 0.5rem;
+    border: none;
+    background: none;
+    border-radius: 0.25rem;
+    font-size: 0.8125rem;
+    /* A <button> doesn't inherit the document font, so without this the View rows
+       render in the UA default font while the <label>-based Show rows below pick
+       up `--font-ui` — make the status rows respect the user's font setting too. */
+    font-family: var(--font-ui);
+    color: var(--text-primary);
+    cursor: pointer;
+    text-align: left;
+}
+
+.drawer-view-option:hover {
+    background: var(--bg-hover);
+}
+
+.drawer-view-option-active {
+    color: var(--accent);
+}
+
+/* The single-select "you are here" checkmark — rendered only on the active row
+   and sitting right after the label text so it hugs the name (reads as part of
+   the text) rather than riding the row's trailing edge or mirroring the Show
+   section's leading toggle checkboxes. No reserved box width: it's present only
+   when active, and the count is pinned right independently (margin-left below).
+   Sized like the row icons via `.drawer-view-option svg`. */
+.drawer-view-check {
+    display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
+}
+
+.drawer-view-option svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+    flex-shrink: 0;
+}
+
+/* Trailing per-view count, pinned to the row's edge with `margin-left:auto`
+   (the label no longer flex-grows — that lets the active checkmark hug the text —
+   so the count claims the row's free space instead). Every view's count sits in
+   an identical centered cell, flush at the row's trailing edge, so the numbers
+   line up in one even vertical column. The cell is as wide as the attention
+   badge's circle (`min-width` matches the base `.badge`), which is what keeps
+   the badge from poking out past the plain numbers — the blue circle paints
+   over the exact same footprint a plain number occupies. Only "Needs attention"
+   wears the blue `.badge` (so it stands out and reads as the same status accent
+   that rides the threads-header filter icon); the other views show a plain
+   muted number. */
+.drawer-view-count {
+    margin-left: auto;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 0.875rem;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+}
+
+/* The attention count's blue pill sits inline (not absolutely positioned like
+   the header `.badge`) and shares the centered cell above, so the circle is
+   centered on the same column as the plain numbers. `.badge.drawer-view-count`
+   outranks the base `.badge` and the plain `.drawer-view-count` regardless of
+   stylesheet order; the base `.badge` supplies the blue background, radius,
+   padding, and min-height. */
+.badge.drawer-view-count {
+    position: static;
+    color: white;
+    font-size: 0.5625rem;
 }
 
 .thread-drawer-list {
@@ -226,6 +373,7 @@
  * section in the drawer today — opacity is a strong-enough demotion cue
  * without needing per-section row treatments. */
 .thread-row.thread-row-lifted-parent .thread-row-title,
+.thread-row.thread-row-lifted-parent .thread-row-created,
 .thread-row.thread-row-lifted-parent .thread-row-context,
 .thread-row.thread-row-lifted-parent .message-channel-tag {
     opacity: 0.6;
@@ -377,6 +525,17 @@ html[data-theme="dark"] .collapse-count-badge {
     font-weight: 400;
     overflow-wrap: break-word;
     word-break: break-word;
+}
+
+.thread-row-created {
+    display: block;
+    margin-top: 0.125rem;
+    font-size: 0.625rem;
+    line-height: 1.2;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .draft-indicator {
@@ -698,20 +857,51 @@ html[data-theme="dark"] .collapse-count-badge {
     color: var(--text-primary);
     font-weight: 700;
     font-size: 0.8125rem;
+    /* Lay out the section icon + label on one centered row for EVERY drawer
+       header — the collapsible lifecycle headers (Pinned/Current/Archive) and
+       the flat alternate-view headers (Drafts/Needs attention), which share the
+       `DrawerSectionHeader` markup. The `gap` lives here (not on the
+       collapsible-only selector) so the icon-to-label spacing is single-sourced
+       and can't differ per section; the icon-less Results header is unaffected
+       (single child). */
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
 }
 
 .list-section-title-collapsible {
     cursor: pointer;
     -webkit-user-select: none;
     user-select: none;
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
+    /* Pin the header's line box to the collapse badge's own `line-height: 1rem`
+       (16px) so the label text and the badge share an identical cross-size.
+       Without this the badge (16px) is 1px taller than the bare 0.8125rem text
+       line box (15px): collapsing adds the badge, the flex row grows 1px, and
+       `align-items: center` re-centers the icon + label 0.5px downward. At
+       retina DPI that 0.5px crosses the device-pixel grid in some sections
+       (Pinned, Archive) but not others (Current) — the "section header jumps on
+       collapse/expand" report. Sharing the badge's line box makes the row a
+       constant height in both states, so the icon and label never move. */
+    line-height: 1rem;
 }
 
 .list-section-title-collapsible > .collapse-count-badge {
     position: relative;
     top: -0.0625rem;
+    /* Extra breathing room after the section name, on top of the flex `gap`
+       (0.25rem) — sets the name-to-count spacing apart from the icon-to-name
+       gap so the badge doesn't crowd the label. */
+    margin-left: 0.25rem;
+}
+
+/* Section header icon — sits left of the label, sharing the title's flex row.
+   Sized to the label cap-height and slightly dimmed so the text stays primary. */
+.drawer-section-icon {
+    display: inline-flex;
+    align-items: center;
+    color: var(--text-secondary);
+    flex: none;
+    margin-right: 0.25rem;
 }
 
 @media (hover: hover) {

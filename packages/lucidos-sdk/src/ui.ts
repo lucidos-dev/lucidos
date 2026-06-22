@@ -5,7 +5,7 @@ import { sse } from './sse';
 import { Select, enhanceSelects } from './select';
 
 const FONT_FAMILIES: Record<string, string> = {
-  monospace: "'SF Mono', 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
+  monospace: "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
   system: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
   inter: "'Inter', system-ui, sans-serif",
   'jetbrains-mono': "'JetBrains Mono', monospace",
@@ -34,6 +34,40 @@ export function isIOSAgent(
   if (!nav) return false;
   return /iPad|iPhone|iPod/.test(nav.userAgent) ||
     (nav.platform === 'MacIntel' && (nav.maxTouchPoints ?? 0) > 1);
+}
+
+type ThemePref = 'light' | 'dark' | 'system';
+const VALID_THEMES: readonly ThemePref[] = ['light', 'dark', 'system'];
+
+/**
+ * Resolve which theme preference applies, mirroring the host shell's
+ * `currentPreference()` (crates/lucidos-app/src/store/actions/preferences.ts)
+ * and the synchronous `sdk-prefs.js` FOUC script. Precedence:
+ *   1. the server-provided value, when present and valid;
+ *   2. else the `lucidos-theme` localStorage value `sdk-prefs.js` read;
+ *   3. else the `data-theme` attribute `sdk-prefs.js` already applied;
+ *   4. else the hard default `'dark'` (matching `sdk-prefs.js`).
+ *
+ * Load-bearing invariant: a MISSING server theme must NEVER clobber the value
+ * the synchronous client resolver already settled on. The previous
+ * `prefs['theme'] || 'dark'` violated this — a device with no server-scoped
+ * theme (e.g. an iPhone PWA that only stored `ui-scale`) flipped every app
+ * iframe to dark even when localStorage said light.
+ *
+ * `getAttr` is a thunk so the DOM is read only as a last resort — keeping the
+ * common path side-effect-free and the function unit-testable without a DOM.
+ * Returns a raw preference; the caller resolves `system` via matchMedia.
+ */
+export function resolveThemePreference(
+  server: string | undefined,
+  local: string | null,
+  getAttr: () => string | null,
+): ThemePref {
+  const valid = VALID_THEMES as readonly string[];
+  if (server && valid.includes(server)) return server as ThemePref;
+  if (local && valid.includes(local)) return local as ThemePref;
+  const attr = getAttr();
+  return attr === 'light' || attr === 'dark' ? attr : 'dark';
 }
 
 let confirmCounter = 0;
@@ -68,20 +102,29 @@ export const ui = {
   async applyPreferences(): Promise<void> {
     const prefs = await prefsModule.get();
 
-    // Theme — resolve "system" via matchMedia
-    let theme = prefs['theme'] || 'dark';
+    // Theme — prefer the value the synchronous sdk-prefs.js resolver already
+    // applied (server → localStorage → data-theme) over a hard default, so a
+    // missing server-scoped theme can't flip the iframe to dark. Then resolve
+    // "system" via matchMedia.
+    let theme: string = resolveThemePreference(
+      prefs['theme'],
+      localStorage.getItem('lucidos-theme'),
+      () => document.documentElement.getAttribute('data-theme'),
+    );
     if (theme === 'system') {
       theme = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
     }
-    const bg = theme === 'light' ? '#ffffff' : '#0b2342';
+    const bg = theme === 'light' ? '#ffffff' : '#07172e';
     document.documentElement.setAttribute('data-theme', theme);
     document.documentElement.style.setProperty('--bg-primary', bg);
     // Mirrors sdk-prefs.js — keeps <html> covered before/after the iframe's
     // stylesheet applies its bg rule (iOS WKWebView underlying white).
     document.documentElement.style.background = bg;
 
-    // Font — load Google Fonts on demand, map to CSS value
-    const fontKey = prefs['font-family'] || 'monospace';
+    // Font — load Google Fonts on demand, map to CSS value. Fall back to the
+    // `lucidos-font-family` localStorage value sdk-prefs.js read before the
+    // hard default, so a missing server value doesn't reset the client font.
+    const fontKey = prefs['font-family'] || localStorage.getItem('lucidos-font-family') || 'monospace';
     const googleUrl = GOOGLE_FONT_URLS[fontKey];
     if (googleUrl && !loadedFonts.has(fontKey)) {
       loadedFonts.add(fontKey);
@@ -94,7 +137,10 @@ export const ui = {
     document.documentElement.style.setProperty('--font-ui', fontValue);
 
     // Mirrors clampUiScale in preferences.ts — keep (75, 200, 12.5) in sync.
-    const rawScale = prefs['ui-scale'] || prefs['text-size'] || prefs['font-size'];
+    // Fall back to the `lucidos-ui-scale` localStorage value sdk-prefs.js read
+    // so a missing server value doesn't drop the client-applied scale.
+    const rawScale = prefs['ui-scale'] || prefs['text-size'] || prefs['font-size']
+      || localStorage.getItem('lucidos-ui-scale');
     if (rawScale) {
       const legacy: Record<string, number> = { small: 100, medium: 112.5, large: 125 };
       let n = legacy[rawScale];

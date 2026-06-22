@@ -28,6 +28,48 @@ describe('exchangeStatus — full branch coverage', () => {
     expect(exchangeStatus(exchange, '', false)).toBe('canceled');
   });
 
+  it('returns "canceled" for a user_stop / user_action ResponseCanceled (regression guard)', () => {
+    // A real Stop click (or Apply/Discard/Archive on a running session) keeps
+    // the "Canceled ✕" rendering — only superseded_by_followup goes neutral.
+    const stop = makeExchange(msg(), [
+      step(1, { type: 'CodingAgentToolCalled', name: 'Bash', args: {} }),
+      step(2, { type: 'ResponseCanceled', cause: 'user_stop' }),
+    ]);
+    expect(exchangeStatus(stop, '', true)).toBe('canceled');
+    const action = makeExchange(msg(), [
+      step(1, { type: 'CodingAgentToolCalled', name: 'Bash', args: {} }),
+      step(2, { type: 'ResponseCanceled', cause: 'user_action' }),
+    ]);
+    expect(exchangeStatus(action, '', true)).toBe('canceled');
+  });
+
+  it('renders a superseded_by_followup ResponseCanceled neutrally — "done", not "canceled"', () => {
+    // Codex mid-turn follow-up redirect: the interrupted turn emits
+    // ResponseCanceled(superseded_by_followup) + CodingAgentIdled, then the
+    // follow-up's MessageReceived opens the next exchange. The interrupted
+    // exchange must read like the chat/CC follow-up (neutral "Done"), never
+    // "Canceled ✕".
+    const exchange = makeExchange(msg(), [
+      step(1, { type: 'CodingAgentToolCalled', name: 'Bash', args: {} }),
+      step(2, { type: 'ResponseCanceled', cause: 'superseded_by_followup' }),
+      step(3, { type: 'CodingAgentIdled' }),
+    ]);
+    expect(exchangeStatus(exchange, '', true)).toBe('done');
+    expect(exchangeStatus(exchange, '', false)).toBe('done');
+  });
+
+  it('superseded_by_followup cancel is terminal "done" even before CodingAgentIdled lands', () => {
+    // Brief live window: the cancel arrives before the idle / the follow-up's
+    // MessageReceived. It must still be a neutral terminal (done), never a stuck
+    // spinner and never "canceled".
+    const exchange = makeExchange(msg(), [
+      step(1, { type: 'CodingAgentToolCalled', name: 'Bash', args: {} }),
+      step(2, { type: 'ResponseCanceled', cause: 'superseded_by_followup' }),
+    ]);
+    expect(exchangeStatus(exchange, '', true)).toBe('done');
+    expect(exchangeStatus(exchange, '', false)).toBe('done');
+  });
+
   // Regression: cancel during CC startup. The backend's interrupt fallback
   // used to emit a spurious `ResponseAborted` (no actor), which split the
   // exchange and rendered as "⚙ System — Response interrupted" with a

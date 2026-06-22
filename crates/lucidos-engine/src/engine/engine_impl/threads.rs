@@ -276,6 +276,41 @@ impl LucidosEngine {
         orphans
     }
 
+    /// Tear down a finished chat turn and recover any follow-up that raced the
+    /// teardown — closing the finalize-window race where a follow-up posted
+    /// while the turn is going idle gets acknowledged but is NEITHER injected
+    /// nor queued.
+    ///
+    /// **Ordering is the whole point.** This drops the [`ThreadGuard`] FIRST —
+    /// removing the handle from `active_threads` (which drops the only
+    /// `injection_tx`) and notifying completion waiters — and only THEN drains
+    /// `injection_rx`. Removal-before-drain is what makes the recovery total:
+    ///
+    /// - The fast-path follow-up send takes the `active_threads` lock, looks up
+    ///   the handle, and sends **while still holding that lock** (see
+    ///   `chat/process/run.rs`). The guard's `Drop` removes the handle under the
+    ///   SAME lock. So a racing send is serialized one of two ways:
+    ///   - it completes fully *before* removal → the message is buffered on
+    ///     `injection_rx` and this drain recovers it as an orphan (re-submitted
+    ///     by the caller as a fresh follow-up = the next turn from the queue);
+    ///   - it runs fully *after* removal → the lookup misses, the send is
+    ///     reported failed, and the caller falls through to the slow path
+    ///     (`register_thread_queued` starts a new turn). A failed inject is
+    ///     harmless precisely because the message was never handed off.
+    ///
+    /// Draining *before* removal (the old order) left a window: a send landing
+    /// after the drain but before the guard dropped was acknowledged into a
+    /// channel nobody would ever read, then silently dropped on return.
+    pub(crate) fn finalize_turn_and_drain_injections(
+        guard: ThreadGuard,
+        injection_rx: &mut mpsc::UnboundedReceiver<InjectedPrompt>,
+    ) -> Vec<InjectedPrompt> {
+        // Remove from active_threads (drops injection_tx) + notify waiters,
+        // closing the inject gate, THEN sweep anything already buffered.
+        drop(guard);
+        Self::drain_orphaned_injections(injection_rx)
+    }
+
     /// Spawn background title generation for a thread (used when pinning).
     /// Looks up the first message of the thread and generates a title via Flash.
     pub async fn spawn_title_generation(&self, thread_id: &str) {

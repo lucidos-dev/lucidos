@@ -11,6 +11,14 @@ import type { MarketplacePlugin } from '../types';
 import { pushNavState } from './navigation';
 import { revealContentPane } from './pane';
 
+/** The official Lucidos plugin marketplace. Suggested as a one-click add in the
+ *  App Store and Settings → Marketplaces empty states so a fresh workspace has a
+ *  marketplace to install plugins from without hunting for a URL. */
+export const OFFICIAL_MARKETPLACE = {
+  source: 'https://github.com/lucidos-dev/plugins',
+  name: 'Lucidos plugins',
+} as const;
+
 // Share an in-flight scan so concurrent callers await the SAME fetch. Without
 // this, opening Apps on the Store tab fires two catalog scans at once — the
 // AppsView prime-load (for installed-app marketplace labels) and the StoreTab
@@ -50,6 +58,14 @@ export async function addPluginMarketplaceAction(source: string, name?: string):
     showToast(`Failed to register marketplace: ${errorDetail(e)}`, 'error');
     return false;
   }
+}
+
+/** One-click register the official Lucidos marketplace (the empty-state
+ *  suggestion). Reuses addPluginMarketplaceAction so it gets the same toast +
+ *  catalog refresh; the backend is idempotent on the URL, so a double-click
+ *  re-registers the same entry harmlessly. */
+export function addOfficialMarketplaceAction(): Promise<boolean> {
+  return addPluginMarketplaceAction(OFFICIAL_MARKETPLACE.source, OFFICIAL_MARKETPLACE.name);
 }
 
 export async function removePluginMarketplaceAction(id: string): Promise<void> {

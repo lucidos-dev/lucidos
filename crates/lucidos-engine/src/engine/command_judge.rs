@@ -11,8 +11,9 @@
 //!
 //! Infra failures (no provider, a failed/empty call) surface as `Err` so the
 //! caller can fall back to the static "dangerous" list
-//! ([`fallback_lane`](crate::engine::command_guard::fallback_lane)) rather than
-//! punish the user for an LLM hiccup. A *parseable-but-unclear* response is NOT
+//! ([`fallback_classify`](crate::engine::command_guard::fallback_classify))
+//! rather than punish the user for an LLM hiccup. A *parseable-but-unclear*
+//! response is NOT
 //! an error — it resolves to `IrreversibleDanger` (ask), per the design's
 //! tie-break.
 

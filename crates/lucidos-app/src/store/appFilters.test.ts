@@ -4,6 +4,7 @@ import {
   threadMap,
   selectedAppIds,
   filterFacets,
+  includeDeletedFilterOptions,
 } from './store';
 import { appFilterOptions } from './appFilters';
 import type { ThreadState } from './thread-events';
@@ -20,6 +21,9 @@ describe('appFilterOptions — only apps with CC sessions', () => {
     threadMap.value = new Map();
     selectedAppIds.value = new Set();
     filterFacets.value = { status: 'not-loaded' };
+    // These cases assert deleted-entry labeling/sorting, which is independent
+    // of the include-deleted toggle — opt in so deleted rows are listed.
+    includeDeletedFilterOptions.value = true;
   });
 
   it('returns [] until appsList loads', () => {
@@ -100,5 +104,33 @@ describe('appFilterOptions — only apps with CC sessions', () => {
     const opt = appFilterOptions.value;
     expect(opt).toHaveLength(1);
     expect(opt[0]).toMatchObject({ id: 'gone', label: 'gone', deleted: true });
+  });
+});
+
+describe('appFilterOptions — include-deleted toggle', () => {
+  beforeEach(() => {
+    appsList.value = { status: 'loaded', data: [{ id: 'momentum', name: 'Momentum', description: '' }] };
+    threadMap.value = new Map([
+      ['t1', appThread('/ws/data/apps/momentum')],
+      ['t2', appThread('/ws/data/apps/gone')],
+    ]);
+    selectedAppIds.value = new Set();
+    filterFacets.value = { status: 'not-loaded' };
+  });
+
+  it('excludes deleted apps when the toggle is off (default)', () => {
+    includeDeletedFilterOptions.value = false;
+    expect(appFilterOptions.value.map(o => o.id)).toEqual(['momentum']);
+  });
+
+  it('includes deleted apps when the toggle is on', () => {
+    includeDeletedFilterOptions.value = true;
+    expect(appFilterOptions.value.map(o => o.id)).toEqual(['momentum', 'gone']);
+  });
+
+  it('keeps a selected deleted app visible even when the toggle is off (stays clearable)', () => {
+    includeDeletedFilterOptions.value = false;
+    selectedAppIds.value = new Set(['gone']);
+    expect(appFilterOptions.value.map(o => o.id)).toEqual(['momentum', 'gone']);
   });
 });

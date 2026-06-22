@@ -1,6 +1,7 @@
 use super::super::process_helpers::{
     build_system_knowhow_section, build_trigger_knowhow_section, build_trigger_started_event,
-    classify_or_fallback, summarize_or_fallback, TriggerContext, ENGINE_RESTART_RULE,
+    classify_or_fallback, summarize_or_fallback, TriggerContext, APPLY_VERIFY_RULE,
+    ENGINE_RESTART_RULE,
 };
 use super::{build_capture_sections, build_loaded_knowhow_block};
 use crate::core::knowhow::KnowhowSummary;
@@ -19,6 +20,7 @@ use std::future::pending;
 fn run_build(
     system_prompt: &str,
     profile_context: &str,
+    device_preferences_context: &str,
     file_list_context: &str,
     credentials_context: &str,
     email_accounts_context: &str,
@@ -38,6 +40,7 @@ fn run_build(
     build_capture_sections(
         system_prompt,
         profile_context,
+        device_preferences_context,
         file_list_context,
         credentials_context,
         email_accounts_context,
@@ -309,6 +312,80 @@ fn engine_restart_rule_still_blocks_post_restart_promises() {
     );
 }
 
+/// The apply/verify rule must keep the chat agent from bouncing yes/no
+/// "did you apply it? / did you restart?" confirmations at the user — the
+/// font-fix-session failure pattern. It must (1) name both self-service tools,
+/// (2) ban the two confirmation questions, (3) tell the agent to probe the
+/// served asset instead of asking, (4) carry the workspace-prefixed-route
+/// gateway gotcha, and (5) ban the "does it look right now?" closer.
+#[test]
+fn apply_verify_rule_tells_agent_to_act_and_verify_not_ask() {
+    let lowered = APPLY_VERIFY_RULE.to_lowercase();
+    assert!(
+        APPLY_VERIFY_RULE.contains("list_changes") && APPLY_VERIFY_RULE.contains("apply_change"),
+        "rule must name both self-service change tools:\n{APPLY_VERIFY_RULE}"
+    );
+    assert!(
+        lowered.contains("have you applied it") && lowered.contains("did you restart"),
+        "rule must explicitly ban the two confirmation questions:\n{APPLY_VERIFY_RULE}"
+    );
+    assert!(
+        lowered.contains("cannot restart the engine"),
+        "rule must state the agent cannot restart the engine (only the user can):\n{APPLY_VERIFY_RULE}"
+    );
+    assert!(
+        lowered.contains("probing the served asset")
+            || lowered.contains("probe the served asset")
+            || lowered.contains("probe served assets"),
+        "rule must tell the agent to verify by probing the served asset:\n{APPLY_VERIFY_RULE}"
+    );
+    assert!(
+        APPLY_VERIFY_RULE.contains("/<workspace>/api/v1/")
+            && lowered.contains("unknown workspace 'api'"),
+        "rule must record the workspace-prefixed-route gateway gotcha:\n{APPLY_VERIFY_RULE}"
+    );
+    assert!(
+        lowered.contains("does it look right now") || lowered.contains("does it match"),
+        "rule must ban the post-apply confirmation-question closer:\n{APPLY_VERIFY_RULE}"
+    );
+}
+
+/// The fix is a NARROW carve-out, not a ban on `ask_user_question` (the user
+/// explicitly flagged this during the work). The rule must reference the tool
+/// to scope the carve-out and must NOT blanket-ban it, so the LLM doesn't
+/// over-correct into never asking genuine next-step choices.
+#[test]
+fn apply_verify_rule_does_not_disable_ask_user_question() {
+    assert!(
+        APPLY_VERIFY_RULE.contains("ask_user_question"),
+        "rule must reference ask_user_question to scope the carve-out:\n{APPLY_VERIFY_RULE}"
+    );
+    let lowered = APPLY_VERIFY_RULE.to_lowercase();
+    for forbidden in [
+        "never use ask_user_question",
+        "do not use ask_user_question",
+        "stop using ask_user_question",
+    ] {
+        assert!(
+            !lowered.contains(forbidden),
+            "rule must not blanket-ban the question tool (`{forbidden}`):\n{APPLY_VERIFY_RULE}"
+        );
+    }
+}
+
+/// The rule must reinforce that the user works on Lucidos constantly and knows
+/// the apply/restart/reload dance — so the agent doesn't re-explain it (the
+/// other half of "don't interrogate the user").
+#[test]
+fn apply_verify_rule_reinforces_user_knows_the_dance() {
+    let lowered = APPLY_VERIFY_RULE.to_lowercase();
+    assert!(
+        lowered.contains("knows the apply/restart/reload dance")
+            && lowered.contains("do not re-explain it"),
+        "rule must reinforce that the user knows the dance and must not be re-taught it:\n{APPLY_VERIFY_RULE}"
+    );
+}
+
 /// Phase 3.1: every turn after the first must inject a `[LOADED KNOWHOW]`
 /// block listing the docs `load_knowhow` brought in earlier in the thread.
 /// The block lives in the user message so the LLM sees it on every turn —
@@ -377,6 +454,7 @@ fn build_capture_sections_tags_existing_sections_with_role_and_group() {
     let sections = run_build(
         "sys",
         "profile",
+        "device-prefs",
         "files",
         "creds",
         "emails",
@@ -407,6 +485,10 @@ fn build_capture_sections_tags_existing_sections_with_role_and_group() {
     assert_eq!(by_name("User Profile").role, ContextRole::User);
     assert_eq!(
         by_name("User Profile").group,
+        Some("Identity & profile".to_string())
+    );
+    assert_eq!(
+        by_name("Device & Preferences").group,
         Some("Identity & profile".to_string())
     );
 
@@ -470,7 +552,7 @@ fn build_capture_sections_tags_existing_sections_with_role_and_group() {
 #[test]
 fn build_capture_sections_filters_empty_sections() {
     let sections = run_build(
-        "sys", "", "", "", "", "", "", "", "", "", "", "", "", "", "user msg", &[], &[],
+        "sys", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "user msg", &[], &[],
     );
     let names: Vec<_> = sections.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, vec!["System Instructions", "User Message"]);
@@ -492,7 +574,7 @@ fn build_capture_sections_emits_one_row_per_loaded_knowhow_doc() {
         },
     ];
     let sections = run_build(
-        "", "", "", "", "", "", "", "", "", "", "", "", "", "", "user msg", &docs, &[],
+        "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "user msg", &docs, &[],
     );
 
     let knowhow: Vec<_> = sections
@@ -552,7 +634,7 @@ fn build_capture_sections_emits_one_row_per_resume_tool_pair() {
         },
     ];
     let sections = run_build(
-        "", "", "", "", "", "", "", "", "", "", "", "", "", "", "user msg", &[], &resume,
+        "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "user msg", &[], &resume,
     );
 
     let prior: Vec<_> = sections
@@ -570,6 +652,38 @@ fn build_capture_sections_emits_one_row_per_resume_tool_pair() {
     assert!(prior.iter().all(|s| s.char_count > 0));
 }
 
+#[test]
+fn build_capture_sections_includes_device_preferences_context() {
+    let sections = run_build(
+        "",
+        "",
+        "[USER DEVICE & PREFERENCES]\n- theme: light\n[END USER DEVICE & PREFERENCES]",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "user msg",
+        &[],
+        &[],
+    );
+
+    let section = sections
+        .iter()
+        .find(|s| s.name == "Device & Preferences")
+        .expect("device/preferences section must be captured");
+    assert_eq!(section.group.as_deref(), Some("Identity & profile"));
+    assert_eq!(section.role, ContextRole::User);
+    assert!(section.char_count > 0);
+}
+
 /// Capturing a body honors the `capture_body` flag: rows get full bodies
 /// (truncated at SECTION_PERSIST_MAX) when on, `None` when off. The
 /// truncation cap itself is exercised by the existing types::tests; this
@@ -581,10 +695,10 @@ fn build_capture_sections_honors_capture_body_flag() {
         body: "BODY".into(),
     }];
     let on = build_capture_sections(
-        "sys", "", "", "", "", "", "", "", "", "", "", "", "", "", "user", &docs, &[], true,
+        "sys", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "user", &docs, &[], true,
     );
     let off = build_capture_sections(
-        "sys", "", "", "", "", "", "", "", "", "", "", "", "", "", "user", &docs, &[], false,
+        "sys", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "user", &docs, &[], false,
     );
     let sys_on = on.iter().find(|s| s.name == "System Instructions").unwrap();
     let sys_off = off.iter().find(|s| s.name == "System Instructions").unwrap();
@@ -668,7 +782,66 @@ fn chat_prompt_nudges_use_of_ask_user_question() {
 // --- FreeText answer eligibility (child-completion vs. human follow-up) ---
 
 use super::run::message_can_answer_pending_question;
+use super::run::resolve_route_overrides;
+use crate::core::{PreferenceStore, PREF_CHAT_MODEL, PREF_CHAT_REASONING_EFFORT};
 use crate::engine::thread_events::ActorMode;
+use crate::test_support::{setup_test_db, teardown_test_db};
+
+/// Coding-agent requests use the same HTTP `reasoning_effort` field for an
+/// explicit agent pick, but an omitted field means "fall through to agent
+/// settings/defaults". It must not be filled from the Lucidos chat preference:
+/// Codex and Claude Code have their own model/effort configuration surfaces.
+#[tokio::test]
+async fn coding_agent_route_does_not_inherit_chat_model_or_effort_defaults() {
+    let (pool, db_name) = setup_test_db().await;
+    PreferenceStore::set(&pool, PREF_CHAT_MODEL, "gemini-3.5-flash")
+        .await
+        .unwrap();
+    PreferenceStore::set(&pool, PREF_CHAT_REASONING_EFFORT, "max")
+        .await
+        .unwrap();
+
+    let (model, effort) =
+        resolve_route_overrides(&pool, Some(true), Some("claude-opus-4-8[1m]"), None).await;
+
+    assert_eq!(model, None);
+    assert_eq!(effort, None);
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn coding_agent_route_preserves_explicit_agent_effort_pick() {
+    let (pool, db_name) = setup_test_db().await;
+    PreferenceStore::set(&pool, PREF_CHAT_REASONING_EFFORT, "high")
+        .await
+        .unwrap();
+
+    let (model, effort) = resolve_route_overrides(&pool, Some(true), None, Some("xhigh")).await;
+
+    assert_eq!(model, None);
+    assert_eq!(effort.as_deref(), Some("xhigh"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn chat_route_still_inherits_chat_model_and_effort_defaults() {
+    let (pool, db_name) = setup_test_db().await;
+    PreferenceStore::set(&pool, PREF_CHAT_MODEL, "claude-opus-4-8[1m]")
+        .await
+        .unwrap();
+    PreferenceStore::set(&pool, PREF_CHAT_REASONING_EFFORT, "high")
+        .await
+        .unwrap();
+
+    let (model, effort) = resolve_route_overrides(&pool, None, None, None).await;
+
+    assert_eq!(model.as_deref(), Some("claude-opus-4-8[1m]"));
+    assert_eq!(effort.as_deref(), Some("high"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
 
 /// A genuine human follow-up typed on a thread with an open question is the
 /// one and only case that may be consumed as a FreeText answer.

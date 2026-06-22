@@ -1,12 +1,15 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { engineRestarting, toasts, showToast } from '../store';
 
-// While the engine is restarting, the screen is covered by the UiBlockingOverlay and
-// every in-flight request fails as the engine goes down. showToast suppresses the
-// resulting toasts so only the "Restarting engine..." status (which opts in via
-// showDuringRestart) is visible — see the central guard in store.ts. These pin
-// the screenshot regression: the SW "New version available" refresh prompt and
-// the "Failed to fetch changes" error must NOT show during a restart.
+// While the engine is restarting, in-flight read requests fail as the engine
+// goes down (a GET already past the awaitEngineReady gate, SSE, health poll).
+// showToast suppresses the resulting noise so only the "Restarting engine..."
+// status (which opts in via showDuringRestart) is visible — see the central guard
+// in store.ts. These pin the screenshot regression: the SW "New version
+// available" refresh prompt and the "Failed to fetch changes" error must NOT show
+// during a restart. (The UI is no longer deactivated during a restart, but this
+// read-noise suppression is unchanged — user-initiated write failures surface
+// elsewhere, e.g. a send's inline ResponseFailed, not via this path.)
 
 beforeEach(() => {
   engineRestarting.value = false;

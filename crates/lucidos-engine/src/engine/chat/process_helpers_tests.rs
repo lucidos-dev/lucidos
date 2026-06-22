@@ -42,6 +42,7 @@ fn make_test_session(process_exited: bool) -> AgentSession {
         requires_restart: false,
         pending_stop: None,
         cancel_actor: None,
+        redirect_followup: false,
         stop: Arc::new(Notify::new()),
         interrupt: Arc::new(Notify::new()),
         idle_notify: Arc::new(Notify::new()),
@@ -316,6 +317,11 @@ async fn arm_redirect_fires_for_codex_mid_turn_user_followup() {
         idle.is_some(),
         "a Codex mid-turn user follow-up must arm the redirect and return idle_notify"
     );
+    assert!(
+        sessions.get(&thread_id).unwrap().redirect_followup,
+        "arming the redirect must flag the session so the interrupt arm classifies \
+         the interrupted turn as SupersededByFollowup (neutral), not UserStop"
+    );
     assert_eq!(
         pending.load(std::sync::atomic::Ordering::Acquire),
         2,
@@ -368,6 +374,10 @@ async fn arm_redirect_skips_claude_code_mid_turn() {
     let idle = arm_codex_redirect(&mut sessions, thread_id, true, &None);
 
     assert!(idle.is_none(), "CC must never be interrupted on a follow-up");
+    assert!(
+        !sessions.get(&thread_id).unwrap().redirect_followup,
+        "CC must not be flagged for redirect — it steers via stdin, never cancels"
+    );
     assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
     assert!(
         tokio::time::timeout(Duration::from_millis(50), interrupt.notified())

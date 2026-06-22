@@ -2,13 +2,12 @@
 //! plus the Google-Search grounding helper. The `VertexProvider` struct and
 //! shared auth/config live in the parent `vertex` module.
 
-
+use super::VertexProvider;
 use crate::llm::provider::{
     ContentBlock, LlmResponse, Message, MessageContent, TokenCallback, ToolCall, ToolDefinition,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use super::VertexProvider;
 
 impl VertexProvider {
     /// Search the web using Gemini's Google Search grounding.
@@ -180,10 +179,11 @@ impl VertexProvider {
 
         let response = build_gemini_llm_response(parsed);
 
-        // Gemini uses non-streaming requests, so emit the full text at once.
-        // This includes the assistant prose on a tool-call turn — the agentic
-        // loop streams it as the "explain along the way" preamble, exactly as
-        // for streamed providers.
+        // Gemini uses non-streaming requests, so emit the full final text at
+        // once. `build_gemini_llm_response` suppresses text attached to
+        // function-call turns because Gemini Flash has returned internal
+        // reasoning in ordinary text parts there; only text-only final answers
+        // reach this callback.
         if let (Some(cb), Some(text)) = (&on_token, &response.content) {
             cb(text);
         }
@@ -199,9 +199,10 @@ impl VertexProvider {
 /// "model returned nothing" indistinguishable from a safety block or a
 /// `MAX_TOKENS` cutoff. We now preserve both verbatim.
 fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
-    let mut content: Option<String> = None;
+    let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls = Vec::new();
     let mut stop_reason: Option<String> = None;
+    let mut thinking_chars: usize = 0;
 
     if let Some(candidates) = parsed.candidates {
         if let Some(candidate) = candidates.into_iter().next() {
@@ -209,10 +210,13 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
             for part in candidate.content.parts {
                 // Skip thinking parts — internal reasoning, not shown to user
                 if part.thought {
+                    if let Some(text) = part.text {
+                        thinking_chars = thinking_chars.saturating_add(text.len());
+                    }
                     continue;
                 }
                 if let Some(text) = part.text {
-                    content = Some(text);
+                    text_parts.push(text);
                 }
                 if let Some(fc) = part.function_call {
                     tool_calls.push(ToolCall {
@@ -225,6 +229,15 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
             }
         }
     }
+    if !tool_calls.is_empty() && !text_parts.is_empty() {
+        thinking_chars =
+            thinking_chars.saturating_add(text_parts.iter().map(|s| s.len()).sum::<usize>());
+    }
+    let content = if tool_calls.is_empty() && !text_parts.is_empty() {
+        Some(text_parts.join("\n"))
+    } else {
+        None
+    };
 
     let (input_tokens, output_tokens) = parsed
         .usage_metadata
@@ -250,7 +263,7 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
         // until the cost UI explicitly grows a Gemini-cached lane.
         cache_creation_tokens: None,
         cache_read_tokens: None,
-        thinking_chars: None,
+        thinking_chars: (thinking_chars > 0).then_some(thinking_chars),
         unknown_sse_dropped: 0,
     }
 }
@@ -619,7 +632,10 @@ mod tests {
             .expect("user ToolResult should map to a functionResponse part");
         assert_eq!(fr.name, "load_knowhow");
         assert_eq!(fr.response["content"], "knowhow body");
-        assert_eq!(contents[2].parts[1].text.as_deref(), Some("Results above..."));
+        assert_eq!(
+            contents[2].parts[1].text.as_deref(),
+            Some("Results above...")
+        );
     }
 
     #[test]
@@ -720,6 +736,75 @@ mod tests {
             Some("Ax9z-encrypted-sig"),
             "Gemini 3's signature on the functionCall part must be captured"
         );
+    }
+
+    #[test]
+    fn build_gemini_llm_response_suppresses_text_on_tool_call_turn() {
+        let thinking =
+            "Never start with \"Okay\". Now address the user's query. Let's call web_search.";
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        { "text": thinking },
+                        {
+                            "functionCall": {
+                                "name": "web_search",
+                                "args": { "query": "Gemini free tier" }
+                            },
+                            "thoughtSignature": "sig-tool"
+                        }
+                    ]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 40,
+                "totalTokenCount": 140
+            }
+        });
+        let parsed: VertexResponse = serde_json::from_value(body).unwrap();
+        let resp = build_gemini_llm_response(parsed);
+
+        assert!(
+            resp.content.is_none(),
+            "Gemini text that accompanies a function call is internal preamble, not printable output"
+        );
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].name, "web_search");
+        assert_eq!(
+            resp.tool_calls[0].thought_signature.as_deref(),
+            Some("sig-tool")
+        );
+        assert_eq!(resp.thinking_chars, Some(thinking.len()));
+    }
+
+    #[test]
+    fn build_gemini_llm_response_counts_explicit_thought_parts() {
+        let thought = "I should check the latest data.";
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        { "text": thought, "thought": true },
+                        { "text": "Final answer." }
+                    ]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 20,
+                "candidatesTokenCount": 8,
+                "totalTokenCount": 28
+            }
+        });
+        let parsed: VertexResponse = serde_json::from_value(body).unwrap();
+        let resp = build_gemini_llm_response(parsed);
+
+        assert_eq!(resp.content.as_deref(), Some("Final answer."));
+        assert!(resp.tool_calls.is_empty());
+        assert_eq!(resp.thinking_chars, Some(thought.len()));
     }
 
     /// Gemini's empty-completion case is the regression target — a

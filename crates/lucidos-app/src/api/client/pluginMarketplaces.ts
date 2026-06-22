@@ -6,10 +6,6 @@ import type {
   PluginUninstallRequest,
 } from '../../store/types';
 
-export interface MarketplacesResponse {
-  marketplaces: PluginMarketplace[];
-}
-
 export interface AddMarketplaceResponse {
   marketplace: PluginMarketplace;
   marketplaces: PluginMarketplace[];
@@ -21,10 +17,6 @@ export interface RemoveMarketplaceResponse {
   marketplaces: PluginMarketplace[];
   removed: boolean;
   commit: string;
-}
-
-export function listPluginMarketplaces(): Promise<MarketplacesResponse> {
-  return json(`${API}/plugins/marketplaces`);
 }
 
 export function addPluginMarketplace(

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { updateAvailable, toasts, threadMap, TOAST_AUTO_DISMISS_MS } from '../store';
-import { hasClientUpdateSincePageLoad, appliedToastRefreshAction } from '../actions/chat-changes';
+import { hasClientUpdateSincePageLoad } from '../actions/chat-changes';
 import { handleThreadEvent } from '../actions/thread-sync';
 import type { Change } from '../../api/client';
 
@@ -122,27 +122,7 @@ describe('hasClientUpdateSincePageLoad', () => {
   });
 });
 
-describe('appliedToastRefreshAction', () => {
-  it('returns a Refresh action for a pure-frontend apply', () => {
-    const action = appliedToastRefreshAction(false, true);
-    expect(action).toBeTruthy();
-    expect(action!.label).toBe('Refresh');
-  });
-
-  it('returns undefined when no client update', () => {
-    expect(appliedToastRefreshAction(false, false)).toBeUndefined();
-  });
-
-  it('returns undefined when restart is required (restart flow handles reload)', () => {
-    expect(appliedToastRefreshAction(true, true)).toBeUndefined();
-  });
-
-  it('returns undefined when neither flag is set', () => {
-    expect(appliedToastRefreshAction(false, false)).toBeUndefined();
-  });
-});
-
-describe('Applied toast auto-dismiss timer', () => {
+describe('Applied toast has no premature Refresh button', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     toasts.value = [];
@@ -152,7 +132,26 @@ describe('Applied toast auto-dismiss timer', () => {
     vi.useRealTimers();
   });
 
-  it('auto-dismisses the Applied toast after TOAST_AUTO_DISMISS_MS even with a Refresh action', () => {
+  it('carries NO Refresh action even when client_update=true', () => {
+    // At ChangeApplied time the rebuilt frontend isn't ready (the build-watch
+    // rebuilds over the next few seconds), so a Refresh now would reload the OLD
+    // build. The genuine affordance is the SW-driven "New version available →
+    // Refresh" toast, which fires only once the rebuild is actually activated.
+    const threadId = 't-no-refresh';
+    const applyKey = `applying-${threadId}`;
+
+    handleThreadEvent({
+      thread_id: threadId,
+      seq: 1,
+      event: { type: 'ChangeApplied', change_id: 'c-1', requires_restart: false, client_update: true },
+      created: '2026-01-01T00:00:00Z',
+    });
+    const toast = toasts.value.find(t => t.key === applyKey);
+    expect(toast).toBeTruthy();
+    expect(toast?.action).toBeUndefined();
+  });
+
+  it('auto-dismisses the Applied toast after TOAST_AUTO_DISMISS_MS', () => {
     const threadId = 't-refresh-timer';
     const applyKey = `applying-${threadId}`;
 
@@ -162,41 +161,9 @@ describe('Applied toast auto-dismiss timer', () => {
       event: { type: 'ChangeApplied', change_id: 'c-1', requires_restart: false, client_update: true },
       created: '2026-01-01T00:00:00Z',
     });
-    expect(toasts.value.find(t => t.key === applyKey)?.action?.label).toBe('Refresh');
+    expect(toasts.value.find(t => t.key === applyKey)).toBeTruthy();
 
     vi.advanceTimersByTime(TOAST_AUTO_DISMISS_MS);
-    expect(toasts.value.find(t => t.key === applyKey)).toBeUndefined();
-  });
-
-  it('restarts the dismiss window when a second ChangeApplied upgrades the toast', () => {
-    const threadId = 't-restart-timer';
-    const applyKey = `applying-${threadId}`;
-    const beforeUpgrade = TOAST_AUTO_DISMISS_MS - 2000;
-    const afterUpgrade = TOAST_AUTO_DISMISS_MS - 2000;
-
-    handleThreadEvent({
-      thread_id: threadId,
-      seq: 1,
-      event: { type: 'ChangeApplied', change_id: 'c-1', requires_restart: false, client_update: false },
-      created: '2026-01-01T00:00:00Z',
-    });
-    expect(toasts.value.find(t => t.key === applyKey)?.action).toBeUndefined();
-
-    vi.advanceTimersByTime(beforeUpgrade);
-    handleThreadEvent({
-      thread_id: threadId,
-      seq: 2,
-      event: { type: 'ChangeApplied', change_id: 'c-2', requires_restart: false, client_update: true },
-      created: '2026-01-01T00:00:03Z',
-    });
-    expect(toasts.value.find(t => t.key === applyKey)?.action?.label).toBe('Refresh');
-
-    // Upgrade should have restarted the dismiss window — toast must survive
-    // a full TOAST_AUTO_DISMISS_MS past the upgrade.
-    vi.advanceTimersByTime(afterUpgrade);
-    expect(toasts.value.find(t => t.key === applyKey)?.action?.label).toBe('Refresh');
-
-    vi.advanceTimersByTime(2001);
     expect(toasts.value.find(t => t.key === applyKey)).toBeUndefined();
   });
 });

@@ -91,6 +91,7 @@ const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
   'UserQuestionAsked',
   'CodingAgentPermissionRequest',
   'CommandPermissionRequested',
+  'McpPermissionRequested',
   'CredentialRequested',
   'McpConsentRequested',
   'ChildThreadCompleted',
@@ -110,6 +111,7 @@ const DIVIDER_USER_EVENT_TYPES: ReadonlySet<string> = new Set([
   'UserQuestionAsked',
   'CodingAgentPermissionRequest',
   'CommandPermissionRequested',
+  'McpPermissionRequested',
   'CredentialRequested',
   'McpConsentRequested',
 ]);
@@ -401,6 +403,18 @@ interface GroupFoldState {
    *  (abort-before-terminal direction) — the incremental path detects it and
    *  falls back to a full rebuild. */
   abortReqIds: Set<string>;
+  /** request_event_id of the most recent request-id-routed chat event — i.e.
+   *  the active chat turn's req_id. The divider redirect bootstrap reads it to
+   *  redirect the turn's post-answer continuation to the divider, instead of
+   *  trusting `previousCurrent` (which can be an UNINGESTED queued
+   *  MessageReceived that intervened between the turn and the question — real
+   *  thread 194474de). Invariant it relies on: a chat `ask_user_question` /
+   *  permission prompt is always preceded in the same turn by its
+   *  request-id-routed tool call, so at divider-creation time this holds the
+   *  turn's real req_id. Undefined until the first routed chat event (e.g. a
+   *  pure CC thread never sets it, so the chat-divider redirect is a no-op
+   *  there — CC events aren't request-id routed). */
+  lastChatTurnReqId?: string;
 }
 
 function newFoldState(): GroupFoldState {
@@ -626,6 +640,11 @@ function foldEvent(
     if (NON_EXCHANGE_METADATA_EVENTS.has(event.type)) return;
 
     const reqId = shouldRouteByRequestId(event) ? requestEventIdOf(event) : undefined;
+    // Remember the active chat turn's req_id (see `lastChatTurnReqId`) so the
+    // divider redirect bootstrap below can target it directly, rather than
+    // inferring it from `previousCurrent` (wrong when a queued follow-up
+    // intervened).
+    if (reqId) state.lastChatTurnReqId = reqId;
     const owner = reqId
       ? (reqIdRedirect.get(reqId) ?? findExchangeByAnchorId(exchanges, reqId))
       : null;
@@ -654,9 +673,20 @@ function foldEvent(
     // cancel attribution via its Cancel-as-picked button — i.e. the question
     // resolved as Canceled. Any non-Canceled resolution leaves the picked
     // option as the visible state, so the boundary panel must render.
+    //
+    // A `superseded_by_followup` cancel (Codex mid-turn follow-up redirect) is
+    // the exception: the user steered, not Stopped, so it renders neutrally like
+    // the chat/CC follow-up. Keep it as a step on the originating exchange (so
+    // step resolution / model extraction still see a terminator) but do NOT open
+    // a boundary — there must be no standalone 'Response canceled' panel.
     if (event.type === 'ResponseCanceled') {
       const target = owner ?? current;
       if (target && target.userEvent.type !== 'ResponseCanceled') {
+        if (event.cause === 'superseded_by_followup') {
+          target.steps.push({ seq, event });
+          touched?.add(target);
+          return;
+        }
         target.steps.push({ seq, event });
         touched?.add(target);
         if (target.userEvent.type === 'UserQuestionAsked') {
@@ -718,7 +748,11 @@ function foldEvent(
         return;
       }
     }
-    if (event.type === 'CodingAgentPermissionResolved' || event.type === 'CommandPermissionResolved') {
+    if (
+      event.type === 'CodingAgentPermissionResolved'
+      || event.type === 'CommandPermissionResolved'
+      || event.type === 'McpPermissionResolved'
+    ) {
       const dividerOwner = permissionDividerOwners.get(event.request_id);
       if (dividerOwner) {
         dividerOwner.steps.push({ seq, event });
@@ -760,7 +794,8 @@ function foldEvent(
         questionDividerOwners.set(event.tool_use_id, current);
       } else if (
         (event.type === 'CodingAgentPermissionRequest'
-          || event.type === 'CommandPermissionRequested')
+          || event.type === 'CommandPermissionRequested'
+          || event.type === 'McpPermissionRequested')
         && event.request_id
       ) {
         permissionDividerOwners.set(event.request_id, current);
@@ -799,21 +834,53 @@ function foldEvent(
       const advancesRedirect =
         event.type === 'UserQuestionAsked'
         || event.type === 'CommandPermissionRequested'
+        || event.type === 'McpPermissionRequested'
         || (event.type === 'ChildThreadCompleted'
           && !!previousCurrent
           && !DIVIDER_USER_EVENT_TYPES.has(previousCurrent.userEvent.type));
       if (advancesRedirect && previousCurrent) {
-        let updatedExisting = false;
+        // Move any redirect that pointed at the previous current (the turn kept
+        // an ANCESTOR's req_id — e.g. a mid-response child completion keeps the
+        // originating MR's id) AND, unconditionally, map the previous current's
+        // OWN anchor id → current. Both are needed: when `previousCurrent`
+        // itself opened a fresh turn (a ChildThreadCompleted whose parent turn
+        // had already finished — its continuation streams under the card's OWN
+        // id), the moved entries are SPURIOUS leftovers and the real reply
+        // routes by `previousCurrent`'s id. Gating the bootstrap on "no entry
+        // moved" dropped that mapping, so the post-answer reply misrouted back
+        // into the card (rendered above the question) and the divider flashed
+        // 'aborted' (real thread 2e98b44a). Setting both keeps the
+        // keep-ancestor-id and fresh-turn cases correct; a redundant entry is
+        // harmless (nothing routes by an unused id).
         for (const [reqId, exchange] of reqIdRedirect.entries()) {
           if (exchange === previousCurrent) {
             reqIdRedirect.set(reqId, current);
-            updatedExisting = true;
           }
         }
-        if (!updatedExisting) {
-          const anchorId = previousCurrent.userEvent._eventId;
-          if (anchorId) reqIdRedirect.set(anchorId, current);
-        }
+        const anchorId = previousCurrent.userEvent._eventId;
+        if (anchorId) reqIdRedirect.set(anchorId, current);
+      }
+      // For a chat in-process divider, the post-answer continuation carries the
+      // ACTIVE turn's req_id — which is `previousCurrent`'s anchor only when
+      // `previousCurrent` IS that turn's exchange. When an UNINGESTED queued
+      // follow-up MessageReceived intervened, `previousCurrent` is the queued MR
+      // and the bootstrap above anchors on the WRONG id, so the reply +
+      // ResponseGenerated route back to the original message exchange and the
+      // divider strands terminal-less → a persistent 'aborted' (real thread
+      // 194474de). Redirect the turn's real req_id (tracked as
+      // `lastChatTurnReqId`, set by the divider-raising tool call) to the divider
+      // directly. Additive and idempotent in the common no-queue case: there
+      // `lastChatTurnReqId` already equals `previousCurrent`'s anchor. CC
+      // dividers never set `lastChatTurnReqId` (CC events aren't request-id
+      // routed), so this is a no-op for them. ChildThreadCompleted is excluded —
+      // its continuation routing is governed by the `previousCurrent` logic above.
+      if (
+        (event.type === 'UserQuestionAsked'
+          || event.type === 'CommandPermissionRequested'
+          || event.type === 'McpPermissionRequested')
+        && state.lastChatTurnReqId
+      ) {
+        reqIdRedirect.set(state.lastChatTurnReqId, current);
       }
     } else if (event.type === 'CodingAgentUserMessageSent') {
       // Legacy: old data has this instead of MessageReceived for CC follow-ups.

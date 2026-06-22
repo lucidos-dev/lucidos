@@ -8,6 +8,7 @@ import {
   setSelectedAppIds,
   threadChannelFilter,
   filterFacets,
+  includeDeletedFilterOptions,
   CODING_AGENT_CHANNEL,
 } from './store';
 import { toggleChannel } from './triggerFilters';
@@ -68,15 +69,21 @@ export const repoFilterOptions = computed<RepoFilterOption[]>(() => {
   }
   for (const id of selectedRepoIds.value) push(id);
 
-  return result.sort((a, b) => {
-    if (a.deleted !== b.deleted) return a.deleted ? 1 : -1;
-    if (a.deleted) {
-      const aTime = a.lastActivity ?? '';
-      const bTime = b.lastActivity ?? '';
-      if (aTime !== bTime) return bTime.localeCompare(aTime);
-    }
-    return a.label.localeCompare(b.label);
-  });
+  // Deleted entries are hidden unless the user opts in — but a *selected*
+  // deleted entry always stays visible so the filter remains clearable.
+  const includeDeleted = includeDeletedFilterOptions.value;
+  const selected = selectedRepoIds.value;
+  return result
+    .filter(o => includeDeleted || !o.deleted || selected.has(o.id))
+    .sort((a, b) => {
+      if (a.deleted !== b.deleted) return a.deleted ? 1 : -1;
+      if (a.deleted) {
+        const aTime = a.lastActivity ?? '';
+        const bTime = b.lastActivity ?? '';
+        if (aTime !== bTime) return bTime.localeCompare(aTime);
+      }
+      return a.label.localeCompare(b.label);
+    });
 });
 
 export function toggleRepoId(id: string): void {

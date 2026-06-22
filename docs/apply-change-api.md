@@ -56,7 +56,7 @@ interface ApplyChangeResult {
 | `applied` | Branch merged into `main`. `applied_commit` and `previous_commit` are populated. The exception is the external-repo handoff path, which marks the change applied without merging — SHAs are absent there. |
 | `noop` | Nothing to merge. Either the change was already applied (idempotent re-apply) or the branch had no commits. The original `applied_commit` is echoed back on idempotent re-apply, so callers can still reference the merge. |
 | `hardening` | The change wasn't hardened, so a hardening recovery session was spawned. The change will auto-apply when hardening completes. `review_thread_id` points at the recovery thread. |
-| `conflict` | Merge conflict — a CC session is resolving it. `conflict_thread_id` points at the thread to focus. Includes the case where an in-place merge failed but the original session stays alive for retry. |
+| `conflict` | Merge conflict — a CC session is resolving it; `conflict_thread_id` points at the thread to focus. For a **live session whose `main` has diverged** and for the **temp-worktree merge**, resolution runs in the background: the call returns immediately and the change auto-applies (`ChangeApplied`) when resolution completes, or emits `ChangeApplyFailed` if it can't. (A clean fast-forward on a live session stays synchronous and returns `applied` instead — only true divergence goes async.) A second apply while one is already running for a live session also returns `conflict` ("already in progress"). |
 
 ## Examples
 

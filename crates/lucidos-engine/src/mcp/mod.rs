@@ -170,8 +170,8 @@ impl McpManager {
 
         let mut statuses = Vec::new();
         for server in servers {
-            let is_running = running.contains_key(&server.id);
-            let (tool_count, tools) = if let Some(entry) = running.get(&server.id) {
+            let running_entry = running.get(&server.id);
+            let (tool_count, tools) = if let Some(entry) = running_entry {
                 let names: Vec<String> =
                     entry.client.tools.iter().map(|t| t.name.clone()).collect();
                 (names.len(), names)
@@ -182,7 +182,7 @@ impl McpManager {
             statuses.push(McpServerStatus {
                 id: server.id,
                 name: server.name,
-                running: is_running,
+                running: running_entry.is_some(),
                 auto_approve: server.auto_approve,
                 tool_count,
                 tools,

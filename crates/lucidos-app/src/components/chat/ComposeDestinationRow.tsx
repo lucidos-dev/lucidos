@@ -5,7 +5,7 @@ import { loadApps } from '../../store/actions/apps';
 import { loadRepositories } from '../../store/actions/chat';
 import { applyDestination, type ComposeMode } from '../../store/actions/compose';
 import { switchMenuItem, openSettingsSubview } from '../../store/actions/menu';
-import { composeHandoffHintDismissed, dismissComposeHandoffHint, setCodingAgentDefault } from '../../store/actions/preferences';
+import { setCodingAgentDefault } from '../../store/actions/preferences';
 import {
   destinationFromState,
   destinationToOptionValue,
@@ -17,14 +17,11 @@ import {
   type ComposeDestination,
 } from '../../store/composeDestination';
 import { Dropdown, type DropdownOption } from '../shared/Dropdown';
-import { CloseIcon } from '../shared/icons';
 import { focusPromptNow } from './promptFocus';
-import { isElementVisible } from './scrollState';
 
 type DestinationSelectionDeps = {
   apply: typeof applyDestination;
   focusPrompt: () => void;
-  focusCodingAgent: () => void;
   switchMenuItem: typeof switchMenuItem;
   openSettingsSubview: typeof openSettingsSubview;
 };
@@ -40,7 +37,6 @@ export function handleComposeDestinationSelection(
   deps: DestinationSelectionDeps = {
     apply: applyDestination,
     focusPrompt: focusPromptNow,
-    focusCodingAgent: focusComposeCodingAgentPicker,
     switchMenuItem,
     openSettingsSubview,
   },
@@ -56,8 +52,7 @@ export function handleComposeDestinationSelection(
   }
   const destination = parseOptionValue(value);
   deps.apply(threadId, destination);
-  if (destination.kind === 'coding') deps.focusCodingAgent();
-  else deps.focusPrompt();
+  deps.focusPrompt();
 }
 
 export function handleComposeCodingAgentSelection(
@@ -69,20 +64,6 @@ export function handleComposeCodingAgentSelection(
 ): void {
   void deps.setCodingAgentDefault(value as CodingAgent);
   deps.focusPrompt();
-}
-
-export function getVisibleComposeCodingAgentTrigger(): HTMLElement | null {
-  const els = document.querySelectorAll<HTMLElement>('.compose-coding-agent-chip .dropdown-trigger');
-  for (const el of els) {
-    if (isElementVisible(el)) return el;
-  }
-  return els.length > 0 ? els[els.length - 1] : null;
-}
-
-export function focusComposeCodingAgentPicker(): void {
-  requestAnimationFrame(() => {
-    getVisibleComposeCodingAgentTrigger()?.focus({ preventScroll: true });
-  });
 }
 
 /** The compose destination picker — its consequence caption,
@@ -221,18 +202,6 @@ export function ComposeDestinationRow({ threadId, toggleMode, fading }: {
           />
         )}
       </div>
-      {dest.kind === 'lucidos-agent' && !composeHandoffHintDismissed() && (
-        <div class="compose-handoff-hint">
-          <span>Not sure? Start with the Lucidos Agent — it can hand off to a coding agent.</span>
-          <button
-            class="icon-btn compose-handoff-hint-dismiss"
-            aria-label="Dismiss hint"
-            onClick={() => { void dismissComposeHandoffHint(); }}
-          >
-            <CloseIcon />
-          </button>
-        </div>
-      )}
     </>
   );
 }

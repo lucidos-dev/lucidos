@@ -108,12 +108,32 @@ describe('restart-required toast persistence', () => {
     // Simulate clicking the Restart button
     toast!.action!.onClick();
 
-    // Toast changes to info type with "Restarting engine..." message
+    // Toast changes to a light info status on the build phase, with a spinner to
+    // signal ongoing work. It stays dismissible, since the UI is no longer
+    // deactivated during restart.
     const updated = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
     expect(updated).toBeTruthy();
     expect(updated!.type).toBe('info');
-    expect(updated!.message).toBe('Restarting engine...');
+    expect(updated!.message).toBe('Building the new version…');
     expect(updated!.spinning).toBe(true);
+    expect(updated!.dismissable).not.toBe(false);
+  });
+
+  it('does not clobber the "Restarting..." status toast while a restart is in flight', () => {
+    // Restart in progress: the info status toast owns RESTART_TOAST_KEY and
+    // engineRestarting is true, but restartRequired is still true (it only
+    // clears on reconnect). A re-sync (SSE reconnect / new applied change) must
+    // NOT replace the status toast with the "restart required" warning.
+    engineRestarting.value = true;
+    restartRequired.value = true;
+    showToast('Restarting engine...', 'info', { key: RESTART_TOAST_KEY, showDuringRestart: true });
+
+    syncRestartToast();
+
+    const toast = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
+    expect(toast).toBeTruthy();
+    expect(toast!.type).toBe('info');
+    expect(toast!.message).toBe('Restarting engine...');
   });
 
   it('syncRestartToast re-creates warning toast after Restart changes it to info', () => {

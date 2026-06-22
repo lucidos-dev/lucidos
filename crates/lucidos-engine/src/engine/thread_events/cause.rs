@@ -17,6 +17,14 @@ pub enum CancelCause {
     /// User clicked Apply / Discard / Archive on a Claude Code session that was still
     /// running — the action implies "stop the current turn first."
     UserAction,
+    /// A user follow-up arrived while a Codex turn was in flight, so the engine
+    /// interrupted the live turn to run the follow-up as the next turn (the
+    /// mid-turn redirect — see `arm_codex_redirect`). Mechanically a cancel (no
+    /// `ResponseGenerated`, no change proposal for the redirected-away partial
+    /// work), but NOT a user Stop: the user steered, they didn't abandon. The
+    /// frontend renders this neutrally — like the chat/CC follow-up — instead of
+    /// the "Canceled ✕" + "Response canceled" panel that `UserStop` gets.
+    SupersededByFollowup,
     /// Pre-typed-cause legacy event, or a now-removed cause string (e.g. the
     /// retired `stale_settle` cancel cause that's now an abort cause). Catches
     /// anything unrecognized so old DB rows replay cleanly. Never emit fresh.

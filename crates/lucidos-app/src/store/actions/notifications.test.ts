@@ -204,6 +204,24 @@ describe('loadUnreadNotifications failure handling', () => {
     expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(1);
   });
 
+  it('does not count a browser-cancelled AbortError toward the threshold', async () => {
+    // No manual AbortController on this path — an AbortError is the browser
+    // cancelling the in-flight fetch on an iOS PWA freeze / radio handoff. It
+    // carries no reachability signal, so it must not push the counter toward the
+    // "Unread count is stale — couldn't reach the engine" escalation. A genuine
+    // unreachable engine fires TimeoutError / a transport TypeError, which still
+    // counts (covered by the threshold test above).
+    (getNotifications as Mock).mockRejectedValue(new DOMException('aborted', 'AbortError'));
+
+    await loadUnreadNotifications();
+    await loadUnreadNotifications();
+    await loadUnreadNotifications();
+    await loadUnreadNotifications();
+    await loadUnreadNotifications();
+
+    expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(0);
+  });
+
   it('resets the failure counter on a successful load', async () => {
     (getNotifications as Mock)
       .mockRejectedValueOnce(new Error('boom'))

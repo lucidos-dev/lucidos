@@ -18,7 +18,7 @@ test.describe('Empty and error states', () => {
 
     // The placeholder should always be the same nudge
     const placeholder = await input.getAttribute('placeholder');
-    expect(placeholder).toBe('What can I help with today?');
+    expect(placeholder).toBe('What can I help with?');
   });
 
   test('thread drawer can be opened and shows content', async ({ page }) => {

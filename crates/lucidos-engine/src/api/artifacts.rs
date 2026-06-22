@@ -156,21 +156,6 @@ pub(super) async fn list_commits(
     }
 }
 
-/// Read a file at a specific git commit
-pub(super) fn read_file_at_commit(
-    workspace: &std::path::Path,
-    path: &str,
-    commit_hash: &str,
-) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let repo = git2::Repository::open(workspace)?;
-    let oid = git2::Oid::from_str(commit_hash)?;
-    let commit = repo.find_commit(oid)?;
-    let tree = commit.tree()?;
-    let entry = tree.get_path(std::path::Path::new(path))?;
-    let blob = repo.find_blob(entry.id())?;
-    Ok(blob.content().to_vec())
-}
-
 /// Routes for the `/commits*` surface (artifact git history).
 pub(super) fn router() -> Router<AppState> {
     Router::new()

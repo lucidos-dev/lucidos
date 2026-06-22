@@ -7,6 +7,57 @@ fn read_only_reason_blocks_system_knowhow() {
 }
 
 #[test]
+fn data_path_app_id_extracts_id_under_apps() {
+    assert_eq!(
+        data_path_app_id("apps/demo-director/index.html"),
+        Some("demo-director")
+    );
+    assert_eq!(data_path_app_id("apps/foo/scripts/x.py"), Some("foo"));
+    // Not an app path / no id segment → None.
+    assert_eq!(data_path_app_id("artifacts/notes.md"), None);
+    assert_eq!(data_path_app_id("apps/"), None);
+    assert_eq!(data_path_app_id("apps"), None);
+}
+
+#[test]
+fn data_path_app_manifest_id_only_matches_the_manifest() {
+    // Only apps/<id>/manifest.json triggers an App* event.
+    assert_eq!(
+        data_path_app_manifest_id("apps/demo-director/manifest.json"),
+        Some("demo-director")
+    );
+    // Any other app file (the bulk of writes during a build) → no event.
+    assert_eq!(data_path_app_manifest_id("apps/demo-director/index.html"), None);
+    assert_eq!(data_path_app_manifest_id("apps/foo/scripts/x.py"), None);
+    // A manifest.json nested below the app root is not the app manifest.
+    assert_eq!(data_path_app_manifest_id("apps/foo/sub/manifest.json"), None);
+    // Non-app paths and malformed paths.
+    assert_eq!(data_path_app_manifest_id("artifacts/manifest.json"), None);
+    assert_eq!(data_path_app_manifest_id("apps/manifest.json"), None);
+    assert_eq!(data_path_app_manifest_id("apps/foo"), None);
+}
+
+#[test]
+fn app_lifecycle_event_is_birth_and_death_only() {
+    let name = || Some("Demo".to_string());
+    // Manifest newly appeared → AppCreated (the load-bearing case).
+    assert!(matches!(
+        app_lifecycle_event("a", name, true, false, false),
+        Some(SystemEvent::AppCreated { .. })
+    ));
+    // Manifest edited (existed before, still exists) → None: AppUpdated is
+    // emitted once per turn by the agentic loop, not per write.
+    assert!(app_lifecycle_event("a", name, true, false, true).is_none());
+    // Manifest removed (existed before) → AppDeleted.
+    assert!(matches!(
+        app_lifecycle_event("a", name, false, true, true),
+        Some(SystemEvent::AppDeleted { .. })
+    ));
+    // Delete against an app that never existed → nothing.
+    assert!(app_lifecycle_event("a", name, false, true, false).is_none());
+}
+
+#[test]
 fn read_only_reason_allows_user_paths() {
     assert!(read_only_reason("artifacts/notes.md").is_none());
     assert!(read_only_reason("knowhow/lucidos/best-practices.md").is_none());

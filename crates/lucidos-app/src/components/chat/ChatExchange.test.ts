@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import type { VNode } from 'preact';
 import { actorInitiator, describeExecutor, shouldShowResponseStatusBadge } from './ChatExchange';
 import { ClaudeIcon, CodexIcon } from '../shared/icons';
-import { LucidosAgentGlyph } from '../shared/LucidosMark';
+import { LucidosGlyph } from '../shared/LucidosMark';
 import { LUCIDOS_AGENT_LABEL } from '../../store/thread-events';
 
 describe('describeExecutor', () => {
@@ -30,7 +30,7 @@ describe('describeExecutor', () => {
   it('shows Lucidos Agent label + mark glyph for non-CC threads (same entity as the parent_thread initiator label)', () => {
     const { icon, label } = describeExecutor(false);
     expect(label).toBe(LUCIDOS_AGENT_LABEL);
-    expect((icon as VNode).type).toBe(LucidosAgentGlyph);
+    expect((icon as VNode).type).toBe(LucidosGlyph);
   });
 });
 
@@ -53,11 +53,12 @@ describe('actorInitiator (closed set: You / Lucidos Agent / Lucidos Engine / Sys
   it('api with mode=agent → Lucidos Agent (mark glyph)', () => {
     const { icon, label } = actorInitiator({ kind: 'api', mode: 'agent' });
     expect(label).toBe(LUCIDOS_AGENT_LABEL);
-    expect((icon as VNode).type).toBe(LucidosAgentGlyph);
+    expect((icon as VNode).type).toBe(LucidosGlyph);
   });
-  it('api with mode=engine → Lucidos Engine', () => {
-    expect(actorInitiator({ kind: 'api', mode: 'engine' }))
-      .toEqual({ icon: '⬡', label: 'Lucidos Engine' });
+  it('api with mode=engine → Lucidos Engine (same mark glyph as the agent; label distinguishes)', () => {
+    const { icon, label } = actorInitiator({ kind: 'api', mode: 'engine' });
+    expect(label).toBe('Lucidos Engine');
+    expect((icon as VNode).type).toBe(LucidosGlyph);
   });
   it('workspace with mode=human → API caller (a human in another workspace is not "You" here)', () => {
     expect(actorInitiator({ kind: 'workspace', workspace: 'p', mode: 'human' }))
@@ -66,30 +67,35 @@ describe('actorInitiator (closed set: You / Lucidos Agent / Lucidos Engine / Sys
   it('workspace with mode=agent → Lucidos Agent (mark glyph)', () => {
     const { icon, label } = actorInitiator({ kind: 'workspace', workspace: 'p', mode: 'agent' });
     expect(label).toBe(LUCIDOS_AGENT_LABEL);
-    expect((icon as VNode).type).toBe(LucidosAgentGlyph);
+    expect((icon as VNode).type).toBe(LucidosGlyph);
   });
-  it('workspace with mode=engine → Lucidos Engine', () => {
-    expect(actorInitiator({ kind: 'workspace', workspace: 'p', mode: 'engine' }))
-      .toEqual({ icon: '⬡', label: 'Lucidos Engine' });
+  it('workspace with mode=engine → Lucidos Engine (mark glyph)', () => {
+    const { icon, label } = actorInitiator({ kind: 'workspace', workspace: 'p', mode: 'engine' });
+    expect(label).toBe('Lucidos Engine');
+    expect((icon as VNode).type).toBe(LucidosGlyph);
   });
   it('parent_thread (default mode=agent) → Lucidos Agent (mark glyph)', () => {
     const { icon, label } = actorInitiator({ kind: 'thread_link', thread_id: 't' });
     expect(label).toBe(LUCIDOS_AGENT_LABEL);
-    expect((icon as VNode).type).toBe(LucidosAgentGlyph);
+    expect((icon as VNode).type).toBe(LucidosGlyph);
   });
-  it('parent_thread with mode=engine → Lucidos Engine', () => {
-    expect(actorInitiator({ kind: 'thread_link', thread_id: 't', mode: 'engine' }))
-      .toEqual({ icon: '⬡', label: 'Lucidos Engine' });
+  it('parent_thread with mode=engine → Lucidos Engine (mark glyph)', () => {
+    const { icon, label } = actorInitiator({ kind: 'thread_link', thread_id: 't', mode: 'engine' });
+    expect(label).toBe('Lucidos Engine');
+    expect((icon as VNode).type).toBe(LucidosGlyph);
   });
-  it('engine origin → Lucidos Engine', () => {
-    expect(actorInitiator({ kind: 'engine', reason: { kind: 'session_recovered' } }))
-      .toEqual({ icon: '⬡', label: 'Lucidos Engine' });
+  it('engine origin → Lucidos Engine (mark glyph)', () => {
+    const { icon, label } = actorInitiator({ kind: 'engine', reason: { kind: 'session_recovered' } });
+    expect(label).toBe('Lucidos Engine');
+    expect((icon as VNode).type).toBe(LucidosGlyph);
   });
-  it('system origin → System (distinct from engine — process killed by host, not engine-deliberate)', () => {
+  it('system origin → System (gear, distinct from the Lucidos mark — process killed by host, not engine-deliberate)', () => {
     expect(actorInitiator({ kind: 'system' })).toEqual({ icon: '⚙', label: 'System' });
   });
-  it('undefined origin → Lucidos Engine', () => {
-    expect(actorInitiator(undefined)).toEqual({ icon: '⬡', label: 'Lucidos Engine' });
+  it('undefined origin → Lucidos Engine (mark glyph)', () => {
+    const { icon, label } = actorInitiator(undefined);
+    expect(label).toBe('Lucidos Engine');
+    expect((icon as VNode).type).toBe(LucidosGlyph);
   });
 });
 

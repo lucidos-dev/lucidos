@@ -224,6 +224,19 @@ export async function clickVisibleElement(page: Page, selector: string, text?: s
   }, { sel: selector, txt: text });
 }
 
+/** Open the unified Filter dropdown and pick a drawer view by its row label
+ *  ("All" | "Needs attention" | "Review" | "Running" | "Drafts"). The View rows
+ *  live in the merged dropdown's top section; picking a view applies it and
+ *  closes the dropdown. Dual-layout safe — the single Filter button
+ *  (`aria-label="Filter threads"`) lives in both the desktop and mobile threads
+ *  headers. Throws if the button or row isn't visible. */
+export async function openDrawerView(page: Page, label: string): Promise<void> {
+  const opened = await clickVisibleElement(page, 'button[aria-label="Filter threads"]');
+  if (!opened) throw new Error('Filter threads button not visible');
+  const picked = await clickVisibleElement(page, '.thread-filter-dropdown .drawer-view-option', label);
+  if (!picked) throw new Error(`Drawer view option "${label}" not visible`);
+}
+
 /** Click compose button to start a new thread (dual-layout safe).
  *  On mobile the compose button navigates to thread pane automatically. */
 export async function newThread(page: Page): Promise<void> {
@@ -423,6 +436,30 @@ export async function waitForActionPanel(page: Page, buttonText: string, timeout
   return page.locator('.thread-action-buttons:visible').first();
 }
 
+/** Click a WaitingBanner change action by label, transparently across the two
+ *  banner shapes. When an Apply action is present the banner is a split button
+ *  (all viewports): the primary Apply face stays a direct button — locate that
+ *  one directly, not via this helper — while Diff / Discard / Archive live in
+ *  the caret menu. When there's no Apply (e.g. an idle CC thread with a diff but
+ *  no pending change) the actions render as their own buttons. Tries the direct
+ *  button first; otherwise opens the caret menu and clicks the matching item. */
+export async function clickChangeAction(
+  page: Page,
+  label: 'Discard' | 'Diff' | 'Archive',
+  timeout = 15_000,
+): Promise<void> {
+  const direct = page.locator(`.thread-action-buttons:visible button.action-btn:has-text("${label}")`).first();
+  if (await direct.isVisible().catch(() => false)) {
+    await direct.click();
+    return;
+  }
+  // Mobile split button: the action lives behind the caret.
+  const caret = page.locator('.thread-action-buttons:visible .split-button-caret').first();
+  await expect(caret).toBeVisible({ timeout });
+  await caret.click();
+  await page.locator(`.split-button-menu:visible button:has-text("${label}")`).first().click();
+}
+
 /** Resolve only on the LAST visible status label leaving Working/Requesting.
  *  Earlier turns may still show idle Done/Diff panels mid-stream of a later
  *  turn, so a "any panel exists" check would return early. */
@@ -551,11 +588,12 @@ export async function countVisibleThreadRows(page: Page): Promise<number> {
 /** Wait for the prompt-area Cancel button, click it, confirm the guard dialog,
  *  then wait for Canceled status.
  *  Works for both chat and Claude Code threads (single hard-cancel path).
- *  Identify the Send→Cancel morph by its post-morph class — the disabled
- *  `Cancel...` state shares the same aria-label, so :not(:disabled) is
- *  load-bearing. */
+ *  Identify the Send→Cancel morph by its `aria-label="Cancel"` — the stop
+ *  button no longer carries `action-btn-danger` (it stays blue now), and the
+ *  disabled `Cancel...` (canceling) state shares the same aria-label, so
+ *  :not(:disabled) is load-bearing to hit the actionable stop state. */
 export async function cancelStreamingResponse(page: Page): Promise<void> {
-  await waitAndClick(page, 'button.send-cancel-morph.action-btn-danger:not(:disabled)', undefined, 30_000);
+  await waitAndClick(page, 'button.send-cancel-morph[aria-label="Cancel"]:not(:disabled)', undefined, 30_000);
 
   // Cancel is guarded by a confirm dialog — accept it to actually cancel.
   await page.locator('.confirm-dialog').waitFor({ state: 'visible', timeout: 10_000 });

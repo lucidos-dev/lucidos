@@ -750,6 +750,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &shared_engine.event_bus,
     )
     .await;
+    // Same for the chat MCP permission lane: a chat turn parked on an
+    // McpPermissionRequested is dead after restart, so clear the card.
+    lucidos_engine::engine::mcp_permission::recover_orphan_mcp_permission_requests(
+        shared_engine.pool(),
+        &shared_engine.event_bus,
+    )
+    .await;
 
     // Reset any threads stuck in 'running' from the previous engine process.
     // These are orphaned — no live task is processing them. The recovery below
@@ -922,6 +929,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .event_bus
         .refire_unprocessed_child_completions()
         .await;
+
+    // Rebuild the Apply-All batch registry from the durable `apply_all_batches`
+    // table and resolve any batch the previous process abandoned mid-flight
+    // (an earlier member required a restart, or a conflict-resolution apply
+    // landed a restart-requiring change). Runs AFTER agent/CC recovery above so
+    // a member with an auto-resuming session is observed as running rather than
+    // re-driven. Without this the in-memory registry came back empty, the
+    // eventual terminal event found no batch, ApplyAllBatchCompleted was never
+    // emitted, and the frontend's "Applying changes…" toast stuck forever.
+    shared_engine.recover_apply_all_batches().await;
 
     // Start memory indexer — subscribes to EventBus and indexes chat events
     lucidos_engine::engine::memory_consumer::spawn(shared_engine.clone());

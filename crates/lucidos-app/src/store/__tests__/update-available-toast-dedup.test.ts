@@ -1,11 +1,13 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { toasts, showToast, hasRefreshToast, restartRequired, restartGroups } from '../store';
-import { appliedToastRefreshAction, syncRestartToast } from '../actions/chat-changes';
+import { syncRestartToast } from '../actions/chat-changes';
 
-// The "New version available" toast (shown from useStartup's service-worker
-// update handler) must not stack on top of a toast that already offers the user
-// a way to pick up the new build. `hasRefreshToast()` is the predicate the guard
-// uses; these tests pin that it detects every real refresh/restart toast.
+// The "New version available" toast (shown from `surfaceUpdateToast` in
+// store/actions/client-update.ts, driven by the build-id check) must not stack on
+// top of a toast that already offers the user a way to pick up the new build.
+// `hasRefreshToast()` is the predicate the guard uses; these tests pin that it
+// detects every real refresh/restart toast. (The end-to-end dedup against the
+// real `surfaceUpdateToast` is covered in actions/client-update.test.ts.)
 
 beforeEach(() => {
   toasts.value = [];
@@ -24,23 +26,11 @@ describe('hasRefreshToast', () => {
     expect(hasRefreshToast()).toBe(false);
   });
 
-  it('detects the "Applied …" toast Refresh button', () => {
-    // clientUpdate && !requiresRestart → the Applied toast carries a Refresh action.
-    showToast('Applied: thing', 'success', {
-      key: 'applying-t1',
-      action: appliedToastRefreshAction(false, true),
-    });
-    expect(hasRefreshToast()).toBe(true);
-  });
-
-  it('does NOT count the "Applied …" toast when it has no Refresh button', () => {
-    // requiresRestart → appliedToastRefreshAction returns undefined, so the
-    // Applied toast has no action; the restart toast (not this one) is the
-    // refresh affordance in that flow.
-    showToast('Applied: thing', 'success', {
-      key: 'applying-t1',
-      action: appliedToastRefreshAction(true, true),
-    });
+  it('does NOT count the "Applied …" toast — it never carries an action', () => {
+    // The Applied toast is a plain success notification with no Refresh button:
+    // at apply time the rebuilt frontend isn't ready, so the refresh affordance
+    // is deferred to the SW-driven "New version available" toast.
+    showToast('Applied: thing', 'success', { key: 'applying-t1' });
     expect(hasRefreshToast()).toBe(false);
   });
 
@@ -60,7 +50,7 @@ describe('hasRefreshToast', () => {
 });
 
 describe('"New version available" dedup decision', () => {
-  // Mirrors the guard in useStartup's onUpdateFound: skip the toast when a
+  // Mirrors the guard in surfaceUpdateToast: skip the toast when a
   // refresh/restart toast is already on screen.
   function maybeShowUpdateToast(): void {
     if (hasRefreshToast()) return;
@@ -71,9 +61,9 @@ describe('"New version available" dedup decision', () => {
   }
 
   it('suppresses the toast when a refresh toast is already showing', () => {
-    showToast('Applied: thing', 'success', {
-      key: 'applying-t1',
-      action: appliedToastRefreshAction(false, true),
+    // The "Engine restarted" reconnect toast carries a Refresh action.
+    showToast('Engine restarted', 'success', {
+      action: { label: 'Refresh', onClick: () => {} },
     });
     maybeShowUpdateToast();
     expect(toasts.value.some(t => t.message === 'New version available')).toBe(false);

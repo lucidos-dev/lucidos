@@ -49,11 +49,12 @@ function blockZ(css: string, selector: string): number {
 }
 
 /**
- * Regression: the UI-blocking overlay blocks the whole UI while the engine
- * restarts or the client refreshes. Nothing may render above it EXCEPT toasts
- * (so the restart toast stays visible/dismissible). Previous bug: drawer thread
- * rows whose status changed during a restart flew above the dim blocker because
- * the FLIP animation portal sat at z-index 9999.
+ * Regression: the UI-blocking overlay blocks the whole UI while the client
+ * refreshes (SW swap + reload). Nothing may render above it EXCEPT toasts (so
+ * the "Refreshing…" toast stays visible). Previous bug: drawer thread rows whose
+ * status changed flew above the dim blocker because the FLIP animation portal sat
+ * at z-index 9999. (Engine restart no longer mounts this overlay — see
+ * UiBlockingOverlay.tsx — but the z-index ordering it relies on is unchanged.)
  */
 describe('ui-blocking overlay z-index (only toasts above the blocker)', () => {
   const overlayZ = blockZ(modalCss, '.ui-blocking-overlay');

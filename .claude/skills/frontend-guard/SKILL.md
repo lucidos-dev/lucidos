@@ -11,10 +11,10 @@ Use these — never hardcode the raw values:
 
 | Token | Value | Use for |
 |-------|-------|---------|
-| `--bg-primary` | `#0b2342` | Page/app background |
-| `--bg-secondary` | `#122c50` | Cards, elevated surfaces |
-| `--bg-tertiary` | `#1b3a60` | Inputs, hover states, code blocks |
-| `--border-color` | `#324f76` | All borders |
+| `--bg-primary` | `#07172e` | Page/app background |
+| `--bg-secondary` | `#0d2244` | Cards, elevated surfaces |
+| `--bg-tertiary` | `#163052` | Inputs, hover states, code blocks |
+| `--border-color` | `#2c456a` | All borders |
 | `--text-primary` | `#e6edf3` | Headings, important text |
 | `--text-secondary` | `#8b949e` | Supporting text |
 | `--text-muted` | `#6e7681` | Timestamps, hints |
@@ -65,15 +65,20 @@ Use `--syntax-key`, `--syntax-string`, `--syntax-number`, `--syntax-keyword`, `-
 
 ## Component Classes
 
+> **Where component CSS lives (three files, split by audience — put each rule in the right one):**
+> - **Reusable (host + app iframes)** → `styles/global/shared-components.css`. SINGLE SOURCE OF TRUTH: the engine `include_str!`s this exact file and appends it to `/api/v1/sdk-iframe.css` (`crates/lucidos-engine/src/api/sdk.rs`), so a class added here ships to the host AND every opted-in app at once. Never copy these into the engine's `sdk_iframe.css`. When you add an app-facing class here, also add it to the component-class table in `system-knowhow/js-sdk.md` (the app-author contract).
+> - **Host-chrome only (never served to apps)** → `styles/global/host-components.css` (custom `<Dropdown>`/`.nav-history-*`, `.send-cancel-*`, `.icon-btn.header-icon`/`.filter-active`/`.pinned`, `.list-row.flip-animating`).
+> - **Iframe-only (apps, not host)** → the engine's `crates/lucidos-engine/src/api/sdk_iframe.css` (`.action-btn-secondary`, `.lucidos-select`).
+
 ### Buttons
 
-- **`.action-btn`** — bordered text button. Default blue, `.action-btn-confirm` green, `.action-btn-danger` red.
+- **`.action-btn`** — filled text button. Default blue, `.action-btn-confirm` green, `.action-btn-danger` red (in `shared-components.css`). For a neutral secondary button in an app iframe, `.action-btn-secondary` (engine `sdk_iframe.css`).
 - **`.icon-btn`** — icon-only button. SVGs inside are auto-sized via `.icon-btn svg { width: var(--icon-size-sm) }`. Do NOT set inline `width`/`height` on SVGs inside `.icon-btn`.
 - Never create per-component button styles. Use the shared classes.
 
 ### Lists
 
-All list items use `.list-row` / `.list-row-info` / `.list-row-actions` from `global.css`. Never create custom list item layouts.
+All list items use `.list-row` / `.list-row-info` / `.list-row-actions` (in `shared-components.css`). Never create custom list item layouts.
 
 ### Dropdowns
 
@@ -97,8 +102,8 @@ Use `showToast(message, type)` for notifications and `await showConfirm(message,
 2. **All icon buttons need `aria-label`** — if the button has no visible text, add `aria-label`.
 3. **No hardcoded colors** — use CSS variables. Exception: `#fff` / `rgba(255,255,255,*)` on translucent overlays over image content.
 4. **No dead code** — delete unused styles, don't comment them out.
-5. **Shared styles in `global.css`** — domain styles in their own file under `styles/`.
-6. **`.error-text`** for inline error messages — defined in `global.css`.
+5. **Reusable component styles in `styles/global/shared-components.css`** (the single source shared with app iframes); host-chrome-only in `host-components.css`; domain styles in their own file under `styles/`.
+6. **`.error-text`** for inline error messages — defined in `shared-components.css`.
 7. **Links always underlined** — use subtle `text-decoration-color` at 40% opacity, full on hover.
 8. **Loading states use `useDelayedLoading`** — 300ms delay before showing spinner text.
 9. **`Loadable<T>` for all async data** — handle all four states (not-loaded, loading, loaded, failed). Never render not-loaded/loading as empty array. Failed must look different from empty.

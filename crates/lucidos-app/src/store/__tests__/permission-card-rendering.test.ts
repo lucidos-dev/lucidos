@@ -185,3 +185,89 @@ describe('exchangeStatus around CommandPermissionRequested (chat command guard)'
     expect(exchangeStatus(divider, '', true, false, false, true)).toBe('aborted');
   });
 });
+
+function mcpRequestStep(seq: number, overrides: Partial<{
+  request_id: string;
+  tool_use_id: string;
+  server_id: string;
+  server_name: string;
+  tool_name: string;
+  arguments_summary: string;
+}> = {}) {
+  return step(seq, {
+    type: 'McpPermissionRequested',
+    request_id: 'mreq-1',
+    tool_use_id: 'tu_1',
+    server_id: 'slack',
+    server_name: 'Slack (read-only)',
+    tool_name: 'channels_list',
+    arguments_summary: '{ "query": "ua-tech" }',
+    ...overrides,
+  });
+}
+
+describe('exchangeStatus around McpPermissionRequested (chat MCP gate)', () => {
+  it('reads as awaiting-answer while waiting for the MCP permission card', () => {
+    const ex = exchange([
+      step(1, { type: 'ToolCalled', name: 'mcp__slack__channels_list', description: 'channels_list' }),
+      mcpRequestStep(2, { request_id: 'mreq-3' }),
+    ]);
+    // threadIsCC = false — the MCP gate fires on chat threads.
+    expect(exchangeStatus(ex, '', true, false, false)).toBe('awaiting-answer');
+  });
+
+  it('leaves awaiting-answer once the MCP permission is resolved', () => {
+    const ex = exchange([
+      mcpRequestStep(1, { request_id: 'mreq-4' }),
+      step(2, { type: 'McpPermissionResolved', request_id: 'mreq-4', allowed: true }),
+      step(3, { type: 'ToolResult', name: 'mcp__slack__channels_list', result: 'ok' }),
+      step(4, { type: 'ResponseGenerated', text: 'done' }),
+    ]);
+    expect(exchangeStatus(ex, '', true, false, false)).not.toBe('awaiting-answer');
+  });
+
+  // The grant resumes the turn: the agent's post-grant reply routes into the
+  // divider (below the card) via reqIdRedirect, so a completed divider owns the
+  // turn's ResponseGenerated and reads 'done'.
+  it('resolved MCP-permission divider with its routed reply reads as done', () => {
+    const divider: Exchange = {
+      userEvent: mcpRequestStep(1, { request_id: 'mreq-5' }).event,
+      userSeq: 1,
+      steps: [
+        step(2, { type: 'McpPermissionResolved', request_id: 'mreq-5', allowed: true, persist_scope: 'broad' }),
+        step(3, { type: 'TextStreamed', text: 'done' }),
+        step(4, { type: 'ResponseGenerated', text: 'done' }),
+      ],
+    };
+    expect(exchangeStatus(divider, '', true, false, false, true)).toBe('done');
+  });
+
+  it('routes post-grant work into the divider so the reply renders below the card', () => {
+    const ev = (type: string, fields: Record<string, unknown> = {}): StoredEvent =>
+      ({ type, ...fields }) as StoredEvent;
+    const events = new Map<number, StoredEvent>([
+      [1, ev('MessageReceived', { text: 'list the ua-tech channels', _eventId: 'req-1' })],
+      [2, ev('ToolCalled', { name: 'mcp__slack__channels_list', args: { query: 'ua-tech' }, request_event_id: 'req-1', _eventId: 'tc-1' })],
+      [3, ev('McpPermissionRequested', { request_id: 'mreq-1', tool_use_id: 'tu-1', server_id: 'slack', server_name: 'Slack (read-only)', tool_name: 'channels_list', arguments_summary: '{}', _eventId: 'mpr-1' })],
+      [4, ev('McpPermissionResolved', { request_id: 'mreq-1', allowed: true, persist_scope: 'broad' })],
+      [5, ev('ToolResult', { name: 'mcp__slack__channels_list', result: 'ok', success: true, tool_called_event_id: 'tc-1', request_event_id: 'req-1' })],
+      [6, ev('TextStreamed', { text: 'Found 3 channels.', request_event_id: 'req-1' })],
+      [7, ev('ResponseGenerated', { text: 'Found 3 channels.', request_event_id: 'req-1' })],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges).toHaveLength(2);
+
+    const [msg, divider] = exchanges;
+    expect(msg.userEvent.type).toBe('MessageReceived');
+    expect(divider.userEvent.type).toBe('McpPermissionRequested');
+    // The gated tool call + its result stay in the message exchange; everything
+    // emitted AFTER the grant routes into the divider (below the card).
+    expect(msg.steps.map(s => s.event.type)).toEqual(['ToolCalled', 'ToolResult']);
+    expect(divider.steps.map(s => s.event.type)).toEqual([
+      'McpPermissionResolved', 'TextStreamed', 'ResponseGenerated',
+    ]);
+
+    expect(exchangeStatus(divider, '', true, false, false, true)).toBe('done');
+    expect(exchangeStatus(msg, '', false, false, false, true)).toBe('interrupted');
+  });
+});

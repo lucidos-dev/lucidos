@@ -158,6 +158,22 @@ export function reportStartupKind(): void {
   const isPwa = isIOSPwa();
   const kind = classifyStartup({ deadMs, cleanClose, navType, isIOSPwa: isPwa });
 
+  // Capture the landing URL's deep-link channels (query + hash) so a push tap
+  // that "opens the app but doesn't navigate" is diagnosable: this is the only
+  // breadcrumb that fires on EVERY boot, including the iOS declarative-push
+  // reload. If `search`/`hash` carry `notification=…&thread=…&tap=…` the deep
+  // link reached the page (look downstream for why nav was lost); if they're
+  // empty the params were dropped before boot (scope → picker, or a redirect).
+  let landingSearch = '';
+  let landingHash = '';
+  let landingPath = '';
+  try {
+    landingSearch = window.location.search.slice(0, 200);
+    landingHash = window.location.hash.slice(0, 200);
+    landingPath = window.location.pathname.slice(0, 80);
+  } catch {
+    /* telemetry only */
+  }
   postClientLog('lifecycle', 'startup', {
     kind,
     gap_ms: gapMs,
@@ -169,6 +185,9 @@ export function reportStartupKind(): void {
     ua: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 100) : '',
     prev_focused_thread: prior?.focusedThread ?? null,
     prev_draft_count: prior?.draftCount ?? 0,
+    landing_path: landingPath,
+    landing_search: landingSearch,
+    landing_hash: landingHash,
   });
 }
 

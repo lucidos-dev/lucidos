@@ -127,12 +127,21 @@ cargo tauri signer generate -w ~/.tauri/lucidos-updater.key
 
 Put the printed **public** key in `crates/lucidos-app/tauri.conf.json` →
 `plugins.updater.pubkey` (replace `REPLACE_WITH_TAURI_SIGNER_PUBLIC_KEY`). At
-build time, export the private key so the bundler signs the update artifacts:
+build time, point the build at the private key file so the bundler signs the
+update artifacts:
 
 ```bash
-export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/lucidos-updater.key)"
+export TAURI_SIGNING_PRIVATE_KEY_PATH="$HOME/.tauri/lucidos-updater.key"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="…"
 ```
+
+`TAURI_SIGNING_PRIVATE_KEY_PATH` is the self-documenting var holding the key
+**file path**; the release scripts load its contents into
+`TAURI_SIGNING_PRIVATE_KEY` (the only name Tauri's bundler reads). For
+back-compat you can still set `TAURI_SIGNING_PRIVATE_KEY` directly to the key
+contents (`"$(cat ~/.tauri/lucidos-updater.key)"`) or to a path Tauri
+auto-detects — when `TAURI_SIGNING_PRIVATE_KEY_PATH` is unset that value is
+honored unchanged.
 
 This emits `*.app.tar.gz` + `*.app.tar.gz.sig` alongside the `.dmg`.
 `bundle.createUpdaterArtifacts: true` is already set in `tauri.conf.json` (Tauri

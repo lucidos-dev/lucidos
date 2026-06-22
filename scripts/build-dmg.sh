@@ -34,17 +34,24 @@
 #
 # Credentials in --release mode come ONLY from the auto-injected environment
 # (APPLE_ID / APPLE_TEAM_ID are DB env vars; APPLE_PASSWORD /
-# TAURI_SIGNING_PRIVATE_KEY are credentials mapped to those names). This script
-# never re-exports or overrides them — it asserts each is non-empty at startup and
-# fails loud if one is missing (the v0.10.1 clobber bug was an empty
-# `export APPLE_ID="$CRED_APPLE_ID"` in the hand-improvised LLM layer).
+# TAURI_SIGNING_PRIVATE_KEY_PATH are credentials mapped to those names). This
+# script never re-exports or overrides the Apple secrets — it asserts each is
+# non-empty at startup and fails loud if one is missing (the v0.10.1 clobber bug
+# was an empty `export APPLE_ID="$CRED_APPLE_ID"` in the hand-improvised LLM layer).
+#
+# The updater key is the one exception that IS resolved: supply its FILE PATH via
+# TAURI_SIGNING_PRIVATE_KEY_PATH (e.g. ~/.tauri/lucidos-updater.key) and the script
+# loads the contents into TAURI_SIGNING_PRIVATE_KEY — the only name Tauri's bundler
+# reads. For back-compat, TAURI_SIGNING_PRIVATE_KEY set directly (contents, or a
+# path Tauri auto-detects) is still honored and left untouched.
 #
 # Usage:
 #   ./scripts/build-dmg.sh                 # build an unsigned local .dmg (no events)
 #   ./scripts/build-dmg.sh --check         # validate the staged resource contract
 #   APPLE_SIGNING_IDENTITY="Developer ID Application: …" \
 #   APPLE_ID=… APPLE_PASSWORD=… APPLE_TEAM_ID=… \
-#   TAURI_SIGNING_PRIVATE_KEY=… TAURI_SIGNING_PRIVATE_KEY_PASSWORD=… \
+#   TAURI_SIGNING_PRIVATE_KEY_PATH=~/.tauri/lucidos-updater.key \
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD=… \
 #     ./scripts/build-dmg.sh               # signed + notarized (local, no events/upload)
 #   ./scripts/build-dmg.sh --release \
 #     --release-version <N.N.N> --upload-tag v<N.N.N> \
@@ -84,8 +91,20 @@ PG_VERSION="${PG_VERSION:-18.4.0}"   # match the dev/docker stack (pgvector/pgve
 PGVECTOR_VERSION="${PGVECTOR_VERSION:-0.8.2}"
 
 # Shared ReleaseStep* / LucidosReleased emit helpers (the cockpit contract).
+# This lib is internal release tooling and is stripped from the public mirror, so
+# source it only when present and fall back to no-op stubs otherwise -- the DMG
+# build itself never depends on event emission.
 # shellcheck source=scripts/lib/release_events.sh
-source "$SCRIPT_DIR/lib/release_events.sh"
+if [ -f "$SCRIPT_DIR/lib/release_events.sh" ]; then
+    source "$SCRIPT_DIR/lib/release_events.sh"
+else
+    emit_release_step() { :; }
+    emit_lucidos_released() { :; }
+fi
+
+# Tauri updater-key resolution (TAURI_SIGNING_PRIVATE_KEY_PATH → contents export).
+# shellcheck source=scripts/lib/tauri_signing_key.sh
+source "$SCRIPT_DIR/lib/tauri_signing_key.sh"
 
 # Release-mode state (set by arg parsing below). In default (local-build) mode
 # RELEASE_MODE stays 0: no events, no asserted creds, no asset upload.
@@ -147,7 +166,10 @@ assert_release_credentials() {
     [ -n "${APPLE_ID:-}" ]                 || missing+=("APPLE_ID")
     [ -n "${APPLE_PASSWORD:-}" ]           || missing+=("APPLE_PASSWORD")
     [ -n "${APPLE_TEAM_ID:-}" ]            || missing+=("APPLE_TEAM_ID")
-    [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] || missing+=("TAURI_SIGNING_PRIVATE_KEY")
+    # By here resolve_tauri_signing_private_key has already loaded the key from
+    # TAURI_SIGNING_PRIVATE_KEY_PATH (if that was how it was supplied), so an empty
+    # TAURI_SIGNING_PRIVATE_KEY means neither var was set.
+    [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] || missing+=("TAURI_SIGNING_PRIVATE_KEY_PATH (path to the updater key) or TAURI_SIGNING_PRIVATE_KEY (key contents)")
     if [ "${#missing[@]}" -gt 0 ]; then
         die "release mode requires these auto-injected vars to be non-empty: ${missing[*]} (do NOT export/override them — they are injected as DB env vars + mapped credentials; see docs/desktop-app.md § Shipping)"
     fi
@@ -186,7 +208,8 @@ Usage:
   ./scripts/build-dmg.sh --check         # validate the staged resource contract
   APPLE_SIGNING_IDENTITY="Developer ID Application: …" \
   APPLE_ID=… APPLE_PASSWORD=… APPLE_TEAM_ID=… \
-  TAURI_SIGNING_PRIVATE_KEY=… TAURI_SIGNING_PRIVATE_KEY_PASSWORD=… \
+  TAURI_SIGNING_PRIVATE_KEY_PATH=~/.tauri/lucidos-updater.key \
+  TAURI_SIGNING_PRIVATE_KEY_PASSWORD=… \
     ./scripts/build-dmg.sh               # signed + notarized (local, no events/upload)
   ./scripts/build-dmg.sh --release \
     --release-version <N.N.N> --upload-tag v<N.N.N> \
@@ -201,6 +224,13 @@ Release-mode flags:
   --upload-tag TAG     GitHub Release tag to attach the DMG + updater assets to
   --notes-file FILE    CHANGELOG section used as the latest.json `notes`
   --repo-slug OWNER/R  GitHub repo for the release (default lucidos-dev/lucidos)
+
+Updater signing key:
+  TAURI_SIGNING_PRIVATE_KEY_PATH   path to the updater key (e.g.
+                                   ~/.tauri/lucidos-updater.key); loaded into
+                                   TAURI_SIGNING_PRIVATE_KEY (what Tauri reads).
+  TAURI_SIGNING_PRIVATE_KEY        back-compat: the key contents directly (or a
+                                   path Tauri auto-detects).
 
 Env knobs (all optional):
   PG_VERSION        relocatable PostgreSQL version       (default 18.4.0)
@@ -263,6 +293,17 @@ fi
 # Now that EFFECTIVE_VERSION + RELEASE_MODE are known, arm the failure trap so any
 # stage error emits ReleaseStepFailed for the in-flight step.
 trap on_err ERR
+
+# Resolve the Tauri updater signing key before any credential assertion or build:
+# TAURI_SIGNING_PRIVATE_KEY_PATH (the self-documenting var holding the key FILE
+# PATH, e.g. ~/.tauri/lucidos-updater.key) is loaded into TAURI_SIGNING_PRIVATE_KEY
+# — the only name Tauri's bundler reads — so `cargo tauri build` below emits the
+# signed .app.tar.gz.sig. If only the legacy TAURI_SIGNING_PRIVATE_KEY is set
+# (contents, or a path Tauri auto-detects), it is left untouched. A PATH that
+# doesn't resolve to a readable, non-empty file fails loud here. Harmless when
+# neither var is set (unsigned local build).
+resolve_tauri_signing_private_key \
+    || die "could not load the Tauri updater key from TAURI_SIGNING_PRIVATE_KEY_PATH (see the error above)"
 
 # Release mode relies solely on auto-injected creds — assert before any work so a
 # missing var fails loud instead of silently skipping notarization.
@@ -356,13 +397,32 @@ step "Running cargo tauri build (app + dmg)"
 # so normal `cargo check` / dev builds aren't tied to staged artifacts).
 RESOURCES_CONFIG="$(tauri_build_config_json)"
 TAURI_BUILD_ARGS=(tauri build --bundles app,dmg --config "$RESOURCES_CONFIG")
+
+# A no-password updater key is still signed with an EMPTY password, not "no
+# password env at all". Tauri defaults the password to empty when the var is
+# unset, but we set it explicitly so the path stays robust if Tauri ever tightens
+# this. (Harmless for the no-password key this repo ships; see context in
+# docs/desktop-app.md § Shipping.)
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
+
 if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
-    # Tauri signs sidecars/framework-style nested code, but these CLI tools are
-    # plain Resources entries. Build unsigned, then sign the exact resource
-    # binaries before refreshing the DMG payload below.
-    TAURI_BUILD_ARGS+=(--no-sign)
+    # Tauri's macOS codesign skips loose Mach-O Resources (the ~200 relocatable
+    # Postgres binaries), so we sign the bundle ourselves further down. We must
+    # therefore make Tauri's build NOT macOS-codesign — but WITHOUT suppressing
+    # the Tauri UPDATER signature.
+    #
+    # The `--no-sign` flag does BOTH: it skips macOS codesign AND skips updater
+    # signing, so the `.app.tar.gz` was produced with no sibling `.app.tar.gz.sig`
+    # (the v0.11.0 upload failure: "no .app.tar.gz.sig produced"). Instead, run the
+    # build with APPLE_SIGNING_IDENTITY removed from the SUBPROCESS env only:
+    # Tauri sees no identity and skips macOS codesigning, but still signs the
+    # updater tarball from TAURI_SIGNING_PRIVATE_KEY, emitting the `.sig`. The
+    # outer-shell APPLE_SIGNING_IDENTITY is untouched, so our manual sign below
+    # still runs.
+    (cd "$APP_DIR" && env -u APPLE_SIGNING_IDENTITY cargo "${TAURI_BUILD_ARGS[@]}")
+else
+    (cd "$APP_DIR" && cargo "${TAURI_BUILD_ARGS[@]}")
 fi
-(cd "$APP_DIR" && cargo "${TAURI_BUILD_ARGS[@]}")
 
 BUNDLE_DIR="$REPO_ROOT/target/release/bundle"
 DMG_PATH="$(/usr/bin/find "$BUNDLE_DIR/dmg" -name '*.dmg' 2>/dev/null | head -1 || true)"
@@ -534,8 +594,8 @@ upload_release_assets() {
     local app_tarball app_sig
     app_tarball="$(/usr/bin/find "$BUNDLE_DIR/macos" -name '*.app.tar.gz' 2>/dev/null | head -1 || true)"
     app_sig="$(/usr/bin/find "$BUNDLE_DIR/macos" -name '*.app.tar.gz.sig' 2>/dev/null | head -1 || true)"
-    [ -n "$app_tarball" ] || die "no .app.tar.gz produced — is TAURI_SIGNING_PRIVATE_KEY set?"
-    [ -n "$app_sig" ]     || die "no .app.tar.gz.sig produced — is TAURI_SIGNING_PRIVATE_KEY set?"
+    [ -n "$app_tarball" ] || die "no .app.tar.gz produced — is the updater key set (TAURI_SIGNING_PRIVATE_KEY_PATH or TAURI_SIGNING_PRIVATE_KEY)?"
+    [ -n "$app_sig" ]     || die "no .app.tar.gz.sig produced — is the updater key set (TAURI_SIGNING_PRIVATE_KEY_PATH or TAURI_SIGNING_PRIVATE_KEY)?"
 
     # latest.json (the in-app auto-update manifest). The uploaded asset's name is
     # the file's basename, and the updater endpoint resolves
@@ -602,5 +662,5 @@ if [ -n "$UPDATER_SIG" ]; then
     echo "  → upload the .dmg, .app.tar.gz, .sig and a latest.json to a GitHub Release"
     echo "    (plugins.updater.endpoints in tauri.conf.json points at latest.json)."
 else
-    echo "  (no updater .sig — set TAURI_SIGNING_PRIVATE_KEY to emit signed update artifacts.)"
+    echo "  (no updater .sig — set TAURI_SIGNING_PRIVATE_KEY_PATH to the updater key to emit signed update artifacts.)"
 fi

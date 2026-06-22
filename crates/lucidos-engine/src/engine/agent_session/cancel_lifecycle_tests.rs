@@ -69,6 +69,7 @@ fn cancel_classifies_as_canceled_with_emit_idle_true() {
     let (terminal, emit_idle) = classify_result(
         is_silent_resume,
         user_hit_stop,
+        false, // interrupt_is_redirect: a plain Stop, not a follow-up redirect
         is_shutdown,
         None,
         false,
