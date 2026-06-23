@@ -100,11 +100,11 @@ export function dispatchDeepLink(target: DeepLinkTarget): boolean {
       handleNavigationRequest(action.to);
       return true;
     case 'view-notification':
-      // viewNotification opens the inbox modal AND marks the row read.
-      // It's async (fetches the full row), but the modal-open + mark-read
-      // are best-effort from the dispatcher's POV: `viewNotification` owns
-      // its own failure toast on the GET, so `void` here keeps the
-      // discriminated return synchronous without dropping the error path.
+      // viewNotification opens the detail in the content pane AND marks the row
+      // read. It's async (fetches the full row), but the open + mark-read are
+      // best-effort from the dispatcher's POV: `viewNotification` owns its own
+      // failure toast on the GET, so `void` here keeps the discriminated return
+      // synchronous without dropping the error path.
       void viewNotification(action.id);
       return true;
     case 'mark-read':
@@ -247,7 +247,7 @@ export function showInAppNotificationToast({ title, body, target }: InAppNotific
   // The toast is ambient (see notifications.md §4) — an Open button is only
   // meaningful when the deep link actually navigates somewhere the toast
   // itself doesn't already show. A `view-notification` action would open the
-  // inbox modal for the same title + body the toast already renders.
+  // detail panel for the same title + body the toast already renders.
   const resolved = resolveDeepLink(target);
   const hasNavigationTarget = resolved.type === 'navigate';
   // This notification is being surfaced in-app now, so the resume affordance

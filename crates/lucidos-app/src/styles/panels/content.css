@@ -109,11 +109,31 @@
     font-family: var(--font-ui);
 }
 
+/* ─── Notification detail (rendered in the content pane) ─── */
+/* The pane's own .content-pane-body scrolls, so the detail lays out at natural
+   height — no nested flex:1/overflow scroll region (which had no defined height
+   outside the former modal's flex column). */
+.notification-detail {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.notification-detail-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 1rem 0;
+}
+
+.notification-detail-date {
+    margin-left: auto;
+    font-size: 0.625rem;
+    color: var(--text-muted);
+}
+
 /* Markdown rules inherited from .markdown-content in global.css */
 .notification-detail-body {
-    flex: 1;
-    overflow-y: auto;
-    overscroll-behavior: contain;
     padding: 1rem;
     font-size: 0.6875rem;
     color: var(--text-secondary);
@@ -142,64 +162,6 @@
     display: flex;
     gap: 0.5rem;
     padding: 0.75rem 1rem;
-}
-
-/* ─── Notifications modal ─── */
-/* Center modal over the content pane, not the full viewport */
-.notifications-modal-overlay {
-    align-items: flex-start;
-    padding-top: calc(4rem + env(safe-area-inset-top, 0px));
-    padding-left: calc(var(--divider-x) + var(--divider-width));
-    transition: padding-left var(--duration-slow) ease;
-}
-
-:root[data-content-collapsed] .notifications-modal-overlay {
-    padding-left: 0;
-}
-
-@media (max-width: 768px) {
-    .notifications-modal-overlay {
-        padding-left: 0;
-    }
-}
-
-.notifications-modal {
-    display: flex;
-    flex-direction: column;
-    max-width: 32rem;
-    width: 100%;
-    max-height: min(36rem, 80vh);
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
-    box-shadow: var(--shadow-lg);
-    overflow: hidden;
-}
-
-.notifications-modal-header {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.75rem 1rem;
-    -webkit-user-select: none;
-    user-select: none;
-}
-
-.notifications-modal-title {
-    flex: 1;
-    font-weight: 600;
-    font-size: 0.8125rem;
-    display: flex;
-    align-items: flex-start;
-    gap: 0.375rem;
-    min-width: 0;
-    word-break: break-word;
-}
-
-.notifications-modal-detail-date {
-    font-size: 0.625rem;
-    color: var(--text-muted);
-    padding: 0.5rem 1rem 0;
 }
 
 /* Content views */

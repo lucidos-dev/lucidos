@@ -926,7 +926,8 @@ impl LucidosEngine {
         // window (e.g. ~1.49M chars for Opus `[1m]` vs ~288k chars for default
         // 200k-token Claude), so Opus turns aren't trimmed back to the smaller
         // model's limit.
-        let resolved_model = model_override.unwrap_or_else(|| self.llm.default_model());
+        let provider = self.current_provider();
+        let resolved_model = model_override.unwrap_or_else(|| provider.default_model());
         let total_budget = agent_context_char_budget(resolved_model);
         let prompt_overhead: usize = system_prompt.len()
             + tools

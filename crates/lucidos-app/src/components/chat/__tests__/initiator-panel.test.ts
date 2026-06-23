@@ -356,3 +356,99 @@ describe('describeInitiator — user control turns render iconless (ResponseCanc
     expect(crash.label).toBe(SYSTEM_LABEL);
   });
 });
+
+// Recursively flatten a vnode tree to its visible text — the divider header
+// `status` is a `<span>` vnode (label + optional glyph), not a bare string.
+function textOf(node: ComponentChildren): string {
+  if (node == null || node === false || node === true) return '';
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(textOf).join('');
+  return textOf((node as AnyVNode).props?.children);
+}
+
+function classOf(node: ComponentChildren): string {
+  return ((node as AnyVNode)?.props?.class as string) ?? '';
+}
+
+const askedDivider = (steps: Exchange['steps'] = []): Exchange => ({
+  userEvent: {
+    type: 'UserQuestionAsked',
+    tool_use_id: 'tu_div',
+    cc_session_id: 'sess',
+    question: 'Approve this plan?',
+    options: [{ id: 'opt-0', label: 'Approve' }],
+  } as Exchange['userEvent'],
+  userSeq: 0,
+  steps,
+});
+
+const sysAbort = (seq: number): Exchange['steps'][number] => ({
+  seq,
+  event: { type: 'ResponseAborted', cause: 'recovery_after_restart', actor: { kind: 'system' } } as Exchange['userEvent'],
+});
+
+// Regression: a question/permission divider whose turn ended WITHOUT the user
+// answering must not claim the user "Canceled" it. A system abort (engine
+// restart recovery) — like every other unanswered-terminal cause — reads as
+// "Unanswered" / "Unresolved"; only an explicit user cancel reads "Canceled".
+// The turn's actual terminal cause (Aborted ⚠ / Error ✕) is carried by the
+// response panel + the abort boundary, not the divider header.
+describe('describeInitiator — divider header reflects the QUESTION, not the turn', () => {
+  it('system-aborted unanswered question reads "Unanswered", never "Canceled"', () => {
+    const desc = describeInitiator(askedDivider([sysAbort(1)]), '', [], 'tid', /*responseTerminated*/ true, /*threadIsCC*/ true);
+    expect(textOf(desc.status)).toContain('Unanswered');
+    expect(textOf(desc.status)).not.toContain('Canceled');
+  });
+
+  it('agent-overtaken unanswered question reads "Unanswered" (terminated, no answer)', () => {
+    const ex = askedDivider();
+    ex.questionOvertaken = true;
+    const desc = describeInitiator(ex, '', [], 'tid', /*responseTerminated*/ true, /*threadIsCC*/ true);
+    expect(textOf(desc.status)).toContain('Unanswered');
+    expect(textOf(desc.status)).not.toContain('Canceled');
+  });
+
+  it('user-canceled question still reads "Canceled ✕"', () => {
+    const desc = describeInitiator(
+      askedDivider([{ seq: 1, event: { type: 'UserQuestionAnswered', tool_use_id: 'tu_div', answer: { kind: 'Canceled' } } as Exchange['userEvent'] }]),
+      '', [], 'tid', /*responseTerminated*/ true, /*threadIsCC*/ true,
+    );
+    expect(textOf(desc.status)).toContain('Canceled');
+    expect(classOf(desc.status)).toContain('exchange-status-canceled');
+  });
+
+  it('answered question reads "Answered ✓" even with a trailing abort', () => {
+    const desc = describeInitiator(
+      askedDivider([
+        { seq: 1, event: { type: 'UserQuestionAnswered', tool_use_id: 'tu_div', answer: { kind: 'Selected', option_id: 'opt-0' } } as Exchange['userEvent'] },
+        sysAbort(2),
+      ]),
+      '', [], 'tid', /*responseTerminated*/ true, /*threadIsCC*/ true,
+    );
+    expect(textOf(desc.status)).toContain('Answered');
+    expect(textOf(desc.status)).not.toContain('Unanswered');
+  });
+
+  it('pending (live) question reads "Needs your answer"', () => {
+    const desc = describeInitiator(askedDivider(), '', [], 'tid', /*responseTerminated*/ false, /*threadIsCC*/ true);
+    expect(textOf(desc.status)).toContain('Needs your answer');
+  });
+
+  it('system-aborted unresolved permission reads "Unresolved", never "Canceled"', () => {
+    const ex: Exchange = {
+      userEvent: {
+        type: 'CodingAgentPermissionRequest',
+        request_id: 'req-1',
+        tool_use_id: 'tu-1',
+        tool_name: 'Bash',
+        input: {},
+        summary: 'run a command',
+      } as Exchange['userEvent'],
+      userSeq: 0,
+      steps: [sysAbort(1)],
+    };
+    const desc = describeInitiator(ex, '', [], 'tid', /*responseTerminated*/ true, /*threadIsCC*/ true);
+    expect(textOf(desc.status)).toContain('Unresolved');
+    expect(textOf(desc.status)).not.toContain('Canceled');
+  });
+});

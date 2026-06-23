@@ -75,3 +75,28 @@ describe('answer control Cancel/Submit have tap-gate scroll protection', () => {
     expect(promptSource).toMatch(/if\s*\(!morphGate\.isTap\(\)\)\s*return;\s*void submit\(\)/);
   });
 });
+
+// The scroll-vs-tap gate stops a *moving* touch; it does NOT stop a laggy
+// *repeat* tap on the same spot after the constructive Send/Submit morphs in
+// place into the destructive Cancel/Stop. That's the post-submit settle window
+// (armCancelSettle / isCancelSettling): a constructive tap arms it, and while it
+// is active the morphed Cancel/Stop renders disabled and the cancel path bails.
+// Source-grep tripwires so removing any leg of the protection fails loudly.
+describe('post-submit cancel settle window is wired', () => {
+  it('arms the settle window when a message/answer is sent', () => {
+    // Both the normal send path (submit) and the multi-select answer path.
+    expect((promptSource.match(/armCancelSettle\(\)/g) ?? []).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('belts the shared cancel helper with the settle check', () => {
+    expect(promptSource).toMatch(/function cancelExchangeForTarget\(\)\s*\{[\s\S]*?if\s*\(isCancelSettling\(\)\)\s*return;/);
+  });
+
+  it('disables the morph Stop while settling', () => {
+    expect(promptSource).toMatch(/morphMode === 'cancel' \? cancelSettling/);
+  });
+
+  it('disables the answer-control lone Cancel while settling', () => {
+    expect(promptSource).toMatch(/disabled=\{cancelSettling\}/);
+  });
+});

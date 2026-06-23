@@ -217,7 +217,7 @@ impl MemoryExtractor {
         if model.starts_with("gpt-") {
             let key = self.openai_api_key.clone().ok_or_else(|| {
                 format!(
-                    "OpenAI background model '{model}' selected but no OpenAI key is configured (Settings → Providers or OPENAI_API_KEY)"
+                    "OpenAI background model '{model}' selected but no OpenAI key is configured (Settings → Models → Providers or OPENAI_API_KEY)"
                 )
             })?;
             Ok(Arc::new(OpenAiProvider::new(key, model.to_string())?))

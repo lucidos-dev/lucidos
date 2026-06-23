@@ -7,7 +7,12 @@ import { ChevronUpIcon } from './icons';
 /** A one-tap primary face joined to a caret that opens an upward Overlay menu
  *  of secondary actions. The face + caret read as a single pill (the CSS
  *  `.split-button-*` classes strip the touching radii and add a hairline
- *  divider). The caret is the Overlay `anchor`, so re-tapping it closes via its
+ *  divider). When open, the wrapper gets `.open`: the menu (above) and a
+ *  `.split-button.open::before` backing (behind the pills) form one slightly
+ *  translucent frosted frame wrapping the button. Both are out of flow, so the
+ *  button stays a steady base — opening changes only paint, never layout (see
+ *  `.split-button.open` / `.split-button-menu` in host-components.css).
+ *  The caret is the Overlay `anchor`, so re-tapping it closes via its
  *  own handler while a tap on the (inert-while-open) primary face dismisses the
  *  menu rather than firing the primary action by accident.
  *
@@ -44,7 +49,7 @@ export function SplitButton(props: SplitButtonProps) {
   const hasMenu = props.menuItems.length > 0;
   const close = () => { open.value = false; };
   return (
-    <div class="split-button" data-row-item>
+    <div class={`split-button${open.value ? ' open' : ''}`} data-row-item>
       <button
         class={`${props.primaryClassName} split-button-primary`}
         data-tooltip={props.primaryTooltip}

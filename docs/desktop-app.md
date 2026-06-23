@@ -26,7 +26,7 @@ window). On boot it:
    with `LUCIDOS_GATEWAY_DATA`, `LUCIDOS_GATEWAY_PG_BACKEND=embedded`,
    `LUCIDOS_PG_BIN_DIR`, `LUCIDOS_PG_LIB_DIR`, `LUCIDOS_ENGINE_BIN`,
    `LUCIDOS_STATIC_DIR`, `LUCIDOS_SDK_DIR`, `FASTEMBED_CACHE_DIR`, and
-   `LUCIDOS_FALLBACK_MOCK=1`,
+   `LUCIDOS_BOOT_WITHOUT_PROVIDER=1`,
 3. the gateway creates/loads the workspace registry, auto-creates the first
    `default` workspace, provisions embedded Postgres for workspaces that need it,
    and spawns one loopback-only `lucidos-engine` per running workspace,
@@ -53,9 +53,13 @@ The stable gateway port is persisted at `<app-data>/config/engine-port`
 so the mobile connect URL never changes across restarts. The gateway is the
 network-facing surface; packaged engines bind loopback-only behind it.
 
-`LUCIDOS_FALLBACK_MOCK` lets workspace engines boot before any provider is
-configured (they would otherwise panic). First run is mock; the user adds a
-provider in **Settings → Providers**, then restarts into the real provider.
+`LUCIDOS_BOOT_WITHOUT_PROVIDER` lets workspace engines boot before any provider
+is configured (they would otherwise panic). First run installs the
+`UnconfiguredProvider` — a sentinel that boots cleanly but returns a clear
+"No LLM provider configured" error on chat (never mock output) and reports
+`llm_configured: false` on `/health`, which the app uses to show first-run
+provider onboarding. The user adds a provider in **Settings → Providers**, then
+restarts into the real provider.
 
 None of this runs in development — `scripts/tauri-dev.sh` still uses Docker
 Postgres + a natively-built engine, and the client launcher/updater

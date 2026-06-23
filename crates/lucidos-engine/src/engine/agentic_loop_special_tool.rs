@@ -817,6 +817,10 @@ impl LucidosEngine {
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let tools = build_intent_tools();
 
+        // Pin ONE provider Arc for this whole intent sub-loop — a runtime swap
+        // (credential added/removed) must not change the in-flight provider.
+        let provider = self.current_provider();
+
         let mut messages = vec![Message {
             role: "user".to_string(),
             content: MessageContent::Text(format!("Task: {}", task)),
@@ -845,8 +849,7 @@ impl LucidosEngine {
             trim_context_if_needed(&mut messages, message_budget, None);
 
             // Call LLM with no streaming (sub-loop doesn't stream text to frontend)
-            let response = self
-                .llm
+            let response = provider
                 .chat(
                     messages.clone(),
                     tools.clone(),

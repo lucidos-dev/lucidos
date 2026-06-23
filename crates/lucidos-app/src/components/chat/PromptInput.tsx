@@ -27,7 +27,7 @@ import { CodingAgentControlMenu, codingAgentMenuOpenRequest } from './CodingAgen
 import { LucidosControlMenu } from './LucidosControlMenu';
 import { TodoListIndicator } from './TodoListPanel';
 import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton, type BannerState } from './WaitingBanner';
-import { composeHasContent, computeMorphMode, computeAnswerActionMode, dispatchSend, computeSubmitMultiCount, findPendingMultiSelectQuestion, findLatestPendingQuestion, shouldClearCanceling, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, type UploadSendIntent } from './prompt-input-helpers';
+import { composeHasContent, computeMorphMode, computeAnswerActionMode, dispatchSend, computeSubmitMultiCount, findPendingMultiSelectQuestion, findLatestPendingQuestion, shouldClearCanceling, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
 import { SplitButton } from '../shared/SplitButton';
 import { resolveThreadActions } from '../../store/actions/threadActions';
 export * from './prompt-input-helpers';
@@ -310,6 +310,8 @@ export function PromptInput() {
     const useCodingAgent = effectiveSendMode(thread) === 'claude_code';
     const context = currentChatContext();
     if (threadId && uploadInFlight) {
+      // A queued send still flips the button to the optimistic Cancel — settle.
+      armCancelSettle();
       queueUploadSend(threadId, { useCodingAgent, context });
       preserveAtBottom();
       return;
@@ -319,6 +321,11 @@ export function PromptInput() {
     scrollToBottom();
     if (isMobile()) el.blur();
 
+    // This constructive tap is about to morph the same button into the
+    // destructive Cancel/Stop (Send→Stop via the optimistic submitting flag, or
+    // Submit→Cancel once the draft clears). Arm the settle window NOW so a laggy
+    // repeat tap can't land on it. See armCancelSettle.
+    armCancelSettle();
     await beginSend(threadId, thread, msg, currentImages, { useCodingAgent, context });
   }
 
@@ -533,6 +540,12 @@ export function PromptInput() {
     hasBannerOrSectionButtons: !!bannerState,
   });
 
+  // Post-submit settle: while true, the destructive Cancel/Stop morph renders
+  // disabled so a laggy repeat tap can't abort the just-started turn. Read once
+  // here so the render subscribes to the arm/expire signal transitions; used by
+  // both the answer-control Cancel and the morph button below.
+  const cancelSettling = isCancelSettling();
+
   // Release the optimistic canceling flag once the cancel has landed. The set
   // survives component re-renders by design (button lives in the always-visible
   // prompt area) — without explicit release the flag sticks across the next
@@ -616,6 +629,9 @@ export function PromptInput() {
     const text = el?.value.trim() ?? '';
     const ids = getMultiSelectedIds(pendingMultiQ.toolUseId);
     if (ids.length === 0 && text.length === 0) return;
+    // Once answered, pendingMultiQ clears and the row falls to the lone Cancel —
+    // settle so a repeat tap can't abort the resuming turn. See armCancelSettle.
+    armCancelSettle();
     preserveAtBottom();
     const answer: AnswerKind = {
       kind: 'MultiSelected',
@@ -651,6 +667,11 @@ export function PromptInput() {
   // answers the cancel by re-asking (thread stays mid-turn). A queued
   // upload-send is dropped instead — there's no live turn to interrupt yet.
   function cancelExchangeForTarget() {
+    // Within the post-submit settle window the destructive morph is held
+    // disabled; this is the belt to the disabled prop's suspenders, so a tap
+    // that slips through (e.g. fired in the same frame before disabled applied)
+    // still can't abort the turn the user just started. See armCancelSettle.
+    if (isCancelSettling()) return;
     const targetId = cancelTargetId;
     if (!targetId) return;
     const targetQuestionId = findLatestPendingQuestion(focusedThread)?.toolUseId;
@@ -724,6 +745,10 @@ export function PromptInput() {
       key="answer-lone"
       type="button"
       class="action-btn action-btn-danger"
+      // Held disabled for the post-submit settle window so a laggy repeat tap
+      // (the Submit the user just pressed morphed into this Cancel) can't abort
+      // the resuming turn. cancelExchangeForTarget belts the same check.
+      disabled={cancelSettling}
       onPointerDown={e => morphGate.down(e.clientX, e.clientY)}
       onPointerMove={e => morphGate.move(e.clientX, e.clientY)}
       onPointerCancel={() => morphGate.cancel()}
@@ -764,7 +789,9 @@ export function PromptInput() {
       tabIndex={morphMode === 'send' || morphMode === 'cancel' ? undefined : -1}
       disabled={
         morphMode === 'send' ? false
-        : morphMode === 'cancel' ? false
+        // Hold the just-morphed Stop disabled for the post-submit settle window
+        // so a laggy repeat tap of Send can't immediately cancel the turn.
+        : morphMode === 'cancel' ? cancelSettling
         : true
       }
       data-tooltip={

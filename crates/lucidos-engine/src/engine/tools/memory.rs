@@ -126,7 +126,7 @@ If NONE should be deleted, reply with "none"."#,
         }];
 
         let verified_indices: Vec<usize> = match self
-            .llm
+            .current_provider()
             .chat(messages, vec![], None, None, None, None)
             .await
         {

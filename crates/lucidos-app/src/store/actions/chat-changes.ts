@@ -1,4 +1,5 @@
-import { showToast, dismissToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, updateAvailable, restartGroups, applyingChangeIds, applyAllInProgress, toasts, engineRestarting, engineVersion, latestEngineVersion, enginePackaged } from '../store';
+import { showToast, dismissToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, updateAvailable, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, toasts, engineRestarting, engineVersion, latestEngineVersion, enginePackaged } from '../store';
+import { changeToastMessage } from './changeToast';
 import { toFailed } from '../types';
 import type { Loadable } from '../types';
 import type { RestartGroup } from '../store';
@@ -246,6 +247,52 @@ export function restoreRestartToast(): void {
   }
 }
 
+/** Reconcile the optimistic Apply Now state (`applyingNowThreadIds` + the
+ *  sticky `applying-<threadId>` spinner toast) against backend truth fetched on
+ *  resume / reconnect / startup.
+ *
+ *  The per-thread state is normally cleared by the live ChangeApplied /
+ *  ChangeApplyFailed SSE event. If that event is missed — an iOS PWA suspend, an
+ *  SSE reconnect gap — the spinner toast sticks "Applying changes…" forever and
+ *  the WaitingBanner stays on a disabled "Apply..." even though the change
+ *  already applied. This mirrors the `apply_all_in_progress` rehydration.
+ *
+ *  A thread is still genuinely applying iff its change is still pending (the row
+ *  flips to `applied` only on success, staying pending through harden / merge /
+ *  conflict resolution) OR the thread is mid-turn (CC is running the apply, or
+ *  hasn't proposed the change yet). Anything else means the apply resolved while
+ *  we weren't listening — drop the optimistic state and resolve the toast:
+ *  "Applied" when the change landed in the applied list, otherwise dismiss it.
+ *  `pending` is the complete unbounded list, so absence is authoritative. */
+function reconcileApplyingNow(pending: Change[], applied: Change[]): void {
+  const tracked = applyingNowThreadIds.value;
+  if (tracked.size === 0) return;
+  const pendingThreadIds = new Set(
+    pending.map((c) => c.thread_id).filter((id): id is string => !!id),
+  );
+  const next = new Map(tracked);
+  let changed = false;
+  for (const threadId of tracked.keys()) {
+    if (pendingThreadIds.has(threadId)) continue; // change still pending → applying
+    const thread = threadMap.value.get(threadId);
+    if (thread && isMidTurn(effectiveThreadStatus(thread))) continue; // CC running the apply
+    next.delete(threadId);
+    changed = true;
+    const key = `applying-${threadId}`;
+    const appliedChange = applied.find((c) => c.thread_id === threadId);
+    if (appliedChange) {
+      showToast(changeToastMessage('Applied', threadId, appliedChange.description), 'success', {
+        key,
+        onClick: () => focusThread(threadId),
+        autoDismissMs: TOAST_AUTO_DISMISS_MS,
+      });
+    } else {
+      dismissToast(key);
+    }
+  }
+  if (changed) applyingNowThreadIds.value = next;
+}
+
 /** Fetch changes from backend and update all related signals.
  *  On TimeoutError (10s client timeout) we retry once before bothering the user:
  *  the iOS PWA fires this from `runResumeSync` after every visibilitychange,
@@ -284,6 +331,12 @@ export function refreshChangesState(): void {
       // while the batch is still running. The effects.ts edge-guard shows/hides
       // the toast off this signal.
       applyAllInProgress.value = state.apply_all_in_progress ?? false;
+      // Same rehydration for the per-thread Apply Now state: its optimistic
+      // spinner toast + WaitingBanner "Apply..." clear only on the live
+      // ChangeApplied/ChangeApplyFailed SSE event, so a missed event (iOS PWA
+      // suspend, an SSE reconnect gap) strands them even though the apply
+      // finished. Reconcile against the freshly-fetched backend truth.
+      reconcileApplyingNow(state.pending, applied);
       if (hasClientUpdateSincePageLoad(applied)) updateAvailable.value = true;
       syncRestartToast();
     })

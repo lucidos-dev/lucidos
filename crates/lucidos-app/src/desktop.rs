@@ -88,8 +88,15 @@ struct GatewayService {
 }
 
 impl GatewayService {
-    /// Stop the gateway, then the engines it spawned. Best-effort; logs failures.
-    fn shutdown(&mut self, app_data: &Path) {
+    /// Stop the gateway, then the engines it spawned, then the embedded Postgres
+    /// cluster. Best-effort; logs failures.
+    ///
+    /// This is the PERMANENT-stop teardown — "Quit Lucidos" (`bootout`) and the
+    /// supervised-exit path both route here. It is NOT reached by the gateway's
+    /// in-place reload (`execv`, same PID), which deliberately leaves the cluster
+    /// running so the re-exec'd image re-adopts it; stopping Postgres here would
+    /// break that re-adoption, so the stop lives in this path only.
+    fn shutdown(&mut self, resources: &Path, app_data: &Path) {
         // The gateway ignores SIGTERM (to survive accidental `xargs kill` from CC
         // test scripts — see engine main.rs); SIGUSR1 is its graceful-stop
         // signal. It exits but deliberately LEAVES its engines running for
@@ -108,7 +115,42 @@ impl GatewayService {
         let _ = self.gateway.kill();
         let _ = self.gateway.wait();
         stop_workspace_engines(app_data);
+        // Stop the embedded cluster last — after the engines that connect to it —
+        // so a permanent shutdown can never leave an orphaned `postgres` holding
+        // the port + postmaster.pid for the next app version to trip over.
+        stop_embedded_postgres(resources, app_data);
     }
+}
+
+/// Stop the embedded Postgres cluster cleanly (`pg_ctl -m fast`) on a permanent
+/// service shutdown. Best-effort + logged; a no-op when no cluster has been
+/// provisioned (no `<app-data>/pgdata/PG_VERSION`). Uses the bundled `pg_ctl` and
+/// libpath — `lucidos-app` links neither the gateway nor engine crate, so this
+/// shells out exactly as the rest of the service role does.
+fn stop_embedded_postgres(resources: &Path, app_data: &Path) {
+    let data = app_data.join("pgdata");
+    if !data.join("PG_VERSION").exists() {
+        return; // no embedded cluster to stop
+    }
+    let bundle = bundled_resources(resources);
+    match embedded_pg_stop_command(&bundle.pg_bin, &bundle.pg_lib, &data).status() {
+        Ok(s) if s.success() => eprintln!("[service] embedded Postgres stopped"),
+        Ok(s) => eprintln!("[service] pg_ctl stop exited with {s}"),
+        Err(e) => eprintln!("[service] failed to run pg_ctl stop: {e}"),
+    }
+}
+
+/// Build the `pg_ctl -D <data> -m fast -w stop` command against the bundled
+/// binaries, with the bundled libpath set (mirrors the gateway's
+/// `with_pg_libpath`). `-m fast` disconnects any still-connected engine clients
+/// and shuts the postmaster down cleanly; `-w` waits for it to finish.
+fn embedded_pg_stop_command(pg_bin: &Path, pg_lib: &Path, data: &Path) -> Command {
+    let mut cmd = Command::new(pg_bin.join("pg_ctl"));
+    cmd.env("DYLD_LIBRARY_PATH", pg_lib);
+    cmd.env("LD_LIBRARY_PATH", pg_lib);
+    cmd.arg("-D").arg(data);
+    cmd.args(["-m", "fast", "-w", "stop"]);
+    cmd
 }
 
 /// SIGUSR1 every workspace engine the gateway spawned (pidfiles under
@@ -320,7 +362,7 @@ pub fn run_service() -> i32 {
     };
     if !wait_for_health(port, ENGINE_HEALTH_TIMEOUT) {
         eprintln!("[service] gateway did not become healthy on port {port}");
-        svc.shutdown(&app_data);
+        svc.shutdown(&resources, &app_data);
         return 1;
     }
     eprintln!("[service] gateway healthy on port {port}; supervising");
@@ -347,7 +389,7 @@ pub fn run_service() -> i32 {
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    svc.shutdown(&app_data);
+    svc.shutdown(&resources, &app_data);
     0
 }
 
@@ -581,9 +623,11 @@ pub fn stop_service() {
 /// registry, provisions one embedded shared Postgres cluster with one database
 /// per workspace, and spawns each workspace's engine (by path via
 /// `LUCIDOS_ENGINE_BIN`, inheriting `LUCIDOS_STATIC_DIR` /
-/// `LUCIDOS_SDK_DIR` / `LUCIDOS_FALLBACK_MOCK` from this env), and reverse-proxies
-/// `/<slug>/`. First run auto-creates a `default` workspace. `LUCIDOS_FALLBACK_MOCK`
-/// lets engines boot before the user has configured a provider (see engine main.rs).
+/// `LUCIDOS_SDK_DIR` / `LUCIDOS_BOOT_WITHOUT_PROVIDER` from this env), and
+/// reverse-proxies `/<slug>/`. First run auto-creates a `default` workspace.
+/// `LUCIDOS_BOOT_WITHOUT_PROVIDER` lets engines boot before the user has
+/// configured a provider — into a clear no-provider onboarding state, NOT mock
+/// output (see engine main.rs).
 fn spawn_gateway(resources: &Path, app_data: &Path, port: u16) -> io::Result<GatewayService> {
     let bundle = bundled_resources(resources);
 
@@ -607,7 +651,7 @@ fn spawn_gateway(resources: &Path, app_data: &Path, port: u16) -> io::Result<Gat
         .env("LUCIDOS_STATIC_DIR", &bundle.frontend)
         .env("LUCIDOS_SDK_DIR", &bundle.sdk)
         .env("FASTEMBED_CACHE_DIR", &fastembed_cache)
-        .env("LUCIDOS_FALLBACK_MOCK", "1")
+        .env("LUCIDOS_BOOT_WITHOUT_PROVIDER", "1")
         .spawn()?;
     Ok(GatewayService { gateway })
 }
@@ -679,6 +723,35 @@ mod tests {
             bundle.pg_lib,
             resources.join(POSTGRES_RESOURCE_NAME).join("lib")
         );
+    }
+
+    #[test]
+    fn embedded_pg_stop_command_uses_fast_mode_against_the_data_dir() {
+        let cmd = embedded_pg_stop_command(
+            Path::new("/r/postgres/bin"),
+            Path::new("/r/postgres/lib"),
+            Path::new("/d/pgdata"),
+        );
+        assert!(cmd
+            .get_program()
+            .to_string_lossy()
+            .ends_with("postgres/bin/pg_ctl"));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["-D", "/d/pgdata", "-m", "fast", "-w", "stop"]);
+    }
+
+    #[test]
+    fn stop_embedded_postgres_is_a_noop_without_a_provisioned_cluster() {
+        // No <app-data>/pgdata/PG_VERSION → must early-return without trying to
+        // spawn a (here, nonexistent) pg_ctl, so this call simply does nothing.
+        let dir = std::env::temp_dir().join(format!("lucidos-nopg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        stop_embedded_postgres(Path::new("/nonexistent/resources"), &dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

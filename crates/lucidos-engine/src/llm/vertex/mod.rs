@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 
+pub mod adc;
 mod claude;
 mod gemini;
 
@@ -59,10 +60,18 @@ pub fn vertex_host(location: &str) -> String {
     }
 }
 
-/// Get a cached gcloud access token, refreshing only when expired (50 min TTL).
-/// Shared by VertexProvider and VertexImagenProvider. The `gcloud` subprocess
-/// runs through `tokio::process::Command` so the runtime worker stays free
-/// during the (cached, rare) refresh.
+/// Get a cached Vertex access token, refreshing only when expired (50 min TTL).
+/// Shared by VertexProvider, VertexImagenProvider, and the MemoryExtractor's
+/// Vertex provider, so every Vertex caller benefits from the same auth.
+///
+/// On a cache miss the token is acquired **ADC-file-first, gcloud-fallback**:
+/// 1. If the user's Application Default Credentials are an `authorized_user`
+///    file (what `gcloud auth application-default login` writes), refresh the
+///    token directly via the OAuth endpoint — **no `gcloud` binary**, so this
+///    works in a packaged build.
+/// 2. Otherwise (no ADC file, an ADC type we don't parse, or a refresh error)
+///    fall back to the `gcloud auth application-default print-access-token`
+///    subprocess — the dev path, unchanged.
 pub async fn get_cached_access_token(
     cache: &TokenCache,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -79,21 +88,39 @@ pub async fn get_cached_access_token(
         }
     }
 
+    let token = fetch_access_token().await?;
+    let mut guard = cache
+        .lock()
+        .map_err(|e| format!("Token cache mutex poisoned: {}", e))?;
+    *guard = Some((token.clone(), std::time::Instant::now()));
+    Ok(token)
+}
+
+/// Acquire a fresh Vertex access token (uncached). ADC-direct first
+/// (packaged-friendly, no binary), then the `gcloud` subprocess fallback.
+async fn fetch_access_token() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(creds) = adc::load() {
+        match adc::refresh_access_token(&creds).await {
+            Ok(token) => return Ok(token),
+            // Don't fail outright — a stale/revoked ADC refresh should still try
+            // the gcloud path (which may re-prompt / use a different config).
+            Err(e) => crate::log!(
+                "[Vertex] ADC token refresh failed, falling back to gcloud: {}",
+                e
+            ),
+        }
+    }
+
     let output = Command::new("gcloud")
         .args(["auth", "application-default", "print-access-token"])
         .output()
         .await?;
 
     if output.status.success() {
-        let token = String::from_utf8(output.stdout)?.trim().to_string();
-        let mut guard = cache
-            .lock()
-            .map_err(|e| format!("Token cache mutex poisoned: {}", e))?;
-        *guard = Some((token.clone(), std::time::Instant::now()));
-        Ok(token)
+        Ok(String::from_utf8(output.stdout)?.trim().to_string())
     } else {
         Err(format!(
-            "Failed to get access token: {}",
+            "Failed to get Vertex access token (no usable ADC file, and gcloud failed): {}",
             String::from_utf8_lossy(&output.stderr)
         )
         .into())

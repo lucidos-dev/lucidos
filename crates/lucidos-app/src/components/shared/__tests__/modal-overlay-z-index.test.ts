@@ -11,8 +11,8 @@ const here: string = dirname(fileURLToPath(import.meta.url));
 const css = readFileSync(resolve(here, '../../../styles/global/base.css'), 'utf-8');
 
 /**
- * Regression test: a modal overlay (StepDetailModal, NotificationsModal,
- * ScaleModal, …) MUST sit above the floating header chrome so it actually
+ * Regression test: a modal overlay (StepDetailModal, ScaleModal, …) MUST sit
+ * above the floating header chrome so it actually
  * blocks the rest of the UI. Previous bug: --z-modal was 2000 while
  * --z-control-panel was 2200, so header buttons (compose, search, menu,
  * thread nav, title) punched through the dim backdrop. Hovering them

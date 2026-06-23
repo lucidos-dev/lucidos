@@ -5,12 +5,14 @@ import {
   notificationsFilter,
   notificationsHasMore,
   notificationsLoadingMore,
-  notificationsModalOpen,
-  notificationModalDetail,
+  panelOverlay,
+  viewingNotification,
   activeMenuItem,
 } from '../store';
 import { toFailed, setLoadingIfFresh } from '../types';
 import { savePreference } from './preferences';
+import { revealContentPane } from './pane';
+import { pushNavState, replaceNavState } from './navigation';
 import {
   getNotifications,
   getNotification,
@@ -178,12 +180,13 @@ export async function loadUnreadNotifications(): Promise<void> {
 
 /** Handle notification SSE events (NotificationCreated/Read/AllRead). Reloads
  *  the unread set so the badge tracks the server, and reloads the inbox browse
- *  list when it's open. Skips the browse reload when the detail modal is open —
- *  the user is navigating through the list and a reload with `filter: 'unread'`
- *  would remove the currently-viewed item, breaking prev/next navigation. */
+ *  list when it's open. Skips the browse reload when a notification detail is
+ *  open in the panel — the user is navigating through the list and a reload with
+ *  `filter: 'unread'` would remove the currently-viewed item, breaking prev/next
+ *  navigation. */
 export function handleNotificationSSE(): void {
   void loadUnreadNotifications();
-  if (activeMenuItem.value === 'notifications' && !notificationsModalOpen.value) {
+  if (activeMenuItem.value === 'notifications' && !viewingNotification.value) {
     void loadNotifications();
   }
 }
@@ -215,14 +218,19 @@ export async function viewNotification(id: string): Promise<void> {
   // second fire (SW postMessage + URL-param cold start, both for one tap) bails on
   // the guard instead of racing a second fetch. Cleared on failure below so a
   // failed fetch never blocks a re-tap — otherwise the retry silently no-ops for
-  // 10s (no modal, no second toast — the tap looks dead).
+  // 10s (no detail panel, no second toast — the tap looks dead).
   _lastViewedId = id;
   _lastViewedAt = now;
   try {
     const notification = await getNotification(id);
     if (notification) {
-      notificationModalDetail.value = notification;
-      notificationsModalOpen.value = true;
+      // Open the detail in the content pane (not a modal): set the overlay,
+      // reveal the pane, and push a nav entry so panel Back returns to the
+      // inbox list and a reload restores the open detail. Mirrors openUrl /
+      // openFilePreview.
+      panelOverlay.value = { type: 'notification-detail', notification };
+      revealContentPane();
+      pushNavState();
       markReadOptimistic(id);
     }
   } catch (error) {
@@ -231,8 +239,11 @@ export async function viewNotification(id: string): Promise<void> {
   }
 }
 
-/** Navigate the modal to another notification by id. Owns the signal writes
- *  the modal previously did inline. Returns the loaded id, or null on
+/** Walk the panel detail to another notification by id (prev/next). Owns the
+ *  overlay write the detail component must not do inline. Replaces the current
+ *  nav entry in place (`replaceNavState`) so the whole detail-viewing session
+ *  is a single history slot and panel Back returns to the inbox list, not
+ *  through each notification stepped over. Returns the loaded id, or null on
  *  failure / unknown target. */
 export async function navigateToNotification(targetId: string): Promise<string | null> {
   const list = notifications.value;
@@ -251,7 +262,8 @@ export async function navigateToNotification(targetId: string): Promise<string |
     const [, full] = await Promise.all(reads);
     if (!full) return null;
 
-    notificationModalDetail.value = full;
+    panelOverlay.value = { type: 'notification-detail', notification: full };
+    replaceNavState();
     if (!target.read) {
       markBrowseRowRead(target.id);
       removeFromUnread(target.id);
@@ -263,13 +275,16 @@ export async function navigateToNotification(targetId: string): Promise<string |
   }
 }
 
-/** Close the notifications detail modal and refresh the list. The view layer
- *  must not flip the modal signals directly — components express intent. */
-export function closeNotificationsModal(): void {
-  notificationsModalOpen.value = false;
-  notificationModalDetail.value = null;
+/** Run when the notification detail panel closes — the overlay is cleared by
+ *  panel Back nav, a menu switch, or any restore path, so there is no single
+ *  call site to hang this on. Driven by an effect on `viewingNotification` in
+ *  store/effects.ts (mirrors the `lastPreviewFile` reset there). Resets the
+ *  view-dedup guard so the same notification can be reopened immediately, and
+ *  refreshes the inbox list when it's the active panel so a now-read row drops
+ *  under the 'unread' filter (what the former modal's close handler did). */
+export function onNotificationDetailClosed(): void {
   resetViewDedup();
-  void loadNotifications();
+  if (activeMenuItem.value === 'notifications') void loadNotifications();
 }
 
 export async function markAllRead(): Promise<void> {

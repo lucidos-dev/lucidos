@@ -1,4 +1,4 @@
-import { connectionStatus, dismissToast, showToast, toasts, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, TOAST_AUTO_DISMISS_MS } from '../store';
+import { connectionStatus, dismissToast, showToast, toasts, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, TOAST_AUTO_DISMISS_MS } from '../store';
 import { checkHealth, API_BASE } from '../../api/client';
 import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearForcedRetries } from './thread-loading';
@@ -229,6 +229,15 @@ export async function checkConnection(): Promise<boolean> {
     }
     lucidosReleaseDirty.value = health.release_dirty === true;
     enginePackaged.value = health.packaged === true;
+    // Only an explicit `false` flips to unconfigured; absent (older engine) or
+    // true keeps the configured default so onboarding never shows spuriously.
+    llmConfigured.value = health.llm_configured !== false;
+    // Providers the engine actually has configured → filters the model picker.
+    // `undefined` (older engine) keeps the current value; `null` means "don't
+    // filter"; an array narrows to those backends. Reflects a runtime swap.
+    if (health.configured_providers !== undefined) {
+      configuredProviders.value = health.configured_providers;
+    }
     if (health.engine_version) {
       engineVersion.value = health.engine_version;
     }

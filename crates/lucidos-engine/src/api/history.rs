@@ -224,6 +224,16 @@ pub(super) async fn health(State(state): State<AppState>) -> Json<serde_json::Va
         // (`launchctl kickstart -k`) or POST the bundled gateway; dev → the
         // /restart script (`web-dev.sh --engine-only`, which rebuilds first).
         "packaged": is_packaged(),
+        // False when the engine booted without any LLM provider configured (the
+        // UnconfiguredProvider sentinel — packaged first run). The frontend
+        // reads this to show first-run provider onboarding (→ Settings →
+        // Providers) instead of letting the user chat into a guaranteed error.
+        "llm_configured": state.engine.llm_configured(),
+        // Which provider backends are actually configured, so the frontend can
+        // filter the model picker to providers the user has set up. `null` means
+        // "don't filter" (mock / no routing); an array enumerates live backends.
+        // Reflects a runtime credential swap (read from the live provider).
+        "configured_providers": state.engine.configured_providers(),
     }))
 }
 

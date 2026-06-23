@@ -743,10 +743,16 @@
     position: relative;
 }
 
+/* The workspace selector and its dim scrim are rebased onto the toast layer
+   (--z-toast = 2400) rather than --z-control-panel (2200): an explicitly-opened
+   selector must sit ON TOP of any toast (e.g. the persistent "Restart needed" /
+   "New version available" toast), which would otherwise paint over it. Tooltips
+   (--z-tooltip = 10000) stay above, so the refresh button's data-tooltip is
+   unaffected. The +40/+50 keeps the panel above its own scrim. */
 .control-panel-scrim {
     position: fixed;
     inset: 0;
-    z-index: calc(var(--z-control-panel) + 40);
+    z-index: calc(var(--z-toast) + 40);
     pointer-events: none;
     background: rgba(0, 0, 0, 0.36);
     animation: modal-in var(--duration-fast) ease;
@@ -754,7 +760,7 @@
 
 .control-panel {
     position: fixed;
-    z-index: calc(var(--z-control-panel) + 50);
+    z-index: calc(var(--z-toast) + 50);
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
     border-radius: 0.375rem;

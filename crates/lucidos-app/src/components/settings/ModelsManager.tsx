@@ -2,7 +2,7 @@ import { useState } from 'preact/hooks';
 import { chatModels } from '../../store/store';
 import { Dropdown } from '../shared/Dropdown';
 import { LoadableError } from '../shared/LoadableError';
-import { setModelEnabled, deleteModel, submitNewModel } from '../../store/actions/models';
+import { setModelEnabled, deleteModel, submitNewModel, isProviderConfigured } from '../../store/actions/models';
 
 const PROVIDERS = [
   { value: 'anthropic', label: 'Anthropic (direct)' },
@@ -58,6 +58,14 @@ export function ModelsManager() {
                 <div class="model-manager-id">{m.id}</div>
               </div>
               <span class="model-provider-badge">{m.provider}</span>
+              {!isProviderConfigured(m.provider) && (
+                <span
+                  class="model-provider-badge model-provider-unconfigured"
+                  data-tooltip="Provider not set up — this model is hidden from the picker until you add it under Providers"
+                >
+                  not set up
+                </span>
+              )}
               {m.source === 'user' ? (
                 <button class="action-btn action-btn-danger" onClick={() => void deleteModel(m.id)}>
                   Delete

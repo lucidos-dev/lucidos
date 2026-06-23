@@ -290,6 +290,28 @@
     margin: 0;
 }
 
+/* Action toasts move keyboard focus to a default button (so Enter acts on it)
+   and trap Tab within the toast. Because that focus is moved PROGRAMMATICALLY,
+   the global `.action-btn:focus-visible` / `.icon-btn:focus-visible` ring is
+   suppressed — browsers only show :focus-visible for keyboard-initiated focus —
+   so the focused button had no indicator and the user was "pressing blindly".
+   Show the ring on plain :focus for toast controls so the active button is
+   always visible, however focus arrived. Gated behind `hover: hover` (a real
+   pointer + keyboard, i.e. desktop) — on touch there is no keyboard to press
+   blindly with, and a tapped toast button would otherwise keep a lingering
+   focus ring. */
+@media (hover: hover) {
+    .toast .toast-actions .action-btn:focus,
+    .toast .toast-close:focus {
+        outline: 0.125rem solid var(--accent);
+        outline-offset: 0.125rem;
+    }
+
+    .toast .toast-close:focus {
+        border-radius: 0.125rem;
+    }
+}
+
 .toast-close svg {
     width: 0.875rem;
     height: 0.875rem;

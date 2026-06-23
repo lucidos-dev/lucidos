@@ -41,6 +41,19 @@ impl ProviderKind {
             _ => Self::Vertex,
         }
     }
+
+    /// The `models.provider` column string — inverse of [`Self::parse`]. Used to
+    /// report configured providers over `/health` in the same vocabulary the
+    /// model rows (and the frontend filter) use.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Vertex => "vertex",
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+            Self::OpenRouter => "openrouter",
+            Self::Local => "local",
+        }
+    }
 }
 
 /// Shared, hot-swappable model→provider map. Cloned into `RoutingProvider` and

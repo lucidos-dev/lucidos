@@ -22,7 +22,6 @@ import {
   fileSearchOpen,
   popupImage,
   messageRoutePanel,
-  notificationsModalOpen,
   stepDetailModal,
   searchEverywhereOpen,
 } from './store/store';
@@ -34,7 +33,6 @@ const ImagePopup = lazyComponent(() => import('./components/shared/ImagePopup').
 const MessageRoutePanel = lazyComponent(() => import('./components/chat/MessageRoutePanel').then(m => m.MessageRoutePanel));
 const StepDetailModal = lazyComponent(() => import('./components/chat/StepDetailModal').then(m => m.StepDetailModal));
 const ScaleModal = lazyComponent(() => import('./components/shared/ScaleModal').then(m => m.ScaleModal));
-const NotificationsModal = lazyComponent(() => import('./components/notifications/NotificationsModal').then(m => m.NotificationsModal));
 const SearchEverywhere = lazyComponent(() => import('./components/search/SearchEverywhere').then(m => m.SearchEverywhere));
 
 // Each overlay sits in its own slot so the signal subscription is leaf-scoped:
@@ -43,7 +41,6 @@ function ImagePopupSlot()        { return popupImage.value           ? <ImagePop
 function MessageRoutePanelSlot() { return messageRoutePanel.value    ? <MessageRoutePanel /> : null; }
 function StepDetailModalSlot()   { return stepDetailModal.value      ? <StepDetailModal />   : null; }
 function ScaleModalSlot()        { return scaleModalOpen.value       ? <ScaleModal />        : null; }
-function NotificationsModalSlot(){ return notificationsModalOpen.value ? <NotificationsModal /> : null; }
 
 // FileSearchModal and SearchEverywhere render a hidden shell instead of
 // unmounting when closed (avoids will-change:transform ghost pixels on iOS
@@ -99,7 +96,6 @@ export function App() {
       <ConfirmDialog />
       <StepDetailModalSlot />
       <ScaleModalSlot />
-      <NotificationsModalSlot />
       <SearchEverywhereSlot />
       <UiBlockingOverlay />
     </>

@@ -105,7 +105,7 @@ impl AnthropicProvider {
                 // message rather than a generic auth error.
                 if status.as_u16() == 401 {
                     return Err(format!(
-                        "Anthropic API 401 — check the Anthropic credential in Settings → Providers \
+                        "Anthropic API 401 — check the Anthropic credential in Settings → Models → Providers \
                          (OAuth subscription tokens are short-lived and may need re-pasting): {}",
                         error_body
                     )

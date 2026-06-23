@@ -5,9 +5,12 @@ pub mod mock;
 pub mod model_registry;
 pub mod openai;
 pub mod provider;
+pub mod provider_build;
+pub mod provider_selection;
 pub mod routing;
 pub mod tool_names;
 pub mod tools;
+pub mod unconfigured;
 pub mod validate;
 pub mod vertex;
 
@@ -19,7 +22,13 @@ pub use openai::{
     OPENAI_DEFAULT_BASE_URL,
 };
 pub use provider::{ContentBlock, LlmProvider, Message, MessageContent, TokenCallback, ToolCall};
+pub use provider_build::{
+    boot_without_provider_enabled, build_active_provider, ProviderBuildContext,
+    ProviderBuildOutcome, PROVIDER_CREDENTIAL_SERVICES,
+};
+pub use provider_selection::{select_provider, ProviderSelection, ProviderSelectionInputs};
 pub use routing::RoutingProvider;
+pub use unconfigured::{UnconfiguredProvider, NO_PROVIDER_MESSAGE};
 pub use tools::{
     get_default_tools, get_image_generation_tool, get_manage_repositories_tool, get_mcp_tools,
     get_navigate_ui_tool, get_notification_tool, get_read_notifications_tool,

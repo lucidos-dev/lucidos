@@ -20,6 +20,12 @@
 # Releases publishing) is env-gated below and documented in
 # docs/desktop-app.md.
 #
+# Build prereqs: the engine statically vendors OpenSSL (openssl-sys/vendored via
+# crates/lucidos-engine/Cargo.toml), so the engine compile needs `perl` + a C
+# toolchain — both already provided by the Xcode Command Line Tools this script
+# relies on (clang, xcrun). This vendoring is unconditional in the manifest, so the
+# dev build (`web-dev.sh -b`) and this packaged build link the identical OpenSSL.
+#
 # ── Script-vs-LLM contract (release pipeline) ────────────────────────────────
 # The deterministic shell pipeline is the SPINE; the LLM/chat layer only drafts
 # the changelog, gets approval (the `draft` step), and handles anomalies.

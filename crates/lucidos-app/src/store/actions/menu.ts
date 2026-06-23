@@ -2,6 +2,7 @@ import {
   activeMenuItem,
   panelOverlay,
   settingsSubview,
+  settingsScrollTarget,
 } from '../store';
 import type { PanelOverlay } from '../store';
 import { revealContentPane } from './pane';
@@ -76,5 +77,18 @@ export function landOnAccountsWithOverlay(overlay: PanelOverlay): void {
   setActiveMenu('settings', overlay);
   settingsSubview.value = 'accounts';
   void loadCredentials();
+  revealContentPane();
+}
+
+/** Deep-link to Settings → Models → Providers in a single render and scroll to
+ *  the Providers section. Used by the first-run provider onboarding (when no LLM
+ *  provider is configured) so the "Set up your AI provider" button lands the
+ *  user exactly where they add one. `settingsScrollTarget` drives the
+ *  scroll-and-highlight effect in `SettingsView`. */
+export function openProviderSettings(): void {
+  setActiveMenu('settings');
+  settingsSubview.value = 'models';
+  settingsScrollTarget.value = 'models:providers';
+  pushNavState();
   revealContentPane();
 }

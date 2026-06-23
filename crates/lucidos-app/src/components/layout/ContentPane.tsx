@@ -15,6 +15,7 @@ const RepoFilePreviewWithSidebar = lazyComponent(() => import('../files/RepoFile
 const UrlPreviewInline = lazyComponent(() => import('../files/UrlPreviewInline').then(m => m.UrlPreviewInline));
 const AppUiInline = lazyComponent(() => import('../apps/AppUiInline').then(m => m.AppUiInline));
 const InlineForm = lazyComponent(() => import('./InlineForm').then(m => m.InlineForm));
+const NotificationDetailInline = lazyComponent(() => import('../notifications/NotificationDetailInline').then(m => m.NotificationDetailInline));
 
 // Per-overlay scoping so scroll resets when switching between, say, two file
 // previews. Returns null when there's nothing to key on, so the hook skips.
@@ -22,6 +23,7 @@ function contentViewKey(active: string | null, overlay: PanelOverlay): string | 
   if (overlay) {
     if (overlay.type === 'file-preview') return `file:${overlay.path}`;
     if (overlay.type === 'url-preview') return `url:${overlay.url}`;
+    if (overlay.type === 'notification-detail') return `notification:${overlay.notification.id}`;
     return overlay.type;
   }
   return active;
@@ -55,6 +57,7 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
             : <FilePreviewInline path={overlay.path} layout={layout} />;
         })()}
         {overlay?.type === 'url-preview' && <UrlPreviewInline url={overlay.url} layout={layout} />}
+        {overlay?.type === 'notification-detail' && <NotificationDetailInline />}
         {!overlay && (
           <>
             {active === 'files' && <FilesView />}

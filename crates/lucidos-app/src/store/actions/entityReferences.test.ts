@@ -10,6 +10,14 @@ vi.mock('./credentials', () => ({ loadCredentials: vi.fn() }));
 vi.mock('./environmentVariables', () => ({ loadEnvironmentVariables: vi.fn() }));
 vi.mock('./oauth', () => ({ loadOAuthAccounts: vi.fn() }));
 vi.mock('./repositoriesLoader', () => ({ loadRepositories: vi.fn() }));
+// Partial-mock the HTTP client so the credential-event /health re-probe is
+// observable without a real network call (keeps every other export real for the
+// modules below that legitimately use them, e.g. pinnedApps).
+const mockCheckHealth = vi.fn();
+vi.mock('../../api/client', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../api/client')>()),
+  checkHealth: (...args: any[]) => mockCheckHealth(...args),
+}));
 vi.mock('./devices', async () => {
   const { signal } = await import('@preact/signals');
   return {
@@ -73,6 +81,10 @@ describe('processSSEForReferences', () => {
     devices.value = { status: 'not-loaded' };
     artifacts.value = { status: 'not-loaded' };
     vi.clearAllMocks();
+    // Safe default for the credential-event /health re-probe so the other
+    // Credential* tests (which don't care about it) don't hit `undefined.status`.
+    // `failed` leaves `llmConfigured` untouched, so it can't leak across tests.
+    mockCheckHealth.mockResolvedValue({ status: 'failed', error: '' });
   });
 
   // ── Deleted app ──────────────────────────────────────────────────────────
@@ -412,6 +424,22 @@ describe('processSSEForReferences', () => {
       processSSEForReferences('CredentialUpdated', { service_name: 'openai' });
       processSSEForReferences('CredentialDeleted', { service_name: 'openai' });
       expect(loadCredentials).toHaveBeenCalledTimes(3);
+    });
+
+    it('re-probes /health on each event so llmConfigured reflects a runtime provider swap', () => {
+      // Independent of the credentials-list cache state: the backend hot-swaps
+      // the active LLM provider on a credential change, so onboarding must clear
+      // (or reappear) without a manual refresh. Fake timers so the delayed
+      // re-check (a 600ms backstop probe) doesn't dangle past the test; we assert
+      // the immediate probe (one /health call per event).
+      vi.useFakeTimers();
+      mockCheckHealth.mockResolvedValue({ status: 'loaded', data: { llm_configured: true } });
+      credentials.value = { status: 'not-loaded' };
+      processSSEForReferences('CredentialCreated', { service_name: 'openai' });
+      processSSEForReferences('CredentialUpdated', { service_name: 'openai' });
+      processSSEForReferences('CredentialDeleted', { service_name: 'openai' });
+      expect(mockCheckHealth).toHaveBeenCalledTimes(3);
+      vi.useRealTimers();
     });
   });
 

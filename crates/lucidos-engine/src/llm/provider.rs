@@ -137,6 +137,28 @@ pub trait LlmProvider: Send + Sync {
     fn default_model(&self) -> &str {
         ""
     }
+
+    /// Whether this provider can actually serve LLM calls. `true` for every
+    /// real provider, `RoutingProvider`, and the deterministic `MockProvider`
+    /// (an explicit `LUCIDOS_MODEL=mock` opt-in for E2E). `false` only for
+    /// `UnconfiguredProvider` — the sentinel installed when a packaged build
+    /// boots before the user has configured any provider. The `/health`
+    /// endpoint surfaces this as `llm_configured` so the frontend can show
+    /// first-run provider onboarding instead of letting the user chat into a
+    /// guaranteed error.
+    fn is_configured(&self) -> bool {
+        true
+    }
+
+    /// Which provider backends are actually configured, for filtering the model
+    /// picker to providers the user has set up. `None` means "don't filter"
+    /// (the default, and what `MockProvider` returns so E2E sees every model);
+    /// `Some(list)` enumerates the live backends — `RoutingProvider` reports the
+    /// ones it holds, `UnconfiguredProvider` reports `Some(vec![])` (nothing).
+    /// Surfaced via `/health.configured_providers`.
+    fn configured_providers(&self) -> Option<Vec<crate::llm::model_registry::ProviderKind>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

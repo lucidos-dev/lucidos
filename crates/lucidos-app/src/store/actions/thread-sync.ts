@@ -16,6 +16,7 @@ import {
   type NativePushRequestedPayload,
 } from './native-push';
 import { addRestartGroup } from './chat-changes';
+import { changeToastMessage } from './changeToast';
 import { scheduleServiceWorkerUpdateChecks } from '../../hooks/sw-update';
 import { loadPreferences } from './preferences';
 import { loadArtifacts } from './artifacts';
@@ -165,17 +166,6 @@ function findChangeDescription(threadId: string, changeId: string): string | und
     }
   }
   return undefined;
-}
-
-/** Build a change toast message with thread title and description/error. */
-export function changeToastMessage(action: string, threadId: string, detail?: string): string {
-  const thread = threadMap.value.get(threadId);
-  const title = thread?.meta?.title;
-  const parts: string[] = [];
-  if (title) parts.push(title);
-  if (detail) parts.push(detail);
-  if (parts.length === 0) return `${action}.`;
-  return `${action}: ${parts.join(' — ')}`;
 }
 
 export function connectThreadEvents(): void {

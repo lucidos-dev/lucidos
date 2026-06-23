@@ -139,7 +139,13 @@ pub struct LucidosEngine {
     python_runtime: PythonRuntime,
     browser_runtime: BrowserRuntime,
     app_manager: Arc<AppManager>,
-    llm: Arc<dyn LlmProvider>,
+    /// Active LLM provider behind a swappable handle so the credential subscriber
+    /// (`spawn_provider_credential_subscriber`) can hot-swap it at runtime when a
+    /// provider credential is added/removed — no engine restart. All reads go
+    /// through [`LucidosEngine::current_provider`], which clones the inner `Arc`
+    /// out under a short read guard (never held across an `.await`). Mirrors the
+    /// `Arc<RwLock<…>>` convention of `ModelRegistry` / `LocationHandle`.
+    llm: Arc<std::sync::RwLock<Arc<dyn LlmProvider>>>,
     embedder: Arc<FastEmbedProvider>,
     memory_index: Option<PgVectorIndex>,
     extractor: Option<MemoryExtractor>,
@@ -517,6 +523,90 @@ fn spawn_models_registry_subscriber(
                     );
                 }
                 Err(e) => log!("[ModelRegistry] reload skipped (lock poisoned): {}", e),
+            }
+        }
+    });
+}
+
+/// Hot-swap the engine's active LLM provider when a provider credential changes.
+/// On any `Credential{Created,Updated,Deleted}` for a provider service
+/// (`openai`/`anthropic`/`openrouter`/`local`), re-resolve `select_provider`
+/// against current DB state via [`crate::llm::build_active_provider`] and swap
+/// the shared provider handle in place — so a first-run user who adds a key in
+/// Settings → Models → Providers gets a working chat with NO restart, and removing the
+/// last key swaps back to the unconfigured sentinel (when
+/// `LUCIDOS_BOOT_WITHOUT_PROVIDER` is set). Mirrors
+/// `spawn_models_registry_subscriber`.
+///
+/// **Mock isolation:** the caller does not spawn this under `LUCIDOS_MODEL=mock`,
+/// and `ctx.model_is_mock` is `false`, so `build_active_provider` can never
+/// return `MockProvider` here — the mock stays reachable only via the explicit
+/// env opt-in. A `FailFast` rebuild (no provider, gate off) keeps the current
+/// provider rather than panicking the running engine.
+fn spawn_provider_credential_subscriber(
+    mut rx: tokio::sync::broadcast::Receiver<event_bus::EmittedEvent>,
+    llm_handle: Arc<std::sync::RwLock<Arc<dyn crate::llm::LlmProvider>>>,
+    pool: sqlx::PgPool,
+    ctx: crate::llm::ProviderBuildContext,
+) {
+    tokio::spawn(async move {
+        use event_bus::{BusEvent, SystemEvent};
+        use tokio::sync::broadcast::error::RecvError;
+        loop {
+            let emitted = match rx.recv().await {
+                Ok(e) => e,
+                // Lag = subscriber fell behind. Skip the dropped events but keep
+                // listening, so a single lag doesn't stop tracking credential
+                // changes for the rest of the engine's lifetime.
+                Err(RecvError::Lagged(n)) => {
+                    log!(
+                        "[Providers] credential subscriber lagged by {} events — continuing",
+                        n
+                    );
+                    continue;
+                }
+                Err(RecvError::Closed) => break,
+            };
+            let service = match &emitted.typed {
+                BusEvent::System(
+                    SystemEvent::CredentialCreated { service_name, .. }
+                    | SystemEvent::CredentialUpdated { service_name, .. }
+                    | SystemEvent::CredentialDeleted { service_name, .. },
+                ) => service_name,
+                _ => continue,
+            };
+            if !crate::llm::PROVIDER_CREDENTIAL_SERVICES.contains(&service.as_str()) {
+                continue;
+            }
+            match crate::llm::build_active_provider(Some(&pool), &ctx).await {
+                Ok(crate::llm::ProviderBuildOutcome::Install(provider, selection)) => {
+                    match llm_handle.write() {
+                        Ok(mut guard) => {
+                            *guard = provider;
+                            log!(
+                                "[Providers] active LLM provider swapped to {:?} after '{}' credential change — no restart",
+                                selection,
+                                service
+                            );
+                        }
+                        Err(e) => {
+                            log!("[Providers] provider swap skipped (lock poisoned): {}", e)
+                        }
+                    }
+                }
+                Ok(crate::llm::ProviderBuildOutcome::FailFast) => {
+                    log!(
+                        "[Providers] '{}' credential change left no provider configured and LUCIDOS_BOOT_WITHOUT_PROVIDER is off — keeping the current provider (a restart would fail-fast)",
+                        service
+                    );
+                }
+                Err(e) => {
+                    log!(
+                        "[Providers] provider rebuild after '{}' credential change failed: {} — keeping current provider",
+                        service,
+                        e
+                    );
+                }
             }
         }
     });

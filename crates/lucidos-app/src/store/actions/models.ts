@@ -1,8 +1,17 @@
-import { chatModels, showToast, showConfirm } from '../store';
+import { chatModels, configuredProviders, showToast, showConfirm } from '../store';
 import { toFailed, setLoadingIfFresh } from '../types';
 import { MODELS } from '../models';
 import { listModels, createModel, updateModel, deleteModelApi } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
+
+/** Whether `provider` is among the backends the engine actually has configured.
+ *  `null` (mock, an older engine, or before the first /health probe) means
+ *  "don't filter" — everything counts as configured, so the picker is never
+ *  spuriously empty. Drives both the picker filter and the manager's badge. */
+export function isProviderConfigured(provider: string): boolean {
+  const set = configuredProviders.value;
+  return set === null || set.includes(provider);
+}
 
 /** Load the DB-backed model registry into the `chatModels` signal. Refetches
  *  (e.g. after a Model* SSE) keep showing existing data through the round trip
@@ -18,13 +27,15 @@ export async function loadChatModels(): Promise<void> {
 }
 
 /** Options for the chat model `<Dropdown>` — enabled models from the loaded
- *  registry, falling back to the static `MODELS` list before the first load (so
- *  the picker never renders empty). */
+ *  registry whose provider is actually configured, falling back to the static
+ *  `MODELS` list before the first load (so the picker never renders empty). The
+ *  provider filter keeps a user with only an OpenAI key from being offered
+ *  Vertex/Anthropic models that would error on use. */
 export function chatModelOptions(): Array<{ value: string; label: string }> {
   const loadable = chatModels.value;
   if (loadable.status === 'loaded') {
     return loadable.data
-      .filter((m) => m.enabled)
+      .filter((m) => m.enabled && isProviderConfigured(m.provider))
       .map((m) => ({ value: m.id, label: m.label }));
   }
   return MODELS;

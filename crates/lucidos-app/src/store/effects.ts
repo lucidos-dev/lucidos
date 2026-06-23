@@ -1,8 +1,9 @@
 import { effect, untracked } from '@preact/signals';
-import { pageTitle, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, diffWholeFile, filePreviewEditing, previewFile, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY, MOBILE_VIEW_KEY } from './store';
+import { pageTitle, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, diffWholeFile, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY, MOBILE_VIEW_KEY } from './store';
 import { clientRefreshing } from '../hooks/sw-update';
 import { cancelApplyAllBatch } from './actions/chat-changes';
 import { handleRestartTimeout } from './actions/connection';
+import { onNotificationDetailClosed } from './actions/notifications';
 
 // Sync page title with unread count
 effect(() => {
@@ -79,22 +80,39 @@ effect(() => {
   localStorage.setItem('lucidos-file-preview-source', String(filePreviewSource.value));
 });
 
-// Persist diff-vs-whole-file toggle (whole merged end-state file in the diff preview)
-effect(() => {
-  localStorage.setItem('lucidos-diff-whole-file', String(diffWholeFile.value));
-});
-
-// Drop inline edit mode whenever the previewed file changes (or the preview
-// closes). Restore-from-history (navigation.restoreState) sets panelOverlay
-// directly without going through openFilePreview, so resetting here — keyed on
-// the previewed path — covers every entry point, not just the click path.
+// Reset transient preview toggles whenever the previewed file changes (or the
+// preview closes): inline edit mode AND the diff-vs-whole-file view, so each new
+// diff opens on the hunks (the diff is the default). Restore-from-history
+// (navigation.restoreState) sets panelOverlay directly without going through
+// openFilePreview, so resetting here — keyed on the previewed path — covers every
+// entry point, not just the click path. Both signals are non-persisted, so even
+// if this effect doesn't fire on the initial hydration tick they start reset.
 let lastPreviewFile: string | null = previewFile.value;
 effect(() => {
   const path = previewFile.value;
   if (path !== lastPreviewFile) {
     lastPreviewFile = path;
     filePreviewEditing.value = false;
+    diffWholeFile.value = false;
   }
+});
+
+// Reset the notification view-dedup guard (and refresh the inbox list when it's
+// the active panel) whenever the notification detail closes. The overlay is
+// cleared by panel Back nav / menu switch / restore — none of which run an
+// explicit close action — so keying on the open notification's id here covers
+// every close path, mirroring the `lastPreviewFile` reset above. Only the
+// →null edge counts as a close; a prev/next walk (X→Y) must not reset the guard
+// or reload mid-walk. `untracked` keeps the effect's sole dependency
+// `viewingNotification` (onNotificationDetailClosed reads activeMenuItem and
+// writes the notifications/toasts signals, which would otherwise be tracked).
+let lastViewingNotificationId: string | null = viewingNotification.value?.id ?? null;
+effect(() => {
+  const id = viewingNotification.value?.id ?? null;
+  if (id === lastViewingNotificationId) return;
+  const closed = id === null && lastViewingNotificationId !== null;
+  lastViewingNotificationId = id;
+  if (closed) untracked(() => onNotificationDetailClosed());
 });
 
 // Persist selected change so the Diff view survives reload — without this,

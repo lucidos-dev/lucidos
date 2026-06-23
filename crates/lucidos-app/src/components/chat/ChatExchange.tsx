@@ -670,15 +670,31 @@ function actionInitiator(label: string, details?: ComponentChildren): InitiatorD
   return { variant: 'system', icon: null, label, details };
 }
 
+/** Which terminal verdict a divider header carries when the prompt was never
+ *  resolved: `'canceled'` only when the USER explicitly dismissed it, `'dropped'`
+ *  for every other turn-ended-without-a-response cause (system abort, error, the
+ *  agent racing past the prompt). */
+type DividerTerminalKind = 'canceled' | 'dropped';
+
 /** Resolution status for question / permission dividers — shown in the initiator
- *  header. Reuses the response panel's `.exchange-status-*` classes so "Answered"
- *  renders exactly like the response's "Done" (gray label + green ✓ after it),
- *  "Canceled" like a canceled response (red ✕), and the pending prompt as a
- *  plain "Needs your answer" call-to-action (no glyph — it isn't a terminal
- *  state). */
-function dividerStatus(resolved: boolean, terminated: boolean, resolvedLabel: string): ComponentChildren {
+ *  header. The header describes what happened to the PROMPT, never the turn:
+ *  "Answered"/"Resolved" (✓) when the user responded, "Canceled" (✕) when the
+ *  user explicitly dismissed it, "Unanswered"/"Unresolved" (muted) when the turn
+ *  ended without a response for any other reason, and a plain "Needs your answer"
+ *  call-to-action while pending. The turn's own terminal cause (Aborted ⚠ /
+ *  Error ✕) is carried by the response panel + the abort boundary — the header
+ *  must NOT impersonate it (a system abort previously rendered here as the
+ *  user-driven "Canceled", contradicting the "Aborted" panel right below it).
+ *  Reuses the response panel's `.exchange-status-*` classes so the glyphs match. */
+function dividerStatus(
+  resolved: boolean,
+  resolvedLabel: string,
+  droppedLabel: string,
+  terminal: DividerTerminalKind | null,
+): ComponentChildren {
   if (resolved) return <span class="exchange-status-label exchange-status-done">{resolvedLabel}<span class="exchange-status-check">{'✓'}</span></span>;
-  if (terminated) return <span class="exchange-status-label exchange-status-canceled">{'Canceled'}<span class="exchange-status-x">{'✕'}</span></span>;
+  if (terminal === 'canceled') return <span class="exchange-status-label exchange-status-canceled">{'Canceled'}<span class="exchange-status-x">{'✕'}</span></span>;
+  if (terminal === 'dropped') return <span class="exchange-status-label exchange-status-dropped">{droppedLabel}</span>;
   return <span class="exchange-status-label exchange-status-awaiting">{'Needs your answer'}</span>;
 }
 
@@ -832,7 +848,12 @@ export function describeInitiator(
         variant: 'lucidos',
         icon: agent.icon,
         label: agent.label,
-        status: dividerStatus(!!answered && !canceled, responseTerminated || canceled, 'Answered'),
+        status: dividerStatus(
+          !!answered && !canceled,
+          'Answered',
+          'Unanswered',
+          canceled ? 'canceled' : responseTerminated ? 'dropped' : null,
+        ),
         details: (
           <QuestionBody
             threadId={threadId}
@@ -860,7 +881,7 @@ export function describeInitiator(
         variant: 'lucidos',
         icon: agent.icon,
         label: agent.label,
-        status: dividerStatus(!!resolvedStep, responseTerminated, 'Resolved'),
+        status: dividerStatus(!!resolvedStep, 'Resolved', 'Unresolved', responseTerminated ? 'dropped' : null),
         details: (
           <PermissionBody
             event={{
@@ -891,7 +912,7 @@ export function describeInitiator(
         variant: 'lucidos',
         icon: agent.icon,
         label: agent.label,
-        status: dividerStatus(!!resolvedStep, responseTerminated, 'Resolved'),
+        status: dividerStatus(!!resolvedStep, 'Resolved', 'Unresolved', responseTerminated ? 'dropped' : null),
         details: (
           <CommandPermissionBody
             event={{
@@ -922,7 +943,7 @@ export function describeInitiator(
         variant: 'lucidos',
         icon: agent.icon,
         label: agent.label,
-        status: dividerStatus(!!resolvedStep, responseTerminated, 'Resolved'),
+        status: dividerStatus(!!resolvedStep, 'Resolved', 'Unresolved', responseTerminated ? 'dropped' : null),
         details: (
           <McpPermissionBody
             event={{

@@ -162,7 +162,10 @@ impl LucidosEngine {
             ..crate::engine::thread_events::EventMeta::NONE
         };
 
-        let model_str = model_override.unwrap_or(self.llm.default_model());
+        // Pin ONE provider Arc for this whole response — a mid-response runtime
+        // swap (credential added/removed) must not change the in-flight provider.
+        let provider = self.current_provider();
+        let model_str = model_override.unwrap_or(provider.default_model());
         let effective_model = (!model_str.is_empty()).then(|| model_str.to_string());
         let effective_effort = reasoning_effort.map(|s| s.to_string());
         let capture_window = super::super::context::context_window_for(capture_seed.model);
@@ -385,7 +388,7 @@ impl LucidosEngine {
             let call_tools = tools.to_vec();
 
             // Race LLM call against cancel token so stop button works immediately
-            let llm_future = self.llm.chat(
+            let llm_future = provider.chat(
                 messages.clone(),
                 call_tools,
                 model_override,

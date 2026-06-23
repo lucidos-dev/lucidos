@@ -28,7 +28,7 @@ vi.mock('../../api/client', () => ({
   ApiError: class extends Error {},
 }));
 vi.mock('../../components/chat/scrollState', () => ({ scrollToBottom: vi.fn() }));
-vi.mock('./thread-sync', () => ({ changeToastMessage }));
+vi.mock('./changeToast', () => ({ changeToastMessage }));
 vi.mock('./threads', () => ({ focusThread: vi.fn() }));
 
 const { handleDiscardCCChanges } = await import('./chat-claude-code');

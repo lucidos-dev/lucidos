@@ -64,3 +64,27 @@ export function withBase(path: string): string {
 /** The PWA / service-worker scope for this context: `/<slug>/`, `/~/`, or `/`.
  *  Always ends with a trailing slash. */
 export const SCOPE_PATH: string = `${BASE_PATH}/`;
+
+/** A workspace slug the gateway would accept. Mirrors `registry::slugify`
+ *  output (lowercase alphanumerics joined by single hyphens, no leading/trailing
+ *  hyphen) — the same shape the picker's `slugifyWorkspaceName` produces. */
+const SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+/** Pure predicate (testable without the DOM): does this served context let the
+ *  app build valid workspace URLs? The picker (`/~`, slug null) and a legacy
+ *  direct-engine root (`''`, slug null) are always valid. A workspace context is
+ *  valid iff its slug is well-formed — that slug IS the string the base-path
+ *  (and thus every origin-relative API URL + the SW scope) is built from, so a
+ *  malformed one is exactly what yields the WebKit "string did not match the
+ *  expected pattern" failures across every fetch + SW registration. */
+export function baseContextValidFor(workspaceId: string | null): boolean {
+  return workspaceId === null || SLUG_RE.test(workspaceId);
+}
+
+/** True when THIS bundle's served base-path context can build valid workspace
+ *  URLs. Wraps {@link baseContextValidFor} with the module's `WORKSPACE_ID`.
+ *  `main.tsx` bounces an invalid workspace context to the picker rather than
+ *  render a broken app. */
+export function baseContextIsValid(): boolean {
+  return baseContextValidFor(WORKSPACE_ID);
+}

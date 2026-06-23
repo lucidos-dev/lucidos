@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use std::time::Duration;
 
 // ~100 words — long enough for streaming/cancel tests to have content to work with.
-const MOCK_RESPONSE: &str = "\
+pub(crate) const MOCK_RESPONSE: &str = "\
 The quick brown fox jumps over the lazy dog. A pangram is a sentence that \
 contains every letter of the alphabet at least once. The five boxing wizards \
 jump quickly across the moonlit field. Pack my box with five dozen liquor jugs. \

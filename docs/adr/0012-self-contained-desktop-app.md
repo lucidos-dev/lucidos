@@ -42,11 +42,21 @@ Several structural questions had to be decided to wire this up.
 2. **The engine serves the bundled frontend** behind `LUCIDOS_STATIC_DIR` (SPA
    fallback to `index.html`). The webview navigates to the engine URL, so the UI,
    the HTTP API, SSE, and the service worker are all **same-origin**.
-3. **First-run before a provider exists uses `LUCIDOS_FALLBACK_MOCK`.** The engine
-   normally panics with no LLM provider; the launcher sets this flag so a packaged
-   build boots into the mock provider instead of crashing. The user configures a
-   provider in Settings → Providers, then restarts into the real one. Dev/docker
-   keep the fail-fast panic.
+3. **First-run before a provider exists uses `LUCIDOS_BOOT_WITHOUT_PROVIDER`.** The
+   engine normally panics with no LLM provider; the launcher sets this flag so a
+   packaged build boots instead of crashing. It boots into an
+   `UnconfiguredProvider` sentinel that returns a clear "No LLM provider
+   configured — add one in Settings → Providers" error on chat and reports
+   `llm_configured: false` on `/health` (which drives first-run provider
+   onboarding). The user configures a provider in Settings → Providers, then
+   restarts into the real one. Dev/docker keep the fail-fast panic.
+
+   > **Update (v0.12.0):** the flag was originally named `LUCIDOS_FALLBACK_MOCK`
+   > and booted into the deterministic `MockProvider`, which streamed a fixed
+   > pangram — a shipped release was serving mock output to real users. It now
+   > boots the `UnconfiguredProvider` (never mock) and was renamed accordingly.
+   > `MockProvider` stays reachable only via the explicit `LUCIDOS_MODEL=mock`
+   > E2E opt-in.
 4. **Auto-update via `tauri-plugin-updater` against GitHub Releases.** The app
    checks a `latest.json` endpoint on launch and prompts to restart. The `.dmg`
    is the first-install artifact; the updater ships `.app.tar.gz` + `.sig` +
@@ -70,10 +80,12 @@ Several structural questions had to be decided to wire this up.
   engine and navigating the window there keeps everything same-origin, exactly
   like the dev reverse-proxy. It also gives the docker-compose path a real UI for
   free.
-- **`LUCIDOS_FALLBACK_MOCK` beats forcing `LUCIDOS_MODEL=mock`.** Forcing mock in
-  the launcher would pin mock permanently — even after the user adds a key. A
-  graceful boot-time fallback only applies when nothing is configured, so the
-  next launch picks up the real provider.
+- **A boot-time gate beats forcing `LUCIDOS_MODEL=mock`.** Forcing mock in the
+  launcher would pin mock permanently — even after the user adds a key — and (the
+  original `LUCIDOS_FALLBACK_MOCK` bug) serve a fixed pangram as if it were a real
+  answer. `LUCIDOS_BOOT_WITHOUT_PROVIDER` only applies when nothing is configured
+  and boots a clear no-provider state (not mock), so the next launch picks up the
+  real provider and a first run never serves fake output.
 - **GitHub Releases + `tauri-plugin-updater` is the first-class path.** It is the
   supported Tauri updater backend, integrates with the bundle, and needs no
   separate update server.
@@ -87,7 +99,7 @@ Several structural questions had to be decided to wire this up.
 - Workspace state (the Postgres cluster + `data/`) lives under the OS app-data dir
   so it survives updates (the updater replaces the `.app`, not app-data).
 - The engine gains a small static-serving branch (`LUCIDOS_STATIC_DIR`) and a
-  `LUCIDOS_FALLBACK_MOCK` boot path — both inert in dev/docker.
+  `LUCIDOS_BOOT_WITHOUT_PROVIDER` boot path — both inert in dev/docker.
 - Dev is unchanged: `scripts/tauri-dev.sh` still uses Docker PG + a native engine;
   `desktop::launch` / the updater short-circuit on `tauri::is_dev()`.
 

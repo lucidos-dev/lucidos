@@ -298,13 +298,19 @@ export function WorkspacePicker() {
       const list = workspaces.value;
       const remembered = recallLastWorkspace();
       if (list.status === 'loaded' && remembered) {
-        if (list.data.some((w) => w.id === remembered)) {
+        const w = list.data.find((x) => x.id === remembered);
+        // Only auto-open a workspace that isn't already known-unhealthy — opening
+        // into an unhealthy engine is the dead-end we're fixing. 'stopped' /
+        // 'booting' still auto-open (a stopped workspace lazy-starts, intended).
+        if (w && pickerState(w) !== 'unhealthy') {
           openWorkspace(remembered); // navigates away; splash holds until unload
           return;
         }
-        forgetLastWorkspace(); // remembered workspace was deleted — stop retrying
+        if (!w) forgetLastWorkspace(); // remembered workspace was deleted — stop retrying
+        // else: it exists but is unhealthy — keep it remembered (not gone), but
+        // fall through to the list so the user sees its state + Retry.
       }
-      autoOpening.value = false; // nothing to open / load failed → show the picker
+      autoOpening.value = false; // nothing to open / unhealthy / load failed → show the picker
     })();
     // Seed the restore banner so a reload mid-restore re-attaches to the live
     // phase (the gateway holds the authoritative single-slot status).
@@ -332,6 +338,21 @@ export function WorkspacePicker() {
   useEffect(() => {
     if (!autoOpening.value) dismissBootSplash();
   }, [autoOpening.value]);
+
+  // First run: when the picker loads with zero workspaces, open the create form
+  // pre-filled with a suggested name ("personal") so the user just confirms (or
+  // types over the selected text) — instead of the passive "No workspaces yet"
+  // dead-end. Runs once; a manual Cancel then stays cancelled.
+  const firstRunPrompted = useSignal(false);
+  useEffect(() => {
+    const list = workspaces.value;
+    if (firstRunPrompted.value) return;
+    if (list.status === 'loaded' && list.data.length === 0 && !creating.value && !restoreOpen.value) {
+      firstRunPrompted.value = true;
+      newName.value = 'personal';
+      creating.value = true;
+    }
+  }, [workspaces.value]);
 
   async function withBusy(fn: () => Promise<void>) {
     busy.value = true;
@@ -491,7 +512,11 @@ export function WorkspacePicker() {
         )}
 
         {v.status === 'loaded' && v.data.length === 0 && (
-          <div class="ws-picker-empty">No workspaces yet — create your first one.</div>
+          <div class="ws-picker-empty">
+            {creating.value
+              ? 'Name your first workspace to get started.'
+              : 'No workspaces yet — create your first one.'}
+          </div>
         )}
 
         {v.status === 'loaded' && (
@@ -720,6 +745,7 @@ export function WorkspacePicker() {
                 value={newName.value}
                 onInput={(e) => (newName.value = (e.target as HTMLInputElement).value)}
                 onKeyDown={(e) => e.key === 'Enter' && onCreate()}
+                onFocus={(e) => (e.target as HTMLInputElement).select()}
                 autoFocus
               />
               <button class="ws-picker-btn ws-picker-btn-confirm" disabled={busy.value || !newName.value.trim()} onClick={onCreate}>

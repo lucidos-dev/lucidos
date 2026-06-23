@@ -58,7 +58,7 @@ export function KeyboardShortcutsSection() {
             {SHORTCUT_DEFS.filter((d) => d.category === cat).map((def) => (
               <div class="list-row" key={def.id}>
                 <div class="list-row-info">
-                  <span>{def.label}</span>
+                  <span class="title">{def.label}</span>
                 </div>
                 <div class="list-row-actions shortcut-row-actions">
                   <button

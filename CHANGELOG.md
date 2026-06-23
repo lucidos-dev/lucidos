@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.12.1 — 2026-06-23
+
+**Added**
+- **Hot-swap LLM provider on credential change** — adding or changing a provider key takes effect on the next chat, no restart required.
+- **Provider-aware first-run onboarding** — a fresh workspace with no LLM provider configured guides you to Settings → Models → Providers instead of silently serving mock output; the engine reports `llm_configured` via `/health`.
+- **Vertex AI in packaged builds** — Application Default Credentials (ADC) auto-read; the model list is filtered to only configured providers.
+- **Workspace-picker boot recovery** — a wedged boot splash now reveals an escape link to the picker; health-gated auto-open and first-run workspace naming.
+- **Notification detail in the content panel** instead of a modal.
+- **Action-toast keyboard support** — focus, Tab cycling, and a visible focus ring.
+
+**Changed**
+- Prompt answer/follow-up SplitButton unified into one frosted, same-width frame.
+- History-navigation arrow defaults swapped: Forward = Up, Back = Down.
+- Setup copy corrected to Settings → Models → Providers; stale "restart" wording dropped.
+
+**Fixed**
+- Bundled engine is now self-contained — OpenSSL is statically vendored, so the packaged build no longer depends on Homebrew OpenSSL (the crash-loop that blocked packaged startup).
+- Self-healing embedded Postgres lifecycle — stops on shutdown, adopts a healthy running instance, version-guarded.
+- Never serve mock LLM output on a no-provider boot.
+- Toast button focus ring no longer shows on mobile/touch.
+- Laggy repeat-tap can no longer cancel a just-sent turn.
+- Question/permission divider no longer mislabels system aborts as "Canceled".
+- Diff view resets to hunks on each new diff.
+- Stranded "Apply Now" toast is cleared on resume.
+- Workspace selector renders above toasts.
+- In-body notification app links open via openAppById, so disk-backed apps no longer falsely report as missing.
+- Keyboard-shortcuts label font size normalized.
 ## v0.12.0 — 2026-06-22
 
 ### Added

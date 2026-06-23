@@ -4,8 +4,7 @@ import {
   unreadNotifications,
   unreadCount,
   notificationsFilter,
-  notificationsModalOpen,
-  notificationModalDetail,
+  panelOverlay,
   activeMenuItem,
   toasts,
 } from '../store';
@@ -63,8 +62,7 @@ describe('handleNotificationSSE', () => {
   beforeEach(() => {
     activeMenuItem.value = 'notifications';
     notificationsFilter.value = 'unread';
-    notificationsModalOpen.value = false;
-    notificationModalDetail.value = null;
+    panelOverlay.value = null;
     notifications.value = {
       status: 'loaded',
       data: [
@@ -75,10 +73,9 @@ describe('handleNotificationSSE', () => {
     };
   });
 
-  it('does NOT reload the inbox list when modal is open', () => {
-    // User is viewing a notification in the modal
-    notificationsModalOpen.value = true;
-    notificationModalDetail.value = makeNotification('a', true);
+  it('does NOT reload the inbox list when a notification detail is open in the panel', () => {
+    // User is viewing a notification detail in the content pane
+    panelOverlay.value = { type: 'notification-detail', notification: makeNotification('a', true) };
 
     // SSE event arrives (e.g. NotificationRead)
     handleNotificationSSE();
@@ -91,8 +88,8 @@ describe('handleNotificationSSE', () => {
     }
   });
 
-  it('reloads the inbox list when modal is closed and panel is active', () => {
-    notificationsModalOpen.value = false;
+  it('reloads the inbox list when no detail is open and panel is active', () => {
+    panelOverlay.value = null;
     (getNotifications as Mock).mockClear();
 
     handleNotificationSSE();

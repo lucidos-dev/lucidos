@@ -293,6 +293,38 @@ impl LucidosEngine {
         self.event_bus.changes_projection()
     }
 
+    /// The currently-installed LLM provider. Clones the inner `Arc` out under a
+    /// short read guard so callers can `.await` on it without holding the lock —
+    /// the credential subscriber may swap the handle at any time, and a chat
+    /// path pins this one `Arc` for the whole response. Poison-tolerant: a
+    /// panicked writer (the subscriber) can't wedge reads.
+    pub fn current_provider(&self) -> Arc<dyn crate::llm::LlmProvider> {
+        self.llm
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Whether the installed LLM provider can actually serve calls. `false` only
+    /// when the engine has no provider configured (the `UnconfiguredProvider`
+    /// sentinel — packaged first run, before a credential is added). Reflects a
+    /// runtime swap. Surfaced by `/health` as `llm_configured` so the frontend
+    /// shows provider onboarding instead of letting the user chat into a
+    /// guaranteed error.
+    pub fn llm_configured(&self) -> bool {
+        self.current_provider().is_configured()
+    }
+
+    /// Which provider backends are actually configured (`vertex`/`anthropic`/
+    /// `openai`/`openrouter`/`local`), or `None` to mean "don't filter" (mock /
+    /// no routing). Reflects a runtime swap (reads the live provider). Surfaced
+    /// by `/health` as `configured_providers` so the frontend filters the model
+    /// picker to providers the user has set up.
+    pub fn configured_providers(&self) -> Option<Vec<String>> {
+        self.current_provider()
+            .configured_providers()
+            .map(|kinds| kinds.iter().map(|k| k.as_str().to_string()).collect())
+    }
 }
 
 /// Typed `data/` subdirectories the file tools write into. Anything else under

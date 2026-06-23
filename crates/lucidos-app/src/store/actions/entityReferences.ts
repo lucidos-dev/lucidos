@@ -5,7 +5,8 @@
  * Wired at the SSE dispatch level in thread-sync.ts, NOT as a side-effect of
  * handleThreadEvent or handleGlobalEvent.
  */
-import { panelOverlay, appsList, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, artifacts } from '../store';
+import { panelOverlay, appsList, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, artifacts, llmConfigured, configuredProviders } from '../store';
+import { checkHealth } from '../../api/client';
 import { loadApps } from './apps';
 import { loadChatModels } from './models';
 import { loadTriggers } from './triggers';
@@ -21,6 +22,41 @@ import { loadDevices, devices, getDeviceId } from './devices';
 
 export const RECENTS_KEY = 'lucidos-search-recents';
 export const NAV_KEY = 'lucidos-nav-history';
+
+/** Re-probe `/health` and update `llmConfigured` after a provider credential
+ *  change. The backend hot-swaps the active LLM provider in an in-process
+ *  broadcast subscriber (`spawn_provider_credential_subscriber`), so there is a
+ *  brief race between that swap and this probe: fire one immediate probe (it
+ *  usually wins — the in-process rebuild beats the SSE→browser→`/health`
+ *  round-trip) plus one short delayed re-check for the loser case. The 5s
+ *  connection poll (`useStartup.ts` → `checkConnection`) is the guaranteed
+ *  backstop, so first-run provider onboarding clears (or reappears on the last
+ *  credential's removal) WITHOUT a manual page refresh.
+ *
+ *  Deliberately a minimal local probe rather than calling `connection.ts`'s
+ *  `checkConnection`: importing connection here would close a circular import
+ *  (`connection → thread-sync → entityReferences`). `checkHealth` never throws
+ *  (returns a `Loadable`); a failed probe is left to the poll backstop — no
+ *  toast, the credential save already reported its own result. */
+async function probeLlmConfigured(): Promise<void> {
+  const result = await checkHealth();
+  if (result.status === 'loaded') {
+    // Mirror connection.ts: only an explicit `false` flips to unconfigured.
+    llmConfigured.value = result.data.llm_configured !== false;
+    // Refresh the configured-provider set too, so the model picker filter
+    // tracks the credential change that triggered this probe.
+    if (result.data.configured_providers !== undefined) {
+      configuredProviders.value = result.data.configured_providers;
+    }
+  }
+}
+
+function refreshLlmConfigured(): void {
+  void probeLlmConfigured();
+  setTimeout(() => {
+    void probeLlmConfigured();
+  }, 600);
+}
 
 /** Process a raw SSE message for entity reference updates.
  *
@@ -157,6 +193,11 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     case 'CredentialUpdated':
     case 'CredentialDeleted':
       if (credentials.value.status === 'loaded') void loadCredentials();
+      // A provider credential change rebuilds + swaps the engine's active LLM
+      // provider at runtime (no restart). Re-probe /health so `llmConfigured`
+      // (and thus first-run provider onboarding) reflects the swap without a
+      // manual page refresh.
+      refreshLlmConfigured();
       break;
     case 'EnvironmentVariableSet':
     case 'EnvironmentVariableDeleted':

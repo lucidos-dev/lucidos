@@ -186,6 +186,14 @@ fn splash_page_html(label: &str) -> String {
 <meta name="theme-color" content="#0a4ea8">
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><radialGradient id='g' gradientUnits='userSpaceOnUse' cx='30' cy='22' r='125'><stop offset='0' stop-color='%232d83e0'/><stop offset='1' stop-color='%230a4ea8'/></radialGradient></defs><rect width='100' height='100' rx='22' fill='url(%23g)'/><g transform='translate(13 13) scale(0.74)' fill='%23fff'><rect x='17' y='17' width='29' height='29' rx='7'/><rect x='17' y='54' width='29' height='29' rx='7'/><rect x='54' y='54' width='29' height='29' rx='7'/><path d='M68.5 12 C71 25 74 28.5 87 31 C74 33.5 71 37 68.5 50 C66 37 63 33.5 50 31 C63 28.5 66 25 68.5 12 Z'/></g></svg>">
 <title>Starting…</title>
+<!-- After ~30s on the splash, reveal the escape link. The first-seen time is a
+single global sessionStorage key (the splash is per-tab and only ever shows one
+stuck workspace at a time), persisted so the 2s meta-refresh reloads don't reset
+the countdown; the workspace app clears it on a successful boot (see
+crates/lucidos-app/src/main.tsx). Decided in <head> so a post-threshold reload
+shows the link from first paint (no per-reload fade). Static (no interpolation) —
+no injection surface. -->
+<script>(function(){try{var k='lucidos-boot-since';var n=Date.now();var v=sessionStorage.getItem(k);if(!v){sessionStorage.setItem(k,String(n));v=String(n);}if(n-parseInt(v,10)>30000){document.documentElement.classList.add('show-escape');}}catch(e){}})();</script>
 <style>
 html,body{margin:0;height:100%}
 /* Paint the gradient on the root with a solid fallback + fixed attachment so it
@@ -204,6 +212,11 @@ status renders the same across the cold-boot→workspace seam. Keep in sync. */
 font-family:ui-monospace,SFMono-Regular,'SF Mono',Menlo,'Fira Code','JetBrains Mono',Monaco,Consolas,monospace}
 .mark{width:min(46vmin,15rem);height:min(46vmin,15rem)}
 .mark-label{margin-top:1.25rem;font-size:.95rem;letter-spacing:.02em;opacity:.85}
+/* Escape link to the workspace picker. Hidden until the <head> reveal script
+adds `show-escape` to <html> (~30s on the splash); no opacity transition so a
+post-threshold 2s meta-refresh reload shows it steadily, not as a pulse. */
+.boot-escape{margin-top:1.75rem;color:#fff;opacity:0;pointer-events:none;font-size:.9rem;letter-spacing:.01em;text-decoration:underline;text-underline-offset:3px}
+html.show-escape .boot-escape{opacity:.85;pointer-events:auto}
 .lmk-tile,.lmk-spark{transform-box:fill-box;transform-origin:center}
 .lmk-tile{animation:tile-in .5s cubic-bezier(.34,1.56,.64,1) both}
 .lmk-tile-1{animation-delay:.15s}.lmk-tile-2{animation-delay:.28s}.lmk-tile-3{animation-delay:.41s}
@@ -223,6 +236,7 @@ font-family:ui-monospace,SFMono-Regular,'SF Mono',Menlo,'Fira Code','JetBrains M
 </svg>
 <p class="mark-label">"##;
     const TAIL: &str = r##"</p>
+<a class="boot-escape" href="/~/?pick">Open the workspace picker</a>
 </body></html>"##;
     format!("{HEAD}{label}{TAIL}")
 }
@@ -268,6 +282,20 @@ mod tests {
         assert_eq!(strip_prefix("/devx/foo", "dev"), None);
         assert_eq!(strip_prefix("/other/foo", "dev"), None);
         assert_eq!(strip_prefix("/api/v1/health", "dev"), None);
+    }
+
+    #[test]
+    fn splash_page_includes_escape_link_and_timed_reveal() {
+        let html = splash_page_html("Workspace starting…");
+        // Escape link to the picker, hidden until the <head> reveal script shows it.
+        assert!(html.contains(r#"<a class="boot-escape" href="/~/?pick">"#));
+        assert!(html.contains("show-escape"));
+        // First-seen time persisted in sessionStorage so the 2s meta-refresh
+        // reloads don't reset the 30s countdown.
+        assert!(html.contains("lucidos-boot-since"));
+        assert!(html.contains("30000"));
+        // The 2s auto-refresh that drives the happy-path transition is preserved.
+        assert!(html.contains(r#"http-equiv="refresh" content="2""#));
     }
 
     #[test]

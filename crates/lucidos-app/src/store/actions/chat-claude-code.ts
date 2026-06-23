@@ -11,7 +11,7 @@ import { loadedOr } from '../types';
 import { applyNow, applyChange, answerThreadQuestion as apiAnswerThreadQuestion, discardCCChanges, sendControlRequest, ApiError } from '../../api/client';
 import type { AnswerKind } from '../thread-events';
 import { scrollToBottom } from '../../components/chat/scrollState';
-import { changeToastMessage } from './thread-sync';
+import { changeToastMessage } from './changeToast';
 import { focusThread } from './threads';
 import { errorDetail } from '../../utils/errorDetail';
 

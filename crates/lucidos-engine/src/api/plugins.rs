@@ -263,6 +263,7 @@ fn setup_status_is_complete(status: &str) -> bool {
 /// - absent and not queued → the thread is *gone* (lost spawn, deleted, or a
 ///   stale catalog id) → complete, so the card falls through to "Open" instead
 ///   of a "Setup" button that 404s on click.
+///
 /// Pure, so the present/pending/gone boundaries are unit-testable.
 fn resolve_setup_complete(summary_status: Option<&str>, in_queue: bool) -> bool {
     match summary_status {

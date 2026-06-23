@@ -34,7 +34,8 @@ export interface DeepLinkTarget {
  *  `Tap` carries everything we need — there's no sugar for old strings.
  *
  *  Missing `tap` (null/undefined) defaults to `{kind:'modal'}` so legacy URLs
- *  that pre-date the structured shape still land on the inbox modal. */
+ *  that pre-date the structured shape still open the notification detail in the
+ *  panel (the `modal` tap kind is the wire name, not a UI modal). */
 export function resolveDeepLink(target: DeepLinkTarget): DeepLinkAction {
   const tap: Tap = target.tap ?? { kind: 'modal' };
   switch (tap.kind) {

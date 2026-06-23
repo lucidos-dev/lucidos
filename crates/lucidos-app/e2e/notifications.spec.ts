@@ -71,18 +71,18 @@ function seedTallChatThread(exchanges: number): { threadId: string; firstEventId
   return { threadId, firstEventId, lastEventId };
 }
 
-test.describe('Notifications modal does not auto-open', () => {
+test.describe('Notification detail does not auto-open', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
     clearNotifications();
   });
 
-  test('NotificationCreated on foregrounded page leaves the modal closed', async ({ page }) => {
+  test('NotificationCreated on foregrounded page leaves the detail panel closed', async ({ page }) => {
     await navigateToApp(page);
     // Bell only renders on the content pane on mobile (no-op on desktop).
     await ensureMobileView(page, 'content');
     await expect(page.locator('.notifications-bell:visible').first()).toBeVisible({ timeout: 10_000 });
-    await expect(page.locator('.notifications-modal')).toHaveCount(0);
+    await expect(page.locator('.notification-detail-body')).toHaveCount(0);
 
     await postNotification(page, {
       title: 'Heads up',
@@ -90,19 +90,19 @@ test.describe('Notifications modal does not auto-open', () => {
     });
 
     // Bell badge bumps — sanity check the SSE landed (otherwise the
-    // modal-closed assertion below is vacuous).
+    // detail-closed assertion below is vacuous).
     await expect(page.locator('.notifications-bell:visible .badge').first()).toHaveText('1', { timeout: 5_000 });
 
     // Wait-then-check: Playwright's auto-retrying assertions PASS on the
     // first poll the condition holds, so `toHaveCount(0, { timeout })`
-    // returns instantly when the modal is already closed — useless for
+    // returns instantly when the detail is already closed — useless for
     // proving absence over a window. Sleep then assert once so a delayed
-    // opener that flips the signal inside the window is actually caught.
+    // opener that flips the overlay inside the window is actually caught.
     await page.waitForTimeout(500);
-    await expect(page.locator('.notifications-modal')).toHaveCount(0);
+    await expect(page.locator('.notification-detail-body')).toHaveCount(0);
   });
 
-  test('NotificationCreated while notifications panel is open leaves the modal closed', async ({ page }) => {
+  test('NotificationCreated while notifications panel is open leaves the detail panel closed', async ({ page }) => {
     await navigateToApp(page);
     await ensureMobileView(page, 'content');
 
@@ -111,7 +111,7 @@ test.describe('Notifications modal does not auto-open', () => {
     await expect(
       page.locator('.empty-state:has-text("No"), .notification-item').first(),
     ).toBeVisible({ timeout: 5_000 });
-    await expect(page.locator('.notifications-modal')).toHaveCount(0);
+    await expect(page.locator('.notification-detail-body')).toHaveCount(0);
 
     await postNotification(page, {
       title: 'Heads up 2',
@@ -119,7 +119,7 @@ test.describe('Notifications modal does not auto-open', () => {
     });
 
     // The list reloads (handleNotificationSSE → loadNotifications when panel
-    // is active). The new row should appear, but the MODAL must stay closed.
+    // is active). The new row should appear, but the DETAIL must stay closed.
     await expect(
       page.locator('.notification-item:has-text("Heads up 2")').first(),
     ).toBeVisible({ timeout: 5_000 });
@@ -127,7 +127,7 @@ test.describe('Notifications modal does not auto-open', () => {
     // Same wait-then-check as scenario 1 — Playwright's auto-retry would
     // pass instantly against an already-zero count.
     await page.waitForTimeout(500);
-    await expect(page.locator('.notifications-modal')).toHaveCount(0);
+    await expect(page.locator('.notification-detail-body')).toHaveCount(0);
   });
 });
 
@@ -237,7 +237,7 @@ test.describe('Notification deep-link to an event in an unfocused thread', () =>
     });
 
     // The reported surface: the in-app notifications panel → the notification's
-    // modal → its "Open thread" action.
+    // detail panel → its "Open thread" action.
     await ensureMobileView(page, 'content');
     await clickVisibleElement(page, '.notifications-bell');
     await waitForVisibleElement(page, '.notification-item', 10_000);
@@ -286,8 +286,8 @@ test.describe('Notification deep-link to an event in an unfocused thread', () =>
     // AFTER scrollToEventAndPulse's) fired last and snapped back to the saved
     // offset. Already-focused threads don't re-run useScrollMemory — which is
     // exactly why the scroll worked when the thread was already focused and not
-    // otherwise. The path is shared by every surface (inbox modal, in-app toast,
-    // push), so the inbox modal reproduces it deterministically.
+    // otherwise. The path is shared by every surface (inbox detail panel,
+    // in-app toast, push), so the inbox detail panel reproduces it deterministically.
     seeded = seedTallChatThread(16);
     const { threadId, lastEventId } = seeded;
 

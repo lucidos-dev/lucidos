@@ -79,9 +79,11 @@ export const filePreviewSource = signal(localStorage.getItem('lucidos-file-previ
 
 /** When true, a diff preview shows the whole file in its merged end state instead
  *  of the unified hunks. Orthogonal to filePreviewSource (which still toggles
- *  source-vs-rendered within the whole-file view). Sticky/persisted, default off
- *  (the diff stays the default), matching the filePreviewSource pattern. */
-export const diffWholeFile = signal(localStorage.getItem('lucidos-diff-whole-file') === 'true');
+ *  source-vs-rendered within the whole-file view). Transient, default off (the
+ *  diff is the default) and reset back to the diff whenever the previewed file
+ *  changes (see store/effects.ts) so each new diff opens on the hunks — like
+ *  filePreviewEditing, NOT persisted across diffs or reloads. */
+export const diffWholeFile = signal(false);
 
 /** When true, the data-file preview shows an editable textarea instead of the
  *  rendered/source view. Reset to false whenever the previewed file changes
@@ -178,6 +180,20 @@ export const latestTauriAppVersion = signal<string | null>(null);
  *  "Restart" control (LaunchAgent kickstart vs. dev rebuild script) and gates
  *  the Tauri-only Mobile Access settings page. Set from /health. */
 export const enginePackaged = signal<boolean>(false);
+
+/** False when the connected engine booted with no LLM provider configured (the
+ *  UnconfiguredProvider sentinel — a packaged build's first run). Drives the
+ *  first-run provider onboarding in the welcome surface. Set from /health.
+ *  Defaults to `true` so onboarding never flashes before the first health probe
+ *  lands; the probe corrects it to `false` only when the engine reports so. */
+export const llmConfigured = signal<boolean>(true);
+
+/** Provider backends the connected engine actually has configured
+ *  (`vertex`/`anthropic`/`openai`/`openrouter`/`local`), from /health. Filters
+ *  the chat model picker to providers the user has set up. `null` = don't filter
+ *  (mock, or an older engine that doesn't report this) — the safe default so the
+ *  picker is never empty before the first probe / under mock. */
+export const configuredProviders = signal<string[] | null>(null);
 
 // --- Model (persisted via preferences; populated by loadPreferences) ---
 export const currentModel = signal(DEFAULT_CHAT_MODEL);
@@ -1119,8 +1135,6 @@ export const notificationsFilter = signal<'all' | 'unread'>(
 );
 export const notificationsHasMore = signal(false);
 export const notificationsLoadingMore = signal(false);
-export const notificationsModalOpen = signal(false);
-export const notificationModalDetail = signal<Notification | null>(null);
 export const pageTitle = computed(() =>
   unreadCount.value > 0 ? `(${unreadCount.value}) Lucidos` : 'Lucidos'
 );

@@ -130,29 +130,102 @@
     transform: rotate(180deg);
 }
 
-/* The menu holds the secondary actions as the same .action-btn pills as the
- * primary face — a padded vertical stack of full-width buttons, not a plain
- * text list. */
+/* When expanded, the caret menu and the primary row read as ONE unit: a single
+ * slightly-translucent frosted frame with the solid .action-btn pills (Diff /
+ * Discard / Apply) stacked inside it. STEADY BASE is the load-bearing rule: the
+ * primary button is the anchor and must NOT move when the menu opens. So the
+ * frame is NOT built by growing the in-flow `.split-button` box (padding/border
+ * on open shoved the right/bottom-anchored button up-and-left — the jump). It's
+ * two OUT-OF-FLOW pieces that wrap the steady button: the menu is the
+ * rounded-top half (absolute, above), `.split-button.open::before` (below) is
+ * the rounded-bottom half (absolute, behind the pills). Both extend the same
+ * `0.375rem` beyond the button on the sides, sharing the same translucent fill
+ * and hairline border, so they fuse into one panel around an unmoved button. */
+
+/* Upper half of the frame. Extended `0.375rem` beyond the button on each side
+ * (matching the ::before below) and dropped flush onto the button's top edge (no
+ * margin) so menu + button fuse. Even padding all round → the seam gap
+ * (menu padding-bottom + the button's top edge) matches the inter-pill gap, so
+ * Diff→Discard→Apply read as one even rhythm without the button needing any
+ * top padding (which would move it). */
 .split-button-menu {
     position: absolute;
     bottom: 100%;
-    right: 0;
-    margin-bottom: 0.25rem;
+    left: -0.375rem;
+    right: -0.375rem;
+    margin-bottom: 0;
     display: flex;
     flex-direction: column;
     gap: 0.375rem;
     padding: 0.375rem;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
-    box-shadow: var(--shadow-md);
+    background: color-mix(in srgb, var(--bg-secondary) 86%, transparent);
+    -webkit-backdrop-filter: blur(0.625rem) saturate(1.2);
+    backdrop-filter: blur(0.625rem) saturate(1.2);
+    border: 1px solid color-mix(in srgb, var(--border-color) 80%, transparent);
+    border-bottom: none;
+    border-radius: 0.5rem 0.5rem 0 0;
+    /* Up-only shadow so the unit lifts off the chat content above without
+     * casting onto (and darkening the seam over) the primary row below. */
+    box-shadow: 0 -0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.1);
     z-index: var(--z-dropdown);
-    min-width: 8.75rem;
+    animation: split-button-menu-in var(--duration-normal) ease;
+}
+
+html[data-theme="dark"] .split-button-menu {
+    box-shadow: 0 -0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.4);
+}
+
+@keyframes split-button-menu-in {
+    from { opacity: 0; transform: translateY(0.375rem); }
+    to   { opacity: 1; transform: translateY(0); }
 }
 
 .split-button-menu button {
     width: 100%;
     text-align: center;
+}
+
+/* Lower half of the frame, drawn OUT OF FLOW so the button never moves. The
+ * `::before` is absolutely positioned and extends `0.375rem` beyond the steady
+ * button on the sides + bottom and up to the button's top edge (the seam with
+ * the menu) — giving the same translucent fill + hairline border + rounded
+ * bottom + grounding shadow as the menu, wrapped around the unmoved pills. It
+ * sits BEHIND the pills (which get `z-index: 1` below); since it adds no padding
+ * or border to the in-flow box, opening the menu changes only paint, never
+ * layout. No `backdrop-filter` here on purpose: it would make this a backdrop
+ * root and break the menu's frost (the menu floats outside this box, over the
+ * chat content), so only the menu is frosted. */
+.split-button.open::before {
+    content: "";
+    position: absolute;
+    left: -0.375rem;
+    right: -0.375rem;
+    top: 0;
+    bottom: -0.375rem;
+    background: color-mix(in srgb, var(--bg-secondary) 86%, transparent);
+    border: 1px solid color-mix(in srgb, var(--border-color) 80%, transparent);
+    border-top: none;
+    border-radius: 0 0 0.5rem 0.5rem;
+    /* Down-only shadow (mirrors the menu's up-only) so the unit grounds at the
+     * bottom without bleeding a shadow up through the translucent menu seam. */
+    box-shadow: 0 0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.1);
+}
+
+html[data-theme="dark"] .split-button.open::before {
+    box-shadow: 0 0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.4);
+}
+
+/* Lift the pills above the ::before frame backing. position+z-index don't change
+ * layout, so the steady base holds. flex:1 makes [Apply & Restart] fill the row
+ * so it + the caret span the same width as the Diff / Discard pills above. */
+.split-button.open .split-button-primary,
+.split-button.open .split-button-caret {
+    position: relative;
+    z-index: 1;
+}
+
+.split-button.open .split-button-primary {
+    flex: 1;
 }
 
 /* Shared dropdown — custom select replacement */

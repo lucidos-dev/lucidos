@@ -67,6 +67,7 @@ export function getContentTitle(): string {
     return fileName;
   }
   if (overlay?.type === 'url-preview') return pageTitle || getHostname(url!);
+  if (overlay?.type === 'notification-detail') return overlay.notification.title || 'Notification';
   if (!overlay && active === 'settings' && settingsSubview.value !== 'main') {
     return settingsSubviewLabel(settingsSubview.value) || '';
   }

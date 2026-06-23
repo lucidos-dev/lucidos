@@ -64,6 +64,51 @@ export function clearSubmittingThread(threadId: string): void {
   submittingThreadIds.value = next;
 }
 
+// --- Post-submit cancel settle window ------------------------------------
+//
+// The prompt-row Send/Submit button morphs IN PLACE into a destructive
+// Cancel/Stop the instant the user submits: a normal Send flips to the
+// running-turn Stop (via the optimistic submitting flag above), and a typed
+// answer's Submit flips to a lone Cancel once the draft clears. On a laggy iOS
+// PWA the user taps the same spot several times before the UI catches up, so a
+// queued or reflexive repeat tap lands on the freshly-morphed Cancel and aborts
+// the turn they just started — stamping the next pending question `Canceled` +
+// `ResponseCanceled { user_stop }`. (Thread fe390597: a FreeText answer's Submit
+// at 15:54:02 → a `Canceled` answer 4.8s later; workspace-wide nearly every
+// user_stop cancel sits on a `waiting_for_user_answer` question.)
+//
+// After a constructive submit we hold the destructive morph DISABLED for this
+// long so the burst is absorbed. A genuine stop is one tap away once the window
+// passes; a fresh question with no preceding submit is never armed, so the
+// escape-hatch Cancel stays immediately usable.
+export const CANCEL_SETTLE_MS = 1200;
+
+// Epoch-ms the settle window ends; 0 = not settling. A signal so the prompt
+// re-renders the Cancel/Stop enabled⇄disabled as the window arms and expires.
+const cancelSettleUntil = signal(0);
+let cancelSettleTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Arm the settle window — call the moment a constructive prompt-row action
+ *  (Send / Submit answer) fires, before the button can morph to Cancel/Stop. */
+export function armCancelSettle(now: number = Date.now()): void {
+  cancelSettleUntil.value = now + CANCEL_SETTLE_MS;
+  if (cancelSettleTimer) clearTimeout(cancelSettleTimer);
+  // Flip the signal back off so the component re-renders the button enabled
+  // again once the window passes (no other render trigger is guaranteed).
+  cancelSettleTimer = setTimeout(() => {
+    cancelSettleUntil.value = 0;
+    cancelSettleTimer = null;
+  }, CANCEL_SETTLE_MS);
+}
+
+/** True while the post-submit settle window is active: the destructive
+ *  Cancel/Stop morph must render disabled and ignore taps. Reactive — reading
+ *  it in render subscribes the component to the arm/expire transitions. */
+export function isCancelSettling(now: number = Date.now()): boolean {
+  const until = cancelSettleUntil.value;
+  return until !== 0 && now < until;
+}
+
 /** For a thread whose Cancel was clicked while a question was on screen, the
  *  `tool_use_id` of the question that was pending at click time. The cleanup
  *  effect (PromptInput) keys the optimistic `cancelingThreadIds` release off

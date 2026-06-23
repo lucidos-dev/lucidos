@@ -19,6 +19,15 @@ export interface HealthInfo {
    *  runs as the launchd service). Routes the "Restart" control: packaged →
    *  restart the LaunchAgent; dev → the /restart rebuild script. */
   packaged?: boolean;
+  /** False when the engine booted with no LLM provider configured (the
+   *  UnconfiguredProvider sentinel — packaged first run). Drives first-run
+   *  provider onboarding. Absent on older engines → treated as configured. */
+  llm_configured?: boolean;
+  /** Provider backends the engine actually has configured
+   *  (`vertex`/`anthropic`/`openai`/`openrouter`/`local`). Used to filter the
+   *  model picker to providers the user has set up. `null`/absent = don't filter
+   *  (mock, or an older engine). Reflects a runtime credential swap. */
+  configured_providers?: string[] | null;
 }
 
 /** Probe `/api/v1/health`. Failed without `httpCode` = transport unreachable;

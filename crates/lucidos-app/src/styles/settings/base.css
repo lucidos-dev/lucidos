@@ -202,3 +202,11 @@
     padding: 0.0625rem 0.3125rem;
     color: var(--text-secondary);
 }
+
+/* Shown next to the provider chip when that backend isn't configured, so the
+   model is hidden from the picker. Muted + dashed to read as "inactive". */
+.model-provider-unconfigured {
+    color: var(--text-muted);
+    border-style: dashed;
+    text-transform: none;
+}

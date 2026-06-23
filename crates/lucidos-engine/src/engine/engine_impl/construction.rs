@@ -674,8 +674,45 @@ impl LucidosEngine {
             crate::core::user_dir::ensure_git_init(ud);
         }
 
+        // Wrap the active provider in the swappable handle BEFORE the struct is
+        // assembled, so the credential subscriber below shares the very handle
+        // stored on `Self.llm` and its writes are seen by every read site.
+        let llm_handle: Arc<std::sync::RwLock<Arc<dyn LlmProvider>>> =
+            Arc::new(std::sync::RwLock::new(llm));
+
+        // Inputs the runtime credential subscriber needs to rebuild a provider
+        // identical to a fresh boot. Env-stable and mirror `main.rs`; the shared
+        // handles (Vertex location/token cache, model registry) are cloned so the
+        // rebuilt provider tracks live region/registry updates and reuses warm
+        // Vertex tokens. Clone everything here — the originals are moved into the
+        // other subscribers / `Self` below.
+        let default_model = std::env::var("LUCIDOS_MODEL")
+            .unwrap_or_else(|_| crate::core::DEFAULT_CHAT_MODEL.to_string());
+        let provider_build_ctx = crate::llm::ProviderBuildContext {
+            model_is_mock: default_model == "mock",
+            default_model,
+            vertex_project_id: vertex_project_id.clone(),
+            vertex_location: vertex_location.clone(),
+            vertex_token_cache: vertex_token_cache.clone(),
+            model_registry: model_registry.clone(),
+            boot_without_provider: crate::llm::boot_without_provider_enabled(),
+        };
+
         spawn_vertex_region_subscriber(event_bus.subscribe(), vertex_location.clone());
         spawn_models_registry_subscriber(event_bus.subscribe(), model_registry, pool.clone());
+
+        // Hot-swap the active LLM provider when a provider credential is added or
+        // removed at runtime — the whole point of booting unconfigured. NOT
+        // spawned under LUCIDOS_MODEL=mock, so the mock is never swapped to/from
+        // (mock isolation).
+        if !provider_build_ctx.model_is_mock {
+            spawn_provider_credential_subscriber(
+                event_bus.subscribe(),
+                llm_handle.clone(),
+                pool.clone(),
+                provider_build_ctx,
+            );
+        }
 
         // Build the wasmtime engine ONCE — both `proxy_modules` (compiled
         // here at startup) and `WasmSignerLayer::apply` (instantiated
@@ -709,7 +746,10 @@ impl LucidosEngine {
             python_runtime,
             browser_runtime,
             app_manager,
-            llm,
+            // The swappable provider handle, shared with the credential
+            // subscriber spawned above (built before this struct so both sides
+            // hold the same lock).
+            llm: llm_handle,
             embedder,
             memory_index,
             extractor,

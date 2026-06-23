@@ -42,7 +42,7 @@ impl LucidosEngine {
         }];
 
         match self
-            .llm
+            .current_provider()
             .chat(messages, vec![], None, None, None, None)
             .await
         {

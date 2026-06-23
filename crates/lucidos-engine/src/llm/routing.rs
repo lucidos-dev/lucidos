@@ -51,16 +51,16 @@ impl RoutingProvider {
     ) -> Result<&dyn LlmProvider, Box<dyn std::error::Error + Send + Sync>> {
         match provider_kind_for(&self.registry, model) {
             ProviderKind::OpenAi => self.openai.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
-                "OpenAI model requested but no OpenAI credential is configured (Settings → Providers) and OPENAI_API_KEY is not set".into()
+                "OpenAI model requested but no OpenAI credential is configured (Settings → Models → Providers) and OPENAI_API_KEY is not set".into()
             }),
             ProviderKind::Anthropic => self.anthropic.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
-                "Anthropic model requested but no Anthropic credential is configured (Settings → Providers)".into()
+                "Anthropic model requested but no Anthropic credential is configured (Settings → Models → Providers)".into()
             }),
             ProviderKind::OpenRouter => self.openrouter.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
-                "OpenRouter model requested but no OpenRouter credential is configured (Settings → Providers) and LUCIDOS_OPENROUTER_API_KEY is not set — add it and restart".into()
+                "OpenRouter model requested but no OpenRouter credential is configured (Settings → Models → Providers) and LUCIDOS_OPENROUTER_API_KEY is not set".into()
             }),
             ProviderKind::Local => self.local.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
-                "Local model requested but the local OpenAI-compatible provider is not configured (Settings → Providers)".into()
+                "Local model requested but the local OpenAI-compatible provider is not configured (Settings → Models → Providers)".into()
             }),
             ProviderKind::Vertex => self
                 .vertex
@@ -98,5 +98,25 @@ impl LlmProvider for RoutingProvider {
 
     fn default_model(&self) -> &str {
         &self.default_model
+    }
+
+    fn configured_providers(&self) -> Option<Vec<ProviderKind>> {
+        let mut kinds = Vec::new();
+        if self.vertex.is_some() {
+            kinds.push(ProviderKind::Vertex);
+        }
+        if self.anthropic.is_some() {
+            kinds.push(ProviderKind::Anthropic);
+        }
+        if self.openai.is_some() {
+            kinds.push(ProviderKind::OpenAi);
+        }
+        if self.openrouter.is_some() {
+            kinds.push(ProviderKind::OpenRouter);
+        }
+        if self.local.is_some() {
+            kinds.push(ProviderKind::Local);
+        }
+        Some(kinds)
     }
 }

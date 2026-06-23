@@ -12,6 +12,7 @@ import {
   cancelingThreadIds,
   removingQueuedMessageIds,
   queuedMessageRemovalKey,
+  llmConfigured,
 } from '../../store/store';
 import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
 import { scrolledUp, awayFromBottom, notAtTop, scrollToBottom, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, hasPendingEventScroll } from './scrollState';
@@ -356,6 +357,24 @@ export function useAutoScroll(ref: preact.RefObject<HTMLDivElement>, deps: unkno
   }, deps);
 }
 
+/** Whether the welcome surface (`WelcomeMessage`) shows on the empty compose
+ *  view. Two independent reasons, both requiring an empty draft:
+ *   - `needsProviderSetup` (no LLM provider configured) → shows the provider
+ *     onboarding variant. A hard requirement, so it ignores history AND the
+ *     "Don't show this again" dismissal (which only retires the starter tips).
+ *   - a genuinely new workspace (no history) that hasn't dismissed the tips →
+ *     shows the starter-suggestions welcome.
+ *  Pure so the gating is unit-testable without rendering the hook-heavy view. */
+export function showWelcomeSurface(opts: {
+  isEmpty: boolean;
+  isNewWorkspace: boolean;
+  welcomeDismissed: boolean;
+  needsProviderSetup: boolean;
+}): boolean {
+  if (!opts.isEmpty) return false;
+  return opts.needsProviderSetup || (opts.isNewWorkspace && !opts.welcomeDismissed);
+}
+
 export function CreateThreadView() {
   const exchanges = activeExchanges.value;
   const streamingBuffer = activeStreamingBuffer.value;
@@ -366,15 +385,18 @@ export function CreateThreadView() {
   const isNotAtTop = notAtTop.value;
 
   const isEmpty = exchanges.length === 0;
-  // Show the new-workspace welcome + starter suggestions only on a genuinely
-  // NEW workspace: no exchanges in this draft, no conversation history yet, and
-  // the user hasn't retired it via "Don't show this again". Gating on
-  // `workspaceHasHistory` (threads) instead of the old "any data/ file" check
-  // fixes the welcome silently vanishing when a fresh workspace happened to
+  // Gating on `workspaceHasHistory` (threads) instead of the old "any data/ file"
+  // check fixes the welcome silently vanishing when a fresh workspace happened to
   // carry a stray config/script. Both reads are reactive: the welcome appears
   // once threads + preferences settle and never flashes for returning users.
   const isNewWorkspace = loaded && !workspaceHasHistory.value;
-  const showWelcome = isEmpty && isNewWorkspace && !welcomeSuggestionsDismissed();
+  const showWelcome = showWelcomeSurface({
+    isEmpty,
+    isNewWorkspace,
+    welcomeDismissed: welcomeSuggestionsDismissed(),
+    // No LLM provider configured → WelcomeMessage renders the setup variant.
+    needsProviderSetup: !llmConfigured.value,
+  });
 
   // hasContent: true exactly when the thread-content div will be in the DOM.
   // useAutoScroll depends on this — if we only pass `loaded`, the effect runs

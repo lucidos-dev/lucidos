@@ -1,6 +1,6 @@
 use lucidos_engine::api::{create_router, SharedEngine};
 use lucidos_engine::engine::LucidosEngine;
-use lucidos_engine::llm::{resolve_openai_api_key, OpenAiProvider, RoutingProvider, VertexProvider};
+use lucidos_engine::llm::{build_active_provider, ProviderBuildContext, ProviderBuildOutcome};
 use lucidos_engine::log;
 use lucidos_engine::scheduler::SchedulerManager;
 use std::net::SocketAddr;
@@ -111,258 +111,6 @@ async fn read_vertex_region_pref(database_url: &str) -> Option<String> {
     .ok()
     .flatten()
     .filter(|s| !s.is_empty())
-}
-
-/// Build the direct-OpenAI provider from a resolved key, logging where the key
-/// came from and degrading to `None` (rather than aborting startup) if the
-/// reqwest client can't be built. Shared by both branches of
-/// `load_direct_providers_and_registry` so the DB-up and DB-down paths honor
-/// the OPENAI_API_KEY fallback identically.
-fn build_openai_provider(
-    credential: Option<(lucidos_engine::core::AuthType, String)>,
-    env_key: Option<String>,
-    default_model: &str,
-) -> Option<OpenAiProvider> {
-    match resolve_openai_api_key(credential, env_key) {
-        Some((key, source)) => {
-            log!("[Startup] OpenAI provider configured (key from {})", source);
-            OpenAiProvider::new(key, default_model.to_string())
-                .map_err(|e| log!("[Startup] Failed to build OpenAI provider: {}", e))
-                .ok()
-        }
-        None => None,
-    }
-}
-
-/// OpenRouter's OpenAI-compatible base URL.
-const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
-
-/// Build the OpenRouter provider — an [`OpenAiProvider`] pinned to OpenRouter's
-/// OpenAI-compatible Chat Completions endpoint — from a stored `openrouter`
-/// credential (Settings → Providers) with the `LUCIDOS_OPENROUTER_API_KEY`
-/// env var as a fallback. Sends OpenRouter's optional `HTTP-Referer` / `X-Title`
-/// attribution headers. `None` when no key is configured.
-fn build_openrouter_provider(
-    credential: Option<(lucidos_engine::core::AuthType, String)>,
-    env_key: Option<String>,
-    default_model: &str,
-) -> Option<OpenAiProvider> {
-    let key = lucidos_engine::llm::resolve_bearer_key(credential, env_key)?;
-    let extra_headers = vec![
-        ("HTTP-Referer".to_string(), "https://lucidos.dev".to_string()),
-        ("X-Title".to_string(), "Lucidos".to_string()),
-    ];
-    match OpenAiProvider::new_with_base_url(
-        key,
-        default_model.to_string(),
-        OPENROUTER_BASE_URL,
-        extra_headers,
-        true,
-    ) {
-        Ok(p) => {
-            log!("[Startup] OpenRouter provider configured");
-            Some(p)
-        }
-        Err(e) => {
-            log!("[Startup] Failed to build OpenRouter provider: {}", e);
-            None
-        }
-    }
-}
-
-/// Build the local OpenAI-compatible provider (Ollama / LM Studio / vLLM /
-/// llama.cpp). Opt-in: only built when the user has signalled local use via the
-/// `local_base_url` preference (`base_url_pref`), a `local` credential
-/// (`api_key_cred`), or the `LUCIDOS_LOCAL_BASE_URL` / `LUCIDOS_LOCAL_API_KEY`
-/// env vars — otherwise `None`, so a default localhost backend isn't conjured
-/// for users who never asked for it (and the "no provider configured" guard
-/// stays honest). The base URL resolves pref → env → [`DEFAULT_LOCAL_BASE_URL`];
-/// the key is optional (the `Authorization` header is omitted when empty).
-///
-/// [`DEFAULT_LOCAL_BASE_URL`]: lucidos_engine::core::DEFAULT_LOCAL_BASE_URL
-fn build_local_provider(
-    base_url_pref: Option<String>,
-    api_key_cred: Option<String>,
-    default_model: &str,
-) -> Option<OpenAiProvider> {
-    let base_pref = base_url_pref.filter(|s| !s.trim().is_empty());
-    let base_env = std::env::var("LUCIDOS_LOCAL_BASE_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-    let key = api_key_cred.filter(|s| !s.trim().is_empty()).or_else(|| {
-        std::env::var("LUCIDOS_LOCAL_API_KEY")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-    });
-
-    if base_pref.is_none() && base_env.is_none() && key.is_none() {
-        return None;
-    }
-
-    let base = base_pref
-        .or(base_env)
-        .unwrap_or_else(|| lucidos_engine::core::DEFAULT_LOCAL_BASE_URL.to_string());
-    match OpenAiProvider::new_with_base_url(
-        key.unwrap_or_default(),
-        default_model.to_string(),
-        &base,
-        Vec::new(),
-        true,
-    ) {
-        Ok(p) => {
-            log!(
-                "[Startup] Local OpenAI-compatible provider configured (base {})",
-                base
-            );
-            Some(p)
-        }
-        Err(e) => {
-            log!("[Startup] Failed to build local provider: {}", e);
-            None
-        }
-    }
-}
-
-/// Open a short-lived pool to assemble the direct OpenAI + Anthropic providers
-/// (from the `openai` / `anthropic` credentials set in Settings → Providers)
-/// and the model→provider registry. Providers are built before
-/// `LucidosEngine::new` creates its own pool, so — like `read_vertex_region_pref`
-/// — this uses a throwaway connection. The OpenAI key prefers the stored
-/// credential and falls back to `openai_env_key` (the `OPENAI_API_KEY` launch
-/// env var); OpenRouter and the local OpenAI-compatible backend resolve the
-/// same way (credential → env). Returns
-/// `(openai, anthropic, openrouter, local, id→provider map)`; each degrades to
-/// `None`/empty on any DB or credential error so the engine still boots on its
-/// other providers.
-async fn load_direct_providers_and_registry(
-    database_url: &str,
-    default_model: &str,
-    openai_env_key: Option<String>,
-) -> (
-    Option<OpenAiProvider>,
-    Option<lucidos_engine::llm::AnthropicProvider>,
-    Option<OpenAiProvider>,
-    Option<OpenAiProvider>,
-    std::collections::HashMap<String, lucidos_engine::llm::ProviderKind>,
-) {
-    let pool = match sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(database_url)
-        .await
-    {
-        Ok(p) => p,
-        Err(e) => {
-            log!(
-                "[Startup] Could not open pool for direct-provider credentials / model registry: {}",
-                e
-            );
-            // No DB access, but the env-var fallbacks must still work.
-            let openai = build_openai_provider(None, openai_env_key, default_model);
-            let openrouter = build_openrouter_provider(
-                None,
-                std::env::var("LUCIDOS_OPENROUTER_API_KEY").ok(),
-                default_model,
-            );
-            let local = build_local_provider(None, None, default_model);
-            return (
-                openai,
-                None,
-                openrouter,
-                local,
-                std::collections::HashMap::new(),
-            );
-        }
-    };
-
-    let registry_map = lucidos_engine::llm::model_registry::load_from_db(&pool).await;
-
-    let anthropic = match lucidos_engine::core::CredentialStore::get(&pool, "anthropic").await {
-        Ok(Some(cred)) => {
-            use lucidos_engine::core::AuthType;
-            use lucidos_engine::llm::AnthropicAuth;
-            let auth = match cred.auth_type {
-                AuthType::ApiKey => Some(AnthropicAuth::ApiKey(cred.auth_value)),
-                AuthType::Bearer => Some(AnthropicAuth::OAuthBearer(cred.auth_value)),
-                other => {
-                    log!(
-                        "[Startup] Anthropic credential auth_type {} unsupported (expected api_key or bearer) — direct Anthropic disabled",
-                        other
-                    );
-                    None
-                }
-            };
-            match auth.and_then(|a| {
-                lucidos_engine::llm::AnthropicProvider::new(a, default_model.to_string())
-                    .map_err(|e| log!("[Startup] Failed to build Anthropic provider: {}", e))
-                    .ok()
-            }) {
-                Some(p) => {
-                    log!("[Startup] Direct Anthropic provider configured");
-                    Some(p)
-                }
-                None => None,
-            }
-        }
-        Ok(None) => None,
-        Err(e) => {
-            log!("[Startup] Failed to read Anthropic credential: {}", e);
-            None
-        }
-    };
-
-    // OpenAI: a stored `openai` credential wins; otherwise the env fallback.
-    let openai_credential = match lucidos_engine::core::CredentialStore::get(&pool, "openai").await {
-        Ok(Some(cred)) => Some((cred.auth_type, cred.auth_value)),
-        Ok(None) => None,
-        Err(e) => {
-            log!("[Startup] Failed to read OpenAI credential: {}", e);
-            None
-        }
-    };
-    let openai = build_openai_provider(openai_credential, openai_env_key, default_model);
-
-    // OpenRouter: a stored `openrouter` credential wins; otherwise the env fallback.
-    let openrouter_credential =
-        match lucidos_engine::core::CredentialStore::get(&pool, "openrouter").await {
-            Ok(Some(cred)) => Some((cred.auth_type, cred.auth_value)),
-            Ok(None) => None,
-            Err(e) => {
-                log!("[Startup] Failed to read OpenRouter credential: {}", e);
-                None
-            }
-        };
-    let openrouter = build_openrouter_provider(
-        openrouter_credential,
-        std::env::var("LUCIDOS_OPENROUTER_API_KEY").ok(),
-        default_model,
-    );
-
-    // Local OpenAI-compatible: base URL from the `local_base_url` pref (env /
-    // default applied inside the builder) and an optional `local` credential.
-    let local_base_pref = match lucidos_engine::core::PreferenceStore::get(
-        &pool,
-        lucidos_engine::core::PREF_LOCAL_BASE_URL,
-    )
-    .await
-    {
-        Ok(opt) => opt,
-        Err(e) => {
-            log!("[Startup] Failed to read local_base_url preference: {}", e);
-            None
-        }
-    };
-    let local_key = match lucidos_engine::core::CredentialStore::get(&pool, "local").await {
-        Ok(Some(cred)) => Some(cred.auth_value),
-        Ok(None) => None,
-        Err(e) => {
-            log!("[Startup] Failed to read local provider credential: {}", e);
-            None
-        }
-    };
-    let local = build_local_provider(local_base_pref, local_key, default_model);
-
-    (openai, anthropic, openrouter, local, registry_map)
 }
 
 fn get_gcloud_project() -> Option<String> {
@@ -584,9 +332,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let database_url = lucidos_engine::core::database_url();
     log!("[Startup] Connecting to PostgreSQL...");
 
-    // Vertex AI config — needed for Claude/Gemini models and memory extraction
+    // Vertex AI config — needed for Claude/Gemini models and memory extraction.
+    // Resolve the project WITHOUT requiring the `gcloud` binary so a packaged
+    // build works from the user's existing ADC: env → ADC `quota_project_id` /
+    // gcloud config `[core] project` (file reads) → `gcloud config` subprocess
+    // (dev fallback).
     let project_id = std::env::var("VERTEX_PROJECT_ID")
         .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(lucidos_engine::llm::vertex::adc::project_from_files)
         .or_else(get_gcloud_project)
         .unwrap_or_default();
 
@@ -608,83 +362,89 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // the engine so the reload subscriber can hot-swap it on Model* events.
     let model_registry = lucidos_engine::llm::model_registry::empty();
 
-    // Create LLM provider — mock mode bypasses real providers entirely
-    let (llm, vertex_token_cache): (
-        Arc<dyn lucidos_engine::llm::LlmProvider>,
-        Option<lucidos_engine::llm::vertex::TokenCache>,
-    ) = if model == "mock" {
-        log!("[Startup] Mock LLM provider active — no external API calls");
-        (
-            Arc::new(lucidos_engine::llm::mock::MockProvider::new(model.clone())),
-            None,
-        )
-    } else {
-        let (vertex, vtc) = if !project_id.is_empty() {
-            log!("[Startup] Vertex AI configured (project: {})", project_id);
-            let cache: lucidos_engine::llm::vertex::TokenCache =
-                std::sync::Arc::new(std::sync::Mutex::new(None));
-            let provider = VertexProvider::with_location_handle(
-                project_id.clone(),
-                vertex_region.clone(),
-                model.clone(),
-                cache.clone(),
-            )?;
-            (Some(provider), Some(cache))
-        } else {
-            log!("[Startup] Vertex AI not configured — Claude/Gemini models unavailable");
-            (None, None)
-        };
+    // Decide + construct the LLM provider via the shared library builder
+    // (`llm::build_active_provider`), so this boot path and the runtime
+    // credential subscriber (`spawn_provider_credential_subscriber`) produce an
+    // identical provider. `LUCIDOS_MODEL=mock` is the explicit E2E opt-in
+    // (deterministic MockProvider); otherwise a real provider (Vertex / OpenAI /
+    // Anthropic / OpenRouter / local) is preferred; otherwise
+    // `LUCIDOS_BOOT_WITHOUT_PROVIDER` decides between booting an
+    // UnconfiguredProvider (a packaged build's first run — boots into onboarding,
+    // returns a clear "configure a provider" error on chat) and the dev/docker
+    // fail-fast panic. The decision matrix lives in `llm::select_provider`
+    // (unit-tested). Once a provider is configured (Settings → Providers), the
+    // credential subscriber swaps it in at runtime — no restart — and a later
+    // boot finds it here.
+    let model_is_mock = model == "mock";
+    let boot_without_provider = lucidos_engine::llm::boot_without_provider_enabled();
 
-        // Direct OpenAI + Anthropic providers (Settings → Providers) and the
-        // DB-backed model→provider routing map, all read from a throwaway pool.
-        // OpenAI prefers a stored `openai` credential and falls back to the
-        // OPENAI_API_KEY launch env var.
-        let openai_env_key = std::env::var("OPENAI_API_KEY").ok();
-        let (openai, anthropic, openrouter, local, registry_map) =
-            load_direct_providers_and_registry(&database_url, &model, openai_env_key).await;
+    if !model_is_mock {
+        if project_id.is_empty() {
+            log!("[Startup] Vertex AI not configured — Claude/Gemini models unavailable");
+        } else {
+            log!("[Startup] Vertex AI configured (project: {})", project_id);
+        }
+    }
+
+    // Create the Vertex token cache up front so the SAME handle is shared by the
+    // boot provider (via the build context), the engine (MemoryExtractor), and
+    // the credential subscriber's rebuilds — reusing warm access tokens. `Some`
+    // exactly when a real Vertex build is possible (non-mock + project
+    // configured), matching the old per-selection storage.
+    let vertex_token_cache: Option<lucidos_engine::llm::vertex::TokenCache> =
+        (!model_is_mock && !project_id.is_empty())
+            .then(|| std::sync::Arc::new(std::sync::Mutex::new(None)));
+
+    // One throwaway pool for the initial registry load + provider build — the
+    // engine's own pool doesn't exist until `LucidosEngine::new` below. `None`
+    // (mock, or DB unavailable) degrades to env-only providers + an empty
+    // registry, exactly as the prior `load_direct_providers_and_registry` did.
+    let boot_pool = if model_is_mock {
+        None
+    } else {
+        match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(&database_url)
+            .await
+        {
+            Ok(p) => Some(p),
+            Err(e) => {
+                log!(
+                    "[Startup] Could not open pool for direct-provider credentials / model registry: {}",
+                    e
+                );
+                None
+            }
+        }
+    };
+    if let Some(pool) = &boot_pool {
+        let registry_map = lucidos_engine::llm::model_registry::load_from_db(pool).await;
         if let Ok(mut guard) = model_registry.write() {
             *guard = registry_map;
         }
+    }
 
-        if vertex.is_none()
-            && openai.is_none()
-            && anthropic.is_none()
-            && openrouter.is_none()
-            && local.is_none()
-        {
-            // A packaged desktop build sets LUCIDOS_FALLBACK_MOCK=1 so the engine
-            // still boots on first run — before the user has entered any provider
-            // credential — instead of crashing the .app on launch. Dev and docker
-            // leave it unset and keep the fail-fast panic. Once a provider is
-            // configured (Settings → Providers, persisted in the DB) the next boot
-            // finds it above and uses it for real.
-            let fallback_mock = std::env::var("LUCIDOS_FALLBACK_MOCK")
-                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-                .unwrap_or(false);
-            if fallback_mock {
-                log!("[Startup] No LLM provider configured — falling back to the mock provider (LUCIDOS_FALLBACK_MOCK set). Add a provider in Settings → Providers, then restart.");
-                (
-                    Arc::new(lucidos_engine::llm::mock::MockProvider::new(model.clone())),
-                    None,
-                )
-            } else {
-                panic!("No LLM provider configured. Set VERTEX_PROJECT_ID (Claude/Gemini via Vertex), configure an OpenAI / Anthropic / OpenRouter credential (Settings → Providers) or OPENAI_API_KEY / LUCIDOS_OPENROUTER_API_KEY, set a local OpenAI-compatible base URL (Settings → Providers or LUCIDOS_LOCAL_BASE_URL), or LUCIDOS_MODEL=mock (for testing).");
-            }
-        } else {
-            (
-                Arc::new(RoutingProvider::new(
-                    vertex,
-                    openai,
-                    anthropic,
-                    openrouter,
-                    local,
-                    model_registry.clone(),
-                    model,
-                )),
-                vtc,
-            )
-        }
+    let provider_ctx = ProviderBuildContext {
+        default_model: model,
+        model_is_mock,
+        vertex_project_id: project_id.clone(),
+        vertex_location: vertex_region.clone(),
+        vertex_token_cache: vertex_token_cache.clone(),
+        model_registry: model_registry.clone(),
+        boot_without_provider,
     };
+    let llm: Arc<dyn lucidos_engine::llm::LlmProvider> =
+        match build_active_provider(boot_pool.as_ref(), &provider_ctx).await? {
+            ProviderBuildOutcome::Install(provider, selection) => {
+                log!("[Startup] LLM provider installed: {:?}", selection);
+                provider
+            }
+            ProviderBuildOutcome::FailFast => {
+                panic!("No LLM provider configured. Set VERTEX_PROJECT_ID (Claude/Gemini via Vertex), configure an OpenAI / Anthropic / OpenRouter credential (Settings → Models → Providers) or OPENAI_API_KEY / LUCIDOS_OPENROUTER_API_KEY, set a local OpenAI-compatible base URL (Settings → Models → Providers or LUCIDOS_LOCAL_BASE_URL), LUCIDOS_BOOT_WITHOUT_PROVIDER=1 (boot into provider onboarding), or LUCIDOS_MODEL=mock (for testing).");
+            }
+        };
+    drop(boot_pool);
 
     // Create engine with pgvector for embeddings
     let engine = LucidosEngine::new(

@@ -1,17 +1,17 @@
 import type { NavigateUi } from '@lucidos/sdk';
 
-/** Button label for a `navigate`-kind notification tap, shown in the inbox
- *  modal (`NotificationsModal`).
+/** Button label for a `navigate`-kind notification tap, shown in the
+ *  notification detail panel (`NotificationDetailInline`).
  *
  *  A navigate tap is actionable from the OS-push tap and the in-app toast
- *  (both run `handleNavigationRequest`), but the inbox modal used to ignore
- *  the `tap` field entirely — so a navigate notification (e.g. the
+ *  (both run `handleNavigationRequest`), but the detail panel would otherwise
+ *  ignore the `tap` field entirely — so a navigate notification (e.g. the
  *  "N changes ready to apply" trigger push, which taps to the Changes panel)
- *  was a dead end when read from the bell. This label gives that button its
- *  text.
+ *  would be a dead end when read from the bell. This label gives that button
+ *  its text.
  *
  *  Targets mirror the SDK `NavigateTarget` union. `thread` / `app` are usually
- *  served by the modal's dedicated "Open thread" / "Open <app>" buttons, but
+ *  served by the panel's dedicated "Open thread" / "Open <app>" buttons, but
  *  this still labels them for a navigate tap that lacks the matching row
  *  metadata. The trailing fallback guards a target string the engine added
  *  after this build — `validateTap` doesn't constrain the target value. */
