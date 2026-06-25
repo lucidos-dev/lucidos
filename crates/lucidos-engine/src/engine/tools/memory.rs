@@ -282,4 +282,296 @@ If NONE should be deleted, reply with "none"."#,
 
         Ok(response)
     }
+
+    /// Delete (and optionally replace) one memory entry by its exact id — the
+    /// precise lane the `[Long-term Memory]` block's `[id: <uuid>]` enables. The
+    /// fuzzy keyword+semantic path (`correct_memory` → `execute_memory_tool`)
+    /// is deliberately left untouched.
+    pub(crate) async fn execute_correct_memory_by_id(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(ref index) = self.memory_index else {
+            return Ok("Error: memory system not available".to_string());
+        };
+        correct_memory_by_id_impl(index, self.embedder.as_ref(), args).await
+    }
+}
+
+/// Parse the `id` arg for `correct_memory_by_id`. Accepts a bare UUID
+/// (hyphenated or simple) and defensively tolerates a `mem-` prefix and
+/// surrounding whitespace. Returns the tool-facing error string on failure so
+/// the caller can hand it straight back to the model.
+pub(crate) fn parse_memory_entry_id(args: &serde_json::Value) -> Result<uuid::Uuid, String> {
+    let raw = match args.get("id").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => {
+            return Err(
+                "Error: id is required — copy it from the `[id: <uuid>]` shown on the memory bullet"
+                    .to_string(),
+            )
+        }
+    };
+    let stripped = raw.strip_prefix("mem-").unwrap_or(raw);
+    uuid::Uuid::parse_str(stripped).map_err(|_| {
+        format!("Error: id must be a memory entry UUID as shown in `[id: <uuid>]` (got '{raw}')")
+    })
+}
+
+/// Core of `correct_memory_by_id`, factored out of the `LucidosEngine` impl so
+/// tests can exercise the delete / not-found / delete-plus-correction branches
+/// against a real Postgres pool with a mock embedder — no full engine, and no
+/// LLM provider (the id lane skips the semantic verification `correct_memory`
+/// needs).
+pub(crate) async fn correct_memory_by_id_impl(
+    index: &crate::memory::PgVectorIndex,
+    embedder: &dyn EmbeddingProvider,
+    args: &serde_json::Value,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let id = match parse_memory_entry_id(args) {
+        Ok(id) => id,
+        Err(msg) => return Ok(msg),
+    };
+
+    // Confirm the target exists first: lets us echo what was removed and tell a
+    // real delete apart from a no-op on a stale / hallucinated id.
+    let Some(entry) = index
+        .get_by_id(id)
+        .await
+        .map_err(|e| format!("Lookup failed: {}", e))?
+    else {
+        return Ok(format!(
+            "No memory entry with id {}. It may already be gone — use correct_memory to search by keyword if you're unsure.",
+            id
+        ));
+    };
+
+    let deleted = index
+        .delete(id)
+        .await
+        .map_err(|e| format!("Delete failed: {}", e))?;
+    if !deleted {
+        return Ok(format!(
+            "Memory entry {} was already gone — no changes made.",
+            id
+        ));
+    }
+    log!(@Memory, "[correct_memory_by_id] DELETED id={} topic={:?}", id, entry.topic);
+
+    let correction = args
+        .get("correction")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let mut response = format!("Deleted memory entry {}:\n  - {}", id, entry.summary);
+
+    if let Some(correction_text) = correction {
+        let embedding = embedder
+            .embed(correction_text)
+            .await
+            .map_err(|e| format!("Embedding failed: {}", e))?;
+        let fact_id = uuid::Uuid::new_v4();
+        let source = crate::memory::pgvector::MemorySource::Event { id: fact_id };
+        index
+            .index_entry(
+                fact_id,
+                &source,
+                "Memory Correction",
+                correction_text,
+                0.8,
+                &[],
+                &embedding,
+                embedder.model_id(),
+                chrono::Utc::now(),
+                crate::memory::EXTRACTOR_VERSION,
+            )
+            .await
+            .map_err(|e| format!("Insert correction failed: {}", e))?;
+        response.push_str(&format!("\n\nAdded corrected fact: {}", correction_text));
+    }
+
+    Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::{MemorySource, PgVectorIndex};
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    use async_trait::async_trait;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    // --- parse_memory_entry_id (pure) ---
+
+    #[test]
+    fn parse_accepts_hyphenated_uuid() {
+        let id = Uuid::new_v4();
+        let args = json!({ "id": id.to_string() });
+        assert_eq!(parse_memory_entry_id(&args).unwrap(), id);
+    }
+
+    #[test]
+    fn parse_accepts_simple_uuid() {
+        let id = Uuid::new_v4();
+        let args = json!({ "id": id.simple().to_string() });
+        assert_eq!(parse_memory_entry_id(&args).unwrap(), id);
+    }
+
+    #[test]
+    fn parse_tolerates_mem_prefix_and_whitespace() {
+        let id = Uuid::new_v4();
+        let args = json!({ "id": format!("  mem-{}  ", id) });
+        assert_eq!(parse_memory_entry_id(&args).unwrap(), id);
+    }
+
+    #[test]
+    fn parse_rejects_missing_id() {
+        let err = parse_memory_entry_id(&json!({})).unwrap_err();
+        assert!(err.contains("id is required"), "{err}");
+    }
+
+    #[test]
+    fn parse_rejects_garbage() {
+        let err = parse_memory_entry_id(&json!({ "id": "not-a-uuid" })).unwrap_err();
+        assert!(err.contains("must be a memory entry UUID"), "{err}");
+    }
+
+    // --- correct_memory_by_id_impl (real PG + mock embedder) ---
+
+    /// pgvector stores `vector(384)`, so the correction path needs a 384-dim
+    /// embedder; `KeywordEmbedder` would emit `keywords.len()` dims. The delete
+    /// path ignores the embedder entirely.
+    struct Fixed384Embedder;
+    #[async_trait]
+    impl EmbeddingProvider for Fixed384Embedder {
+        async fn embed(
+            &self,
+            _text: &str,
+        ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(vec![0.1f32; 384])
+        }
+        async fn embed_batch(
+            &self,
+            texts: &[&str],
+        ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(texts.iter().map(|_| vec![0.1f32; 384]).collect())
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "test-fixed-384"
+        }
+    }
+
+    async fn insert(index: &PgVectorIndex, summary: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        index
+            .index_entry(
+                id,
+                &MemorySource::Event { id: Uuid::new_v4() },
+                "Config",
+                summary,
+                0.8,
+                &[],
+                &vec![0.1f32; 384],
+                "test-fixed-384",
+                chrono::Utc::now(),
+                crate::memory::EXTRACTOR_VERSION,
+            )
+            .await
+            .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn delete_by_id_removes_only_the_target() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+
+        let target = insert(&index, "Config dir is at gws-personal").await;
+        let bystander = insert(&index, "User prefers dark theme").await;
+
+        let out = correct_memory_by_id_impl(
+            &index,
+            &Fixed384Embedder,
+            &json!({ "id": target.to_string() }),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("Deleted memory entry"), "{out}");
+        assert!(out.contains("gws-personal"), "echoes the deleted summary: {out}");
+
+        assert!(
+            index.get_by_id(target).await.unwrap().is_none(),
+            "target should be deleted"
+        );
+        assert!(
+            index.get_by_id(bystander).await.unwrap().is_some(),
+            "bystander must be untouched"
+        );
+
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_id_is_a_safe_no_op() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+
+        let survivor = insert(&index, "User prefers dark theme").await;
+        let out = correct_memory_by_id_impl(
+            &index,
+            &Fixed384Embedder,
+            &json!({ "id": Uuid::new_v4().to_string() }),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("No memory entry with id"), "{out}");
+        assert!(
+            index.get_by_id(survivor).await.unwrap().is_some(),
+            "nothing should be deleted"
+        );
+        assert_eq!(index.len().await.unwrap(), 1);
+
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn delete_with_correction_replaces_the_fact() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+
+        let target = insert(&index, "Config dir is at gws-personal").await;
+        let out = correct_memory_by_id_impl(
+            &index,
+            &Fixed384Embedder,
+            &json!({
+                "id": target.to_string(),
+                "correction": "The gws-personal config dir was deleted",
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("Added corrected fact"), "{out}");
+
+        assert!(
+            index.get_by_id(target).await.unwrap().is_none(),
+            "old entry should be gone"
+        );
+
+        // The replacement is stored under the Memory Correction topic.
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_entries WHERE topic = 'Memory Correction' AND summary = $1",
+        )
+        .bind("The gws-personal config dir was deleted")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, 1, "correction fact should be stored");
+
+        teardown_test_db(&db_name).await;
+    }
 }

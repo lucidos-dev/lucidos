@@ -148,6 +148,9 @@ impl LucidosEngine {
             tn::BASH_OUTPUT => self.execute_bash_output_tool(args, thread_id).await,
             tn::BASH_KILL => self.execute_bash_kill_tool(args).await,
             tn::CORRECT_MEMORY => to_outcome(self.execute_memory_tool(args).await),
+            tn::CORRECT_MEMORY_BY_ID => {
+                to_outcome(self.execute_correct_memory_by_id(args).await)
+            }
             tn::GENERATE_IMAGE => to_outcome(self.execute_generate_image(args, thread_id).await),
             tn::SAVE_THREAD_IMAGE => {
                 to_outcome(self.execute_save_thread_image(args, thread_id).await)

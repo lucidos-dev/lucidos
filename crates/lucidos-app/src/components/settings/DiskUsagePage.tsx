@@ -285,7 +285,6 @@ export function DiskUsagePage() {
   if (loadable.status === 'failed') {
     return (
       <div class="settings-section">
-        <div class="settings-section-title">Disk usage</div>
         <div class="list-rows">
           <LoadableError noun="disk usage" error={loadable.error} />
         </div>
@@ -297,7 +296,6 @@ export function DiskUsagePage() {
     if (!showLoading) return null;
     return (
       <div class="settings-section">
-        <div class="settings-section-title">Disk usage</div>
         <div class="list-rows">
           <div class="loading-spinner" />
         </div>
@@ -316,7 +314,6 @@ export function DiskUsagePage() {
   return (
     <>
       <div class="settings-section">
-        <div class="settings-section-title">Disk usage</div>
         <StatCard
           label="Free space on volume"
           value={

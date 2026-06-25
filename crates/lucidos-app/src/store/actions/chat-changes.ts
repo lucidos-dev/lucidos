@@ -1,4 +1,4 @@
-import { showToast, dismissToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, updateAvailable, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, toasts, engineRestarting, engineVersion, latestEngineVersion, enginePackaged } from '../store';
+import { showToast, dismissToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, toasts, engineRestarting, engineVersion, latestEngineVersion, enginePackaged } from '../store';
 import { changeToastMessage } from './changeToast';
 import { toFailed } from '../types';
 import type { Loadable } from '../types';
@@ -19,22 +19,6 @@ export const RESTART_LS_KEY = 'lucidos-restart-required';
  *  hidden — a new commit or new thread group changes the fingerprint and
  *  the toast comes back. */
 export const RESTART_DISMISSED_FP_LS_KEY = 'lucidos-restart-dismissed-fp';
-
-/** Timestamp (ms) when this page's JavaScript was loaded.
- *  Changes applied before this time are already reflected in the running client. */
-const PAGE_LOADED_AT = Date.now();
-
-const CLIENT_FILE_RE = /\.(ts|tsx|css|html|js|jsx)$/;
-
-/** Check if any applied change with frontend files was resolved after the page loaded.
- *  This replaces the backend's `client_update_available` flag which checks "since engine
- *  start" and incorrectly persists across page refreshes. */
-export function hasClientUpdateSincePageLoad(applied: Change[]): boolean {
-  return applied.some(c =>
-    c.resolved_at && new Date(c.resolved_at).getTime() > PAGE_LOADED_AT &&
-    c.files.some(f => CLIENT_FILE_RE.test(f))
-  );
-}
 
 export const RESTART_GROUPS_LS_KEY = 'lucidos-restart-groups';
 const LEGACY_RESTART_REASONS_LS_KEY = 'lucidos-restart-reasons';
@@ -337,7 +321,13 @@ export function refreshChangesState(): void {
       // suspend, an SSE reconnect gap) strands them even though the apply
       // finished. Reconcile against the freshly-fetched backend truth.
       reconcileApplyingNow(state.pending, applied);
-      if (hasClientUpdateSincePageLoad(applied)) updateAvailable.value = true;
+      // The update badge is NOT lit from the applied-changes list here. It shares
+      // the toast's single honest source of truth — the build-id check
+      // (syncClientUpdateFromBuild), which runs on startup/resume/SW-activate and
+      // sets the badge true only when the loaded bundle is genuinely older than the
+      // served /sw.js. Lighting it from "a frontend change was applied since page
+      // load" led the real update (the rebuilt bundle may not be served yet) and
+      // could disagree with the toast.
       syncRestartToast();
     })
     .catch(e => {

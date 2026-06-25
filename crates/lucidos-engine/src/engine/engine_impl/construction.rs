@@ -436,8 +436,9 @@ impl LucidosEngine {
         let app_manager = Arc::new(AppManager::new(&workspace_path)?);
 
         // The long pole on a first-ever open: this downloads the embedding model
-        // (hundreds of MB) before HTTP binds. Narrate it on the boot splash.
-        crate::boot_report::report(crate::boot_report::BUILDING_SEARCH_INDEX);
+        // (hundreds of MB) that powers vector memory, before HTTP binds. Narrate
+        // it on the boot splash.
+        crate::boot_report::report(crate::boot_report::DOWNLOADING_MEMORY_MODEL);
         let embedder = Arc::new(FastEmbedProvider::new()?);
 
         let browser_runtime = BrowserRuntime::new(workspace_path.clone(), pool.clone());

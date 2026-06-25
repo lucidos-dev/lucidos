@@ -1167,7 +1167,7 @@ impl GatewayState {
                 SuperviseAction::MarkUnhealthy => {
                     s.health = Health::Unhealthy;
                     // Gave up auto-respawning — drop the phase; the last label
-                    // would otherwise lie ("Building search index…" on a dead
+                    // would otherwise lie ("Downloading memory model…" on a dead
                     // engine). The splash falls back to the neutral default.
                     self.clear_boot_phase(&s.ws.id);
                     if s.last_error.is_none() {
@@ -1553,7 +1553,7 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
             // it's still Booting — so a cold-open navigation lands HERE, not on
             // the no-route branch below. Pass the current boot phase so the
             // proxy's connect-failure splash narrates the engine-reported phases
-            // (migrating → building search index → recovering); a transient
+            // (migrating → downloading memory model → recovering); a transient
             // restart of a live workspace simply has no phase set (default).
             let boot_label = state.boot_phase_label(&slug);
             proxy::proxy(&state.inner.proxy_client, &target, &slug, boot_label, req).await

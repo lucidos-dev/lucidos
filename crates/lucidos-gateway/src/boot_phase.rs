@@ -12,14 +12,14 @@
 //!     [`StartingEngine`]) — see `server.rs`;
 //!   * **engine-reported** phases the engine POSTs to
 //!     `/~/api/v1/control/workspaces/:id/boot-phase` *during its own startup*,
-//!     before its HTTP server is up ([`Migrating`], [`BuildingSearchIndex`],
+//!     before its HTTP server is up ([`Migrating`], [`DownloadingMemoryModel`],
 //!     [`Recovering`]) — best-effort telemetry, see the engine's
 //!     `report_boot_phase`.
 //!
 //! [`ProvisioningDatabase`]: BootPhase::ProvisioningDatabase
 //! [`StartingEngine`]: BootPhase::StartingEngine
 //! [`Migrating`]: BootPhase::Migrating
-//! [`BuildingSearchIndex`]: BootPhase::BuildingSearchIndex
+//! [`DownloadingMemoryModel`]: BootPhase::DownloadingMemoryModel
 //! [`Recovering`]: BootPhase::Recovering
 
 /// One named step of a workspace's cold boot, rendered as a human label on the
@@ -32,9 +32,10 @@ pub enum BootPhase {
     StartingEngine,
     /// Engine-reported: running database migrations.
     Migrating,
-    /// Engine-reported: loading/downloading the embedding model. The long pole on
-    /// a first-ever open (the model is fetched once, then cached).
-    BuildingSearchIndex,
+    /// Engine-reported: loading/downloading the embedding model that powers
+    /// vector memory. The long pole on a first-ever open (the model is fetched
+    /// once, then cached).
+    DownloadingMemoryModel,
     /// Engine-reported: replaying recovery sweeps (sessions, queues, changes).
     Recovering,
 }
@@ -49,7 +50,7 @@ impl BootPhase {
             "provisioning-database" => Some(Self::ProvisioningDatabase),
             "starting-engine" => Some(Self::StartingEngine),
             "migrating" => Some(Self::Migrating),
-            "building-search-index" => Some(Self::BuildingSearchIndex),
+            "downloading-memory-model" => Some(Self::DownloadingMemoryModel),
             "recovering" => Some(Self::Recovering),
             _ => None,
         }
@@ -61,7 +62,7 @@ impl BootPhase {
             Self::ProvisioningDatabase => "Provisioning database…",
             Self::StartingEngine => "Starting engine…",
             Self::Migrating => "Running migrations…",
-            Self::BuildingSearchIndex => "Building search index — first run, this can take a minute…",
+            Self::DownloadingMemoryModel => "Downloading memory model — first run, this can take a minute…",
             Self::Recovering => "Recovering sessions…",
         }
     }
@@ -81,7 +82,7 @@ mod tests {
             "provisioning-database",
             "starting-engine",
             "migrating",
-            "building-search-index",
+            "downloading-memory-model",
             "recovering",
         ] {
             let phase = BootPhase::from_wire(wire).expect("known phase parses");
@@ -93,6 +94,6 @@ mod tests {
     fn unknown_wire_value_is_none() {
         assert_eq!(BootPhase::from_wire("ready"), None);
         assert_eq!(BootPhase::from_wire(""), None);
-        assert_eq!(BootPhase::from_wire("Building-Search-Index"), None);
+        assert_eq!(BootPhase::from_wire("Downloading-Memory-Model"), None);
     }
 }

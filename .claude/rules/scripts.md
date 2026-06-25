@@ -180,11 +180,25 @@ changes when rebuilt, so it can't drift ahead of the engine binary. Trade-off: *
 `BUILD_ID` into `sw.js` — and the same id into the app bundle as `CLIENT_BUILD_ID`
 via the `virtual:build-id` module — through the `lucidos-sw-stamp` plugin in
 `crates/lucidos-app/vite.config.ts`), and the existing **"New version available →
-Refresh"** toast tells you when to reload. The "client update available" dot is
-driven by comparing the running bundle's `CLIENT_BUILD_ID` against the served
-`sw.js` `BUILD_ID` (`syncClientUpdateFromBuild`) — an honest "is my loaded code
-stale?" signal that self-clears once a reload lands on the served build, rather
-than latching on the controlling worker's id.
+Refresh"** toast tells you when to reload. The "client update available" dot AND
+that toast share a **single source of truth** — `syncClientUpdateFromBuild`, which
+compares the running bundle's `CLIENT_BUILD_ID` against the served `sw.js`
+`BUILD_ID` — an honest "is my loaded code stale?" signal that self-clears once a
+reload lands on the served build, rather than latching on the controlling worker's
+id. Both surface **together** once the rebuilt `sw.js` is genuinely served: the
+badge no longer leads the toast, because the former *eager* `ChangeApplied`/resync
+badge-light was removed (it set the dot at apply time, before the rebuilt bundle was
+served, so the dot appeared seconds before — or sometimes without — the toast). The
+`ChangeApplied` arm now only nudges the SW (`scheduleServiceWorkerUpdateChecks`) so
+the build-id check re-runs promptly once the rebuild lands. The badge also renders
+as a dot on the **reload icon in the workspace switcher** (control panel), mirroring
+the brand toggle's badge. The toast keeps two suppressions layered on top of the
+shared check — a build already dismissed (`wasSwUpdateDismissed`) and an on-screen
+restart/refresh toast (`hasRefreshToast`) — in which case the badge stays lit as the
+persistent indicator while the toast is held back. (Two badge-lights are
+deliberately NOT part of this shared check: the Tauri desktop app-version signal in
+`connection.ts`, a separate versioned-shell update mechanism, and the dev-only
+`import.meta.hot` HMR path in `main.tsx`, inert under built serving.)
 
 **Atomic dist publish (a failed rebuild can't 404 the app).** Vite empties the
 outDir at the start of every (re)build, so a watch rebuild that fails or is
@@ -267,7 +281,11 @@ it via a `lucidos:get-build-id` message (SW replies `lucidos:build-id`), re-quer
 on `controllerchange` and each time the panel opens, so the shown id tracks the
 *live* worker. If the id is unchanged across workspaces / across an apply, the SW
 never picked up a new build (rebuild or stamp issue); if it changed but no toast
-fired, the toast logic is the suspect.
+fired, the toast logic is the suspect. Because the badge and toast now share the one
+`syncClientUpdateFromBuild` check, a badge **without** a toast is expected only under
+the two toast-specific suppressions (dismissed build / restart toast on screen) — a
+badge with no toast in any *other* case means the check ran (lighting the badge) but
+the toast guard mis-fired.
 
 The old `--hmr` live-Vite-dev-server path was **removed** (ADR 0014): there is no
 Vite in the serving path to proxy to, so the engine serves the built `dist/`

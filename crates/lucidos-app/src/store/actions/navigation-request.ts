@@ -79,10 +79,17 @@ export function handleNavigationRequest(nav: {
     case 'files':
     case 'apps':
     case 'triggers':
-    case 'thread-queue':
     case 'changes':
     case 'notifications':
       switchMenuItem(nav.target as MenuItem);
+      break;
+    case 'thread-queue':
+      // The Thread Queue lives under Settings → System (no longer a top-level
+      // panel). The `thread-queue` NavigateTarget stays stable in the SDK +
+      // engine (notification overflow taps / navigate_ui still emit it); the
+      // frontend just reinterprets it to land on the System subpanel.
+      switchMenuItem('settings');
+      openSettingsSubview('thread-queue');
       break;
     case 'app-store':
       // The App Store is now the Store tab of the Apps section. Older

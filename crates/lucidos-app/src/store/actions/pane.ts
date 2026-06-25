@@ -71,8 +71,12 @@ export function revealContentPane() {
 }
 
 /** Move desktop pane focus. No-op on mobile, where panes are navigated, not
- *  focused. Called on a pointer-down inside a pane so the focus indicator always
- *  tracks where the user is actually working, and by the two-stage toggles. */
+ *  focused. Called on a pointer-down inside a pane BODY (SplitLayout panes /
+ *  thread drawer) and on CLICK inside a header region — the header doubles as the
+ *  Tauri window-drag region, so firing focus on click (not pointerdown) keeps a
+ *  window drag from changing the focused pane (a native drag suppresses the
+ *  click). Either way the focus indicator tracks where the user is working. Also
+ *  called by the two-stage toggles. */
 export function focusPane(pane: FocusedPane): void {
   if (isMobile()) return;
   focusedPane.value = pane;

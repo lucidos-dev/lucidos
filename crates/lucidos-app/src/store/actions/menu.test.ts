@@ -138,15 +138,6 @@ describe('switchMenuItem', () => {
     expect(revealContentPane).toHaveBeenCalledTimes(1);
   });
 
-  it('navigates to the Thread Queue panel like any other menu item', () => {
-    // Mirror entry for the Thread Queue navigation point (frontend.md: new
-    // navigation entry points get pinned here). The panel rides the standard
-    // switchMenuItem path — active item set + content pane revealed.
-    switchMenuItem('thread-queue');
-    expect(activeMenuItem.value).toBe('thread-queue');
-    expect(revealContentPane).toHaveBeenCalledTimes(1);
-  });
-
 });
 
 describe('openSettingsSubview', () => {
@@ -195,6 +186,15 @@ describe('openSettingsSubview', () => {
   it('opens the environment-variables subview', () => {
     openSettingsSubview('environment-variables');
     expect(settingsSubview.value).toBe('environment-variables');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens the thread-queue subview (Thread Queue lives under Settings → System)', () => {
+    // Mirror entry for the Thread Queue navigation point (frontend.md: new
+    // navigation entry points get pinned here). The Thread Queue is now a System
+    // subpanel reached via openSettingsSubview, not a top-level menu item.
+    openSettingsSubview('thread-queue');
+    expect(settingsSubview.value).toBe('thread-queue');
     expect(revealContentPane).toHaveBeenCalledTimes(1);
   });
 });

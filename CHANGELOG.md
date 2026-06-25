@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.12.5 — 2026-06-25
+
+### Added
+- **Welcome screen redesign** — compact "Hi, there!" hero with a chevron suggestion carousel (one idea at a time), conversational de-quoted starter ideas, and a top-right dismiss pill. New starter suggestions: app store, mobile-access setup, daily scraper, weekday email summary.
+- **Targetable memory entries** — memory entry IDs now surface in the `[Long-term Memory]` block and the Memory settings view (copyable), plus a new `correct_memory_by_id` tool to delete/replace one specific memory by id.
+- **Thread Queue moved into Settings → System.**
+- Files import hint relabeled to "Drop or click to import" in a dashed drop box.
+
+### Changed
+- Gateway boot-splash phase renamed to "Downloading memory model".
+- Settings: Environment Variables now indexed in search; redundant subpanel titles dropped.
+- Notifications: a trayed/unfocused Tauri window now counts as not-in-use, so push is delivered when the window isn't actually visible (device-presence re-sync deduped on native focus change).
+
+### Fixed
+- macOS app menu derived from the system default so arrow keys move the cursor; About item labeled "About Lucidos".
+- Tauri: nav-history popover renders above the internal browser; app menu placed below the header strip; window drag and thread-toggle no longer steal the focused pane.
+- Settings: API URL renders at normal row size (not page-base); system subpanel tabs render on the Environment Variables view.
+- Threads: thread-link hover shows the real destination; cross-workspace thread links route through the gateway; stopped peers aren't lazy-started just to read a title.
+- Update badge + toast unified on the build-id check; switcher reload icon badged.
+- Welcome surface shows until dismissed and no longer clips the empty compose box.
 ## v0.12.4 — 2026-06-25
 
 **Fixed**

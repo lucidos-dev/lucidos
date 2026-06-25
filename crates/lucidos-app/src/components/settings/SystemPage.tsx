@@ -29,13 +29,15 @@ import { ENGINE_VERSION } from 'virtual:engine-version';
 import { BackupSection } from './BackupSection';
 import { DiskUsagePage } from './DiskUsagePage';
 import { MemoryInspector } from './MemoryInspector';
+import { EnvironmentVariablesPage } from './EnvironmentVariablesPage';
+import { ThreadQueueView } from '../thread-queue/ThreadQueueView';
 
 /** The SPA origin, read lazily so importing this module never touches the DOM. */
 function getApiUrl(): string {
   return typeof window !== 'undefined' && window.location ? window.location.origin : '';
 }
 
-export type SystemPanel = 'overview' | 'backup' | 'memory' | 'disk-usage';
+export type SystemPanel = 'overview' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables';
 
 const SYSTEM_PANELS: Array<{ key: SystemPanel; label: string; subview: SettingsNavKey }> = [
   { key: 'overview', label: 'Overview', subview: 'system' },
@@ -130,9 +132,11 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
 
   function renderPanel() {
     switch (panel) {
+      case 'thread-queue': return <ThreadQueueView />;
       case 'backup': return <BackupSection />;
       case 'memory': return <MemoryInspector />;
       case 'disk-usage': return <DiskUsagePage />;
+      case 'environment-variables': return <EnvironmentVariablesPage />;
       default: return renderOverview();
     }
   }

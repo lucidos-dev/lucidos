@@ -91,6 +91,7 @@ pub const RUN_THREAD: &str = "run_thread";
 
 // Memory
 pub const CORRECT_MEMORY: &str = "correct_memory";
+pub const CORRECT_MEMORY_BY_ID: &str = "correct_memory_by_id";
 
 // Events
 pub const EMIT_EVENT: &str = "emit_event";

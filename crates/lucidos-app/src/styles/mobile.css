@@ -139,7 +139,13 @@
 /* Desktop: drawer emerges from the split divider, scoped to panel area */
 @media (min-width: 769px) {
     .drawer-backdrop {
-        top: calc(2.5rem + 0.25rem + env(safe-area-inset-top, 0px));
+        /* The backdrop is position:fixed, so its top is measured from the
+           viewport, not the header's flex slot. It must land at the header's
+           BOTTOM edge: the reclaimed macOS title-bar strip (--titlebar-inset,
+           0px off the macOS Tauri build) sits above the header and pushes it
+           down, so the offset has to include it — without it the menu rendered
+           ~28px too high and overlapped the header controls in the Tauri app. */
+        top: calc(var(--titlebar-inset, 0px) + 2.5rem + 0.25rem + env(safe-area-inset-top, 0px));
         left: calc(var(--divider-x) + var(--divider-width));
         overflow: hidden;
     }

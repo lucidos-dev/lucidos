@@ -118,6 +118,23 @@ function MemoryEntryRow({ entry }: { entry: MemoryEntryInfo }) {
         {expanded && (
           <div class="memory-entry-details">
             <div class="memory-detail-row">
+              <span class="memory-detail-label">ID:</span>
+              <button
+                type="button"
+                class="memory-id-value"
+                data-tooltip="Copy id"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  navigator.clipboard?.writeText(entry.id).then(
+                    () => showToast('Memory id copied', 'success'),
+                    () => showToast('Could not copy memory id', 'error'),
+                  );
+                }}
+              >
+                {entry.id}
+              </button>
+            </div>
+            <div class="memory-detail-row">
               <span class="memory-detail-label">Importance:</span>
               <span>{entry.importance.toFixed(2)}</span>
             </div>

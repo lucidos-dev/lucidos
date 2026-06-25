@@ -1,5 +1,16 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { marked } from 'marked';
+
+// Mutable stand-in for basePath's load-time `WORKSPACE_ID` const (the gateway
+// slug this bundle is served under, or null when served directly / in tests with
+// no stamped <base>). Read via a getter so renderMarkdown sees the current value.
+const base = vi.hoisted(() => ({ workspaceId: null as string | null }));
+vi.mock('./basePath', () => ({
+  get WORKSPACE_ID() {
+    return base.workspaceId;
+  },
+}));
+
 import { renderMarkdown, renderMarkdownInline, renderMarkdownInlineWithLinks } from './renderMarkdown';
 
 describe('renderMarkdown', () => {
@@ -442,6 +453,11 @@ Use this pattern for all prompts.`;
   });
 
   describe('thread reference links', () => {
+    // No <base> stamped in tests → WORKSPACE_ID null → served-directly fallback.
+    beforeEach(() => {
+      base.workspaceId = null;
+    });
+
     it('rewrites bare-UUID thread links into clickable thread chips', () => {
       const html = renderMarkdown('See [the bug](thread:1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff)');
       expect(html).toContain('class="thread-link"');
@@ -456,6 +472,44 @@ Use this pattern for all prompts.`;
       expect(html).toContain('data-thread-id="1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff"');
       expect(html).toContain('data-thread-workspace="dev"');
       expect(html).not.toContain('href="thread:');
+    });
+
+    it('uses href="#" when not served behind the gateway (no workspace slug)', () => {
+      const html = renderMarkdown('See [it](thread:0a11aaaa-bbbb-cccc-dddd-eeeeffff0009)');
+      expect(html).toContain('href="#"');
+      expect(html).toContain('class="thread-link"');
+    });
+  });
+
+  describe('thread reference links — behind the gateway', () => {
+    // Served at https://<gateway>/personal/ → hover should show the real
+    // destination, not the `#`-resolves-to-current-page URL.
+    beforeEach(() => {
+      base.workspaceId = 'personal';
+      vi.stubGlobal('location', { origin: 'https://localhost:5251' });
+    });
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      base.workspaceId = null;
+    });
+
+    it('points an untagged (same-workspace) link at the current workspace slug', () => {
+      const html = renderMarkdown('See [the bug](thread:aa11aaaa-bbbb-cccc-dddd-eeeeffff0001)');
+      expect(html).toContain('href="https://localhost:5251/personal/#thread=aa11aaaa-bbbb-cccc-dddd-eeeeffff0001"');
+      expect(html).toContain('class="thread-link"');
+    });
+
+    it('points a cross-workspace link at the target workspace slug', () => {
+      const html = renderMarkdown('See [the bug](thread:dev/aa11aaaa-bbbb-cccc-dddd-eeeeffff0002)');
+      expect(html).toContain('href="https://localhost:5251/dev/#thread=aa11aaaa-bbbb-cccc-dddd-eeeeffff0002"');
+      expect(html).toContain('data-thread-workspace="dev"');
+    });
+
+    it('slugifies the ref workspace name for the href (lowercased)', () => {
+      const html = renderMarkdown('See [the bug](thread:Dev/aa11aaaa-bbbb-cccc-dddd-eeeeffff0003)');
+      expect(html).toContain('href="https://localhost:5251/dev/#thread=aa11aaaa-bbbb-cccc-dddd-eeeeffff0003"');
+      // raw (un-slugified) workspace name is preserved for the click handler
+      expect(html).toContain('data-thread-workspace="Dev"');
     });
   });
 

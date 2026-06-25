@@ -180,25 +180,10 @@ export async function clearRestoreStatus(): Promise<void> {
   await controlJson<void>('/restore-status', { method: 'DELETE' });
 }
 
-/** Slug a workspace name the way the gateway registry does (lowercase,
- *  non-alphanumerics → single `-`, trimmed), so the picker can predict a
- *  collision against existing workspace ids before uploading. Mirrors
- *  `registry::slugify`. */
-export function slugifyWorkspaceName(name: string): string {
-  let out = '';
-  let prevDash = false;
-  for (const ch of name) {
-    if (/[a-z0-9]/i.test(ch)) {
-      out += ch.toLowerCase();
-      prevDash = false;
-    } else if (!prevDash && out.length > 0) {
-      out += '-';
-      prevDash = true;
-    }
-  }
-  out = out.replace(/-+$/, '');
-  return out || 'workspace';
-}
+/** Slug a workspace name the way the gateway registry does. Re-exported from the
+ *  leaf util `utils/slug` (single source of truth) so existing
+ *  `from '.../api/client/control'` importers keep working. */
+export { slugifyWorkspaceName } from '../../utils/slug';
 
 /** Derive the workspace name a backup archive was produced for, from its
  *  filename (`lucidos-backup-{name}-{YYYYMMDD-HHMMSS}.enc`). Returns null for a

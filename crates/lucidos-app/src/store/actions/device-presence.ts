@@ -22,6 +22,7 @@
 import { API } from '../../api/client';
 import { getDeviceId } from './devices';
 import { isPageActive } from '../../utils/pageActive';
+import { startNativeWindowActiveTracking } from '../../utils/nativeWindow';
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const ENDPOINT = `${API}/device-presence`;
@@ -114,6 +115,33 @@ export function startDevicePresenceTracking(): () => void {
   };
   window.addEventListener('beforeunload', onBeforeUnload);
   cleanupFns.push(() => window.removeEventListener('beforeunload', onBeforeUnload));
+
+  // Tauri desktop only: the native window's active state (focus + tray) is
+  // invisible to the webview's visibilitychange/focus events — macOS `orderOut:`
+  // (trayed) fires nothing the WKWebView reports, and its hasFocus() is
+  // unreliable. Bridge it so presence re-syncs the instant the native window goes
+  // inactive/active, flipping the engine's candidate index immediately instead of
+  // aging out over PRESENCE_STALE_AFTER (120s). nativeWindow.ts updates its cache
+  // (read by isPageActive) BEFORE this onChange runs, so a plain (deduped)
+  // syncDevicePresence coalesces with the webview's own focus/blur post for the
+  // unfocused case yet still fires for the tray case the webview can't see (there
+  // lastReported is still true, so the value genuinely changed). No-op off-Tauri.
+  let nativeWindowCanceled = false;
+  let stopNativeWindow: (() => void) | null = null;
+  startNativeWindowActiveTracking(() => syncDevicePresence())
+    .then((un) => {
+      if (nativeWindowCanceled) un();
+      else stopNativeWindow = un;
+    })
+    .catch(() => {
+      // Best-effort wiring: even if this fails, the cache + isPageActive still
+      // update via the listen; presence just lags to the next heartbeat. No user
+      // intent here (telemetry carve-out, .claude/rules/frontend.md).
+    });
+  cleanupFns.push(() => {
+    nativeWindowCanceled = true;
+    stopNativeWindow?.();
+  });
 
   syncDevicePresence();
 

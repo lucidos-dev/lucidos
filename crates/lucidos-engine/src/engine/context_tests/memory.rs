@@ -1,3 +1,4 @@
+use super::format_memory_bullet;
 use super::jaccard_similarity;
 use crate::engine::memory::relevance_score;
 use crate::memory::{MemoryEntry, MemorySource};
@@ -76,6 +77,30 @@ fn run_pipeline(entries: Vec<(MemoryEntry, f64)>) -> Vec<(String, Vec<(MemoryEnt
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     sorted
+}
+
+// --- Bullet formatting tests ---
+
+#[test]
+fn bullet_renders_full_uuid_so_the_agent_can_target_it() {
+    let mut entry = make_entry("Config dir is at gws-personal", "Config", 0.8, 3);
+    let id = Uuid::new_v4();
+    entry.id = id;
+
+    let bullet = format_memory_bullet(&entry);
+
+    // Date + summary preserved, plus a copyable full-UUID id the
+    // correct_memory_by_id tool can parse verbatim.
+    assert!(bullet.starts_with("- "), "bullet keeps its dash prefix: {bullet:?}");
+    assert!(
+        bullet.contains("Config dir is at gws-personal"),
+        "summary preserved: {bullet:?}"
+    );
+    assert!(
+        bullet.contains(&format!("[id: {}]", id)),
+        "bullet must carry the entry's full uuid: {bullet:?}"
+    );
+    assert!(bullet.ends_with("\n"), "bullet stays newline-terminated: {bullet:?}");
 }
 
 // --- Scoring tests ---

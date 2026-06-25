@@ -606,6 +606,15 @@ pub(super) fn trim_history_from_oldest(history: &mut String, bytes_to_trim: usiz
     }
 }
 
+/// Render one memory entry as its `[Long-term Memory]` bullet. The trailing
+/// `[id: <uuid>]` is what lets the agent target the exact entry for deletion or
+/// correction via the `correct_memory_by_id` tool; the fuzzy `correct_memory`
+/// path needs no id. Keep this in sync with the id form the tool parses.
+fn format_memory_bullet(entry: &MemoryEntry) -> String {
+    let date = entry.src_created_at.format("%Y-%m-%d");
+    format!("- {}: {} [id: {}]\n", date, entry.summary, entry.id)
+}
+
 impl LucidosEngine {
     pub(crate) async fn retrieve_context(
         &self,
@@ -804,9 +813,7 @@ impl LucidosEngine {
         for (topic, entries) in &sorted_topics {
             let mut topic_block = format!("## {}\n", topic);
             for (entry, _) in entries {
-                let date = entry.src_created_at.format("%Y-%m-%d").to_string();
-                let line = format!("- {}: {}\n", date, entry.summary);
-                topic_block.push_str(&line);
+                topic_block.push_str(&format_memory_bullet(entry));
             }
             topic_block.push('\n');
 

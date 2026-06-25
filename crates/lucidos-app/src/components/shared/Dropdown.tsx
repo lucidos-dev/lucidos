@@ -1,8 +1,7 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
-import { isTauri } from '../../utils/platform';
 import { isMobile } from '../../utils/viewport';
-import { hidePanelWebview, showPanelWebview } from '../../utils/tauri';
 import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
+import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from './Overlay';
 
 export interface DropdownOption {
@@ -131,11 +130,7 @@ export function Dropdown({
     setDraftValue(trimmed || lastCommittedRef.current);
   }
 
-  useEffect(() => {
-    if (!open || !isTauri()) return;
-    hidePanelWebview();
-    return () => showPanelWebview();
-  }, [open]);
+  useHidePanelWebviewWhile(open);
 
   // Focus management while open. For freeText the trigger IS the text input, so
   // focus it on open (existing behavior). For a normal dropdown, focus stays on

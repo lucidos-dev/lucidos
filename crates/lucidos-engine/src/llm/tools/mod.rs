@@ -96,6 +96,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
     tools.extend(misc::connect_oauth_tools()); // connect_oauth_account
     tools.extend(threads::spawn_tools()); // run_thread, run_coding_agent
     tools.extend(memory::correct_memory_tools()); // correct_memory
+    tools.extend(memory::correct_memory_by_id_tools()); // correct_memory_by_id
     tools.extend(misc::execute_intent_tools()); // execute_intent
     tools.extend(events::event_tools()); // emit_event, query_events, count_events
     tools.extend(threads::list_tools()); // list_threads, count_threads

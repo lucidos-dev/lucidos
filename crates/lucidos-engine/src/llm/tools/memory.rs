@@ -33,6 +33,29 @@ pub(super) fn correct_memory_tools() -> Vec<ToolDefinition> {
     ]
 }
 
+pub(super) fn correct_memory_by_id_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: tn::CORRECT_MEMORY_BY_ID.to_string(),
+            description: "Delete (and optionally replace) ONE specific memory by its id. Use this when the wrong memory is visible in the [Long-term Memory] block — every bullet ends with `[id: <uuid>]`; copy that uuid here. This is the precise path: it removes exactly that entry, with no keyword search or guessing. When the entry is NOT shown in the [Long-term Memory] block (so you don't have its id), use correct_memory instead, which searches by keyword.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "The memory entry's id, copied verbatim from the `[id: <uuid>]` shown at the end of its bullet in the [Long-term Memory] block (a UUID)."
+                    },
+                    "correction": {
+                        "type": "string",
+                        "description": "Optional corrected fact to store after deleting this entry. Omit to just delete without replacement."
+                    }
+                },
+                "required": ["id"]
+            }),
+        },
+    ]
+}
+
 pub(super) fn dismiss_from_context_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {

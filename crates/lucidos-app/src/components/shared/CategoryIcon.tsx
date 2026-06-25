@@ -26,8 +26,6 @@ export function CategoryIcon({ category }: { category: string }) {
       return <svg {...props}><path d="M4 3v10M12 3v4" /><circle cx="4" cy="13" r="1.5" fill="currentColor" stroke="none" /><circle cx="12" cy="7" r="1.5" fill="currentColor" stroke="none" /><path d="M12 8.5c0 2-2 3-4 4.5" /></svg>;
     case 'notifications':
       return <svg {...props}><path d="M12 6.5a4 4 0 0 0-8 0c0 4-1.5 5-1.5 5h11s-1.5-1-1.5-5Z" /><path d="M9.4 13.5a1.6 1.6 0 0 1-2.8 0" /></svg>;
-    case 'thread-queue':
-      return <svg {...props}><path d="M3 4.5h10M3 8h10M3 11.5h6" /></svg>;
     case 'web':
       return <svg {...props}><circle cx="8" cy="8" r="5.5" /><path d="M2.5 8h11" /><path d="M8 2.5a8.5 8.5 0 0 1 0 11 8.5 8.5 0 0 1 0-11Z" /></svg>;
     default:

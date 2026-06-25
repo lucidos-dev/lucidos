@@ -1,6 +1,24 @@
 import { marked } from 'marked';
 import type { Tokens } from 'marked';
 import { COPY_ICON, escapeHtmlAttr } from './markedConfig';
+import { WORKSPACE_ID } from './basePath';
+import { slugifyWorkspaceName } from './slug';
+
+/** Real destination for a thread link, so HOVERING shows where it goes instead
+ *  of the `#`-resolves-to-the-current-page URL (the confusing `…/<current>/#`).
+ *  Behind the gateway every workspace is same-origin under `/<slug>/`, so we point
+ *  straight at `/<slug>/#thread=<id>` — slug from the ref's workspace (slugified,
+ *  exact when name === slug, the common case), or the current workspace for an
+ *  untagged / same-workspace link. The left-click is still intercepted by the
+ *  global `.thread-link` handler (`useStartup`), which does the authoritative
+ *  routing; this href is for the hover tooltip, middle/⌘-click, and accessibility.
+ *  Served directly on an engine port (no gateway, `WORKSPACE_ID` null) we can't
+ *  build a peer URL synchronously, so we keep `#` and let the handler route. */
+function threadLinkHref(workspace: string | undefined, threadId: string): string {
+  if (WORKSPACE_ID === null || typeof location === 'undefined') return '#';
+  const slug = workspace ? slugifyWorkspaceName(workspace) : WORKSPACE_ID;
+  return `${location.origin}/${encodeURIComponent(slug)}/#thread=${threadId}`;
+}
 
 // Inline renderer for renderMarkdownInline — overrides `link` to drop the
 // <a> wrapper while preserving any nested inline markdown (e.g. **bold**
@@ -150,7 +168,8 @@ export function renderMarkdown(md: string, opts?: { cache?: boolean }): string {
     /href="thread:(?:([a-zA-Z0-9_-]+)\/)?([0-9a-f-]+)"/g,
     (_match, workspace: string | undefined, threadId: string) => {
       const wsAttr = workspace ? ` data-thread-workspace="${escapeHtmlAttr(workspace)}"` : '';
-      return `href="#" data-thread-id="${threadId}"${wsAttr} class="thread-link"`;
+      const href = escapeHtmlAttr(threadLinkHref(workspace, threadId));
+      return `href="${href}" data-thread-id="${threadId}"${wsAttr} class="thread-link"`;
     }
   );
   if (useCache) {

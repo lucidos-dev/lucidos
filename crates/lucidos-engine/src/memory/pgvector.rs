@@ -445,6 +445,30 @@ impl PgVectorIndex {
         Ok(!exists.0)
     }
 
+    /// Fetch a single entry by its primary key, or `None` if it doesn't exist.
+    /// The `correct_memory_by_id` tool uses this to confirm the target exists
+    /// (and to echo what was removed) before deleting it.
+    pub async fn get_by_id(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<MemoryEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, source, topic, summary, importance, entities, src_created_at, created_at
+            FROM memory_entries
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => Ok(Some(row_to_memory_entry(&row)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Delete an entry
     pub async fn delete(&self, id: Uuid) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let result = sqlx::query("DELETE FROM memory_entries WHERE id = $1")
@@ -854,6 +878,53 @@ mod extractor_version_tests {
         // Re-running the same delete is a no-op now that no rows are below 1.
         let deleted_again = index.delete_below_extractor_version(1).await.unwrap();
         assert_eq!(deleted_again, 0);
+
+        teardown_test_db(&db_name).await;
+    }
+}
+
+#[cfg(test)]
+mod get_by_id_tests {
+    use super::*;
+    use crate::test_support::{setup_test_db, teardown_test_db};
+
+    /// `get_by_id` round-trips an inserted entry and returns `None` for an
+    /// unknown id — the lookup the `correct_memory_by_id` tool relies on to
+    /// distinguish "deleted that one" from "no such id" (a safe no-op).
+    #[tokio::test]
+    async fn get_by_id_round_trips_and_misses_cleanly() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+
+        let id = Uuid::new_v4();
+        index
+            .index_entry(
+                id,
+                &MemorySource::Event { id: Uuid::new_v4() },
+                "Config",
+                "Config dir is at gws-personal",
+                0.8,
+                &["gws-personal".to_string()],
+                &vec![0.1f32; 384],
+                "model",
+                Utc::now(),
+                crate::memory::EXTRACTOR_VERSION,
+            )
+            .await
+            .unwrap();
+
+        let found = index
+            .get_by_id(id)
+            .await
+            .unwrap()
+            .expect("inserted entry should be found by id");
+        assert_eq!(found.id, id);
+        assert_eq!(found.topic, "Config");
+        assert_eq!(found.summary, "Config dir is at gws-personal");
+        assert_eq!(found.entities, vec!["gws-personal".to_string()]);
+
+        let missing = index.get_by_id(Uuid::new_v4()).await.unwrap();
+        assert!(missing.is_none(), "unknown id must return None, not an entry");
 
         teardown_test_db(&db_name).await;
     }

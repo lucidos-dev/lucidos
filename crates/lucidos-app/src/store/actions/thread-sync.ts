@@ -1,6 +1,6 @@
 import { API } from '../../api/client';
 import type { Change } from '../../api/client';
-import { threadMap, focusedThreadId, changes, appliedChanges, changesHasMore, updateAvailable, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
+import { threadMap, focusedThreadId, changes, appliedChanges, changesHasMore, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
 import { memoryRebuildProgress, backupProgress, backupStatusVersion, recoveryProgress, showConfirm, showToast, dismissToast, toasts, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
 import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, modeToInitiator, PENDING_TITLE_PLACEHOLDER, type ActorMode, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
@@ -555,10 +555,14 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
       addRestartGroup({ threadId, threadTitle, commits });
     }
     if (clientUpdate) {
-      updateAvailable.value = true;
-      // In --built mode the frontend rebuilds over the next few seconds; nudge
-      // the SW to pick up the new build so the Refresh toast fires promptly.
-      // No-op in the live dev server (sw.js never changes).
+      // Don't light the badge here. It now shares the toast's single honest source
+      // of truth — the build-id check (syncClientUpdateFromBuild) — so badge and
+      // toast can't disagree or appear out of order. At ChangeApplied time the
+      // rebuilt bundle isn't served yet, so an eager badge would lead the real
+      // update. Instead nudge the SW to pick up the rebuilt /sw.js over the next
+      // few seconds; its activation re-runs the build-id check, which lights BOTH
+      // badge and toast together once the new build is genuinely served. No-op in
+      // the live dev server (sw.js never changes).
       scheduleServiceWorkerUpdateChecks();
     }
   } else if (event.type === 'ChangeDiscarded') {

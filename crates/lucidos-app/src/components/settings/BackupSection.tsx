@@ -442,8 +442,6 @@ export function BackupSection() {
 
   return (
     <div class="settings-section">
-      <div class="settings-section-title">Backup</div>
-
       {backupHealthCard({
         status: statusLoadable,
         liveProgress: progress,

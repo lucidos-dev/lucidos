@@ -55,7 +55,7 @@ mod imp {
         UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationRequest,
         UNNotificationResponse, UNUserNotificationCenter, UNUserNotificationCenterDelegate,
     };
-    use tauri::{AppHandle, Emitter, Manager};
+    use tauri::{AppHandle, Emitter};
 
     /// App handle the delegate uses to focus the window + emit the tap event.
     /// Set once in [`setup`]; read on the main thread in the tap callback.
@@ -106,11 +106,9 @@ mod imp {
                     if let Some(app) = APP.get() {
                         // Any tap (not a dismiss) brings the app forward, even if
                         // the deep link is missing — matches the prior behaviour.
-                        if let Some(win) = app.get_webview_window("main") {
-                            let _ = win.unminimize();
-                            let _ = win.show();
-                            let _ = win.set_focus();
-                        }
+                        // show_main_window also emits `native-window-active = true`
+                        // so the reshown page counts as active again.
+                        crate::show_main_window(app);
                         if let Some(link) = link {
                             let _ = app.emit("native-notification-tapped", link);
                         }

@@ -3,6 +3,7 @@ import { useRef, useState } from 'preact/hooks';
 import { Overlay } from './Overlay';
 import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { useLongPress } from '../../hooks/useLongPress';
+import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { BackIcon, ForwardIcon } from './icons';
 
 export interface NavHistoryItem {
@@ -48,6 +49,11 @@ export function NavChevron({
   const menuRef = useRef<HTMLDivElement>(null);
   const pos = useAnchoredPosition(anchor, menuRef);
   const open = anchor !== null;
+
+  // The popover drops over the content pane, where the Tauri internal browser's
+  // native webview paints above all HTML — hide it while the menu is open so the
+  // history list isn't rendered behind it (mirrors Dropdown / Drawer / dialogs).
+  useHidePanelWebviewWhile(open);
 
   const close = () => setAnchor(null);
   // A tap while the menu is open toggles it shut (the anchor is exempt from the

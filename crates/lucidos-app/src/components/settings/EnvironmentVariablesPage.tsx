@@ -166,7 +166,6 @@ export function EnvironmentVariablesPage() {
 
   return (
     <div class="settings-section">
-      <div class="settings-section-title">Environment Variables</div>
       <p class="settings-section-desc">
         User-managed environment variables made available to agent scripts and tools.
       </p>

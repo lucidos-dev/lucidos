@@ -35,7 +35,7 @@ export function setLoadingIfFresh<T>(signal: { value: Loadable<T> }): void {
 }
 
 // Menu item names (drawer navigation)
-export const MENU_ITEMS = ['files', 'apps', 'triggers', 'thread-queue', 'settings', 'changes', 'notifications'] as const;
+export const MENU_ITEMS = ['files', 'apps', 'triggers', 'settings', 'changes', 'notifications'] as const;
 export type MenuItem = typeof MENU_ITEMS[number];
 
 // Connection status. 'connecting' is the initial state before the first

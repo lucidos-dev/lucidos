@@ -19,7 +19,7 @@ use std::time::Duration;
 /// (`BootPhase::from_wire`). Engine-reported phases only — the gateway sets the
 /// `provisioning-database` / `starting-engine` phases itself.
 pub const MIGRATING: &str = "migrating";
-pub const BUILDING_SEARCH_INDEX: &str = "building-search-index";
+pub const DOWNLOADING_MEMORY_MODEL: &str = "downloading-memory-model";
 pub const RECOVERING: &str = "recovering";
 
 /// Report the current cold-boot `phase` to the gateway, if we were spawned by

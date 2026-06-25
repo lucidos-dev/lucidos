@@ -6,7 +6,6 @@ import { lazyComponent } from '../../utils/lazyComponent';
 const FilesView = lazyComponent(() => import('../files/FilesView').then(m => m.FilesView));
 const AppsView = lazyComponent(() => import('../apps/AppsView').then(m => m.AppsView));
 const TriggersView = lazyComponent(() => import('../triggers/TriggersView').then(m => m.TriggersView));
-const ThreadQueueView = lazyComponent(() => import('../thread-queue/ThreadQueueView').then(m => m.ThreadQueueView));
 const SettingsView = lazyComponent(() => import('../settings/SettingsView').then(m => m.SettingsView));
 const ChangesView = lazyComponent(() => import('../changes/ChangesView').then(m => m.ChangesView));
 const NotificationsView = lazyComponent(() => import('../notifications/NotificationsView').then(m => m.NotificationsView));
@@ -63,7 +62,6 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
             {active === 'files' && <FilesView />}
             {active === 'apps' && <AppsView />}
             {active === 'triggers' && <TriggersView />}
-            {active === 'thread-queue' && <ThreadQueueView />}
             {active === 'settings' && <SettingsView />}
             {active === 'changes' && <ChangesView />}
             {active === 'notifications' && <NotificationsView />}

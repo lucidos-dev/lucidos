@@ -37,9 +37,18 @@ function ThreadsHeader() {
   // The button glyph reflects the selected view (funnel for `all`).
   const ViewIcon = viewIcon(drawerView.value);
 
+  // Header regions set the focused pane on `click`, NOT `pointerdown`: in the
+  // Tauri build the whole header is a window-drag region (useWindowDragRegion),
+  // and a press that turns into a window drag must not change the focused pane —
+  // the user is moving the window, not picking a pane. A native window drag
+  // suppresses the synthetic `click`, so firing focus on click means only a
+  // real click (press + release, no drag) moves focus. Off Tauri this is just
+  // "click to focus" and behaves the same as before. The other three regions
+  // (collapsed-thread-actions, pane-header-brand, content-header-elements)
+  // follow the same rule.
   return (
     <div class={`threads-header${searchOpen ? ' search-active' : ''}`}
-         onPointerDown={() => focusPane('drawer')}>
+         onClick={() => focusPane('drawer')}>
       <div class="thread-search-bar">
         <SearchIcon className="thread-search-bar-icon" />
         <input
@@ -239,7 +248,9 @@ export function AppHeader() {
               transition). */}
           <div class="thread-header-elements">
             <ThreadsHeader />
-            <div class="collapsed-thread-actions" onPointerDown={() => focusPane('thread')}>
+            {/* Focus on click, not pointerdown, so a window drag never shifts
+                focus — see ThreadsHeader. */}
+            <div class="collapsed-thread-actions" onClick={() => focusPane('thread')}>
               <ThreadToggleButton />
               <ThreadNav showTooltip />
               <button
@@ -251,7 +262,9 @@ export function AppHeader() {
                 <ComposeIcon />
               </button>
             </div>
-            <span class="pane-header-brand" onPointerDown={() => focusPane('thread')}>
+            {/* Focus on click, not pointerdown, so a window drag never shifts
+                focus — see ThreadsHeader. */}
+            <span class="pane-header-brand" onClick={() => focusPane('thread')}>
               <div class="thread-nav-group">
                 <ThreadToggleButton />
                 <ThreadNav showTooltip />
@@ -292,7 +305,9 @@ export function AppHeader() {
               )}
             </span>
           </div>
-          <div class="content-header-elements" onPointerDown={() => focusPane('content')}>
+          {/* Focus on click, not pointerdown, so a window drag never shifts
+              focus — see ThreadsHeader. */}
+          <div class="content-header-elements" onClick={() => focusPane('content')}>
             <PanelNav />
             <span class="pane-header-content-title">
               {showContentTitle && (

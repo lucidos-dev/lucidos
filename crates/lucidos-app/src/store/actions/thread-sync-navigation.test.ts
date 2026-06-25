@@ -95,9 +95,12 @@ describe('handleNavigationRequest', () => {
     expect(switchMenuItem).toHaveBeenCalledWith('files');
   });
 
-  it('switches to thread-queue tab (Thread Queue notification tap)', () => {
+  it('lands on Settings → System → Thread Queue (Thread Queue notification tap)', () => {
+    // The `thread-queue` NavigateTarget stays stable in the SDK + engine; the
+    // frontend reinterprets it to the System subpanel under Settings.
     handleNavigationRequest({ target: 'thread-queue' });
-    expect(switchMenuItem).toHaveBeenCalledWith('thread-queue');
+    expect(switchMenuItem).toHaveBeenCalledWith('settings');
+    expect(openSettingsSubview).toHaveBeenCalledWith('thread-queue');
   });
 
   it('opens app by id (delegates to openAppById, no stale-cache pre-check)', () => {

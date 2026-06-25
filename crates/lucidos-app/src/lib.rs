@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Mutex;
 use std::time::Instant;
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::webview::PageLoadEvent;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -869,13 +869,33 @@ fn show_native_notification(title: String, body: String, link: serde_json::Value
     notifications::show(&title, &body, link);
 }
 
+/// Bridge the native window's *active* state (focused AND on-screen) to that
+/// window's webview as a `native-window-active` event (a bare bool). The embedded
+/// WKWebView can't observe macOS `orderOut:` — a window dismissed to the menu-bar
+/// tray keeps `document.visibilityState='visible'` and `document.hasFocus()=true`
+/// — and its `hasFocus()` is unreliable generally, so the page can't tell "in
+/// use" from "trayed / behind another app" on its own. The frontend caches this
+/// and feeds it into `isPageActive()` so a non-active desktop client gets the OS
+/// native banner instead of a suppressed, invisible in-app toast. Targeted to the
+/// specific window so a secondary New-Window client keeps its own state. See
+/// `utils/nativeWindow.ts` and `system-knowhow/notifications.md` §1, §4.
+fn emit_window_active(app: &tauri::AppHandle, label: &str, active: bool) {
+    let _ = app.emit_to(label, "native-window-active", active);
+}
+
 /// Show + focus the main window, recreating it if it was destroyed. Backs the
-/// menu-bar "Open Lucidos" item and the macOS Dock-click (Reopen), so a window
-/// hidden on close can always be brought back.
-fn show_main_window(app: &tauri::AppHandle) {
+/// menu-bar "Open Lucidos" item, the macOS Dock-click (Reopen), and a
+/// native-notification tap, so a window hidden on close can always be brought
+/// back. Emits `native-window-active = true` so the reshown page immediately
+/// counts as active again.
+pub(crate) fn show_main_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
+        let _ = win.unminimize();
         let _ = win.show();
         let _ = win.set_focus();
+        // `set_focus()` also fires `WindowEvent::Focused(true)`, but emit
+        // explicitly so the reshow is deterministic regardless of event timing.
+        emit_window_active(app, "main", true);
     } else if let Err(e) = open_new_window(app) {
         eprintln!("[Tauri] Failed to open window: {e}");
     }
@@ -1003,7 +1023,23 @@ pub fn run() {
                     if !tauri::is_dev() && window.label() == "main" {
                         api.prevent_close();
                         let _ = window.hide();
+                        // Trayed via orderOut: — the WKWebView won't report this
+                        // (visibilityState stays 'visible', hasFocus() stays true)
+                        // and `Focused(false)` may not fire on orderOut, so this
+                        // is the load-bearing signal that the page is no longer
+                        // active. Lets the engine send the OS native banner instead
+                        // of a suppressed, invisible in-app toast.
+                        emit_window_active(app, window.label(), false);
                     }
+                }
+                // Native focus changed (app switch, behind another app, Space
+                // change, app-hide, minimize). Bridge it so isPageActive() honors
+                // the desktop "active = visible AND focused" rule using the
+                // authoritative AppKit state instead of the flaky WKWebView
+                // hasFocus(). The trayed (orderOut:) case is covered by the
+                // explicit emit in CloseRequested above. See emit_window_active.
+                tauri::WindowEvent::Focused(focused) if is_app_window(window.label()) => {
+                    emit_window_active(app, window.label(), *focused);
                 }
                 // Geometry changed — arm the debounced background flush. The plugin
                 // keeps its own in-memory cache up to date from these same events;
@@ -1165,80 +1201,71 @@ pub fn run() {
         });
 }
 
-/// Build and install the macOS app menu. Mirrors the default menu (so standard
-/// shortcuts keep working) but maps Cmd+Q to "Close Window" (hides the client,
-/// leaving the always-on service running) and exposes the deliberate full
-/// teardown as a separate, unshortcutted "Quit and Stop Background Service" item
-/// (routed through `on_menu_event` → `quit_lucidos`; also in the menu-bar tray).
+/// Build and install the app menu.
+///
+/// We DERIVE from Tauri's OS-default menu (`Menu::default`) rather than building
+/// every submenu by hand. This is load-bearing on macOS: the system only loads
+/// the standard text-editing key-binding dictionary for a WKWebView when the app
+/// exposes a *complete* native app menu (the default App menu — About, Services,
+/// Hide… — is what gets the first submenu recognized as the Apple menu). A fully
+/// hand-rolled menu that omitted those predefined items left the bindings
+/// inactive, so `interpretKeyEvents:` found no command for the arrow keys and
+/// fell back to `insertText:` — typing the raw arrow NSFunctionKey characters
+/// (U+F700–F703, rendered as tofu boxes) into the focused textarea instead of
+/// moving the cursor. Deriving from the default keeps that wiring; on macOS we
+/// then graft on our service-aware items.
+///
+/// macOS customizations: Cmd+Q maps to "Close Window" (hides the client, leaving
+/// the always-on service running); the deliberate full teardown is the separate,
+/// unshortcutted "Quit and Stop Background Service" (`on_menu_event` →
+/// `quit_lucidos`; also in the menu-bar tray); plus "Uninstall Lucidos…" and a
+/// File-menu "New Window". Other platforms keep the default menu unchanged.
 fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
-    let uninstall = MenuItem::with_id(
-        app,
-        "uninstall_lucidos",
-        "Uninstall Lucidos…",
-        true,
-        None::<&str>,
-    )?;
-    // Cmd+Q closes the window (hides the client) rather than quitting — the
-    // always-on service must survive it. The deliberate full teardown is the
-    // separate, unshortcutted "Quit and Stop Background Service" (also in the tray).
-    let close_window =
-        MenuItem::with_id(app, "close_main_window", "Close Window", true, Some("Cmd+Q"))?;
-    let quit = MenuItem::with_id(
-        app,
-        "quit_lucidos",
-        "Quit and Stop Background Service",
-        true,
-        None::<&str>,
-    )?;
+    let menu = Menu::default(app.handle())?;
 
-    let app_menu = Submenu::with_items(
-        app,
-        "Lucidos",
-        true,
-        &[
-            &PredefinedMenuItem::about(app, Some("About Lucidos"), None)?,
-            &PredefinedMenuItem::separator(app)?,
-            &PredefinedMenuItem::hide(app, None)?,
-            &PredefinedMenuItem::hide_others(app, None)?,
-            &PredefinedMenuItem::show_all(app, None)?,
-            &PredefinedMenuItem::separator(app)?,
-            &uninstall,
-            &PredefinedMenuItem::separator(app)?,
-            &close_window,
-            &quit,
-        ],
-    )?;
+    #[cfg(target_os = "macos")]
+    {
+        use tauri::menu::MenuItemKind;
 
-    let new_window = MenuItem::with_id(app, "new_window", "New Window", true, Some("Cmd+N"))?;
-    let file_menu = Submenu::with_items(app, "File", true, &[&new_window])?;
+        // Default macOS submenu order is [App, File, Edit, View, Window, Help].
+        let items = menu.items()?;
 
-    let edit_menu = Submenu::with_items(
-        app,
-        "Edit",
-        true,
-        &[
-            &PredefinedMenuItem::undo(app, None)?,
-            &PredefinedMenuItem::redo(app, None)?,
-            &PredefinedMenuItem::separator(app)?,
-            &PredefinedMenuItem::cut(app, None)?,
-            &PredefinedMenuItem::copy(app, None)?,
-            &PredefinedMenuItem::paste(app, None)?,
-            &PredefinedMenuItem::select_all(app, None)?,
-        ],
-    )?;
+        if let Some(MenuItemKind::Submenu(app_menu)) = items.first() {
+            // Drop the default Quit (its last item; Cmd+Q → terminate) so Cmd+Q
+            // is free for "Close Window", and graft on our service-aware items.
+            // Removing only Quit leaves About/Services/Hide intact, so the menu
+            // is still recognized as the Apple menu (the arrow-key fix above).
+            // The default's item before Quit is a separator, so the grafted items
+            // start straight at Uninstall (no leading separator → no double rule).
+            let last = app_menu.items()?.len();
+            if last > 0 {
+                app_menu.remove_at(last - 1)?;
+            }
+            let uninstall =
+                MenuItem::with_id(app, "uninstall_lucidos", "Uninstall Lucidos…", true, None::<&str>)?;
+            let close_window =
+                MenuItem::with_id(app, "close_main_window", "Close Window", true, Some("Cmd+Q"))?;
+            let quit = MenuItem::with_id(
+                app,
+                "quit_lucidos",
+                "Quit and Stop Background Service",
+                true,
+                None::<&str>,
+            )?;
+            app_menu.append_items(&[
+                &uninstall,
+                &PredefinedMenuItem::separator(app)?,
+                &close_window,
+                &quit,
+            ])?;
+        }
 
-    let window_menu = Submenu::with_items(
-        app,
-        "Window",
-        true,
-        &[
-            &PredefinedMenuItem::minimize(app, None)?,
-            &PredefinedMenuItem::separator(app)?,
-            &PredefinedMenuItem::close_window(app, None)?,
-        ],
-    )?;
+        if let Some(MenuItemKind::Submenu(file_menu)) = items.get(1) {
+            let new_window = MenuItem::with_id(app, "new_window", "New Window", true, Some("Cmd+N"))?;
+            file_menu.prepend(&new_window)?;
+        }
+    }
 
-    let menu = Menu::with_items(app, &[&app_menu, &file_menu, &edit_menu, &window_menu])?;
     app.set_menu(menu)?;
     Ok(())
 }

@@ -1,5 +1,29 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
+// Mock the native-window bridge so we can drive its onChange and read the cached
+// active state (which the real isPageActive consults). startNativeWindowActiveTracking
+// captures the callback; firing it (active=false/true) is the trayed/unfocused
+// transition the engine's candidate index must follow promptly.
+const nativeMock = vi.hoisted(() => ({
+  active: true,
+  onChange: undefined as ((active: boolean) => void) | undefined,
+}));
+vi.mock('../../utils/nativeWindow', () => ({
+  isNativeWindowActive: () => nativeMock.active,
+  setNativeWindowActive: (active: boolean) => {
+    nativeMock.active = active;
+  },
+  startNativeWindowActiveTracking: (onChange?: (active: boolean) => void) => {
+    // Mirror the real module: update the cache BEFORE invoking onChange so
+    // syncDevicePresence reads the fresh isPageActive().
+    nativeMock.onChange = (active: boolean) => {
+      nativeMock.active = active;
+      onChange?.(active);
+    };
+    return Promise.resolve(() => {});
+  },
+}));
+
 // jsdom isn't loaded; mirror presence.test.ts and inject minimal globals so
 // the device-presence module's event-listener wiring doesn't blow up.
 // We capture registered listeners by event type so individual tests can fire
@@ -72,6 +96,8 @@ describe('device presence tracking', () => {
     fetchMock.mockClear();
     documentListeners.clear();
     windowListeners.clear();
+    nativeMock.active = true;
+    nativeMock.onChange = undefined;
   });
 
   afterEach(() => {
@@ -152,5 +178,26 @@ describe('device presence tracking', () => {
     fetchMock.mockClear();
     fire(windowListeners, 'focus');
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  // Tauri: the native window trayed (orderOut:) or going behind another app is
+  // invisible to the webview's visibilitychange/focus events. The native-active
+  // bridge re-syncs presence so the engine's candidate index flips immediately
+  // (instead of aging out over 120s) and a non-active desktop client gets the OS
+  // native banner rather than a suppressed, invisible in-app toast.
+  it('re-syncs device presence (visible=false) when the native window goes inactive', () => {
+    startDevicePresenceTracking();
+    fetchMock.mockClear();
+    nativeMock.onChange?.(false);
+    expect(lastFetchBody()).toMatchObject({ visible: false });
+  });
+
+  it('re-syncs device presence (visible=true) when the native window becomes active', () => {
+    startDevicePresenceTracking();
+    // Go inactive first so the visible=true re-sync isn't deduped away.
+    nativeMock.onChange?.(false);
+    fetchMock.mockClear();
+    nativeMock.onChange?.(true);
+    expect(lastFetchBody()).toMatchObject({ visible: true });
   });
 });

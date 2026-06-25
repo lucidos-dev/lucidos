@@ -1,7 +1,6 @@
 import { useEffect, useRef } from 'preact/hooks';
 import { confirmState } from '../../store/store';
-import { isTauri } from '../../utils/platform';
-import { hidePanelWebview, showPanelWebview } from '../../utils/tauri';
+import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from './Overlay';
 
 function resolve(value: boolean) {
@@ -15,9 +14,11 @@ export function ConfirmDialog() {
   const dialogRef = useRef<HTMLDivElement>(null);
   const okBtnRef = useRef<HTMLButtonElement>(null);
 
+  // The native panel webview paints over the dialog; hold it hidden while open.
+  useHidePanelWebviewWhile(state.visible);
+
   useEffect(() => {
     if (!state.visible) return;
-    if (isTauri()) hidePanelWebview();
 
     okBtnRef.current?.focus();
 
@@ -51,7 +52,6 @@ export function ConfirmDialog() {
     document.addEventListener('keydown', handleKey);
     return () => {
       document.removeEventListener('keydown', handleKey);
-      if (isTauri()) showPanelWebview();
     };
   }, [state.visible]);
 

@@ -81,8 +81,11 @@ describe('getContentTitle — menu labels', () => {
     }
   });
 
-  it('thread-queue renders its canonical "Thread Queue" title', () => {
-    activeMenuItem.value = 'thread-queue';
+  it('Thread Queue renders its canonical title from the Settings → System subview', () => {
+    // Thread Queue is no longer a top-level menu item — it's a System subpanel,
+    // so its title comes from the settings subview label, not menuLabels.
+    activeMenuItem.value = 'settings';
+    settingsSubview.value = 'thread-queue';
     expect(getContentTitle()).toBe('Thread Queue');
   });
 

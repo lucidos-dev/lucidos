@@ -12,11 +12,22 @@
  */
 import type { ComponentChildren, VNode } from 'preact';
 import { afterEach, describe, expect, it } from 'vitest';
-import { WelcomeMessage, ProviderSetupWelcome } from '../WelcomeMessage';
+import { WelcomeMessage, ProviderSetupWelcome, SuggestionCarousel, suggestionView } from '../WelcomeMessage';
 import { showWelcomeSurface } from '../CreateThreadView';
 import { llmConfigured } from '../../../store/store';
 
 type AnyVNode = VNode<Record<string, unknown>>;
+
+/** Whether a vnode subtree contains a vnode of the given component type. Unlike
+ *  findByClass this matches function components (used to assert a child
+ *  component is rendered without descending into its hook-bearing body). */
+function containsComponent(node: ComponentChildren, comp: unknown): boolean {
+  if (node === null || node === undefined || typeof node !== 'object') return false;
+  if (Array.isArray(node)) return node.some((n) => containsComponent(n, comp));
+  const v = node as AnyVNode;
+  if (v.type === comp) return true;
+  return containsComponent(v.props?.children as ComponentChildren, comp);
+}
 
 /** Collect DOM (string-typed) vnodes whose class list includes `cls`. Does NOT
  *  descend into function components (matches the ThreadFilterDropdown idiom). */
@@ -67,12 +78,16 @@ describe('WelcomeMessage — provider-aware variant selection', () => {
     expect(vnode.type).toBe(ProviderSetupWelcome);
   });
 
-  it('renders the starter-suggestions welcome when a provider is configured', () => {
+  it('renders the suggestion carousel when a provider is configured', () => {
     llmConfigured.value = true;
     const vnode = WelcomeMessage() as AnyVNode;
     // Configured branch is the inline DOM tree, not the setup component.
     expect(vnode.type).toBe('div');
-    expect(findByClass(vnode, 'welcome-suggestion-chip').length).toBeGreaterThan(0);
+    // Suggestions render via the chevron carousel (its own component), with the
+    // lead-in label above it. No clickable chips, no provider-setup CTA.
+    expect(containsComponent(vnode, SuggestionCarousel)).toBe(true);
+    expect(textOf(vnode)).toContain('A few suggestions');
+    expect(findByClass(vnode, 'welcome-suggestion-chip').length).toBe(0);
     expect(findByClass(vnode, 'welcome-provider-setup').length).toBe(0);
   });
 });
@@ -85,6 +100,21 @@ describe('ProviderSetupWelcome — onboarding content', () => {
     expect(textOf(btns[0])).toContain('Set up your AI provider');
     // The fix must steer to provider setup, not offer agent-assuming prompts.
     expect(textOf(tree)).toContain('Settings → Models → Providers');
-    expect(findByClass(tree, 'welcome-suggestion-chip').length).toBe(0);
+    expect(containsComponent(tree, SuggestionCarousel)).toBe(false);
+  });
+});
+
+describe('suggestionView — chevron carousel view-model', () => {
+  const ideas = ['a', 'b', 'c'];
+
+  it('reports the current item and which chevrons apply', () => {
+    expect(suggestionView(ideas, 0)).toEqual({ current: 'a', index: 0, hasPrev: false, hasNext: true });
+    expect(suggestionView(ideas, 1)).toEqual({ current: 'b', index: 1, hasPrev: true, hasNext: true });
+    expect(suggestionView(ideas, 2)).toEqual({ current: 'c', index: 2, hasPrev: true, hasNext: false });
+  });
+
+  it('clamps an out-of-range index into bounds', () => {
+    expect(suggestionView(ideas, -5).index).toBe(0);
+    expect(suggestionView(ideas, 99).index).toBe(2);
   });
 });

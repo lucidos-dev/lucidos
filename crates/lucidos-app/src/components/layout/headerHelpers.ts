@@ -7,7 +7,6 @@ import { PENDING_TITLE_PLACEHOLDER } from '../../store/thread-events';
 
 const menuLabels: Record<string, string> = {
   files: 'Files', apps: 'Apps', triggers: 'Triggers',
-  'thread-queue': 'Thread Queue',
   changes: 'Changes', notifications: 'Notifications',
   settings: 'Settings',
 };
@@ -104,9 +103,9 @@ export function navEntryTitle(entry: NavEntry): string {
  *  beside each row in the content back/forward history menu (PanelNav). Mirrors
  *  `navEntryTitle`'s branching, mapping every destination to one of the
  *  Search Everywhere content categories (plus the content-pane-only ones:
- *  `notifications`, `thread-queue`, `web`). The bare menu items already share
- *  their names with the category icons, so the no-overlay case returns the
- *  menu item verbatim; anything unmapped falls through to the icon's default. */
+ *  `notifications`, `web`). The bare menu items already share their names with
+ *  the category icons, so the no-overlay case returns the menu item verbatim;
+ *  anything unmapped falls through to the icon's default. */
 export function navEntryCategory(entry: NavEntry): string {
   const overlay = entry.overlay;
   if (overlay?.type === 'form') {
@@ -125,8 +124,8 @@ export function navEntryCategory(entry: NavEntry): string {
   if (overlay?.type === 'url-preview') return 'web';
   if (overlay?.type === 'notification-detail') return 'notifications';
   // No overlay → the active menu item is the destination; its name is also the
-  // category icon's key (files / apps / triggers / thread-queue / settings /
-  // changes / notifications).
+  // category icon's key (files / apps / triggers / settings / changes /
+  // notifications).
   return entry.menuItem;
 }
 

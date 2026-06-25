@@ -118,7 +118,7 @@ export function closeInlineForm(): void {
 }
 
 // --- Settings subview ---
-export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'marketplaces' | 'disk-usage' | 'permissions' | 'keyboard-shortcuts' | 'mobile-access' | 'environment-variables';
+export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'marketplaces' | 'disk-usage' | 'permissions' | 'keyboard-shortcuts' | 'mobile-access' | 'environment-variables' | 'thread-queue';
 export type SettingsNavKey = Exclude<SettingsSubview, 'main'>;
 export interface SettingsNavItem {
   key: SettingsNavKey;
@@ -129,6 +129,7 @@ export const settingsSubview = signal<SettingsSubview>('main');
 export const settingsScrollTarget = signal<string | null>(null);
 
 export const SETTINGS_SYSTEM_SUBPANEL_ITEMS: SettingsNavItem[] = [
+  { key: 'thread-queue', label: 'Thread Queue' },
   { key: 'backup', label: 'Backup' },
   { key: 'memory', label: 'Memory' },
   { key: 'disk-usage', label: 'Disk Usage' },

@@ -118,11 +118,11 @@
     --header-fg-muted: rgba(255, 255, 255, 0.72);
     --header-control-hover-bg: rgba(255, 255, 255, 0.12);
     --header-control-active-bg: rgba(255, 255, 255, 0.22);
-    /* Header divider: a very faint translucent white tint over the brand-blue
-       bar — barely-there, so it reads as a hint of a seam rather than the stark
-       light-gray line --border-color would draw in light mode. Full-height
-       geometry still matches the pane .split-divider. */
-    --header-divider: rgba(255, 255, 255, 0.1);
+    /* Header divider: currently disabled (transparent) so the brand-blue bar
+       reads as one seamless header across the drawer/chat/content splits. The
+       full-height ::before/::after geometry is kept (matching the pane
+       .split-divider below) so re-enabling is just a color change here. */
+    --header-divider: transparent;
     --header-badge-bg: #ffffff;
     --header-badge-fg: var(--brand-blue-deep);
     /* Base bar color: any inherited text / currentColor glyph (e.g. the
@@ -233,18 +233,32 @@
     flex: 0 0 auto;
 }
 
-/* When the welcome surface is present, the compose view has real content to
-   show. `.thread-content` is `position: absolute; inset: 0`, so it contributes
-   no height to its `flex: 0 0 auto` wrap — without this the welcome renders into
-   a zero-height, overflow-hidden box and is clipped to nothing (the "no welcome
-   on a fresh install" bug). Give the wrap the available column space so the
-   absolute content fills + scrolls and the prompt docks at the bottom, exactly
-   like a real thread. The wrap only contains `.thread-content.visible` when
-   `hasContent` is true (CreateThreadView), which in compose-empty mode means the
-   welcome is showing. */
+/* Compose-empty welcome: a COMPACT surface that flows at its natural height, so
+   the centered group (welcome + prompt) keeps the prompt near the middle on
+   desktop, and on mobile (where `.thread-pane-body` is bottom-docked) the
+   welcome sits just above the prompt. `.thread-content` is normally a fill +
+   scroll container (desktop `position: absolute; inset: 0`; mobile `flex: 1`);
+   here it flows at content height so the welcome is only as tall as it needs to
+   be. Only the compose-empty welcome is affected — a real transcript keeps its
+   fill + scroll behavior. The wrap therefore sizes to content (not `flex: 1`).
+   `.thread-content` only exists here when `hasContent` is true (CreateThreadView),
+   which in compose-empty mode means the welcome is showing. */
 .compose-empty .thread-content-wrap:has(> .thread-content.visible) {
-    flex: 1;
+    flex: 0 0 auto;
     min-height: 0;
+}
+
+/* Scoped to `.visible` (0,3,0) so it beats the base/mobile `.thread-content`
+   rules. The dismiss pill anchors to this (`position: relative`). */
+.compose-empty .thread-content.visible {
+    position: relative;   /* was absolute inset:0 (desktop) — flow at natural height */
+    inset: auto;
+    flex: none;           /* mobile sets flex:1 — don't grow in compose-empty */
+    overflow: visible;    /* compact: no inner scroll; the carousel scrolls itself */
+    /* No scrolling transcript to fade here, and the dismiss pill lives in this
+       area — kill the desktop top-fade mask so it isn't ghosted. */
+    -webkit-mask-image: none;
+    mask-image: none;
 }
 
 .compose-empty .prompt-area {
@@ -364,8 +378,8 @@
 
     /* Divider between chat and panel header areas — centered on the split bar.
        Full-height + same width as the pane .split-divider below it, so the two
-       read as one continuous divider; tinted (--header-divider) to blend with
-       the blue bar rather than standing out like the opaque pane divider. */
+       would read as one continuous divider. Painted with --header-divider,
+       currently transparent (seam disabled — see the token definition). */
     .app-header::after {
         content: '';
         position: absolute;
@@ -919,6 +933,7 @@
 }
 
 .control-panel-ws-refresh {
+    position: relative;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -953,6 +968,22 @@
 /* A restart is pending — draw attention to the refresh button. */
 .control-panel-ws-refresh.is-pending {
     color: var(--accent);
+}
+
+/* An update is available — a small dot on the refresh button mirrors the brand
+   toggle's update badge inside the switcher. Non-interactive (the swallow contract
+   and long-press live on the button); the ring matches the active row's surface
+   (--bg-tertiary) so it reads as floating above the reload glyph. */
+.control-panel-ws-refresh-badge {
+    position: absolute;
+    top: 0.1875rem;
+    right: 0.1875rem;
+    width: 0.4375rem;
+    height: 0.4375rem;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 0.0625rem var(--bg-tertiary);
+    pointer-events: none;
 }
 
 .control-panel-ws-restart-confirm {

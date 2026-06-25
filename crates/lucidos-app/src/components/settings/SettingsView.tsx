@@ -20,7 +20,6 @@ import { getCcAllowedTools, putCcAllowedTools, getAgentAllowedCommands, putAgent
 import { KeyboardShortcutsSection } from './KeyboardShortcutsSection';
 import { MarketplacesSection } from './MarketplacesSection';
 import { MobileAccessPage } from './MobileAccessPage';
-import { EnvironmentVariablesPage } from './EnvironmentVariablesPage';
 import { SystemPage } from './SystemPage';
 import { isTauri } from '../../utils/platform';
 import { ChevronRightIcon } from '../shared/icons';
@@ -868,6 +867,7 @@ export function SettingsView() {
   function renderSubview() {
     switch (settingsSubview.value) {
       case 'system': return <SystemPage />;
+      case 'thread-queue': return <SystemPage panel="thread-queue" />;
       case 'models': return modelsSection();
       case 'appearance': return appearanceSection();
       case 'memory': return <SystemPage panel="memory" />;
@@ -880,7 +880,7 @@ export function SettingsView() {
       case 'permissions': return permissionsSection();
       case 'keyboard-shortcuts': return <KeyboardShortcutsSection />;
       case 'disk-usage': return <SystemPage panel="disk-usage" />;
-      case 'environment-variables': return <EnvironmentVariablesPage />;
+      case 'environment-variables': return <SystemPage panel="environment-variables" />;
       default: return null;
     }
   }

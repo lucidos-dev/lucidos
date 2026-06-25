@@ -90,12 +90,11 @@ function WorkspaceFilesView() {
               <button class="files-toolbar-btn" onClick={collapseAllFolders} data-tooltip="Collapse all folders">Collapse All</button>
             </>
           )}
-          <label class="files-toolbar-btn">
-            <HiddenFileInput multiple onChange={handleFileSelected} />
-            Import
-          </label>
         </span>
-        <span class="files-hint">Drop to import</span>
+        <label class="files-import-dropzone">
+          <HiddenFileInput multiple onChange={handleFileSelected} />
+          Drop or click to import
+        </label>
       </div>
       <div class="artifacts-desktop">
         {hasArtifacts && <FolderTree />}

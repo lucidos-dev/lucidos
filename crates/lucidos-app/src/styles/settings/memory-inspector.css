@@ -191,6 +191,27 @@
     flex-shrink: 0;
 }
 
+/* Copyable, targetable id — same uuid the agent sees as `[id: <uuid>]` in the
+   [Long-term Memory] block and accepts in the correct_memory_by_id tool. */
+.memory-id-value {
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    color: var(--text-secondary);
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    padding: 0.0625rem 0.375rem;
+    cursor: pointer;
+    text-align: left;
+    overflow-wrap: anywhere;
+    min-width: 0;
+}
+
+.memory-id-value:hover {
+    color: var(--text-primary);
+    border-color: var(--text-muted);
+}
+
 .memory-view-source-btn {
     margin-top: 0.5rem;
 }

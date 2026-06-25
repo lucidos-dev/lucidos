@@ -1,5 +1,5 @@
 import { signal } from '@preact/signals';
-import { useEffect, useRef } from 'preact/hooks';
+import { useRef } from 'preact/hooks';
 import { activeMenuItem, panelOverlay, pinnedApps, appsList, changes } from '../../store/store';
 import { switchMenuItem } from '../../store/actions/menu';
 import { openUrl } from '../../store/actions/artifacts';
@@ -7,7 +7,7 @@ import { openAppById } from '../../store/actions/apps';
 import { showToast } from '../../store/store';
 import { errorDetail } from '../../utils/errorDetail';
 import { isTauri } from '../../utils/platform';
-import { hidePanelWebview, showPanelWebview } from '../../utils/tauri';
+import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from '../shared/Overlay';
 import type { MenuItem } from '../../store/types';
 
@@ -15,7 +15,6 @@ const menuItems: Array<{ id: MenuItem; label: string }> = [
   { id: 'files', label: 'Files' },
   { id: 'apps', label: 'Apps' },
   { id: 'triggers', label: 'Triggers' },
-  { id: 'thread-queue', label: 'Thread Queue' },
 ];
 
 export const drawerOpen = signal(false);
@@ -75,11 +74,7 @@ export function Drawer() {
   const pinned = resolvedPinnedUis();
   const drawerRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    if (!isOpen || !isTauri()) return;
-    hidePanelWebview();
-    return () => showPanelWebview();
-  }, [isOpen]);
+  useHidePanelWebviewWhile(isOpen);
 
   if (!isOpen) return null;
 

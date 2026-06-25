@@ -136,6 +136,19 @@ export function controlPanelBadgeTooltip(): string | undefined {
   return undefined;
 }
 
+/** Display state for the current workspace's refresh control: its tooltip and
+ *  whether to show the update-available dot. Pure so it can be unit-tested across
+ *  all four pending×update combinations. `pending` = a restart is pending
+ *  (`restartRequired`); `update` = a newer build is available (`updateAvailable`,
+ *  the same honest build-id signal that drives the brand badge). */
+export function currentWorkspaceRefreshState(
+  pending: boolean,
+  update: boolean,
+): { tooltip: string; showUpdateBadge: boolean } {
+  const base = pending ? 'Refresh · hold to restart & apply changes' : 'Refresh · hold to restart';
+  return { tooltip: update ? `Update available · ${base}` : base, showUpdateBadge: update };
+}
+
 function isGatewayRunning(ws: WorkspaceStatus): boolean {
   return ws.health === 'healthy' || ws.health === 'booting';
 }
@@ -177,6 +190,7 @@ function ManageWorkspacesItem() {
 function CurrentWorkspaceControls() {
   const confirming = useSignal(false);
   const pending = restartRequired.value;
+  const update = updateAvailable.value;
 
   const longPress = useLongPress(
     () => {
@@ -213,7 +227,7 @@ function CurrentWorkspaceControls() {
     );
   }
 
-  const tooltip = pending ? 'Refresh · hold to restart & apply changes' : 'Refresh · hold to restart';
+  const { tooltip, showUpdateBadge } = currentWorkspaceRefreshState(pending, update);
   return (
     <button
       type="button"
@@ -229,6 +243,10 @@ function CurrentWorkspaceControls() {
       onClick={longPress.onClick}
     >
       <ReloadIcon />
+      {/* Non-interactive dot (pointer-events: none) so it never intercepts the
+          tap/long-press; mirrors the brand toggle's update badge inside the
+          switcher. */}
+      {showUpdateBadge && <span class="control-panel-ws-refresh-badge" aria-hidden="true" />}
     </button>
   );
 }
@@ -386,7 +404,10 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
                   <a
                     class="control-panel-workspace-row"
                     key={ws.path}
-                    href={ws.port ? `https://localhost:${ws.port}` : undefined}
+                    // Legacy (no-gateway) fallback: link to the peer engine's own
+                    // port on the host the user is already on — never hardcoded
+                    // localhost, which would break over Tailscale.
+                    href={ws.port ? `${location.protocol}//${location.hostname}:${ws.port}` : undefined}
                     target="_blank"
                     rel="noopener"
                   >

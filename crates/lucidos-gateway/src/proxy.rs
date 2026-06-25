@@ -282,9 +282,9 @@ mod tests {
 
     #[test]
     fn splash_renders_the_phase_label_and_has_no_escape_link() {
-        let html = splash_page_html("Building search index — first run, this can take a minute…");
+        let html = splash_page_html("Downloading memory model — first run, this can take a minute…");
         // The current boot-phase label is shown beneath the mark.
-        assert!(html.contains("Building search index — first run, this can take a minute…"));
+        assert!(html.contains("Downloading memory model — first run, this can take a minute…"));
         // The 2s auto-refresh that advances the label / drives the happy-path
         // transition is preserved.
         assert!(html.contains(r#"http-equiv="refresh" content="2""#));
@@ -435,7 +435,7 @@ mod proxy_tests {
             &build_client(),
             &target,
             "dev",
-            "Building search index — first run, this can take a minute…",
+            "Downloading memory model — first run, this can take a minute…",
             request("GET", "/dev/", Body::empty()),
         )
         .await;
@@ -449,7 +449,7 @@ mod proxy_tests {
             .unwrap();
         let html = String::from_utf8_lossy(&body);
         assert!(
-            html.contains("Building search index — first run, this can take a minute…"),
+            html.contains("Downloading memory model — first run, this can take a minute…"),
             "the connect-failure splash must render the passed boot phase label"
         );
     }

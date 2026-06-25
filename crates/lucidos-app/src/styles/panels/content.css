@@ -195,6 +195,27 @@
     color: var(--text-muted);
 }
 
+/* Clickable dashed-border import box — also the panel's drop target hint */
+.files-import-dropzone {
+    display: inline-flex;
+    align-items: center;
+    font-size: 0.6875rem;
+    color: var(--text-muted);
+    border: 1px dashed var(--border-color);
+    border-radius: 0.375rem;
+    padding: 0.1875rem 0.625rem;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, background-color 0.15s;
+}
+
+@media (hover: hover) {
+    .files-import-dropzone:hover {
+        color: var(--text-primary);
+        border-color: var(--accent);
+        background: var(--bg-hover);
+    }
+}
+
 .files-toolbar-actions {
     display: flex;
     gap: 0.25rem;

@@ -1,8 +1,8 @@
-import { prefillCompose } from '../../store/actions/compose';
+import { useSignal } from '@preact/signals';
 import { dismissWelcomeSuggestions } from '../../store/actions/preferences';
 import { openProviderSettings } from '../../store/actions/menu';
 import { llmConfigured } from '../../store/store';
-import { composeHandlers } from './promptFocus';
+import { ChevronLeftIcon, ChevronRightIcon } from '../shared/icons';
 
 /** The MIT-license disclaimer shown at the foot of every welcome variant. */
 function WelcomeDisclaimer() {
@@ -55,28 +55,60 @@ export function ProviderSetupWelcome() {
   );
 }
 
-/** A clickable starter prompt. `label` is the short chip heading; `prompt` is
- *  the full text dropped into the compose input (not sent — the user reviews it
- *  and hits Send). Mirrors the capability examples in the welcome copy. */
-interface Suggestion {
-  label: string;
-  prompt: string;
+/** Conversational starter ideas — example things to ask the Lucidos Agent.
+ *  These are illustrative copy, not interactive: the user reads them and types
+ *  their own request. Shown one at a time in a chevron carousel (SuggestionCarousel). */
+const IDEAS: string[] = [
+  'Build me an app that tracks my reading list.',
+  'Send a summary of my emails for review every weekday at 8am.',
+  'Research e-bike options under €3000 and write up what you find — then set up a daily web scraper for relevant bargains and notify me when a good one comes up.',
+  'Tell me how to set up Lucidos for mobile access.',
+  'Show me the app store.',
+];
+
+/** Pure view-model for {@link SuggestionCarousel}: clamps `index` into range and
+ *  reports the current suggestion plus whether the prev/next chevrons apply. */
+export function suggestionView(ideas: string[], index: number) {
+  const last = ideas.length - 1;
+  const clamped = Math.max(0, Math.min(index, last));
+  return {
+    current: ideas[clamped],
+    index: clamped,
+    hasPrev: clamped > 0,
+    hasNext: clamped < last,
+  };
 }
 
-const SUGGESTIONS: Suggestion[] = [
-  {
-    label: 'Build an app',
-    prompt: 'Build me an app that tracks my reading list.',
-  },
-  {
-    label: 'Set up a reminder',
-    prompt: 'Remind me every morning at 8am to review my inbox.',
-  },
-  {
-    label: 'Research something',
-    prompt: 'Research e-bike options under €3000 and write up what you find.',
-  },
-];
+/** One suggestion at a time, flanked by ‹ › chevrons. The chevrons are disabled
+ *  at the ends ("when applicable"). Kept in its own component so WelcomeMessage
+ *  stays hook-free (the welcome tests invoke it as a plain function). */
+export function SuggestionCarousel() {
+  const index = useSignal(0);
+  const view = suggestionView(IDEAS, index.value);
+  return (
+    <div class="welcome-carousel">
+      <button
+        type="button"
+        class="welcome-carousel-nav"
+        aria-label="Previous suggestion"
+        disabled={!view.hasPrev}
+        onClick={() => { index.value = view.index - 1; }}
+      >
+        <ChevronLeftIcon size="1rem" />
+      </button>
+      <p class="welcome-carousel-item">{view.current}</p>
+      <button
+        type="button"
+        class="welcome-carousel-nav"
+        aria-label="Next suggestion"
+        disabled={!view.hasNext}
+        onClick={() => { index.value = view.index + 1; }}
+      >
+        <ChevronRightIcon size="1rem" />
+      </button>
+    </div>
+  );
+}
 
 export function WelcomeMessage() {
   // No provider configured → guide the user to set one up instead of offering
@@ -85,37 +117,7 @@ export function WelcomeMessage() {
     return <ProviderSetupWelcome />;
   }
   return (
-    <div class="response-content markdown-content welcome-message">
-      <h2>Welcome to Lucidos</h2>
-      <p>
-        I'm the Lucidos Agent — I remember our conversations, keep your files
-        and notes as artifacts, and act on your behalf: research, schedules,
-        apps, automations.
-      </p>
-      <div class="welcome-suggestions">
-        <p class="welcome-suggestions-label">New here? Tap one to start:</p>
-        <div class="welcome-suggestion-chips">
-          {SUGGESTIONS.map((s) => (
-            <button
-              key={s.label}
-              type="button"
-              class="welcome-suggestion-chip"
-              // composeHandlers focuses the prompt within the tap gesture
-              // (iOS keyboard) BEFORE prefilling, so a mobile tap lands the
-              // text with the keyboard already open.
-              {...composeHandlers(() => prefillCompose(s.prompt))}
-            >
-              <span class="welcome-suggestion-chip-label">{s.label}</span>
-              <span class="welcome-suggestion-chip-prompt">“{s.prompt}”</span>
-            </button>
-          ))}
-        </div>
-      </div>
-      <p>
-        Want to change code instead? Point the picker below at a coding
-        target — the Lucidos source, an app, or one of your repositories — and
-        a coding agent takes the thread, proposing changes you review.
-      </p>
+    <div class="response-content markdown-content welcome-message welcome-hero">
       <button
         type="button"
         class="welcome-dismiss"
@@ -123,6 +125,9 @@ export function WelcomeMessage() {
       >
         Don't show this again
       </button>
+      <h2>Hi, there!</h2>
+      <p class="welcome-suggestions-label">A few suggestions to get you started:</p>
+      <SuggestionCarousel />
       <WelcomeDisclaimer />
     </div>
   );
