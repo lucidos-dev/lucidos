@@ -13,14 +13,18 @@
 //!    spawns + supervises the standalone **workspace gateway** (the
 //!    `lucidos-gateway` binary, ADR 0014) on a STABLE port. The gateway owns the
 //!    rest — it provisions the embedded Postgres + spawns one engine per
-//!    registered workspace and reverse-proxies `/<slug>/` (first run auto-creates
-//!    `default`). No window, no AppKit. On crash launchd respawns the service (the
-//!    new gateway re-adopts already-running engines); on `launchctl bootout` (an
-//!    explicit "Quit Lucidos") it tears the whole stack down and stays stopped.
+//!    registered workspace and reverse-proxies `/<slug>/` (first run creates no
+//!    workspace; the smart root serves the picker). No window, no AppKit. On
+//!    crash launchd respawns the service (the
+//!    new gateway re-adopts already-running engines); on `launchctl bootout` (the
+//!    explicit "Quit & Stop Background Service") it tears the whole stack down and
+//!    stays stopped.
 //!  * **Client** (the GUI app the user double-clicks): [`launch`] ensures the
 //!    service is installed + running, waits for `/~/api/v1/health` (the gateway),
 //!    then points the window at it (the gateway serves the workspace picker behind
-//!    the sigil namespace `/~/`). Window close leaves the service running.
+//!    the sigil namespace `/~/`). Closing the window and Cmd+Q only dismiss the
+//!    window — the client stays resident in the menu bar and the service keeps
+//!    running; only the menu-bar "Quit & Stop Background Service" tears it down.
 //!
 //! None of this runs in development — `scripts/tauri-dev.sh` keeps using Docker
 //! Postgres + a natively-built engine, and [`launch`] short-circuits on
@@ -91,8 +95,8 @@ impl GatewayService {
     /// Stop the gateway, then the engines it spawned, then the embedded Postgres
     /// cluster. Best-effort; logs failures.
     ///
-    /// This is the PERMANENT-stop teardown — "Quit Lucidos" (`bootout`) and the
-    /// supervised-exit path both route here. It is NOT reached by the gateway's
+    /// This is the PERMANENT-stop teardown — "Quit & Stop Background Service"
+    /// (`bootout`) and the supervised-exit path both route here. It is NOT reached by the gateway's
     /// in-place reload (`execv`, same PID), which deliberately leaves the cluster
     /// running so the re-exec'd image re-adopts it; stopping Postgres here would
     /// break that re-adoption, so the stop lives in this path only.
@@ -155,7 +159,8 @@ fn embedded_pg_stop_command(pg_bin: &Path, pg_lib: &Path, data: &Path) -> Comman
 
 /// SIGUSR1 every workspace engine the gateway spawned (pidfiles under
 /// `<app-data>/workspaces/<id>/.lucidos/engine.pid`). Used on a full service stop
-/// ("Quit Lucidos"); the gateway leaves them running on its own SIGUSR1 so they
+/// ("Quit & Stop Background Service"); the gateway leaves them running on its own
+/// SIGUSR1 so they
 /// can be re-adopted across a gateway restart, but an explicit stop tears the
 /// whole stack down.
 fn stop_workspace_engines(app_data: &Path) {
@@ -222,8 +227,9 @@ fn bundled_resources(resources: &Path) -> BundledResources {
 
 /// `~/Library/Application Support/<bundle id>` — the same path Tauri's
 /// `app_data_dir()` returns for the client, computed from `$HOME` so the
-/// service role (no `AppHandle`) agrees with the client.
-fn app_data_dir_from_env() -> io::Result<PathBuf> {
+/// service role (no `AppHandle`) agrees with the client. `pub` so the uninstall
+/// command resolves the exact same data dir the service uses.
+pub fn app_data_dir_from_env() -> io::Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| io::Error::other("HOME not set"))?;
     Ok(PathBuf::from(home)
         .join("Library/Application Support")
@@ -604,8 +610,9 @@ pub fn restart_service() -> Result<(), String> {
 }
 
 /// Stop the always-on service entirely (`launchctl bootout`) — the explicit
-/// "Quit Lucidos" path. Removes the agent so it won't respawn; the next GUI
-/// launch re-installs and re-bootstraps it. No-op in development (no service).
+/// "Quit & Stop Background Service" path (menu-bar item / app menu). Removes the
+/// agent so it won't respawn; the next GUI launch re-installs and re-bootstraps
+/// it. No-op in development (no service).
 pub fn stop_service() {
     if tauri::is_dev() {
         return;
@@ -613,6 +620,270 @@ pub fn stop_service() {
     if let Err(e) = bootout_service() {
         eprintln!("[desktop] stop service failed: {e}");
     }
+}
+
+// ── Uninstall (client role) ─────────────────────────────────────────────────
+
+/// Fully remove the bundled Lucidos install from the GUI — modeled on Docker
+/// Desktop's uninstall so a non-developer never needs a terminal. Stops the
+/// background service + embedded Postgres, removes the launchd agent + plist,
+/// deletes the support data (the embedded database + workspaces AND the WKWebView
+/// web storage — localStorage + service worker — only when `delete_data`; the
+/// ephemeral caches/prefs/saved-state always), and moves the running `.app` to
+/// the Trash. Clearing the WebView storage on `delete_data` is what makes a
+/// reinstall start clean (see `support_data_paths` for why a leftover service
+/// worker / `lucidos-last-workspace` wedges the next boot on the picker).
+///
+/// Every step is best-effort + logged and continues on error; failures are
+/// collected. Returns `Ok(())` only when the CRITICAL steps succeeded — booting
+/// out the service (or it not being loaded) AND every attempted support-data
+/// deletion — otherwise `Err` with all collected failures joined. Stopping
+/// engines / Postgres, deleting the plist, and trashing the bundle are
+/// best-effort: their failures are logged + included in any returned `Err`, but
+/// do not on their own fail the uninstall.
+///
+/// Touches ONLY the bundled install's paths (`com.lucidos.app` / `lucidos-app`
+/// under `~/Library`, and the running `.app`) — never the developer dev-setup
+/// dirs (`~/projects/lucidos`, `~/workspaces`, `~/.lucidos`).
+#[cfg(target_os = "macos")]
+pub fn uninstall(app_data: &Path, delete_data: bool) -> Result<(), String> {
+    let mut failures: Vec<String> = Vec::new();
+
+    // (a) Stop per-workspace engines — best-effort + logged internally.
+    stop_workspace_engines(app_data);
+
+    // (b) Stop the embedded Postgres cluster BEFORE deleting its data dir, so no
+    //     running postmaster holds the tree. Best-effort; logs internally.
+    match resource_dir_from_exe() {
+        Ok(resources) => stop_embedded_postgres(&resources, app_data),
+        Err(e) => {
+            eprintln!("[service] uninstall: cannot resolve resources to stop Postgres: {e}")
+        }
+    }
+
+    // (c) Stop + unload the launchd agent (CRITICAL). `bootout` errors when the
+    //     job isn't loaded — that's the goal already met, not a failure — so only
+    //     bootout when it is actually loaded.
+    let bootout_ok = if is_service_loaded() {
+        match bootout_service() {
+            Ok(()) => {
+                eprintln!("[service] uninstall: launchd service booted out");
+                true
+            }
+            Err(e) => {
+                eprintln!("[service] uninstall: bootout failed: {e}");
+                failures.push(format!("stop background service: {e}"));
+                false
+            }
+        }
+    } else {
+        eprintln!("[service] uninstall: launchd service not loaded; nothing to stop");
+        true
+    };
+
+    // (d) Delete the LaunchAgent plist (best-effort) so it can't reload at login.
+    match plist_path() {
+        Ok(plist) => match delete_path(&plist) {
+            Ok(()) => eprintln!("[service] uninstall: removed {}", plist.display()),
+            Err(e) => {
+                eprintln!(
+                    "[service] uninstall: failed to remove {}: {e}",
+                    plist.display()
+                );
+                failures.push(format!("delete {}: {e}", plist.display()));
+            }
+        },
+        Err(e) => {
+            eprintln!("[service] uninstall: cannot resolve plist path: {e}");
+            failures.push(format!("resolve plist path: {e}"));
+        }
+    }
+
+    // (e) Delete the support-data tree (CRITICAL).
+    let mut data_ok = true;
+    match std::env::var_os("HOME") {
+        Some(home) => {
+            for path in support_data_paths(Path::new(&home), app_data, delete_data) {
+                match delete_path(&path) {
+                    Ok(()) => eprintln!("[service] uninstall: removed {}", path.display()),
+                    Err(e) => {
+                        eprintln!(
+                            "[service] uninstall: failed to remove {}: {e}",
+                            path.display()
+                        );
+                        failures.push(format!("delete {}: {e}", path.display()));
+                        data_ok = false;
+                    }
+                }
+            }
+        }
+        None => {
+            eprintln!("[service] uninstall: HOME not set; cannot resolve support-data paths");
+            failures.push("HOME not set; cannot resolve support-data paths".to_string());
+            data_ok = false;
+        }
+    }
+
+    // (f) Move the running .app bundle to the Trash (best-effort) — derived from
+    //     the current exe, so it trashes wherever the app actually lives. Done
+    //     LAST so current_exe() stays valid for the resource resolution above.
+    match std::env::current_exe()
+        .ok()
+        .and_then(|exe| app_bundle_root_from_exe(&exe))
+    {
+        Some(bundle) => match trash_or_remove_bundle(&bundle) {
+            Ok(()) => eprintln!("[service] uninstall: moved app bundle {} to Trash", bundle.display()),
+            Err(e) => {
+                eprintln!("[service] uninstall: failed to remove app bundle: {e}");
+                failures.push(e);
+            }
+        },
+        None => {
+            // Unbundled (e.g. `tauri dev`) — nothing to trash. Not a failure.
+            eprintln!("[service] uninstall: not running from a .app bundle; skipping bundle removal");
+        }
+    }
+
+    if bootout_ok && data_ok {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn uninstall(_app_data: &Path, _delete_data: bool) -> Result<(), String> {
+    Err("Uninstall is only supported on macOS".to_string())
+}
+
+/// The support-data paths the uninstall removes, derived from `$HOME`. The App
+/// Support data dir (the embedded Postgres cluster + all workspaces) AND the
+/// WKWebView web-storage trees (`~/Library/WebKit/<id>`, `~/Library/HTTPStorages/<id>`)
+/// are included ONLY when `delete_data`; the ephemeral caches / preferences /
+/// saved window state are always included. Pure path construction (no IO) so it
+/// is unit-testable against a fake HOME.
+///
+/// The WebKit trees are load-bearing for a clean reinstall: they hold the
+/// embedded WebView's `localStorage` (the device-global `lucidos-last-workspace`
+/// key) and the registered **service worker** + its `CacheStorage`/`IndexedDB`.
+/// Without removing them, a "delete my data" uninstall leaves both behind — on
+/// reinstall the stale `lucidos-last-workspace` drives the cold-start redirect
+/// (index.html) to the now-deleted workspace slug, and the surviving service
+/// worker serves its cached `/<slug>/` shell, so the app boots `<App/>` against a
+/// workspace the gateway 404s and wedges the boot splash instead of reaching the
+/// picker. Both the current (`com.lucidos.app`) and legacy (`lucidos-app`) bundle
+/// names are cleared, mirroring the Caches removal. The keep-data path leaves
+/// them intact: the workspaces survive, so the SW + last-workspace memory are
+/// still valid (and theme/font/scale prefs in `localStorage` are preserved).
+#[cfg(target_os = "macos")]
+fn support_data_paths(home: &Path, app_data: &Path, delete_data: bool) -> Vec<PathBuf> {
+    let library = home.join("Library");
+    let mut paths = Vec::new();
+    if delete_data {
+        // The authoritative data dir (`~/Library/Application Support/<id>`),
+        // passed in so it matches exactly what the service uses.
+        paths.push(app_data.to_path_buf());
+        // The WKWebView web storage (localStorage + service worker +
+        // CacheStorage/IndexedDB). Removing it is what makes a reinstall actually
+        // clean — see the doc comment above. Both bundle names, like Caches.
+        paths.push(library.join("WebKit").join(BUNDLE_IDENTIFIER));
+        paths.push(library.join("WebKit").join("lucidos-app"));
+        // Disk HTTP cache + cookies (may not exist on every machine; delete_path
+        // treats a missing path as success).
+        paths.push(library.join("HTTPStorages").join(BUNDLE_IDENTIFIER));
+        paths.push(library.join("HTTPStorages").join("lucidos-app"));
+        paths.push(
+            library
+                .join("HTTPStorages")
+                .join(format!("{BUNDLE_IDENTIFIER}.binarycookies")),
+        );
+    }
+    paths.push(library.join("Caches").join(BUNDLE_IDENTIFIER));
+    paths.push(library.join("Caches").join("lucidos-app"));
+    paths.push(
+        library
+            .join("Preferences")
+            .join(format!("{BUNDLE_IDENTIFIER}.plist")),
+    );
+    paths.push(
+        library
+            .join("Saved Application State")
+            .join(format!("{BUNDLE_IDENTIFIER}.savedState")),
+    );
+    paths
+}
+
+/// Walk an executable path up to its enclosing `.app` bundle root. A macOS
+/// bundle runs `<bundle>.app/Contents/MacOS/<exe>`, so the bundle is three
+/// parents up. Returns `None` when the exe isn't inside a `.app` (e.g. an
+/// unbundled `tauri dev` / `cargo` binary), so the caller skips bundle removal.
+#[cfg(target_os = "macos")]
+fn app_bundle_root_from_exe(exe: &Path) -> Option<PathBuf> {
+    let bundle = exe.parent()?.parent()?.parent()?;
+    if bundle
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("app"))
+    {
+        Some(bundle.to_path_buf())
+    } else {
+        None
+    }
+}
+
+/// Delete a file or directory tree. A missing path is success (the goal — it's
+/// already gone). Uses `symlink_metadata` so a symlink is removed as a link, not
+/// followed.
+#[cfg(target_os = "macos")]
+fn delete_path(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Move the app bundle to the user's Trash via Finder (recoverable), falling
+/// back to `rm -rf` if the AppleScript path fails.
+#[cfg(target_os = "macos")]
+fn trash_or_remove_bundle(bundle: &Path) -> Result<(), String> {
+    match move_bundle_to_trash(bundle) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!("[service] uninstall: Finder trash failed ({e}); falling back to rm -rf");
+            std::fs::remove_dir_all(bundle)
+                .map_err(|e2| format!("remove app bundle {}: {e2}", bundle.display()))
+        }
+    }
+}
+
+/// `tell application "Finder" to delete POSIX file "<path>"` — moves the bundle
+/// to the Trash so it's recoverable rather than permanently deleted.
+#[cfg(target_os = "macos")]
+fn move_bundle_to_trash(bundle: &Path) -> Result<(), String> {
+    let script = format!(
+        r#"tell application "Finder" to delete POSIX file "{}""#,
+        applescript_escape(&bundle.to_string_lossy())
+    );
+    let out = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map_err(|e| format!("run osascript: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Finder delete failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// Escape a string for embedding inside an AppleScript double-quoted literal.
+#[cfg(target_os = "macos")]
+fn applescript_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 // ── Gateway boot (service role) ─────────────────────────────────────────────
@@ -624,7 +895,8 @@ pub fn stop_service() {
 /// per workspace, and spawns each workspace's engine (by path via
 /// `LUCIDOS_ENGINE_BIN`, inheriting `LUCIDOS_STATIC_DIR` /
 /// `LUCIDOS_SDK_DIR` / `LUCIDOS_BOOT_WITHOUT_PROVIDER` from this env), and
-/// reverse-proxies `/<slug>/`. First run auto-creates a `default` workspace.
+/// reverse-proxies `/<slug>/`. First run creates no workspace — the smart root
+/// serves the picker so the user names their first one.
 /// `LUCIDOS_BOOT_WITHOUT_PROVIDER` lets engines boot before the user has
 /// configured a provider — into a clear no-provider onboarding state, NOT mock
 /// output (see engine main.rs).
@@ -652,6 +924,11 @@ fn spawn_gateway(resources: &Path, app_data: &Path, port: u16) -> io::Result<Gat
         .env("LUCIDOS_SDK_DIR", &bundle.sdk)
         .env("FASTEMBED_CACHE_DIR", &fastembed_cache)
         .env("LUCIDOS_BOOT_WITHOUT_PROVIDER", "1")
+        // Tell the gateway it's a packaged build so the picker hides the dev-only
+        // gateway self-reload control (packaged updates go through the app updater
+        // + a full service restart, not a gateway re-exec). Mirrors the
+        // BOOT_WITHOUT_PROVIDER "I am packaged" signal above.
+        .env("LUCIDOS_PACKAGED", "1")
         .spawn()?;
     Ok(GatewayService { gateway })
 }
@@ -780,5 +1057,109 @@ mod tests {
         assert_eq!(resolve_engine_port(&dir), DEFAULT_ENGINE_PORT);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn support_data_paths_full_wipe_targets_the_bundled_install_only() {
+        // Path construction only — this deletes nothing. A fake HOME proves no
+        // username / absolute path is hardcoded.
+        let home = Path::new("/fake/home");
+        let app_data = Path::new("/fake/home/Library/Application Support/com.lucidos.app");
+        let paths = support_data_paths(home, app_data, true);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/fake/home/Library/Application Support/com.lucidos.app"),
+                // WKWebView web storage (localStorage + service worker +
+                // CacheStorage/IndexedDB) — both bundle names, so a reinstall is clean.
+                PathBuf::from("/fake/home/Library/WebKit/com.lucidos.app"),
+                PathBuf::from("/fake/home/Library/WebKit/lucidos-app"),
+                // Disk HTTP cache + cookies.
+                PathBuf::from("/fake/home/Library/HTTPStorages/com.lucidos.app"),
+                PathBuf::from("/fake/home/Library/HTTPStorages/lucidos-app"),
+                PathBuf::from("/fake/home/Library/HTTPStorages/com.lucidos.app.binarycookies"),
+                PathBuf::from("/fake/home/Library/Caches/com.lucidos.app"),
+                PathBuf::from("/fake/home/Library/Caches/lucidos-app"),
+                PathBuf::from("/fake/home/Library/Preferences/com.lucidos.app.plist"),
+                PathBuf::from(
+                    "/fake/home/Library/Saved Application State/com.lucidos.app.savedState"
+                ),
+            ]
+        );
+        // Never touches the developer dev-setup dirs.
+        for p in &paths {
+            let s = p.to_string_lossy();
+            assert!(!s.contains("/projects/lucidos"), "{s}");
+            assert!(!s.contains("/workspaces"), "{s}");
+            assert!(!s.contains("/.lucidos"), "{s}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn support_data_paths_keep_data_preserves_the_app_support_dir() {
+        let home = Path::new("/fake/home");
+        let app_data = Path::new("/fake/home/Library/Application Support/com.lucidos.app");
+        let paths = support_data_paths(home, app_data, false);
+        // App Support (the database + workspaces) is NOT in the delete set.
+        assert!(!paths.contains(&app_data.to_path_buf()));
+        // Keep-data preserves the workspaces, so the WebView storage (service
+        // worker + last-workspace memory + prefs) must survive with them.
+        for p in &paths {
+            let s = p.to_string_lossy();
+            assert!(!s.contains("/WebKit/"), "{s}");
+            assert!(!s.contains("/HTTPStorages/"), "{s}");
+        }
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/fake/home/Library/Caches/com.lucidos.app"),
+                PathBuf::from("/fake/home/Library/Caches/lucidos-app"),
+                PathBuf::from("/fake/home/Library/Preferences/com.lucidos.app.plist"),
+                PathBuf::from(
+                    "/fake/home/Library/Saved Application State/com.lucidos.app.savedState"
+                ),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn app_bundle_root_from_exe_walks_to_the_dot_app() {
+        let exe = Path::new("/Applications/Lucidos.app/Contents/MacOS/Lucidos");
+        assert_eq!(
+            app_bundle_root_from_exe(exe),
+            Some(PathBuf::from("/Applications/Lucidos.app"))
+        );
+        // Trashes wherever the bundle actually lives, not a hardcoded location.
+        let elsewhere = Path::new("/Users/someone/Desktop/Lucidos.app/Contents/MacOS/Lucidos");
+        assert_eq!(
+            app_bundle_root_from_exe(elsewhere),
+            Some(PathBuf::from("/Users/someone/Desktop/Lucidos.app"))
+        );
+        // An unbundled binary (dev / cargo) has no `.app` root → skip removal.
+        assert_eq!(
+            app_bundle_root_from_exe(Path::new("/usr/local/bin/lucidos")),
+            None
+        );
+        assert_eq!(app_bundle_root_from_exe(Path::new("/lucidos")), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn applescript_escape_escapes_quotes_and_backslashes() {
+        assert_eq!(
+            applescript_escape(r#"/Apps/Weird "Name"\dir/Lucidos.app"#),
+            r#"/Apps/Weird \"Name\"\\dir/Lucidos.app"#
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn delete_path_treats_missing_as_success() {
+        let missing = std::env::temp_dir().join(format!("lucidos-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(delete_path(&missing).is_ok());
     }
 }

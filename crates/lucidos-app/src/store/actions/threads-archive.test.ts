@@ -33,7 +33,7 @@ import { archiveThread } from '../../api/threads';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { drawerOpen } from '../../components/layout/Drawer';
 import { _resetComposeDraftsForTesting } from '../composeDrafts';
-import { ALL_CHANNELS, archivingThreadIds, focusedThreadId, generatedTitleIds, getCurrentThreads, mobileView, resetCodingAgentPendingPreferences, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, toasts } from '../store';
+import { ALL_CHANNELS, archivingThreadIds, drawerView, focusedThreadId, generatedTitleIds, getCurrentThreads, mobileView, resetCodingAgentPendingPreferences, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, threadSearchQuery, threadSearchResults, toasts } from '../store';
 import { upsertThread } from './thread-loading';
 import { handleThreadEvent } from './thread-sync';
 import { focusThread, handleArchiveThread } from './threads';
@@ -88,6 +88,11 @@ beforeEach(() => {
   selectedTriggerIds.value = new Set();
   selectedRepoIds.value = new Set();
   selectedAppIds.value = new Set();
+  // Reset the drawer view + search so the post-archive focus picker defaults to
+  // the full Current list unless a test opts into an alternate view.
+  drawerView.value = 'all';
+  threadSearchQuery.value = '';
+  threadSearchResults.value = { status: 'not-loaded' };
   localStorage.removeItem('lucidos-focused-thread');
 });
 
@@ -379,6 +384,128 @@ describe('handleArchiveThread', () => {
     await handleArchiveThread('focused');
 
     expect(focusedThreadId.value).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handleArchiveThread — respects the active drawer view
+// ---------------------------------------------------------------------------
+// The post-archive focus walks the view the user is *currently looking at*, not
+// always the Current section. Archiving from "Needs attention" lands on the next
+// attention row; from "Review" the next review row; from search the next result.
+// A thread that's in Current but NOT in the active view must be skipped.
+// ---------------------------------------------------------------------------
+
+describe('handleArchiveThread — active drawer view', () => {
+  it('lands on the next Needs-attention thread, skipping a Current-only thread', async () => {
+    // a1 (focused) and a3 both need attention (waiting_for_user_answer). c2 is a
+    // plain Current thread (idle, no CTA) that is NOT in the attention view but
+    // sorts between them in the Current list — so the OLD Current-only picker
+    // would land on c2. In the attention view, archiving a1 must skip c2 and
+    // land on a3.
+    const map = new Map<string, ThreadState>();
+    map.set('a1', makeThreadState('a1', {
+      meta: { id: 'a1', title: 'Attention 1', channel: 'claude_code', updatedAt: '2026-01-01T00:00:03Z', status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
+    }));
+    map.set('c2', makeThreadState('c2', {
+      meta: { id: 'c2', title: 'Current only', channel: 'claude_code', updatedAt: '2026-01-01T00:00:02Z', status: 'idle', messageCount: 1, section: 'inbox' },
+    }));
+    map.set('a3', makeThreadState('a3', {
+      meta: { id: 'a3', title: 'Attention 3', channel: 'claude_code', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
+    }));
+    threadMap.value = map;
+    drawerView.value = 'attention';
+    focusThread('a1');
+
+    await handleArchiveThread('a1');
+
+    expect(focusedThreadId.value).toBe('a3');
+  });
+
+  it('lands on the next Review thread when the review view is active', async () => {
+    // r1 (focused) and r3 are review threads (codingAgentProposed, idle). a2 needs
+    // attention but is NOT in review. In the review view, archiving r1 must skip
+    // a2 and land on r3.
+    const map = new Map<string, ThreadState>();
+    map.set('r1', makeThreadState('r1', {
+      meta: { id: 'r1', title: 'Review 1', channel: 'claude_code', updatedAt: '2026-01-01T00:00:03Z', status: 'idle', codingAgentProposed: true, messageCount: 1, section: 'inbox' },
+    }));
+    map.set('a2', makeThreadState('a2', {
+      meta: { id: 'a2', title: 'Attention 2', channel: 'claude_code', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
+    }));
+    map.set('r3', makeThreadState('r3', {
+      meta: { id: 'r3', title: 'Review 3', channel: 'claude_code', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentProposed: true, messageCount: 1, section: 'inbox' },
+    }));
+    threadMap.value = map;
+    drawerView.value = 'review';
+    focusThread('r1');
+
+    await handleArchiveThread('r1');
+
+    expect(focusedThreadId.value).toBe('r3');
+  });
+
+  it('falls back to the thread above within the attention view', async () => {
+    // a1 (top), a2 (bottom/focused) both need attention. Archiving the last one
+    // falls back to the one above — within the view.
+    const map = new Map<string, ThreadState>();
+    map.set('a1', makeThreadState('a1', {
+      meta: { id: 'a1', title: 'Attention 1', channel: 'claude_code', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
+    }));
+    map.set('a2', makeThreadState('a2', {
+      meta: { id: 'a2', title: 'Attention 2', channel: 'claude_code', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
+    }));
+    threadMap.value = map;
+    drawerView.value = 'attention';
+    focusThread('a2');
+
+    await handleArchiveThread('a2');
+
+    expect(focusedThreadId.value).toBe('a1');
+  });
+
+  it('unfocuses when the attention view has no other thread (a Current-only thread is not offered)', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('a1', makeThreadState('a1', {
+      meta: { id: 'a1', title: 'Attention 1', channel: 'claude_code', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
+    }));
+    map.set('c2', makeThreadState('c2', {
+      meta: { id: 'c2', title: 'Current only', channel: 'claude_code', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', messageCount: 1, section: 'inbox' },
+    }));
+    threadMap.value = map;
+    drawerView.value = 'attention';
+    focusThread('a1');
+
+    await handleArchiveThread('a1');
+
+    expect(focusedThreadId.value).toBeNull();
+  });
+
+  it('walks the search results when a search query is active (overriding the view)', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('s1', makeThreadState('s1', {
+      meta: { id: 's1', title: 'Search 1', channel: 'claude_code', updatedAt: '2026-01-01T00:00:03Z', status: 'waiting', codingAgentProposed: true, messageCount: 1, section: 'inbox' },
+    }));
+    map.set('s2', makeThreadState('s2', {
+      meta: { id: 's2', title: 'Search 2', channel: 'claude_code', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentProposed: true, messageCount: 1, section: 'inbox' },
+    }));
+    threadMap.value = map;
+    // A search query overrides drawerView (mirrors ThreadDrawer's activeView):
+    // the next focus follows the result order, not the Current section.
+    drawerView.value = 'all';
+    threadSearchQuery.value = 'foo';
+    threadSearchResults.value = {
+      status: 'loaded',
+      data: [
+        { thread_id: 's1' } as any,
+        { thread_id: 's2' } as any,
+      ],
+    };
+    focusThread('s1');
+
+    await handleArchiveThread('s1');
+
+    expect(focusedThreadId.value).toBe('s2');
   });
 });
 

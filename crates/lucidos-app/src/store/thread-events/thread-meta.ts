@@ -351,14 +351,22 @@ export const recencyKey = (t: ThreadState): string =>
 export const byRecent = (a: ThreadState, b: ThreadState): number =>
   recencyKey(b).localeCompare(recencyKey(a));
 
+/** Creation-time key for drawer ordering: the immutable creation timestamp, so
+ *  the row never moves once created (no reshuffle from agent churn). Falls back
+ *  to `updatedAt` only for skeleton rows that haven't received a `createdAt` yet
+ *  (the backend always sends one for real threads). The Current AND Archive
+ *  sections order by this — and `loadOlderThreads` pages the Archive by the same
+ *  key, so the pagination cursor and the display sort stay coherent. */
+export const createdKey = (t: ThreadState): string =>
+  t.meta.createdAt || t.meta.updatedAt;
+
 /** Sort threads by creation time descending (newest created first). The drawer's
- *  Current section orders by this so the list stays stable: a thread holds its
- *  position regardless of agent churn or attention state — the attention/drafts
- *  filter icons surface those subsets instead of reshuffling the list. Falls
- *  back to `updatedAt` only for skeleton rows that haven't received a
- *  `createdAt` yet (the backend always sends one for real threads). */
+ *  Current and Archive sections order by this so the list stays stable: a thread
+ *  holds its position regardless of agent churn or attention state — the
+ *  attention/drafts filter icons surface those subsets instead of reshuffling
+ *  the list, and the displayed date (createdAt) matches the sort. */
 export const byCreated = (a: ThreadState, b: ThreadState): number =>
-  (b.meta.createdAt || b.meta.updatedAt).localeCompare(a.meta.createdAt || a.meta.updatedAt);
+  createdKey(b).localeCompare(createdKey(a));
 
 /** Threads whose compose state hides them from every drawer section: composing
  *  drafts live in the compose pane / Drafts surface, and discarded threads

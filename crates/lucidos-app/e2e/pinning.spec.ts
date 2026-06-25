@@ -1,10 +1,10 @@
 import { test, expect } from './fixtures';
 import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, ensureOnThreadPane, waitForVisibleInput } from './helpers';
 
-const SAVE_BTN = 'button[aria-label="Save thread"]:visible';
-const UNSAVE_BTN = 'button[aria-label="Remove thread from Saved section"]:visible';
+const SAVE_BTN = 'button[aria-label="Pin thread"]:visible';
+const UNSAVE_BTN = 'button[aria-label="Remove thread from Pinned section"]:visible';
 
-test.describe('Thread save (formerly pin)', () => {
+test.describe('Thread pin', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
   });

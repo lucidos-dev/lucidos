@@ -169,7 +169,7 @@ function StatCard({
 }
 
 function StatusBadge({ row }: { row: WorktreeRow }) {
-  if (row.is_saved) return <span class="label" data-tooltip="Saved threads are exempt from auto-cleanup">Saved</span>;
+  if (row.is_saved) return <span class="label" data-tooltip="Pinned threads are exempt from auto-cleanup">Pinned</span>;
   if (row.is_dirty) return <span class="label channel-error" data-tooltip="Worktree has uncommitted changes">Dirty</span>;
   return <span class="label" data-tooltip="No uncommitted changes; safe to remove">Clean</span>;
 }

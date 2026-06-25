@@ -111,6 +111,11 @@ export function openWorkspace(id: string): void {
 export interface GatewayStatus {
   build_id: string;
   update_available: boolean;
+  /** True under the packaged desktop runtime. The picker hides the dev-only
+   *  gateway self-reload control when set (packaged updates go through the app
+   *  updater + a full service restart, not a gateway re-exec). Absent on an older
+   *  gateway → treated as dev (control shown). */
+  packaged?: boolean;
 }
 
 /** Build id of the running gateway + whether a newer binary is on disk (the dev

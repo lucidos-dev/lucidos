@@ -10,7 +10,7 @@ import { CheckIcon, ReloadIcon } from '../shared/icons';
 import { fetchWorkspaces } from '../../api/client';
 import type { WorkspaceInfo } from '../../api/client';
 import { listWorkspaces, openWorkspace, type WorkspaceStatus } from '../../api/client/control';
-import { WORKSPACE_ID } from '../../utils/basePath';
+import { WORKSPACE_ID, gatewayPickerHref } from '../../utils/basePath';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { Overlay } from '../shared/Overlay';
@@ -150,10 +150,17 @@ function closeControlPanel(): void {
 }
 
 function ManageWorkspacesItem() {
-  // `?pick` suppresses the picker's auto-open-last-workspace so this link always
-  // lands on the list (see WorkspacePicker `autoOpening`).
+  // The gateway picker lives at `/~/` (ADR 0014). Behind the gateway that's a
+  // relative same-origin route; on a direct engine-port page the gateway is a
+  // different origin, so `gatewayPickerHref` builds an absolute URL from the
+  // engine-stamped gateway port. `?pick` suppresses the picker's
+  // auto-open-last-workspace so this link always lands on the list (see
+  // WorkspacePicker `autoOpening`). No href ⇒ no gateway (legacy no-gateway
+  // engine) ⇒ no picker to link to ⇒ render nothing.
+  const href = gatewayPickerHref();
+  if (href === null) return null;
   return (
-    <a class="control-panel-workspace-row control-panel-manage-row accent-link" href="/~/?pick">
+    <a class="control-panel-workspace-row control-panel-manage-row accent-link" href={href}>
         <span class="control-panel-ws-name">Manage workspaces</span>
     </a>
   );

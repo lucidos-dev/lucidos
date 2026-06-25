@@ -68,28 +68,30 @@ async fn get_older_threads_resolves_parent_title() {
     teardown_test_db(&db).await;
 }
 
-/// The drawer sorts by `last_user_action`, NOT `last_activity` — so a thread the
-/// agent churned on more recently must still sort BELOW one the user touched more
-/// recently. This is the core of the "stop background agent churn reshuffling my
-/// list" change. `churned` has the newer last_activity but older last_user_action;
-/// `acted` is the opposite. Expected order: acted, then churned.
+/// The Saved section sorts by `last_user_action`, NOT `last_activity` — so a
+/// thread the agent churned on more recently must still sort BELOW one the user
+/// touched more recently. This is the "stop background agent churn reshuffling my
+/// list" guarantee, which now lives on the Saved query (`get_saved_threads`);
+/// Current + Archive moved to `created_at` (see the archive-window /
+/// `get_older_threads` tests below). `churned` has the newer last_activity but
+/// older last_user_action; `acted` is the opposite. Expected: acted, then churned.
 #[tokio::test]
-async fn get_recent_threads_sorts_by_last_user_action_not_last_activity() {
+async fn get_saved_threads_sorts_by_last_user_action_not_last_activity() {
     let (pool, db) = setup_test_db().await;
     let store = EventStore::new(pool.clone());
 
     let churned = Uuid::new_v4();
     let acted = Uuid::new_v4();
-    // churned: agent streamed 1 min ago, but the user last acted 1 day ago.
-    // acted:   user typed 1 hour ago, agent silent since (last_activity also 1h).
+    // Both saved. churned: agent streamed 1 min ago, user last acted 1 day ago.
+    // acted: user typed 1 hour ago, agent silent since.
     sqlx::query(
         "INSERT INTO thread_summaries \
-             (thread_id, title, source, message_count, has_response, archive_state, \
+             (thread_id, title, source, message_count, has_response, is_saved, \
               last_activity, last_user_action, last_agent_action) \
          VALUES \
-             ($1, 'Churned', 'claude_code', 1, TRUE, 'archived', \
+             ($1, 'Churned', 'claude_code', 1, TRUE, TRUE, \
               NOW() - INTERVAL '1 minute', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 minute'), \
-             ($2, 'Acted',   'chat',        1, TRUE, 'archived', \
+             ($2, 'Acted',   'chat',        1, TRUE, TRUE, \
               NOW() - INTERVAL '1 hour',   NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour')",
     )
     .bind(churned)
@@ -98,11 +100,8 @@ async fn get_recent_threads_sorts_by_last_user_action_not_last_activity() {
     .await
     .expect("insert thread_summaries");
 
-    let recent = store
-        .get_recent_threads(15)
-        .await
-        .expect("get_recent_threads");
-    let order: Vec<&str> = recent.iter().map(|t| t.thread_id.as_str()).collect();
+    let saved = store.get_saved_threads().await.expect("get_saved_threads");
+    let order: Vec<&str> = saved.iter().map(|t| t.thread_id.as_str()).collect();
     let acted_s = acted.to_string();
     let churned_s = churned.to_string();
     let acted_pos = order.iter().position(|id| *id == acted_s).expect("acted present");
@@ -113,7 +112,107 @@ async fn get_recent_threads_sorts_by_last_user_action_not_last_activity() {
     assert!(
         acted_pos < churned_pos,
         "the recently-USER-acted thread must sort above the recently-AGENT-churned one \
-         (last_user_action drives the order, not last_activity); got {order:?}"
+         (last_user_action drives the Saved order, not last_activity); got {order:?}"
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// The per-source Archive window (`get_recent_threads`' `ROW_NUMBER`) selects the
+/// newest-`created_at` per source — the SAME axis the drawer's Archive section
+/// sorts and `get_older_threads` pages by, so the window/page seam is gap-free.
+/// With `per_source=1` and two archived threads where created_at diverges from
+/// BOTH last_user_action and last_activity, only the newest-CREATED one makes the
+/// cut. (Pre-fix the window ordered by last_user_action, which would have kept the
+/// other one — the thread the user touched later but created earlier.)
+#[tokio::test]
+async fn get_recent_threads_archive_window_selects_by_created_at() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let newest_created = Uuid::new_v4(); // created last, never touched again
+    let touched_later = Uuid::new_v4(); // created first, but user acted later
+    // Same source + both archived idle, so only the rn<=per_source window decides
+    // inclusion. created_at is the ONLY axis under which `newest_created` wins.
+    sqlx::query(
+        "INSERT INTO thread_summaries \
+             (thread_id, title, source, message_count, has_response, archive_state, \
+              created_at, last_user_action, last_activity) \
+         VALUES \
+             ($1, 'Newest created', 'chat', 1, TRUE, 'archived', \
+              TIMESTAMPTZ '2026-06-20 00:00:00Z', TIMESTAMPTZ '2026-06-11 00:00:00Z', TIMESTAMPTZ '2026-06-12 00:00:00Z'), \
+             ($2, 'Touched later',  'chat', 1, TRUE, 'archived', \
+              TIMESTAMPTZ '2026-06-10 00:00:00Z', TIMESTAMPTZ '2026-06-25 00:00:00Z', TIMESTAMPTZ '2026-06-26 00:00:00Z')",
+    )
+    .bind(newest_created)
+    .bind(touched_later)
+    .execute(&pool)
+    .await
+    .expect("insert thread_summaries");
+
+    let recent = store.get_recent_threads(1).await.expect("get_recent_threads");
+    let returned: std::collections::HashSet<&str> =
+        recent.iter().map(|t| t.thread_id.as_str()).collect();
+    assert!(
+        returned.contains(newest_created.to_string().as_str()),
+        "the newest-CREATED archived thread must be in the per-source window; got {} entries",
+        recent.len()
+    );
+    assert!(
+        !returned.contains(touched_later.to_string().as_str()),
+        "the earlier-created thread must fall outside the window even though its \
+         last_user_action / last_activity are newer (window orders by created_at)"
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// `get_older_threads` pages the Archive by `created_at` (cursor filter + order),
+/// matching the drawer's Archive display sort so a recently-created-but-stale
+/// thread can't page in late and go missing from the top. With three archived
+/// threads whose created_at diverges from last_user_action, a `created_at` cursor
+/// returns exactly the older-CREATED ones, newest-created first. (Pre-fix the
+/// cursor filtered/ordered by last_user_action — a different, wrong set.)
+#[tokio::test]
+async fn get_older_threads_pages_by_created_at() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let after_cursor = Uuid::new_v4(); // created_at Jun 20 — newer than the cursor
+    let mid = Uuid::new_v4(); //          created_at Jun 15 — older than the cursor
+    let oldest = Uuid::new_v4(); //       created_at Jun 10 — older than the cursor
+    sqlx::query(
+        "INSERT INTO thread_summaries \
+             (thread_id, title, source, message_count, has_response, archive_state, \
+              created_at, last_user_action) \
+         VALUES \
+             ($1, 'After',  'chat', 1, TRUE, 'archived', TIMESTAMPTZ '2026-06-20 00:00:00Z', TIMESTAMPTZ '2026-06-05 00:00:00Z'), \
+             ($2, 'Mid',    'chat', 1, TRUE, 'archived', TIMESTAMPTZ '2026-06-15 00:00:00Z', TIMESTAMPTZ '2026-06-25 00:00:00Z'), \
+             ($3, 'Oldest', 'chat', 1, TRUE, 'archived', TIMESTAMPTZ '2026-06-10 00:00:00Z', TIMESTAMPTZ '2026-06-12 00:00:00Z')",
+    )
+    .bind(after_cursor)
+    .bind(mid)
+    .bind(oldest)
+    .execute(&pool)
+    .await
+    .expect("insert thread_summaries");
+
+    // Cursor at Jun 18 (created_at). created_at < Jun18 → {mid, oldest}, ordered
+    // created_at DESC → [mid, oldest]. `after_cursor` (created Jun 20) is excluded.
+    // A last_user_action cursor would instead return {after_cursor, oldest}.
+    let before = chrono::DateTime::parse_from_rfc3339("2026-06-18T00:00:00Z")
+        .expect("parse cursor")
+        .with_timezone(&chrono::Utc);
+    let older = store
+        .get_older_threads(before, 15, None, None, None, None)
+        .await
+        .expect("get_older_threads");
+    let order: Vec<&str> = older.iter().map(|t| t.thread_id.as_str()).collect();
+
+    assert_eq!(
+        order,
+        vec![mid.to_string(), oldest.to_string()],
+        "older page must be created_at < cursor, ordered created_at DESC; got {order:?}"
     );
 
     teardown_test_db(&db).await;

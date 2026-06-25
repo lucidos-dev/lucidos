@@ -167,9 +167,16 @@ export async function getThreadCcDiff(threadId: string): Promise<ThreadCcDiff> {
   return json(`${API}/threads/${encodeURIComponent(threadId)}/cc-diff`);
 }
 
-export async function getChangeFileContent(changeId: string, path: string): Promise<string> {
+/** URL of the full "after" version of a file in a change. Served with a
+ *  content-type inferred from the extension, so a binary-media preview can
+ *  point an <img>/<video>/<audio>/<iframe> `src` at it. */
+export function changeFileUrl(changeId: string, path: string): string {
   const params = new URLSearchParams({ path });
-  return text(`${API}/changes/${encodeURIComponent(changeId)}/file?${params}`);
+  return `${API}/changes/${encodeURIComponent(changeId)}/file?${params}`;
+}
+
+export async function getChangeFileContent(changeId: string, path: string): Promise<string> {
+  return text(changeFileUrl(changeId, path));
 }
 
 export async function getRepoChanges(repoId: string, limit?: number, before?: number): Promise<RepoChangesState> {

@@ -551,6 +551,15 @@ pub(crate) fn format_exit_status(
     }
 }
 
+/// Grace a cancelled CC process group gets to tear itself down (SIGTERM) before
+/// the engine force-kills it (SIGKILL). Sized for a Playwright runner in the tree
+/// to close the browsers it tracks — those `setsid`-escape the group, so only the
+/// runner's own teardown reaps them; a bare SIGKILL orphaned them (the 2026-06-24
+/// WebKit pile-up). Runs in the detached `driver_task`, off the cancel UX path,
+/// so the wait costs no interactive latency. See
+/// `spawn_env::graceful_kill_child_process_group`.
+const GROUP_TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Drive the CC process: forward stdout → events_tx, input/control → stdin,
 /// and react to cancellation. Always emits `AgentEvent::Exited` (best-effort)
 /// before returning so consumers can distinguish a clean close from a panic.
@@ -721,13 +730,18 @@ async fn driver_task(
     }
 
     // Deliberate teardown: tear down the whole process group (CC + every
-    // descendant it spawned — Bash tools, cargo/rustc) so nothing is left
-    // orphaned holding the stdout pipe. Only while the child is unreaped — see
-    // `signal_child_process_group`'s pid-recycle caveat.
+    // descendant it spawned — Bash tools, cargo/rustc, an e2e Playwright runner)
+    // so nothing is left orphaned holding the stdout pipe. Graceful-first: SIGTERM
+    // the group + a short grace so a Playwright runner can close the browsers it
+    // tracks (they `setsid`-escape the group and can't be reached directly — only
+    // its own teardown reaps them), THEN SIGKILL. A bare SIGKILL orphaned those
+    // browsers (the 2026-06-24 WebKit pile-up). Only while the child is unreaped —
+    // see `signal_child_process_group`'s pid-recycle caveat.
     #[cfg(unix)]
     if !child_reaped {
         if let Some(pid) = child_pid {
-            crate::runtime::spawn_env::signal_child_process_group(pid, libc::SIGKILL);
+            crate::runtime::spawn_env::graceful_kill_child_process_group(pid, GROUP_TEARDOWN_GRACE)
+                .await;
         }
     }
 

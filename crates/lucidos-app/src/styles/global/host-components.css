@@ -263,8 +263,9 @@ html[data-theme="dark"] .split-button.open::before {
 
 .dropdown-trigger:focus-visible {
     color: var(--text-primary);
-    outline: 0.125rem solid var(--accent);
-    outline-offset: 0.125rem;
+    /* Shared --focus-ring — matches .action-btn / .icon-btn. */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
 }
 
 .dropdown-trigger:disabled {
@@ -493,8 +494,9 @@ html[data-theme="dark"] .split-button.open::before {
 }
 
 .dropdown-input-wrap:focus-within {
-    outline: 0.125rem solid var(--accent);
-    outline-offset: 0.125rem;
+    /* Shared --focus-ring — matches .action-btn / .icon-btn. */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
 }
 
 .dropdown-input-wrap .dropdown-chevron {

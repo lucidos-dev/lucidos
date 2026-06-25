@@ -17,6 +17,10 @@ const BACKFILL_TRIGGER_ID_FROM_EVENTS_MARKER: &str = "backfill_trigger_id_from_e
 /// successfully so subsequent boots skip the `changes` scan.
 const BACKFILL_REPO_NAMES_FROM_CHANGES_MARKER: &str = "backfill_repo_names_from_changes_done";
 
+/// Preference marker: set after `backfill_cc_repo_id_to_deterministic` runs
+/// successfully so subsequent boots don't re-point thread bindings.
+const BACKFILL_CC_REPO_ID_DETERMINISTIC_MARKER: &str = "backfill_cc_repo_id_to_deterministic_done";
+
 /// Two-state initiator stored in the `thread_summaries.initiator` text column
 /// and exposed on `ThreadSummary` for the frontend (`'user' | 'system'`).
 ///

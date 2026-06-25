@@ -69,6 +69,14 @@ html {
        theme block's bare `html` selector (0,0,1) and clobber the override. */
     --brand-blue: #1a6fd0;
     --brand-blue-deep: #0a4ea8;
+
+    /* Focus ring — the single soft accent band shared by every focusable button
+       (.action-btn, .icon-btn, dropdowns, question options, …). `--accent` is
+       resolved per theme at use time, so one definition covers both. The
+       transparent outline each rule keeps alongside this is the forced-colors
+       fallback. Redefine --focus-ring on a context (e.g. the blue app header)
+       to recolor the ring there without touching every button rule. */
+    --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 /* Dark theme (default) */
@@ -131,6 +139,9 @@ html, html[data-theme="dark"] {
        slab against the near-black app), without sinking into murky navy. Light
        foreground stays legible on it. */
     --header-gradient: linear-gradient(180deg, #15549e 0%, #0b3868 100%);
+    /* Reclaimed macOS title-bar band (.titlebar-strip) — solid = the gradient's
+       TOP stop above, so the strip is seamless with the header's top edge. */
+    --titlebar-strip-bg: #15549e;
 }
 
 /* Light theme */
@@ -183,6 +194,9 @@ html[data-theme="light"] {
     /* Header bar — vivid brand blue on the white app (deep-navy dark-mode
        variant is in the dark theme block above). */
     --header-gradient: linear-gradient(180deg, var(--brand-blue) 0%, var(--brand-blue-deep) 100%);
+    /* Reclaimed macOS title-bar band (.titlebar-strip) — solid = the gradient's
+       TOP stop above (--brand-blue), so the strip is seamless with the header. */
+    --titlebar-strip-bg: var(--brand-blue);
 }
 
 button,

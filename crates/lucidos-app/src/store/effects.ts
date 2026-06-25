@@ -81,8 +81,10 @@ effect(() => {
 });
 
 // Reset transient preview toggles whenever the previewed file changes (or the
-// preview closes): inline edit mode AND the diff-vs-whole-file view, so each new
-// diff opens on the hunks (the diff is the default). Restore-from-history
+// preview closes): inline edit mode AND the diff whole-file *override*. Clearing
+// the override to `null` re-derives each new diff's default from file status (see
+// `diffWholeFileEffective`: added → whole file, otherwise the hunks) instead of
+// dragging the prior file's explicit toggle along. Restore-from-history
 // (navigation.restoreState) sets panelOverlay directly without going through
 // openFilePreview, so resetting here — keyed on the previewed path — covers every
 // entry point, not just the click path. Both signals are non-persisted, so even
@@ -93,7 +95,7 @@ effect(() => {
   if (path !== lastPreviewFile) {
     lastPreviewFile = path;
     filePreviewEditing.value = false;
-    diffWholeFile.value = false;
+    diffWholeFile.value = null;
   }
 });
 

@@ -45,3 +45,4 @@ Keep entries scannable. A decision log nobody reads is just more drift.
 - [0013 — Multi-workspace via a workspace gateway: one reverse-proxy fronts N always-on per-workspace engine stacks, addressed by path prefix](0013-multi-workspace-gateway.md) *(refined by 0014: standalone gateway crate, `/<workspace>` prefix, shared Postgres cluster, engine-served frontend)*
 - [0014 — Multi-workspace redesign: standalone gateway crate, `/<workspace>` path prefix, shared Postgres cluster, engine-served frontend](0014-multi-workspace-redesign.md)
 - [0015 — Restore lives in the workspace picker: local-file only, run via the engine `restore-archive` subcommand](0015-restore-in-the-workspace-picker.md)
+- [0016 — Packaged Tauri e2e is a boot smoke test, not UI automation (no WebDriver for macOS WKWebView)](0016-packaged-tauri-e2e-boot-smoke-test.md)

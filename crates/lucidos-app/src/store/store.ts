@@ -77,13 +77,15 @@ export const previewFile = computed(() => {
 /** When true, file preview shows raw source instead of rendered output (for md, html, csv, svg). */
 export const filePreviewSource = signal(localStorage.getItem('lucidos-file-preview-source') === 'true');
 
-/** When true, a diff preview shows the whole file in its merged end state instead
- *  of the unified hunks. Orthogonal to filePreviewSource (which still toggles
- *  source-vs-rendered within the whole-file view). Transient, default off (the
- *  diff is the default) and reset back to the diff whenever the previewed file
- *  changes (see store/effects.ts) so each new diff opens on the hunks — like
+/** User override for the diff whole-file toggle. `null` = no explicit choice, so
+ *  the effective view defaults by file status (see `diffWholeFileEffective`):
+ *  added files open as the whole file, everything else on the unified hunks.
+ *  `true`/`false` = the user toggled the header button. Orthogonal to
+ *  filePreviewSource (which still toggles source-vs-rendered within the whole-file
+ *  view). Transient, reset to `null` whenever the previewed file changes (see
+ *  store/effects.ts) so each new diff re-derives its default — like
  *  filePreviewEditing, NOT persisted across diffs or reloads. */
-export const diffWholeFile = signal(false);
+export const diffWholeFile = signal<boolean | null>(null);
 
 /** When true, the data-file preview shows an editable textarea instead of the
  *  rendered/source view. Reset to false whenever the previewed file changes
@@ -925,6 +927,27 @@ export function parseRepoPath(encoded: string): { repoId: string; mode: 'file' |
   }
   return null;
 }
+
+/** Effective whole-file view state for the current diff preview. Resolves the
+ *  `diffWholeFile` user override against a per-file default: an *added* file
+ *  defaults to the whole-file (regular) view since its diff is 100% additions —
+ *  rendering it as unified hunks just prefixes every line with `+`. Modified and
+ *  deleted files default to the hunks. An explicit header toggle writes a boolean
+ *  to `diffWholeFile`, which then wins until the previewed file changes (the reset
+ *  in store/effects.ts puts it back to `null`). Derived from file status rather
+ *  than stamped at open time so it stays correct after a reload, where `repoDiff`
+ *  re-populates asynchronously under a nav-restored overlay. */
+export const diffWholeFileEffective = computed<boolean>(() => {
+  const override = diffWholeFile.value;
+  if (override !== null) return override;
+  const encoded = previewFile.value;
+  if (!encoded) return false;
+  const parsed = parseRepoPath(encoded);
+  if (!parsed || parsed.mode !== 'diff') return false;
+  const diff = repoDiff.value;
+  if (diff.status !== 'loaded') return false;
+  return diff.data.files.find(f => f.path === parsed.path)?.status === 'added';
+});
 
 // --- Claude Code ---
 /** Change IDs currently being applied through conflict resolution or hardening revival.

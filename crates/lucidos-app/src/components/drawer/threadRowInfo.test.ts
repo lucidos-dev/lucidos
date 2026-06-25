@@ -58,6 +58,24 @@ describe('threadRowTooltip', () => {
     expect(byLabel(rows, 'Status')?.value).toBe('Running');
     expect(byLabel(rows, 'Status')?.tone).toBe('running');
   });
+
+  it('reads "Waiting" when idle with active children (matches the status dot)', () => {
+    const rows = threadRowTooltip({ ...base, activeChildrenCount: 2 } as ThreadMeta, 'idle');
+    expect(byLabel(rows, 'Status')?.value).toBe('Waiting');
+    expect(byLabel(rows, 'Status')?.tone).toBe('waiting');
+  });
+
+  it('lets the thread\'s own running state win over active children', () => {
+    const rows = threadRowTooltip({ ...base, activeChildrenCount: 2 } as ThreadMeta, 'running');
+    expect(byLabel(rows, 'Status')?.value).toBe('Running');
+    expect(byLabel(rows, 'Status')?.tone).toBe('running');
+  });
+
+  it('reads "Waiting for you" when paused on a question', () => {
+    const rows = threadRowTooltip(base, 'waiting_for_user_answer');
+    expect(byLabel(rows, 'Status')?.value).toBe('Waiting for you');
+    expect(byLabel(rows, 'Status')?.tone).toBe('waiting');
+  });
 });
 
 describe('draftRowTooltip', () => {

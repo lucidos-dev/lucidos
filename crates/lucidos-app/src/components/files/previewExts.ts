@@ -2,11 +2,36 @@
 // path (markdown, slides, csv, html, svg) instead of raw text/diff.
 export const RENDERABLE_EXTS = ['md', 'html', 'htm', 'csv', 'svg', 'slides'];
 
+// Binary-media extensions both file viewers render via a URL-pointed element
+// (<img>/<video>/<audio>/<iframe>), never by fetching the bytes as text. SVG is
+// deliberately NOT here — it's XML, so it gets the rich/source text path
+// (RENDERABLE_EXTS) and only FilePreviewInline shows it as an <img> by default.
+export const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'bmp'];
+// .ogg is treated as audio (Vorbis/Opus is by far the most common modern usage);
+// .ogv is the video variant. Listing 'ogg' in both video and audio caused
+// double-render of <video> and <audio> for the same file.
+export const VIDEO_EXTS = ['mp4', 'webm', 'ogv', 'mov'];
+export const AUDIO_EXTS = ['mp3', 'wav', 'ogg', 'flac', 'm4a'];
+
+/** How a file extension should be previewed. `'text'` is the default
+ *  (syntax-highlighted source / rich render) — it covers SVG and every
+ *  extensionless or unknown-but-textual repo file (Makefile, LICENSE, …), so
+ *  callers must never gate the text path on a known-extension allow-list. The
+ *  binary kinds are diverted to a URL-pointed media element instead. */
+export type PreviewMediaKind = 'image' | 'video' | 'audio' | 'pdf' | 'text';
+export function previewMediaKind(ext: string): PreviewMediaKind {
+  if (IMAGE_EXTS.includes(ext)) return 'image';
+  if (VIDEO_EXTS.includes(ext)) return 'video';
+  if (AUDIO_EXTS.includes(ext)) return 'audio';
+  if (ext === 'pdf') return 'pdf';
+  return 'text';
+}
+
 // Extensions FilePreviewInline treats as text — shown as syntax-highlighted
 // source (or the rendered view for the RENDERABLE_EXTS subset) and editable
 // inline. Excludes binary previews (image / pdf / audio / video).
 export const TEXT_EXTS = [
-  'txt', 'md', 'json', 'csv', 'js', 'ts', 'jsx', 'tsx', 'css', 'html', 'xml',
+  'txt', 'md', 'json', 'csv', 'js', 'gs', 'ts', 'jsx', 'tsx', 'css', 'html', 'xml',
   'py', 'rb', 'go', 'rs', 'java', 'kt', 'kts', 'c', 'cpp', 'h', 'sh', 'bash', 'zsh',
   'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf', 'log', 'sql', 'graphql',
   'vue', 'svelte', 'slides',

@@ -5,7 +5,8 @@ import { getPreferences, setPreference } from '../../api/client';
 import { getDeviceId } from './devices';
 import { errorDetail } from '../../utils/errorDetail';
 import { REASONING_LEVELS, clampReasoningEffort, DEFAULT_CHAT_MODEL } from '../models';
-import { isIOS } from '../../utils/platform';
+import { isIOS, isTauri } from '../../utils/platform';
+import { setTitlebarColor } from '../../utils/tauri';
 
 export type Theme = 'light' | 'dark' | 'system';
 export type FontFamily = 'monospace' | 'system' | 'inter' | 'jetbrains-mono' | 'ibm-plex-mono';
@@ -151,6 +152,19 @@ export function applyTheme(theme: Theme): void {
   }
 
   document.documentElement.style.colorScheme = resolved;
+
+  // Tauri (packaged macOS): match the reclaimed title-bar band's behind-the-
+  // webview fallback (the window background) to the in-app header — the
+  // header-gradient top stop per theme (mirrors --header-gradient in
+  // styles/global/base.css, like the --bg-primary literal above; the visible
+  // band itself is the CSS .titlebar-strip). Best-effort and cosmetic: it runs
+  // whenever the theme is applied (incl. startup / system-theme changes) with no
+  // user-facing surface, and a failed call self-heals on the next applyTheme, so
+  // a toast would be wrong.
+  if (isTauri()) {
+    const titlebar = resolved === 'light' ? '#1a6fd0' : '#15549e';
+    setTitlebarColor(titlebar).catch((e) => console.warn('[titlebar] tint failed', e));
+  }
 
   syncSystemThemeListener(theme);
   lastAppliedTheme = theme;
@@ -318,12 +332,13 @@ export function setLocalBaseUrl(url: string): Promise<void> {
 
 // --- Capture context ---
 
-/** Per-step ContextAssembled capture toggle. Defaults to true (on). */
+/** Per-step ContextAssembled capture toggle. Defaults to false (off) — the
+ *  debugging capture ships dark; only an explicit `'true'` opts in. */
 export function currentCaptureContext(): boolean {
-  if (preferences.value.status !== 'loaded') return true;
+  if (preferences.value.status !== 'loaded') return false;
   const raw = preferences.value.data['capture_context'];
-  if (raw == null) return true;
-  return raw !== 'false';
+  if (raw == null) return false;
+  return raw === 'true';
 }
 
 export function setCaptureContext(enabled: boolean): Promise<void> {

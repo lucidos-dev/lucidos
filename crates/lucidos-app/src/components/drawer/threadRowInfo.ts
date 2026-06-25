@@ -1,6 +1,7 @@
 import type { ThreadMeta, ComposeChannelMode } from '../../store/thread-events';
 import type { Scope } from '../../store/store';
 import type { ThreadStatus } from '../../generated/thread-lifecycle';
+import { resolveVisualStatus, type VisualStatus } from '../shared/ThreadStatusIcon';
 import { appIdFromFolder } from '../../utils/appIdFromFolder';
 import { formatChannel } from '../../utils/formatChannel';
 import { formatTimeAgo } from '../../utils/formatTime';
@@ -57,30 +58,27 @@ export interface TooltipRow {
   tone?: StatusTone;
 }
 
-/** Human-readable status word for the tooltip. A pending change reads as
- *  "Changes ready" (more useful than the underlying 'idle' status), but only
- *  when the loop isn't mid-stream. */
-function statusWord(status: ThreadStatus, codingAgentProposed: boolean): string {
-  if (status === 'running') return 'Running';
-  if (codingAgentProposed) return 'Changes ready';
-  switch (status) {
-    case 'waiting_for_user_answer': return 'Waiting for you';
-    case 'failed': return 'Failed';
-    case 'idle': return 'Idle';
-    default: return status;
-  }
-}
-
-/** Status dot tone, kept in lockstep with `statusWord` above. */
-function statusTone(status: ThreadStatus, codingAgentProposed: boolean): StatusTone {
-  if (status === 'running') return 'running';
-  if (codingAgentProposed) return 'changes';
-  switch (status) {
-    case 'waiting_for_user_answer': return 'waiting';
-    case 'failed': return 'failed';
-    default: return 'idle';
-  }
-}
+/** Card word + tone for each resolved `VisualStatus`. The card derives its
+ *  Status row from the SAME `resolveVisualStatus` that paints the row's dot (and
+ *  the dot's own hover tooltip), so the word can never contradict the dot — the
+ *  bug this replaced: a thread idle-but-waiting-on-children read "Idle" here
+ *  while the dot said "Waiting". The wording is intentionally a touch more
+ *  conversational than the dot's terse `STATUS_INFO` labels ("Changes ready" vs
+ *  "Changes to review", "Waiting for you" vs "Waiting for your answer"). Both
+ *  `waiting` (active children) and `question` (paused on a question) paint the
+ *  same `waiting` tone — the card has no distinct question dot. */
+const CARD_STATUS: Record<VisualStatus, { word: string; tone: StatusTone }> = {
+  running: { word: 'Running', tone: 'running' },
+  waiting: { word: 'Waiting', tone: 'waiting' },
+  question: { word: 'Waiting for you', tone: 'waiting' },
+  changes: { word: 'Changes ready', tone: 'changes' },
+  failed: { word: 'Failed', tone: 'failed' },
+  idle: { word: 'Idle', tone: 'idle' },
+  // `resolveVisualStatus` collapses the raw `waiting_for_user_answer` ThreadStatus
+  // into `question`, so this key is unreachable in practice — present only because
+  // `VisualStatus` is a superset of `ThreadStatus`. Kept in sync with `question`.
+  waiting_for_user_answer: { word: 'Waiting for you', tone: 'waiting' },
+};
 
 /** Structured rows for a thread row's tooltip, rendered as a two-column
  *  label/value grid by the global tooltip system (`data-tooltip-rows`).
@@ -91,8 +89,13 @@ export function threadRowTooltip(meta: ThreadMeta, status: ThreadStatus): Toolti
   // (test fixtures); production always has them.
   const userAt = meta.lastUserAction || meta.createdAt;
   const agentAt = meta.lastAgentAction || meta.updatedAt || meta.createdAt;
+  // Resolve the visual status from the exact same three inputs the dot uses
+  // (see ThreadDrawer's `resolveVisualStatus(status, …)`), so the Status word
+  // tracks the dot — including the active-children "Waiting" case.
+  const visual = resolveVisualStatus(status, meta.activeChildrenCount > 0, meta.codingAgentProposed);
+  const { word, tone } = CARD_STATUS[visual];
   return [
-    { label: 'Status', value: statusWord(status, meta.codingAgentProposed), tone: statusTone(status, meta.codingAgentProposed) },
+    { label: 'Status', value: word, tone },
     { label: 'You', value: formatTimeAgo(new Date(userAt)) },
     { label: 'Agent', value: formatTimeAgo(new Date(agentAt)) },
     threadContextRow(meta),

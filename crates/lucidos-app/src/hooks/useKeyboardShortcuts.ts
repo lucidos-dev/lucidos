@@ -12,9 +12,11 @@ import { adjustUiScale, resetUiScale, scaleModalOpen, dismissScaleModal } from '
 import { UI_SCALE_STEP } from '../store/actions/preferences';
 import { isMobile } from '../utils/viewport';
 import {
-  toggleThreads, toggleThreadPane, toggleContentPane,
+  toggleThreadPane, toggleContentPane,
+  focusOrToggleThreadDrawer, toggleMaximizeFocusedPaneGroup,
   stepThreadPaneWidth, stepThreadDrawerWidth, resetPaneLayout,
 } from '../store/actions/pane';
+import { seedDrawerHighlight } from '../components/drawer/ThreadDrawer';
 import { handlePaneTab } from '../components/layout/paneFocus';
 import { historyBack, historyForward } from '../store/actions/focused-pane-history';
 
@@ -35,9 +37,10 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
   searchEverywhere: () => { searchEverywhereOpen.value = !searchEverywhereOpen.value; },
   historyBack: () => historyBack(),
   historyForward: () => historyForward(),
-  toggleThreadDrawer: toggleThreads,
+  toggleThreadDrawer: () => { if (focusOrToggleThreadDrawer()) seedDrawerHighlight(); },
   toggleThreadPane,
   toggleContentPane,
+  maximizePaneGroup: toggleMaximizeFocusedPaneGroup,
   narrowThreadPane: () => stepThreadPaneWidth(-1),
   widenThreadPane: () => stepThreadPaneWidth(1),
   narrowThreadDrawer: () => stepThreadDrawerWidth(-1),

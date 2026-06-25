@@ -176,4 +176,71 @@ impl EventStore {
         .await?;
         Ok(inserted)
     }
+
+    /// Re-point coding-agent threads orphaned by the old random-UUID
+    /// `repositories` registry onto the default Lucidos repo's **deterministic**
+    /// id (`uuidv5(namespace, root_commit_sha)`), passed in by the caller.
+    ///
+    /// Why: `repositories.id` used to be a random `gen_random_uuid()` regenerated
+    /// on every remove+re-add / registry wipe / directory move, so a thread bound
+    /// at first `SessionStarted` to a prior id was orphaned — the frontend repo
+    /// filter keys live-vs-`(deleted)` on id (`repoFilters.ts`), so it showed a
+    /// "(deleted)"/missing-repo badge even though the checkout was present. With
+    /// deterministic ids this can't recur, so this is a ONE-TIME cleanup, not a
+    /// permanent alias layer.
+    ///
+    /// General and per-workspace-correct — NO hardcoded UUIDs, NO name
+    /// heuristics: a *Lucidos-source* coding-agent thread targets the Lucidos
+    /// repo *by definition*, so its `cc_repo_id` is `default_repo_det_id`. The
+    /// WHERE clause identifies Lucidos-source threads conservatively:
+    ///  - `coding_agent_is_external_repo = FALSE` — the durable external marker
+    ///    (a NOT-NULL bool predating `coding_agent_kind`), so a **legacy
+    ///    external-repo thread** (created before the kind column, hence
+    ///    `coding_agent_kind IS NULL` but flagged external) is NOT mis-repointed;
+    ///  - `coding_agent_kind = 'lucidos' OR NULL` — excludes `'app'` and modern
+    ///    `'external'` threads;
+    ///  - `cc_repo_id` is NOT a currently-registered repository — a live binding
+    ///    isn't orphaned (no badge) and must not be rewritten; this also shields
+    ///    a still-registered external repo whose earliest threads predate the
+    ///    external flag column.
+    /// App threads (kind `'app'`, NULL `cc_repo_id`) are untouched. Once-only —
+    /// guarded by a marker.
+    pub async fn backfill_cc_repo_id_to_deterministic(
+        &self,
+        default_repo_det_id: uuid::Uuid,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        if crate::core::PreferenceStore::get(
+            &self.pool,
+            BACKFILL_CC_REPO_ID_DETERMINISTIC_MARKER,
+        )
+        .await?
+        .is_some()
+        {
+            return Ok(0);
+        }
+
+        let det = default_repo_det_id.to_string();
+        let updated = sqlx::query(
+            "UPDATE thread_summaries ts \
+             SET cc_repo_id = $1 \
+             WHERE ts.is_coding_agent \
+               AND ts.cc_repo_id IS NOT NULL \
+               AND ts.cc_repo_id <> $1 \
+               AND ts.coding_agent_is_external_repo = FALSE \
+               AND (ts.coding_agent_kind = 'lucidos' OR ts.coding_agent_kind IS NULL) \
+               AND NOT EXISTS (SELECT 1 FROM repositories r WHERE r.id::text = ts.cc_repo_id)",
+        )
+        .bind(&det)
+        .execute(&self.pool)
+        .await?
+        .rows_affected() as usize;
+
+        crate::core::PreferenceStore::set(
+            &self.pool,
+            BACKFILL_CC_REPO_ID_DETERMINISTIC_MARKER,
+            "1",
+        )
+        .await?;
+        Ok(updated)
+    }
 }

@@ -60,6 +60,7 @@ What each piece does — include only what you need:
 | Text | `--text-primary`, `--text-secondary`, `--text-muted`, `--text-on-accent` |
 | Border | `--border-color` |
 | Accents | `--accent`, `--accent-light`, `--accent-green`, `--accent-yellow`, `--accent-red` |
+| Focus | `--focus-ring` — a ready-made `box-shadow` value (a soft accent band) for focus indicators; the `.action-btn`/`.icon-btn` classes use it, and your own controls match the host with `:focus-visible { box-shadow: var(--focus-ring); }` |
 | Shadows | `--shadow-sm`, `--shadow-md`, `--shadow-lg` |
 | Layout (theme-independent) | `--font-ui`, `--font-mono`, `--transition`, `--user-ui-scale` — plus the spacing / radius / motion scales below |
 

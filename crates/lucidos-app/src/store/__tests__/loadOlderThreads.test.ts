@@ -17,8 +17,10 @@ const countMock = vi.mocked(fetchArchivedCount);
 
 function loaded(thread: ThreadState, updatedAt: string): ThreadState {
   thread.meta.updatedAt = updatedAt;
-  // The pagination cursor sorts by last user action, so set it to the same
-  // recency this helper is simulating.
+  // The Archive pagination cursor keys on created_at (matching the display
+  // sort), so set it to the recency this helper simulates. lastUserAction is set
+  // too for the Saved-sort paths that still read it.
+  thread.meta.createdAt = updatedAt;
   thread.meta.lastUserAction = updatedAt;
   return thread;
 }
@@ -105,6 +107,32 @@ describe('loadOlderThreads', () => {
     );
   });
 
+  it('ignores inbox threads when computing the archive cursor (created_at axis)', async () => {
+    // Regression: the Archive cursor keys on created_at. An active inbox chat
+    // created long ago must NOT drive the cursor — otherwise its old created_at
+    // collapses pagination and archived threads created after it are never
+    // fetched (the bug a created_at cursor over the whole map would reintroduce,
+    // since inbox rows are old-created but recently-active).
+    const inboxOld = makeOptimisticThreadState({
+      id: 'inbox-old', title: 'Long-lived chat', channel: 'chat', initiator: 'user',
+      eventsLoaded: false, timestamp: '2026-01-01T00:00:00Z',
+    });
+    inboxOld.meta.section = 'inbox';
+    const archived = makeOptimisticThreadState({
+      id: 'arch', title: 'Archived', channel: 'chat', initiator: 'user',
+      eventsLoaded: false, timestamp: '2026-06-01T00:00:00Z',
+    });
+    archived.meta.section = 'archived';
+    threadMap.value = new Map([['inbox-old', inboxOld], ['arch', archived]]);
+
+    await loadOlderThreads();
+
+    // Cursor is the ARCHIVED thread's created_at, not the old inbox thread's.
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      '2026-06-01T00:00:00Z', 15, undefined, undefined, undefined, undefined,
+    );
+  });
+
   it('a family-extension thread does not advance the cursor on the next page', async () => {
     // A trigger parent with a much-older child: the first pagination call
     // returns the parent's sibling (`base-1`) as a base thread plus the
@@ -145,6 +173,9 @@ describe('loadOlderThreads', () => {
       ...oldChildInfo,
       thread_id: 'base-1',
       parent_thread_id: null,
+      // created_at drives the cursor; distinct from old-child's so the assertion
+      // proves the family-extension child (older created_at) is excluded.
+      created_at: '2026-05-17T00:30:00Z',
       last_activity: '2026-05-17T00:30:00Z',
       title: 'Some older sibling',
     };

@@ -33,6 +33,7 @@ macro_rules! log {
     };
 }
 
+mod boot_phase;
 mod control;
 mod error;
 mod postgres;

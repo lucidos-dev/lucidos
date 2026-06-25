@@ -1,10 +1,14 @@
 //! Auto-update wiring (`tauri-plugin-updater`).
 //!
-//! On launch (packaged only) the app checks its update endpoint — a
-//! `latest.json` manifest served from GitHub Releases (configured in
-//! `tauri.conf.json` → `plugins.updater.endpoints`). If a newer signed build is
-//! available it prompts *"Update available — restart now?"*; on confirm it
-//! downloads, installs, and relaunches into the new version.
+//! A packaged build surfaces updates INSIDE the workspace UI — not a native
+//! launch dialog, not the picker. Most users have a single workspace and auto-open
+//! straight into it, so the web app (running in the packaged Tauri client) polls
+//! [`check_app_update`] on startup + on an interval and shows an in-app
+//! "Update & restart" toast. The toast's action calls
+//! [`install_app_update_and_restart`], which installs the new signed bundle and
+//! restarts the WHOLE stack onto the new version — the launchd background service
+//! (gateway + per-workspace engines + embedded Postgres) AND the GUI client —
+//! rather than only relaunching the window.
 //!
 //! Distribution model: the `.dmg` is for first install; the updater ships the
 //! `.app.tar.gz` + its `.sig` and `latest.json` (all on the same GitHub Release).
@@ -12,64 +16,53 @@
 //! in config; `TAURI_SIGNING_PRIVATE_KEY` at build time) — separate from Apple
 //! notarization, which gates the first-install `.dmg`.
 //!
-//! No-op in development.
+//! No-op in development (the updater endpoint isn't reachable and there's no
+//! launchd service to restart).
 
 use tauri::AppHandle;
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
-use tauri_plugin_updater::{Update, UpdaterExt};
+use tauri_plugin_updater::UpdaterExt;
 
-/// Spawn a background check for updates. Safe to call from `setup`.
-pub fn check_on_startup(app: &AppHandle) {
+/// Check GitHub Releases for a newer signed build. Returns the new version string
+/// when an update is available, else `None`. The packaged workspace UI polls this
+/// (gated on running in the Tauri client) to drive the in-app update toast.
+/// No-op (`None`) in development.
+#[tauri::command]
+pub async fn check_app_update(app: AppHandle) -> Result<Option<String>, String> {
     if tauri::is_dev() {
-        return;
+        return Ok(None);
     }
-    let handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        if let Err(e) = check(&handle).await {
-            // Best-effort: a transient network / endpoint error must never block
-            // app startup. The next launch re-checks.
-            eprintln!("[updater] check failed: {e}");
-        }
-    });
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = updater.check().await.map_err(|e| e.to_string())?;
+    Ok(update.map(|u| u.version.clone()))
 }
 
-async fn check(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(update) = app.updater()?.check().await? else {
-        return Ok(()); // already up to date
+/// Install the available update and restart EVERYTHING onto the new version:
+/// download + swap the bundle, restart the launchd background service (gateway +
+/// engines + embedded Postgres) so it runs the NEW binaries, then relaunch the GUI
+/// client. Never returns on success (the client re-execs).
+///
+/// Ordering is load-bearing: install first (new bytes on disk), then the service
+/// restart, then the never-returning `app.restart()`. The service restart is
+/// best-effort — a failure is logged but does not abort the client relaunch (the
+/// service otherwise picks up the new binary on its next restart / reboot).
+#[tauri::command]
+pub async fn install_app_update_and_restart(app: AppHandle) -> Result<(), String> {
+    if tauri::is_dev() {
+        return Err("Updates are only available in a packaged build".to_string());
+    }
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
+        return Err("No update available".to_string());
     };
-
-    let version = update.version.clone();
-    let app_for_confirm = app.clone();
-    app.dialog()
-        .message(format!(
-            "Lucidos {version} is available. Install it and restart now?"
-        ))
-        .title("Update available")
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            "Restart now".to_string(),
-            "Later".to_string(),
-        ))
-        .show(move |confirmed| {
-            if confirmed {
-                let app = app_for_confirm.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Err(e) = install_and_restart(&app, update).await {
-                        eprintln!("[updater] install failed: {e}");
-                    }
-                });
-            }
-        });
-
-    Ok(())
-}
-
-async fn install_and_restart(
-    app: &AppHandle,
-    update: Update,
-) -> Result<(), Box<dyn std::error::Error>> {
     update
         .download_and_install(|_chunk, _total| {}, || {})
-        .await?;
-    // Relaunch into the freshly-installed version. `restart` never returns.
+        .await
+        .map_err(|e| e.to_string())?;
+    // New bytes are on disk. Restart the whole background service onto them BEFORE
+    // relaunching the client — `app.restart()` never returns.
+    if let Err(e) = crate::desktop::restart_service() {
+        eprintln!("[updater] background service restart failed: {e}");
+    }
+    // Relaunch the client onto its new bytes. Never returns.
     app.restart();
 }

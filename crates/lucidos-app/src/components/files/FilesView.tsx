@@ -95,7 +95,7 @@ function WorkspaceFilesView() {
             Import
           </label>
         </span>
-        <span class="files-hint">Drop here to import</span>
+        <span class="files-hint">Drop to import</span>
       </div>
       <div class="artifacts-desktop">
         {hasArtifacts && <FolderTree />}

@@ -1,14 +1,14 @@
 import { useEffect, useCallback, useMemo } from 'preact/hooks';
 import type { DiffFile, RepoDiff } from '../../store/store';
-import { selectedLines, repoDiff, repoPending, filePreviewSource, diffWholeFile, openImagePopup, repoSelectedChangeId } from '../../store/store';
+import { selectedLines, repoDiff, repoPending, filePreviewSource, diffWholeFileEffective, openImagePopup, repoSelectedChangeId } from '../../store/store';
 import type { Loadable } from '../../store/types';
-import { getRepoFileContent, getChangeFileContent } from '../../api/client';
+import { getRepoFileContent, getChangeFileContent, repoFileUrl, changeFileUrl } from '../../api/client';
 import { loadChangeContextById } from '../../store/actions/repositories';
 import { highlightFileLines, CODE_EXTS } from '../../utils/syntaxHighlight';
 import { escapeHtml } from '../../utils/escapeHtml';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { renderCsvTable } from '../../utils/csv';
-import { RENDERABLE_EXTS } from './previewExts';
+import { RENDERABLE_EXTS, previewMediaKind } from './previewExts';
 import { isMobile, viewportIsMobile } from '../../utils/viewport';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
@@ -145,8 +145,9 @@ function RepoFilePreview({ repoId, mode, path, changeId, layout }: Props) {
     const branchRef = repoPending.value?.branch_name ?? null;
 
     // Whole-file mode: show the file as it would be once merged (end state),
-    // rendered like the All Files view. A deletion has no end state.
-    const wholeFileOn = diffWholeFile.value;
+    // rendered like the All Files view. A deletion has no end state. Added files
+    // default to this view (their diff is all additions); see diffWholeFileEffective.
+    const wholeFileOn = diffWholeFileEffective.value;
     if (wholeFileOn) {
       if (shouldShowWholeFile({ wholeFileOn, fileStatus: file.status })) {
         return <RepoFileContent repoId={repoId} path={path} changeId={activeChangeId ?? undefined} />;
@@ -169,7 +170,36 @@ function RepoFilePreview({ repoId, mode, path, changeId, layout }: Props) {
   return <RepoFileContent repoId={repoId} path={path} />;
 }
 
+/** Dispatches a repo file to the right preview. Binary-media files (images,
+ *  video, audio, pdf) are pointed at the file URL via a media element — the
+ *  engine serves them with a content-type from the extension. Everything else
+ *  (source, markdown, csv, svg, and any extensionless/unknown-but-textual file)
+ *  goes through the text path, which fetches the body as a string. Fetching a
+ *  PNG as text was the bug: it rendered the raw bytes line-numbered. */
 function RepoFileContent({ repoId, path, changeId }: { repoId: string; path: string; changeId?: string }) {
+  const ext = path.split('.').pop()?.toLowerCase() || '';
+  if (previewMediaKind(ext) !== 'text') {
+    return <RepoFileMedia repoId={repoId} path={path} changeId={changeId} ext={ext} />;
+  }
+  return <RepoFileText repoId={repoId} path={path} changeId={changeId} />;
+}
+
+/** Binary-media preview. Builds the file URL (same change-vs-branch ref logic as
+ *  RepoFileText) and renders it without fetching the bytes as text. */
+function RepoFileMedia({ repoId, path, changeId, ext }: { repoId: string; path: string; changeId?: string; ext: string }) {
+  const gitRef = repoPending.value?.branch_name;
+  const url = changeId ? changeFileUrl(changeId, path) : repoFileUrl(repoId, path, gitRef ?? undefined);
+  const kind = previewMediaKind(ext);
+
+  if (kind === 'image') {
+    return <img src={url} alt={path} style="max-width:100%;max-height:100%;object-fit:contain;" onClick={() => { if (isMobile()) openImagePopup(url); }} />;
+  }
+  if (kind === 'pdf') return <iframe src={url} style="width:100%;height:100%;border:none;" />;
+  if (kind === 'video') return <video src={url} controls style="max-width:100%;max-height:100%;" />;
+  return <audio src={url} controls style="width:100%;" />;
+}
+
+function RepoFileText({ repoId, path, changeId }: { repoId: string; path: string; changeId?: string }) {
   const gitRef = repoPending.value?.branch_name;
   // With a Lucidos/app change row, fetch the end state via /changes/:id/file —
   // the correct ref for both pending (branch) and applied (post_merge_sha). Without

@@ -125,20 +125,21 @@ function CameraCapture() {
 // includes pending uploads). Without this, the banner's actions briefly show in
 // place of Send during the upload window for any thread in the review section.
 
-// Pin toggle — saves/unsaves the focused thread. Lives among the left header
-// icons (not the right action cluster) and reads as a pin rather than a Save
-// text button: a filled pin means saved, an outline pin means not saved.
-// `saved` and `onToggle` come from the save-category TaggedAction so this can
-// never drift from resolveThreadActions (the same selector the close cascade
-// and server-side guards consult). The unsave path confirms internally.
+// Pin toggle — pins/unpins the focused thread (internally still the save
+// category: `is_saved` + the `ThreadSaved`/`ThreadUnsaved` events). Lives among
+// the left header icons (not the right action cluster) and reads as a pin: a
+// filled pin means pinned, an outline pin means not pinned. `saved` and
+// `onToggle` come from the save-category TaggedAction so this can never drift
+// from resolveThreadActions (the same selector the close cascade and
+// server-side guards consult). The unpin path confirms internally.
 function PinThreadButton({ saved, onToggle }: { saved: boolean; onToggle: () => void }) {
   return (
     <button
       class={`icon-btn header-icon pin-thread-btn${saved ? ' active' : ''}`}
       onClick={onToggle}
       aria-pressed={saved}
-      aria-label={saved ? 'Remove thread from Saved section' : 'Save thread'}
-      data-tooltip={saved ? 'Saved — click to unsave' : 'Save thread'}
+      aria-label={saved ? 'Remove thread from Pinned section' : 'Pin thread'}
+      data-tooltip={saved ? 'Pinned — click to unpin' : 'Pin thread'}
       data-row-item
     >
       <PinIcon filled={saved} />

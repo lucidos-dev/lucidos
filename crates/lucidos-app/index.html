@@ -202,9 +202,14 @@
       workspace auto-open is a full cross-document navigation (a reload). A reveal
       animation that played in BOTH documents would build, reload, and build again
       — the jank we hit before. So:
-        • The picker (base href `/~/`) is about to reload: the inline script below
-          tags the splash `boot-splash-reload`, which HIDES the mark (keeping its
-          reserved space). The picker shows only the gradient + the status line.
+        • The picker (base href `/~/`) hides the mark (the inline script below
+          tags the splash `boot-splash-reload`) so the reveal plays only in the
+          workspace. When the picker LIST renders (no remembered workspace to
+          auto-open, or an explicit `?pick`) that script also CLEARS the baked
+          "Opening your workspace…" status — on the picker you choose a workspace,
+          you don't open one — so it shows only the silent gradient cover. The
+          auto-open path (a remembered workspace) keeps the status and carries it
+          into the workspace document.
         • The final document (workspace / direct, base href NOT `/~/`) plays the
           per-tile reveal ONCE, then settles into a gentle breathe. So the mark
           builds up exactly once, on a clean gradient, in the destination — never
@@ -215,10 +220,12 @@
 
       STATUS LINE — constant size always (incl. when invisible) so the mark never
       shifts, and a baked default ("Opening your workspace…") shown from first
-      paint. This SAME text is baked into both documents and the picker does NOT
-      override it, so the status is byte-identical across the picker→workspace
+      paint. This SAME text is baked into both documents; the auto-open path does
+      NOT override it, so the status is byte-identical across the picker→workspace
       reload — it neither vanishes ("message that disappears immediately") nor
-      swaps wording ("opening your workspace" → "opening") at the seam.
+      swaps wording ("opening your workspace" → "opening") at the seam. (The
+      picker-LIST render path is the exception — it clears the status, since you're
+      choosing a workspace there, not opening one; see the body script below.)
       src/utils/bootSplash.ts updates the text; it fades the whole splash out once
       the app is ready. The mark geometry mirrors
       scripts/generate-brand-icons.mjs / components/shared/LucidosMark.tsx
@@ -245,22 +252,18 @@
       .boot-splash-mark {
         width: min(46vmin, 15rem);
         height: min(46vmin, 15rem);
-        /* Gentle breathe AFTER the reveal completes (~1.15s in). */
-        animation: boot-mark-breathe 2.8s ease-in-out 1.3s infinite;
-      }
-      /* Reveal — tiles build in bottom-up with a slight overshoot, then the spark
-         twinkles; `both` holds the from-state before each delay so nothing
-         flashes formed first. Plays once. */
-      .boot-splash-mark .bs-tile,
-      .boot-splash-mark .bs-spark {
-        transform-box: fill-box; /* scale about each shape's own centre */
+        /* Reveal the WHOLE mark as one compositor layer (svg-root transform +
+           opacity), then breathe. The previous reveal animated transform:scale on
+           each SVG shape (.bs-tile/.bs-spark) — iOS WebKit does NOT GPU-composite
+           SVG sub-element transforms, so they ran on the main thread and janked
+           while boot saturated it (bundle parse + initial render). Animating the
+           svg element itself composites cleanly (will-change hints the layer), so
+           the reveal stays smooth regardless of main-thread load. */
+        will-change: transform, opacity;
         transform-origin: center;
+        animation: boot-mark-reveal 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) both,
+                   boot-mark-breathe 2.8s ease-in-out 1.3s infinite;
       }
-      .boot-splash-mark .bs-tile { animation: boot-tile-in 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) both; }
-      .boot-splash-mark .bs-tile-1 { animation-delay: 0.15s; }
-      .boot-splash-mark .bs-tile-2 { animation-delay: 0.28s; }
-      .boot-splash-mark .bs-tile-3 { animation-delay: 0.41s; }
-      .boot-splash-mark .bs-spark { animation: boot-spark-in 0.55s cubic-bezier(0.34, 1.56, 0.64, 1) 0.6s both; }
       /* Picker (about to reload): hide the mark so the reveal happens ONLY in the
          workspace. Space is reserved (visibility, not display) so the status line
          keeps its position. */
@@ -292,15 +295,10 @@
       }
       .boot-splash-status.boot-splash-status-shown { opacity: 1; }
       .boot-splash-leaving { animation: boot-splash-out 0.45s ease forwards; }
-      @keyframes boot-tile-in {
-        from { opacity: 0; transform: scale(0.3); }
-        60%  { opacity: 1; transform: scale(1.08); }
+      @keyframes boot-mark-reveal {
+        from { opacity: 0; transform: scale(0.86); }
+        70%  { opacity: 1; transform: scale(1.04); }
         to   { opacity: 1; transform: scale(1); }
-      }
-      @keyframes boot-spark-in {
-        from { opacity: 0; transform: scale(0) rotate(-60deg); }
-        70%  { opacity: 1; transform: scale(1.2) rotate(8deg); }
-        to   { opacity: 1; transform: scale(1) rotate(0); }
       }
       @keyframes boot-mark-breathe {
         0%, 100% { opacity: 1; }
@@ -308,9 +306,7 @@
       }
       @keyframes boot-splash-out { to { opacity: 0; visibility: hidden; } }
       @media (prefers-reduced-motion: reduce) {
-        .boot-splash-mark,
-        .boot-splash-mark .bs-tile,
-        .boot-splash-mark .bs-spark { animation: none; }
+        .boot-splash-mark { animation: none; }
         .boot-splash-status { transition: none; }
         .boot-splash-leaving { animation-duration: 0.15s; }
       }
@@ -320,26 +316,42 @@
     <div class="boot-splash" aria-hidden="true">
       <svg class="boot-splash-mark" viewBox="0 0 100 100">
         <g transform="translate(11 11) scale(0.78)" fill="#ffffff">
-          <rect class="bs-tile bs-tile-1" x="17" y="17" width="29" height="29" rx="7" />
-          <rect class="bs-tile bs-tile-2" x="17" y="54" width="29" height="29" rx="7" />
-          <rect class="bs-tile bs-tile-3" x="54" y="54" width="29" height="29" rx="7" />
-          <path class="bs-spark" d="M68.5 12 C71 25 74 28.5 87 31 C74 33.5 71 37 68.5 50 C66 37 63 33.5 50 31 C63 28.5 66 25 68.5 12 Z" />
+          <rect x="17" y="17" width="29" height="29" rx="7" />
+          <rect x="17" y="54" width="29" height="29" rx="7" />
+          <rect x="54" y="54" width="29" height="29" rx="7" />
+          <path d="M68.5 12 C71 25 74 28.5 87 31 C74 33.5 71 37 68.5 50 C66 37 63 33.5 50 31 C63 28.5 66 25 68.5 12 Z" />
         </g>
       </svg>
       <div class="boot-splash-status boot-splash-status-shown" role="status" aria-live="polite">Opening your workspace…</div>
     </div>
     <script>
-      // The picker (server-stamped <base href="/~/">) is about to reload into the
-      // workspace, so it must NOT play the mark reveal — it would replay in the
-      // destination (jank). Tag the splash so the CSS hides the mark; the reveal
-      // then happens exactly once, in the workspace document. Runs synchronously
-      // right after the splash node so it takes effect before first paint. See the
-      // splash comment above + hooks/useBootSplashReady.ts.
+      // Picker context (server-stamped <base href="/~/">). Two jobs, both before
+      // first paint:
+      //   1. Hide the mark (tag `boot-splash-reload`) so the per-tile reveal plays
+      //      ONLY in the workspace document, never double-builds across the
+      //      picker→workspace auto-open navigation.
+      //   2. When the picker LIST is what renders — i.e. we are NOT auto-opening a
+      //      remembered workspace (explicit `?pick`, or none remembered: the SAME
+      //      condition the <head> redirect uses to NOT redirect) — clear the baked
+      //      "Opening your workspace…" status. On the picker you choose a
+      //      workspace, you don't open one, so that message is wrong; cleared, the
+      //      picker shows a silent gradient cover that fades into the list. The
+      //      auto-open path keeps the status (it redirects in <head> and the text
+      //      carries into the workspace document, byte-identical across the seam).
+      // See the splash comment above + hooks/useBootSplashReady.ts.
       (function () {
         var base = document.querySelector('base');
-        if (base && base.getAttribute('href') === '/~/') {
-          var splash = document.querySelector('.boot-splash');
-          if (splash) splash.classList.add('boot-splash-reload');
+        if (!base || base.getAttribute('href') !== '/~/') return;
+        var splash = document.querySelector('.boot-splash');
+        if (splash) splash.classList.add('boot-splash-reload');
+        var renderingList;
+        try {
+          renderingList = new URLSearchParams(location.search).has('pick') ||
+            !localStorage.getItem('lucidos-last-workspace');
+        } catch (e) { renderingList = true; }
+        if (renderingList && splash) {
+          var status = splash.querySelector('.boot-splash-status');
+          if (status) { status.textContent = ''; status.classList.remove('boot-splash-status-shown'); }
         }
       })();
     </script>

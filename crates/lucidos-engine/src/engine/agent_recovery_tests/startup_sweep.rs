@@ -385,6 +385,7 @@ mod startup_sweep_coding_agent_has_diff {
             "external-test",
             external_repo.to_str().unwrap(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -411,6 +412,156 @@ mod startup_sweep_coding_agent_has_diff {
             "sweep must resolve external-repo root via cc_repo_id lookup, \
              find the worktree, detect the on-disk diff, and leave \
              coding_agent_has_diff=true (not fall back to lucidos_repo_root)"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn startup_sweep_resolves_app_thread_root_via_workspace_path() {
+        // App coding-agent threads carry `coding_agent_kind = 'app'` and a NULL
+        // `cc_repo_id` — their branch lives in the WORKSPACE git repo (where
+        // `data/apps/<id>/` lives), not in the Lucidos main repo and not in any
+        // registered external repo. The sweep MUST route app threads to
+        // `workspace_path`.
+        //
+        // Bug shape this guards against: routing on `cc_repo_id` alone (NULL →
+        // `lucidos_repo_root`) sends app threads to the Lucidos main repo, where
+        // the `claude-code/app/...` branch does not exist. `proposal_files_for_branch`
+        // then returns None → the sweep wipes `coding_agent_has_diff` to FALSE on
+        // every engine restart, hiding the WaitingBanner Diff button and the
+        // standalone WIP diff button for an app thread that genuinely has a diff.
+        // Pre-seeded FALSE proves the fix actively flips it to TRUE via the
+        // workspace route.
+        use crate::engine::agent_recovery::refresh_coding_agent_has_diff_for_active_cc_threads;
+        use crate::engine::agent_session::CodingAgentKind;
+
+        let branch = "claude-code/app/habit-tracker/sweep";
+
+        // Workspace IS a git repo; the app branch is a worktree of it with one
+        // commit beyond main under `data/apps/<id>/`. The worktree lives under
+        // `<workspace>/.lucidos/worktrees/`, as in production.
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        git_cmd(&["init", "-b", "main"], &workspace).await.unwrap();
+        git_cmd(&["config", "user.email", "test@example.com"], &workspace)
+            .await
+            .unwrap();
+        git_cmd(&["config", "user.name", "Test"], &workspace)
+            .await
+            .unwrap();
+        std::fs::create_dir_all(workspace.join("data/apps/habit-tracker")).unwrap();
+        std::fs::write(
+            workspace.join("data/apps/habit-tracker/index.html"),
+            "<h1>v1</h1>",
+        )
+        .unwrap();
+        git_cmd(&["add", "."], &workspace).await.unwrap();
+        git_cmd(&["commit", "-m", "init app"], &workspace)
+            .await
+            .unwrap();
+
+        let worktrees_dir = workspace.join(".lucidos/worktrees");
+        std::fs::create_dir_all(&worktrees_dir).unwrap();
+        let wt = worktrees_dir.join("thread-app");
+        git_cmd(
+            &["worktree", "add", wt.to_str().unwrap(), "-b", branch],
+            &workspace,
+        )
+        .await
+        .unwrap();
+        std::fs::write(
+            wt.join("data/apps/habit-tracker/index.html"),
+            "<h1>v2</h1>",
+        )
+        .unwrap();
+        git_cmd(&["add", "."], &wt).await.unwrap();
+        git_cmd(&["commit", "-m", "edit app"], &wt).await.unwrap();
+
+        // Separate empty Lucidos repo with NO `branch` ref. If the sweep
+        // mis-routes app threads here, `proposal_files_for_branch` returns None
+        // and the column is wiped to FALSE.
+        let lucidos_tmp = tempfile::tempdir().unwrap();
+        let lucidos_repo = lucidos_tmp.path().to_path_buf();
+        git_cmd(&["init", "-b", "main"], &lucidos_repo).await.unwrap();
+        git_cmd(&["config", "user.email", "test@example.com"], &lucidos_repo)
+            .await
+            .unwrap();
+        git_cmd(&["config", "user.name", "Test"], &lucidos_repo)
+            .await
+            .unwrap();
+        std::fs::write(lucidos_repo.join("seed.txt"), "x").unwrap();
+        git_cmd(&["add", "."], &lucidos_repo).await.unwrap();
+        git_cmd(&["commit", "-m", "init"], &lucidos_repo).await.unwrap();
+
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+
+        // SessionStarted for an APP thread: kind='app', cc_repo_id NULL.
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::SessionStarted {
+                coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                session_id: "test-session".into(),
+                branch: branch.into(),
+                repo_id: None,
+                coding_agent_kind: CodingAgentKind::App,
+                coding_agent_folder: workspace
+                    .join("data/apps/habit-tracker")
+                    .to_string_lossy()
+                    .into(),
+                app_id: Some("habit-tracker".into()),
+            },
+            meta: EventMeta {
+                channel: Some(EventChannel::ClaudeCode),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .unwrap();
+
+        // Record the worktree path (source #1 in `resolve_worktree_path`) so the
+        // worktree is found regardless of repo_root — isolating the bug to the
+        // repo_root routing that `seed_coding_agent_has_diff` diffs against.
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::CodingAgentIdled {
+                has_changes: true,
+                is_external_repo: false,
+                requires_restart: false,
+                cc_session_id: Some("sid".into()),
+                coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                reason: None,
+                worktree_path: Some(wt.to_string_lossy().into()),
+                worktree_head_sha: None,
+                bg_bash_pending: false,
+            },
+            meta: EventMeta {
+                channel: Some(EventChannel::ClaudeCode),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .unwrap();
+
+        // Pre-seed FALSE so the assertion proves the sweep actively flips it to
+        // TRUE via the workspace_path route (the bug leaves it FALSE).
+        sqlx::query("UPDATE thread_summaries SET coding_agent_has_diff = FALSE WHERE thread_id = $1")
+            .bind(thread_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        refresh_coding_agent_has_diff_for_active_cc_threads(&pool, &workspace, &lucidos_repo).await;
+
+        assert!(
+            read_coding_agent_has_diff(&pool, thread_id).await,
+            "sweep must route app-kind threads to workspace_path, find the \
+             branch diff, and leave coding_agent_has_diff=true (not fall back \
+             to lucidos_repo_root, where the app branch does not exist)"
         );
 
         pool.close().await;

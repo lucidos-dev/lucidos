@@ -77,12 +77,27 @@ event IS the policy). Defaults in parentheses:
   `max_concurrent_sub_thread` (16) / `max_concurrent_coding_agent` (24) —
   per-kind caps (background kinds only; user-initiated isn't bucketed by kind).
 - `max_concurrent_per_trigger` (1) — concurrent runs of one trigger. 1 keeps a
-  trigger's fires strictly in arrival order (FIFO per trigger).
-- `max_queued_per_trigger` (25) — hard ceiling on one trigger's backlog.
+  trigger's fires strictly in arrival order (FIFO per trigger). Governs event
+  triggers; cron coalesces (see below).
+- `max_queued_per_trigger` (25) — hard ceiling on one trigger's backlog (event
+  triggers; cron never reaches it — it coalesces to one).
 - `overflow` (`drop-oldest`) — what happens at the ceiling:
   `drop-oldest` drops the trigger's oldest waiting fire + notifies;
   `pause-trigger` pauses the trigger + notifies (its queued fires wait for a
   manual resume).
+
+**Cron coalescing (cron kind only).** A cron fire carries no distinct payload
+(`Cron { trigger_id }` and nothing else), so a cron trigger never needs more than
+one pending fire — it holds **at most one entry** (active + queued ≤ 1). A cron
+submission while one of its fires is already active *or* queued is **coalesced**:
+dropped as redundant (no persisted queue event), with its scheduler `await`
+resolved immediately so the cron loop / missed-grace catch-up proceeds to the
+next occurrence rather than hanging. This is intrinsic to the cron kind — not a
+configurable knob — so `max_queued_per_trigger` / `overflow` never apply to cron.
+Event triggers carry a per-fire `event_payload` and keep strict FIFO (the caps
+above govern them); they are never coalesced. This is what stops a restart storm
+(each boot re-queuing the in-flight fire + re-firing the missed occurrence) from
+stacking dozens of identical cron fires.
 
 Concurrency caps of **0 mean "hold"** — admission pauses and the queue
 accumulates (e.g. `max_concurrent_total: 0` freezes all work — including new
@@ -98,6 +113,8 @@ queues behind the trigger's existing backlog even when capacity is free) and
 **best-effort across triggers** (an entry blocked by its own trigger's cap
 doesn't hold up other triggers' entries). A new background `submit` also yields a
 free slot to a waiting user — unless background is still below its reserved floor.
+Cron fires don't queue behind each other at all — they coalesce to a single
+entry per trigger (see *Cron coalescing* above).
 
 ## Persistence & restart
 
@@ -113,6 +130,11 @@ requeue do not silently fall back to Claude Code. On engine restart:
   catch-up); sub-thread / coding-agent spawns whose thread already
   materialized are handed off to thread-level recovery (CC auto-resume / chat
   settle) instead of re-spawning a duplicate.
+- **Cron recovery is idempotent.** Duplicate cron rows for one trigger (left by
+  a restart storm) collapse to a single entry on reload — the oldest is kept and
+  re-queued, the rest emit `ThreadQueueDropped` (reason "coalesced on recovery")
+  to clear their projection rows. So repeated reboots can never re-stack a cron
+  backlog.
 
 **User-initiated** slots are in-memory only — they are NOT persisted and NOT
 re-fired. A dead response is simply gone on restart (the person re-sends if they

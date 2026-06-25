@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.12.2 — 2026-06-25
+
+**Added**
+- **Menu-bar tray model (macOS)** — the always-on service now survives closing the client window; the engine keeps running in the menu bar.
+- **In-app "Uninstall Lucidos" command (macOS)** — clears WKWebView web storage and hides client windows on confirm, with a keep-vs-delete data choice, so a reinstall is clean.
+- **First run shows the workspace picker** — no more silently auto-created default workspace; offers personal/work name suggestions.
+- **`view_image` chat tool** — reprocess images posted earlier in a thread back into the agent's vision.
+- **macOS title-bar tinting** — the native title-bar strip is reclaimed as a blue drag-band matching the app header.
+- **Gateway boot-phase progress** — the workspace boot splash now renders engine-reported boot phases instead of a blank wait.
+- **Keyboard pane navigation** — focus the Conversation drawer (Cmd+Shift+1) and maximize the focused pane group (Cmd+Shift+Enter).
+- **`.gs` (Google Apps Script) files** highlighted as JavaScript in the file preview.
+- **Unattended trigger-spawned coding agents** — trigger-spawned sessions inherit the side-effect grant and auto-resolve permission prompts.
+- **Two-phase release pipeline** — `release.sh --verify-build` / `--publish-verified` and an `--attach-staged` path that builds once and verifies before publishing.
+
+**Changed**
+- **Security: permissive CORS disabled by default**, and the **gateway default bind address secured** (no longer binds broadly out of the box).
+- **Resolved npm-audit vulnerabilities** — vite 6.4.2→6.4.3, @babel/core 7.29.0→7.29.7.
+- Packaged update now restarts the whole service and surfaces inside the workspace; the dev-only gateway reload is hidden on packaged builds.
+- JSON API responses are gzip/brotli-compressed via tower-http.
+- Deterministic root-commit repository identity, with orphaned-thread backfill.
+- Per-parent child-thread fan-out cap raised 3 to 10.
+- Single-file changes open directly into their diff; added files render as the whole file.
+- User-facing thread "Saved" renamed to **"Pinned"**.
+- Cron fires coalesce so a trigger holds at most one queue entry (idempotent recovery).
+- "Lucidos source" coding target hidden on packaged builds; capture-context debug toggle defaults off.
+- Unified focus ring across buttons/dropdowns via a `--focus-ring` token (collapsed to a single soft band).
+- Perf: windowed thread render, faster exchange sort + incremental pending-message fold, memoized drawer categorization — fixes dev-workspace input lag.
+
+**Fixed**
+- Engine no longer culls alive-but-busy engines (gateway respawn-storm fix).
+- Graceful coding-agent process-group teardown so Playwright reaps its browsers.
+- Concurrent worktree spawns no longer collide on `.git/config.lock`; backoff sleep skipped on the final retry.
+- Attached images stay visible to the agent for the whole turn; image message protected from context pass 2.
+- Avoid a UTF-8 panic when truncating memory context.
+- Coding agent treats relative `..` targets as out-of-workspace; unwraps `shell -c` before classifying Codex commands.
+- Globally disable browser autofill on host-app text inputs.
+- Render binary images in the repo file viewer.
+- Archive drawer ordered by created_at; inbox threads excluded from the archive pagination cursor.
+- Hard-exit after uninstall so the window-state plugin can't re-create the deleted data dir.
+- Various: picker boot-splash text, "Manage workspaces" link on a direct engine port, app-thread change-row Diff, legacy workspace switcher list, per-pane Tab trap, thread-row "Waiting" tooltip.
 ## v0.12.1 — 2026-06-23
 
 **Added**

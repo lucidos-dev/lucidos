@@ -86,6 +86,10 @@ describe('formatBinding', () => {
     expect(formatBinding(shortcutDef('historyBack').defaultBinding, true)).toBe('⌘⌥↓');
     expect(formatBinding(shortcutDef('narrowThreadDrawer').defaultBinding, false)).toBe('Ctrl+Alt+Shift+←');
   });
+  it('renders Enter as the ↵ glyph and keeps ⌘ (Enter is not an OS-reserved alnum chord)', () => {
+    expect(formatBinding(shortcutDef('maximizePaneGroup').defaultBinding, true)).toBe('⌘⇧↵');
+    expect(formatBinding(shortcutDef('maximizePaneGroup').defaultBinding, false)).toBe('Ctrl+Shift+↵');
+  });
 });
 
 describe('SHORTCUT_DEFS registry invariants', () => {

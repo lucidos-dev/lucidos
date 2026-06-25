@@ -29,20 +29,57 @@ export function computeExchanges(thread: ThreadState): Exchange[] {
   // CC threads: Keep `created` — follow-ups are delivered immediately, so events
   // after the follow-up ARE responses to it. Timestamp-based sorting correctly
   // splits events between old and new exchanges.
-  const augmented = new Map(thread.events);
   const isCC = thread.meta.channel === 'claude_code';
-  for (let i = 0; i < thread.pendingUserMessages.length; i++) {
+  const pendingCount = thread.pendingUserMessages.length;
+  const synthetic: SequencedEvent[] = [];
+  for (let i = 0; i < pendingCount; i++) {
     const pending = thread.pendingUserMessages[i];
-    const syntheticSeq = Number.MAX_SAFE_INTEGER - thread.pendingUserMessages.length + i;
-    augmented.set(syntheticSeq, {
-      type: 'MessageReceived' as const,
-      text: pending.text,
-      _eventId: pending.eventId,
-      channel: thread.meta.channel,
-      ...(isCC ? { created: pending.created } : { _displayCreated: pending.created }),
-      ...(pending.image_hashes?.length ? { user_image_hashes: pending.image_hashes } : {}),
-    } as StoredEvent);
+    const seq = Number.MAX_SAFE_INTEGER - pendingCount + i;
+    synthetic.push({
+      seq,
+      event: {
+        type: 'MessageReceived' as const,
+        text: pending.text,
+        _eventId: pending.eventId,
+        channel: thread.meta.channel,
+        ...(isCC ? { created: pending.created } : { _displayCreated: pending.created }),
+        ...(pending.image_hashes?.length ? { user_image_hashes: pending.image_hashes } : {}),
+      } as StoredEvent,
+    });
   }
+
+  // Fast path: when every pending message sorts strictly after the last folded
+  // real event — ALWAYS true for chat (synthetic seqs are MAX_SAFE_INTEGER-based
+  // and chat synthetics carry no `created`, so the sort falls to seq) and the
+  // normal case for CC (pending.created is "now", after every persisted event) —
+  // the augmented fold is exactly the cached real-event fold with one fresh
+  // trailing exchange per pending message. Reuse the incremental cache and append
+  // instead of copying the whole events Map + re-sorting + re-folding the entire
+  // history on EVERY send and EVERY streamed token while the optimistic pending
+  // row is live (the "sending lags on a big thread" cost). Checking only the
+  // earliest pending (smallest seq, earliest send) suffices: later pending
+  // messages have strictly larger seqs and same-or-later timestamps.
+  const base = groupIntoExchangesCached(thread.events);
+  const cache = incrementalCache.get(thread.events);
+  const first = synthetic[0];
+  const canAppendTrailing =
+    !!cache &&
+    cache.cacheable &&
+    compareSortKeys(first.event.created, first.seq, cache.lastCreated, cache.lastSeq) >= 0;
+
+  if (canAppendTrailing) {
+    const exchanges = [...base];
+    for (const { seq, event } of synthetic) {
+      exchanges.push({ userEvent: event, userSeq: seq, steps: [] });
+    }
+    return filterRemovedQueuedExchanges(exchanges, thread.events);
+  }
+
+  // Fallback (CC clock-skew / a real event landing before the MessageReceived
+  // echo cleared the pending; or a non-cacheable legacy map): the augmented full
+  // re-fold — literally the prior behavior, so equivalence holds either way.
+  const augmented = new Map(thread.events);
+  for (const { seq, event } of synthetic) augmented.set(seq, event);
   return filterRemovedQueuedExchanges(groupIntoExchanges(augmented), augmented);
 }
 
@@ -468,9 +505,13 @@ function compareSortKeys(
   bCreated: string | null,
   bSeq: number,
 ): number {
-  if (aCreated && bCreated) {
-    const cmp = aCreated.localeCompare(bCreated);
-    if (cmp !== 0) return cmp;
+  // ISO-8601 UTC timestamps (fixed-width, Zulu) sort identically under a plain
+  // lexical `<`/`>` compare, which is ~10–50× cheaper than the Intl collator
+  // that `String.localeCompare` spins up — and this comparator runs O(n log n)
+  // times per fold (every thread open + every full recompute). Equal timestamps
+  // (and the legacy missing-`created` case) fall through to the `seq` tiebreak.
+  if (aCreated && bCreated && aCreated !== bCreated) {
+    return aCreated < bCreated ? -1 : 1;
   }
   return aSeq - bSeq;
 }

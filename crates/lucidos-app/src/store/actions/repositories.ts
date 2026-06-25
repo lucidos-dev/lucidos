@@ -4,7 +4,7 @@ import {
   repoSelectedChangeId, repoChanges, repoChangesLoadingMore,
   activeMenuItem, repositories, showToast,
   panelOverlay, parseRepoPath, encodeRepoPath, SELECTED_CHANGE_KEY,
-  threadMap,
+  threadMap, type RepoDiff,
 } from '../store';
 import { listRepoFiles, getChangeDiff, getChangeById, getRepoChanges, getThreadCcDiff, ApiError } from '../../api/client';
 import type { Change, ThreadCcDiff } from '../../api/client';
@@ -170,11 +170,37 @@ export async function viewChangeDiffById(changeId: string): Promise<void> {
   }
 }
 
+/** A single-file diff has nothing to pick from — skip the file list and open that
+ *  one file's diff directly. openRepoFilePreview pushes its own nav entry (the
+ *  caller nulls panelOverlay first, so it pushes rather than replaces), so Back
+ *  returns to where the user came from instead of an intermediate one-item list.
+ *  Returns true when it opened the file (caller must then NOT also pushNavState).
+ *  No-op (returns false) without a registered repoSource — openRepoFilePreview
+ *  can't target a path there, so app coding-agent diffs keep rendering inline —
+ *  or when repoDiff isn't a single loaded file, leaving the caller to push the
+ *  file-list view. Shared by both diff entry points (a change row and the
+ *  thread-level CC branch diff). */
+function openSingleFileDiffDirectly(): boolean {
+  const diff = repoDiff.value;
+  if (repoSource.value && diff.status === 'loaded' && diff.data.files.length === 1) {
+    openRepoFilePreview(diff.data.files[0].path, 'diff');
+    return true;
+  }
+  return false;
+}
+
 export async function viewChangeDiff(change: Change): Promise<void> {
   activeMenuItem.value = 'files';
   panelOverlay.value = null;
   revealContentPane();
   await loadChangeContext(change);
+  // Gate on repoSelectedChangeId === change.id so we only auto-open the single
+  // file when THIS change actually loaded — both selectRepoChange (registered
+  // repo) and the inline unregistered-repo path stamp repoSelectedChangeId, so
+  // this also rejects a stale single-file diff left by a prior change. The
+  // inline path leaves repoSource null, so openSingleFileDiffDirectly no-ops
+  // there and the change's diff renders inline instead of opening a file preview.
+  if (repoSelectedChangeId.value === change.id && openSingleFileDiffDirectly()) return;
   pushNavState();
 }
 
@@ -189,9 +215,53 @@ export async function loadChangeContext(change: Change): Promise<void> {
   }
   const repos = loadedOr(repositories.value, []);
   const repo = repos.find(r => r.path === change.repo_root);
-  if (!repo) return;
+  if (!repo) {
+    // No registered Repository matches change.repo_root — app coding-agent
+    // changes use the workspace root, and a change whose repo was later removed
+    // has no row either. Render the change's diff inline rather than bailing.
+    await loadUnregisteredChangeDiff(change);
+    return;
+  }
   if (repoSource.value !== repo.id) await switchRepoSource(repo.id);
   await selectRepoChange(change);
+}
+
+/** Render a change's diff inline when no registered repo backs its repo_root —
+ *  app coding-agent changes (repo_root = workspace root) and changes whose repo
+ *  was later removed. Mirrors viewThreadCcDiff's app branch: the backend already
+ *  scopes app changes to data/apps/<id>/, and the "All Files" tab is meaningless
+ *  without a registered repo, but the diff itself is not. Wipe any prior
+ *  registered-repo state first (switchRepoSource(null)) so lingering signals
+ *  don't observe stale paths and openSingleFileDiffDirectly no-ops on the null
+ *  repoSource — the diff then renders inline regardless of file count. */
+async function loadUnregisteredChangeDiff(change: Change): Promise<void> {
+  await switchRepoSource(null);
+  repoSelectedChangeId.value = change.id;
+  repoDiff.value = { status: 'loading' };
+
+  let diff: RepoDiff;
+  try {
+    diff = await getChangeDiff(change.id);
+  } catch (e) {
+    repoDiff.value = toFailed(e);
+    showToast(`Failed to load diff: ${errorDetail(e)}`, 'error');
+    return;
+  }
+
+  // Best-effort app-id label, mirroring viewThreadCcDiff — only when the change's
+  // thread is loaded AND is an app coding-agent thread. Absent (e.g. the Changes
+  // panel showing a change for an unloaded thread) → just the change description.
+  const meta = change.thread_id ? threadMap.value.get(change.thread_id)?.meta : undefined;
+  const appId = meta?.codingAgentKind === 'app' ? appIdFromFolder(meta.codingAgentFolder) : null;
+
+  repoPending.value = {
+    branch_name: change.branch_name,
+    files: diff.files.map(f => f.path),
+    description: appId ? `${change.description} — ${appId}` : change.description,
+    thread_id: change.thread_id,
+  };
+  repoViewMode.value = 'changes';
+  repoDiff.value = { status: 'loaded', data: diff };
 }
 
 export async function loadChangeContextById(changeId: string): Promise<void> {
@@ -337,5 +407,10 @@ export async function viewThreadCcDiff(threadId: string): Promise<void> {
   // Re-fetch file tree at the branch ref — switchRepoSource loaded it at HEAD
   // because repoPending was still null at that point.
   await loadRepoFiles(repo.id);
+  // Single-file branch diff opens the file directly, same as a change row. No
+  // stale-diff guard needed here: repoDiff was just set synchronously above and
+  // repoSelectedChangeId is null (a thread diff has no Change row), so the
+  // file-preview encodes no changeId and resolves via the branch ref.
+  if (openSingleFileDiffDirectly()) return;
   pushNavState();
 }

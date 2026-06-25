@@ -54,7 +54,7 @@ mod web;
 
 use crate::llm::provider::ToolDefinition;
 
-pub use images::{get_image_generation_tool, get_save_thread_image_tool};
+pub use images::{get_image_generation_tool, get_save_thread_image_tool, get_view_image_tool};
 pub use mcp::get_mcp_tools;
 pub use misc::{get_manage_repositories_tool, get_navigate_ui_tool};
 pub use notifications::{get_notification_tool, get_read_notifications_tool};

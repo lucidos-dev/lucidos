@@ -1,5 +1,7 @@
 use super::*;
+use rand::Rng;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const LUCIDOS_HOOKS_PATH: &str = ".lucidos/git-hooks";
 const LUCIDOS_POST_COMMIT_HOOK: &str = "post-commit";
@@ -253,7 +255,21 @@ pub(crate) async fn worktree_add(
     let wt_str = wt_path
         .to_str()
         .ok_or_else(|| format!("non-utf8 worktree path: {}", wt_path.display()))?;
-    let mut args: Vec<&str> = vec!["worktree", "add", "--no-checkout", wt_str];
+    let mut args: Vec<&str> = vec!["worktree", "add", "--no-checkout"];
+    // Engine-created isolation branches (`-b <name>`) must NOT set up upstream
+    // tracking. They're throwaway `claude-code/*` / app branches merged into
+    // main locally and never pushed on their own, so tracking config is dead
+    // weight — AND it is the ONLY thing `git worktree add` writes to the shared
+    // `.git/config`. With `branch.autoSetupMerge` in play that write races on
+    // `.git/config.lock` whenever several coding-agent spawns start at once,
+    // failing the spawn with "could not lock config file .git/config: File
+    // exists" / "unable to write upstream branch configuration". `--no-track`
+    // suppresses the write entirely (only valid when creating a branch), so
+    // concurrent spawns can no longer collide here.
+    if extra_args.iter().any(|a| *a == "-b" || *a == "-B") {
+        args.push("--no-track");
+    }
+    args.push(wt_str);
     args.extend_from_slice(extra_args);
     let add_out = worktree_add_pruning_stale(repo_root, &args).await?;
     if !add_out.status.success() {
@@ -391,6 +407,54 @@ pub(crate) async fn is_live_worktree_at(wt_path: &Path) -> bool {
     canon(Path::new(&toplevel)) == canon(wt_path)
 }
 
+/// Attempts for a shared-`.git/config` write that loses the `.git/config.lock`
+/// race against a concurrent git process.
+const CONFIG_LOCK_RETRIES: u32 = 8;
+
+/// True when a git invocation's stderr is the transient `.git/config.lock`
+/// contention error — git's lockfile fails fast (it does not block) when
+/// another process holds the lock, expecting the caller to retry.
+fn is_config_lock_contention(stderr: &str) -> bool {
+    stderr.contains("could not lock config file")
+}
+
+/// Set `key=value` in the repo's SHARED `.git/config`, retrying when a
+/// concurrent git process holds `.git/config.lock`. The engine spawns many
+/// coding-agent worktrees at once, each touching the shared config; git's
+/// lockfile fails fast on contention rather than blocking, so the engine must
+/// retry to be a well-behaved concurrent client. Backoff is jittered so
+/// simultaneous losers don't resynchronize and collide again. The caller is
+/// responsible for ensuring the write is idempotent (safe to repeat).
+async fn set_shared_config_with_lock_retry(
+    repo_root: &Path,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 0..CONFIG_LOCK_RETRIES {
+        let out = git_cmd(&["config", key, value], repo_root).await?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if !is_config_lock_contention(&stderr) {
+            return Err(format!("git config {key} {value} failed: {stderr}"));
+        }
+        last_err = stderr;
+        // No point sleeping after the final attempt — we're about to give up.
+        if attempt + 1 < CONFIG_LOCK_RETRIES {
+            // Grow the base delay with the attempt, plus a random spread so
+            // concurrent losers retry at different moments.
+            let base = 20u64 * (attempt as u64 + 1);
+            let jitter = rand::thread_rng().gen_range(0..40);
+            tokio::time::sleep(Duration::from_millis(base + jitter)).await;
+        }
+    }
+    Err(format!(
+        "git config {key} {value} failed after {CONFIG_LOCK_RETRIES} attempts (config lock contention): {last_err}"
+    ))
+}
+
 /// Install the per-worktree post-commit hook that lets a coding-agent commit
 /// refresh the visible Diff button immediately, before the turn idles.
 ///
@@ -431,12 +495,20 @@ pub(crate) async fn install_coding_agent_diff_hook(
             .map_err(|e| format!("chmod {}: {}", hook_path.display(), e))?;
     }
 
-    let enable = git_cmd(&["config", "extensions.worktreeConfig", "true"], repo_root).await?;
-    if !enable.status.success() {
-        return Err(format!(
-            "git config extensions.worktreeConfig failed: {}",
-            String::from_utf8_lossy(&enable.stderr).trim()
-        ));
+    // `extensions.worktreeConfig` lives in the SHARED `.git/config`, so under
+    // concurrent coding-agent spawns its write races on `.git/config.lock` the
+    // same way the worktree-add tracking write did. It's an idempotent
+    // repo-global flag: read it first and skip the write once it's enabled (the
+    // steady state — every spawn after the first), and on the cold-start write
+    // retry through lock contention. Without this, six near-simultaneous spawns
+    // could all lose the lock and silently fail to install the diff hook.
+    let already_enabled = matches!(
+        git_cmd(&["config", "--get", "extensions.worktreeConfig"], repo_root).await,
+        Ok(out) if out.status.success()
+            && String::from_utf8_lossy(&out.stdout).trim() == "true"
+    );
+    if !already_enabled {
+        set_shared_config_with_lock_retry(repo_root, "extensions.worktreeConfig", "true").await?;
     }
 
     let set_hooks = git_cmd(
@@ -885,5 +957,72 @@ pub(crate) async fn cleanup_failed_spawn(
                 e
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod config_lock_tests {
+    use super::*;
+
+    #[test]
+    fn config_lock_contention_recognized() {
+        assert!(is_config_lock_contention(
+            "error: could not lock config file .git/config: File exists"
+        ));
+        assert!(!is_config_lock_contention(
+            "error: pathspec 'main' did not match any file(s)"
+        ));
+        assert!(!is_config_lock_contention(""));
+    }
+
+    async fn init_repo() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        let _ = git_cmd(&["init", "-q", "-b", "main"], &repo).await;
+        let _ = git_cmd(&["config", "user.email", "t@e.com"], &repo).await;
+        let _ = git_cmd(&["config", "user.name", "T"], &repo).await;
+        let _ = git_cmd(&["commit", "-q", "--allow-empty", "-m", "init"], &repo).await;
+        (tmp, repo)
+    }
+
+    #[tokio::test]
+    async fn shared_config_write_succeeds_without_contention() {
+        let (_tmp, repo) = init_repo().await;
+        set_shared_config_with_lock_retry(&repo, "extensions.worktreeConfig", "true")
+            .await
+            .expect("uncontended write should succeed");
+        let out = git_cmd(&["config", "--get", "extensions.worktreeConfig"], &repo)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "true");
+    }
+
+    /// A held `.git/config.lock` makes `git config` fail fast (it does not
+    /// block); the retry loop must ride it out and succeed once the lock is
+    /// released, rather than surfacing the contention error.
+    #[tokio::test]
+    async fn shared_config_write_retries_until_lock_released() {
+        let (_tmp, repo) = init_repo().await;
+        let lock = repo.join(".git/config.lock");
+        tokio::fs::write(&lock, b"").await.unwrap();
+
+        // Release shortly after the first attempt fails; the 8-attempt backoff
+        // budget (~1s) comfortably covers a 60ms hold.
+        let lock_clone = lock.clone();
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let _ = tokio::fs::remove_file(&lock_clone).await;
+        });
+
+        let res =
+            set_shared_config_with_lock_retry(&repo, "extensions.worktreeConfig", "true").await;
+        let _ = releaser.await;
+        let _ = tokio::fs::remove_file(&lock).await;
+
+        assert!(
+            res.is_ok(),
+            "retry should ride out a transient lock: {:?}",
+            res.err()
+        );
     }
 }

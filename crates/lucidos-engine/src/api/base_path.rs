@@ -52,12 +52,45 @@ pub fn inject_base_href(html: &str, prefix: &str) -> String {
     if prefix == "/" {
         return html.to_string();
     }
-    let tag = format!("<base href=\"{prefix}\">");
+    insert_into_head(html, &format!("<base href=\"{prefix}\">"))
+}
+
+/// The workspace gateway's external port, from `LUCIDOS_GATEWAY_PORT` — set by
+/// the gateway when it spawns this engine (ADR 0014, `lucidos-gateway` `stack.rs`).
+/// `None` for a legacy no-gateway engine (`LUCIDOS_NO_GATEWAY`, e2e direct-engine),
+/// which has no gateway picker to address.
+pub fn gateway_port() -> Option<String> {
+    std::env::var("LUCIDOS_GATEWAY_PORT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Insert `<meta name="lucidos-gateway-port" content="…">` as the first child of
+/// `<head>`. This lets a page served on the engine's OWN port (direct access,
+/// `<base href="/">`) build an absolute URL to the gateway picker — whose origin
+/// (port) differs from the engine's, so the relative `/~/` picker route can't
+/// reach it. Behind the gateway the relative route already works, so the page
+/// ignores this; it is harmless to stamp in both cases. `None` is a no-op (no
+/// gateway). Falls back to prepending when there is no `<head>`.
+pub fn inject_gateway_port(html: &str, port: Option<&str>) -> String {
+    match port {
+        None => html.to_string(),
+        Some(port) => insert_into_head(
+            html,
+            &format!("<meta name=\"lucidos-gateway-port\" content=\"{port}\">"),
+        ),
+    }
+}
+
+/// Insert `tag` as the first child of `<head>`; prepend it when there is no
+/// `<head>`. Shared by the base-href and gateway-port stampers.
+fn insert_into_head(html: &str, tag: &str) -> String {
     match find_head_open_end(html) {
         Some(pos) => {
             let mut out = String::with_capacity(html.len() + tag.len());
             out.push_str(&html[..pos]);
-            out.push_str(&tag);
+            out.push_str(tag);
             out.push_str(&html[pos..]);
             out
         }
@@ -114,5 +147,40 @@ mod tests {
     fn inject_base_href_prepends_without_head() {
         let html = "<p>x</p>";
         assert_eq!(inject_base_href(html, "/dev/"), "<base href=\"/dev/\"><p>x</p>");
+    }
+
+    #[test]
+    fn inject_gateway_port_after_head() {
+        let html = "<html><head><meta charset=\"utf-8\"></head><body>x</body></html>";
+        let out = inject_gateway_port(html, Some("5251"));
+        assert!(out.contains(
+            "<head><meta name=\"lucidos-gateway-port\" content=\"5251\"><meta charset=\"utf-8\">"
+        ));
+    }
+
+    #[test]
+    fn inject_gateway_port_none_is_noop() {
+        let html = "<html><head></head></html>";
+        assert_eq!(inject_gateway_port(html, None), html);
+    }
+
+    #[test]
+    fn inject_gateway_port_prepends_without_head() {
+        let html = "<p>x</p>";
+        assert_eq!(
+            inject_gateway_port(html, Some("5252")),
+            "<meta name=\"lucidos-gateway-port\" content=\"5252\"><p>x</p>"
+        );
+    }
+
+    #[test]
+    fn base_href_and_gateway_port_compose() {
+        // serve_shell stamps base href, then gateway port — both land as the
+        // first child of <head>, gateway port outermost (stamped last).
+        let html = "<html><head><title>x</title></head></html>";
+        let out = inject_gateway_port(&inject_base_href(html, "/dev/"), Some("5251"));
+        assert!(out.contains(
+            "<head><meta name=\"lucidos-gateway-port\" content=\"5251\"><base href=\"/dev/\"><title>x</title>"
+        ));
     }
 }

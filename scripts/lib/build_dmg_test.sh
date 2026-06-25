@@ -57,6 +57,82 @@ else
 fi
 
 echo ""
+echo "test: --release-build is recognized and shares the version-stamp guard"
+# --release-build is a BUILD mode, so it runs the same up-front version guard as
+# --release and exits fast (before any build) on a mismatch — proving it parses.
+out="$("$PROJECT_DIR/scripts/build-dmg.sh" --release-build --release-version 99.99.99-build-dmg-test 2>&1)"
+rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "version-stamp mismatch"; then
+    pass "--release-build rejects a mismatched --release-version (recognized as a build mode)"
+else
+    fail "expected version-stamp mismatch for --release-build; got rc=$rc out: $out"
+fi
+
+echo ""
+echo "test: --release-attach requires --staging-dir"
+out="$("$PROJECT_DIR/scripts/build-dmg.sh" --release-attach --upload-tag v9.9.9 2>&1)"
+rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "requires --staging-dir"; then
+    pass "--release-attach without --staging-dir exits non-zero with a clear message"
+else
+    fail "expected --staging-dir requirement; got rc=$rc out: $out"
+fi
+
+# ── --release-attach staging guard (offline) ─────────────────────────────────
+# Build a staging fixture (fake artifacts + a real manifest) and corrupt it. Each
+# case below fails at staging VERIFICATION — before any gh/network/event — so the
+# whole suite stays offline + signing-free.
+# shellcheck source=scripts/lib/release_staging.sh
+source "$PROJECT_DIR/scripts/lib/release_staging.sh"
+make_staging() {
+    local dir; dir="$(mktemp -d)"
+    printf 'dmg\n' > "$dir/Lucidos_0.0.0_aarch64.dmg"
+    printf 'tar\n' > "$dir/Lucidos.app.tar.gz"
+    printf 'sig\n' > "$dir/Lucidos.app.tar.gz.sig"
+    release_staging_write_manifest "$dir" 0.0.0 abc123 \
+        Lucidos_0.0.0_aarch64.dmg Lucidos.app.tar.gz Lucidos.app.tar.gz.sig >/dev/null
+    printf '%s' "$dir"
+}
+
+echo ""
+echo "test: --release-attach refuses a staging dir with no manifest"
+EMPTY="$(mktemp -d)"
+out="$("$PROJECT_DIR/scripts/build-dmg.sh" --release-attach --staging-dir "$EMPTY" --upload-tag v9.9.9 2>&1)"
+rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -qi "manifest"; then
+    pass "missing manifest is refused"
+else
+    fail "expected missing-manifest refusal; got rc=$rc out: $out"
+fi
+rm -rf "$EMPTY"
+
+echo ""
+echo "test: --release-attach refuses a missing staged artifact"
+S="$(make_staging)"
+rm -f "$S/Lucidos.app.tar.gz.sig"
+out="$("$PROJECT_DIR/scripts/build-dmg.sh" --release-attach --staging-dir "$S" --upload-tag v9.9.9 2>&1)"
+rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -qi "missing"; then
+    pass "missing artifact is refused"
+else
+    fail "expected missing-artifact refusal; got rc=$rc out: $out"
+fi
+rm -rf "$S"
+
+echo ""
+echo "test: --release-attach refuses a checksum-mismatched staged artifact"
+S="$(make_staging)"
+printf 'tampered\n' >> "$S/Lucidos_0.0.0_aarch64.dmg"
+out="$("$PROJECT_DIR/scripts/build-dmg.sh" --release-attach --staging-dir "$S" --upload-tag v9.9.9 2>&1)"
+rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -qi "checksum mismatch"; then
+    pass "checksum mismatch is refused"
+else
+    fail "expected checksum-mismatch refusal; got rc=$rc out: $out"
+fi
+rm -rf "$S"
+
+echo ""
 echo "test: release scripts keep the failure-emit contract (errtrace + ERR trap)"
 # A failing stage must emit ReleaseStepFailed, not exit silently. That relies on
 # `set -E` (so the ERR trap inherits into shell functions) AND an `on_err` ERR

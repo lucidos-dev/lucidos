@@ -38,7 +38,7 @@ The security model is **unchanged and load-bearing**: the engine has no inbound 
 
 10. **Root `/` behavior is smart.** One workspace → drop the user straight in; multiple → show the picker. (Consistent with 0013's first-run "drop the user in".)
 
-11. **Boot-window UX.** During engine cold boot (pgvector init, migrations, embedding warmup, and ~20 coding-agent sessions resuming after a restart), the gateway serves a lightweight "workspace starting…" auto-retry page instead of a raw 502 (Issue 7).
+11. **Boot-window UX.** During engine cold boot (pgvector init, migrations, embedding warmup, and ~20 coding-agent sessions resuming after a restart), the gateway serves a lightweight "workspace starting…" auto-retry page instead of a raw 502 (Issue 7). The page narrates **boot-phase progress** rather than a single opaque label: the gateway shows the phases it observes itself (provisioning database, starting engine), and the engine — whose own HTTP isn't up yet — reports its internal phases (migrating, building the search index, recovering) best-effort to `POST /~/api/v1/control/workspaces/:id/boot-phase`, which the splash renders on the next 2s refresh. The phase is cleared when the workspace goes healthy or is stopped, so a later cold open starts clean. (The "building search index" phase is the long pole on a first-ever open — the embedding model is downloaded once, then cached.)
 
 ## Dev runtime topology (normative)
 
@@ -82,8 +82,12 @@ contradicting §10). The corrected model:
   toggle). On gateway boot, per workspace: an engine already answering health is
   **re-adopted**; else an `autostart` workspace is **spawned**; else it is left
   **stopped** (listed, started only on explicit open/launch). New workspaces
-  default `autostart=false` (manual); the first-run bootstrap `default` defaults
-  `true` so a fresh install opens straight into a running workspace.
+  default `autostart=false` (manual, enabled only via the picker toggle).
+  **First run** finds an empty registry, creates **nothing**, and the smart root
+  serves the **picker** so the user names their first workspace ("personal" /
+  "work" suggestions). *(Updated 2026-06-24: first run shows the picker rather
+  than auto-creating an `autostart=true` `default` workspace — there is no longer
+  any auto-created `default`.)*
 - A document navigation to a registered-but-stopped workspace (`/<slug>/`)
   **lazy-starts** it and serves the existing boot-window page (§11) — so the
   picker's "Open" and a direct URL both work on a stopped workspace. API/SSE/
@@ -138,3 +142,32 @@ access, which coexists with the gateway.
 - **Gateway as a separate crate that still depends on `lucidos-engine` (Q-new B).** Rejected — enforces a module boundary but the binary still links the whole engine, so no surface-area, binary-size, or compile win.
 - **Full multi-user with auth now (Q1).** Rejected — login/sessions/per-user isolation is a separate project; external infra can layer it on the path-prefix scheme.
 - **Subdomain per workspace (`a.lucidos.ts.net`).** Rejected (carried from 0013) — cleaner origin isolation but needs wildcard TLS + per-subdomain `serve`, materially harder off-LAN than path prefixes.
+
+## Addendum (2026-06-24): supervisor must not cull an alive-but-busy engine
+
+The gateway supervises each engine by probing `/api/v1/health`. The first
+implementation respawned an engine (past its boot grace) on a **single** missed
+probe with a 3s timeout — it could not tell "dead/wedged" from "alive but too
+busy to answer in 3s". Under a heavy load spike (the nightly e2e suite plus a
+Playwright WebKit browser pile-up raising memory pressure), healthy engines blew
+the 3s budget and were culled; each respawn is expensive (replay ~14k trigger
+events, rescan worktrees), which spiked load further and starved the *next*
+engine's probe — a self-sustaining cross-workspace **respawn storm** (577
+respawns in one night; it interrupted the nightly e2e thread `86ae9ec6`).
+
+**Decision:** the cull policy is now asymmetric and patience-based
+(`respawn_decision` in `crates/lucidos-gateway/src/server.rs`):
+
+- The probe classifies its outcome — `Healthy` / `Unreachable` (connection
+  refused, non-timeout — a strong "down" signal) / `Slow` (timed out — likely
+  alive but busy) / `Other`.
+- An engine is culled only after **consecutive** missed probes: a small
+  threshold (`DEAD_MISS_THRESHOLD`) for `Unreachable` or a dead process, a high
+  one (`SLOW_MISS_THRESHOLD`) for an alive-but-`Slow` engine. The probe timeout
+  is 5s. A real death still recovers promptly; a busy engine is never culled on a
+  transient spike.
+- Boot grace and the restart cap → `Unhealthy` terminal are unchanged.
+
+The browser-orphan half of the loop (force-stopped CC e2e sessions leaking
+Playwright browsers across respawns) is tracked separately — see
+`docs/plans/2026-06-24-gateway-respawn-storm-fix.md`.

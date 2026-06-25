@@ -479,7 +479,9 @@ impl ThreadQueue {
                         },
                     );
                 }
-                AdmissionDecision::Queue | AdmissionDecision::Overflow => {}
+                AdmissionDecision::Queue
+                | AdmissionDecision::Overflow
+                | AdmissionDecision::Coalesce => {}
             }
             decision
         };
@@ -520,6 +522,27 @@ impl ThreadQueue {
             }
             AdmissionDecision::Overflow => {
                 self.handle_overflow(entry, actor).await;
+                SubmitOutcome {
+                    entry_id,
+                    admitted: false,
+                    position: 0,
+                    completion: completion_rx,
+                }
+            }
+            AdmissionDecision::Coalesce => {
+                // A fire of this cron trigger is already active or queued — this
+                // one is redundant (cron fires carry no distinct payload). Drop
+                // it without a persisted event (it never entered the queue), and
+                // resolve completion so the awaiting submitter (cron loop /
+                // missed-grace catch-up) proceeds to the next occurrence rather
+                // than hanging on a fire that will never run.
+                log!(
+                    "[ThreadQueue] Coalesced redundant cron fire for trigger '{}'",
+                    trigger_name.as_deref().or(trigger_id.as_deref()).unwrap_or("?")
+                );
+                if let Some(tx) = entry.completion_tx.take() {
+                    let _ = tx.send(());
+                }
                 SubmitOutcome {
                     entry_id,
                     admitted: false,
@@ -1287,6 +1310,13 @@ impl ThreadQueue {
             rows.len()
         );
 
+        // Cron coalescing on recovery: rows arrive oldest-first (ORDER BY
+        // sequence). The first cron row of a trigger is kept; any later one is a
+        // duplicate scheduled fire (a restart storm re-queues the in-flight fire
+        // each boot) — drop it so reboots are cron-idempotent and can't re-stack
+        // a backlog. Tracks trigger_ids already loaded this sweep.
+        let mut seen_cron: HashSet<String> = HashSet::new();
+
         for row in rows {
             let request: ThreadQueueRequest = match serde_json::from_value(row.request) {
                 Ok(r) => r,
@@ -1303,6 +1333,23 @@ impl ThreadQueue {
             };
             let kind = request.kind();
             debug_assert_eq!(kind.as_str(), row.kind);
+
+            if kind == ThreadQueueKind::Cron {
+                if let Some(tid) = row.trigger_id.clone() {
+                    if !seen_cron.insert(tid) {
+                        // Already loaded a fire for this cron trigger — this row
+                        // is redundant. Emit ThreadQueueDropped to clear its
+                        // projection row; don't reload it into memory.
+                        self.emit_dropped(
+                            row.id,
+                            "coalesced on recovery — duplicate scheduled fire",
+                            None,
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+            }
 
             let requeue = if row.status == "queued" {
                 false // already queued — load silently, keep original queued_at

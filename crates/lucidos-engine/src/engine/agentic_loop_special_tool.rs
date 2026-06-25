@@ -844,9 +844,10 @@ impl LucidosEngine {
 
             // Trim context if needed. Intent sub-loops have no user message
             // to pin — the seed messages were synthesized by the special-tool
-            // dispatcher, not typed by a user — so pass 2 trims freely.
+            // dispatcher, not typed by a user — so pass 2 trims freely and there
+            // is no current-turn image to keep.
             let message_budget = 400_000; // ~100k tokens budget for intent sub-loops
-            trim_context_if_needed(&mut messages, message_budget, None);
+            trim_context_if_needed(&mut messages, message_budget, None, None);
 
             // Call LLM with no streaming (sub-loop doesn't stream text to frontend)
             let response = provider

@@ -641,3 +641,80 @@ fn files_require_restart_for_engine_bundled_iframe_assets() {
     ]));
 }
 
+/// Creating an isolation branch (`-b`) must NOT write upstream-tracking config.
+/// That write — triggered by `branch.autoSetupMerge` — is the ONLY thing
+/// `git worktree add` puts in the SHARED `.git/config`, and under several
+/// near-simultaneous coding-agent spawns it raced on `.git/config.lock`, failing
+/// the spawn with "could not lock config file .git/config / unable to write
+/// upstream branch configuration". `worktree_add` now passes `--no-track`, so no
+/// tracking config is written and there is nothing to collide on.
+#[tokio::test]
+async fn worktree_add_creates_branch_without_upstream_tracking() {
+    let (_tmp, repo) = make_test_repo().await;
+    // Reproduce the workspace config that made branch creation write tracking.
+    let o = git_cmd(&["config", "branch.autoSetupMerge", "always"], &repo)
+        .await
+        .unwrap();
+    assert!(o.status.success(), "set autoSetupMerge failed");
+
+    let wt_dir = tempfile::tempdir().unwrap();
+    let wt_path = wt_dir.path().join("wt");
+    let out = worktree_add(&repo, &wt_path, &["-b", "claude-code/no-track", "main"])
+        .await
+        .expect("worktree_add returned Err");
+    assert!(
+        out.status.success(),
+        "worktree_add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cfg = git_cmd(
+        &["config", "--get-regexp", r"^branch\.claude-code/no-track\."],
+        &repo,
+    )
+    .await
+    .unwrap();
+    // `--get-regexp` exits non-zero with empty stdout when nothing matches.
+    assert!(
+        !cfg.status.success() && String::from_utf8_lossy(&cfg.stdout).trim().is_empty(),
+        "branch must have no upstream tracking config, got: {}",
+        String::from_utf8_lossy(&cfg.stdout)
+    );
+}
+
+/// The reported failure, reproduced directly: a concurrent git process holds the
+/// shared `.git/config.lock` while a coding-agent spawn creates its worktree.
+/// Because `worktree_add` no longer writes the shared config (see `--no-track`
+/// above), the add must succeed even while the lock is held — the prior code
+/// died here with "could not lock config file .git/config: File exists".
+#[tokio::test]
+async fn worktree_add_succeeds_while_config_lock_is_held() {
+    let (_tmp, repo) = make_test_repo().await;
+    let o = git_cmd(&["config", "branch.autoSetupMerge", "always"], &repo)
+        .await
+        .unwrap();
+    assert!(o.status.success(), "set autoSetupMerge failed");
+
+    // Stand in for another git process mid-config-write.
+    let lock = repo.join(".git/config.lock");
+    tokio::fs::write(&lock, b"").await.unwrap();
+
+    let wt_dir = tempfile::tempdir().unwrap();
+    let wt_path = wt_dir.path().join("wt");
+    let result = worktree_add(&repo, &wt_path, &["-b", "claude-code/locked", "main"]).await;
+
+    // Release the lock regardless of outcome so nothing is left behind.
+    let _ = tokio::fs::remove_file(&lock).await;
+
+    let out = result.expect("worktree_add returned Err");
+    assert!(
+        out.status.success(),
+        "worktree_add must not need the shared config lock, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wt_path.join("init.txt").exists(),
+        "worktree not checked out"
+    );
+}
+

@@ -9,6 +9,23 @@
     overflow: hidden;
 }
 
+/* Reclaimed macOS title-bar band. Under the packaged macOS Tauri build
+   (titleBarStyle:"Overlay") the webview spans the full window height and the OS
+   traffic lights float over the top-left. This strip fills that reclaimed band
+   so it reads as our blue chrome (continuous with the header below) instead of
+   the default black bar, and it IS the window drag region (the native bar that
+   used to provide dragging is gone). It sizes to --titlebar-inset, which the
+   macOS Tauri build sets to the title-bar height before first paint (see
+   `titlebar_inset_script` in src-tauri lib.rs); everywhere else (web, PWA,
+   non-macOS) the var is unset, so the strip is 0px tall and the layout is
+   byte-for-byte identical to before. The header and everything below it are
+   untouched — only this band is added on top. */
+.titlebar-strip {
+    flex: none;
+    height: var(--titlebar-inset, 0px);
+    background: var(--titlebar-strip-bg);
+}
+
 /* ─── Content row (thread drawer + split layout) ─── */
 
 .content-row {
@@ -896,9 +913,9 @@
 }
 
 .control-panel-ws-refresh:focus-visible {
-    outline: none;
-    background: var(--bg-secondary);
-    color: var(--text-primary);
+    /* Shared --focus-ring, like every other icon button. */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
 }
 
 /* A restart is pending — draw attention to the refresh button. */
@@ -989,7 +1006,10 @@
 }
 
 .app-header .icon-btn:focus-visible {
-    outline-color: var(--header-fg);
+    /* Recolor the shared ring to the header foreground — the accent ring is
+       low-contrast on the blue header bar. The .icon-btn rule reads this
+       overridden --focus-ring for its box-shadow. */
+    --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--header-fg) 55%, transparent);
 }
 
 @media (hover: hover) {

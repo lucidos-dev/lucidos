@@ -101,9 +101,20 @@ async fn driver_task_cancellation_terminates_process() {
 
     cancel.cancel();
 
-    let exited = tokio::time::timeout(std::time::Duration::from_secs(5), agent.events_rx.recv())
+    // The cancel path is NOT instant: it runs `graceful_kill_child_process_group`,
+    // whose `GROUP_TEARDOWN_GRACE` is a FIXED `tokio::time::sleep` (it can't
+    // early-exit — the group leader is an unreaped zombie, so a liveness poll
+    // never sees the group empty; see that function's doc comment). So `Exited`
+    // cannot arrive before `GROUP_TEARDOWN_GRACE` elapses no matter how fast the
+    // sleep dies. Budget the deadline as that fixed floor PLUS generous headroom
+    // so the assertion tracks the real contract and stays robust under the timer
+    // slippage of a fully-loaded test runner (a flat 5s left only ~2s over the
+    // 3s floor and flaked under the full-suite concurrent load). A genuine
+    // "never emits Exited" hang still fails — it just has an honest budget.
+    let deadline = GROUP_TEARDOWN_GRACE + std::time::Duration::from_secs(10);
+    let exited = tokio::time::timeout(deadline, agent.events_rx.recv())
         .await
-        .expect("driver should emit Exited within 5s of cancellation")
+        .expect("driver should emit Exited within the cancel grace + headroom")
         .expect("events channel should be open");
     // Engine-initiated cancel — the driver's own SIGKILL must NOT be reported
     // as a stray signal kill (that would wrongly trigger auto-resume).

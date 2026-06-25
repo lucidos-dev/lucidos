@@ -21,11 +21,17 @@
 //! so there's nothing to recover beyond the orphan-resolution sweeps.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::path::Path;
+use std::sync::{Arc, Mutex, RwLock};
 use uuid::Uuid;
 
+use crate::engine::command_guard::{self, RiskLane, SideEffectCategory, StaticVerdict};
 use crate::engine::event_bus::{BusEvent, EventBus};
-use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
+use crate::engine::thread_events::{
+    ActorMode, EngineReason, EventMeta, MessageOrigin, ThreadDirection, ThreadEvent,
+};
+use crate::llm::tool_names as tn;
+use crate::triggers::TriggerConfig;
 
 /// User-facing reason on a denied permission. Surfaces in the response body
 /// returned to CC's MCP middleware and in the persisted `Resolved` event.
@@ -44,6 +50,26 @@ pub const SUPERSEDED_REASON: &str = "Superseded by a new message";
 /// `CodingAgentPermissionRequest`/`Resolved` event is emitted on the
 /// auto-allow path, so this string never reaches the chat UI.
 pub const SESSION_ALLOW_REASON: &str = "Allowed for this thread";
+
+/// Reason on an unattended auto-ALLOW of a benign in-workspace request (a read,
+/// an in-workspace write/edit, git, `lucidos data write`, …). The coding-agent
+/// session was launched by a trigger with no human to answer a card, so the
+/// engine resolves immediately. Like the session-allow fast path, the
+/// unattended path emits NO `CodingAgentPermissionRequest`/`Resolved` event, so
+/// this string never reaches the chat UI — it only rides the response body so
+/// the agent's tool log records *why* the prompt was bypassed.
+pub const UNATTENDED_ALLOW_BENIGN_REASON: &str =
+    "Auto-allowed: benign in-workspace operation (unattended trigger session)";
+
+/// Reason on an unattended auto-ALLOW of an irreversible side-effect whose
+/// category is covered by the originating trigger's side-effect grant.
+pub const UNATTENDED_ALLOW_GRANTED_REASON: &str =
+    "Auto-allowed: covered by the trigger's side-effect grant";
+
+/// Reason on an unattended auto-DENY of a catastrophic command — denied
+/// regardless of any grant (the command guard's hard deny-list).
+pub const UNATTENDED_DENY_CATASTROPHIC_REASON: &str =
+    "Auto-denied: catastrophic operation, never permitted unattended";
 
 /// Grouping key for collapsing identical concurrent permission requests.
 /// `canonical_input` is `serde_json::to_string(&input)` — sufficient for CC's
@@ -243,6 +269,344 @@ pub async fn lookup_thread_actor(
     }
 }
 
+/// Whether a coding-agent session has a human reachable to answer a permission
+/// card. Decided by walking the spawn tree to its root (see
+/// [`resolve_attend_mode`]): a human device at the root ⇒ [`AttendMode::Interactive`]
+/// (render a card, wait); a trigger/scheduler (or any engine origin) at the root
+/// ⇒ [`AttendMode::Unattended`] (auto-resolve, never hang).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttendMode {
+    /// A human is reachable at the root of the spawn tree — render a card and
+    /// wait indefinitely (the pre-existing behavior).
+    Interactive,
+    /// No human is reachable. Auto-resolve permission requests immediately.
+    /// `grant` is the originating trigger's side-effect grant (empty when the
+    /// root is the engine but not a scheduler-fired trigger).
+    Unattended { grant: Vec<SideEffectCategory> },
+}
+
+/// Hard cap on the spawn-tree walk so a malformed parent chain (or a cycle) can
+/// never loop forever. Real spawn trees are shallow; a chain this deep is
+/// almost certainly automated, so the cap-exceeded fallback is `Unattended`.
+const MAX_ANCESTRY_HOPS: usize = 16;
+
+/// Read a thread's *originating* `MessageOrigin` — the earliest event that
+/// carries one, among the spawn-defining event types. `TriggerStarted` (a direct
+/// scheduler-fired thread) and `MessageReceived` (chat or an agent-spawned
+/// sub-thread) both stamp a `MessageOrigin` into `payload->'origin'`. Returns
+/// `None` when no such event carries an origin (legacy rows / odd threads),
+/// which the caller treats as interactive (preserve the pre-existing behavior).
+async fn fetch_thread_origin(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<MessageOrigin> {
+    let row: Result<Option<(serde_json::Value,)>, sqlx::Error> = sqlx::query_as(
+        "SELECT payload->'origin' FROM events \
+         WHERE thread_id = $1 \
+           AND event_type IN ('TriggerStarted', 'MessageReceived') \
+           AND payload ? 'origin' \
+           AND payload->'origin' != 'null'::jsonb \
+         ORDER BY sequence ASC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await;
+    match row {
+        Ok(Some((v,))) => serde_json::from_value::<MessageOrigin>(v).ok(),
+        Ok(None) => None,
+        Err(e) => {
+            crate::log!(
+                "[CCPermission] fetch_thread_origin failed for {}: {}",
+                thread_id,
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Decide whether this coding-agent session is interactive (a human can answer a
+/// card) or unattended, and — when unattended — what side-effect grant it
+/// inherits. Walks the spawn tree from `thread_id` up to its root via the
+/// persisted `MessageOrigin` chain:
+///
+///   * `Device` / human-mode `Api`/`Workspace` at the root ⇒ `Interactive`.
+///   * `Engine { Scheduler { trigger_id } }` ⇒ `Unattended` with that trigger's
+///     `side_effect_grant` (looked up in the in-memory registry, rebuilt from
+///     events at boot — so this is restart-safe).
+///   * any other engine / system / non-human origin ⇒ `Unattended` with an
+///     empty grant.
+///   * `ThreadLink { direction: Parent }` ⇒ hop to the parent and continue.
+///
+/// Everything is derived from already-persisted events plus the trigger
+/// registry — no new persistence, no spawn-time plumbing. A user-rooted tree
+/// stays interactive even when an agent spawned the leaf coding-agent thread, so
+/// a human watching can still answer; only trigger/engine-rooted trees
+/// auto-resolve.
+pub async fn resolve_attend_mode(
+    pool: &sqlx::PgPool,
+    trigger_configs: &Arc<RwLock<HashMap<String, TriggerConfig>>>,
+    thread_id: Uuid,
+) -> AttendMode {
+    let mut current = thread_id;
+    let mut seen: HashSet<Uuid> = HashSet::new();
+    for _ in 0..MAX_ANCESTRY_HOPS {
+        if !seen.insert(current) {
+            break; // cycle guard — should never happen for a tree
+        }
+        let Some(origin) = fetch_thread_origin(pool, current).await else {
+            // No recorded origin — preserve the pre-existing interactive behavior
+            // rather than auto-resolving a thread we can't classify.
+            return AttendMode::Interactive;
+        };
+        match origin {
+            MessageOrigin::Device { .. } => return AttendMode::Interactive,
+            MessageOrigin::Api {
+                mode,
+                source_thread_id,
+                ..
+            } => match (mode, source_thread_id) {
+                (ActorMode::Human, _) => return AttendMode::Interactive,
+                (_, Some(parent)) => {
+                    current = parent;
+                }
+                (_, None) => return AttendMode::Unattended { grant: Vec::new() },
+            },
+            MessageOrigin::Workspace { mode, .. } => {
+                return match mode {
+                    ActorMode::Human => AttendMode::Interactive,
+                    _ => AttendMode::Unattended { grant: Vec::new() },
+                };
+            }
+            MessageOrigin::ThreadLink {
+                thread_id: parent,
+                direction,
+                ..
+            } => {
+                // Only a Parent link means "the linked thread spawned me"; a
+                // Child callback shouldn't be a thread's originating origin, but
+                // be safe and treat it as non-human.
+                if direction == ThreadDirection::Parent {
+                    current = parent;
+                } else {
+                    return AttendMode::Unattended { grant: Vec::new() };
+                }
+            }
+            MessageOrigin::Engine { reason } => {
+                return match reason {
+                    EngineReason::Scheduler { trigger_id, .. } => {
+                        let grant = trigger_configs
+                            .read()
+                            .ok()
+                            .and_then(|m| m.get(&trigger_id).map(|c| c.side_effect_grant.clone()))
+                            .unwrap_or_default();
+                        AttendMode::Unattended { grant }
+                    }
+                    _ => AttendMode::Unattended { grant: Vec::new() },
+                };
+            }
+            MessageOrigin::System => return AttendMode::Unattended { grant: Vec::new() },
+        }
+    }
+    // Depth/cycle exceeded — a chain this deep is automated; never hang.
+    AttendMode::Unattended { grant: Vec::new() }
+}
+
+/// Static classification of one coding-agent permission request, deciding how an
+/// unattended session resolves it. Deterministic — reuses the command guard's
+/// static passes, never the LLM judge (the permission path must not be able to
+/// stall).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestVerdict {
+    /// Benign in-workspace work — allow even with an empty grant.
+    Benign,
+    /// A catastrophic, irreversible operation — deny regardless of any grant.
+    Catastrophic,
+    /// An irreversible real-world side-effect of this category — allow only when
+    /// the trigger's grant contains it.
+    SideEffect(SideEffectCategory),
+}
+
+/// Extract the shell command from a coding-agent *command* request. Codex raises
+/// these as `command_execution`; Claude Code as `Bash`.
+fn coding_agent_command<'a>(tool_name: &str, input: &'a serde_json::Value) -> Option<&'a str> {
+    if !matches!(tool_name, "command_execution" | "Bash") {
+        return None;
+    }
+    input.get("command").and_then(|v| v.as_str())
+}
+
+/// Codex sends commands pre-wrapped as `/bin/zsh -lc '<script>'`, but the command
+/// guard's static classifier only inspects each segment's HEAD and does NOT
+/// descend into a shell `-c`/`-lc` payload — so a wrapped `curl -X POST` would
+/// read as head `zsh` → benign, silently bypassing the grant check. Unwrap a
+/// single shell `-c`-style wrapper so the inner script is what gets classified.
+/// Returns the original command when it isn't a recognized shell wrapper (Claude
+/// Code's `Bash` passes the raw command, which falls through unchanged).
+fn unwrap_shell_command(command: &str) -> &str {
+    const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "ash"];
+    let trimmed = command.trim_start();
+    let Some(first) = trimmed.split_whitespace().next() else {
+        return command;
+    };
+    let base = first.rsplit('/').next().unwrap_or(first);
+    if !SHELLS.contains(&base) {
+        return command;
+    }
+    // Walk whitespace-delimited tokens (with byte offsets) to find the `-c`-style
+    // flag; everything after it is the script. One quote layer is stripped so the
+    // common `zsh -lc 'curl …'` form classifies as a clean `curl …`.
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if start == i {
+            break;
+        }
+        if is_shell_c_flag(&trimmed[start..i]) {
+            return strip_one_quote_layer(trimmed[i..].trim());
+        }
+    }
+    command
+}
+
+/// A single-dash cluster of shell option letters that includes `c` — `-c`, `-lc`,
+/// `-ic`, `-lic`, etc. Rejects long options and non-shell flags (`-config`,
+/// `-l`).
+fn is_shell_c_flag(tok: &str) -> bool {
+    match tok.strip_prefix('-') {
+        Some(letters) if tok.len() >= 2 && !tok.starts_with("--") => {
+            letters.contains('c') && letters.chars().all(|ch| "clixeasfm".contains(ch))
+        }
+        _ => false,
+    }
+}
+
+/// Strip one matching layer of surrounding single/double quotes, if present.
+fn strip_one_quote_layer(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 2 && (b[0] == b'\'' || b[0] == b'"') && b[b.len() - 1] == b[0] {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+/// Extract the target path from a coding-agent *file-write* request. Codex
+/// raises these as `file_change` (carrying `grant_root`); Claude Code as
+/// `Edit`/`Write`/`MultiEdit`/`NotebookEdit` (carrying `file_path`/`path`).
+fn coding_agent_file_target(tool_name: &str, input: &serde_json::Value) -> Option<String> {
+    if !matches!(
+        tool_name,
+        "file_change" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
+    ) {
+        return None;
+    }
+    for key in ["file_path", "path", "notebook_path", "grant_root"] {
+        if let Some(s) = input.get(key).and_then(|v| v.as_str()) {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// True when `path` provably targets somewhere OUTSIDE the workspace root. A
+/// `..` component (absolute OR relative) can escape and can't be proven
+/// contained lexically → treat as outside (conservative: grant-gated). A
+/// relative path with no `..` resolves against the worktree (inside the
+/// workspace) → inside. Otherwise check containment against the workspace root.
+fn path_outside_workspace(path: &str, workspace_path: &Path) -> bool {
+    let p = Path::new(path);
+    // Checked FIRST, before the relative-is-inside shortcut — a relative
+    // `../../etc/...` escapes the worktree just as an absolute one does.
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return true;
+    }
+    if !p.is_absolute() {
+        return false;
+    }
+    !p.starts_with(workspace_path)
+}
+
+/// Classify one coding-agent permission request for the unattended decision.
+///
+/// * Command requests (`command_execution` / `Bash`): reuse the command guard's
+///   STATIC classification by normalizing onto its bash tool vocabulary — the
+///   catastrophic deny-list, the obviously-safe allowlist, and the static
+///   side-effect/destruction fallback all apply, with no LLM judge. An
+///   in-workspace destruction (`ReversibleDanger`) counts as benign here (it's
+///   recoverable and in-workspace); an irreversible side-effect carries its
+///   category for the grant check.
+/// * File requests (`file_change` / `Edit` / `Write` / …): an in-workspace
+///   target is benign; a target outside the workspace root is out-of-workspace
+///   destruction (grant-gated).
+/// * Anything else (reads, etc.) is benign.
+pub fn classify_coding_agent_request(
+    tool_name: &str,
+    input: &serde_json::Value,
+    workspace_path: &Path,
+) -> RequestVerdict {
+    if let Some(cmd) = coding_agent_command(tool_name, input) {
+        // Codex wraps commands as `/bin/zsh -lc '<script>'`; classify the inner
+        // script so a wrapped side-effect isn't hidden behind the `zsh` head.
+        let synthetic = serde_json::json!({ "command": unwrap_shell_command(cmd) });
+        return match command_guard::static_classify(tn::RUN_BASH, &synthetic) {
+            StaticVerdict::Settled(RiskLane::Catastrophic) => RequestVerdict::Catastrophic,
+            // `static_classify` only ever settles Safe/Catastrophic; map the
+            // rest defensively to benign.
+            StaticVerdict::Settled(_) => RequestVerdict::Benign,
+            StaticVerdict::NeedsJudge(ji) => {
+                let judged = command_guard::fallback_classify(&ji);
+                match judged.lane {
+                    RiskLane::Catastrophic => RequestVerdict::Catastrophic,
+                    RiskLane::IrreversibleDanger => RequestVerdict::SideEffect(
+                        judged.category.unwrap_or(SideEffectCategory::Other),
+                    ),
+                    RiskLane::Safe | RiskLane::ReversibleDanger => RequestVerdict::Benign,
+                }
+            }
+        };
+    }
+    if let Some(path) = coding_agent_file_target(tool_name, input) {
+        if path_outside_workspace(&path, workspace_path) {
+            return RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction);
+        }
+        return RequestVerdict::Benign;
+    }
+    RequestVerdict::Benign
+}
+
+/// Resolve a permission request for an unattended session from its classified
+/// verdict and the inherited grant. Returns `(allowed, reason)`.
+fn decide_unattended(verdict: RequestVerdict, grant: &[SideEffectCategory]) -> (bool, String) {
+    match verdict {
+        RequestVerdict::Benign => (true, UNATTENDED_ALLOW_BENIGN_REASON.to_string()),
+        RequestVerdict::Catastrophic => (false, UNATTENDED_DENY_CATASTROPHIC_REASON.to_string()),
+        RequestVerdict::SideEffect(cat) => {
+            if grant.contains(&cat) {
+                (true, UNATTENDED_ALLOW_GRANTED_REASON.to_string())
+            } else {
+                (
+                    false,
+                    format!(
+                        "Auto-denied: this coding-agent session runs unattended under a trigger \
+                         that did not grant {} — add the matching category to the trigger's \
+                         side-effect grant to allow it.",
+                        cat.reason()
+                    ),
+                )
+            }
+        }
+    }
+}
+
 /// One blocking permission round-trip — the shared core both permission
 /// raise paths drive:
 ///
@@ -253,7 +617,13 @@ pub async fn lookup_thread_actor(
 ///     requests)
 ///
 /// Flow: session-allow pre-check (an earlier "Allow for this thread" click
-/// whose pattern matches skips the prompt entirely) → dedup
+/// whose pattern matches skips the prompt entirely) → **unattended fast path**
+/// (a trigger/engine-rooted session has no human to answer a card, so
+/// [`resolve_attend_mode`] + [`classify_coding_agent_request`] +
+/// [`decide_unattended`] resolve it immediately — benign in-workspace work
+/// auto-allows, an irreversible side-effect auto-allows iff the originating
+/// trigger granted its category, everything else auto-denies; emits no card
+/// events, so the session never hangs) → otherwise (interactive) dedup
 /// `register_or_attach` (identical concurrent requests share one card) → if
 /// canonical, emit `CodingAgentPermissionRequest` (rendered as a
 /// PermissionCard) → wait **indefinitely** on the broadcast for the user's
@@ -264,6 +634,8 @@ pub async fn prompt_coding_agent_permission(
     pool: &sqlx::PgPool,
     event_bus: &EventBus,
     pending: &Mutex<PermissionState>,
+    trigger_configs: &Arc<RwLock<HashMap<String, TriggerConfig>>>,
+    workspace_path: &Path,
     thread_id: Uuid,
     tool_use_id: String,
     tool_name: String,
@@ -283,6 +655,30 @@ pub async fn prompt_coding_agent_permission(
         return PermissionPromptOutcome {
             allowed: true,
             reason: Some(SESSION_ALLOW_REASON.to_string()),
+        };
+    }
+
+    // Unattended (trigger/engine-rooted) sessions have no human to answer a
+    // card — resolve immediately from the originating trigger's inherited
+    // side-effect grant plus a static benign check, so the session NEVER hangs.
+    // Like the session-allow fast path above, this emits no card events. An
+    // auto-allow surfaces as the normal CodingAgentToolCalled/Result; an
+    // auto-deny surfaces in the agent's own failure report.
+    if let AttendMode::Unattended { grant } =
+        resolve_attend_mode(pool, trigger_configs, thread_id).await
+    {
+        let verdict = classify_coding_agent_request(&tool_name, &input, workspace_path);
+        let (allowed, reason) = decide_unattended(verdict, &grant);
+        crate::log!(
+            "[CCPermission] unattended auto-resolve thread={} tool={} -> {} ({})",
+            thread_id,
+            tool_name,
+            if allowed { "allow" } else { "deny" },
+            reason
+        );
+        return PermissionPromptOutcome {
+            allowed,
+            reason: Some(reason),
         };
     }
 
@@ -605,6 +1001,472 @@ mod tests {
         .expect("SessionStarted persisted");
     }
 
+    fn empty_trigger_configs() -> Arc<RwLock<HashMap<String, TriggerConfig>>> {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    /// Build a one-entry trigger registry whose trigger carries `grant`.
+    fn trigger_configs_with(
+        trigger_id: &str,
+        grant: Vec<SideEffectCategory>,
+    ) -> Arc<RwLock<HashMap<String, TriggerConfig>>> {
+        let payload = serde_json::json!({
+            "trigger_id": trigger_id,
+            "name": "Test Trigger",
+            "schedule": ["0 0 3 * * *"],
+            "timezone": "UTC",
+            "run": { "type": "intent", "intent": "do nightly work" },
+            "side_effect_grant": serde_json::to_value(&grant).unwrap(),
+        });
+        let config = TriggerConfig::from_created_payload(&payload).expect("build TriggerConfig");
+        let mut map = HashMap::new();
+        map.insert(trigger_id.to_string(), config);
+        Arc::new(RwLock::new(map))
+    }
+
+    /// Insert a raw event row carrying `{"origin": <origin>}` so the resolver's
+    /// `payload->'origin'` query has something to read — cheaper than driving a
+    /// full MessageReceived through the bus + lifecycle guard.
+    async fn insert_origin_event(
+        pool: &sqlx::PgPool,
+        thread_id: Uuid,
+        event_type: &str,
+        origin: &MessageOrigin,
+    ) {
+        let payload = serde_json::json!({ "origin": origin });
+        sqlx::query(
+            "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+             VALUES ($1, 'thread', $2, $3, $4, NOW(), $2::uuid)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(thread_id.to_string())
+        .bind(event_type)
+        .bind(payload)
+        .execute(pool)
+        .await
+        .expect("insert origin event");
+    }
+
+    fn parent_link(parent: Uuid) -> MessageOrigin {
+        MessageOrigin::ThreadLink {
+            thread_id: parent,
+            title: None,
+            spawning_event_id: None,
+            mode: ActorMode::Agent,
+            direction: ThreadDirection::Parent,
+        }
+    }
+
+    fn scheduler_origin(trigger_id: &str) -> MessageOrigin {
+        MessageOrigin::engine(EngineReason::Scheduler {
+            trigger_id: trigger_id.to_string(),
+            trigger_name: None,
+        })
+    }
+
+    // --- classifier (pure, no DB) ------------------------------------------
+
+    #[test]
+    fn classify_benign_in_workspace_command_allows() {
+        // `lucidos data write` is not a recognized side-effect / destruction
+        // shape, so it classifies benign — the reported work-tracker write.
+        let v = classify_coding_agent_request(
+            "command_execution",
+            &serde_json::json!({
+                "command": "lucidos data write artifacts/work-tracker/data.json --from /tmp/x.json"
+            }),
+            Path::new("/ws"),
+        );
+        assert_eq!(v, RequestVerdict::Benign);
+    }
+
+    #[test]
+    fn classify_external_api_command_is_side_effect() {
+        let v = classify_coding_agent_request(
+            "command_execution",
+            &serde_json::json!({"command": "curl -X POST https://example.com/api -d @data"}),
+            Path::new("/ws"),
+        );
+        assert_eq!(v, RequestVerdict::SideEffect(SideEffectCategory::ExternalApi));
+    }
+
+    #[test]
+    fn classify_email_command_is_side_effect() {
+        let v = classify_coding_agent_request(
+            "Bash",
+            &serde_json::json!({"command": "echo body | mail -s hi a@b.com"}),
+            Path::new("/ws"),
+        );
+        assert_eq!(v, RequestVerdict::SideEffect(SideEffectCategory::Email));
+    }
+
+    #[test]
+    fn classify_catastrophic_command_denied() {
+        let v = classify_coding_agent_request(
+            "command_execution",
+            &serde_json::json!({"command": "rm -rf /"}),
+            Path::new("/ws"),
+        );
+        assert_eq!(v, RequestVerdict::Catastrophic);
+    }
+
+    #[test]
+    fn classify_in_workspace_file_write_is_benign() {
+        let v = classify_coding_agent_request(
+            "file_change",
+            &serde_json::json!({"grant_root": "/ws/data/artifacts"}),
+            Path::new("/ws"),
+        );
+        assert_eq!(v, RequestVerdict::Benign);
+    }
+
+    #[test]
+    fn classify_out_of_workspace_file_write_is_side_effect() {
+        let v = classify_coding_agent_request(
+            "Write",
+            &serde_json::json!({"file_path": "/etc/cron.d/evil"}),
+            Path::new("/ws"),
+        );
+        assert_eq!(
+            v,
+            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction)
+        );
+    }
+
+    #[test]
+    fn classify_relative_dotdot_file_write_is_side_effect() {
+        // A relative target that escapes the worktree via `..` must NOT slip
+        // through as benign — it's grant-gated out-of-workspace destruction.
+        let v = classify_coding_agent_request(
+            "Edit",
+            &serde_json::json!({"file_path": "../../etc/cron.d/evil"}),
+            Path::new("/ws"),
+        );
+        assert_eq!(
+            v,
+            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction)
+        );
+    }
+
+    #[test]
+    fn classify_unknown_tool_is_benign() {
+        let v = classify_coding_agent_request(
+            "Read",
+            &serde_json::json!({"file_path": "/etc/passwd"}),
+            Path::new("/ws"),
+        );
+        assert_eq!(v, RequestVerdict::Benign);
+    }
+
+    #[test]
+    fn unwrap_shell_command_cases() {
+        // The realistic Codex shape.
+        assert_eq!(
+            unwrap_shell_command("/bin/zsh -lc 'curl -X POST https://x -d @y'"),
+            "curl -X POST https://x -d @y"
+        );
+        assert_eq!(unwrap_shell_command("bash -c \"rm -rf /\""), "rm -rf /");
+        // Not a shell wrapper → unchanged (Claude Code's raw Bash command).
+        assert_eq!(
+            unwrap_shell_command("curl -X POST https://x"),
+            "curl -X POST https://x"
+        );
+        // Shell with no -c flag → unchanged.
+        assert_eq!(unwrap_shell_command("zsh script.sh"), "zsh script.sh");
+    }
+
+    #[test]
+    fn classify_zsh_wrapped_side_effect_is_detected() {
+        // Codex wraps everything in `/bin/zsh -lc '…'`; the inner side-effect
+        // must still be seen (otherwise the grant check is bypassed).
+        let v = classify_coding_agent_request(
+            "command_execution",
+            &serde_json::json!({"command": "/bin/zsh -lc 'curl -X POST https://example.com -d @x'"}),
+            Path::new("/ws"),
+        );
+        assert_eq!(v, RequestVerdict::SideEffect(SideEffectCategory::ExternalApi));
+    }
+
+    #[test]
+    fn classify_zsh_wrapped_benign_is_benign() {
+        let v = classify_coding_agent_request(
+            "command_execution",
+            &serde_json::json!({
+                "command": "/bin/zsh -lc 'lucidos data write artifacts/work-tracker/data.json --from /tmp/x.json'"
+            }),
+            Path::new("/ws"),
+        );
+        assert_eq!(v, RequestVerdict::Benign);
+    }
+
+    #[test]
+    fn classify_zsh_wrapped_catastrophic_is_catastrophic() {
+        let v = classify_coding_agent_request(
+            "command_execution",
+            &serde_json::json!({"command": "/bin/zsh -lc 'rm -rf /'"}),
+            Path::new("/ws"),
+        );
+        assert_eq!(v, RequestVerdict::Catastrophic);
+    }
+
+    #[test]
+    fn path_outside_workspace_cases() {
+        let ws = Path::new("/ws");
+        assert!(!path_outside_workspace("/ws/data/x", ws));
+        assert!(!path_outside_workspace("relative/path", ws)); // relative, no .. → inside
+        assert!(path_outside_workspace("/etc/passwd", ws));
+        assert!(path_outside_workspace("/ws/../etc", ws)); // absolute .. → outside
+        // Relative `..` escapes the worktree too — must be caught (the gate is
+        // checked before the relative-is-inside shortcut).
+        assert!(path_outside_workspace("../../etc/cron.d/evil", ws));
+    }
+
+    // --- decision matrix (pure, no DB) -------------------------------------
+
+    #[test]
+    fn decide_benign_allows_with_empty_grant() {
+        let (allowed, _) = decide_unattended(RequestVerdict::Benign, &[]);
+        assert!(allowed);
+    }
+
+    #[test]
+    fn decide_catastrophic_denies_even_when_other_granted() {
+        let (allowed, _) =
+            decide_unattended(RequestVerdict::Catastrophic, &[SideEffectCategory::Other]);
+        assert!(!allowed);
+    }
+
+    #[test]
+    fn decide_side_effect_allows_only_when_granted() {
+        let (allowed, reason) = decide_unattended(
+            RequestVerdict::SideEffect(SideEffectCategory::Email),
+            &[SideEffectCategory::Email],
+        );
+        assert!(allowed);
+        assert_eq!(reason, UNATTENDED_ALLOW_GRANTED_REASON);
+
+        let (denied, _) = decide_unattended(
+            RequestVerdict::SideEffect(SideEffectCategory::Email),
+            &[SideEffectCategory::ExternalApi],
+        );
+        assert!(!denied);
+    }
+
+    // --- resolver (DB-backed) ----------------------------------------------
+
+    #[tokio::test]
+    async fn resolve_attend_mode_human_device_is_interactive() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let thread_id = Uuid::new_v4();
+        insert_origin_event(
+            &pool,
+            thread_id,
+            "MessageReceived",
+            &MessageOrigin::Device {
+                device_id: "d1".into(),
+                label: "Phone".into(),
+            },
+        )
+        .await;
+        let mode = resolve_attend_mode(&pool, &empty_trigger_configs(), thread_id).await;
+        assert_eq!(mode, AttendMode::Interactive);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_attend_mode_trigger_root_inherits_grant() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let trigger_id = "trig-1";
+        let thread_id = Uuid::new_v4();
+        insert_origin_event(&pool, thread_id, "TriggerStarted", &scheduler_origin(trigger_id)).await;
+        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::ExternalApi]);
+        let mode = resolve_attend_mode(&pool, &cfgs, thread_id).await;
+        assert_eq!(
+            mode,
+            AttendMode::Unattended {
+                grant: vec![SideEffectCategory::ExternalApi]
+            }
+        );
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_attend_mode_walks_agent_subthread_to_trigger_root() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let trigger_id = "trig-2";
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        insert_origin_event(&pool, root, "TriggerStarted", &scheduler_origin(trigger_id)).await;
+        insert_origin_event(&pool, child, "MessageReceived", &parent_link(root)).await;
+        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::Email]);
+        let mode = resolve_attend_mode(&pool, &cfgs, child).await;
+        assert_eq!(
+            mode,
+            AttendMode::Unattended {
+                grant: vec![SideEffectCategory::Email]
+            }
+        );
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_attend_mode_human_rooted_subthread_is_interactive() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        insert_origin_event(
+            &pool,
+            root,
+            "MessageReceived",
+            &MessageOrigin::Device {
+                device_id: "d".into(),
+                label: "Mac".into(),
+            },
+        )
+        .await;
+        insert_origin_event(&pool, child, "MessageReceived", &parent_link(root)).await;
+        let mode = resolve_attend_mode(&pool, &empty_trigger_configs(), child).await;
+        assert_eq!(mode, AttendMode::Interactive);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_attend_mode_no_origin_is_interactive() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let mode = resolve_attend_mode(&pool, &empty_trigger_configs(), Uuid::new_v4()).await;
+        assert_eq!(mode, AttendMode::Interactive);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    // --- unattended prompt path (DB-backed) --------------------------------
+
+    #[tokio::test]
+    async fn unattended_trigger_session_auto_allows_benign_without_card() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let pending = Arc::new(Mutex::new(PermissionState::default()));
+        let trigger_id = "trig-benign";
+        let thread_id = Uuid::new_v4();
+        seed_cc_thread(&bus, thread_id).await;
+        insert_origin_event(&pool, thread_id, "MessageReceived", &scheduler_origin(trigger_id)).await;
+        let cfgs = trigger_configs_with(trigger_id, vec![]);
+
+        // No broadcast is ever fired — if the call WAITED for a card, the timeout
+        // would fire and fail the test. That is the no-hang invariant.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            prompt_coding_agent_permission(
+                &pool,
+                &bus,
+                &pending,
+                &cfgs,
+                Path::new("/ws"),
+                thread_id,
+                "i".into(),
+                "command_execution".into(),
+                serde_json::json!({
+                    "command": "/bin/zsh -lc 'lucidos data write artifacts/work-tracker/data.json --from /tmp/x.json'"
+                }),
+            ),
+        )
+        .await
+        .expect("unattended resolve must not hang");
+        assert!(outcome.allowed, "benign in-workspace write auto-allows");
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE thread_id = $1 AND event_type = 'CodingAgentPermissionRequest'",
+        )
+        .bind(thread_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(count, 0, "unattended path must not render a card");
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn unattended_trigger_denies_ungranted_side_effect() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let pending = Arc::new(Mutex::new(PermissionState::default()));
+        let trigger_id = "trig-nogrant";
+        let thread_id = Uuid::new_v4();
+        seed_cc_thread(&bus, thread_id).await;
+        insert_origin_event(&pool, thread_id, "TriggerStarted", &scheduler_origin(trigger_id)).await;
+        let cfgs = trigger_configs_with(trigger_id, vec![]); // grants nothing
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            prompt_coding_agent_permission(
+                &pool,
+                &bus,
+                &pending,
+                &cfgs,
+                Path::new("/ws"),
+                thread_id,
+                "i".into(),
+                "command_execution".into(),
+                serde_json::json!({"command": "/bin/zsh -lc 'curl -X POST https://example.com -d @x'"}),
+            ),
+        )
+        .await
+        .expect("must not hang");
+        assert!(!outcome.allowed, "ungranted external API auto-denies");
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn unattended_trigger_allows_granted_side_effect() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let pending = Arc::new(Mutex::new(PermissionState::default()));
+        let trigger_id = "trig-grant";
+        let thread_id = Uuid::new_v4();
+        seed_cc_thread(&bus, thread_id).await;
+        insert_origin_event(&pool, thread_id, "TriggerStarted", &scheduler_origin(trigger_id)).await;
+        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::ExternalApi]);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            prompt_coding_agent_permission(
+                &pool,
+                &bus,
+                &pending,
+                &cfgs,
+                Path::new("/ws"),
+                thread_id,
+                "i".into(),
+                "command_execution".into(),
+                serde_json::json!({"command": "/bin/zsh -lc 'curl -X POST https://example.com -d @x'"}),
+            ),
+        )
+        .await
+        .expect("must not hang");
+        assert!(outcome.allowed, "granted external API auto-allows");
+        assert_eq!(outcome.reason.as_deref(), Some(UNATTENDED_ALLOW_GRANTED_REASON));
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
     /// The full blocking round-trip both raise paths (CC MCP HTTP, Codex
     /// app-server bridge) share: the canonical caller emits ONE
     /// `CodingAgentPermissionRequest`, the user's click (the consent
@@ -623,11 +1485,14 @@ mod tests {
             let pool = pool.clone();
             let bus = bus.clone();
             let pending = pending.clone();
+            let trigger_configs = empty_trigger_configs();
             tokio::spawn(async move {
                 prompt_coding_agent_permission(
                     &pool,
                     &bus,
                     &pending,
+                    &trigger_configs,
+                    Path::new("/tmp"),
                     thread_id,
                     "i1".to_string(),
                     "command_execution".to_string(),
@@ -702,6 +1567,8 @@ mod tests {
             &pool,
             &bus,
             &pending,
+            &empty_trigger_configs(),
+            Path::new("/tmp"),
             thread_id,
             "i2".to_string(),
             "Bash".to_string(),

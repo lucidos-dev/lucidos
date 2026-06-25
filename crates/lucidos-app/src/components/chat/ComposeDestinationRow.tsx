@@ -1,6 +1,6 @@
 import { useRef } from 'preact/hooks';
 import type { CodingAgent } from '../../api/types';
-import { repositories, selectedScope, selectedCodingAgent, appsList } from '../../store/store';
+import { repositories, selectedScope, selectedCodingAgent, appsList, enginePackaged } from '../../store/store';
 import { loadApps } from '../../store/actions/apps';
 import { loadRepositories } from '../../store/actions/chat';
 import { applyDestination, type ComposeMode } from '../../store/actions/compose';
@@ -11,12 +11,12 @@ import {
   destinationToOptionValue,
   parseOptionValue,
   destinationCaption,
-  LUCIDOS_AGENT_BLURB,
   LUCIDOS_SOURCE_REPO_NAME,
   REGISTER_REPO_OPTION_VALUE,
   type ComposeDestination,
 } from '../../store/composeDestination';
-import { Dropdown, type DropdownOption } from '../shared/Dropdown';
+import { buildDestinationOptions } from './composeDestinationOptions';
+import { Dropdown } from '../shared/Dropdown';
 import { focusPromptNow } from './promptFocus';
 
 type DestinationSelectionDeps = {
@@ -102,56 +102,17 @@ export function ComposeDestinationRow({ threadId, toggleMode, fading }: {
   if (fading) dest = lastDestRef.current;
   else lastDestRef.current = dest;
 
-  const options: DropdownOption[] = [
-    {
-      value: destinationToOptionValue({ kind: 'lucidos-agent' }),
-      label: 'Lucidos Agent',
-      description: LUCIDOS_AGENT_BLURB,
-    },
-    { value: '__hdr-coding', label: 'Coding agent on…', disabled: true },
-    {
-      value: destinationToOptionValue({ kind: 'coding', scope: { kind: 'lucidos' } }),
-      label: 'Lucidos source',
-      description: "The Lucidos platform's own code",
-    },
-  ];
-  for (const a of apps) {
-    options.push({
-      value: destinationToOptionValue({ kind: 'coding', scope: { kind: 'app', appId: a.id } }),
-      label: `${a.name} · app`,
-    });
-  }
-  for (const r of externalRepos) {
-    options.push({
-      value: destinationToOptionValue({ kind: 'coding', scope: { kind: 'external', repoId: r.id } }),
-      label: `${r.name} · repository`,
-    });
-  }
-  // Loading must not look like "no apps / no repos" — the open menu carries
-  // an explicit pending row until both lists have settled.
-  if (listsPending) {
-    options.push({ value: '__loading', label: 'Loading…', disabled: true });
-  }
-  // Failed must look different from empty — each list gets its own error row.
-  if (reposLoadable.status === 'failed') {
-    options.push({
-      value: '__repos-error',
-      label: 'Failed to load repositories',
-      description: reposLoadable.error,
-      disabled: true,
-      danger: true,
-    });
-  }
-  if (appsLoadable.status === 'failed') {
-    options.push({
-      value: '__apps-error',
-      label: 'Failed to load apps',
-      description: appsLoadable.error,
-      disabled: true,
-      danger: true,
-    });
-  }
-  options.push({ value: REGISTER_REPO_OPTION_VALUE, label: '＋ Register a repository…' });
+  // "Lucidos source" is gated on a dev build: a packaged install has no source
+  // checkout, so the option would 500 on send (see composeDestinationOptions).
+  const options = buildDestinationOptions({
+    dest,
+    apps,
+    externalRepos,
+    packaged: enginePackaged.value,
+    listsPending,
+    reposError: reposLoadable.status === 'failed' ? reposLoadable.error : null,
+    appsError: appsLoadable.status === 'failed' ? appsLoadable.error : null,
+  });
 
   const codingScope = dest.kind === 'coding' ? dest.scope : null;
   const scopeAppId = codingScope?.kind === 'app' ? codingScope.appId : null;
@@ -159,19 +120,7 @@ export function ComposeDestinationRow({ threadId, toggleMode, fading }: {
   const appName = scopeAppId ? apps.find(a => a.id === scopeAppId)?.name : undefined;
   const repoName = scopeRepoId ? repos.find(r => r.id === scopeRepoId)?.name : undefined;
 
-  // A restored coding target whose app/repo no longer exists would render the
-  // loading placeholder forever — surface it as an explicit unavailable row
-  // instead once the lists have settled (sending would target a dead folder;
-  // the engine rejects it, but the picker shouldn't pretend it's loading).
   const value = destinationToOptionValue(dest);
-  if (!listsPending && !options.some(o => o.value === value)) {
-    options.push({
-      value,
-      label: `${scopeAppId ?? scopeRepoId ?? value} · unavailable`,
-      disabled: true,
-      danger: true,
-    });
-  }
 
   return (
     <>

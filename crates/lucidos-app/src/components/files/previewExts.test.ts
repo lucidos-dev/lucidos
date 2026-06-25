@@ -1,5 +1,38 @@
 import { describe, it, expect } from 'vitest';
-import { isEditableDataFile } from './previewExts';
+import { isEditableDataFile, previewMediaKind } from './previewExts';
+
+describe('previewMediaKind', () => {
+  // Regression: the repo file viewer (RepoFileContent) fetched EVERY file as
+  // text and rendered it line-numbered, so a PNG icon showed as raw bytes. It
+  // must classify binary images as 'image' so they divert to a URL-pointed
+  // <img> instead of the text path.
+  it('classifies image extensions as image', () => {
+    for (const ext of ['png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'bmp']) {
+      expect(previewMediaKind(ext)).toBe('image');
+    }
+  });
+
+  it('classifies video and audio extensions', () => {
+    expect(previewMediaKind('mp4')).toBe('video');
+    expect(previewMediaKind('mov')).toBe('video');
+    expect(previewMediaKind('mp3')).toBe('audio');
+    expect(previewMediaKind('ogg')).toBe('audio');
+  });
+
+  it('classifies pdf', () => {
+    expect(previewMediaKind('pdf')).toBe('pdf');
+  });
+
+  it('treats svg as text (XML, rendered via the rich/source path, not <img>-by-ext)', () => {
+    expect(previewMediaKind('svg')).toBe('text');
+  });
+
+  it('treats source/unknown/extensionless files as text', () => {
+    for (const ext of ['ts', 'rs', 'md', 'json', 'lock', '']) {
+      expect(previewMediaKind(ext)).toBe('text');
+    }
+  });
+});
 
 describe('isEditableDataFile', () => {
   it('allows text data files', () => {

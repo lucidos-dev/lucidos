@@ -2,7 +2,7 @@ import { Fragment } from 'preact';
 import type { ComponentChild } from 'preact';
 import { useState, useEffect } from 'preact/hooks';
 import { NotificationsBell } from '../notifications/NotificationsBell';
-import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, diffWholeFile, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen } from '../../store/store';
+import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, diffWholeFile, diffWholeFileEffective, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen } from '../../store/store';
 import { closeUrl, refreshFilePreview } from '../../store/actions/artifacts';
 import { getAppFrameSrc, getVisibleAppFrame, exitPseudoFullscreen, refreshAppUI, toggleAppSearch } from '../../store/actions/apps';
 import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon, FileIcon, DiffIcon } from '../shared/icons';
@@ -163,9 +163,11 @@ export function ContentHeaderActions() {
         isDiff ? 'Diff is fixed to this change' : undefined,
       ));
       // Diff-only: toggle between the unified hunks and the whole file in its
-      // merged end state. Orthogonal to the source/rendered toggle below.
+      // merged end state. Orthogonal to the source/rendered toggle below. Read
+      // the effective state (which carries the added-file default) so the icon
+      // matches what's shown, and write the inverse as an explicit override.
       if (isDiff) {
-        const wholeFile = diffWholeFile.value;
+        const wholeFile = diffWholeFileEffective.value;
         addAction('diff-whole-file',
           <button
             class="icon-btn header-icon diff-whole-file-toggle"

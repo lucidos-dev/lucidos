@@ -32,6 +32,11 @@ pub fn router() -> Router<GatewayState> {
         .route("/workspaces/:id/restart", post(restart))
         .route("/workspaces/:id/stop", post(stop))
         .route("/workspaces/:id/autostart", post(set_autostart))
+        // A booting engine reports its current phase here (best-effort) so the
+        // boot splash can narrate the wait. Called by the engine during its own
+        // startup, before its HTTP server is up — see the engine's
+        // `report_boot_phase`.
+        .route("/workspaces/:id/boot-phase", post(set_boot_phase))
         .route("/workspaces/:id", delete(delete_workspace))
 }
 
@@ -61,6 +66,13 @@ struct AutostartBody {
     enabled: bool,
 }
 
+#[derive(Deserialize)]
+struct BootPhaseBody {
+    /// Kebab-case phase name (see [`crate::boot_phase::BootPhase::from_wire`]).
+    /// An unrecognized value is accepted and ignored (forward-compatible).
+    phase: String,
+}
+
 #[derive(Deserialize, Default)]
 struct DeleteBody {
     /// Type-the-name confirmation. When present it must match the workspace's
@@ -84,7 +96,7 @@ async fn create(
     // Picker "+ New": auto-start off by default — the user opens it now; whether
     // it auto-starts on a future gateway boot is their per-workspace toggle.
     let status = state
-        .create_workspace(name, false)
+        .create_workspace(name)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(json!({ "workspace": status })))
@@ -201,11 +213,14 @@ async fn restore_status(State(state): State<GatewayState>) -> Json<RestoreStatus
 }
 
 /// Gateway self-update status for the picker's reload control: this process's
-/// build id, and whether a newer gateway binary is on disk waiting to be adopted.
+/// build id, whether a newer gateway binary is on disk waiting to be adopted, and
+/// whether this is a packaged build (the picker hides the dev-only self-reload
+/// control when `packaged`).
 async fn gateway_status(State(state): State<GatewayState>) -> Json<Value> {
     Json(json!({
         "build_id": state.build_id(),
         "update_available": state.gateway_update_available().await,
+        "packaged": state.packaged(),
     }))
 }
 
@@ -293,6 +308,25 @@ async fn stop(
         .await
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     Ok(StatusCode::ACCEPTED)
+}
+
+/// Record the booting engine's current phase for the boot splash. Best-effort
+/// telemetry: an unknown phase string is accepted and ignored (a newer engine
+/// may report a phase this gateway doesn't render), and an unknown/healthy
+/// workspace is a harmless no-op (the splash only renders for a stopped slug;
+/// the next healthy probe clears the phase). 204 on success (400 only for a
+/// malformed id, which the engine never sends); either way the engine's
+/// fire-and-forget caller ignores the response, so a report can't fail the boot.
+async fn set_boot_phase(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(body): Json<BootPhaseBody>,
+) -> Result<StatusCode, ApiError> {
+    reject_invalid_id(&id)?;
+    if let Some(phase) = crate::boot_phase::BootPhase::from_wire(&body.phase) {
+        state.set_boot_phase(&id, phase);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Flip a workspace's auto-start flag (registry only; does not start/stop the

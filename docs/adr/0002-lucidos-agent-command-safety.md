@@ -148,3 +148,50 @@ Phased build: `docs/plans/2026-06-08-agent-command-safety-implementation.md`.
 | **Reuse the MCP `--permission-prompt-tool` path for chat** | Pointless for an in-process agent; the loop already has `QuestionWaitRegistry` pause/resume. |
 | **Undo-only, no prompts** | Can't cover irreversible real-world side-effects (the #1 threat) — you can't git-revert a sent email. Undo is the *reversible* lane only. |
 | **Runtime prompt for triggers too** | Deadlocks an unattended trigger; nobody to click. Pre-authorize at setup instead. |
+
+## Addendum (2026-06-25): Phase 5 grant extended to unattended coding-agent sessions
+
+**Context.** Phase 5 gave a *trigger* a *side-effect grant* so its *Lucidos Agent*
+(chat) command-guard runs could perform pre-authorized irreversible side-effects
+unattended. But a trigger can also spawn a *coding-agent thread* (Claude Code /
+Codex) — directly, or as an agent-spawned sub-thread of an orchestrator. Those
+threads have their own permission flow (`CodingAgentPermissionRequest`, ADR 0005
+for Codex), which waited **indefinitely** for a human to click the card. With no
+human present, a trigger-spawned coding-agent thread that hit a sandbox
+escalation / out-of-cwd write **hung forever** (observed: a nightly Codex
+security scan stuck on `lucidos data write` to the workspace `data/` dir, blocked
+by Codex's `workspace-write` sandbox).
+
+**Decision.** The grant now **also governs unattended coding-agent sessions**, at
+the shared permission chokepoint `engine::cc_permission::prompt_coding_agent_permission`
+(both the CC MCP HTTP path and the Codex app-server bridge funnel through it):
+
+1. **Attend mode by spawn-tree root.** `resolve_attend_mode` walks the thread's
+   persisted `MessageOrigin` chain to its root. Human device at the root ⇒
+   *interactive* (unchanged: emit a card, wait). Trigger/scheduler at the root ⇒
+   *unattended*, inheriting that trigger's `side_effect_grant` from the in-memory
+   registry (rebuilt from events at boot ⇒ restart-safe). A user-rooted tree
+   stays interactive even when an agent spawned the leaf thread.
+2. **Static classification, no judge.** `classify_coding_agent_request` reuses the
+   command guard's `static_classify` / `fallback_classify` (commands) plus a
+   workspace-containment check (file writes) — deterministic, so the permission
+   path can't itself stall.
+3. **Decision (`decide_unattended`).** Benign in-workspace work → allow; an
+   irreversible `SideEffectCategory` in the grant → allow; an ungranted
+   irreversible side-effect → deny; catastrophic → deny. The unattended path emits
+   **no** card events (mirrors the session-allow fast path), so it never hangs.
+4. **Deny ≠ fail-run (the difference from chat).** The chat command guard returns
+   `FailTrigger` and fails the whole run on an ungranted side-effect. The
+   coding-agent path denies just the **one** request — the agent receives the
+   denial and routes around it or reports the step failed. Applies regardless of
+   the `command_guard` toggle (the coding-agent permission flow is always on).
+
+**Non-goals.** No change to Codex's `approvalPolicy` (kept `on-request` so an
+auto-**allowed** escalation actually runs — the benign work-tracker write
+succeeds). No sandbox `writable_roots` change, no new persisted events / migration,
+no LLM judge in the permission path. Interactive sessions are unchanged.
+
+Implementation: `engine/cc_permission.rs` (`AttendMode`, `resolve_attend_mode`,
+`RequestVerdict`, `classify_coding_agent_request`, `decide_unattended`). Plan:
+`docs/plans/2026-06-25-trigger-coding-agent-inherited-grant.md`. See also ADR 0005
+(the Codex app-server approval bridge this rides on).

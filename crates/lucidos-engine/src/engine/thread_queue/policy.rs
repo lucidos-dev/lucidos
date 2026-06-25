@@ -135,6 +135,10 @@ pub enum AdmissionDecision {
     Queue,
     /// The trigger's queue is at its hard ceiling — apply [`OverflowPolicy`].
     Overflow,
+    /// A cron fire of this trigger is already active or queued — the new fire
+    /// is redundant (cron fires carry no distinct payload), so it is dropped
+    /// instead of queued. Cron only; event triggers keep FIFO.
+    Coalesce,
 }
 
 impl CapacityPolicy {
@@ -178,6 +182,16 @@ impl CapacityPolicy {
         kind: ThreadQueueKind,
         has_trigger: bool,
     ) -> AdmissionDecision {
+        // Cron coalescing: a cron fire carries no distinct payload (just
+        // `trigger_id`), so a trigger never needs more than one pending fire.
+        // If one is already active OR queued, the new fire is redundant — drop
+        // it instead of stacking a duplicate (the restart-storm pile-up fix).
+        // Cron only; event triggers carry a per-fire `event_payload` and keep
+        // strict FIFO.
+        if kind == ThreadQueueKind::Cron && (counts.trigger_active >= 1 || counts.trigger_queued >= 1)
+        {
+            return AdmissionDecision::Coalesce;
+        }
         let must_queue = (has_trigger && counts.trigger_queued > 0)
             || counts.total_active() >= self.max_concurrent_total
             || counts.kind_active >= self.cap_for_kind(kind)
@@ -301,6 +315,54 @@ mod tests {
             trigger_queued: 0,
             user_active: 0,
             user_queued: 0,
+        };
+        let d = policy().decide_submit(counts, ThreadQueueKind::EventTrigger, true);
+        assert_eq!(d, AdmissionDecision::Queue);
+    }
+
+    #[test]
+    fn cron_first_fire_admits() {
+        // No active, none queued for this cron trigger — the first fire runs.
+        let d = policy().decide_submit(AdmissionCounts::default(), ThreadQueueKind::Cron, true);
+        assert_eq!(d, AdmissionDecision::Admit);
+    }
+
+    #[test]
+    fn cron_coalesces_when_one_active() {
+        // A fire of this cron trigger is already running — a new one is
+        // redundant (cron fires carry no distinct payload) and coalesces.
+        let counts = AdmissionCounts {
+            background_active: 1,
+            kind_active: 1,
+            trigger_active: 1,
+            ..Default::default()
+        };
+        let d = policy().decide_submit(counts, ThreadQueueKind::Cron, true);
+        assert_eq!(d, AdmissionDecision::Coalesce);
+    }
+
+    #[test]
+    fn cron_coalesces_when_one_queued() {
+        // One already waiting for this cron trigger — the new fire collapses
+        // into it rather than deepening the backlog.
+        let counts = AdmissionCounts {
+            trigger_queued: 1,
+            ..Default::default()
+        };
+        let d = policy().decide_submit(counts, ThreadQueueKind::Cron, true);
+        assert_eq!(d, AdmissionDecision::Coalesce);
+    }
+
+    #[test]
+    fn event_trigger_does_not_coalesce() {
+        // Event-trigger fires carry a distinct `event_payload` each — they keep
+        // strict FIFO and must NEVER coalesce, even with one active and queued.
+        let counts = AdmissionCounts {
+            background_active: 1,
+            kind_active: 1,
+            trigger_active: 1,
+            trigger_queued: 1,
+            ..Default::default()
         };
         let d = policy().decide_submit(counts, ThreadQueueKind::EventTrigger, true);
         assert_eq!(d, AdmissionDecision::Queue);

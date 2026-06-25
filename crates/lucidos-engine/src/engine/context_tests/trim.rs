@@ -38,7 +38,7 @@ fn test_no_trim_under_budget() {
         text_msg("user", "How are you?"),
     ];
     let original_len = messages.len();
-    let removed = trim_context_if_needed(&mut messages, 500_000, None);
+    let removed = trim_context_if_needed(&mut messages, 500_000, None, None);
     assert_eq!(removed, 0);
     assert_eq!(messages.len(), original_len);
     // Content should be unchanged
@@ -62,7 +62,7 @@ fn test_pass1_truncates_large_tool_results() {
     ];
     let original_len = messages.len();
     // Budget smaller than total (~10K) but large enough that pass 1 truncation suffices
-    let removed = trim_context_if_needed(&mut messages, 5_000, None);
+    let removed = trim_context_if_needed(&mut messages, 5_000, None, None);
 
     assert_eq!(removed, 0, "pass 2 should not be needed");
     assert_eq!(messages.len(), original_len, "no messages removed");
@@ -113,7 +113,7 @@ fn test_pass2_removes_old_pairs() {
     let initial_len = messages.len();
     // Set a very small budget to force pass 2
     let budget = 200;
-    let removed = trim_context_if_needed(&mut messages, budget, None);
+    let removed = trim_context_if_needed(&mut messages, budget, None, None);
 
     assert!(removed > 0, "should have removed messages in pass 2");
     // The returned count must match the actual length delta — `agentic_loop`
@@ -163,7 +163,7 @@ fn test_preserves_initial_and_recent() {
 
     // Budget that requires trimming the old pairs
     let budget = 1_000;
-    trim_context_if_needed(&mut messages, budget, None);
+    trim_context_if_needed(&mut messages, budget, None, None);
 
     // message[0] must always be preserved
     assert_eq!(messages[0].content.as_text(), "important initial context");
@@ -211,7 +211,7 @@ fn test_pass0_strips_images_from_older_messages() {
     ];
 
     // Budget large enough that no other trimming is needed after stripping
-    trim_context_if_needed(&mut messages, 500_000, None);
+    trim_context_if_needed(&mut messages, 500_000, None, None);
 
     // Older image at index 0 should be replaced with placeholder
     if let MessageContent::Blocks(blocks) = &messages[0].content {
@@ -272,7 +272,7 @@ fn test_pass0_preserves_current_message_image_with_resume_blocks() {
         image_msg("user", "Request: what is in this screenshot?", 100),
     ];
 
-    trim_context_if_needed(&mut messages, 500_000, None);
+    trim_context_if_needed(&mut messages, 500_000, None, None);
 
     let last_idx = messages.len() - 1;
     if let MessageContent::Blocks(blocks) = &messages[last_idx].content {
@@ -293,47 +293,164 @@ fn test_pass0_preserves_current_message_image_with_resume_blocks() {
     }
 }
 
+/// An image block's budget cost is a small FIXED estimate (real provider token
+/// cost), NOT its base64 byte length. This is what lets the current-turn image
+/// stay in context for the whole turn without one photo dwarfing the budget and
+/// forcing Pass 2 to evict real conversation/tool context.
 #[test]
-fn test_pass0_image_stripping_brings_under_budget() {
-    // A conversation where images alone push it over budget
+fn test_image_block_char_estimate_is_fixed_not_base64_len() {
+    let small = estimate_message_chars(&image_msg("user", "shot", 10)); // 10 KB base64
+    let huge = estimate_message_chars(&image_msg("user", "shot", 3_000)); // ~3 MB base64
+    assert_eq!(
+        small, huge,
+        "image budget cost must not scale with base64 length"
+    );
+    // The fixed per-image cost is tiny relative to a real megabyte photo, so a
+    // single image can never blow a normal char budget on its own.
+    let img_only = estimate_message_chars(&Message {
+        role: "user".to_string(),
+        content: MessageContent::Blocks(vec![ContentBlock::Image {
+            source_type: "base64".to_string(),
+            media_type: "image/png".to_string(),
+            data: "x".repeat(3_000 * 1024),
+        }]),
+    });
+    assert!(
+        img_only < 10_000,
+        "one image must cost far less than its base64 length ({img_only} chars)"
+    );
+}
+
+/// The core regression for "the bot can't see my attached image": once the
+/// model makes a tool call, the current-turn user message (with the image) is
+/// no longer the LAST entry. Pass 0 must still keep its image bytes — driven by
+/// `keep_image_idx` — so the model can reason about the image after gathering
+/// context. Without the fix the image was replaced with a text placeholder and
+/// the model went blind mid-turn.
+#[test]
+fn test_pass0_keeps_current_turn_image_when_not_last() {
+    let img_idx = 0;
     let mut messages = vec![
-        text_msg("user", "hello"),
-        image_msg("user", "big screenshot", 300), // 300KB image in older msg
-        text_msg("assistant", "I see it"),
-        text_msg("user", "thanks"),
+        // Current-turn user message with the attached image at index 0...
+        image_msg("user", "Request: why won't this part fit?", 100),
+        // ...followed by tool pairs the loop appended, so it is no longer last.
+        tool_use_msg("t1", "list_files", serde_json::json!({})),
+        tool_result_msg("t1", "files: a, b, c"),
+        tool_use_msg("t2", "read_file", serde_json::json!({"path": "notes.md"})),
+        tool_result_msg("t2", "notes"),
     ];
 
-    let total_before: usize = messages.iter().map(estimate_message_chars).sum();
-    assert!(total_before > 200_000, "should be over budget before trim");
+    trim_context_if_needed(&mut messages, 500_000, Some(img_idx), Some(img_idx));
 
-    // Budget that's achievable only by stripping the image
-    trim_context_if_needed(&mut messages, 200_000, None);
+    // The image bytes must survive on the (now non-last) current-turn message.
+    if let MessageContent::Blocks(blocks) = &messages[img_idx].content {
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. })),
+            "current-turn image must be kept for the whole turn, not just the first call"
+        );
+        assert!(
+            !blocks.iter().any(
+                |b| matches!(b, ContentBlock::Text { text } if text.contains("image from earlier"))
+            ),
+            "current-turn image must NOT be replaced with the placeholder"
+        );
+    } else {
+        panic!("expected Blocks content at the current-turn user message");
+    }
+}
 
-    let total_after: usize = messages.iter().map(estimate_message_chars).sum();
+/// Without `keep_image_idx`, a non-last image-bearing message is still stripped
+/// (older images the model already saw). This pins the "only the current turn's
+/// image is exempt" boundary.
+#[test]
+fn test_pass0_strips_non_last_image_when_not_kept() {
+    let mut messages = vec![
+        image_msg("user", "older screenshot", 100), // index 0 — not kept, not last
+        tool_use_msg("t1", "list_files", serde_json::json!({})),
+        tool_result_msg("t1", "files"),
+    ];
+
+    trim_context_if_needed(&mut messages, 500_000, None, None);
+
+    if let MessageContent::Blocks(blocks) = &messages[0].content {
+        assert!(
+            !blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. })),
+            "a non-last image with no keep_image_idx must still be stripped"
+        );
+    }
+}
+
+/// After a mid-turn prompt injection the protected index (latest user input)
+/// moves ABOVE the image-bearing message, so `keep_image_idx < protected_idx`.
+/// Pass 0 keeps the image bytes, but Pass 2 must ALSO refuse to remove that
+/// whole message — it protects down to the lower of the two indices — or the
+/// image (and the original request) is lost despite Pass 0 preserving its bytes.
+#[test]
+fn test_pass2_keeps_image_message_below_protected_after_injection() {
+    let large_resume = "x".repeat(2_000);
+    let mut messages = vec![text_msg("user", "workspace context")];
+    // 10 resume tool pairs from turn 1 (20 messages).
+    for i in 0..10 {
+        let id = format!("resume{}", i);
+        messages.push(tool_use_msg(&id, "read_file", serde_json::json!({"path": "x.rs"})));
+        messages.push(tool_result_msg(&id, &large_resume));
+    }
+    // The current-turn image message — must survive with its image.
+    let img_idx = messages.len();
+    messages.push(image_msg("user", "Request: why won't this part fit?", 100));
+    // A tool pair, then a mid-turn injected prompt (the new latest user input).
+    messages.push(tool_use_msg("mid", "grep", serde_json::json!({"pattern": "x"})));
+    messages.push(tool_result_msg("mid", "match"));
+    let injected_idx = messages.len();
+    messages.push(text_msg("user", "actually also check the manual"));
+    // Recent tail.
+    for i in 0..3 {
+        let id = format!("recent{}", i);
+        messages.push(tool_use_msg(&id, "grep", serde_json::json!({"pattern": "y"})));
+        messages.push(tool_result_msg(&id, "ok"));
+    }
+
     assert!(
-        total_after < 200_000,
-        "should be under budget after stripping images"
+        injected_idx > img_idx,
+        "injected prompt must sit above the image message"
     );
-    // No messages removed — just image stripped
-    assert_eq!(messages.len(), 4);
+
+    // Tight budget forces pass 2 to remove many old pairs; protected_idx points
+    // at the injected prompt, keep_image_idx at the (lower) image message.
+    let removed =
+        trim_context_if_needed(&mut messages, 1_000, Some(injected_idx), Some(img_idx));
+
+    // The image message must survive at its post-removal position, image intact.
+    let post_img = img_idx.saturating_sub(removed);
+    if let MessageContent::Blocks(blocks) = &messages[post_img].content {
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. })),
+            "the image-bearing message must survive pass 2 even when protected_idx diverges above it"
+        );
+    } else {
+        panic!("expected the image message to survive with its Blocks content");
+    }
 }
 
 /// Regression for the "Set Up Spotify on Sonos Mobile" thread (personal
 /// workspace, 2026-05-24). A long turn 1 left ~13 resume tool pairs in
-/// `messages` for turn 2. The user's new message arrived with a 552 KB iPhone
-/// screenshot — pass 0 protects the image bytes only while the user message
-/// is the LAST entry, so iter 1 sees the image, then the iter-1 image-strip
-/// hook replaces the bytes with `[image: <Flash description>]`. As turn 2's
-/// tool loop appended assistant/user pairs the user message slid out of the
-/// last `PRESERVE_RECENT_MESSAGES` slots; with no `protected_idx` guard
-/// pass 2 eventually removed it, leaving the model with no record of the
-/// request or the description. The captured user_message_idx — which is
-/// supposed to follow the message via `saturating_sub(removed_count)` —
-/// silently pointed at whatever message ended up at the old slot, so even
+/// `messages` for turn 2. As turn 2's tool loop appended assistant/user pairs
+/// the current user message slid out of the last `PRESERVE_RECENT_MESSAGES`
+/// slots; with no `protected_idx` guard pass 2 eventually removed it, leaving
+/// the model with no record of the request line. The captured user_message_idx
+/// — which is supposed to follow the message via `saturating_sub(removed_count)`
+/// — silently pointed at whatever message ended up at the old slot, so even
 /// the bookkeeping looked correct. Pinning the index is what makes the
 /// promise true: with `protected_idx = Some(user_message_idx)`, pass 2
 /// stops before removing the user message even at the cost of staying over
-/// budget.
+/// budget. (The attached image on that message is preserved separately by
+/// `keep_image_idx` — see `test_pass0_keeps_current_turn_image_when_not_last`.)
 #[test]
 fn test_pass2_does_not_remove_protected_user_message() {
     // Layout: m0 = workspace context, then many resume tool pairs (turn 1's
@@ -362,7 +479,7 @@ fn test_pass2_does_not_remove_protected_user_message() {
     }
 
     // Tight budget forces pass 2 to remove many messages.
-    let removed = trim_context_if_needed(&mut messages, 1_000, Some(protected));
+    let removed = trim_context_if_needed(&mut messages, 1_000, Some(protected), None);
 
     // The user message must survive at its post-removal position.
     let post_protected = protected.saturating_sub(removed);
@@ -399,7 +516,7 @@ fn test_pass2_stops_when_protected_lands_at_index_one() {
     // Tiny budget — pass 2 would remove everything between m0 and the
     // protected entry, then would want to remove the protected entry itself
     // to keep going. The guard must stop instead.
-    let removed = trim_context_if_needed(&mut messages, 10, Some(protected));
+    let removed = trim_context_if_needed(&mut messages, 10, Some(protected), None);
 
     // Protected index hasn't shifted (nothing between m0 and it was removed
     // since it was already at index 1).
@@ -448,7 +565,7 @@ fn test_pass1_5_trims_large_tail_tool_results() {
         "test premise: total must exceed budget"
     );
 
-    let _removed = trim_context_if_needed(&mut messages, budget, None);
+    let _removed = trim_context_if_needed(&mut messages, budget, None, None);
 
     // The second-to-last preserved tool result (recent1's, at index len-3)
     // sits inside the tail BUT NOT in the very last message — pass 1.5
@@ -486,7 +603,7 @@ fn test_pass1_5_preserves_very_last_message() {
     ];
 
     let budget = TAIL_TRUNCATION_THRESHOLD;
-    let _ = trim_context_if_needed(&mut messages, budget, None);
+    let _ = trim_context_if_needed(&mut messages, budget, None, None);
 
     let last_idx = messages.len() - 1;
     if let MessageContent::Blocks(blocks) = &messages[last_idx].content {
@@ -548,7 +665,7 @@ fn test_pass1_5_then_pass2_uses_post_truncation_total() {
     messages.push(tool_result_msg("r2", "small")); // last, preserved verbatim
 
     let budget = 1_500;
-    let removed = trim_context_if_needed(&mut messages, budget, None);
+    let removed = trim_context_if_needed(&mut messages, budget, None, None);
 
     // With the bug (`current_total = total_after_pass1`) Pass 2 would
     // remove every old pair until the message-count guard fires
@@ -620,7 +737,7 @@ fn test_pass2_skips_pair_removal_that_would_drop_protected() {
     ];
     let protected = 2;
 
-    let _ = trim_context_if_needed(&mut messages, 100, Some(protected));
+    let _ = trim_context_if_needed(&mut messages, 100, Some(protected), None);
 
     // Find the protected text — it must still be present somewhere.
     let still_present = messages

@@ -183,7 +183,7 @@ TIMEZONE HANDLING:
         let mandatory_prefs: &[(&str, &str, bool)] = &[
             ("timezone", "- TIMEZONE: Ask what timezone they are in and call set_timezone (e.g., \"America/New_York\", \"Europe/London\", \"Asia/Tokyo\").", false),
             ("language", "- LANGUAGE: Ask what language they prefer and call set_language to save it.", false),
-            ("push_notifications", "- PUSH NOTIFICATIONS: Ask if they want to enable browser push notifications for scheduled task alerts. If yes, call enable_push_notifications(enabled=true). If no, call enable_push_notifications(enabled=false) so you don't ask again.", true),
+            ("push_notifications", "- PUSH NOTIFICATIONS: Ask if they want to enable push notifications for scheduled task alerts (do NOT call them \"browser\" notifications — Lucidos runs as a desktop app too, where these are native OS alerts). If yes, call enable_push_notifications(enabled=true). If no, call enable_push_notifications(enabled=false) so you don't ask again.", true),
         ];
 
         let mut missing_instructions = Vec::new();
@@ -553,7 +553,7 @@ IMPORTANT — spawn threads sparingly:
 - ONLY spawn a child thread when the task has multiple TRULY INDEPENDENT subtasks that benefit from parallel execution (e.g., researching 3 unrelated topics simultaneously).
 - NEVER spawn a thread for something you could do with a single tool call or a few sequential steps.
 - NEVER spawn one thread per item in a list — batch related work together.
-- Maximum 3 child threads per parent, maximum depth 3. Budget them wisely.
+- Maximum __MAX_CHILDREN_PER_THREAD__ child threads per parent, maximum depth 3. Budget them wisely.
 - Each child thread costs tokens and time. Fewer, well-scoped threads beat many small ones.
 
 CRITICAL RULES:
@@ -572,6 +572,10 @@ VERIFICATION: Before saying "done", check that write_file returned "Created:" or
             .replace(
                 "__MAX_TOOL_CALLS__",
                 &crate::engine::agentic_loop::MAX_ITERATIONS.to_string(),
+            )
+            .replace(
+                "__MAX_CHILDREN_PER_THREAD__",
+                &super::super::recursion_guard::MAX_CHILDREN_PER_THREAD.to_string(),
             );
 
         let system_prompt = format!("{}{}", system_prompt, system_prompt_base);
@@ -682,6 +686,11 @@ VERIFICATION: Before saying "done", check that write_file returned "Created:" or
                 (e.g. \"[attached image (thread:2)]\"). When images are included in the message content, \
                 they are labeled as \"from earlier in the conversation\" or \"attached to current message\" \
                 so you can tell which are new. \
+                Older images age out of your vision after a few messages — the history then shows only a \
+                text note like \"[attached image (thread:2) — image not included]\" plus a description. \
+                When the user refers to an image you can no longer see, call the view_image tool with its \
+                reference (e.g. image: 'thread:2') to load it back into your vision, then answer from what \
+                you see — do NOT claim you have no image or ask the user to re-send it. \
                 You can save any conversation image to an artifact file with the save_thread_image tool \
                 (e.g., image: 'thread:1', path: 'artifacts/photos/reaction.jpg').", system_prompt);
             if image_provider_available {

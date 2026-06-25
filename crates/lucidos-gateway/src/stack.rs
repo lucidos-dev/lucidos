@@ -42,6 +42,12 @@ pub struct StackRuntime {
     pub health: Health,
     /// Respawn attempts since the stack was last healthy. Caps auto-respawn.
     pub restart_attempts: u32,
+    /// Consecutive failed health probes since the stack was last healthy (or
+    /// last respawned). The supervisor requires several of these before culling
+    /// an alive-but-busy engine, so a transient load spike (a single slow probe)
+    /// never triggers a respawn — the root cause of the 2026-06-24 respawn
+    /// storm. Reset on a healthy probe and on respawn.
+    pub health_misses: u32,
     pub last_spawn: Option<Instant>,
     pub last_error: Option<String>,
 }
@@ -177,12 +183,43 @@ pub fn reclaim_stale_engine(resolved_dir: &Path) {
     let _ = resolved_dir;
 }
 
-/// Probe `GET <scheme>://127.0.0.1:<port>/api/v1/health`. `true` on a 2xx.
+/// Outcome of one health probe. Distinguishes a dead engine (the listener is
+/// gone — connection refused) from an alive-but-busy one (the probe timed out),
+/// so the supervisor can be PATIENT with the latter and PROMPT with the former.
+/// This split is what stops a heavy load spike (e.g. an e2e run) from being
+/// read as "engine died" and culled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProbeOutcome {
+    /// 2xx from `/api/v1/health`.
+    Healthy,
+    /// Connect error that is NOT a timeout (connection refused / reset) — the
+    /// engine isn't accepting connections. A strong "down" signal (crashed, or
+    /// mid-restart).
+    Unreachable,
+    /// The probe timed out (connect or read) — the process is (likely) alive
+    /// but too busy to answer within the budget. A WEAK signal: never cull on a
+    /// single one.
+    Slow,
+    /// Any other error, or a non-2xx response. Treated like `Slow` (patient).
+    Other,
+}
+
+/// Probe `GET <scheme>://127.0.0.1:<port>/api/v1/health`.
 /// `scheme` is `http` for a loopback (packaged) engine, `https` for a dev engine
 /// that serves TLS directly on its port.
-pub async fn probe_health(client: &reqwest::Client, scheme: &str, port: u16) -> bool {
+///
+/// Timeout is classified BEFORE connect: a connect-timeout under load means
+/// "alive but the accept loop is starved" (busy), not "refused", so it must read
+/// as `Slow`. Only a genuine non-timeout connect error is `Unreachable`.
+pub async fn probe_health(client: &reqwest::Client, scheme: &str, port: u16) -> ProbeOutcome {
     let url = format!("{scheme}://127.0.0.1:{port}/api/v1/health");
-    matches!(client.get(&url).send().await, Ok(r) if r.status().is_success())
+    match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => ProbeOutcome::Healthy,
+        Ok(_) => ProbeOutcome::Other,
+        Err(e) if e.is_timeout() => ProbeOutcome::Slow,
+        Err(e) if e.is_connect() => ProbeOutcome::Unreachable,
+        Err(_) => ProbeOutcome::Other,
+    }
 }
 
 /// A short-timeout client for health probes (distinct from the proxy client,
@@ -193,12 +230,18 @@ pub async fn probe_health(client: &reqwest::Client, scheme: &str, port: u16) -> 
 /// *new* connections, not that a stale pooled keepalive connection still works.
 /// Accepts invalid certs because a dev engine serves its own self-signed cert on
 /// its port, probed via `127.0.0.1` (harmless for the plain-http packaged engine).
+///
+/// The 5s timeout gives a busy engine headroom to answer before the probe is
+/// classified `Slow` (a response that arrives in <5s is healthy). Culling never
+/// hinges on this timeout alone — it takes `SLOW_MISS_THRESHOLD` consecutive
+/// slow probes (see `server.rs`), so the budget can stay modest without
+/// false-culling working engines.
 pub fn build_health_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
         .danger_accept_invalid_certs(true)
         .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(5))
         .build()
         .expect("failed to build gateway health client")
 }
@@ -227,6 +270,7 @@ mod tests {
             engine: None,
             health: Health::Healthy,
             restart_attempts: 0,
+            health_misses: 0,
             last_spawn: None,
             last_error: None,
         };

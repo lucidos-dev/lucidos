@@ -1,9 +1,9 @@
-import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds } from '../store';
+import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, drawerView, threadSearchQuery, threadSearchResults } from '../store';
 import { navigateToPane } from './pane';
 import { isMobile } from '../../utils/viewport';
 import type { ThreadSection, ThreadState } from '../thread-events';
 import { threadPassesChannelFilter } from '../threadFilter';
-import { computeFamilyGraph, filterByTopThread, orderedCurrentForReview } from '../../components/drawer/family-graph';
+import { computeFamilyGraph, filterByTopThread, orderedCurrentForReview, attentionThreads, reviewThreads, runningThreads, draftThreads } from '../../components/drawer/family-graph';
 import type { FamilyGraph } from '../../components/drawer/family-graph';
 import { saveThread, unsaveThread, archiveThread } from '../../api/threads';
 import { ApiError } from '../../api/client';
@@ -155,7 +155,7 @@ export async function handleSaveThread(threadId: string): Promise<void> {
     await saveThread(threadId);
   } catch (e) {
     updateThreadMeta(threadId, { saved: false });
-    showToast(`Failed to save thread: ${errorDetail(e)}`, 'error');
+    showToast(`Failed to pin thread: ${errorDetail(e)}`, 'error');
   }
 }
 
@@ -163,7 +163,7 @@ export async function handleUnsaveThread(threadId: string): Promise<void> {
   const thread = threadMap.value.get(threadId);
   if (!thread || !thread.meta.saved) return;
 
-  if (!await showConfirm('Remove this thread from the Saved section?', 'Remove')) {
+  if (!await showConfirm('Remove this thread from the Pinned section?', 'Remove')) {
     return;
   }
 
@@ -172,7 +172,7 @@ export async function handleUnsaveThread(threadId: string): Promise<void> {
     await unsaveThread(threadId);
   } catch (e) {
     updateThreadMeta(threadId, { saved: true });
-    showToast(`Failed to unsave thread: ${errorDetail(e)}`, 'error');
+    showToast(`Failed to unpin thread: ${errorDetail(e)}`, 'error');
   }
 }
 
@@ -205,21 +205,51 @@ function visibleThreadsAndGraph(): { visible: ThreadState[]; graph: FamilyGraph 
   return { visible, graph };
 }
 
-/** Ordered list of visible Current-section thread ids to consider as the next
- *  focus when the user archives `aroundId` — closest below first, then closest
- *  above. Walks the drawer's exact render order (`orderedCurrentForReview`:
- *  creation-time sorted, then nested by parent) so "next in queue" is the next
- *  *visible row* in the same order the user sees. Snapshotted BEFORE the
- *  optimistic flip so the position anchor survives the cascade dropping
- *  `aroundId` (and its descendants) out of Current. */
-function currentCandidatesAround(aroundId: string): string[] {
-  const { visible, graph } = visibleThreadsAndGraph();
-  const ordered = orderedCurrentForReview(visible, graph);
-  const idx = ordered.findIndex(t => t.meta.id === aroundId);
+/** The visible thread ids of the drawer view the user is *currently looking at*,
+ *  in the same order the drawer renders them. The post-archive focus walks this
+ *  so "next" is the next visible row in whatever view is active — the next
+ *  Needs-attention row when the attention view is open, the next Review/Running
+ *  row, the next filtered Current row in the default view — instead of always
+ *  jumping into Current. Mirrors `ThreadDrawer`'s `activeView` resolution: a live
+ *  search query overrides the selected view; otherwise `drawerView` decides.
+ *
+ *  The alternate views (attention/review/running/drafts) deliberately bypass the
+ *  channel/trigger/repo/app filter — exactly as the drawer renders them — so the
+ *  next focus matches what's on screen. Only the default `all` view is
+ *  filter-aware, walking the visible Current section (`orderedCurrentForReview`)
+ *  the same way the drawer does. */
+function orderedVisibleThreadIds(): string[] {
+  // Search overrides the selected view (mirrors ThreadDrawer's activeView).
+  if (threadSearchQuery.value.trim().length > 0) {
+    const results = threadSearchResults.value;
+    return results.status === 'loaded' ? results.data.map(r => r.thread_id) : [];
+  }
+  const map = threadMap.value;
+  switch (drawerView.value) {
+    case 'attention': return attentionThreads(map).map(t => t.meta.id);
+    case 'review':    return reviewThreads(map).map(t => t.meta.id);
+    case 'running':   return runningThreads(map).map(t => t.meta.id);
+    case 'drafts':    return draftThreads(map).map(t => t.meta.id);
+    case 'all':
+    default: {
+      const { visible, graph } = visibleThreadsAndGraph();
+      return orderedCurrentForReview(visible, graph).map(t => t.meta.id);
+    }
+  }
+}
+
+/** Ordered list of visible thread ids to consider as the next focus when the
+ *  user archives `aroundId` — closest below first, then closest above — within
+ *  the currently active drawer view (`orderedVisibleThreadIds`). Snapshotted
+ *  BEFORE the optimistic flip so the position anchor survives the cascade
+ *  dropping `aroundId` (and its descendants) out of the view. */
+function visibleCandidatesAround(aroundId: string): string[] {
+  const ordered = orderedVisibleThreadIds();
+  const idx = ordered.indexOf(aroundId);
   if (idx < 0) return [];
   const result: string[] = [];
-  for (let i = idx + 1; i < ordered.length; i++) result.push(ordered[i].meta.id);
-  for (let i = idx - 1; i >= 0; i--) result.push(ordered[i].meta.id);
+  for (let i = idx + 1; i < ordered.length; i++) result.push(ordered[i]);
+  for (let i = idx - 1; i >= 0; i--) result.push(ordered[i]);
   return result;
 }
 
@@ -274,8 +304,8 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
   }
 
   // Snapshot the position anchor BEFORE the optimistic flip — once the
-  // cascade leaves Current, currentCandidatesAround() can't compute it.
-  const candidates = currentCandidatesAround(threadId);
+  // cascade leaves the active view, visibleCandidatesAround() can't compute it.
+  const candidates = visibleCandidatesAround(threadId);
 
   // Snapshot section + codingAgentProposed on every family member so we can
   // roll back if the API rejects (409 blocking, 500 mid-cascade). Both fields

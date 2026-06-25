@@ -12,6 +12,16 @@
 # 32 GB Mac on 2026-04-19, see e2e_lock.sh). This reaper stays as the host-memory
 # safety net regardless of how often the wedge actually fires.
 #
+# NOTE (2026-06-24): the PRIMARY orphan-prevention is now graceful engine
+# teardown — on cancel/shutdown the engine SIGTERMs the CC process group and
+# waits before SIGKILL so the Playwright runner closes its own (detached)
+# browsers (see crates/lucidos-engine/src/runtime/spawn_env.rs ::
+# graceful_kill_child_process_group, and ADR 0014's 2026-06-24 addendum). This
+# reaper is the macOS last-resort BACKSTOP for browsers that still slip through
+# (macOS has no PR_SET_PDEATHSIG / cgroup guarantee). It is deliberately NOT
+# expanded into a count/aggregate cap — graceful teardown is the fix, not more
+# bespoke heuristics.
+#
 # This reaper is the HOST-RESOURCE half of the mitigation (the test suite covers
 # the recovery half). It periodically samples the RSS of Playwright's WebKit
 # child processes and SIGKILLs any single one that exceeds a configurable cap —

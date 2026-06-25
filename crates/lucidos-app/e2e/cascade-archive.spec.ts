@@ -108,7 +108,7 @@ test.describe('Cascading archive — Archive button gating', () => {
         .first(),
     ).toBeVisible({ timeout: 15_000 });
 
-    // Archive must NOT render while the CC sub-thread is running. Save still
+    // Archive must NOT render while the CC sub-thread is running. Pin still
     // renders (it's independent of resolveActions and reads is_saved only).
     // The Archive button has no aria-label — match its `.action-btn` class +
     // exact "Archive" text. `:text-is` enforces an exact match so the "Archive..."
@@ -116,7 +116,7 @@ test.describe('Cascading archive — Archive button gating', () => {
     // "not present" assertion.
     const archiveBtn = page.locator('button.action-btn:text-is("Archive"):visible');
     await expect(archiveBtn).toHaveCount(0, { timeout: 5_000 });
-    await expect(page.locator('button[aria-label="Save thread"]:visible').first())
+    await expect(page.locator('button[aria-label="Pin thread"]:visible').first())
       .toBeVisible();
 
     // Flip the child to idle and zero the parent's blocking count — what the

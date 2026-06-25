@@ -152,6 +152,7 @@ impl LucidosEngine {
             tn::SAVE_THREAD_IMAGE => {
                 to_outcome(self.execute_save_thread_image(args, thread_id).await)
             }
+            tn::VIEW_IMAGE => to_outcome(self.execute_view_image(args, thread_id).await),
             tn::NAVIGATE_UI => self.execute_navigate_ui(args, thread_id).await,
             tn::SEND_NOTIFICATION => self.execute_send_notification(args, thread_id).await,
             tn::READ_NOTIFICATIONS => self.execute_read_notifications(args).await,
@@ -574,8 +575,12 @@ impl LucidosEngine {
                 }
 
                 let desc = args.get("description").and_then(|v| v.as_str());
+                // Deterministic identity from the repo's root-commit SHA (read
+                // from disk); None (no commits) → path-derived id inside `add`.
+                let root_commit_sha =
+                    crate::engine::git_ops::root_commit_sha(std::path::Path::new(&expanded)).await;
                 match crate::core::repositories::RepositoryStore::add(
-                    &self.pool, name, &expanded, desc,
+                    &self.pool, name, &expanded, desc, root_commit_sha.as_deref(),
                 )
                 .await
                 {

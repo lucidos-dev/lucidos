@@ -52,6 +52,17 @@ export async function getWebviewContent(): Promise<{ title: string; content: str
 }
 
 /**
+ * Tint the macOS window background to match the in-app header. Under
+ * `titleBarStyle: "Overlay"` the webview paints the reclaimed title-bar band (the
+ * `.titlebar-strip`); this colors the behind-the-webview fallback so that band
+ * reads blue, not black, before the page paints. `color` is a CSS hex string (the
+ * header-gradient top stop for the active theme). Sets the window layer only, so
+ * the page background isn't tinted. Only call when isTauri() is true. */
+export function setTitlebarColor(color: string): Promise<void> {
+  return invoke('set_titlebar_color', { color });
+}
+
+/**
  * Show a native macOS notification banner via the app's own
  * `show_native_notification` command (notifications.rs). We drive Apple's modern
  * `UserNotifications` framework (`UNUserNotificationCenter`) in Rust — not
@@ -74,6 +85,24 @@ export async function showNativeNotification(opts: {
     body: opts.body,
     link: opts.deepLink,
   });
+}
+
+// --- App auto-update (packaged desktop app) ---
+
+/** Check GitHub Releases for a newer signed packaged build. Returns the new
+ *  version string when an update is available, else null. Drives the in-app
+ *  update toast. Only call when isTauri() is true (no-op → null in dev). */
+export function checkAppUpdate(): Promise<string | null> {
+  return invoke<string | null>('check_app_update');
+}
+
+/** Install the available packaged update and restart the WHOLE stack — the
+ *  launchd background service (gateway + engines + embedded Postgres) AND the GUI
+ *  client — onto the new version. On success the client re-execs and this promise
+ *  never resolves; it rejects with a string error otherwise (no update, download
+ *  failure). Only call when isTauri() is true. */
+export function installAppUpdateAndRestart(): Promise<void> {
+  return invoke('install_app_update_and_restart');
 }
 
 // --- Mobile access (packaged desktop app; macOS) ---

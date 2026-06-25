@@ -24,6 +24,37 @@ pub(crate) async fn branch_head_sha(repo_root: &Path, branch_name: &str) -> Opti
     (!sha.is_empty()).then_some(sha)
 }
 
+/// The repo's **root-commit SHA** — the hash of its initial (parent-less) commit
+/// (`git rev-list --max-parents=0 HEAD`). This is intrinsic to the git history:
+/// it survives moving, renaming, and re-cloning the checkout, so it is the basis
+/// of a repository's deterministic identity (see `core::repositories::deterministic_id`).
+/// A history with multiple root commits (merged-in unrelated histories) yields
+/// several — we pick the lexically-smallest for a stable, order-independent
+/// answer and log the multi-root case. Returns `None` when the repo has no
+/// commits yet or git fails; callers fall back to a path-derived id.
+pub(crate) async fn root_commit_sha(repo_root: &Path) -> Option<String> {
+    let output = git_cmd(&["rev-list", "--max-parents=0", "HEAD"], repo_root)
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut roots: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if roots.len() > 1 {
+        log!(
+            "[GitOps] {} root commits at {} — using lexically-smallest for stable repo id",
+            roots.len(),
+            repo_root.display()
+        );
+    }
+    roots.sort();
+    roots.into_iter().next()
+}
+
 
 /// Auto-commit harmless dirty files (docs/plans), then return whether the repo
 /// is still dirty. This prevents apply/revert from blocking on safe changes.

@@ -15,6 +15,19 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Rust engine
 
+- **`graceful_kill_child_process_group`'s SIGTERM→sleep→SIGKILL does NOT race
+  pid recycling.** The function (`runtime/spawn_env.rs`) signals a process
+  *group* (`-pid`), sleeps the grace, then signals again — and a fresh reviewer
+  may worry the pid (= pgid) could be recycled during the `sleep().await` and
+  the second signal hit an unrelated group. It can't, at the one call site
+  (`claude_code.rs` `driver_task` teardown): the call is gated by
+  `if !child_reaped`, and the `tokio::process::Child` handle is held on the
+  stack across the whole grace — `child.wait()`/`try_wait()` run only *after*
+  the function returns. The group leader (the engine's direct child) therefore
+  stays an unreaped zombie for the entire grace, so its pid cannot be recycled
+  before the SIGKILL. Re-flag only if a caller starts reaping the child before
+  or during the call. (`runtime/spawn_env.rs`, `runtime/claude_code.rs`.)
+
 - **`starts_with`-guarded byte slicing is boundary-safe.** Sites like the
   Result-flush in `agent_session/run_session/run.rs` slice
   `result_trimmed[buf_trimmed.len()..]` only inside an

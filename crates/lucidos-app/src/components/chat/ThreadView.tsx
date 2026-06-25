@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { focusedThreadId, threadMap, activeStreamingBuffer, threadsLoaded, promptAnimating, revealOnFocus } from '../../store/store';
 import { getThreadEventsBump } from '../../store/threadActivity';
 import { unfocusThread } from '../../store/actions/threads';
@@ -11,7 +11,8 @@ import { CopyThreadRefButton } from '../shared/CopyThreadRefButton';
 import { ExportThreadButton } from '../shared/ExportThreadButton';
 import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
 import { computeExchanges, hasContentEvents } from '../../store/thread-events';
-import { awayFromBottom, notAtTop, scrollToBottom, scrolledUp, hasPendingEventScroll } from './scrollState';
+import { awayFromBottom, notAtTop, scrollToBottom, scrolledUp, hasPendingEventScroll, deepLinkRenderAll } from './scrollState';
+import { INITIAL_WINDOW, computeRenderFromIndex, hasMoreAbove, expandRenderCount, WINDOW_EXPAND_MARGIN_PX } from './threadWindow';
 import { useScrollMemory, hasSavedScroll, threadScrollKey } from '../../hooks/useScrollMemory';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { DelayedSpinner } from '../shared/DelayedSpinner';
@@ -23,6 +24,12 @@ import { refreshClient } from '../../hooks/sw-update';
 // Module-level tracking survives component unmount/remount (e.g. Thread A → CreateThread → Thread B).
 // Using a ref would reset on remount, causing the fade-in to be skipped.
 let lastRevealedThread: string | null = null;
+
+// Per-thread render-window size (count of trailing exchanges to render), kept at
+// module scope so it survives a switch-away-and-back — see the windowing block in
+// ThreadView. `Infinity` = render all (set by a deep-link). Session-scoped; one
+// small int per visited thread.
+const renderCountByThread = new Map<string, number>();
 
 /** Escalating retry delays for the empty-thread safety retry. */
 const EMPTY_THREAD_RETRY_DELAYS = [500, 2000, 5000];
@@ -174,6 +181,41 @@ export function ThreadView() {
         [threadId, eventCount, pendingCount, hasContent, animating, eventsBump],
     );
     const streamingBuffer = animating ? '' : activeStreamingBuffer.value;
+
+    // --- Thread-render windowing (perf) ---
+    // A large focused thread used to render — and markdown-parse — every exchange
+    // synchronously on open and on every re-render (measured ~270–500ms of pure
+    // JS). Render only a TAIL of the list and grow it on scroll-up. The per-thread
+    // render count lives in a module Map (`renderCountByThread`) so it SURVIVES a
+    // switch-away-and-back — otherwise returning to a thread you'd scrolled up in
+    // would re-window to the tail and useScrollMemory couldn't restore your spot.
+    // A new thread starts at INITIAL_WINDOW (so its first render is already
+    // windowed — never a one-off full render). A notification deep-link forces the
+    // full list (so a windowed-out target can render); the persist effect below
+    // keeps it full afterward so clearing the claim doesn't snap the user back.
+    // See threadWindow.ts + scrollState.deepLinkRenderAll.
+    const [, bumpWin] = useState(0);
+    let renderCount = threadId ? (renderCountByThread.get(threadId) ?? INITIAL_WINDOW) : INITIAL_WINDOW;
+    if (deepLinkRenderAll.value) renderCount = Infinity;
+    const renderFromIndex = computeRenderFromIndex(exchanges.length, renderCount);
+
+    // Persist the deep-link "render all" so the thread stays fully rendered after
+    // the claim clears (no snap back to the tail while the user reads an old event).
+    useEffect(() => {
+        if (threadId && deepLinkRenderAll.value && renderCountByThread.get(threadId) !== Infinity) {
+            renderCountByThread.set(threadId, Infinity);
+            bumpWin(n => n + 1);
+        }
+    }, [threadId, deepLinkRenderAll.value]);
+
+    // Latest exchange count for the scroll handler (avoids re-attaching the
+    // listener on every streaming append).
+    const exchangesLenRef = useRef(0);
+    exchangesLenRef.current = exchanges.length;
+    // Scroll metrics captured just before a window grow, so the layout effect
+    // below can restore scrollTop and keep the viewport anchored (prepending
+    // older exchanges grows the content upward).
+    const pendingExpandRef = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
 
     // Eligible for slide-in? revealOnFocus checked in the layout effect only
     // to avoid subscribing the render to the signal (prevents extra re-renders).
@@ -393,6 +435,46 @@ export function ThreadView() {
         prevPendingRef.current = pendingCount;
     }, [pendingCount]);
 
+    // Window expansion: when the user scrolls near the top and older exchanges
+    // remain above the rendered tail, reveal another chunk. Captures scroll
+    // metrics so the layout effect below keeps the viewport anchored. Re-attached
+    // per focused thread; reads the live exchange count via a ref so streaming
+    // appends don't churn the listener.
+    useEffect(() => {
+        const el = areaRef.current;
+        if (!el || !threadId) return;
+        const onScroll = () => {
+            if (pendingExpandRef.current) return;
+            if (el.scrollTop > WINDOW_EXPAND_MARGIN_PX) return;
+            const total = exchangesLenRef.current;
+            const current = renderCountByThread.get(threadId) ?? INITIAL_WINDOW;
+            if (!hasMoreAbove(total, current)) return;
+            const next = expandRenderCount(total, current);
+            // Only arm the anchor when the count actually grows — guarantees
+            // renderFromIndex changes, so the keyed layout effect runs and clears
+            // pendingExpandRef. Without this, a no-op expansion would leave the
+            // ref set and the re-entrancy guard above would wedge all future
+            // expansion. (next === current can't happen given hasMoreAbove today,
+            // but make the invariant explicit rather than implicit.)
+            if (next === current) return;
+            pendingExpandRef.current = { prevScrollHeight: el.scrollHeight, prevScrollTop: el.scrollTop };
+            renderCountByThread.set(threadId, next);
+            bumpWin(n => n + 1);
+        };
+        el.addEventListener('scroll', onScroll, { passive: true });
+        return () => el.removeEventListener('scroll', onScroll);
+    }, [threadId, eventsLoaded]);
+
+    // After a window grow prepends older exchanges (content grows upward), restore
+    // scrollTop by the height added so the viewport stays put — no jump.
+    useLayoutEffect(() => {
+        const el = areaRef.current;
+        const pend = pendingExpandRef.current;
+        if (!el || !pend) return;
+        pendingExpandRef.current = null;
+        el.scrollTop = pend.prevScrollTop + (el.scrollHeight - pend.prevScrollHeight);
+    }, [renderFromIndex]);
+
     if (!threadId) return null;
 
     if (!eventThread) {
@@ -437,7 +519,7 @@ export function ThreadView() {
                     {exchanges.length === 0 ? (
                         <ThreadEmptyState key={threadId} reason={emptyReason(animating, eventsLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!)} />
                     ) : (
-                        renderExchanges(exchanges, threadId!, streamingBuffer)
+                        renderExchanges(exchanges, threadId!, streamingBuffer, renderFromIndex)
                     )}
                 </div>
                 <ScrollControls

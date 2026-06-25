@@ -17,7 +17,7 @@
  */
 
 import { useSignal } from '@preact/signals';
-import { useEffect } from 'preact/hooks';
+import { useEffect, useRef } from 'preact/hooks';
 import type { Loadable } from '../../store/types';
 import { Overlay } from '../shared/Overlay';
 import { dismissBootSplash } from '../../utils/bootSplash';
@@ -72,6 +72,11 @@ const RESTORE_PHASE_LABELS: Record<string, string> = {
   restoring_db: 'Restoring database…',
   done: 'Finishing…',
 };
+
+/** Quick-fill names offered in the create form while the name field is empty —
+ *  the first-run "name your first workspace" nudge. Clicking one fills the
+ *  (editable) field; the user still confirms with Create. */
+export const WORKSPACE_NAME_SUGGESTIONS = ['personal', 'work'] as const;
 
 /* ── Inline icons (kept local so the picker stays self-contained) ─────────── */
 
@@ -340,19 +345,31 @@ export function WorkspacePicker() {
   }, [autoOpening.value]);
 
   // First run: when the picker loads with zero workspaces, open the create form
-  // pre-filled with a suggested name ("personal") so the user just confirms (or
-  // types over the selected text) — instead of the passive "No workspaces yet"
-  // dead-end. Runs once; a manual Cancel then stays cancelled.
+  // so the user names their first workspace right away — instead of the passive
+  // "No workspaces yet" dead-end (and instead of a pre-made `default`). The field
+  // stays empty and editable; the suggestion chips ("personal" / "work") offer a
+  // one-click fill. Runs once; a manual Cancel then stays cancelled.
   const firstRunPrompted = useSignal(false);
   useEffect(() => {
     const list = workspaces.value;
     if (firstRunPrompted.value) return;
     if (list.status === 'loaded' && list.data.length === 0 && !creating.value && !restoreOpen.value) {
       firstRunPrompted.value = true;
-      newName.value = 'personal';
       creating.value = true;
     }
   }, [workspaces.value]);
+
+  // Ref to the create form's name input so a suggestion chip can fill it and
+  // hand focus back (select the filled text so the user can type over it).
+  const nameInputRef = useRef<HTMLInputElement | null>(null);
+  function pickSuggestion(name: string) {
+    newName.value = name;
+    const el = nameInputRef.current;
+    if (el) {
+      el.focus();
+      el.select();
+    }
+  }
 
   async function withBusy(fn: () => Promise<void>) {
     busy.value = true;
@@ -452,7 +469,7 @@ export function WorkspacePicker() {
     <div class="ws-picker">
       <div class="ws-picker-shell">
         <header class="ws-picker-header">
-          {gatewayStatus.value && (
+          {gatewayStatus.value && !gatewayStatus.value.packaged && (
             <>
               <button
                 class={`ws-picker-reload${gatewayStatus.value.update_available ? ' has-update' : ''}${reloading.value ? ' is-reloading' : ''}`}
@@ -738,20 +755,39 @@ export function WorkspacePicker() {
 
         <footer class="ws-picker-footer">
           {creating.value ? (
-            <div class="ws-picker-inline">
-              <input
-                class="ws-picker-input"
-                placeholder="Workspace name"
-                value={newName.value}
-                onInput={(e) => (newName.value = (e.target as HTMLInputElement).value)}
-                onKeyDown={(e) => e.key === 'Enter' && onCreate()}
-                onFocus={(e) => (e.target as HTMLInputElement).select()}
-                autoFocus
-              />
-              <button class="ws-picker-btn ws-picker-btn-confirm" disabled={busy.value || !newName.value.trim()} onClick={onCreate}>
-                {busy.value ? 'Creating…' : 'Create'}
-              </button>
-              <button class="ws-picker-btn" onClick={() => { creating.value = false; newName.value = ''; }}>Cancel</button>
+            <div class="ws-picker-create">
+              {!newName.value.trim() && (
+                <div class="ws-picker-suggestions">
+                  <span class="ws-picker-suggestions-label">Try</span>
+                  {WORKSPACE_NAME_SUGGESTIONS.map((s) => (
+                    <button
+                      key={s}
+                      type="button"
+                      class="ws-picker-suggestion"
+                      disabled={busy.value}
+                      onClick={() => pickSuggestion(s)}
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div class="ws-picker-inline">
+                <input
+                  ref={nameInputRef}
+                  class="ws-picker-input"
+                  placeholder="Workspace name"
+                  value={newName.value}
+                  onInput={(e) => (newName.value = (e.target as HTMLInputElement).value)}
+                  onKeyDown={(e) => e.key === 'Enter' && onCreate()}
+                  onFocus={(e) => (e.target as HTMLInputElement).select()}
+                  autoFocus
+                />
+                <button class="ws-picker-btn ws-picker-btn-confirm" disabled={busy.value || !newName.value.trim()} onClick={onCreate}>
+                  {busy.value ? 'Creating…' : 'Create'}
+                </button>
+                <button class="ws-picker-btn" onClick={() => { creating.value = false; newName.value = ''; }}>Cancel</button>
+              </div>
             </div>
           ) : restoreOpen.value ? (
             <div class="ws-picker-restore-form">

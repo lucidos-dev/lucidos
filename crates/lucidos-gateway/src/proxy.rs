@@ -63,6 +63,7 @@ pub async fn proxy(
     client: &Client,
     target_base: &str,
     slug: &str,
+    boot_label: &str,
     req: axum::extract::Request,
 ) -> Response {
     let path_and_query = req
@@ -119,8 +120,13 @@ pub async fn proxy(
             // migrations, embedding warmup, ~20 CC sessions resuming) can take
             // tens of seconds, during which a connect fails. Serve a lightweight
             // auto-retry page for navigations instead of a raw 502 the user must
-            // reload by hand.
-            return starting_page();
+            // reload by hand. This is the path that renders the ENGINE-reported
+            // phases: once `bring_up` sets the route (while the engine is still
+            // Booting), a lazy-start navigation lands here, not on `fallback`'s
+            // no-route branch — so `boot_label` carries the current phase
+            // (caller passes `boot_phase_label`; a transient mid-session restart
+            // has no phase and gets the neutral default).
+            return starting_page(boot_label);
         }
     };
 
@@ -147,6 +153,10 @@ pub async fn proxy(
 /// Used by the proxy on a connect failure (engine cold boot) and by the gateway
 /// `fallback` when a document navigation lazy-starts a stopped workspace.
 ///
+/// `label` is the current boot-phase label (see [`crate::boot_phase`]) — the
+/// gateway passes the phase for the slug, the proxy passes the neutral default.
+/// It advances across the 2s meta-refresh reloads as the boot progresses.
+///
 /// Carries `X-Lucidos-Boot-Splash: 1` so the PWA service worker
 /// (`crates/lucidos-app/public/sw.js::networkFirstShell`) can tell this
 /// intentional 503 boot page apart from a transient 502/500. Without the marker
@@ -154,13 +164,13 @@ pub async fn proxy(
 /// shell instead — which then 503-storms its API calls against the not-yet-ready
 /// engine, so the splash never shows for an installed PWA. The marker tells the SW
 /// to SHOW this response; it is never cached (still a 503 + `no-store`).
-pub fn starting_page() -> Response {
+pub fn starting_page(label: &str) -> Response {
     let mut resp = Response::builder().status(StatusCode::SERVICE_UNAVAILABLE);
     resp = resp.header(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
     resp = resp.header(header::RETRY_AFTER, HeaderValue::from_static("2"));
     resp = resp.header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     resp = resp.header("x-lucidos-boot-splash", HeaderValue::from_static("1"));
-    resp.body(Body::from(splash_page_html("Workspace starting…")))
+    resp.body(Body::from(splash_page_html(label)))
         .unwrap_or_else(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())
 }
 
@@ -186,14 +196,6 @@ fn splash_page_html(label: &str) -> String {
 <meta name="theme-color" content="#0a4ea8">
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><radialGradient id='g' gradientUnits='userSpaceOnUse' cx='30' cy='22' r='125'><stop offset='0' stop-color='%232d83e0'/><stop offset='1' stop-color='%230a4ea8'/></radialGradient></defs><rect width='100' height='100' rx='22' fill='url(%23g)'/><g transform='translate(13 13) scale(0.74)' fill='%23fff'><rect x='17' y='17' width='29' height='29' rx='7'/><rect x='17' y='54' width='29' height='29' rx='7'/><rect x='54' y='54' width='29' height='29' rx='7'/><path d='M68.5 12 C71 25 74 28.5 87 31 C74 33.5 71 37 68.5 50 C66 37 63 33.5 50 31 C63 28.5 66 25 68.5 12 Z'/></g></svg>">
 <title>Starting…</title>
-<!-- After ~30s on the splash, reveal the escape link. The first-seen time is a
-single global sessionStorage key (the splash is per-tab and only ever shows one
-stuck workspace at a time), persisted so the 2s meta-refresh reloads don't reset
-the countdown; the workspace app clears it on a successful boot (see
-crates/lucidos-app/src/main.tsx). Decided in <head> so a post-threshold reload
-shows the link from first paint (no per-reload fade). Static (no interpolation) —
-no injection surface. -->
-<script>(function(){try{var k='lucidos-boot-since';var n=Date.now();var v=sessionStorage.getItem(k);if(!v){sessionStorage.setItem(k,String(n));v=String(n);}if(n-parseInt(v,10)>30000){document.documentElement.classList.add('show-escape');}}catch(e){}})();</script>
 <style>
 html,body{margin:0;height:100%}
 /* Paint the gradient on the root with a solid fallback + fixed attachment so it
@@ -212,11 +214,6 @@ status renders the same across the cold-boot→workspace seam. Keep in sync. */
 font-family:ui-monospace,SFMono-Regular,'SF Mono',Menlo,'Fira Code','JetBrains Mono',Monaco,Consolas,monospace}
 .mark{width:min(46vmin,15rem);height:min(46vmin,15rem)}
 .mark-label{margin-top:1.25rem;font-size:.95rem;letter-spacing:.02em;opacity:.85}
-/* Escape link to the workspace picker. Hidden until the <head> reveal script
-adds `show-escape` to <html> (~30s on the splash); no opacity transition so a
-post-threshold 2s meta-refresh reload shows it steadily, not as a pulse. */
-.boot-escape{margin-top:1.75rem;color:#fff;opacity:0;pointer-events:none;font-size:.9rem;letter-spacing:.01em;text-decoration:underline;text-underline-offset:3px}
-html.show-escape .boot-escape{opacity:.85;pointer-events:auto}
 .lmk-tile,.lmk-spark{transform-box:fill-box;transform-origin:center}
 .lmk-tile{animation:tile-in .5s cubic-bezier(.34,1.56,.64,1) both}
 .lmk-tile-1{animation-delay:.15s}.lmk-tile-2{animation-delay:.28s}.lmk-tile-3{animation-delay:.41s}
@@ -236,7 +233,6 @@ html.show-escape .boot-escape{opacity:.85;pointer-events:auto}
 </svg>
 <p class="mark-label">"##;
     const TAIL: &str = r##"</p>
-<a class="boot-escape" href="/~/?pick">Open the workspace picker</a>
 </body></html>"##;
     format!("{HEAD}{label}{TAIL}")
 }
@@ -285,17 +281,19 @@ mod tests {
     }
 
     #[test]
-    fn splash_page_includes_escape_link_and_timed_reveal() {
-        let html = splash_page_html("Workspace starting…");
-        // Escape link to the picker, hidden until the <head> reveal script shows it.
-        assert!(html.contains(r#"<a class="boot-escape" href="/~/?pick">"#));
-        assert!(html.contains("show-escape"));
-        // First-seen time persisted in sessionStorage so the 2s meta-refresh
-        // reloads don't reset the 30s countdown.
-        assert!(html.contains("lucidos-boot-since"));
-        assert!(html.contains("30000"));
-        // The 2s auto-refresh that drives the happy-path transition is preserved.
+    fn splash_renders_the_phase_label_and_has_no_escape_link() {
+        let html = splash_page_html("Building search index — first run, this can take a minute…");
+        // The current boot-phase label is shown beneath the mark.
+        assert!(html.contains("Building search index — first run, this can take a minute…"));
+        // The 2s auto-refresh that advances the label / drives the happy-path
+        // transition is preserved.
         assert!(html.contains(r#"http-equiv="refresh" content="2""#));
+        // The "Open the workspace picker" escape link (and its reveal machinery)
+        // is gone — no anchor, no CSS class, no sessionStorage countdown.
+        assert!(!html.contains("boot-escape"));
+        assert!(!html.contains("Open the workspace picker"));
+        assert!(!html.contains("show-escape"));
+        assert!(!html.contains("lucidos-boot-since"));
     }
 
     #[test]
@@ -315,6 +313,7 @@ mod tests {
 #[cfg(test)]
 mod proxy_tests {
     use super::*;
+    use crate::boot_phase::DEFAULT_LABEL;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -358,7 +357,7 @@ mod proxy_tests {
             .header("accept-language", "en-US")
             .body(Body::empty())
             .unwrap();
-        let resp = proxy(&build_client(), &target, "dev", req).await;
+        let resp = proxy(&build_client(), &target, "dev", DEFAULT_LABEL, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let got = captured.lock().await.to_lowercase();
         assert!(
@@ -388,7 +387,7 @@ mod proxy_tests {
             .header("x-forwarded-prefix", "/evil/")
             .body(Body::empty())
             .unwrap();
-        let resp = proxy(&build_client(), &target, "dev", req).await;
+        let resp = proxy(&build_client(), &target, "dev", DEFAULT_LABEL, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let got = captured.lock().await.to_lowercase();
         assert!(
@@ -407,6 +406,7 @@ mod proxy_tests {
             &build_client(),
             "http://127.0.0.1:1",
             "dev",
+            DEFAULT_LABEL,
             request("GET", "/dev", Body::empty()),
         )
         .await;
@@ -418,7 +418,7 @@ mod proxy_tests {
     }
 
     #[tokio::test]
-    async fn unreachable_engine_serves_starting_page() {
+    async fn unreachable_engine_serves_starting_page_with_boot_label() {
         // Bind then drop to get a definitely-closed loopback port (connect →
         // ECONNREFUSED). The boot-window page (503 + auto-refresh) replaces the
         // raw 502 from 0013.
@@ -427,11 +427,30 @@ mod proxy_tests {
             l.local_addr().unwrap().port()
         };
         let target = format!("http://127.0.0.1:{port}");
-        let resp = proxy(&build_client(), &target, "dev", request("GET", "/dev/", Body::empty())).await;
+        // The route is set while the engine is still Booting, so a cold-open
+        // navigation reaches the proxy (not fallback's no-route branch) during
+        // the engine-reported phases — the connect-failure splash MUST render the
+        // passed phase label, or those phases would never reach the user.
+        let resp = proxy(
+            &build_client(),
+            &target,
+            "dev",
+            "Building search index — first run, this can take a minute…",
+            request("GET", "/dev/", Body::empty()),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "2");
         // The PWA service worker keys on this marker to SHOW the splash instead of
         // falling back to the cached app shell (sw.js::networkFirstShell).
         assert_eq!(resp.headers().get("x-lucidos-boot-splash").unwrap(), "1");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(
+            html.contains("Building search index — first run, this can take a minute…"),
+            "the connect-failure splash must render the passed boot phase label"
+        );
     }
 }

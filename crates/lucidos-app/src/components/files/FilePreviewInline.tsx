@@ -9,16 +9,16 @@ import { isMobile, viewportIsMobile } from '../../utils/viewport';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { ApiError, fetchKnowhowEntries, knowhowPreviewPath, saveDataFile, type KnowhowEntry } from '../../api/client';
 import { openFilePreview, refreshFilePreview } from '../../store/actions/artifacts';
-import { RENDERABLE_EXTS, TEXT_EXTS, isEditableDataFile } from './previewExts';
+import { RENDERABLE_EXTS, TEXT_EXTS, IMAGE_EXTS, VIDEO_EXTS, AUDIO_EXTS, isEditableDataFile } from './previewExts';
 import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
 
-const imageExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'bmp'];
-// .ogg is treated as audio (Vorbis/Opus is by far the most common modern usage);
-// .ogv is the video variant. Listing 'ogg' in both video and audio caused
-// double-render of <video> and <audio> for the same file.
-const videoExts = ['mp4', 'webm', 'ogv', 'mov'];
-const audioExts = ['mp3', 'wav', 'ogg', 'flac', 'm4a'];
+// SVG is text (XML) but the data-file preview shows it as an <img> by default —
+// the source view is the opt-in (sourceMode), handled by the TextContent branch.
+// So the <img>-eligible set here is the shared binary-image list plus svg.
+function isImageLike(ext: string): boolean {
+  return IMAGE_EXTS.includes(ext) || ext === 'svg';
+}
 
 /** Last `/`-separated segment of `path`, or `''` for empty / trailing-slash input. */
 export function basename(path: string): string {
@@ -47,12 +47,12 @@ export function FilePreviewInline({ path, layout }: Props) {
     <div class="file-preview-inline">
       <div class="file-preview-content">
         {editing && <FileEditor path={path} url={url} />}
-        {!editing && imageExts.includes(ext) && !(ext === 'svg' && sourceMode) && <img src={url} alt={path} style="max-width:100%;max-height:100%;object-fit:contain;" onClick={() => { if (isMobile()) openImagePopup(url); }} />}
+        {!editing && isImageLike(ext) && !(ext === 'svg' && sourceMode) && <img src={url} alt={path} style="max-width:100%;max-height:100%;object-fit:contain;" onClick={() => { if (isMobile()) openImagePopup(url); }} />}
         {!editing && ext === 'pdf' && <iframe src={url} style="width:100%;height:100%;border:none;" />}
-        {!editing && videoExts.includes(ext) && <video src={url} controls style="max-width:100%;max-height:100%;" />}
-        {!editing && audioExts.includes(ext) && <audio src={url} controls style="width:100%;" />}
+        {!editing && VIDEO_EXTS.includes(ext) && <video src={url} controls style="max-width:100%;max-height:100%;" />}
+        {!editing && AUDIO_EXTS.includes(ext) && <audio src={url} controls style="width:100%;" />}
         {!editing && (TEXT_EXTS.includes(ext) || (ext === 'svg' && sourceMode)) && <TextContent ext={ext} url={url} sourceMode={sourceMode} path={path} />}
-        {!editing && !imageExts.includes(ext) && ext !== 'pdf' && !videoExts.includes(ext) && !audioExts.includes(ext) && !TEXT_EXTS.includes(ext) && (
+        {!editing && !isImageLike(ext) && ext !== 'pdf' && !VIDEO_EXTS.includes(ext) && !AUDIO_EXTS.includes(ext) && !TEXT_EXTS.includes(ext) && (
           <div class="empty-state">
             <p>Preview not available for <strong>.{ext}</strong> files</p>
             {/* Bare `<a download>` desugars to `download={true}`, which Preact

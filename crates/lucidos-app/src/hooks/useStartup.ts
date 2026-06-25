@@ -16,6 +16,7 @@ import { loadAllThreads, loadFilterFacets } from '../store/actions/thread-loadin
 import { refreshPushSubscription, recoverServiceWorker } from '../store/actions/push';
 import { setupNativePushTapRouting } from '../store/actions/native-push';
 import { startDevicePresenceTracking } from '../store/actions/device-presence';
+import { startAppUpdateChecks, stopAppUpdateChecks } from '../store/actions/app-update';
 import { startScrollVisibilityHandler } from '../components/chat/scrollState';
 import { isTauri } from '../utils/platform';
 import { invoke } from '../utils/tauri';
@@ -443,12 +444,18 @@ export function useStartup(): void {
       ? setInterval(() => { invoke('heartbeat').catch(() => {}); }, 15_000)
       : null;
 
+    // Packaged build: surface "update available" INSIDE the workspace (in-app
+    // toast), checking on startup + on an interval so a long-resident client still
+    // notices. Tauri-only; a no-op in a browser/PWA/dev. See store/actions/app-update.ts.
+    startAppUpdateChecks();
+
     return () => {
       unmounted = true;
       stopLiveness();
       clearInterval(connectionInterval);
       stopSwProbe();
       if (heartbeatInterval) clearInterval(heartbeatInterval);
+      stopAppUpdateChecks();
       clearTimeout(initialHealthCheck);
       window.removeEventListener('message', onAppFrameMessage);
       stopHashRouting();

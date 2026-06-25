@@ -19,6 +19,28 @@
 //! `native-notification-tapped` — the SAME event + payload shape the page
 //! already routes through `dispatchDeepLink` (`store/actions/native-push.ts`).
 
+/// The notification request identifier carried by a deep link: the engine
+/// `notification_id` string, or `""` when absent / not a string. It keys the
+/// pending-link map and IS the UN request identifier, so a repeat for the same
+/// notification REPLACES its banner (matching the web-push `tag`). Pure +
+/// platform-independent so the extraction is unit-testable off macOS.
+#[cfg(any(target_os = "macos", test))]
+fn link_identifier(link: &serde_json::Value) -> String {
+    link.get("notification_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// True when a UN response action identifier is the swipe-away dismiss
+/// pseudo-action (`…DismissActionIdentifier`) rather than a real tap — a dismiss
+/// must drop its stashed deep link WITHOUT routing or bringing the app forward.
+/// Pure + platform-independent so it is testable off macOS.
+#[cfg(any(target_os = "macos", test))]
+fn is_dismiss_action(action: &str) -> bool {
+    action.ends_with("DismissActionIdentifier")
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use std::collections::HashMap;
@@ -77,7 +99,7 @@ mod imp {
                 // The dismiss pseudo-action ("…DismissActionIdentifier") is a
                 // swipe-away, not a tap — drop its stashed link without routing.
                 let action = response.actionIdentifier().to_string();
-                let routed = !action.ends_with("DismissActionIdentifier");
+                let routed = !super::is_dismiss_action(&action);
 
                 let link = pending().lock().unwrap().remove(&identifier);
                 if routed {
@@ -155,11 +177,7 @@ mod imp {
         if tauri::is_dev() {
             return;
         }
-        let identifier = link
-            .get("notification_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
+        let identifier = super::link_identifier(&link);
 
         let content = UNMutableNotificationContent::new();
         content.setTitle(&NSString::from_str(title));
@@ -194,3 +212,39 @@ pub fn setup(_app: &tauri::AppHandle) {}
 
 #[cfg(not(target_os = "macos"))]
 pub fn show(_title: &str, _body: &str, _link: serde_json::Value) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn link_identifier_reads_the_notification_id_string() {
+        // Present → the id IS the request identifier (replace-by-id semantics).
+        assert_eq!(
+            link_identifier(&json!({"notification_id": "abc-123", "thread_id": "t1"})),
+            "abc-123"
+        );
+        // Absent → empty (the caller then skips the pending-link insert).
+        assert_eq!(link_identifier(&json!({"thread_id": "t1"})), "");
+        // Non-string → empty (defensive: a number/null is not a usable id).
+        assert_eq!(link_identifier(&json!({"notification_id": 42})), "");
+        assert_eq!(link_identifier(&json!({"notification_id": null})), "");
+        assert_eq!(link_identifier(&serde_json::Value::Null), "");
+    }
+
+    #[test]
+    fn is_dismiss_action_only_matches_the_swipe_away_pseudo_action() {
+        // The system dismiss pseudo-action → true (drop the link, don't route).
+        assert!(is_dismiss_action(
+            "com.apple.UNNotificationDismissActionIdentifier"
+        ));
+        // The default tap action → false (route the deep link).
+        assert!(!is_dismiss_action(
+            "com.apple.UNNotificationDefaultActionIdentifier"
+        ));
+        // A custom action id → false.
+        assert!(!is_dismiss_action("my.custom.action"));
+        assert!(!is_dismiss_action(""));
+    }
+}

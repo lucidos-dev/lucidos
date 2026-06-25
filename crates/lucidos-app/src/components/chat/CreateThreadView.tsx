@@ -29,6 +29,14 @@ export function renderExchanges(
   exchanges: Exchange[],
   threadId: string,
   streamingBuffer: string,
+  /** Windowing: emit DOM only for exchanges at this index or later. The loop
+   *  still iterates the FULL array so every index-based decision (activeIdx,
+   *  queued run, unresumedAbort) and accumulator (imgOffset, prior model/effort)
+   *  stays correct — only `nodes.push` is gated. A large thread thus renders (and
+   *  markdown-parses) just its visible tail; older exchanges materialize as the
+   *  user scrolls up (see ThreadView's renderCount). Default 0 = render all (the
+   *  pre-windowing behavior, used by tests and the deep-link "render all" path). */
+  renderFromIndex = 0,
 ): VNode[] {
   // Compute once which abort exchange (if any) gets the Continue button —
   // the most recent ResponseAborted that has no later ContinuationStarted.
@@ -127,7 +135,7 @@ export function renderExchanges(
     if (queuedCount === 1) {
       const i = queuedOrder[0];
       const ex = exchanges[i];
-      nodes.push(renderOne(ex, i));
+      if (i >= renderFromIndex) nodes.push(renderOne(ex, i));
       advance(ex);
       return;
     }
@@ -135,9 +143,12 @@ export function renderExchanges(
     const queuedNodes: VNode[] = [];
     for (const j of queuedOrder) {
       const ex = exchanges[j];
-      queuedNodes.push(renderOne(ex, j));
+      if (j >= renderFromIndex) queuedNodes.push(renderOne(ex, j));
       advance(ex);
     }
+    // Queued followups ride the active turn at the tail, so they're virtually
+    // always in-window; bail if windowing happened to exclude them all.
+    if (queuedNodes.length === 0) return;
     nodes.push(
       <details
         class="queued-message-group"
@@ -175,7 +186,7 @@ export function renderExchanges(
     }
 
     const ex = exchanges[i];
-    nodes.push(renderOne(ex, i));
+    if (i >= renderFromIndex) nodes.push(renderOne(ex, i));
     advance(ex);
 
     if (i === activeIdx) {

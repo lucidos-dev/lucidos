@@ -3,6 +3,7 @@ import {
   repoSelectedChangeId, repoChanges, repoChangesLoadingMore,
   repoSource, repoDiff, repoPending, repoViewMode, repositories,
   activeMenuItem, panelOverlay, SELECTED_CHANGE_KEY,
+  threadMap, toasts,
 } from '../store';
 import '../effects';
 import type { Change, RepoChangesState } from '../../api/client';
@@ -16,12 +17,13 @@ vi.mock('../../api/client', async () => {
     getChangeById: vi.fn(),
     getRepoChanges: vi.fn(),
     listRepoFiles: vi.fn(),
+    getThreadCcDiff: vi.fn(),
   };
 });
 
-import { getChangeById, getChangeDiff, getRepoChanges, ApiError } from '../../api/client';
+import { getChangeById, getChangeDiff, getRepoChanges, listRepoFiles, getThreadCcDiff, ApiError } from '../../api/client';
 import {
-  selectRepoChange, loadRepoChanges, viewChangeDiff,
+  selectRepoChange, loadRepoChanges, viewChangeDiff, viewThreadCcDiff,
   restoreRepoSelectionFromStorage,
 } from '../actions/repositories';
 
@@ -66,6 +68,8 @@ beforeEach(() => {
   repositories.value = { status: 'not-loaded' };
   activeMenuItem.value = 'files';
   panelOverlay.value = null;
+  threadMap.value = new Map();
+  toasts.value = [];
   localStorage.removeItem(SELECTED_CHANGE_KEY);
   vi.clearAllMocks();
 });
@@ -181,15 +185,156 @@ describe('viewChangeDiff', () => {
     expect(panelOverlay.value).toBeNull();
   });
 
-  it('does nothing if repo not found', async () => {
+  // App coding-agent changes use the workspace root as repo_root (not a
+  // registered Repository), as do changes whose repo was later removed. Both
+  // render the diff inline instead of bailing — the All-Files tab needs a
+  // registered repo, but the diff itself does not.
+  it('renders the diff inline when no registered repo matches', async () => {
     repositories.value = {
       status: 'loaded',
       data: [{ id: 'repo-2', name: 'Other', path: '/other/repo' }],
     };
+    (getChangeDiff as ReturnType<typeof vi.fn>).mockResolvedValue({
+      files: [
+        { path: 'data/apps/widget/index.html', status: 'modified', hunks: [] },
+        { path: 'data/apps/widget/app.js', status: 'modified', hunks: [] },
+      ],
+    });
 
     await viewChangeDiff(mockChange);
 
-    expect(repoSelectedChangeId.value).toBeNull();
+    expect(getChangeDiff).toHaveBeenCalledWith('change-1');
+    expect(activeMenuItem.value).toBe('files');
+    expect(repoSource.value).toBeNull();
+    expect(repoSelectedChangeId.value).toBe('change-1');
+    expect(repoViewMode.value).toBe('changes');
+    expect(repoDiff.value.status).toBe('loaded');
+    // No threadMap entry → no app-id suffix, just the change description.
+    expect(repoPending.value?.description).toBe('Fix the widget');
+  });
+
+  it('appends the app id to the description for an app coding-agent change', async () => {
+    repositories.value = { status: 'loaded', data: [] };
+    threadMap.value = new Map([
+      ['thread-1', { meta: { codingAgentKind: 'app', codingAgentFolder: '/ws/data/apps/widget/' } } as never],
+    ]);
+    (getChangeDiff as ReturnType<typeof vi.fn>).mockResolvedValue({
+      files: [{ path: 'data/apps/widget/index.html', status: 'modified', hunks: [] }],
+    });
+
+    await viewChangeDiff(mockChange);
+
+    expect(repoPending.value?.description).toBe('Fix the widget — widget');
+  });
+
+  it('renders a single-file unregistered change inline (no file-preview overlay)', async () => {
+    repositories.value = { status: 'loaded', data: [] };
+    (getChangeDiff as ReturnType<typeof vi.fn>).mockResolvedValue({
+      files: [{ path: 'data/apps/widget/solo.js', status: 'modified', hunks: [] }],
+    });
+
+    await viewChangeDiff(mockChange);
+
+    // openSingleFileDiffDirectly no-ops without a registered repoSource, so even
+    // a single-file diff renders inline rather than opening a file preview.
+    expect(panelOverlay.value).toBeNull();
+    expect(repoViewMode.value).toBe('changes');
+    expect(repoSource.value).toBeNull();
+  });
+
+  it('surfaces a failed diff fetch for an unregistered change', async () => {
+    repositories.value = { status: 'loaded', data: [] };
+    (getChangeDiff as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('git diff failed'));
+
+    await viewChangeDiff(mockChange);
+
+    expect(repoDiff.value.status).toBe('failed');
+    expect(toasts.value.find(t => t.type === 'error')).toBeTruthy();
+  });
+
+  it('opens the only file directly when the change touches a single file', async () => {
+    repositories.value = {
+      status: 'loaded',
+      data: [{ id: 'repo-1', name: 'Test', path: '/test/repo' }],
+    };
+    (getChangeDiff as ReturnType<typeof vi.fn>).mockResolvedValue({ files: [{ path: 'solo.rs', status: 'modified', hunks: [] }] });
+    (getRepoChanges as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [], applied: [], has_more: false });
+
+    await viewChangeDiff(mockChange);
+
+    // Skips the file list and lands on the file-preview overlay for that file.
+    expect(panelOverlay.value).toEqual({
+      type: 'file-preview',
+      path: 'repo:repo-1:diff#change-1:solo.rs',
+    });
+  });
+
+  it('lands on the file list (no direct open) for a multi-file change', async () => {
+    repositories.value = {
+      status: 'loaded',
+      data: [{ id: 'repo-1', name: 'Test', path: '/test/repo' }],
+    };
+    (getChangeDiff as ReturnType<typeof vi.fn>).mockResolvedValue({ files: [
+      { path: 'a.rs', status: 'modified', hunks: [] },
+      { path: 'b.rs', status: 'added', hunks: [] },
+    ] });
+    (getRepoChanges as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [], applied: [], has_more: false });
+
+    await viewChangeDiff(mockChange);
+
+    expect(panelOverlay.value).toBeNull();
+    expect(repoViewMode.value).toBe('changes');
+  });
+});
+
+describe('viewThreadCcDiff', () => {
+  // The thread-level Diff button (WaitingBanner / standalone CC diff button)
+  // routes here, NOT through viewChangeDiff — so the single-file direct-open
+  // behavior must hold here too.
+  it('opens the only file directly for a single-file branch diff', async () => {
+    repositories.value = {
+      status: 'loaded',
+      data: [{ id: 'repo-1', name: 'Test', path: '/test/repo' }],
+    };
+    (getThreadCcDiff as ReturnType<typeof vi.fn>).mockResolvedValue({
+      repo_root: '/test/repo',
+      branch_name: 'claude-code/feat',
+      base_ref: 'main',
+      files: [{ path: 'solo.rs', status: 'added', hunks: [] }],
+    });
+    (getRepoChanges as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [], applied: [], has_more: false });
+    (listRepoFiles as ReturnType<typeof vi.fn>).mockResolvedValue(['solo.rs']);
+
+    await viewThreadCcDiff('thread-1');
+
+    // No Change row backs a thread diff, so the file-preview encodes no changeId.
+    expect(panelOverlay.value).toEqual({
+      type: 'file-preview',
+      path: 'repo:repo-1:diff:solo.rs',
+    });
+  });
+
+  it('lands on the file list for a multi-file branch diff', async () => {
+    repositories.value = {
+      status: 'loaded',
+      data: [{ id: 'repo-1', name: 'Test', path: '/test/repo' }],
+    };
+    (getThreadCcDiff as ReturnType<typeof vi.fn>).mockResolvedValue({
+      repo_root: '/test/repo',
+      branch_name: 'claude-code/feat',
+      base_ref: 'main',
+      files: [
+        { path: 'a.rs', status: 'modified', hunks: [] },
+        { path: 'b.rs', status: 'added', hunks: [] },
+      ],
+    });
+    (getRepoChanges as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [], applied: [], has_more: false });
+    (listRepoFiles as ReturnType<typeof vi.fn>).mockResolvedValue(['a.rs', 'b.rs']);
+
+    await viewThreadCcDiff('thread-1');
+
+    expect(panelOverlay.value).toBeNull();
+    expect(repoViewMode.value).toBe('changes');
   });
 });
 

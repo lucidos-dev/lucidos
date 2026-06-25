@@ -484,6 +484,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared_engine.start_parent_callback_listener();
     shared_engine.start_apply_all_driver();
 
+    // Construction is done (migrations + embedder); the recovery sweeps below run
+    // before the HTTP server binds, so narrate them on the boot splash.
+    lucidos_engine::boot_report::report(lucidos_engine::boot_report::RECOVERING);
+
     // If the bash supervisor dropped a respawn sidecar (the previous engine
     // pid died unexpectedly), emit one EngineSupervisorRespawned event so
     // the respawn is recorded in the audit timeline. Emits before recovery

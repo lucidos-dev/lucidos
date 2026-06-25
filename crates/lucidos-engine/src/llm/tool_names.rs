@@ -124,6 +124,8 @@ pub const ASK_USER_QUESTION: &str = "ask_user_question";
 // Image generation
 pub const GENERATE_IMAGE: &str = "generate_image";
 pub const SAVE_THREAD_IMAGE: &str = "save_thread_image";
+// Pull an image posted earlier in the thread back into the model's vision.
+pub const VIEW_IMAGE: &str = "view_image";
 
 // MCP server management
 pub const SETUP_MCP_SERVER: &str = "setup_mcp_server";

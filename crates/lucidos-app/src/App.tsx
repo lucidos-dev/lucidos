@@ -69,6 +69,9 @@ export function App() {
   return (
     <>
       <div class="app-shell">
+        {/* Reclaimed macOS title-bar band + window drag region. Collapses to 0px
+            (and is inert) off the macOS Tauri build — see .titlebar-strip CSS. */}
+        <div class="titlebar-strip" data-tauri-drag-region />
         <AppHeader />
         <Drawer />
         {mobile ? (

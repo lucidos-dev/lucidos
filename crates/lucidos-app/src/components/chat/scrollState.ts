@@ -18,6 +18,14 @@ import { signal } from '@preact/signals';
 export const scrolledUp = signal(false);
 export const awayFromBottom = signal(false);
 export const notAtTop = signal(false);
+/** True while a notification deep-link is resolving a scroll to a specific event
+ *  or change. The thread render is WINDOWED (only a tail of exchanges is in the
+ *  DOM), so a deep-link target above the window would never render for
+ *  scrollToSelectorAndPulse to find. ThreadView reads this and renders ALL
+ *  exchanges while it's true (and keeps them rendered afterwards, so the user
+ *  isn't snapped when it clears). A signal (not the plain `_pendingEventScrollTarget`
+ *  var) so the render subscribes. */
+export const deepLinkRenderAll = signal(false);
 /** True once the transcript is scrolled even slightly from the very top (2px
  *  subpixel slack). Drives the mobile thread-title fade overlay so it eases in
  *  the moment content slides under the sticky title — unlike `notAtTop`, whose
@@ -326,13 +334,21 @@ function scrollToSelectorAndPulse(selector: string, preferLast = false, pulseChi
   // claim (not on scrolledUp) is what lets the events-load effect keep its
   // separate slow-load scrolledUp recovery.
   _pendingEventScrollTarget = selector;
+  // Force ThreadView to render the FULL exchange list so a windowed-out target
+  // can render for tryResolve/the MutationObserver to find. Stays true until the
+  // claim releases; ThreadView keeps the thread fully rendered afterward so the
+  // user isn't snapped back to the windowed tail mid-read.
+  deepLinkRenderAll.value = true;
 
   // Release this call's claim — but only if it's still ours. A second deep-link
   // started mid-flight has overwritten the slot with its own target; its own
   // release handles that one. Without the guard, this call's deadline would
   // clear the newer claim and let an auto-scroll-to-bottom override it.
   const releaseClaim = () => {
-    if (_pendingEventScrollTarget === selector) _pendingEventScrollTarget = null;
+    if (_pendingEventScrollTarget === selector) {
+      _pendingEventScrollTarget = null;
+      deepLinkRenderAll.value = false;
+    }
   };
 
   const stopWatching = () => {
@@ -459,6 +475,7 @@ export function scrollToChangeAndPulse(changeId: string): void {
  *  can't leak onto the newly-focused thread's load. */
 export function clearPendingEventScroll(): void {
   _pendingEventScrollTarget = null;
+  deepLinkRenderAll.value = false;
 }
 
 /** True when the chat exchange with the given `data-event-id` is currently

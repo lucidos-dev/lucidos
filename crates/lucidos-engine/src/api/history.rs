@@ -446,10 +446,11 @@ fn restart_via_launchd() -> Result<StatusCode, (StatusCode, Json<serde_json::Val
     }
 }
 
-/// List other running Lucidos workspaces by calling status.sh --json.
-/// Excludes the current workspace from results. Times out after 10s to
+/// List all Lucidos workspaces by calling status.sh --json — including the
+/// current one, which the control panel renders as the active row with its
+/// refresh control (parity with the gateway picker). Times out after 10s to
 /// avoid blocking if Docker or target engines are unresponsive.
-pub(super) async fn list_workspaces(State(state): State<AppState>) -> Json<serde_json::Value> {
+pub(super) async fn list_workspaces() -> Json<serde_json::Value> {
     let empty = || Json(serde_json::json!({ "workspaces": [] }));
     let script = match crate::paths::script("status.sh") {
         Ok(p) => p,
@@ -458,11 +459,10 @@ pub(super) async fn list_workspaces(State(state): State<AppState>) -> Json<serde
             return empty();
         }
     };
-    let ws = state.workspace_path.to_string_lossy().to_string();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         tokio::process::Command::new(&script)
-            .args(["--json", "-w", &ws])
+            .args(["--json"])
             .output(),
     )
     .await;

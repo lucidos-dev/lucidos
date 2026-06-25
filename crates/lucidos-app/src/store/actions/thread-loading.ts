@@ -1,6 +1,6 @@
 import { threadMap, focusedThreadId, setFocusedThread, showToast, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, filterFacets, codingAgentSessionVersion, engineRestarting, archivingThreadIds, CODING_AGENT_CHANNEL, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
 import { threadPassesChannelFilter } from '../threadFilter';
-import { handleEvent, isChannelDefiningEvent, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, recencyKey, type ThreadAggregate, type ThreadState, type ThreadEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
+import { handleEvent, isChannelDefiningEvent, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, createdKey, type ThreadAggregate, type ThreadState, type ThreadEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { applyDraftBatch, setDraft, clearDraft, type ComposeDraft } from '../composeDrafts';
 import { fetchThreads, fetchThreadEvents, fetchOlderThreads, fetchFilterFacets, fetchArchivedCount } from '../../api/threads';
@@ -41,7 +41,8 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       createdAt: info.created_at || new Date().toISOString(),
       updatedAt: info.last_activity || info.created_at || new Date().toISOString(),
       // Absent (legacy/test mocks) → fall back to last_activity, matching
-      // recencyKey's fallback so the sort key + pagination cursor stay coherent.
+      // recencyKey's fallback so the Saved-section sort key stays coherent.
+      // (Archive sorts + pages by createdAt now, not this field.)
       lastUserAction: info.last_user_action || info.last_activity || info.created_at || new Date().toISOString(),
       lastAgentAction: info.last_agent_action || info.last_activity || info.created_at || new Date().toISOString(),
       status: (info.status as ThreadStatus) || 'idle',
@@ -629,6 +630,16 @@ export async function loadOlderThreads(): Promise<void> {
     let oldestTime: string | null = null;
     for (const t of map.values()) {
       if (t.meta.saved) continue;
+      // Only the Archive pile paginates — inbox/REVIEW is loaded in full by
+      // `get_recent_threads`. The cursor pages by `created_at`, and an inbox
+      // thread can be old-CREATED yet recently-active (a long-lived chat); if
+      // it drove the cursor it would collapse it far into the past, and
+      // `get_older_threads(before=that)` would skip every archived thread
+      // created after it — Archive would stop paging. Restrict to archived rows
+      // so the cursor is the oldest loaded ARCHIVE thread. (With the old
+      // last_user_action axis this didn't bite because active rows have a recent
+      // last_user_action; created_at does not move with activity.)
+      if (t.meta.section !== 'archived') continue;
       // Family-extension threads are loaded eagerly so the drawer can nest
       // them under their parent, but their own `last_activity` can be
       // arbitrarily old. Letting one drive the cursor would jump natural
@@ -638,10 +649,10 @@ export async function loadOlderThreads(): Promise<void> {
       // thread that actually matches the active filter (channel + trigger +
       // repo/app union) — never drifts from what's shown.
       if (!threadPassesChannelFilter(t, filter, triggerIdSet, repoIdSet, appIdSet)) continue;
-      // Cursor on last_user_action — the column the backend `get_older_threads`
-      // pages by — so the cursor axis matches the sort axis (else pagination
-      // skips or repeats rows).
-      const key = recencyKey(t);
+      // Cursor on created_at — the column the backend `get_older_threads`
+      // pages by — so the cursor axis matches the Archive sort axis (else
+      // pagination skips or repeats rows). Same fallback chain as `byCreated`.
+      const key = createdKey(t);
       if (!oldestTime || key < oldestTime) oldestTime = key;
     }
 

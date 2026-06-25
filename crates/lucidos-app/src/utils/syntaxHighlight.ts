@@ -37,7 +37,7 @@ hljs.registerLanguage('json', json);
 hljs.registerLanguage('xml', xml);
 
 const EXT_TO_LANG: Record<string, string> = {
-  js: 'javascript', jsx: 'javascript',
+  js: 'javascript', jsx: 'javascript', gs: 'javascript',
   ts: 'typescript', tsx: 'typescript',
   py: 'python', rb: 'ruby', go: 'go', rs: 'rust',
   java: 'java', kt: 'kotlin', kts: 'kotlin',

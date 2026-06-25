@@ -84,11 +84,17 @@ pub async fn add_repository(
         ));
     }
 
+    // Intrinsic identity comes from the repo's root-commit SHA (read from disk),
+    // so re-registering the same history is idempotent. None (no commits) falls
+    // back to a path-derived id inside `add`.
+    let root_commit_sha = crate::engine::git_ops::root_commit_sha(path).await;
+
     let repo = RepositoryStore::add(
         &state.pool,
         &req.name,
         &expanded_path,
         req.description.as_deref(),
+        root_commit_sha.as_deref(),
     )
     .await
     .map_err(|e| {
@@ -504,6 +510,14 @@ fn parse_range(s: &str) -> (u32, u32) {
 }
 
 /// GET /api/v1/changes/:id/diff — compute diff for any change (pending or applied)
+///
+/// Mirrors `get_thread_cc_diff` for app coding-agent changes: resolves the
+/// pending base via `default_diff_base` (the workspace's actual default branch,
+/// not a hardcoded `main`) and scopes the diff to `data/apps/<id>/` via
+/// `lookup_app_pathspec`, so the change-row Diff matches the thread-level Diff
+/// and never leaks files the agent touched outside the app folder. Registered
+/// Lucidos-source / external changes resolve `default_diff_base` to their
+/// `main` / `origin/main`, so their diff is unchanged.
 pub async fn get_change_diff(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
@@ -516,11 +530,13 @@ pub async fn get_change_diff(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "Change not found".into()))?;
 
+    let repo_root = std::path::Path::new(&change.repo_root);
     let range = if change.status == "pending" {
         if super::is_dangerous_git_ref(&change.branch_name) {
             return Err((StatusCode::BAD_REQUEST, "Invalid branch name".into()));
         }
-        format!("main...{}", change.branch_name)
+        let base = crate::engine::git_ops::default_diff_base(repo_root).await;
+        format!("{}...{}", base, change.branch_name)
     } else {
         let pre_sha = change.pre_merge_sha.as_deref().ok_or((
             StatusCode::BAD_REQUEST,
@@ -534,23 +550,14 @@ pub async fn get_change_diff(
         format!("{}..{}", pre_sha, post_sha)
     };
 
-    let output = crate::engine::git_ops::git_cmd(
-        &["diff", &range, "--no-color"],
-        std::path::Path::new(&change.repo_root),
-    )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("git diff failed: {stderr}"),
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let files = parse_diff_output(&stdout);
+    // App coding-agent changes live under `data/apps/<id>/` in the workspace
+    // repo; scope the diff there. None for Lucidos-source / external changes
+    // (and for changes with no thread_id), leaving the diff unscoped as before.
+    let pathspec = match change.thread_id {
+        Some(thread_id) => lookup_app_pathspec(&state.pool, thread_id).await,
+        None => None,
+    };
+    let files = run_git_diff(repo_root, &range, pathspec.as_deref()).await?;
     Ok(Json(RepoDiff { files }))
 }
 

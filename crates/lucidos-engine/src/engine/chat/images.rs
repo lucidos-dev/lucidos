@@ -1,6 +1,6 @@
 use base64::Engine as _;
 
-use crate::core::blobs::{ext_for_mime, resolve_blob};
+use crate::core::blobs::resolve_blob;
 use crate::llm::{ContentBlock, MessageContent};
 
 /// Maximum total base64 bytes for all images included in a single LLM call.
@@ -180,57 +180,6 @@ pub(super) fn build_user_content_with_images(
     }
 
     MessageContent::Blocks(blocks)
-}
-
-/// Decode user-attached images to `.lucidos/tmp/images/` so CC's `Read`
-/// tool can reference them by path. Returns workspace-relative paths
-/// (e.g., `.lucidos/tmp/images/20260317-143052-0.jpg`).
-pub(super) fn save_images_to_tmp(
-    workspace_path: &std::path::Path,
-    images: &[crate::api::ChatImage],
-) -> Vec<String> {
-    if images.is_empty() {
-        return Vec::new();
-    }
-
-    let images_dir = workspace_path.join(".lucidos/tmp/images");
-    if let Err(e) = std::fs::create_dir_all(&images_dir) {
-        crate::log!("[Image] Failed to create tmp/images dir: {}", e);
-        return Vec::new();
-    }
-
-    let now = chrono::Utc::now();
-    let timestamp = now.format("%Y%m%d-%H%M%S").to_string();
-    let mut paths = Vec::new();
-
-    for (i, img) in images.iter().enumerate() {
-        let ext = ext_for_mime(&img.mime_type).unwrap_or("jpg");
-        let filename = format!("{}-{}.{}", timestamp, i, ext);
-        let rel_path = format!(".lucidos/tmp/images/{}", filename);
-        let full_path = workspace_path.join(&rel_path);
-
-        match base64::engine::general_purpose::STANDARD.decode(&img.base64) {
-            Ok(bytes) => {
-                if let Err(e) = std::fs::write(&full_path, &bytes) {
-                    crate::log!("[Image] Failed to write {}: {}", rel_path, e);
-                    continue;
-                }
-                paths.push(rel_path);
-            }
-            Err(e) => {
-                crate::log!("[Image] Failed to decode base64 for image {}: {}", i, e);
-            }
-        }
-    }
-
-    if !paths.is_empty() {
-        crate::log!(
-            "[Image] Saved {} image(s) to .lucidos/tmp/images/",
-            paths.len()
-        );
-    }
-
-    paths
 }
 
 #[cfg(test)]

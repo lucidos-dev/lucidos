@@ -349,6 +349,7 @@ impl LucidosEngine {
             .await?;
 
         // Run sqlx migrations before any schema init calls
+        crate::boot_report::report(crate::boot_report::MIGRATING);
         sqlx::migrate!().run(&pool).await?;
 
         let event_store = EventStore::new(pool.clone());
@@ -434,6 +435,9 @@ impl LucidosEngine {
         let python_runtime = PythonRuntime::new(workspace_path.clone())?;
         let app_manager = Arc::new(AppManager::new(&workspace_path)?);
 
+        // The long pole on a first-ever open: this downloads the embedding model
+        // (hundreds of MB) before HTTP binds. Narrate it on the boot splash.
+        crate::boot_report::report(crate::boot_report::BUILDING_SEARCH_INDEX);
         let embedder = Arc::new(FastEmbedProvider::new()?);
 
         let browser_runtime = BrowserRuntime::new(workspace_path.clone(), pool.clone());
@@ -558,11 +562,16 @@ impl LucidosEngine {
             }
         };
 
-        // Register the Lucidos repo so it appears in the Files view without manual setup
+        // Register the Lucidos repo so it appears in the Files view without manual
+        // setup. Its id is derived from the repo's root-commit SHA (read from
+        // disk), so a registry wipe / re-seed always recomputes the SAME id —
+        // coding-agent threads bound to it never orphan.
+        let default_repo_root_commit = git_ops::root_commit_sha(&repo_root).await;
         if let Err(e) = crate::core::repositories::RepositoryStore::ensure_exists(
             &pool,
             Self::DEFAULT_REPO_NAME,
             &repo_root.to_string_lossy(),
+            default_repo_root_commit.as_deref(),
         )
         .await
         {
@@ -570,6 +579,27 @@ impl LucidosEngine {
                 "[Startup] Failed to register default Lucidos repository: {}",
                 e
             );
+        }
+
+        // One-time, marker-guarded: re-point coding-agent threads orphaned by the
+        // old random-UUID registry onto the default repo's deterministic id (every
+        // lucidos/legacy thread targets the Lucidos source by definition). Must run
+        // AFTER ensure_exists above so the live row already carries the new id.
+        let default_repo_det_id = crate::core::repositories::deterministic_id(
+            default_repo_root_commit.as_deref(),
+            &repo_root.to_string_lossy(),
+        );
+        match event_store
+            .backfill_cc_repo_id_to_deterministic(default_repo_det_id)
+            .await
+        {
+            Ok(n) if n > 0 => log!(
+                "[Engine] Backfilled {} thread_summaries rows: cc_repo_id → deterministic repo id {}",
+                n,
+                default_repo_det_id
+            ),
+            Ok(_) => {}
+            Err(e) => log!("[Startup] cc_repo_id deterministic backfill failed: {}", e),
         }
 
         // Auto-commit safe files (docs) if dirty — a dirty working tree blocks

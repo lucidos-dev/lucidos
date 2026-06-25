@@ -303,12 +303,10 @@
 @media (hover: hover) {
     .toast .toast-actions .action-btn:focus,
     .toast .toast-close:focus {
-        outline: 0.125rem solid var(--accent);
-        outline-offset: 0.125rem;
-    }
-
-    .toast .toast-close:focus {
-        border-radius: 0.125rem;
+        /* Shared --focus-ring on plain :focus (programmatic focus isn't
+           :focus-visible) so the toast's default button is always indicated. */
+        outline: 0.125rem solid transparent;
+        box-shadow: var(--focus-ring);
     }
 }
 

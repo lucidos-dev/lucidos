@@ -16,11 +16,12 @@
 //! A workspace slug can never start with the sigil (slugs are `[a-z0-9-]`), so
 //! the first path segment is unambiguous with no reserved-word list.
 
+use crate::boot_phase::{self, BootPhase};
 use crate::error::ApiError;
 use crate::postgres::{self, PgBackend, PgHandle};
 use crate::proxy;
 use crate::registry::{self, Registry, Workspace, SIGIL};
-use crate::stack::{self, Health, StackRuntime, WorkspaceStatus};
+use crate::stack::{self, Health, ProbeOutcome, StackRuntime, WorkspaceStatus};
 use crate::BoxError;
 use axum::body::Body;
 use axum::extract::State;
@@ -96,6 +97,17 @@ const BOOT_GRACE: Duration = Duration::from_secs(120);
 const RESPAWN_BACKOFF: Duration = Duration::from_secs(5);
 /// Auto-respawn attempts (since last healthy) before a stack is marked unhealthy.
 const RESTART_CAP: u32 = 5;
+/// Consecutive missed probes before culling an engine that is UNREACHABLE
+/// (connection refused — listener gone) or whose process has exited. Small: a
+/// real death should recover promptly.
+const DEAD_MISS_THRESHOLD: u32 = 2;
+/// Consecutive missed probes before culling an alive-but-SLOW engine (probe
+/// timed out but the process is alive — busy, not dead). High so a load spike
+/// (a heavy e2e run, memory pressure) never culls a working engine: with
+/// `SUPERVISE_INTERVAL` = 2s and a 5s probe timeout, 5 misses is ~25–35s of
+/// sustained unresponsiveness before a respawn. This is the core fix for the
+/// 2026-06-24 respawn storm, where a single missed 3s probe culled busy engines.
+const SLOW_MISS_THRESHOLD: u32 = 5;
 
 /// Shared, cheaply-cloneable gateway handle.
 #[derive(Clone)]
@@ -126,6 +138,13 @@ struct GatewayInner {
     /// configured, so the gateway must proxy + health-probe it over https.
     engine_tls: bool,
     pg_backend: PgBackend,
+    /// True under the packaged desktop runtime (`desktop.rs::spawn_gateway` sets
+    /// `LUCIDOS_PACKAGED=1`), false in dev (`web-dev.sh` sets nothing). Reported in
+    /// `GET /~/api/v1/control/gateway/status` so the picker hides the dev-only
+    /// gateway self-reload control in packaged (where binary swaps happen via the
+    /// app updater + a full service restart, never a re-exec under a running
+    /// gateway).
+    packaged: bool,
     /// Shared-cluster provisioning is serialized across workspaces. Docker
     /// container creation and embedded `pg_ctl` startup are cluster-level
     /// operations; concurrent per-workspace starts should queue at this boundary,
@@ -146,6 +165,13 @@ struct GatewayInner {
     /// packaged builds, all interfaces in dev), so proxying never contends with a
     /// stack mutex held during a multi-second respawn.
     routes: RwLock<HashMap<String, u16>>,
+    /// id → current cold-boot phase, rendered as the boot-splash label
+    /// ([`crate::boot_phase`]). Gateway-observed phases are written here directly
+    /// (provisioning, spawning); engine-reported phases arrive via the
+    /// `boot-phase` control endpoint. Entries are removed once the workspace is
+    /// healthy / stopped so a later cold open never shows a stale phase. Mirrors
+    /// the `routes` map (cheap `RwLock`, off the stack-mutex path).
+    boot_phases: RwLock<HashMap<String, BootPhase>>,
     /// Single-slot state of the picker's restore-from-backup flow (see
     /// [`RestoreStatus`]). Polled via the control API; never persisted.
     restore: RwLock<RestoreStatus>,
@@ -199,6 +225,35 @@ impl GatewayState {
         }
     }
 
+    /// Record the current cold-boot phase for `id` (rendered on the boot splash).
+    /// Hot path — no async locks. Called by the gateway as it provisions/spawns
+    /// and by the `boot-phase` control endpoint when the engine reports.
+    pub fn set_boot_phase(&self, id: &str, phase: BootPhase) {
+        if let Ok(mut p) = self.inner.boot_phases.write() {
+            p.insert(id.to_string(), phase);
+        }
+    }
+
+    /// Drop any boot phase for `id`. Called when the workspace becomes healthy or
+    /// is stopped, so a later cold open starts from the default label rather than
+    /// a stale phase from the previous boot.
+    pub fn clear_boot_phase(&self, id: &str) {
+        if let Ok(mut p) = self.inner.boot_phases.write() {
+            p.remove(id);
+        }
+    }
+
+    /// The boot-splash label for `id` — the current phase's label, or the default
+    /// when no phase is known yet (initial paint / between boots).
+    fn boot_phase_label(&self, id: &str) -> &'static str {
+        self.inner
+            .boot_phases
+            .read()
+            .ok()
+            .and_then(|p| p.get(id).map(|phase| phase.label()))
+            .unwrap_or(boot_phase::DEFAULT_LABEL)
+    }
+
     /// The single workspace's slug when exactly one is registered, else `None`.
     fn sole_workspace(&self) -> Option<String> {
         let reg = self.inner.registry.lock().unwrap();
@@ -246,6 +301,13 @@ impl GatewayState {
     /// This process's baked build id.
     pub fn build_id(&self) -> &'static str {
         GATEWAY_BUILD_ID
+    }
+
+    /// True under the packaged desktop runtime. The picker hides the dev-only
+    /// gateway self-reload control when this is set (binary swaps in packaged go
+    /// through the app updater + a full service restart, not a gateway re-exec).
+    pub fn packaged(&self) -> bool {
+        self.inner.packaged
     }
 
     /// Whether the on-disk gateway binary has a different build id than this
@@ -341,7 +403,8 @@ impl GatewayState {
             let me = self.clone();
             async move {
                 let running =
-                    stack::probe_health(&me.inner.health_client, me.engine_scheme(), ws.port).await;
+                    stack::probe_health(&me.inner.health_client, me.engine_scheme(), ws.port).await
+                        == ProbeOutcome::Healthy;
                 if running || ws.autostart {
                     // bring_up itself re-adopts a healthy engine and only spawns
                     // when none is running, so this is correct for both cases.
@@ -405,11 +468,15 @@ impl GatewayState {
                 engine,
                 health,
                 restart_attempts: 0,
+                health_misses: 0,
                 last_spawn: Some(Instant::now()),
                 last_error: None,
             },
             Err(e) => {
                 crate::log!("[Gateway] workspace '{}' failed to start: {}", ws.id, e);
+                // Start failed — drop any phase so the splash shows the neutral
+                // default rather than a stale "Provisioning database…".
+                self.clear_boot_phase(&ws.id);
                 StackRuntime {
                     ws: ws.clone(),
                     resolved_dir,
@@ -417,6 +484,7 @@ impl GatewayState {
                     engine: None,
                     health: Health::Unhealthy,
                     restart_attempts: RESTART_CAP,
+                    health_misses: 0,
                     last_spawn: None,
                     last_error: Some(e.to_string()),
                 }
@@ -439,10 +507,17 @@ impl GatewayState {
         ws: &Workspace,
         resolved_dir: &Path,
     ) -> Result<(PgHandle, Option<std::process::Child>, Health), BoxError> {
+        // First splash phase: provisioning Postgres can pull/start a container or
+        // run `initdb` on a first-ever open.
+        self.set_boot_phase(&ws.id, BootPhase::ProvisioningDatabase);
         let prov = self.ensure_postgres(ws).await?;
 
-        if stack::probe_health(&self.inner.health_client, self.engine_scheme(), ws.port).await {
+        if stack::probe_health(&self.inner.health_client, self.engine_scheme(), ws.port).await
+            == ProbeOutcome::Healthy
+        {
             crate::log!("[Gateway] re-adopting healthy engine for '{}'", ws.id);
+            // Already up — no boot window to narrate.
+            self.clear_boot_phase(&ws.id);
             return Ok((prov.handle, None, Health::Healthy));
         }
 
@@ -455,6 +530,10 @@ impl GatewayState {
             self.inner.gateway_port,
             self.inner.engine_loopback,
         )?;
+        // Engine process is up; it now reports finer phases (migrating, building
+        // search index, recovering) via the boot-phase control endpoint until its
+        // first healthy probe clears the phase.
+        self.set_boot_phase(&ws.id, BootPhase::StartingEngine);
         Ok((prov.handle, Some(child), Health::Booting))
     }
 
@@ -463,15 +542,11 @@ impl GatewayState {
     /// provisioning so a provisioning failure leaves a recoverable `Unhealthy`
     /// workspace (retry / delete from the picker) rather than vanishing.
     ///
-    /// `autostart` seeds the new entry's flag: the picker's "+ New" passes `false`
-    /// (the user opens it now; whether it auto-starts on a future gateway boot is
-    /// their per-workspace toggle), while the first-run bootstrap passes `true`
-    /// so a fresh install opens straight into a running `default`.
-    pub async fn create_workspace(
-        &self,
-        name: &str,
-        autostart: bool,
-    ) -> Result<WorkspaceStatus, BoxError> {
+    /// New workspaces are created with `autostart = false`: the user opens this
+    /// one now, and whether it auto-starts on a future gateway boot is their
+    /// per-workspace picker toggle. (This is the sole creation path — there is no
+    /// auto-created bootstrap `default`; first run shows the picker.)
+    pub async fn create_workspace(&self, name: &str) -> Result<WorkspaceStatus, BoxError> {
         let ws = {
             let mut reg = self.inner.registry.lock().unwrap();
             let base = registry::slugify(name);
@@ -483,7 +558,7 @@ impl GatewayState {
                 dir: format!("workspaces/{id}"),
                 port,
                 database_url: None,
-                autostart,
+                autostart: false,
             };
             reg.add(ws.clone())?;
             reg.save(&self.inner.registry_path)?;
@@ -717,6 +792,7 @@ impl GatewayState {
                     engine: Some(child),
                     health: Health::Booting,
                     restart_attempts: 0,
+                    health_misses: 0,
                     last_spawn: Some(Instant::now()),
                     last_error: None,
                 };
@@ -901,6 +977,9 @@ impl GatewayState {
             stop_engine_process(&mut s);
         }
         self.clear_route(id);
+        // No live route means the next open lazy-starts fresh — drop any stale
+        // boot phase so that open begins from the default splash label.
+        self.clear_boot_phase(id);
         crate::log!("[Gateway] stopped '{}' (kept in registry)", id);
         Ok(())
     }
@@ -992,7 +1071,11 @@ impl GatewayState {
         stop_engine_process(s);
         s.last_spawn = Some(Instant::now());
         s.restart_attempts += 1;
+        // The respawn acts on the accumulated misses — clear them so the fresh
+        // engine starts its boot window with a clean consecutive-miss count.
+        s.health_misses = 0;
 
+        self.set_boot_phase(&s.ws.id, BootPhase::ProvisioningDatabase);
         let prov = match self.ensure_postgres(&s.ws).await {
             Ok(p) => p,
             Err(e) => {
@@ -1014,6 +1097,7 @@ impl GatewayState {
                 s.engine = Some(child);
                 s.health = Health::Booting;
                 s.last_error = None;
+                self.set_boot_phase(&s.ws.id, BootPhase::StartingEngine);
                 crate::log!(
                     "[Gateway] respawned '{}' (attempt {})",
                     s.ws.id,
@@ -1047,45 +1131,134 @@ impl GatewayState {
             if s.health == Health::Unhealthy {
                 continue;
             }
-            if stack::probe_health(&self.inner.health_client, self.engine_scheme(), s.ws.port).await
-            {
+            let outcome =
+                stack::probe_health(&self.inner.health_client, self.engine_scheme(), s.ws.port)
+                    .await;
+            if outcome == ProbeOutcome::Healthy {
                 s.health = Health::Healthy;
                 s.restart_attempts = 0;
+                s.health_misses = 0;
                 s.last_error = None;
+                // Booted — drop the boot phase so a later cold open starts clean.
+                self.clear_boot_phase(&s.ws.id);
                 continue;
             }
 
             let since_spawn = s.last_spawn.map(|t| t.elapsed()).unwrap_or(Duration::MAX);
             let alive = engine_process_alive(&mut s);
+            // Count this miss; a healthy probe (above) resets it. The decision
+            // requires several consecutive misses before culling an
+            // alive-but-busy engine, so a transient load spike never respawns a
+            // working engine — the root cause of the 2026-06-24 respawn storm.
+            s.health_misses = s.health_misses.saturating_add(1);
 
-            // Process alive but not yet healthy, still within its boot window →
-            // it's booting. Don't respawn it out from under itself.
-            if alive && since_spawn < BOOT_GRACE {
-                s.health = Health::Booting;
-                continue;
-            }
-
-            // Crash backoff: don't respawn more often than RESPAWN_BACKOFF.
-            if since_spawn < RESPAWN_BACKOFF {
-                continue;
-            }
-            if s.restart_attempts >= RESTART_CAP {
-                s.health = Health::Unhealthy;
-                if s.last_error.is_none() {
-                    s.last_error =
-                        Some("engine failed to become healthy after repeated restarts".to_string());
+            match respawn_decision(
+                outcome,
+                alive,
+                since_spawn,
+                s.health_misses,
+                s.restart_attempts,
+            ) {
+                // Healthy is handled above; treat defensively as a no-op.
+                SuperviseAction::Healthy => {}
+                SuperviseAction::Booting => s.health = Health::Booting,
+                // Within backoff or below the miss threshold — keep accumulating.
+                SuperviseAction::Wait => {}
+                SuperviseAction::MarkUnhealthy => {
+                    s.health = Health::Unhealthy;
+                    // Gave up auto-respawning — drop the phase; the last label
+                    // would otherwise lie ("Building search index…" on a dead
+                    // engine). The splash falls back to the neutral default.
+                    self.clear_boot_phase(&s.ws.id);
+                    if s.last_error.is_none() {
+                        s.last_error = Some(
+                            "engine failed to become healthy after repeated restarts".to_string(),
+                        );
+                    }
+                    crate::log!(
+                        "[Gateway] '{}' marked unhealthy after {} restarts",
+                        s.ws.id,
+                        s.restart_attempts
+                    );
                 }
-                crate::log!(
-                    "[Gateway] '{}' marked unhealthy after {} restarts",
-                    s.ws.id,
-                    s.restart_attempts
-                );
-                continue;
+                SuperviseAction::Respawn => {
+                    crate::log!(
+                        "[Gateway] respawning '{}' after {} missed probe(s) (outcome={:?}, alive={})",
+                        s.ws.id,
+                        s.health_misses,
+                        outcome,
+                        alive
+                    );
+                    self.respawn_stack(&mut s).await;
+                }
             }
-            // Either crashed (dead process) or wedged past the boot grace.
-            self.respawn_stack(&mut s).await;
         }
     }
+}
+
+/// What the supervisor should do with one stack after a single health probe.
+/// Output of the pure [`respawn_decision`] so the cull policy is unit-testable
+/// in isolation from the async probe + process plumbing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SuperviseAction {
+    /// Probe succeeded — mark healthy, reset counters. (Handled before the fn is
+    /// called; returned only for completeness.)
+    Healthy,
+    /// Process alive, still inside its cold-boot window — leave it alone.
+    Booting,
+    /// Not enough evidence to cull yet (within backoff, or below the miss
+    /// threshold for this outcome) — wait and keep accumulating.
+    Wait,
+    /// Cull and respawn the engine.
+    Respawn,
+    /// Hit the restart cap — mark Unhealthy and stop auto-respawning.
+    MarkUnhealthy,
+}
+
+/// Pure cull/keep decision for one stack, given a probe outcome and the stack's
+/// current state. Extracted from [`GatewayState::supervise_once`] so the policy
+/// — the fix for the 2026-06-24 respawn storm — is exhaustively unit-tested.
+///
+/// Patience is asymmetric by outcome: an `Unreachable` engine (or one whose
+/// process has exited) is culled after `DEAD_MISS_THRESHOLD` misses (a real
+/// death recovers promptly), while an alive-but-`Slow` engine needs
+/// `SLOW_MISS_THRESHOLD` consecutive misses (a busy engine is never culled on a
+/// transient spike). `misses` is the consecutive-miss count INCLUDING the
+/// current probe.
+fn respawn_decision(
+    outcome: ProbeOutcome,
+    alive: bool,
+    since_spawn: Duration,
+    misses: u32,
+    restart_attempts: u32,
+) -> SuperviseAction {
+    if outcome == ProbeOutcome::Healthy {
+        return SuperviseAction::Healthy;
+    }
+    // A live process still inside its cold-boot window is BOOTING (pgvector
+    // init / migrations / embedding warmup take tens of seconds) — never cull.
+    if alive && since_spawn < BOOT_GRACE {
+        return SuperviseAction::Booting;
+    }
+    // Crash backoff: don't respawn more often than RESPAWN_BACKOFF.
+    if since_spawn < RESPAWN_BACKOFF {
+        return SuperviseAction::Wait;
+    }
+    // How dead does it look? A refused connection, or a process that has
+    // actually exited, is a strong "down" signal → prompt. An alive process
+    // that merely times out is "busy" → patient.
+    let required = if outcome == ProbeOutcome::Unreachable || !alive {
+        DEAD_MISS_THRESHOLD
+    } else {
+        SLOW_MISS_THRESHOLD
+    };
+    if misses < required {
+        return SuperviseAction::Wait;
+    }
+    if restart_attempts >= RESTART_CAP {
+        return SuperviseAction::MarkUnhealthy;
+    }
+    SuperviseAction::Respawn
 }
 
 /// Whether a stack's engine process is currently alive. For an engine this
@@ -1164,7 +1337,24 @@ pub async fn run() -> Result<(), BoxError> {
     // on its own port for direct access (ADR 0014 §4), so the gateway must proxy
     // + probe it over https. A packaged engine serves plain http on loopback.
     let engine_tls = !engine_loopback && std::env::var_os("LUCIDOS_TLS_CERT").is_some();
+    // The gateway fronts every workspace API and its own destructive control
+    // plane. Default to loopback so a packaged/default launch is not exposed to
+    // the LAN; deployments that intentionally front Lucidos on the network must
+    // opt in explicitly.
+    let gateway_bind_all = matches!(
+        std::env::var("LUCIDOS_GATEWAY_BIND_ALL")
+            .unwrap_or_default()
+            .trim(),
+        "1" | "true" | "yes" | "on"
+    );
     let pg_backend = PgBackend::from_env()?;
+    // Packaged desktop runtime sets `LUCIDOS_PACKAGED=1` (mirrors its
+    // `LUCIDOS_BOOT_WITHOUT_PROVIDER=1`); dev leaves it unset. Drives the picker's
+    // dev-only self-reload control gating.
+    let packaged = matches!(
+        std::env::var("LUCIDOS_PACKAGED").unwrap_or_default().trim(),
+        "1" | "true" | "yes" | "on"
+    );
 
     crate::log!("[Gateway] Lucidos workspace gateway starting...");
     crate::log!("[Gateway] app-data: {}", app_data.display());
@@ -1186,6 +1376,14 @@ pub async fn run() -> Result<(), BoxError> {
         },
         if engine_tls { "https" } else { "http" }
     );
+    crate::log!(
+        "[Gateway] gateway bind: {}",
+        if gateway_bind_all {
+            "all interfaces (explicit opt-in)"
+        } else {
+            "loopback-only"
+        }
+    );
     crate::log!("[Gateway] postgres backend: {:?}", pg_backend);
 
     let registry = Registry::load(&registry_path)?;
@@ -1199,6 +1397,7 @@ pub async fn run() -> Result<(), BoxError> {
             engine_loopback,
             engine_tls,
             pg_backend,
+            packaged,
             pg_lock: AsyncMutex::new(()),
             proxy_client: proxy::build_client(),
             health_client: stack::build_health_client(),
@@ -1206,6 +1405,7 @@ pub async fn run() -> Result<(), BoxError> {
             stacks: AsyncMutex::new(HashMap::new()),
             starting: AsyncMutex::new(HashSet::new()),
             routes: RwLock::new(HashMap::new()),
+            boot_phases: RwLock::new(HashMap::new()),
             restore: RwLock::new(RestoreStatus::default()),
             exe_path: std::env::current_exe().ok(),
             update_check: Mutex::new(UpdateCheck::default()),
@@ -1213,18 +1413,12 @@ pub async fn run() -> Result<(), BoxError> {
     };
     crate::log!("[Gateway] build id: {}", GATEWAY_BUILD_ID);
 
-    // First run: an empty registry auto-creates `default` (auto-start, so a fresh
-    // install opens straight into a running workspace, ADR 0014 §10) and drops
-    // the user in.
-    let is_empty = state.inner.registry.lock().unwrap().workspaces.is_empty();
-    if is_empty {
-        crate::log!("[Gateway] empty registry — auto-creating 'default'");
-        if let Err(e) = state.create_workspace("Default", true).await {
-            crate::log!("[Gateway] failed to auto-create default workspace: {}", e);
-        }
-    } else {
-        state.boot_all().await;
-    }
+    // Re-adopt running engines and spawn the auto-start workspaces (ADR 0014).
+    // A first-run empty registry is a no-op here: nothing is auto-created, so the
+    // smart root serves the picker and the user names their first workspace
+    // ("personal" / "work" suggestions) instead of being dropped into a
+    // pre-made `default`.
+    state.boot_all().await;
 
     // Supervisor.
     {
@@ -1237,14 +1431,14 @@ pub async fn run() -> Result<(), BoxError> {
         });
     }
 
-    serve(state, gateway_port).await
+    serve(state, gateway_port, gateway_bind_all).await
 }
 
 /// Build the gateway router and serve it (TLS when certs are configured, like
 /// the engine). `/~/api/v1/health` + `/~/api/v1/control/*` are the gateway's
 /// own; every other path falls through to [`fallback`] (smart root, picker
 /// static under `/~/`, else proxy `/<slug>/*`).
-async fn serve(state: GatewayState, port: u16) -> Result<(), BoxError> {
+async fn serve(state: GatewayState, port: u16, bind_all: bool) -> Result<(), BoxError> {
     let router = Router::new()
         .route("/~/api/v1/health", get(gateway_health))
         .nest("/~/api/v1/control", crate::control::router())
@@ -1253,10 +1447,15 @@ async fn serve(state: GatewayState, port: u16) -> Result<(), BoxError> {
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-cache"),
         ))
-        .layer(CorsLayer::permissive())
         .with_state(state);
+    let router = if permissive_cors_enabled() {
+        crate::log!("[Gateway] permissive CORS enabled by LUCIDOS_PERMISSIVE_CORS");
+        router.layer(CorsLayer::permissive())
+    } else {
+        router
+    };
 
-    let addr = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+    let addr = gateway_bind_addr(port, bind_all);
     let handle = axum_server::Handle::new();
     install_shutdown(handle.clone());
 
@@ -1264,19 +1463,35 @@ async fn serve(state: GatewayState, port: u16) -> Result<(), BoxError> {
     let tls_key = std::env::var("LUCIDOS_TLS_KEY").ok();
     if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
         let cfg = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await?;
-        crate::log!("[Gateway] listening on https://[::]:{} (TLS)", port);
+        crate::log!("[Gateway] listening on https://{} (TLS)", addr);
         axum_server::bind_rustls(addr, cfg)
             .handle(handle)
             .serve(router.into_make_service())
             .await?;
     } else {
-        crate::log!("[Gateway] listening on http://[::]:{}", port);
+        crate::log!("[Gateway] listening on http://{}", addr);
         axum_server::bind(addr)
             .handle(handle)
             .serve(router.into_make_service())
             .await?;
     }
     Ok(())
+}
+
+fn gateway_bind_addr(port: u16, bind_all: bool) -> SocketAddr {
+    if bind_all {
+        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port))
+    } else {
+        SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port))
+    }
+}
+
+fn permissive_cors_enabled() -> bool {
+    permissive_cors_enabled_value(std::env::var("LUCIDOS_PERMISSIVE_CORS").ok().as_deref())
+}
+
+fn permissive_cors_enabled_value(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1" | "true" | "yes" | "on"))
 }
 
 /// Gateway-own health (`/~/api/v1/health`). The launcher polls this.
@@ -1334,7 +1549,14 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
                 return serve_workspace_manifest(&state, &slug);
             }
             let target = format!("{}://127.0.0.1:{port}", state.engine_scheme());
-            proxy::proxy(&state.inner.proxy_client, &target, &slug, req).await
+            // The route is set the instant `bring_up` spawns the engine — while
+            // it's still Booting — so a cold-open navigation lands HERE, not on
+            // the no-route branch below. Pass the current boot phase so the
+            // proxy's connect-failure splash narrates the engine-reported phases
+            // (migrating → building search index → recovering); a transient
+            // restart of a live workspace simply has no phase set (default).
+            let boot_label = state.boot_phase_label(&slug);
+            proxy::proxy(&state.inner.proxy_client, &target, &slug, boot_label, req).await
         }
         None => {
             // No live route. If the slug is a registered-but-stopped workspace
@@ -1359,7 +1581,10 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
                     let st = state.clone();
                     let id = slug.clone();
                     tokio::spawn(async move { st.lazy_start(&id).await });
-                    return proxy::starting_page();
+                    // Label reflects the current boot phase (default until the
+                    // background lazy-start records one); the 2s meta-refresh
+                    // picks up later phases.
+                    return proxy::starting_page(state.boot_phase_label(&slug));
                 }
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1738,6 +1963,31 @@ mod tests {
         assert_eq!(location, "/~/?pick");
     }
 
+    #[test]
+    fn gateway_bind_addr_defaults_to_loopback_unless_explicitly_opened() {
+        let loopback = gateway_bind_addr(5251, false);
+        assert_eq!(
+            loopback,
+            SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 5251))
+        );
+
+        let all_interfaces = gateway_bind_addr(5251, true);
+        assert_eq!(
+            all_interfaces,
+            SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 5251))
+        );
+    }
+
+    #[test]
+    fn permissive_cors_is_disabled_unless_explicitly_enabled() {
+        for value in [None, Some(""), Some("0"), Some("false"), Some("off")] {
+            assert!(!permissive_cors_enabled_value(value), "value: {value:?}");
+        }
+        for value in [Some("1"), Some("true"), Some("yes"), Some("on")] {
+            assert!(permissive_cors_enabled_value(value), "value: {value:?}");
+        }
+    }
+
     /// The bug: the bundled manifest's relative `scope: "."` would scope the
     /// installed picker PWA to `/~/`, so opening a workspace (`/<slug>/`) left the
     /// scope and iOS opened it in an in-app browser. The picker manifest must
@@ -1800,5 +2050,145 @@ mod tests {
             assert_eq!(out["start_url"], "/~/", "source: {source:?}");
             assert_eq!(out["id"], "/~/", "source: {source:?}");
         }
+    }
+
+    // ── Gateway health-supervisor cull policy (respawn_decision) ───────────
+    // The 2026-06-24 respawn storm: a single missed 3s probe culled busy-but-
+    // alive engines, cascading across every workspace. These pin the
+    // asymmetric-patience fix (patient with Slow-while-alive, prompt with a
+    // refused connection or a dead process).
+
+    /// `since_spawn` comfortably past the boot grace → an "established" engine
+    /// (also past the respawn backoff, since BOOT_GRACE > RESPAWN_BACKOFF).
+    fn established() -> Duration {
+        BOOT_GRACE + Duration::from_secs(1)
+    }
+
+    #[test]
+    fn healthy_probe_keeps_engine() {
+        assert_eq!(
+            respawn_decision(ProbeOutcome::Healthy, true, established(), 0, 0),
+            SuperviseAction::Healthy
+        );
+    }
+
+    #[test]
+    fn alive_within_boot_grace_is_booting_not_culled() {
+        // Even with a pile of misses, a live process still cold-booting is spared.
+        for outcome in [
+            ProbeOutcome::Slow,
+            ProbeOutcome::Unreachable,
+            ProbeOutcome::Other,
+        ] {
+            assert_eq!(
+                respawn_decision(outcome, true, Duration::from_secs(1), 999, 0),
+                SuperviseAction::Booting,
+                "outcome={outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn within_backoff_waits() {
+        // Just (re)spawned, not yet healthy → don't respawn again immediately.
+        assert_eq!(
+            respawn_decision(
+                ProbeOutcome::Unreachable,
+                false,
+                Duration::from_secs(0),
+                99,
+                0
+            ),
+            SuperviseAction::Wait
+        );
+    }
+
+    #[test]
+    fn alive_but_slow_is_not_culled_on_a_single_miss() {
+        // The core fix: one slow probe on a busy engine must NOT respawn it...
+        assert_eq!(
+            respawn_decision(ProbeOutcome::Slow, true, established(), 1, 0),
+            SuperviseAction::Wait
+        );
+        // ...nor anywhere below the slow threshold.
+        assert_eq!(
+            respawn_decision(
+                ProbeOutcome::Slow,
+                true,
+                established(),
+                SLOW_MISS_THRESHOLD - 1,
+                0
+            ),
+            SuperviseAction::Wait
+        );
+    }
+
+    #[test]
+    fn alive_but_slow_culled_after_sustained_misses() {
+        assert_eq!(
+            respawn_decision(
+                ProbeOutcome::Slow,
+                true,
+                established(),
+                SLOW_MISS_THRESHOLD,
+                0
+            ),
+            SuperviseAction::Respawn
+        );
+    }
+
+    #[test]
+    fn unreachable_engine_culled_promptly() {
+        // A refused connection is a strong "down" signal → small threshold.
+        assert_eq!(
+            respawn_decision(
+                ProbeOutcome::Unreachable,
+                false,
+                established(),
+                DEAD_MISS_THRESHOLD - 1,
+                0
+            ),
+            SuperviseAction::Wait
+        );
+        assert_eq!(
+            respawn_decision(
+                ProbeOutcome::Unreachable,
+                false,
+                established(),
+                DEAD_MISS_THRESHOLD,
+                0
+            ),
+            SuperviseAction::Respawn
+        );
+    }
+
+    #[test]
+    fn dead_process_uses_the_fast_threshold_even_if_slow() {
+        // Probe timed out but the process has EXITED → treat as dead, not busy,
+        // so a crash recovers promptly instead of waiting the slow threshold.
+        assert_eq!(
+            respawn_decision(
+                ProbeOutcome::Slow,
+                false,
+                established(),
+                DEAD_MISS_THRESHOLD,
+                0
+            ),
+            SuperviseAction::Respawn
+        );
+    }
+
+    #[test]
+    fn restart_cap_marks_unhealthy_instead_of_respawning() {
+        assert_eq!(
+            respawn_decision(
+                ProbeOutcome::Unreachable,
+                false,
+                established(),
+                DEAD_MISS_THRESHOLD,
+                RESTART_CAP
+            ),
+            SuperviseAction::MarkUnhealthy
+        );
     }
 }

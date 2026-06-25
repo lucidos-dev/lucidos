@@ -216,14 +216,14 @@ impl PreferenceStore {
         Ok(result)
     }
 
-    /// Read the per-step context-capture toggle. Returns `Ok(true)` when
-    /// unset so existing workspaces keep capturing; DB errors propagate as
-    /// `Err` so callers can surface a real failure instead of silently
-    /// defaulting to "on".
+    /// Read the per-step context-capture toggle. Returns `Ok(false)` when
+    /// unset — the debugging capture ships dark and is enabled per-workspace;
+    /// set the preference to `"true"` to opt in. DB errors propagate as `Err`
+    /// so callers can surface a real failure instead of silently defaulting.
     pub async fn capture_context(pool: &PgPool) -> Result<bool, sqlx::Error> {
         Self::get(pool, PREF_CAPTURE_CONTEXT)
             .await
-            .map(|opt| opt.map(|v| v != "false").unwrap_or(true))
+            .map(|opt| opt.map(|v| v == "true").unwrap_or(false))
     }
 
     /// Read the *command guard* toggle (ADR 0002). The command guard is a
@@ -325,9 +325,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capture_context_defaults_to_true_when_unset() {
+    async fn capture_context_defaults_to_false_when_unset() {
         let (pool, db_name) = setup_test_db().await;
-        assert!(PreferenceStore::capture_context(&pool).await.unwrap());
+        assert!(!PreferenceStore::capture_context(&pool).await.unwrap());
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -356,7 +356,7 @@ mod tests {
 
     // Pins the row-absent-vs-error distinction in one place: splitting the
     // two assertions across separate tests would let a regression that
-    // collapses both branches back into the same `Ok(true)` (the original
+    // collapses both branches back into the same `Ok(false)` (the original
     // bug) pass each test individually.
     #[tokio::test]
     async fn capture_context_distinguishes_error_from_unset() {
@@ -372,8 +372,8 @@ mod tests {
 
         assert_eq!(
             unset_result.ok(),
-            Some(true),
-            "row-absent must remain the safe `true` default",
+            Some(false),
+            "row-absent must remain the ships-dark `false` default",
         );
         assert!(
             err_result.is_err(),

@@ -132,8 +132,10 @@ impl LucidosEngine {
                 "this prompt looks like a request to describe/analyse an image, but \
                  `generate_image` SYNTHESISES new images and returns image bytes — not \
                  text descriptions. To describe or analyse an image, just describe it \
-                 directly in your reply: you have native vision over images already in \
-                 the conversation."
+                 directly in your reply: you have native vision over recent images in the \
+                 conversation. If the image was posted earlier and you can no longer see \
+                 it, call view_image (e.g. image: 'thread:2') first to bring it back into \
+                 view, then describe it."
                     .into(),
             );
         }
@@ -271,6 +273,49 @@ impl LucidosEngine {
         Ok(format!("Image saved to {}.", artifact_path))
     }
 
+    /// Re-load an image posted earlier in the thread back into the model's
+    /// vision. Resolves a `thread:N` reference to bytes and returns the
+    /// `[IMAGE_CONTENT:<type>]\n<base64>` sentinel, which the agentic loop
+    /// (`parse_image_content_marker`) lifts into a real `ContentBlock::Image` —
+    /// the same path `read_file` uses for image files. This is the only way the
+    /// model can see an image that has aged out of the auto-included window.
+    pub(crate) async fn execute_view_image(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let reference = args
+            .get("image")
+            .and_then(|v| v.as_str())
+            .ok_or("image is required (e.g. 'thread:1')")?;
+
+        if !reference.starts_with("thread:") {
+            return Err("image must be a thread reference like 'thread:1'. To view an \
+                 image file saved under data/artifacts/, use read_file instead."
+                .into());
+        }
+
+        let events = self
+            .event_store
+            .get_thread_events(&thread_id.to_string())
+            .await?;
+        // resolve_thread_image_refs validates the ref (format, index range,
+        // missing-blob) and errors with an actionable message, so on Ok the vec
+        // holds exactly the one requested image.
+        let mut resolved =
+            resolve_thread_image_refs(&self.workspace_path, &events, &[reference.to_string()])?;
+        let img = resolved
+            .pop()
+            .ok_or("internal: resolve_thread_image_refs returned no image")?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(&img.base64)?;
+
+        crate::log!("[Image] view_image loaded {} into vision", reference);
+        Ok(crate::engine::tools::files::encode_image_for_read(
+            bytes,
+            &img.mime_type,
+        ))
+    }
+
     /// Resolve an image reference to raw bytes.
     /// Supports:
     /// - "thread:N" — Nth image in the conversation (1-based)
@@ -334,7 +379,7 @@ mod tests {
     use crate::core::blobs::write_blob;
     use crate::core::events::EventRow;
     use crate::llm::tool_names as tn;
-    use crate::llm::tools::{get_default_tools, get_save_thread_image_tool};
+    use crate::llm::tools::{get_default_tools, get_save_thread_image_tool, get_view_image_tool};
     use std::path::Path;
 
     /// Minimal valid PNG with a per-test discriminator byte so each call
@@ -445,6 +490,57 @@ mod tests {
             "error should explain expected format, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn view_image_tool_definition() {
+        let tool = get_view_image_tool();
+        assert_eq!(tool.name, tn::VIEW_IMAGE);
+        let props = tool.parameters.get("properties").unwrap();
+        assert!(props.get("image").is_some(), "must declare an `image` arg");
+        let required = tool.parameters.get("required").unwrap().as_array().unwrap();
+        assert_eq!(required.len(), 1);
+        assert!(required.iter().any(|v| v.as_str() == Some("image")));
+        // The description must steer the model to use it for re-viewing earlier
+        // conversation images (the whole point of the tool).
+        let lower = tool.description.to_lowercase();
+        assert!(
+            lower.contains("view") || lower.contains("see"),
+            "description should explain it brings an image back into view: {}",
+            tool.description
+        );
+    }
+
+    /// The exact pipeline `execute_view_image` runs (minus arg-parsing + the DB
+    /// event fetch): resolve a `thread:N` ref to a `ChatImage`, decode it, and
+    /// re-encode via `encode_image_for_read`. The result MUST be an
+    /// `[IMAGE_CONTENT:…]` sentinel that the agentic loop's
+    /// `parse_image_content_marker` lifts into a real vision block — otherwise
+    /// the model never actually sees the re-loaded image.
+    #[test]
+    fn view_image_pipeline_produces_a_vision_sentinel() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 2);
+        let events = vec![event];
+
+        let img = resolve_thread_image_refs(tmp.path(), &events, &["thread:2".to_string()])
+            .unwrap()
+            .pop()
+            .unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&img.base64)
+            .unwrap();
+        let sentinel = crate::engine::tools::files::encode_image_for_read(bytes, &img.mime_type);
+
+        let parsed = crate::engine::tools::files::parse_image_content_marker(&sentinel);
+        assert!(
+            parsed.is_some(),
+            "view_image output must be a vision sentinel the loop lifts into an image block, got: {}",
+            &sentinel[..sentinel.len().min(60)]
+        );
+        let (media_type, b64) = parsed.unwrap();
+        assert!(media_type.starts_with("image/"), "media type: {}", media_type);
+        assert!(!b64.is_empty(), "sentinel must carry base64 image data");
     }
 
     #[test]

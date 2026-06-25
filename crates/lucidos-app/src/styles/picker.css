@@ -474,6 +474,45 @@
 .ws-picker-btn-danger { background: #da3633; border-color: transparent; }
 .ws-picker-btn-danger:hover:not(:disabled) { background: #f85149; }
 
+/* Create form: stacks the quick-fill suggestion chips above the name-input row. */
+.ws-picker-create {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  width: 100%;
+}
+
+/* First-run quick-fill name chips, shown while the name field is empty. */
+.ws-picker-suggestions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+  padding: 0.25rem 0.25rem 0;
+}
+
+.ws-picker-suggestions-label {
+  font-size: 0.8125rem;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.ws-picker-suggestion {
+  border: 1px solid rgba(255, 255, 255, 0.32);
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  border-radius: 1rem;
+  padding: 0.25rem 0.75rem;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.ws-picker-suggestion:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.2);
+  border-color: rgba(255, 255, 255, 0.6);
+}
+.ws-picker-suggestion:disabled { opacity: 0.45; cursor: default; }
+
 /* ── Footer ──────────────────────────────────────────────────────────────── */
 
 .ws-picker-footer {

@@ -158,6 +158,21 @@ pub(super) fn sanitize_file_content_for_llm(content: String, path: &str, offset:
     )
 }
 
+/// Per-image char cost used by [`estimate_message_chars`] for budget sizing.
+///
+/// An image's base64 `data.len()` is NOT its cost to the model: providers
+/// tokenize an image by its (resized) pixel dimensions, not its byte length.
+/// Anthropic bills a resized image at roughly its tile count — on the order of
+/// ~1.6k tokens for a full-size photo, regardless of how many megabytes of
+/// base64 it serializes to. Counting `data.len()` (2–3 M chars for a phone
+/// photo) made one attached image dwarf the entire context budget, which forced
+/// trim Pass 2 to evict real conversation/tool context just to "fit" the image
+/// — or, with the image pinned, made the loop strip the bytes after the first
+/// LLM call so the model went blind to the image mid-turn ("the bot can't see
+/// my attached image"). Estimating the real token cost lets the image stay in
+/// context for the whole turn without distorting the budget.
+pub(super) const IMAGE_BUDGET_TOKEN_ESTIMATE: usize = 1_600;
+
 /// Estimate the total character count of all content in a message.
 pub(super) fn estimate_message_chars(message: &Message) -> usize {
     match &message.content {
@@ -174,10 +189,9 @@ pub(super) fn estimate_message_chars(message: &Message) -> usize {
                         tool_use_id,
                         content,
                     } => tool_use_id.len() + content.len(),
-                    ContentBlock::Image { data, .. } => {
-                        // Estimate: base64 data is ~4/3 of original size, count as token-heavy
-                        data.len()
-                    }
+                    // Count the real token cost (`* 3 / 2` = the 1.5 chars/token
+                    // ratio the budget assumes), not the base64 byte length.
+                    ContentBlock::Image { .. } => IMAGE_BUDGET_TOKEN_ESTIMATE * 3 / 2,
                 })
                 .sum()
         }
@@ -225,7 +239,7 @@ pub(super) fn replace_image_blocks(
 /// Trim the agent loop message history to fit within a character budget.
 ///
 /// Three passes:
-/// 0. Strip image bytes from every message except the last (see inline note).
+/// 0. Strip image bytes from every message except the last and `keep_image_idx`.
 /// 1. Truncate large tool results/inputs in old messages.
 /// 2. If still over budget, remove oldest message pairs from index 1 onward.
 ///
@@ -235,21 +249,34 @@ pub(super) fn replace_image_blocks(
 /// leaves the loop over budget. Callers use this to pin the current turn's
 /// user message — once tool iterations push it out of the last
 /// `PRESERVE_RECENT_MESSAGES` slots, the recent-tail rule alone no longer
-/// covers it and pass 2 would otherwise drop the original request (and any
-/// post-iter-1 image-description placeholder) from the prompt.
+/// covers it and pass 2 would otherwise drop the original request (and, with
+/// `keep_image_idx` pinning it, the attached image) from the prompt.
+///
+/// If `keep_image_idx` is `Some(i)`, pass 0 preserves the image bytes on the
+/// message at index `i` (the current turn's user message) in addition to the
+/// literal last message. The freshly-attached image must stay visible for the
+/// WHOLE turn: once the model makes a tool call the user message is no longer
+/// last, and stripping its image there blinds the model to it for the rest of
+/// the turn (the "the bot can't see my attached image" bug).
 ///
 /// Returns the number of messages removed in pass 2.
 pub(super) fn trim_context_if_needed(
     messages: &mut Vec<Message>,
     budget: usize,
     protected_idx: Option<usize>,
+    keep_image_idx: Option<usize>,
 ) -> usize {
-    // The current user message is the LAST entry — `chat::process` builds
-    // `messages = resume_tool_blocks; messages.push(current_user_message)`.
-    // Earlier messages' images were already seen by the LLM on prior turns.
+    // The current user message is the LAST entry on the first iteration —
+    // `chat::process` builds `messages = resume_tool_blocks;
+    // messages.push(current_user_message)`. As the tool loop appends pairs it
+    // is no longer last, so `keep_image_idx` pins its image too. Every other
+    // message's images were already seen by the LLM on prior turns / iterations.
     let mut image_bytes_stripped = 0usize;
-    let preserve = messages.len().saturating_sub(1);
-    for msg in messages.iter_mut().take(preserve) {
+    let last_idx = messages.len().saturating_sub(1);
+    for (idx, msg) in messages.iter_mut().enumerate() {
+        if idx == last_idx || Some(idx) == keep_image_idx {
+            continue;
+        }
         if let MessageContent::Blocks(blocks) = &mut msg.content {
             image_bytes_stripped +=
                 replace_image_blocks(blocks, || "[image from earlier in conversation]".to_string());
@@ -356,7 +383,19 @@ pub(super) fn trim_context_if_needed(
     // Track the protected message's position as removals shift it down. Once
     // it reaches index 1 (or its tool_result pair-mate would be removed),
     // stop — losing the pinned request is worse than going over budget.
-    let mut protected = protected_idx;
+    //
+    // Protect down to the LOWER of `protected_idx` (the latest user input) and
+    // `keep_image_idx` (the image-bearing message). They're equal in the common
+    // case, but a mid-turn prompt injection moves `protected_idx` to the new
+    // last message while the image stays at a lower index — pass 0 keeps the
+    // image bytes, but pass 2 must also refuse to remove that whole message, or
+    // the image (and the original request) is lost anyway. Stopping at the min
+    // keeps both: everything from that index up survives.
+    let mut protected = match (protected_idx, keep_image_idx) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, None) => a,
+        (None, b) => b,
+    };
     while current_total > budget && messages.len() > PRESERVE_RECENT_MESSAGES + 1 {
         if messages.len() <= 1 {
             break;

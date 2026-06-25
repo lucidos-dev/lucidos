@@ -138,3 +138,12 @@ Setup is **partly interactive** — you can set the variables, but the user must
    - **Persistent bulk reference corpora the user wants to keep but not in the workspace** → `~/.lucidos/data/{name}/` (sibling to `~/.lucidos/knowhow/`, cross-workspace, persistent, agent-discoverable). Pin the absolute path in the relevant app's knowhow so converter scripts can find it. Use `lucidos data-store add {name} {source-dir}` to move an existing directory there.
    - **Intermediate / debug / one-shot render output** (e.g. cropping tiles, OMR debug pixmaps, scratch PNGs from a one-time analysis) does NOT belong in `artifacts/imported/` at all. Use `.lucidos/tmp/` and delete after the analysis.
    - **Inherited cruft from earlier sessions** — if you find unexplained files under `data/artifacts/imported/` that don't appear in the consuming app's source, scripts, or knowhow, verify each one (grep app + scripts + knowhow), ask the user about ambiguous cases, then `git rm` the dead files in a single commit with before/after artifact counts in the message.
+
+## Images posted in a thread
+
+Every image a user pastes (and every image you generate) is numbered sequentially across the conversation as `thread:N` (1-based). On upload, each is auto-described by a fast vision model and that description is kept as a derived fact.
+
+- **Recent images are already in your vision** — you can see and describe them natively; just answer.
+- **Older images age out of your vision** after a few newer messages (so stale screenshots don't mislead you in long threads). The conversation history then shows only a text note like `[attached image (thread:2) — image not included, may be outdated]` plus the saved description.
+- **To see an aged-out image again, call `view_image`** with its reference, e.g. `view_image(image: "thread:2")`. It re-loads the actual pixels into your vision so you can describe or reason about it. **When the user refers to "the image I posted earlier" (or similar) and you can't currently see it, call `view_image` — do NOT reply that there's no image or ask them to re-send it.** Find the right `thread:N` from the history's image notes.
+- **To keep an image** as a file, use `save_thread_image(image: "thread:N", path: "...")` (writes under `data/artifacts/`, git-committed). **To edit/restyle an image**, use `generate_image` with `input_images: ["thread:N"]`. To view an image *file* already under `data/artifacts/`, use `read_file` (not `view_image`).

@@ -30,13 +30,29 @@
 # The deterministic shell pipeline is the SPINE; the LLM/chat layer only drafts
 # the changelog, gets approval (the `draft` step), and handles anomalies.
 #
-# In --release mode this script OWNS the build → codesign → notarize → staple →
+# In release mode this script OWNS the build → codesign → notarize → staple →
 # upload-asset stages, and emits its own ReleaseStep* domain events at each stage
 # boundary (via scripts/lib/release_events.sh) so the Release Cockpit app lights
 # up stage by stage. The cockpit is a PURE READ-ONLY CONSUMER — this script never
 # writes to it. Each stage emits ReleaseStepFailed (not a silent exit) on error so
 # the cockpit shows red. release.sh / release-to-lucidos.sh own the surrounding
 # git / tag / GitHub-Release / changelog stages and the final LucidosReleased.
+#
+# ── Build-once / verify-first / publish-verified (split build from upload) ────
+# The release is split so the DMG you manually verify is bit-for-bit the DMG that
+# ships. Three release modes:
+#   --release-build   build → codesign → notarize → staple, then STAGE the .dmg +
+#                     updater .app.tar.gz + .sig into
+#                     .lucidos/release-staging/<version>/ with a manifest.json
+#                     ({version, source_commit, artifacts:[{name,sha256}]}). Emits
+#                     the build/codesign/notarize steps. NO upload, NO Release.
+#   --release-attach  --staging-dir <d> --upload-tag <t> --notes-file <f>:
+#                     VERIFY that staging (refuse on missing manifest / missing
+#                     artifact / checksum mismatch), generate latest.json from the
+#                     STAGED .sig + notes, and upload the staged artifacts. Emits
+#                     the upload step. NO rebuild, NO signing creds needed.
+#   --release         back-compat one-shot = --release-build immediately followed
+#                     by --release-attach against the freshly-staged dir.
 #
 # Credentials in --release mode come ONLY from the auto-injected environment
 # (APPLE_ID / APPLE_TEAM_ID are DB env vars; APPLE_PASSWORD /
@@ -59,16 +75,22 @@
 #   TAURI_SIGNING_PRIVATE_KEY_PATH=~/.tauri/lucidos-updater.key \
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD=… \
 #     ./scripts/build-dmg.sh               # signed + notarized (local, no events/upload)
+#   ./scripts/build-dmg.sh --release-build # build + sign + notarize + STAGE (no upload)
+#   ./scripts/build-dmg.sh --release-attach \
+#     --staging-dir <dir> --upload-tag v<N.N.N> --notes-file <changelog-section>
+#                                          # verify staging + upload it (no rebuild)
 #   ./scripts/build-dmg.sh --release \
 #     --release-version <N.N.N> --upload-tag v<N.N.N> \
 #     --notes-file <changelog-section> --repo-slug <owner/repo>
-#                                          # full release: assert creds, version
-#                                          # guard, emit ReleaseStep* events,
-#                                          # sign+notarize+staple, upload assets
+#                                          # one-shot (build-then-attach), back-compat
 #
 # Release-mode flags:
-#   --release            enable release mode (events, asserted creds, asset upload)
-#   --release-version V  expected version; must equal the RELEASE file (guard)
+#   --release            one-shot: --release-build then --release-attach (back-compat)
+#   --release-build      build + sign + notarize + stage; no upload, no Release
+#   --release-attach     verify --staging-dir + upload it; no rebuild, no signing
+#   --staging-dir DIR    staging dir (required for --release-attach; default for the
+#                        build modes is .lucidos/release-staging/<version>)
+#   --release-version V  expected version; must equal the RELEASE file / manifest
 #   --upload-tag TAG     GitHub Release tag to attach the DMG + updater assets to
 #   --notes-file FILE    CHANGELOG section used as the latest.json `notes`
 #   --repo-slug OWNER/R  GitHub repo for the release (default lucidos-dev/lucidos)
@@ -112,13 +134,29 @@ fi
 # shellcheck source=scripts/lib/tauri_signing_key.sh
 source "$SCRIPT_DIR/lib/tauri_signing_key.sh"
 
+# Staging-manifest helpers for the build-once / verify-then-publish flow
+# (--release-build stages + writes manifest.json; --release-attach verifies it +
+# uploads). Pure shell + python3 and carries nothing sensitive, so — unlike
+# release_events.sh above — it is NOT stripped from the public mirror; source it
+# unconditionally, like tauri_signing_key.sh.
+# shellcheck source=scripts/lib/release_staging.sh
+source "$SCRIPT_DIR/lib/release_staging.sh"
+
 # Release-mode state (set by arg parsing below). In default (local-build) mode
-# RELEASE_MODE stays 0: no events, no asserted creds, no asset upload.
+# all stay 0: no events, no asserted creds, no staging, no asset upload.
+#   RELEASE_MODE  1 for any --release* mode (drives event emission + assertions)
+#   DO_BUILD      1 for --release-build / --release (build → sign → notarize →
+#                 stage; signing creds asserted)
+#   DO_ATTACH     1 for --release-attach / --release (upload staged artifacts)
 RELEASE_MODE=0
+DO_BUILD=0
+DO_ATTACH=0
 RELEASE_VERSION_ARG=""
 UPLOAD_TAG=""
 NOTES_FILE=""
 REPO_SLUG="lucidos-dev/lucidos"
+STAGING_DIR_ARG=""     # --staging-dir override (required for --release-attach)
+STAGING_DIR=""         # resolved staging dir (default .lucidos/release-staging/<v>)
 EFFECTIVE_VERSION=""   # the version stamped into the DMG; set after arg parse
 CURRENT_STEP=""        # cockpit step id currently in flight (for failure emit)
 
@@ -217,16 +255,22 @@ Usage:
   TAURI_SIGNING_PRIVATE_KEY_PATH=~/.tauri/lucidos-updater.key \
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD=… \
     ./scripts/build-dmg.sh               # signed + notarized (local, no events/upload)
+  ./scripts/build-dmg.sh --release-build # build + sign + notarize + STAGE (no upload)
+  ./scripts/build-dmg.sh --release-attach \
+    --staging-dir <dir> --upload-tag v<N.N.N> --notes-file <changelog-section>
+                                         # verify staging + upload it (no rebuild)
   ./scripts/build-dmg.sh --release \
     --release-version <N.N.N> --upload-tag v<N.N.N> \
     --notes-file <changelog-section> --repo-slug <owner/repo>
-                                         # full release: assert creds, version
-                                         # guard, emit ReleaseStep* events,
-                                         # sign+notarize+staple, upload assets
+                                         # one-shot (build-then-attach), back-compat
 
 Release-mode flags:
-  --release            enable release mode (events, asserted creds, asset upload)
-  --release-version V  expected version; must equal the RELEASE file (guard)
+  --release            one-shot: --release-build then --release-attach (back-compat)
+  --release-build      build + sign + notarize + stage; no upload, no Release
+  --release-attach     verify --staging-dir + upload it; no rebuild, no signing
+  --staging-dir DIR    staging dir (required for --release-attach; default for the
+                       build modes is .lucidos/release-staging/<version>)
+  --release-version V  expected version; must equal the RELEASE file / manifest
   --upload-tag TAG     GitHub Release tag to attach the DMG + updater assets to
   --notes-file FILE    CHANGELOG section used as the latest.json `notes`
   --repo-slug OWNER/R  GitHub repo for the release (default lucidos-dev/lucidos)
@@ -263,12 +307,137 @@ check_resource_contract() {
     printf 'OK: build-dmg resources include %s\n' "${RESOURCE_NAMES[*]}"
 }
 
+# stage_release_artifacts <staging-dir> — copy the just-built signed/notarized DMG
+# + updater tarball + .sig into <staging-dir> and write manifest.json (version,
+# the git HEAD of the built tree as source_commit, and a sha256 per artifact).
+# This is the hand-off the verify-then-publish flow consumes: --release-attach
+# (and release.sh --publish-verified) re-verify this manifest before any upload,
+# so the DMG you verified is bit-for-bit the DMG that ships. No upload, no Release.
+stage_release_artifacts() {
+    local dir="$1"
+    local app_tarball app_sig source_commit
+    app_tarball="$(/usr/bin/find "$BUNDLE_DIR/macos" -name '*.app.tar.gz' 2>/dev/null | head -1 || true)"
+    app_sig="$(/usr/bin/find "$BUNDLE_DIR/macos" -name '*.app.tar.gz.sig' 2>/dev/null | head -1 || true)"
+    [ -n "$app_tarball" ] || die "no .app.tar.gz produced — is the updater key set (TAURI_SIGNING_PRIVATE_KEY_PATH or TAURI_SIGNING_PRIVATE_KEY)?"
+    [ -n "$app_sig" ]     || die "no .app.tar.gz.sig produced — is the updater key set (TAURI_SIGNING_PRIVATE_KEY_PATH or TAURI_SIGNING_PRIVATE_KEY)?"
+    source_commit="$(git -C "$REPO_ROOT" rev-parse HEAD)" \
+        || die "cannot read git HEAD of $REPO_ROOT for the staging manifest"
+
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    cp "$DMG_PATH" "$dir/"
+    cp "$app_tarball" "$dir/"
+    cp "$app_sig" "$dir/"
+    release_staging_write_manifest "$dir" "$EFFECTIVE_VERSION" "$source_commit" \
+        "$(basename "$DMG_PATH")" "$(basename "$app_tarball")" "$(basename "$app_sig")" \
+        || die "failed to write the staging manifest in $dir"
+}
+
+# upload_staged_assets <staging-dir> — generate latest.json from the STAGED
+# updater .sig + notes and attach every staged artifact (DMG + updater tarball +
+# .sig + latest.json) to the GitHub Release $UPLOAD_TAG. No rebuild — the bytes
+# are exactly what was staged (and, for --release-attach, already verified). This
+# is the cockpit `upload` step. release-to-lucidos.sh creates the Release first;
+# we only attach assets to it.
+upload_staged_assets() {
+    local dir="$1"
+    [ -n "$UPLOAD_TAG" ] || die "release upload requires --upload-tag"
+    command -v gh >/dev/null 2>&1 || die "gh CLI required to upload release artifacts (https://cli.github.com/)."
+
+    local dmg app_tarball app_sig
+    dmg="$(/usr/bin/find "$dir" -maxdepth 1 -name '*.dmg' 2>/dev/null | head -1 || true)"
+    app_tarball="$(/usr/bin/find "$dir" -maxdepth 1 -name '*.app.tar.gz' 2>/dev/null | head -1 || true)"
+    app_sig="$(/usr/bin/find "$dir" -maxdepth 1 -name '*.app.tar.gz.sig' 2>/dev/null | head -1 || true)"
+    [ -n "$dmg" ]         || die "no staged .dmg in $dir"
+    [ -n "$app_tarball" ] || die "no staged .app.tar.gz in $dir"
+    [ -n "$app_sig" ]     || die "no staged .app.tar.gz.sig in $dir"
+
+    # latest.json (the in-app auto-update manifest). The uploaded asset's name is
+    # the file's basename, and the updater endpoint resolves
+    # …/releases/latest/download/latest.json — so the file must literally be named
+    # latest.json. Stage it under that exact name.
+    local platform_key tarball_name download_url pub_date latest_dir latest_json
+    case "$(uname -m)" in
+        arm64|aarch64) platform_key="darwin-aarch64" ;;
+        x86_64)        platform_key="darwin-x86_64" ;;
+        *) die "unsupported arch for latest.json: $(uname -m)" ;;
+    esac
+    tarball_name="$(basename "$app_tarball")"
+    download_url="https://github.com/$REPO_SLUG/releases/download/$UPLOAD_TAG/$tarball_name"
+    pub_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    latest_dir="$(mktemp -d -t lucidos-latest)"
+    latest_json="$latest_dir/latest.json"
+
+    # python3 is present on any Mac with the Xcode CLT this script already needs.
+    # It JSON-encodes the multi-line changelog notes + the signature safely. The
+    # notes file is optional (empty notes if --notes-file was not supplied).
+    RELEASE_VERSION="$EFFECTIVE_VERSION" PLATFORM_KEY="$platform_key" DOWNLOAD_URL="$download_url" \
+    PUB_DATE="$pub_date" NOTES_FILE="${NOTES_FILE:-}" SIG_FILE="$app_sig" \
+    python3 - > "$latest_json" <<'PY'
+import json, os
+notes_file = os.environ.get("NOTES_FILE", "")
+notes = open(notes_file, encoding="utf-8").read().strip() if notes_file else ""
+sig = open(os.environ["SIG_FILE"], encoding="utf-8").read().strip()
+manifest = {
+    "version": os.environ["RELEASE_VERSION"],
+    "notes": notes,
+    "pub_date": os.environ["PUB_DATE"],
+    "platforms": {
+        os.environ["PLATFORM_KEY"]: {
+            "signature": sig,
+            "url": os.environ["DOWNLOAD_URL"],
+        }
+    },
+}
+print(json.dumps(manifest, indent=2))
+PY
+    [ -s "$latest_json" ] || die "latest.json generation produced no output"
+
+    # --clobber so a re-run replaces assets instead of erroring on existing names.
+    gh release upload "$UPLOAD_TAG" --repo "$REPO_SLUG" --clobber \
+        "$dmg" "$app_tarball" "$app_sig" "$latest_json" \
+        || die "gh release upload failed for $UPLOAD_TAG"
+    rm -rf "$latest_dir"
+}
+
+# run_release_attach — the --release-attach entry point: VERIFY the staged
+# artifacts against their manifest, then upload them. NO build, NO signing, NO
+# rebuild. Requires --staging-dir; the version comes from the staged manifest.
+run_release_attach() {
+    [ -n "$STAGING_DIR_ARG" ] || die "--release-attach requires --staging-dir <dir>"
+    STAGING_DIR="$STAGING_DIR_ARG"
+
+    # Arm the failure trap so an upload error emits ReleaseStepFailed. The verify
+    # below runs with CURRENT_STEP unset, so a bad manifest just exits non-zero
+    # (no event) — exactly what the cockpit should see for a pre-upload refusal.
+    trap on_err ERR
+
+    # Integrity guard: refuse on missing manifest, missing artifact, or checksum
+    # mismatch BEFORE touching the network.
+    release_staging_verify "$STAGING_DIR" \
+        || die "staging verification failed for $STAGING_DIR — refusing to attach unverified artifacts."
+
+    EFFECTIVE_VERSION="$(release_staging_manifest_field "$STAGING_DIR" version)" \
+        || die "could not read version from $STAGING_DIR/manifest.json"
+    if [ -n "$RELEASE_VERSION_ARG" ] && [ "$RELEASE_VERSION_ARG" != "$EFFECTIVE_VERSION" ]; then
+        die "version mismatch: --release-version '$RELEASE_VERSION_ARG' != staged manifest version '$EFFECTIVE_VERSION'."
+    fi
+
+    begin_step upload "Generating latest.json and attaching the STAGED signed DMG + updater artifacts to $UPLOAD_TAG (no rebuild)."
+    step "Uploading staged DMG + updater artifacts to GitHub Release $UPLOAD_TAG"
+    upload_staged_assets "$STAGING_DIR"
+    end_step upload "Uploaded the staged signed DMG + updater tarball + .sig + latest.json to $UPLOAD_TAG."
+}
+
 DO_CHECK=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --check)           DO_CHECK=1; shift ;;
         -h|--help)         usage; exit 0 ;;
-        --release)         RELEASE_MODE=1; shift ;;
+        --release)         RELEASE_MODE=1; DO_BUILD=1; DO_ATTACH=1; shift ;;
+        --release-build)   RELEASE_MODE=1; DO_BUILD=1; shift ;;
+        --release-attach)  RELEASE_MODE=1; DO_ATTACH=1; shift ;;
+        --staging-dir)     [ $# -ge 2 ] || die "--staging-dir requires an argument"; STAGING_DIR_ARG="$2"; shift 2 ;;
         --release-version) [ $# -ge 2 ] || die "--release-version requires an argument"; RELEASE_VERSION_ARG="$2"; shift 2 ;;
         --upload-tag)      [ $# -ge 2 ] || die "--upload-tag requires an argument"; UPLOAD_TAG="$2"; shift 2 ;;
         --notes-file)      [ $# -ge 2 ] || die "--notes-file requires an argument"; NOTES_FILE="$2"; shift 2 ;;
@@ -279,6 +448,17 @@ done
 
 if [ "$DO_CHECK" = "1" ]; then
     check_resource_contract
+    exit 0
+fi
+
+# ── --release-attach (no build): verify the staged artifacts and upload them ──
+# This path does NO build, NO codesign, NO notarize — it only attaches artifacts
+# a prior --release-build already produced + verified. It therefore needs neither
+# the Apple/Tauri signing creds nor the Darwin/cargo/tauri/npm build tooling; it
+# only needs `gh` + a valid staging dir. Handled before the build preamble so the
+# manifest guard fails fast offline.
+if [ "$DO_ATTACH" = "1" ] && [ "$DO_BUILD" = "0" ]; then
+    run_release_attach
     exit 0
 fi
 
@@ -588,73 +768,26 @@ else
 fi
 end_step notarize "Notarized + stapled the DMG and the .app."
 
-# ── 6b. upload assets to the GitHub Release (release mode) ───────────────────
-# The deterministic build owns the asset upload: signed DMG + Tauri updater
-# tarball + .sig + a generated latest.json, attached to the release tag. This is
-# the cockpit `upload` step. release-to-lucidos.sh creates the Release first; we
-# only attach assets to it.
-upload_release_assets() {
-    [ -n "$UPLOAD_TAG" ] || die "release upload requires --upload-tag"
-    command -v gh >/dev/null 2>&1 || die "gh CLI required to upload release artifacts (https://cli.github.com/)."
+# ── 6b. stage artifacts (verify-then-publish hand-off) ───────────────────────
+# In any release-grade BUILD (--release-build or --release) the signed/notarized
+# artifacts are staged with a checksum manifest so they can be verified and then
+# published WITHOUT a rebuild. --release-build stops after staging; --release
+# continues to the upload below against this same staging dir (the old one-shot
+# behavior, byte-for-byte: build → stage → upload now).
+if [ "$DO_BUILD" = "1" ]; then
+    STAGING_DIR="${STAGING_DIR_ARG:-$REPO_ROOT/.lucidos/release-staging/$EFFECTIVE_VERSION}"
+    step "Staging release artifacts → $STAGING_DIR"
+    stage_release_artifacts "$STAGING_DIR"
+fi
 
-    local app_tarball app_sig
-    app_tarball="$(/usr/bin/find "$BUNDLE_DIR/macos" -name '*.app.tar.gz' 2>/dev/null | head -1 || true)"
-    app_sig="$(/usr/bin/find "$BUNDLE_DIR/macos" -name '*.app.tar.gz.sig' 2>/dev/null | head -1 || true)"
-    [ -n "$app_tarball" ] || die "no .app.tar.gz produced — is the updater key set (TAURI_SIGNING_PRIVATE_KEY_PATH or TAURI_SIGNING_PRIVATE_KEY)?"
-    [ -n "$app_sig" ]     || die "no .app.tar.gz.sig produced — is the updater key set (TAURI_SIGNING_PRIVATE_KEY_PATH or TAURI_SIGNING_PRIVATE_KEY)?"
-
-    # latest.json (the in-app auto-update manifest). The uploaded asset's name is
-    # the file's basename, and the updater endpoint resolves
-    # …/releases/latest/download/latest.json — so the file must literally be named
-    # latest.json. Stage it under that exact name.
-    local platform_key tarball_name download_url pub_date latest_dir latest_json
-    case "$(uname -m)" in
-        arm64|aarch64) platform_key="darwin-aarch64" ;;
-        x86_64)        platform_key="darwin-x86_64" ;;
-        *) die "unsupported arch for latest.json: $(uname -m)" ;;
-    esac
-    tarball_name="$(basename "$app_tarball")"
-    download_url="https://github.com/$REPO_SLUG/releases/download/$UPLOAD_TAG/$tarball_name"
-    pub_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    latest_dir="$(mktemp -d -t lucidos-latest)"
-    latest_json="$latest_dir/latest.json"
-
-    # python3 is present on any Mac with the Xcode CLT this script already needs.
-    # It JSON-encodes the multi-line changelog notes + the signature safely. The
-    # notes file is optional (empty notes if --notes-file was not supplied).
-    RELEASE_VERSION="$EFFECTIVE_VERSION" PLATFORM_KEY="$platform_key" DOWNLOAD_URL="$download_url" \
-    PUB_DATE="$pub_date" NOTES_FILE="${NOTES_FILE:-}" SIG_FILE="$app_sig" \
-    python3 - > "$latest_json" <<'PY'
-import json, os
-notes_file = os.environ.get("NOTES_FILE", "")
-notes = open(notes_file, encoding="utf-8").read().strip() if notes_file else ""
-sig = open(os.environ["SIG_FILE"], encoding="utf-8").read().strip()
-manifest = {
-    "version": os.environ["RELEASE_VERSION"],
-    "notes": notes,
-    "pub_date": os.environ["PUB_DATE"],
-    "platforms": {
-        os.environ["PLATFORM_KEY"]: {
-            "signature": sig,
-            "url": os.environ["DOWNLOAD_URL"],
-        }
-    },
-}
-print(json.dumps(manifest, indent=2))
-PY
-    [ -s "$latest_json" ] || die "latest.json generation produced no output"
-
-    # --clobber so a re-run replaces assets instead of erroring on existing names.
-    gh release upload "$UPLOAD_TAG" --repo "$REPO_SLUG" --clobber \
-        "$DMG_PATH" "$app_tarball" "$app_sig" "$latest_json" \
-        || die "gh release upload failed for $UPLOAD_TAG"
-    rm -rf "$latest_dir"
-}
-
-if [ "$RELEASE_MODE" = "1" ]; then
+# ── 6c. upload staged assets (one-shot --release only) ───────────────────────
+# --release-build skips this (DO_ATTACH=0) and leaves the staging in place for a
+# later --release-attach / release.sh --publish-verified — the whole point of the
+# build-once / verify-first flow.
+if [ "$DO_ATTACH" = "1" ]; then
     begin_step upload "Generating latest.json and attaching the signed DMG + updater artifacts to $UPLOAD_TAG."
-    step "Uploading DMG + updater artifacts to GitHub Release $UPLOAD_TAG"
-    upload_release_assets
+    step "Uploading staged DMG + updater artifacts to GitHub Release $UPLOAD_TAG"
+    upload_staged_assets "$STAGING_DIR"
     end_step upload "Uploaded the signed DMG + updater tarball + .sig + latest.json to $UPLOAD_TAG."
 fi
 
@@ -665,8 +798,19 @@ echo "  .dmg:  $DMG_PATH"
 UPDATER_SIG="$(/usr/bin/find "$BUNDLE_DIR/macos" -name '*.app.tar.gz.sig' 2>/dev/null | head -1 || true)"
 if [ -n "$UPDATER_SIG" ]; then
     echo "  updater artifacts: $(dirname "$UPDATER_SIG")/*.app.tar.gz(.sig)"
-    echo "  → upload the .dmg, .app.tar.gz, .sig and a latest.json to a GitHub Release"
-    echo "    (plugins.updater.endpoints in tauri.conf.json points at latest.json)."
 else
     echo "  (no updater .sig — set TAURI_SIGNING_PRIVATE_KEY_PATH to the updater key to emit signed update artifacts.)"
+fi
+if [ "$DO_BUILD" = "1" ] && [ -n "$STAGING_DIR" ]; then
+    echo "  staged:  $STAGING_DIR (manifest.json + .dmg + .app.tar.gz + .sig)"
+    if [ "$DO_ATTACH" != "1" ]; then
+        echo ""
+        echo "  → Verify this DMG, then publish the SAME artifacts (no rebuild) with:"
+        echo "      scripts/release.sh --publish-verified $EFFECTIVE_VERSION"
+        echo "    or directly:  scripts/build-dmg.sh --release-attach \\"
+        echo "                    --staging-dir '$STAGING_DIR' --upload-tag <tag> --notes-file <file>"
+    fi
+elif [ -z "$STAGING_DIR" ]; then
+    echo "  → upload the .dmg, .app.tar.gz, .sig and a latest.json to a GitHub Release"
+    echo "    (plugins.updater.endpoints in tauri.conf.json points at latest.json)."
 fi

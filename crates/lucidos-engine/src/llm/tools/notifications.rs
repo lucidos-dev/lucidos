@@ -70,7 +70,7 @@ pub(super) fn enable_push_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::ENABLE_PUSH_NOTIFICATIONS.to_string(),
-            description: "Enable or decline browser push notifications. Call with enabled=true if the user wants OS-level alerts for triggered tasks, or enabled=false if they decline.".to_string(),
+            description: "Enable or decline push notifications. Call with enabled=true if the user wants OS-level alerts for triggered tasks, or enabled=false if they decline.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

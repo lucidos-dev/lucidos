@@ -420,7 +420,10 @@ fn image_media_type(ext: &str) -> Option<&'static str> {
 /// so an oversized iPhone photo is downsampled to fit rather than rejected. Fitting compresses
 /// to JPEG when it shrinks the image, so the emitted media type becomes `image/jpeg` for those;
 /// the sentinel always names the media type of the bytes actually returned.
-fn encode_image_for_read(bytes: Vec<u8>, media_type: &str) -> String {
+///
+/// `pub(crate)` so `view_image` (`engine::tools::image`) can emit the same sentinel —
+/// the agentic loop's `parse_image_content_marker` lifts it into a vision block.
+pub(crate) fn encode_image_for_read(bytes: Vec<u8>, media_type: &str) -> String {
     let fitted = crate::api::ChatImage {
         base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
         mime_type: media_type.to_string(),

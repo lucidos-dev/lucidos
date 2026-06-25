@@ -12,13 +12,13 @@ use crate::engine::types::*;
 use crate::engine::LucidosEngine;
 use crate::llm::{
     get_default_tools, get_image_generation_tool, get_mcp_tools, get_notification_tool,
-    get_save_thread_image_tool, Message,
+    get_save_thread_image_tool, get_view_image_tool, Message,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::super::events::{describe_images, emit_routing_failure, make_message_received};
-use super::super::images::{build_user_content_with_images, save_images_to_tmp};
+use super::super::images::build_user_content_with_images;
 use super::super::process_helpers::{
     build_trigger_started_event, classify_or_fallback, TriggerContext,
 };
@@ -724,13 +724,6 @@ impl LucidosEngine {
             emit_result.event_id
         };
 
-        // Auto-save images to .lucidos/tmp/images/ so the LLM can reference them by path
-        let saved_image_paths = if let Some(imgs) = user_images {
-            save_images_to_tmp(&self.workspace_path, imgs)
-        } else {
-            Vec::new()
-        };
-
         self.maybe_emit_titles(
             thread_id,
             &thread_id_str,
@@ -908,6 +901,9 @@ impl LucidosEngine {
         tools.push(crate::llm::get_navigate_ui_tool());
         tools.push(crate::llm::get_manage_repositories_tool());
         tools.push(get_save_thread_image_tool());
+        // view_image re-loads an earlier thread image into vision — it needs no
+        // image *generation* provider, so it's always available (unlike generate_image).
+        tools.push(get_view_image_tool());
         if image_provider_available {
             tools.push(get_image_generation_tool());
         }
@@ -963,7 +959,11 @@ impl LucidosEngine {
             let excess = expendable_size - expendable_budget;
             // Trim memory first (most expendable), then history from oldest (start)
             if memory_context.len() >= excess {
-                memory_context.truncate(memory_context.len() - excess);
+                // `len - excess` is a raw byte offset that can land mid-UTF-8
+                // character (multilingual memory context) — `String::truncate`
+                // panics off a char boundary, so snap down to the nearest one.
+                let cut = memory_context.floor_char_boundary(memory_context.len() - excess);
+                memory_context.truncate(cut);
                 if let Some(pos) = memory_context.rfind('\n') {
                     memory_context.truncate(pos);
                 }
@@ -1054,18 +1054,12 @@ impl LucidosEngine {
         let request_line = format!("Request: {}", user_message);
         user_message_parts.push(&request_line);
 
-        let user_message_text = {
-            let base = user_message_parts.join("\n\n");
-            if saved_image_paths.is_empty() {
-                base
-            } else {
-                let path_annotations: Vec<String> = saved_image_paths
-                    .iter()
-                    .map(|p| format!("[Image saved to {}]", p))
-                    .collect();
-                format!("{}\n\n{}", base, path_annotations.join("\n"))
-            }
-        };
+        // Attached images ride inline as base64 image blocks on the user message
+        // (`build_user_content_with_images` below) and stay visible for the whole
+        // turn. No on-disk path annotation: the chat `read_file` tool is rooted at
+        // `data/artifacts/`, so a `.lucidos/tmp/images/…` hint only sent the model
+        // chasing a path it can't reach ("the bot can't see my attached image").
+        let user_message_text = user_message_parts.join("\n\n");
 
         // Section *shape* (name + char_count) is always built so the
         // modal can render the breakdown; only the body is gated by

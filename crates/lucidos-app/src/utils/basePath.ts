@@ -49,10 +49,59 @@ export const BASE_PATH: string = normalizeBasePath(baseHref());
  *  `main.tsx` renders the picker iff this is set. */
 export const IS_PICKER: boolean = BASE_PATH === `/${SIGIL}`;
 
+/** Read the gateway's external port from the `<meta name="lucidos-gateway-port">`
+ *  the engine stamps into the served shell when it runs behind a gateway (ADR
+ *  0014). `null` when absent (legacy no-gateway engine, or no DOM in tests) or
+ *  malformed — never a `NaN`/garbage port that would build a broken URL. */
+function readGatewayPort(): number | null {
+  if (typeof document === 'undefined') return null;
+  const raw = document
+    .querySelector('meta[name="lucidos-gateway-port"]')
+    ?.getAttribute('content');
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/** The workspace gateway's port, or `null` when this engine runs with no gateway
+ *  (so there is no picker to address). Computed once at module load — used to
+ *  build an absolute URL to the gateway picker from a *direct* engine-port page,
+ *  whose origin is the engine, not the gateway. */
+export const GATEWAY_PORT: number | null = readGatewayPort();
+
+/** Pure: the href for the "Manage workspaces" link, or `null` when no gateway
+ *  picker is reachable. Behind the gateway (or in the picker context) the picker
+ *  is same-origin, so the relative `/~/?pick` route works. On a direct
+ *  engine-port page the gateway is a *different* origin (its own port), so build
+ *  an absolute URL from the stamped gateway port and the host the user is already
+ *  on (covers localhost AND Tailscale; `protocol` covers http/https). With no
+ *  stamped port and not behind a gateway, there is no picker → `null`. */
+export function computeGatewayPickerHref(opts: {
+  behindGateway: boolean;
+  gatewayPort: number | null;
+  protocol: string;
+  hostname: string;
+}): string | null {
+  if (opts.behindGateway) return `/${SIGIL}/?pick`;
+  if (opts.gatewayPort === null) return null;
+  return `${opts.protocol}//${opts.hostname}:${opts.gatewayPort}/${SIGIL}/?pick`;
+}
+
 /** The workspace id (slug) this bundle is serving, or `null` outside a workspace
  *  (the picker, or a legacy root). */
 export const WORKSPACE_ID: string | null =
   IS_PICKER || BASE_PATH === '' ? null : BASE_PATH.slice(1);
+
+/** Live-wired {@link computeGatewayPickerHref} for the current served context. */
+export function gatewayPickerHref(): string | null {
+  return computeGatewayPickerHref({
+    // Served under `/<slug>/` or the picker `/~/` → this origin IS the gateway.
+    behindGateway: WORKSPACE_ID !== null || IS_PICKER,
+    gatewayPort: GATEWAY_PORT,
+    protocol: typeof location !== 'undefined' ? location.protocol : 'https:',
+    hostname: typeof location !== 'undefined' ? location.hostname : 'localhost',
+  });
+}
 
 /** Prefix a root-relative path (leading `/`) with the base path. `withBase('/sw.js')`
  *  → `/<slug>/sw.js` behind the gateway, `/sw.js` at the root. */

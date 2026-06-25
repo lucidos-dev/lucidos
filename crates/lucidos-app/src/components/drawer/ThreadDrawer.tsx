@@ -1,5 +1,5 @@
 import type { ComponentChildren } from 'preact';
-import { useRef, useEffect, useCallback } from 'preact/hooks';
+import { useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { signal } from '@preact/signals';
 import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerView, selectedCodingAgent, selectedScope, repositories } from '../../store/store';
@@ -41,10 +41,13 @@ function formatCreatedTimestamp(createdAt: string | undefined): string {
 }
 
 // Per-section header display: label + icon. The `'saved'` section reads "Pinned"
-// in the UI for now — a TEMPORARY label-only override (the underlying section
-// key, `is_saved`, the `ThreadSaved`/`ThreadUnsaved` events, and the chat
-// "Save / ✓ Saved" toggle all still say "saved"); a full-stack rename is a
-// later decision. The other two derive their label from the section key.
+// in the UI — a label-only override. Every USER-FACING surface now says
+// "Pinned" / "Pin" / "Unpin" (this header, the chat pin toggle, the unpin
+// confirm dialog, tooltips, aria-labels, the disk-usage badge); only the
+// INTERNAL identifiers still say "saved" (the section key, `is_saved`, the
+// `ThreadSaved`/`ThreadUnsaved` events, the `/threads/save`+`/unsave` routes) —
+// a full-stack rename of those is a later decision. The other two sections
+// derive their label from the section key.
 const SECTION_META: Record<DisplaySection, { title: string; Icon: ComponentType<{ size?: string }> }> = {
     saved: { title: 'Pinned', Icon: PinIcon },
     current: { title: 'Current', Icon: InboxIcon },
@@ -121,6 +124,29 @@ export function moveHighlight(delta: number) {
     el?.scrollIntoView({ block: 'nearest' });
 }
 
+/** Pure seed: where the keyboard highlight starts when the drawer gains focus —
+ *  the open thread if it's navigable, else the first row, else null (empty list).
+ *  Exported for unit testing. */
+export function pickInitialHighlight(openThreadId: string | null, ids: string[]): string | null {
+    if (openThreadId && ids.includes(openThreadId)) return openThreadId;
+    return ids[0] ?? null;
+}
+
+/** Seed the keyboard highlight when the drawer is focused via ⌘⇧1, so Enter has
+ *  an immediate target. `navigableIds` is set in a post-render effect, so on a
+ *  fresh open it can still be empty for the first frame(s); retry a few frames
+ *  while it's empty so the seed lands on a real row. A genuinely empty list just
+ *  seeds null after the retries, which is harmless. */
+export function seedDrawerHighlight(): void {
+    let tries = 0;
+    const seed = () => {
+        const ids = navigableIds.value;
+        if (ids.length === 0 && tries++ < 3) { requestAnimationFrame(seed); return; }
+        highlightedThreadId.value = pickInitialHighlight(focusedThreadId.value, ids);
+    };
+    requestAnimationFrame(seed);
+}
+
 export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) {
     // On mobile, the drawer overlay is disabled — mobile has a dedicated threads
     // pane (pane 0) that keeps dots, header, and content in sync via mobileView.
@@ -140,6 +166,11 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
     useScrollMemory(listRef, 'lucidos-scroll-thread-drawer', { paused: activeView !== 'all' });
 
     const handleKeyDown = useCallback((e: KeyboardEvent) => {
+        // List-nav owns only un-modified arrows/Enter. Any chord with a primary
+        // modifier or Alt is a global shortcut (⌘⇧↵ maximize pane group, ⌘⌥↑↓
+        // history, …) — let it bubble to the document handler instead of stealing
+        // Enter as "select highlighted" / arrows as "move highlight".
+        if (e.metaKey || e.ctrlKey || e.altKey) return;
         if (e.key === 'ArrowDown') {
             e.preventDefault();
             moveHighlight(1);
@@ -184,9 +215,8 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
 }
 
 
-import { attentionThreads, reviewThreads, runningThreads, categorizeThreads, composingThreads, computeFamilyDecorations, computeFamilyGraph, computeFamilyKeys, computeFamilySections, depthStyle, draftThreads, filterByTopThread, hasCollapsedAncestor, nestByParent, threadHasUnsentDraft } from './family-graph';
-import { byCreated } from '../../store/thread-events';
-import type { FamilyDecorations, FamilyGraph, NestedThread, ThreadSections } from './family-graph';
+import { attentionThreads, reviewThreads, runningThreads, composingThreads, computeDrawerCategorization, depthStyle, draftThreads, hasCollapsedAncestor, nestByParent, threadHasUnsentDraft } from './family-graph';
+import type { DrawerCategorization, NestedThread } from './family-graph';
 export * from './family-graph';
 function ThreadList() {
     const containerRef = useRef<HTMLDivElement>(null);
@@ -199,52 +229,38 @@ function ThreadList() {
     // Otherwise the composing drafts would be the only thing visible.
     const composingList = filter.size === 0 ? [] : composingThreads(threadMap.value);
 
-    let categorized: ThreadSections;
-    let familyGraph: FamilyGraph = { byId: new Map(), rootByThread: new Map() };
-    let decorations: FamilyDecorations = { routedByThread: new Map(), liftedRoots: new Set() };
-    if (hydrated) {
-        const triggerSelection = selectedTriggerIds.value;
-        const repoSelection = selectedRepoIds.value;
-        const appSelection = selectedAppIds.value;
-        // Filter at top-thread scope so a family is shown iff its top-thread
-        // passes — a per-thread filter would drop sub-threads while the
-        // parent row still advertised them via meta.totalChildrenCount.
-        // Share the same graph across routing, sort keys, decorations, and
-        // the collapse filter; rebuilding it for the filtered subset would
-        // double the per-render parent-walk cost.
-        //
-        // When a trigger/repo/app sub-selection is active, switch to any-member
-        // matching: the repo/app/trigger is a property of a specific coding-agent thread,
-        // not its (often chat/trigger) top-thread, so a coding-agent thread in the
-        // selected repo/app must surface with its family even when the root's
-        // channel is filtered out.
-        const subSelectionActive =
-            triggerSelection.size > 0 || repoSelection.size > 0 || appSelection.size > 0;
-        const unfilteredArr = Array.from(threadMap.value.values());
-        familyGraph = computeFamilyGraph(unfilteredArr);
-        const allThreads = filterByTopThread(unfilteredArr, familyGraph, t =>
-            threadPassesChannelFilter(t, filter, triggerSelection, repoSelection, appSelection),
-            subSelectionActive,
-        );
-        const familySections = computeFamilySections(allThreads, familyGraph);
-        categorized = categorizeThreads(allThreads, familyGraph, familySections);
-        decorations = computeFamilyDecorations(allThreads, familyGraph, familySections);
-        const familyKeys = computeFamilyKeys(allThreads, familyGraph);
-        const byFamilyRecent = (a: ThreadState, b: ThreadState) =>
-            familyKeys.get(b.meta.id)!.recentKey.localeCompare(familyKeys.get(a.meta.id)!.recentKey);
-        // Current sorts by creation time (newest first) — a stable order that
-        // doesn't reshuffle as agents churn or threads gain a CTA. Attention and
-        // drafts are surfaced by the header filter icons, not by bubbling. Saved
-        // / Archive still sort by the family's freshest user action.
-        categorized.current.sort(byCreated);
-        categorized.saved.sort(byFamilyRecent);
-        categorized.archive.sort(byFamilyRecent);
-    } else {
-        categorized = {
-            current: [], saved: [], archive: [],
-            statusMap: new Map(),
-        };
-    }
+    // The categorization pipeline (family graph → top-thread filter → section
+    // routing → sort) is O(loaded threads) across several passes. It used to run
+    // on EVERY ThreadList render — including renders triggered by signals it does
+    // NOT depend on (a section collapse, the archive-count refresh, a pagination
+    // loading-flip). In a workspace with many coding-agent families the loaded set
+    // (inbox + saved + archive page + family extensions) is large enough that
+    // re-running it per render blocks the main thread and delays click handling
+    // (dev-ws input lag, 2026-06-24). Read its real inputs into locals — so the
+    // component still SUBSCRIBES to them — and memoize on exactly those, so a
+    // re-render that didn't change them reuses the result. Collapse-filtering and
+    // nesting stay below: they key on `collapsedFamilies` and are cheap over the
+    // already-categorized rendered set.
+    const triggerSelection = selectedTriggerIds.value;
+    const repoSelection = selectedRepoIds.value;
+    const appSelection = selectedAppIds.value;
+    const threadMapValue = threadMap.value;
+    const { categorized, familyGraph, decorations } = useMemo<DrawerCategorization>(
+        () => hydrated
+            ? computeDrawerCategorization(
+                Array.from(threadMapValue.values()),
+                filter,
+                triggerSelection,
+                repoSelection,
+                appSelection,
+            )
+            : {
+                categorized: { current: [], saved: [], archive: [], statusMap: new Map() },
+                familyGraph: { byId: new Map(), rootByThread: new Map() },
+                decorations: { routedByThread: new Map(), liftedRoots: new Set() },
+            },
+        [hydrated, threadMapValue, filter, triggerSelection, repoSelection, appSelection],
+    );
     const { current, saved, archive, statusMap } = categorized;
 
     // Drop descendants of collapsed families. The parent itself stays visible

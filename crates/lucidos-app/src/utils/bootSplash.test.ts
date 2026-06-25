@@ -160,10 +160,13 @@ describe('index.html inline boot splash', () => {
     expect(html).toContain("getAttribute('href') !== '/~/'");
   });
 
-  it('plays the reveal in the final doc but hides the mark in the picker', () => {
-    // Reveal tiles exist (final document builds the mark once)…
-    expect(html).toContain('bs-tile');
-    expect(html).toContain('@keyframes boot-tile-in');
+  it('plays the mark reveal in the final doc but hides the mark in the picker', () => {
+    // The whole-mark reveal animation exists and is applied to the mark — the
+    // per-tile reveal (bs-tile / boot-tile-in) was dropped because iOS WebKit
+    // doesn't GPU-composite SVG sub-element transforms, so it janked at boot
+    // (see the index.html boot-splash comment). The mark builds up once…
+    expect(html).toContain('@keyframes boot-mark-reveal');
+    expect(html).toMatch(/\.boot-splash-mark\s*\{[^}]*animation:\s*boot-mark-reveal/);
     // …and the picker (boot-splash-reload) hides the mark so the reveal happens
     // only in the workspace document, set by the inline base-href check.
     expect(html).toMatch(/\.boot-splash-reload\s+\.boot-splash-mark\s*\{[^}]*visibility:\s*hidden/);

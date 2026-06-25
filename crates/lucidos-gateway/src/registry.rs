@@ -51,9 +51,9 @@ pub struct Workspace {
     ///
     /// `true` → the engine is **auto-started** when the gateway (re)starts (the
     /// always-on posture: a packaged install's login-launched gateway brings up
-    /// its auto-start workspaces; the bootstrap `default` workspace is auto-start
-    /// so a fresh install opens straight into it). `false` (the default for a
-    /// newly-registered workspace) → the workspace is **listed** in the picker
+    /// its auto-start workspaces). `false` (the default for a newly-created
+    /// workspace; enabled only via the picker toggle) → the workspace is
+    /// **listed** in the picker
     /// but its engine is started only on an explicit open/launch (lazy). An
     /// already-running engine is re-adopted on gateway restart regardless of this
     /// flag. Backward-compatible: a legacy entry with no field reads as `false`.
@@ -83,7 +83,8 @@ pub struct Registry {
 
 impl Registry {
     /// Load the registry from `path`. A missing file is an empty registry (the
-    /// first-run state — the caller then auto-creates `default`). A present but
+    /// first-run state — the gateway boots with no workspaces and the smart root
+    /// serves the picker, where the user names their first one). A present but
     /// unparseable file is a hard error: silently discarding it would orphan
     /// every registered workspace's data behind a fresh empty registry.
     pub fn load(path: &Path) -> Result<Self, BoxError> {

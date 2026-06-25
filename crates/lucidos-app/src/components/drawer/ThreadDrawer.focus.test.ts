@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { focusedPane } from '../../store/store';
-import { handleDrawerPointerDown, isThreadRowTarget } from './ThreadDrawer';
+import { handleDrawerPointerDown, isThreadRowTarget, pickInitialHighlight } from './ThreadDrawer';
 
 // The test environment has no real DOM, so we stand in minimal `closest`-bearing
 // stubs for the pointer-down target. A thread row is any element inside a
@@ -44,5 +44,21 @@ describe('isThreadRowTarget', () => {
     expect(isThreadRowTarget(chromeTarget)).toBe(false);
     expect(isThreadRowTarget(null)).toBe(false);
     expect(isThreadRowTarget({} as EventTarget)).toBe(false);
+  });
+});
+
+describe('pickInitialHighlight', () => {
+  it('seeds the open thread when it is navigable', () => {
+    expect(pickInitialHighlight('b', ['a', 'b', 'c'])).toBe('b');
+  });
+  it('falls back to the first row when the open thread is not in the list', () => {
+    expect(pickInitialHighlight('z', ['a', 'b', 'c'])).toBe('a');
+  });
+  it('falls back to the first row when no thread is open', () => {
+    expect(pickInitialHighlight(null, ['a', 'b', 'c'])).toBe('a');
+  });
+  it('returns null for an empty list', () => {
+    expect(pickInitialHighlight('a', [])).toBeNull();
+    expect(pickInitialHighlight(null, [])).toBeNull();
   });
 });

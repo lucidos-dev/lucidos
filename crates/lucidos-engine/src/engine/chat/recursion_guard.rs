@@ -7,7 +7,7 @@ use crate::engine::LucidosEngine;
 pub(crate) const MAX_THREAD_DEPTH: i32 = 3;
 
 /// Maximum number of child threads a single parent can spawn.
-pub(crate) const MAX_CHILDREN_PER_THREAD: i64 = 3;
+pub(crate) const MAX_CHILDREN_PER_THREAD: i64 = 10;
 
 impl LucidosEngine {
     /// Check recursion guard before spawning a child thread.

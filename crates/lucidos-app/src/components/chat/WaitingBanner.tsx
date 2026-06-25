@@ -6,7 +6,7 @@ import { SplitButton, type SplitButtonMenuItem } from '../shared/SplitButton';
 
 /** The close-set kinds the banner renders. Discard-draft (a compose-draft
  *  action resolved by the close-cascade shortcut, not the banner) and the
- *  Save/Unsave toggle (rendered by PromptInput's section buttons) are excluded —
+ *  Pin/Unpin toggle (rendered by PromptInput's section buttons) are excluded —
  *  they come from the same selector but live in a different slot. */
 const BANNER_CLOSE_KINDS: ReadonlySet<string> = new Set(['discard', 'apply', 'archive']);
 
@@ -102,19 +102,19 @@ interface BannerSlots {
    *  "Discard..." spinners and Diff-less actions all fit naturally). */
   liftable: ComponentChildren | null;
   /** Action buttons that always render on the bottom row, anchored to the
-   *  right. PromptInput renders sectionButtons (Save / ✓ Saved) just before
+   *  right. PromptInput renders sectionButtons (Pin / ✓ Pinned) just before
    *  these — never inside the lift sub-row, so the bottom row stays
-   *  [icons][Save][Discard][Apply] when there is room for it. */
+   *  [icons][Pin][Discard][Apply] when there is room for it. */
   primary: ComponentChildren;
 }
 
 /** Splits the banner's buttons into liftable + primary slots so the caller
  *  (PromptInput) can decide whether to render them as one row or stack the
  *  liftable slot above the row that holds the icons. PromptInput owns where
- *  Save / ✓ Saved goes (always in the bottom row, before the action buttons),
+ *  Pin / ✓ Pinned goes (always in the bottom row, before the action buttons),
  *  so getBannerSlots only worries about the action-side layout. When there's
- *  room, [Save][Diff][Discard][Apply] sit together; when there isn't, only
- *  Diff hops to a row above and [Save][Discard][Apply] stay on the bottom. */
+ *  room, [Pin][Diff][Discard][Apply] sit together; when there isn't, only
+ *  Diff hops to a row above and [Pin][Discard][Apply] stay on the bottom. */
 export function getBannerSlots(state: BannerState): BannerSlots {
   if (state.type === 'applying') {
     return {

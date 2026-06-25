@@ -36,6 +36,30 @@ function expectMatchesFull(thread: ThreadState): void {
   expect(incremental).toEqual(reference);
 }
 
+/** Reference fold over `thread.events` + the synthetic pending MessageReceived
+ *  events (the ground truth the pending fast-path AND the fallback must both
+ *  equal). Mirrors the synthetic construction documented in computeExchanges:
+ *  MAX_SAFE_INTEGER-based seqs, `created` for CC / `_displayCreated` for chat. */
+function expectMatchesAugmented(thread: ThreadState): void {
+  const augmented = new Map(thread.events);
+  const isCC = thread.meta.channel === 'claude_code';
+  const n = thread.pendingUserMessages.length;
+  for (let i = 0; i < n; i++) {
+    const p = thread.pendingUserMessages[i];
+    augmented.set(Number.MAX_SAFE_INTEGER - n + i, {
+      type: 'MessageReceived',
+      text: p.text,
+      _eventId: p.eventId,
+      channel: thread.meta.channel,
+      ...(isCC ? { created: p.created } : { _displayCreated: p.created }),
+      ...(p.image_hashes?.length ? { user_image_hashes: p.image_hashes } : {}),
+    } as never);
+  }
+  const incremental = computeExchanges(thread).map(({ revision: _r, ...rest }) => rest);
+  const reference = groupIntoExchanges(augmented).map(({ revision: _r, ...rest }) => rest);
+  expect(incremental).toEqual(reference);
+}
+
 /** Replay events through handleEvent with increasing timestamps, asserting
  *  incremental ≡ full after every single step. */
 function replay(
@@ -213,6 +237,39 @@ describe('incremental grouping ≡ full grouping', () => {
     handleEvent(map, 'thread-1', 3, { type: 'MessageReceived', text: 'queued follow-up' } as ThreadEvent, at(51), 'pending-1');
     expect(thread.pendingUserMessages).toHaveLength(0);
     expectMatchesFull(thread);
+  });
+
+  it('CC pending message (fast append-trailing path) ≡ augmented full fold', () => {
+    const thread = makeThreadState();
+    thread.meta.channel = 'claude_code';
+    const map = new Map([['thread-1', thread]]);
+    handleEvent(map, 'thread-1', 1, { type: 'MessageReceived', text: 'first' } as ThreadEvent, at(10), 'evt-1');
+    handleEvent(map, 'thread-1', 2, { type: 'CodingAgentIdled', has_changes: false, coding_agent: 'claude-code' } as ThreadEvent, at(20), 'evt-2');
+    expectMatchesFull(thread); // warm the cache, no pending yet
+    // Follow-up sent "now" — created AFTER every persisted event, so the guard
+    // takes the fast append-trailing path.
+    thread.pendingUserMessages.push({ eventId: 'pending-1', text: 'follow up', created: at(30) });
+    expectMatchesAugmented(thread);
+    const ex = computeExchanges(thread);
+    expect(ex[ex.length - 1].userEvent.type).toBe('MessageReceived');
+    expect((ex[ex.length - 1].userEvent as { text?: string }).text).toBe('follow up');
+    expect(ex[ex.length - 1].steps).toHaveLength(0);
+  });
+
+  it('CC pending older than a not-yet-echoed real event falls back, stays equivalent', () => {
+    const thread = makeThreadState();
+    thread.meta.channel = 'claude_code';
+    const map = new Map([['thread-1', thread]]);
+    handleEvent(map, 'thread-1', 1, { type: 'MessageReceived', text: 'first' } as ThreadEvent, at(10), 'evt-1');
+    expectMatchesFull(thread); // warm the cache
+    // A late persisted event lands with created AFTER the pending's created
+    // (CC clock-skew / event arriving before the MessageReceived echo cleared
+    // the pending). The guard must route to the augmented full re-fold rather
+    // than append-trailing — append-trailing would diverge.
+    thread.pendingUserMessages.push({ eventId: 'pending-1', text: 'follow up', created: at(15) });
+    handleEvent(map, 'thread-1', 2, { type: 'CodingAgentTextStreamed', text: 'late', coding_agent: 'claude-code' } as ThreadEvent, at(20), 'evt-2');
+    expect(thread.pendingUserMessages).toHaveLength(1); // a CC stream event doesn't clear it
+    expectMatchesAugmented(thread);
   });
 
   it('abort and matching terminal arriving in ONE batch stay equivalent', () => {

@@ -6,7 +6,7 @@
 type FileIconKind = 'document' | 'code' | 'image';
 
 const CODE_EXTENSIONS = new Set([
-  'c', 'cc', 'cpp', 'cs', 'css', 'go', 'h', 'hpp', 'html', 'java', 'js',
+  'c', 'cc', 'cpp', 'cs', 'css', 'go', 'gs', 'h', 'hpp', 'html', 'java', 'js',
   'jsx', 'kt', 'php', 'py', 'rb', 'rs', 'scss', 'sh', 'swift', 'ts', 'tsx',
 ]);
 const IMAGE_EXTENSIONS = new Set(['gif', 'jpeg', 'jpg', 'png', 'svg', 'webp']);

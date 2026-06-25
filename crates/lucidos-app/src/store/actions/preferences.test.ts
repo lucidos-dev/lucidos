@@ -3,9 +3,18 @@ import { preferences } from '../store';
 import { applyTheme, applyFontFamily, applyUiScale, currentTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions } from './preferences';
 import * as apiClient from '../../api/client';
 
-const platformMocks = vi.hoisted(() => ({ isIOS: false }));
+const platformMocks = vi.hoisted(() => ({ isIOS: false, isTauri: false }));
 vi.mock('../../utils/platform', () => ({
   isIOS: () => platformMocks.isIOS,
+  isTauri: () => platformMocks.isTauri,
+}));
+
+// applyTheme tints the native title bar via this when isTauri(); mock it so the
+// web-path tests don't need a Tauri IPC bridge and the Tauri-path test can
+// assert the per-theme color.
+const setTitlebarColorMock = vi.hoisted(() => vi.fn(() => Promise.resolve()));
+vi.mock('../../utils/tauri', () => ({
+  setTitlebarColor: setTitlebarColorMock,
 }));
 
 describe('currentTheme — localStorage fallback', () => {
@@ -304,6 +313,31 @@ describe("applyTheme('system') — matchMedia change listener gating", () => {
     platformMocks.isIOS = true;
     applyTheme('system');
     expect(listeners).toHaveLength(0);
+  });
+});
+
+describe('applyTheme — native title-bar tint (Tauri)', () => {
+  beforeEach(() => {
+    setTitlebarColorMock.mockClear();
+    platformMocks.isTauri = false;
+  });
+
+  afterEach(() => {
+    platformMocks.isTauri = false;
+  });
+
+  it('does not tint the title bar outside Tauri (web / PWA)', () => {
+    applyTheme('light');
+    expect(setTitlebarColorMock).not.toHaveBeenCalled();
+  });
+
+  it('tints the title bar the header-top blue per theme inside Tauri', () => {
+    platformMocks.isTauri = true;
+    // Mirrors --header-gradient's top stop in styles/global/base.css.
+    applyTheme('light');
+    expect(setTitlebarColorMock).toHaveBeenLastCalledWith('#1a6fd0');
+    applyTheme('dark');
+    expect(setTitlebarColorMock).toHaveBeenLastCalledWith('#15549e');
   });
 });
 

@@ -224,10 +224,11 @@ pub(crate) async fn refresh_coding_agent_has_diff_for_active_cc_threads(
     struct ActiveCcThread {
         thread_id: Uuid,
         cc_repo_id: Option<String>,
+        coding_agent_kind: Option<String>,
     }
 
     let active_threads: Vec<ActiveCcThread> = match sqlx::query_as(
-        "SELECT thread_id, cc_repo_id FROM thread_summaries \
+        "SELECT thread_id, cc_repo_id, coding_agent_kind FROM thread_summaries \
          WHERE is_coding_agent = TRUE AND state = 'active' \
            AND archive_state != 'archived'",
     )
@@ -256,7 +257,7 @@ pub(crate) async fn refresh_coding_agent_has_diff_for_active_cc_threads(
     let mut missing_worktree = 0usize;
     let started = std::time::Instant::now();
 
-    for ActiveCcThread { thread_id, cc_repo_id } in active_threads {
+    for ActiveCcThread { thread_id, cc_repo_id, coding_agent_kind } in active_threads {
         // Look up the latest SessionStarted's branch. Most-recent wins because
         // a thread may have multiple SessionStarted events (initial + resume +
         // hardening); the last one names the live branch.
@@ -298,16 +299,29 @@ pub(crate) async fn refresh_coding_agent_has_diff_for_active_cc_threads(
             }
         };
 
-        let repo_root = match cc_repo_id.as_deref() {
-            Some(rid) => repo_root_by_id.get(rid).cloned().unwrap_or_else(|| {
-                log!(
-                    "[Recovery WARN] cc_repo_id {} not found in repositories map for thread {} — falling back to lucidos_repo_root",
-                    rid,
-                    thread_id
-                );
-                lucidos_repo_root.to_path_buf()
-            }),
-            None => lucidos_repo_root.to_path_buf(),
+        // App coding-agent threads live in the WORKSPACE git repo (their branch
+        // holds the `data/apps/<id>/` edits) and carry a NULL `cc_repo_id`. Route
+        // them to `workspace_path` BEFORE the `cc_repo_id` branch — a NULL
+        // `cc_repo_id` otherwise falls through to `lucidos_repo_root`, where the
+        // `claude-code/app/...` branch does not exist, so `proposal_files_for_branch`
+        // comes back empty and the sweep wipes `coding_agent_has_diff` to FALSE on
+        // every restart (hiding the WaitingBanner Diff button and the standalone
+        // WIP diff button). Mirrors the kind routing in
+        // `propose_one_held_back_change`.
+        let repo_root = if coding_agent_kind.as_deref() == Some("app") {
+            workspace_path.to_path_buf()
+        } else {
+            match cc_repo_id.as_deref() {
+                Some(rid) => repo_root_by_id.get(rid).cloned().unwrap_or_else(|| {
+                    log!(
+                        "[Recovery WARN] cc_repo_id {} not found in repositories map for thread {} — falling back to lucidos_repo_root",
+                        rid,
+                        thread_id
+                    );
+                    lucidos_repo_root.to_path_buf()
+                }),
+                None => lucidos_repo_root.to_path_buf(),
+            }
         };
 
         // Resolve the worktree the same way production code does. The

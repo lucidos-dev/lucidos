@@ -86,6 +86,9 @@ mod context_capture_lazy_test;
 #[path = "api_support/tool_result_lazy_test.rs"]
 mod tool_result_lazy_test;
 
+#[path = "api_support/snapshot_compression_test.rs"]
+mod snapshot_compression_test;
+
 #[path = "api_support/trigger_groups_test.rs"]
 mod trigger_groups_test;
 

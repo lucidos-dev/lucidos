@@ -13,6 +13,7 @@ export type ShortcutId =
   | 'toggleThreadDrawer'
   | 'toggleThreadPane'
   | 'toggleContentPane'
+  | 'maximizePaneGroup'
   | 'narrowThreadPane'
   | 'widenThreadPane'
   | 'narrowThreadDrawer'
@@ -55,6 +56,7 @@ export const SHORTCUT_DEFS: readonly ShortcutDef[] = [
   { id: 'toggleThreadDrawer', label: 'Show or hide thread drawer', category: 'Panes', defaultBinding: B(true, true, false, '1') },
   { id: 'toggleThreadPane', label: 'Focus or hide thread pane', category: 'Panes', defaultBinding: B(true, true, false, '2') },
   { id: 'toggleContentPane', label: 'Focus or hide content pane', category: 'Panes', defaultBinding: B(true, true, false, '3') },
+  { id: 'maximizePaneGroup', label: 'Maximize focused pane group', category: 'Panes', defaultBinding: B(true, true, false, 'Enter') },
   { id: 'narrowThreadPane', label: 'Narrow thread pane', category: 'Panes', defaultBinding: B(true, false, true, 'ArrowLeft') },
   { id: 'widenThreadPane', label: 'Widen thread pane', category: 'Panes', defaultBinding: B(true, false, true, 'ArrowRight') },
   { id: 'narrowThreadDrawer', label: 'Narrow thread drawer', category: 'Panes', defaultBinding: B(true, true, true, 'ArrowLeft') },
@@ -171,6 +173,7 @@ const KEY_GLYPHS: Record<string, string> = {
   ArrowRight: '→',
   ArrowUp: '↑',
   ArrowDown: '↓',
+  Enter: '↵',
 };
 
 /** Platform-correct display string, e.g. Mac `⌘K` / `⌃⇧O`, Win/Linux

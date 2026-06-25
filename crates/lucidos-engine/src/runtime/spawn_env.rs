@@ -152,6 +152,41 @@ pub(super) fn signal_child_process_group(pid: u32, signal: i32) {
 #[cfg(not(unix))]
 pub(super) fn signal_child_process_group(_pid: u32, _signal: i32) {}
 
+/// Gracefully tear down an agent child's whole process group, then force what
+/// ignores it. Sends the group SIGTERM (CATCHABLE — a descendant such as a
+/// Playwright test runner handles it and closes the browsers it tracks; those
+/// browsers `setsid`-DETACH into their own group, so a group signal can't reach
+/// them directly — only the runner's own teardown reaps them), waits `grace` for
+/// that teardown to run, then SIGKILLs the group to force anything that ignored
+/// the SIGTERM.
+///
+/// A bare SIGKILL (the previous behavior) gave the runner no chance to close its
+/// detached browsers — they orphaned and piled up (the 2026-06-24 WebKit
+/// pile-up that, combined with an over-eager gateway respawn, fed a respawn
+/// storm). macOS has no `PR_SET_PDEATHSIG`/cgroup guarantee, so graceful-first +
+/// a content-matching reaper backstop (`scripts/lib/webkit_reaper.sh`) is the
+/// accepted shape; this makes graceful teardown the PRIMARY mechanism.
+///
+/// `grace` is a fixed wait, not a liveness poll: the group LEADER (the agent
+/// child) is the engine's direct child and becomes an unreaped zombie the instant
+/// it exits — until the caller `wait()`s it — so a `kill(-pgid, 0)` poll would
+/// never see the group empty and couldn't end early. This runs in the detached
+/// `driver_task`, off the user-visible cancel path, so the wait costs no
+/// interactive latency.
+///
+/// Best-effort, and MUST only be called while the child is still unreaped — after
+/// `wait()` the pid (hence the group id) can be recycled and signalling a
+/// recycled group would hit unrelated processes (see `signal_child_process_group`).
+#[cfg(unix)]
+pub(super) async fn graceful_kill_child_process_group(pid: u32, grace: std::time::Duration) {
+    signal_child_process_group(pid, libc::SIGTERM);
+    tokio::time::sleep(grace).await;
+    signal_child_process_group(pid, libc::SIGKILL);
+}
+
+#[cfg(not(unix))]
+pub(super) async fn graceful_kill_child_process_group(_pid: u32, _grace: std::time::Duration) {}
+
 /// Drain remaining stderr from an agent child (up to 4 KB).
 ///
 /// Per-line timeout — 100 ms of stderr silence means we're done. A
@@ -333,5 +368,51 @@ mod tests {
         let _ = survivor.start_kill();
         let _ = leader.wait().await;
         let _ = survivor.wait().await;
+    }
+
+    // ── Graceful group teardown (graceful_kill_child_process_group) ─────────
+    // Best-practice fix for orphaned Playwright browsers: SIGTERM the group
+    // (lets a runner close its detached browsers), grace, then SIGKILL. Both
+    // tests use their OWN isolated group so the signals never reach the test
+    // runner's group.
+
+    /// Terminates a normal (SIGTERM-respecting) group.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_kill_reaps_a_normal_group() {
+        let mut child = spawn_sleeper(isolate_in_process_group);
+        let pid = child.id().expect("child pid");
+        graceful_kill_child_process_group(pid, std::time::Duration::from_millis(200)).await;
+        let reaped = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+            .await
+            .is_ok();
+        assert!(reaped, "graceful_kill must terminate a normal process group");
+    }
+
+    /// The SIGKILL fallback is load-bearing: a group leader that IGNORES SIGTERM
+    /// must still be reaped after the grace. `perl` ignores TERM and sleeps;
+    /// skipped if perl isn't on the host (the property is platform-independent).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_kill_force_kills_a_sigterm_ignoring_group() {
+        let mut cmd = tokio::process::Command::new("perl");
+        cmd.arg("-e").arg(r#"$SIG{TERM}="IGNORE"; sleep 600"#);
+        isolate_in_process_group(&mut cmd);
+        cmd.kill_on_drop(true);
+        let Ok(mut child) = cmd.spawn() else {
+            eprintln!("SKIP graceful_kill_force_kills_a_sigterm_ignoring_group: perl unavailable");
+            return;
+        };
+        let pid = child.id().expect("child pid");
+        // Let perl install its SIGTERM-ignore handler before we signal.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        graceful_kill_child_process_group(pid, std::time::Duration::from_millis(300)).await;
+        let reaped = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+            .await
+            .is_ok();
+        assert!(
+            reaped,
+            "a SIGTERM-ignoring group leader must be SIGKILLed after the grace"
+        );
     }
 }

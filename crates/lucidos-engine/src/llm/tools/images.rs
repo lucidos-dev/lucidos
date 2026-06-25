@@ -1,9 +1,33 @@
-//! LLM-facing schemas for image tools (save_thread_image, generate_image).
+//! LLM-facing schemas for image tools (save_thread_image, generate_image,
+//! view_image).
 
 
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
+
+/// Tool for pulling an image posted earlier in the thread back into vision.
+///
+/// Recently-posted images are already in the model's vision; older ones age out
+/// of the auto-included window and only survive in the history as a text note +
+/// description. This tool re-loads any thread image's actual pixels on demand so
+/// the model can look at it again ("the image I posted earlier").
+pub fn get_view_image_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: tn::VIEW_IMAGE.to_string(),
+        description: "Load an image posted earlier in this thread back into your vision so you can actually SEE its pixels again. Use this whenever the user refers to an image you can no longer see — older images drop out of your view after a few messages, leaving only a text note like '[attached image (thread:2) — image not included]'. Call view_image to bring it back, then describe/answer from what you see. This is for re-viewing conversation images; use read_file for image files saved under data/artifacts/.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "image": {
+                    "type": "string",
+                    "description": "Thread image reference: 'thread:N' where N is the 1-based sequential index shown in the conversation history (same numbering as generate_image's input_images and save_thread_image)."
+                }
+            },
+            "required": ["image"]
+        }),
+    }
+}
 
 /// Tool for saving a thread image to an artifact path.
 pub fn get_save_thread_image_tool() -> ToolDefinition {
@@ -34,7 +58,8 @@ pub fn get_image_generation_tool() -> ToolDefinition {
         description: "SYNTHESIZES a new image, or edits an existing image. Returns image bytes — never text. \
             This is NOT a vision/analysis tool: do NOT call it to 'describe', 'analyze', 'summarize', \
             'transcribe', or 'tell me what's in' an image. To describe an image already in the conversation, \
-            just describe it directly in your reply — you can see it natively. \
+            just describe it directly in your reply — you can see recent ones natively; for an older image \
+            you can no longer see, call view_image('thread:N') first, then describe it. \
             Provide `prompt` describing the desired output image. To edit an existing image, also pass \
             `input_images`. The current image provider may only support one input image — if you provide \
             multiple and it's not supported, the call fails with an error asking the user to pick one.".to_string(),

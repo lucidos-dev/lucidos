@@ -96,6 +96,49 @@ export function toggleThreads() {
   }
 }
 
+export type DrawerShortcutAction = 'open-focus' | 'focus' | 'close';
+
+/** Pure decision for the focus-aware drawer shortcut (⌘⇧1). Visibility means the
+ *  drawer is open AND the Conversation side isn't collapsed (`splitRatio > 0`).
+ *  Hidden → open + focus; visible but unfocused → focus; visible + focused →
+ *  close. Mirrors the three-stage toggleThreadPane/toggleContentPane shape. */
+export function computeDrawerShortcutAction(
+  open: boolean, splitR: number, drawerFocused: boolean,
+): DrawerShortcutAction {
+  const visible = open && splitR > 0;
+  if (!visible) return 'open-focus';
+  if (!drawerFocused) return 'focus';
+  return 'close';
+}
+
+/** ⌘⇧1: the focus-aware three-stage drawer toggle (keyboard path only — the
+ *  drawer icon stays a pure show/hide via `toggleThreads`). Moves real DOM focus
+ *  into the drawer so its existing ↑/↓/Enter list-nav is reachable, re-expanding
+ *  a collapsed Conversation side first. Returns true when the drawer is now
+ *  focused (the caller seeds the keyboard highlight), false when it closed.
+ *  Desktop-only; on mobile it navigates to the threads pane. */
+export function focusOrToggleThreadDrawer(): boolean {
+  if (isMobile()) { navigateToPane('threads'); return false; }
+  const action = computeDrawerShortcutAction(
+    threadDrawerOpen.value, splitRatio.value, focusedPane.value === 'drawer',
+  );
+  if (action === 'close') {
+    // The drawer is open + focused here, so toggleThreads closes it and drops
+    // focus back to the thread pane — the single source of that close behavior.
+    toggleThreads();
+    return false;
+  }
+  if (action === 'open-focus') {
+    threadDrawerOpen.value = true;
+    // A collapsed Conversation side (Content pane group maximized) would keep the
+    // drawer hidden even with the open flag set — re-expand so focus lands on a
+    // visible drawer.
+    if (splitRatio.value <= 0) setSplitRatio(DEFAULT_SPLIT_RATIO);
+  }
+  focusPaneAndControl('drawer');
+  return true;
+}
+
 /** Collapse/expand the thread pane with two-stage focus → hide. Desktop: a
  *  collapsed pane expands to DEFAULT_SPLIT_RATIO and takes focus; a
  *  visible-but-unfocused pane just takes focus; a focused, visible pane
@@ -137,6 +180,40 @@ export function toggleContentPane(): void {
     setSplitRatio(toggleContentPaneRatio(splitRatio.value)); // collapse
     focusPaneAndControl('thread');
   }
+}
+
+/** Pure logic for ⌘⇧↵ (maximize the focused *pane group*, toggle). The Threads
+ *  pane group (drawer/thread focused) fills via `splitRatio` 1 — the drawer rides
+ *  `splitRatio > 0` so it stays open; the Content pane group (content focused)
+ *  fills via 0. When already maximized for the focused group, restore the
+ *  remembered pre-maximize ratio (or the default if none was remembered, e.g.
+ *  after a reload). Returns the next ratio and the ratio to remember next (null
+ *  once restored). Pure — exported for unit testing. */
+export function computeMaximizeRatio(
+  pane: FocusedPane, currentRatio: number, prevRatio: number | null,
+): { next: number; newPrev: number | null } {
+  const target = pane === 'content' ? 0 : 1;
+  if (currentRatio === target) {
+    return { next: prevRatio ?? DEFAULT_SPLIT_RATIO, newPrev: null };
+  }
+  return { next: target, newPrev: currentRatio };
+}
+
+/** Remembers the pre-maximize split ratio so the second ⌘⇧↵ restores it.
+ *  In-memory only — a reload discards it (the maximize itself persists via
+ *  `splitRatio`), so a post-reload restore falls back to DEFAULT_SPLIT_RATIO. */
+let prevMaximizeRatio: number | null = null;
+
+/** ⌘⇧↵: toggle the focused *pane group* full-width, restoring the previous split
+ *  on the second press. Desktop-only — `focusedPane` doesn't exist on mobile,
+ *  where panes are navigated, not focused. */
+export function toggleMaximizeFocusedPaneGroup(): void {
+  if (isMobile()) return;
+  const { next, newPrev } = computeMaximizeRatio(
+    focusedPane.value, splitRatio.value, prevMaximizeRatio,
+  );
+  prevMaximizeRatio = newPrev;
+  setSplitRatio(next);
 }
 
 /** Keyboard resize: move the split divider by one KEYBOARD_RESIZE_STEP_PX step.

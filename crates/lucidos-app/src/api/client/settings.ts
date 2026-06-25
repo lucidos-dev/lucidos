@@ -388,10 +388,17 @@ export async function listRepoFiles(repoId: string, gitRef?: string): Promise<st
   return json(`${API}/repositories/${encodeURIComponent(repoId)}/files${params}`);
 }
 
-export async function getRepoFileContent(repoId: string, path: string, gitRef?: string): Promise<string> {
+/** URL of a repo file's raw bytes at `gitRef` (default HEAD). The engine serves
+ *  it with a content-type inferred from the extension, so this is safe to point
+ *  an <img>/<video>/<audio>/<iframe> `src` at for binary-media previews. */
+export function repoFileUrl(repoId: string, path: string, gitRef?: string): string {
   const params = new URLSearchParams({ path });
   if (gitRef) params.set('ref', gitRef);
-  return text(`${API}/repositories/${encodeURIComponent(repoId)}/file?${params}`);
+  return `${API}/repositories/${encodeURIComponent(repoId)}/file?${params}`;
+}
+
+export async function getRepoFileContent(repoId: string, path: string, gitRef?: string): Promise<string> {
+  return text(repoFileUrl(repoId, path, gitRef));
 }
 
 // --- Browse Directories ---

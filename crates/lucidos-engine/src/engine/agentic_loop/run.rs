@@ -11,18 +11,22 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::super::context::{
-    estimate_message_chars, estimate_tokens_from_chars, replace_image_blocks,
-    trim_context_if_needed,
+    estimate_message_chars, estimate_tokens_from_chars, trim_context_if_needed,
 };
 use super::super::types::*;
 use super::super::LucidosEngine;
 use super::helpers::*;
 
 impl LucidosEngine {
-    async fn strip_original_user_images_after_first_llm_call(
+    /// After the first LLM call, emit the derived `ImageDescribed` fact(s) for
+    /// the turn's attached images. The actual image bytes are deliberately KEPT
+    /// in the user message for the whole turn — `trim_context_if_needed`'s
+    /// `keep_image_idx` preserves them so the model can still see the image
+    /// after intervening tool calls. The Flash description is recorded as a
+    /// past-tense fact (for memory + the "what was shown" record), not used to
+    /// replace the bytes.
+    async fn emit_image_descriptions_after_first_llm_call(
         &self,
-        messages: &mut [Message],
-        original_user_message_idx: usize,
         image_description_handle: &mut Option<
             tokio::task::JoinHandle<Option<(String, String)>>,
         >,
@@ -42,20 +46,6 @@ impl LucidosEngine {
         } else {
             None
         };
-        let image_description: Option<&str> = described.as_ref().map(|(d, _)| d.as_str());
-
-        if let Some(msg) = messages.get_mut(original_user_message_idx) {
-            if let MessageContent::Blocks(blocks) = &mut msg.content {
-                let desc = image_description.unwrap_or("user-attached image").to_string();
-                let stripped = replace_image_blocks(blocks, || format!("[image: {}]", desc));
-                if stripped > 0 {
-                    log!(
-                        "[AgentLoop] Stripped {}KB of image data from context after first LLM call",
-                        stripped / 1024
-                    );
-                }
-            }
-        }
 
         // Emit one `ImageDescribed` event per attached hash so the
         // description is preserved as a derived past-tense fact — who
@@ -265,14 +255,20 @@ impl LucidosEngine {
                 ));
             }
 
-            // Pin the current turn's user message so pass 2 cannot drop it.
-            // The recent-tail rule alone fails once enough tool iterations
-            // shift the message out of the last PRESERVE_RECENT_MESSAGES
-            // slots; losing it strips the request line and the iter-1
-            // image-description placeholder from every subsequent call,
-            // making the model report "I lost track of what you asked".
-            let removed_count =
-                trim_context_if_needed(messages, message_budget, Some(user_message_idx));
+            // Pin the current turn's user message so pass 2 cannot drop it
+            // (`Some(user_message_idx)`), and keep its attached image bytes for
+            // the whole turn (`Some(original_user_message_idx)`). The recent-tail
+            // rule alone fails once enough tool iterations shift the message out
+            // of the last PRESERVE_RECENT_MESSAGES slots; losing it strips the
+            // request line from every subsequent call (model reports "I lost
+            // track of what you asked"), and stripping its image blinds the
+            // model to what the user attached.
+            let removed_count = trim_context_if_needed(
+                messages,
+                message_budget,
+                Some(user_message_idx),
+                Some(original_user_message_idx),
+            );
             let trimmed = removed_count > 0;
             // Pass 2 of trim removes oldest messages from index 1; the protected
             // index guard ensures every removal sits strictly below
@@ -747,9 +743,7 @@ impl LucidosEngine {
                     {
                         user_message_idx = messages.len().saturating_sub(1);
                         if iterations == 1 {
-                            self.strip_original_user_images_after_first_llm_call(
-                                messages,
-                                original_user_message_idx,
+                            self.emit_image_descriptions_after_first_llm_call(
                                 &mut image_description_handle,
                                 origin_id,
                                 thread_id,
@@ -1662,14 +1656,13 @@ impl LucidosEngine {
                 }
             }
 
-            // After the first LLM call, replace base64 image data in the original
-            // user message with the Flash-generated text description. The LLM has
-            // already seen the actual bytes — subsequent iterations only need the
-            // description to remember what was shown.
+            // After the first LLM call, emit the derived `ImageDescribed` fact(s)
+            // for any attached images. The actual image bytes STAY in the user
+            // message (preserved by trim's `keep_image_idx`) so the model can
+            // still see the image after intervening tool calls — the description
+            // is only recorded as a past-tense fact, never swapped in for the bytes.
             if iterations == 1 {
-                self.strip_original_user_images_after_first_llm_call(
-                    messages,
-                    original_user_message_idx,
+                self.emit_image_descriptions_after_first_llm_call(
                     &mut image_description_handle,
                     origin_id,
                     thread_id,

@@ -313,3 +313,104 @@ async fn backfill_repo_names_from_changes_recovers_basename() {
 
     teardown_test_db(&db).await;
 }
+
+/// Insert a coding-agent thread row with an explicit kind, external flag, and
+/// stale `cc_repo_id`, mirroring the orphaned-thread state (a random repo id
+/// bound at first `SessionStarted`, the live registry having since moved on).
+async fn insert_ca_thread(
+    pool: &sqlx::PgPool,
+    kind: Option<&str>,
+    is_external: bool,
+    cc_repo_id: Option<&str>,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO thread_summaries \
+         (thread_id, title, source, message_count, last_activity, has_response, is_saved, is_coding_agent, coding_agent_kind, coding_agent_is_external_repo, cc_repo_id) \
+         VALUES ($1, 'CC', 'claude_code', 1, NOW(), TRUE, FALSE, TRUE, $2, $3, $4)",
+    )
+    .bind(id)
+    .bind(kind)
+    .bind(is_external)
+    .bind(cc_repo_id)
+    .execute(pool)
+    .await
+    .expect("insert coding-agent thread");
+    id
+}
+
+async fn fetch_cc_repo_id(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT cc_repo_id FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await
+        .expect("fetch cc_repo_id")
+}
+
+#[tokio::test]
+async fn backfill_repoints_lucidos_and_legacy_threads_to_deterministic_id() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let stale_a = Uuid::new_v4().to_string();
+    let stale_b = Uuid::new_v4().to_string();
+    let external_id = Uuid::new_v4().to_string();
+    let legacy_external_id = Uuid::new_v4().to_string();
+    let live_external_id = Uuid::new_v4();
+
+    // lucidos-kind and legacy-NULL-kind threads BOTH target the Lucidos source
+    // by definition → both should be re-pointed.
+    let lucidos = insert_ca_thread(&pool, Some("lucidos"), false, Some(&stale_a)).await;
+    let legacy = insert_ca_thread(&pool, None, false, Some(&stale_b)).await;
+    // Modern external-repo thread (kind='external') — untouched.
+    let external = insert_ca_thread(&pool, Some("external"), true, Some(&external_id)).await;
+    // LEGACY external-repo thread: created before the kind column, so
+    // coding_agent_kind IS NULL but the durable external flag is set. The
+    // `kind IS NULL` arm must NOT mis-repoint it (the regression guard).
+    let legacy_external =
+        insert_ca_thread(&pool, None, true, Some(&legacy_external_id)).await;
+    // A NULL-kind thread whose cc_repo_id is still a LIVE repository (not
+    // orphaned) — must be left alone even without the external flag.
+    insert_repository(&pool, live_external_id, "other", "/tmp/other").await;
+    let live_bound =
+        insert_ca_thread(&pool, None, false, Some(&live_external_id.to_string())).await;
+    // App thread — untouched.
+    let app = insert_app_thread(&pool, "demo", 5, false).await;
+
+    let det = Uuid::new_v4();
+    let det_s = det.to_string();
+
+    let updated = store
+        .backfill_cc_repo_id_to_deterministic(det)
+        .await
+        .expect("backfill");
+    assert_eq!(updated, 2, "exactly the lucidos + legacy Lucidos rows were re-pointed");
+
+    assert_eq!(fetch_cc_repo_id(&pool, lucidos).await.as_deref(), Some(det_s.as_str()));
+    assert_eq!(fetch_cc_repo_id(&pool, legacy).await.as_deref(), Some(det_s.as_str()));
+    assert_eq!(
+        fetch_cc_repo_id(&pool, external).await.as_deref(),
+        Some(external_id.as_str()),
+        "modern external-repo thread untouched"
+    );
+    assert_eq!(
+        fetch_cc_repo_id(&pool, legacy_external).await.as_deref(),
+        Some(legacy_external_id.as_str()),
+        "legacy NULL-kind external-repo thread untouched (external flag guard)"
+    );
+    assert_eq!(
+        fetch_cc_repo_id(&pool, live_bound).await.as_deref(),
+        Some(live_external_id.to_string().as_str()),
+        "thread bound to a live repository untouched (live-binding guard)"
+    );
+    assert_eq!(fetch_cc_repo_id(&pool, app).await, None, "app thread cc_repo_id stays NULL");
+
+    // Idempotent — a second boot re-points nothing (marker set).
+    let again = store
+        .backfill_cc_repo_id_to_deterministic(det)
+        .await
+        .expect("idempotent");
+    assert_eq!(again, 0, "second run touches nothing (marker set)");
+
+    teardown_test_db(&db).await;
+}

@@ -192,14 +192,14 @@ function tagAction(
       return {
         kind,
         category: 'save',
-        label: 'Save',
+        label: 'Pin',
         invoke: () => void handleSaveThread(threadId),
       };
     case 'unsave':
       return {
         kind,
         category: 'save',
-        label: '✓ Saved',
+        label: '✓ Pinned',
         // handleUnsaveThread confirms internally.
         invoke: () => void handleUnsaveThread(threadId),
       };

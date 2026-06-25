@@ -28,6 +28,10 @@
        with base.css. */
     --brand-blue: #1a6fd0;
     --brand-blue-deep: #0a4ea8;
+
+    /* Focus ring shared by the component classes below (.action-btn, .icon-btn).
+       `--accent` is resolved per theme at use time. Keep in sync with base.css. */
+    --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 /* Dark theme (default) */

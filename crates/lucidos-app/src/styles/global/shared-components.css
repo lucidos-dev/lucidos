@@ -150,9 +150,10 @@ h4, h5, h6 { font-size: 0.8125rem; }
 }
 
 .icon-btn:focus-visible {
-    outline: 0.125rem solid var(--accent);
-    outline-offset: 0.125rem;
-    border-radius: 0.125rem;
+    /* Shared --focus-ring: one soft accent band (see base.css). The transparent
+       outline is the forced-colors fallback, where box-shadow is stripped. */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
 }
 
 .icon-btn:disabled {
@@ -185,8 +186,11 @@ h4, h5, h6 { font-size: 0.8125rem; }
 }
 
 .action-btn:focus-visible {
-    outline: 0.125rem solid var(--accent);
-    outline-offset: 0.125rem;
+    /* Shared --focus-ring (see .icon-btn:focus-visible). Replaces the old solid
+       offset outline, which on a filled button read as a clunky same-color
+       double-band against the button's own accent fill. */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
 }
 
 .action-btn:disabled {

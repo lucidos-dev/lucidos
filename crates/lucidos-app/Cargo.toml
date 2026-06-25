@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tauri = { version = "2", features = ["unstable"] }
+tauri = { version = "2", features = ["unstable", "tray-icon"] }
 tauri-plugin-window-state = "2"
 # Auto-update from GitHub Releases ("update available -> restart") + the confirm
 # dialog it shows. See src/updater.rs and tauri.conf.json plugins.updater.

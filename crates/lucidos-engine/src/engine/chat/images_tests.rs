@@ -283,57 +283,6 @@ fn oversized_history_image_is_fitted_to_target() {
     }
 }
 
-// --- save_images_to_tmp tests ---
-
-#[test]
-fn save_images_to_tmp_writes_files() {
-    use base64::Engine as _;
-    let tmp = tempfile::TempDir::new().unwrap();
-    let workspace = tmp.path().to_path_buf();
-    let images = vec![crate::api::ChatImage {
-        base64: base64::engine::general_purpose::STANDARD.encode(b"fake-image-data"),
-        mime_type: "image/jpeg".to_string(),
-    }];
-    let paths = save_images_to_tmp(&workspace, &images);
-    assert_eq!(paths.len(), 1);
-    assert!(paths[0].starts_with(".lucidos/tmp/images/"));
-    assert!(paths[0].ends_with(".jpg"));
-    let full_path = workspace.join(&paths[0]);
-    assert!(full_path.exists());
-    let contents = std::fs::read(&full_path).unwrap();
-    assert_eq!(contents, b"fake-image-data");
-}
-
-#[test]
-fn save_images_to_tmp_handles_multiple() {
-    use base64::Engine as _;
-    let tmp = tempfile::TempDir::new().unwrap();
-    let workspace = tmp.path().to_path_buf();
-    let images = vec![
-        crate::api::ChatImage {
-            base64: base64::engine::general_purpose::STANDARD.encode(b"img1"),
-            mime_type: "image/png".to_string(),
-        },
-        crate::api::ChatImage {
-            base64: base64::engine::general_purpose::STANDARD.encode(b"img2"),
-            mime_type: "image/jpeg".to_string(),
-        },
-    ];
-    let paths = save_images_to_tmp(&workspace, &images);
-    assert_eq!(paths.len(), 2);
-    assert!(paths[0].ends_with(".png"));
-    assert!(paths[1].ends_with(".jpg"));
-    assert_eq!(std::fs::read(workspace.join(&paths[0])).unwrap(), b"img1");
-    assert_eq!(std::fs::read(workspace.join(&paths[1])).unwrap(), b"img2");
-}
-
-#[test]
-fn save_images_to_tmp_empty_returns_empty() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let paths = save_images_to_tmp(tmp.path(), &[]);
-    assert!(paths.is_empty());
-}
-
 #[test]
 fn oversized_history_images_skipped() {
     // Budget is measured on the fitted (compressed-if-over) size. The big blob

@@ -40,6 +40,41 @@ fn release_tool_slot(tools_in_flight: &std::sync::atomic::AtomicI32) {
     }
 }
 
+/// The coding-agent driver dropped its input receiver before the engine could
+/// send the first prompt — which only happens when the driver task already
+/// wound down (the agent process failed to start, exited immediately, or its
+/// handshake failed). In every such path the driver flushes its REAL cause onto
+/// `events_rx` first — a `Result { error }` (Codex spawn / handshake failure, a
+/// CC `error_during_execution` line) or, when the process simply died, an
+/// `Exited { killed_by_signal }`. Recover it so the thread surfaces an
+/// actionable reason instead of the old bare "input channel closed", which
+/// named neither what failed nor why.
+///
+/// Non-blocking on purpose: by the time the receiver-drop is observed the driver
+/// has returned, so every event it will ever emit is already buffered in the
+/// unbounded channel — `try_recv` drains the full tail without awaiting.
+fn drain_startup_failure_reason(
+    events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+) -> Option<String> {
+    let mut reason: Option<String> = None;
+    let mut killed_by_signal = false;
+    while let Ok(ev) = events_rx.try_recv() {
+        match ev {
+            // Last non-empty error wins — the driver emits the specific cause
+            // before the terminal Exited.
+            AgentEvent::Result { error: Some(e), .. } if !e.trim().is_empty() => {
+                reason = Some(e);
+            }
+            AgentEvent::Exited { killed_by_signal: k } => killed_by_signal = k,
+            _ => {}
+        }
+    }
+    reason.or_else(|| {
+        killed_by_signal
+            .then(|| "coding agent process was killed by a signal during startup".to_string())
+    })
+}
+
 impl LucidosEngine {
     // Bridges every per-session input (thread / user msg / images / origin /
     // cancel / recovery / repo / prompt / resume / CC model+effort + worktree)
@@ -597,9 +632,18 @@ impl LucidosEngine {
                     branch_created,
                 )
                 .await;
-                return Err(
-                    "Agent input channel closed before initial prompt could be sent".into(),
-                );
+                // The driver already wound down (its input receiver is gone),
+                // so recover the real cause it flushed onto events_rx rather
+                // than reporting a bare "channel closed" that hides what failed.
+                let cause = drain_startup_failure_reason(&mut events_rx);
+                return Err(match cause {
+                    Some(c) => format!(
+                        "Coding agent exited during startup before the first prompt could be sent: {c}"
+                    ),
+                    None => "Coding agent exited during startup before the first prompt could be sent"
+                        .to_string(),
+                }
+                .into());
             }
         }
 
@@ -1625,6 +1669,13 @@ impl LucidosEngine {
                             let pool = self.pool.clone();
                             let bus = self.event_bus.clone();
                             let pending = self.pending_cc_permission.clone();
+                            // Unattended (trigger-rooted) sessions auto-resolve
+                            // the card from the inherited side-effect grant
+                            // instead of hanging — `prompt_coding_agent_permission`
+                            // needs the trigger registry + workspace root to
+                            // decide (see `cc_permission::resolve_attend_mode`).
+                            let trigger_configs = self.trigger_configs.clone();
+                            let workspace_path = self.workspace_path.clone();
                             // Disarm the watchdog while the card waits — the
                             // approval may arrive BEFORE the item's ToolUse
                             // (codex raises it pre-execution), so the paired
@@ -1639,6 +1690,8 @@ impl LucidosEngine {
                                         &pool,
                                         &bus,
                                         &pending,
+                                        &trigger_configs,
+                                        &workspace_path,
                                         thread_id,
                                         req.id,
                                         req.tool_name,
@@ -2065,4 +2118,72 @@ pub(super) async fn build_resume_prompt_text(
         block.len()
     );
     format!("{}\n\n{}", block, user_message)
+}
+
+#[cfg(test)]
+mod startup_failure_tests {
+    use super::*;
+
+    #[test]
+    fn recovers_driver_result_error() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tx.send(AgentEvent::Result {
+            text: String::new(),
+            duration_ms: 0,
+            error: Some("Failed to start Codex: No such file or directory".to_string()),
+        })
+        .unwrap();
+        tx.send(AgentEvent::Exited {
+            killed_by_signal: false,
+        })
+        .unwrap();
+        drop(tx); // driver wound down
+
+        assert_eq!(
+            drain_startup_failure_reason(&mut rx).as_deref(),
+            Some("Failed to start Codex: No such file or directory")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_signal_kill_when_no_result_error() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tx.send(AgentEvent::Exited {
+            killed_by_signal: true,
+        })
+        .unwrap();
+        drop(tx);
+
+        assert_eq!(
+            drain_startup_failure_reason(&mut rx).as_deref(),
+            Some("coding agent process was killed by a signal during startup")
+        );
+    }
+
+    #[test]
+    fn none_when_no_failure_signal() {
+        // Clean exit, no error, no signal — caller uses its generic message.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tx.send(AgentEvent::Exited {
+            killed_by_signal: false,
+        })
+        .unwrap();
+        drop(tx);
+
+        assert_eq!(drain_startup_failure_reason(&mut rx), None);
+    }
+
+    #[test]
+    fn ignores_empty_error_strings() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tx.send(AgentEvent::Result {
+            text: String::new(),
+            duration_ms: 0,
+            error: Some("   ".to_string()),
+        })
+        .unwrap();
+        drop(tx);
+
+        assert_eq!(drain_startup_failure_reason(&mut rx), None);
+    }
 }

@@ -8,8 +8,10 @@ import { IS_PICKER, WORKSPACE_ID, baseContextIsValid } from './utils/basePath';
 import { rememberLastWorkspace } from './utils/lastWorkspace';
 import { updateAvailable } from './store/store';
 import { installActionBtnBlurListener } from './components/chat/promptFocus';
+import { installNoAutofill } from './utils/noAutofill';
 import { isTouchDevice } from './utils/viewport';
 import { openAppById } from './store/actions/apps';
+import { startPerfProbe } from './utils/perfProbe';
 import './styles/global.css';
 import './styles/picker.css';
 import './styles/header.css';
@@ -31,6 +33,10 @@ if (isTouchDevice()) {
 }
 
 installActionBtnBlurListener();
+// Suppress WebKit's saved-value autofill dropdown (+ its white→dark flash) and
+// autocorrect/autocapitalize on every text field — App and Picker both. See
+// utils/noAutofill.ts.
+installNoAutofill();
 
 // E2E test hook — Playwright opens an app by id from `page.evaluate`. The
 // real `openApp(app: App)` requires an `App` object that the test doesn't
@@ -84,16 +90,14 @@ function recoverFromBrokenContext(): boolean {
 }
 
 if (!recoverFromBrokenContext()) {
-  // Reaching here means a real served document loaded (the workspace app or the
-  // picker), so we're not stuck — clear the gateway splash's first-seen marker so
-  // the next stuck boot starts its escape-link countdown fresh (see proxy.rs
-  // splash_page_html + the boot-recovery plan).
-  try { sessionStorage.removeItem('lucidos-boot-since'); } catch { /* storage off */ }
   // Remember the workspace the user is in, so the gateway's smart root (`/`) can
   // auto-open it next time (see lastWorkspace.ts / WorkspacePicker). Only inside a
   // real workspace — never the picker (IS_PICKER) or legacy direct-engine root
   // (WORKSPACE_ID null).
   if (!IS_PICKER && WORKSPACE_ID) rememberLastWorkspace(WORKSPACE_ID);
+  // TEMP: locate the click-lag main-thread blocker (dev workspace). Quiet unless
+  // an interaction/task crosses the threshold. Remove once measured.
+  if (!IS_PICKER) startPerfProbe();
   render(IS_PICKER ? <WorkspacePicker /> : <App />, appRoot);
 }
 

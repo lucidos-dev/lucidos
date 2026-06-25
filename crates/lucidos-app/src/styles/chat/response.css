@@ -579,8 +579,9 @@
 }
 
 .question-option:focus-visible {
-    outline: 0.125rem solid var(--accent);
-    outline-offset: 0.125rem;
+    /* Shared --focus-ring. */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
 }
 
 @media (hover: hover) {

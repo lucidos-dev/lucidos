@@ -18,6 +18,7 @@ globs:
 ./scripts/new-migration.sh <description>  # Create timestamped migration
 ./scripts/dev-codesign-setup.sh           # One-time: stable macOS code-signing identity
 ./scripts/test-engine.sh [--full|--fresh] # Engine tests against a dedicated Docker PG
+./scripts/e2e-packaged.sh [--rebuild]     # macOS-only: boot the packaged .app (service + embedded PG) and smoke-test the chain (heavy: builds the .app)
 ```
 
 ### Workspace gateway + dev topology (ADR 0014 — Dev ≠ packaged!)
@@ -107,29 +108,38 @@ listed) and leaves the gateway up for peers. Stop the gateway itself with
   change to `crates/lucidos-gateway/**` (e.g. the boot-splash HTML) is rebuilt on
   disk but NOT served until the gateway itself restarts. The workspace picker
   surfaces this: `GET /~/api/v1/control/gateway/status` returns
-  `{build_id, update_available}` — the running process's baked `GATEWAY_BUILD_ID`
-  (git short SHA + a hash of any uncommitted gateway-source diff, baked by
-  `crates/lucidos-gateway/build.rs`; printable via `lucidos-gateway --build-id`)
-  and whether the on-disk binary's id differs (checked behind a cheap
-  `current_exe` mtime gate so the picker's 2s poll doesn't fork per tick). The
-  picker shows a reload icon, badged when `update_available`. `POST
-  /~/api/v1/control/gateway/reload` makes the gateway **re-exec itself** onto the
-  on-disk binary (`execv(current_exe, argv)`): SAME PID, so the supervisor keeps
-  `wait`ing on it (no respawn) and `gateway.pid` stays valid; the fresh `main()`
-  re-adopts the running engines on boot. This is the ONLY in-place gateway
+  `{build_id, update_available, packaged}` — the running process's baked
+  `GATEWAY_BUILD_ID` (git short SHA + a hash of any uncommitted gateway-source
+  diff, baked by `crates/lucidos-gateway/build.rs`; printable via
+  `lucidos-gateway --build-id`) and whether the on-disk binary's id differs
+  (checked behind a cheap `current_exe` mtime gate so the picker's 2s poll doesn't
+  fork per tick). The picker shows a reload icon, badged when `update_available`.
+  `POST /~/api/v1/control/gateway/reload` makes the gateway **re-exec itself** onto
+  the on-disk binary (`execv(current_exe, argv)`): SAME PID, so the supervisor
+  keeps `wait`ing on it (no respawn) and `gateway.pid` stays valid; the fresh
+  `main()` re-adopts the running engines on boot. This is the ONLY in-place gateway
   restart — note it is distinct from the supervisor's SIGUSR1, which is the
   gateway's *permanent* stop (clean exit → supervisor stops, see
   `scripts/lib/gateway_supervisor.sh`), not a restart. The endpoint returns 202
   before the (short-delayed) exec so the picker's request still resolves.
+  **The self-reload control is DEV-ONLY:** the status `packaged` field is `true`
+  under the packaged desktop runtime (`desktop.rs::spawn_gateway` sets
+  `LUCIDOS_PACKAGED=1`; dev's `web-dev.sh` sets nothing → `false`), and the picker
+  renders the reload icon only when `!packaged`. A re-exec onto a rebuilt on-disk
+  binary only makes sense in dev (a CC Apply rebuilds the gateway binary under a
+  running gateway); a packaged build never rebuilds in place — its updates go
+  through the app updater + a full launchd service restart (see
+  `crates/lucidos-app/src/updater.rs` and `docs/desktop-app.md`).
 - **Auto-start + boot (ADR 0014):** the registry's per-workspace `autostart` flag
   (picker toggle → `POST /~/api/v1/control/workspaces/<id>/autostart {enabled}`)
   governs gateway boot — it **re-adopts** already-running engines, **spawns** the
   auto-start workspaces, and leaves the rest **stopped** (lazy-started on open).
   New dev workspaces default `autostart:false`: an explicit `web-dev.sh` launch
   starts them for the session (via the restart POST above) but they won't
-  auto-start on a future gateway boot until toggled on; the first-run bootstrap
-  `default` defaults on. This is why the dev launcher always POSTs restart for the
-  launched workspace rather than relying on the gateway's boot.
+  auto-start on a future gateway boot until toggled on. (There is no auto-created
+  `default`: on a truly empty registry the gateway creates nothing and the smart
+  root serves the picker.) This is why the dev launcher always POSTs restart for
+  the launched workspace rather than relying on the gateway's boot.
 - **Shared Postgres (ADR 0014 §6/§7):** the dev launcher starts/verifies one
   shared Docker Postgres cluster and ensures the launched workspace database
   exists. If a legacy per-workspace `lucidos-pg-<cksum>` cluster exists and the

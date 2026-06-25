@@ -84,3 +84,7 @@ mod spawn_cleanup_tests;
 #[cfg(test)]
 #[path = "../git_ops_tests/worktree_validity.rs"]
 mod worktree_validity_tests;
+
+#[cfg(test)]
+#[path = "../git_ops_tests/commits.rs"]
+mod commits_tests;

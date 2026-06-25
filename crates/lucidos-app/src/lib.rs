@@ -1,9 +1,11 @@
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Mutex;
 use std::time::Instant;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::tray::TrayIconBuilder;
 use tauri::webview::PageLoadEvent;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 mod desktop;
 mod mobile;
@@ -17,10 +19,21 @@ pub fn run_service() -> i32 {
     desktop::run_service()
 }
 
-/// Build a Safari-like user-agent from the actual system Safari version.
+/// Format a Safari-like user-agent string for the given Safari version.
 /// WKWebView's default UA omits the `Version/X.Y Safari/605.1.15` suffix,
-/// making Google Docs (and others) think it's an unsupported browser.
-/// Cached via `OnceLock` so the `defaults` process only spawns once.
+/// making Google Docs (and others) think it's an unsupported browser. Pure
+/// (no IO) so the format is unit-testable independently of the `defaults` probe.
+fn safari_ua(version: &str) -> String {
+    format!(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+         AppleWebKit/605.1.15 (KHTML, like Gecko) \
+         Version/{version} Safari/605.1.15"
+    )
+}
+
+/// Build a Safari-like user-agent from the actual system Safari version
+/// (falling back to `18.0` when the `defaults` probe fails). Cached via
+/// `OnceLock` so the `defaults` process only spawns once.
 fn safari_user_agent() -> &'static str {
     static UA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     UA.get_or_init(|| {
@@ -34,13 +47,10 @@ fn safari_user_agent() -> &'static str {
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "18.0".to_string());
 
-        format!(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-             AppleWebKit/605.1.15 (KHTML, like Gecko) \
-             Version/{safari_version} Safari/605.1.15"
-        )
+        safari_ua(&safari_version)
     })
 }
 
@@ -71,8 +81,27 @@ struct PanelWebview(Mutex<Option<String>>);
 /// hear from it in 60s, we reload the webview.
 struct LastHeartbeat(Mutex<Instant>);
 
+/// How long the JS heartbeat may go silent before the watchdog treats the
+/// WKWebView content process as crashed and reloads it. The page heartbeats
+/// every 15s, so 60s is four missed beats.
+const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// True when the watchdog should reload the webview: the last heartbeat is older
+/// than [`HEARTBEAT_TIMEOUT`]. Pure so the threshold is unit-testable without
+/// the watchdog thread.
+fn heartbeat_expired(elapsed: std::time::Duration) -> bool {
+    elapsed > HEARTBEAT_TIMEOUT
+}
+
 /// Counter for generating unique webview/window labels.
 static WEBVIEW_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Set true only by the explicit full-teardown path ("Quit & Stop Background
+/// Service" — `quit_lucidos`) so the `ExitRequested` handler lets that
+/// `app.exit(0)` through. Otherwise that handler prevents the auto-exit a
+/// last-window close would trigger, keeping the client resident in the menu bar
+/// while the always-on launchd service runs untouched. Packaged only.
+static QUITTING: AtomicBool = AtomicBool::new(false);
 
 /// Label prefix for additional top-level app windows opened via File → New
 /// Window. The first window is `main` (declared in `tauri.conf.json`); each
@@ -80,6 +109,37 @@ static WEBVIEW_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// `url-preview-<n>` prefix instead, so app-window-only setup (the app-version
 /// injection in `on_page_load`) can tell the two apart.
 const APP_WINDOW_PREFIX: &str = "window-";
+
+/// Default macOS window background tint, applied before the frontend reports the
+/// active theme. It's the dark-theme header-top blue — the first stop of
+/// `--header-gradient` in `crates/lucidos-app/src/styles/global/base.css`; dark
+/// is the app's default theme. Under `titleBarStyle: "Overlay"` the webview owns
+/// the full window height and paints the reclaimed title-bar band itself (the
+/// `.titlebar-strip` element); this NSWindow background is the pre-paint /
+/// behind-the-webview fallback so that band reads blue, not black, before the
+/// page paints. The frontend's `applyTheme` refines it to the exact per-theme
+/// blue via the `set_titlebar_color` command.
+const TITLE_BAR_DEFAULT_COLOR: &str = "#15549e";
+
+/// JS appended to every app window's startup injection. On macOS it sets the
+/// `--titlebar-inset` CSS variable (the macOS standard title-bar height) before
+/// the page paints, so under `titleBarStyle: "Overlay"` the reclaimed title-bar
+/// band — drawn by the `.titlebar-strip` element, which sizes to
+/// `var(--titlebar-inset, 0px)` — appears with no layout shift, while the header
+/// content below keeps its position. Empty on every other platform and the web
+/// build, where there is no native title bar: `--titlebar-inset` stays unset
+/// (0px) and the strip collapses to nothing.
+fn titlebar_inset_script() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "if(document.documentElement)\
+         document.documentElement.style.setProperty('--titlebar-inset','28px');"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ""
+    }
+}
 
 /// Get the main window. Tries get_window first, falls back to get_webview_window.
 fn get_main_window(app: &tauri::AppHandle) -> Option<tauri::Window> {
@@ -96,6 +156,36 @@ fn is_app_window(label: &str) -> bool {
     label == "main" || label.starts_with(APP_WINDOW_PREFIX)
 }
 
+/// Paint the macOS window background of every top-level app window the given
+/// color. Sets the WINDOW-layer background only (`Window::set_background_color`),
+/// never the webview's — so the page background is never tinted (no load flash).
+/// Under `titleBarStyle: "Overlay"` this is the pre-paint / behind-the-webview
+/// fallback for the reclaimed title-bar band (the visible band is the CSS
+/// `.titlebar-strip`). Panel preview webviews (`url-preview-*`) are skipped.
+/// Best-effort per window: a failure on one is logged, not fatal.
+fn paint_title_bars(app: &tauri::AppHandle, color: tauri::utils::config::Color) {
+    for (label, window) in app.windows() {
+        if is_app_window(&label) {
+            if let Err(e) = window.set_background_color(Some(color)) {
+                eprintln!("[Tauri] Failed to set title-bar color on {label}: {e}");
+            }
+        }
+    }
+}
+
+/// Frontend-driven window-background tint. The app's `applyTheme` calls this with
+/// the header-top blue for the active theme (`#1a6fd0` light / `#15549e` dark) so
+/// the behind-the-webview fallback for the reclaimed title-bar band tracks the
+/// in-app header across theme switches. `color` is a CSS hex string (`#rgb` /
+/// `#rrggbb` / `#rrggbbaa`). See `paint_title_bars` for why only the window layer
+/// is colored.
+#[tauri::command]
+fn set_titlebar_color(app: tauri::AppHandle, color: String) -> Result<(), String> {
+    let parsed = color.parse().map_err(|e| format!("invalid color {color:?}: {e}"))?;
+    paint_title_bars(&app, parsed);
+    Ok(())
+}
+
 /// Open an additional top-level app window (File → New Window / Cmd+N). Every
 /// window is just another client of the same engine — the engine + Postgres run
 /// as a shared launchd service (see `desktop`), so all windows share one
@@ -105,11 +195,26 @@ fn open_new_window(app: &tauri::AppHandle) -> Result<(), String> {
     let counter = WEBVIEW_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let label = format!("{APP_WINDOW_PREFIX}{counter}");
 
-    WebviewWindowBuilder::new(app, &label, new_window_url(app))
+    // `titleBarStyle: "Overlay"` + hidden title is set per-window: the
+    // tauri.conf.json values only apply to the declared `main` window, so
+    // builder-made windows need them explicitly or they'd render the default
+    // opaque (black) bar. The builder methods are macOS-only, so they're applied
+    // via a cfg-gated shadow (the rest of this crate stays cross-platform
+    // compilable).
+    let builder = WebviewWindowBuilder::new(app, &label, new_window_url(app))
         .title("Lucidos")
-        .inner_size(1024.0, 768.0)
-        .build()
-        .map_err(|e| format!("{e}"))?;
+        .inner_size(1024.0, 768.0);
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true);
+    builder.build().map_err(|e| format!("{e}"))?;
+    // Tint the bar immediately (window layer only) so it's not black for the
+    // moment before this window's frontend boots and calls `set_titlebar_color`.
+    // The window is registered by `build()`, so paint_title_bars now covers it.
+    if let Ok(color) = TITLE_BAR_DEFAULT_COLOR.parse() {
+        paint_title_bars(app, color);
+    }
     Ok(())
 }
 
@@ -446,13 +551,147 @@ fn restart_service() -> Result<(), String> {
     desktop::restart_service()
 }
 
-/// Fully quit Lucidos: stop the always-on gateway service (`launchctl bootout`),
-/// then exit the GUI. This is the ONLY teardown path — window close leaves the
-/// service running. The next app launch re-installs and re-bootstraps it.
+/// Full teardown: stop the always-on gateway service (`launchctl bootout`), then
+/// exit the client. This is the ONLY path that stops the service — closing the
+/// window / Cmd+Q merely hide the client (it stays resident in the menu bar), so
+/// triggers, scheduled tasks, coding-agent sessions, and push keep running.
+/// Reached from the menu-bar "Quit & Stop Background Service" item and the
+/// app-menu item of the same name. Sets `QUITTING` so the `ExitRequested` guard
+/// lets this exit through. The next app launch re-installs and re-bootstraps the
+/// service.
 #[tauri::command]
 fn quit_lucidos(app: tauri::AppHandle) {
+    QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
     desktop::stop_service();
     app.exit(0);
+}
+
+/// Fully uninstall Lucidos from the GUI — modeled on Docker Desktop's uninstall
+/// so a non-developer never needs a terminal. A two-step native confirm (the
+/// `tauri_plugin_dialog` plugin caps at two buttons, so the keep-vs-delete choice
+/// is its own dialog): first confirm the uninstall, then choose whether to also
+/// delete all data. The plugin can't make a non-default button the native
+/// default, so the affirmative button is highlighted; the scary copy + explicit
+/// two-button choice + result dialog provide the safety. On success the result
+/// dialog dismisses into a hard process exit (NOT `app.exit`, which would run
+/// Tauri's on-exit handlers and let the window-state plugin re-create the data
+/// dir we just deleted); on error the app keeps running so the user can retry.
+#[tauri::command]
+fn uninstall_lucidos(app: tauri::AppHandle) {
+    let confirm_app = app.clone();
+    app.dialog()
+        .message(
+            "This will quit Lucidos, stop the background service, and move the Lucidos app to \
+             the Trash.",
+        )
+        .title("Uninstall Lucidos")
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Continue".to_string(),
+            "Cancel".to_string(),
+        ))
+        .show(move |proceed| {
+            if !proceed {
+                return; // Cancel / Escape — no-op.
+            }
+            // Step 2: data fate. The cancel-slot ("Keep My Data", false) is the
+            // SAFE choice, so Escape here keeps data and still proceeds with the
+            // uninstall (the user already committed by clicking Continue).
+            let fate_app = confirm_app.clone();
+            confirm_app
+                .dialog()
+                .message(
+                    "Do you also want to permanently delete all Lucidos data, including your \
+                     local database and all workspaces? This cannot be undone.\n\nChoose Keep My \
+                     Data to preserve it so you can reinstall and pick up where you left off.",
+                )
+                .title("Uninstall Lucidos")
+                .buttons(MessageDialogButtons::OkCancelCustom(
+                    "Delete Everything".to_string(),
+                    "Keep My Data".to_string(),
+                ))
+                .show(move |delete_data| {
+                    // The uninstall is committed (both data-fate buttons proceed —
+                    // only the data deletion differs). Hide the client window(s)
+                    // NOW, before the destructive steps tear down the engine +
+                    // service: otherwise the user stares at a window whose backend
+                    // is dying and the frontend spews "engine unreachable" errors.
+                    // The result/error dialogs are app-level, so they still show
+                    // with no window visible; on failure `run_uninstall` re-shows
+                    // the main window so the user can retry.
+                    hide_all_windows(&fate_app);
+                    run_uninstall(fate_app.clone(), delete_data);
+                });
+        });
+}
+
+/// Hide every Lucidos client window (the declared `main` plus any New-Window
+/// children). Called the instant an uninstall is confirmed so the about-to-be-torn
+/// -down backend can't surface a cascade of frontend errors behind the result
+/// dialog. Best-effort: a hide failure must not abort the uninstall. Window
+/// messages are proxied to the main event loop, so this is safe from the dialog
+/// callback thread.
+fn hide_all_windows(app: &tauri::AppHandle) {
+    for window in app.webview_windows().values() {
+        let _ = window.hide();
+    }
+}
+
+/// Resolve the data dir, run the destructive uninstall off the dialog-callback
+/// thread (so the UI doesn't freeze during `pg_ctl stop` / Finder), then report
+/// the outcome natively. On success, exit; on error, keep running.
+fn run_uninstall(app: tauri::AppHandle, delete_data: bool) {
+    std::thread::spawn(move || {
+        let app_data = match desktop::app_data_dir_from_env() {
+            Ok(p) => p,
+            Err(e) => {
+                report_uninstall_error(
+                    &app,
+                    &format!("Could not resolve the Lucidos data directory: {e}"),
+                );
+                return;
+            }
+        };
+        match desktop::uninstall(&app_data, delete_data) {
+            Ok(()) => {
+                let body = if delete_data {
+                    "Lucidos has been uninstalled and all its data deleted. The app has been \
+                     moved to the Trash."
+                        .to_string()
+                } else {
+                    format!(
+                        "Lucidos has been uninstalled. Your data was preserved at {}. The app has \
+                         been moved to the Trash.",
+                        app_data.display()
+                    )
+                };
+                app.dialog()
+                    .message(body)
+                    .title("Uninstall Lucidos")
+                    .buttons(MessageDialogButtons::Ok)
+                    // Hard-exit rather than app.exit(0): a normal exit runs
+                    // Tauri's RunEvent::Exit handlers, and the window-state
+                    // plugin would re-persist `.window-state.json` into a freshly
+                    // re-created `~/Library/Application Support/com.lucidos.app`,
+                    // leaving residue after a full "Delete Everything".
+                    .show(|_| std::process::exit(0));
+            }
+            Err(e) => report_uninstall_error(&app, &e),
+        }
+    });
+}
+
+/// Surface an uninstall failure in a native dialog (and the logs). Does NOT
+/// exit — the user can retry. Re-shows the main window, which was hidden when the
+/// uninstall was confirmed, so the user isn't stranded with no window to retry
+/// from.
+fn report_uninstall_error(app: &tauri::AppHandle, msg: &str) {
+    eprintln!("[Tauri] Uninstall failed: {msg}");
+    show_main_window(app);
+    app.dialog()
+        .message(format!("Uninstall did not complete:\n\n{msg}"))
+        .title("Uninstall Lucidos")
+        .buttons(MessageDialogButtons::Ok)
+        .show(|_| {});
 }
 
 #[cfg(unix)]
@@ -505,6 +744,68 @@ fn show_native_notification(title: String, body: String, link: serde_json::Value
     notifications::show(&title, &body, link);
 }
 
+/// Show + focus the main window, recreating it if it was destroyed. Backs the
+/// menu-bar "Open Lucidos" item and the macOS Dock-click (Reopen), so a window
+/// hidden on close can always be brought back.
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.set_focus();
+    } else if let Err(e) = open_new_window(app) {
+        eprintln!("[Tauri] Failed to open window: {e}");
+    }
+}
+
+/// Install the macOS menu-bar (tray) status item — packaged builds only. It keeps
+/// the client resident after the window is dismissed: "Open Lucidos" re-shows the
+/// window and "Quit & Stop Background Service" is the only full teardown
+/// (`quit_lucidos` → `bootout` + exit). The always-on launchd service is
+/// unaffected by closing the window.
+fn install_tray(app: &tauri::App) -> tauri::Result<()> {
+    let Some(icon) = app.default_window_icon().cloned() else {
+        eprintln!("[Tauri] No default window icon available; skipping tray icon");
+        return Ok(());
+    };
+    let open = MenuItem::with_id(app, "tray_open", "Open Lucidos", true, None::<&str>)?;
+    let status = MenuItem::with_id(
+        app,
+        "tray_status",
+        format!("Service running · localhost:{}", desktop::engine_port()),
+        false,
+        None::<&str>,
+    )?;
+    let quit = MenuItem::with_id(
+        app,
+        "tray_quit_stop",
+        "Quit & Stop Background Service",
+        true,
+        None::<&str>,
+    )?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &open,
+            &PredefinedMenuItem::separator(app)?,
+            &status,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
+    )?;
+    TrayIconBuilder::with_id("lucidos-tray")
+        .icon(icon)
+        .tooltip("Lucidos")
+        .menu(&menu)
+        .on_menu_event(|app, event| {
+            if event.id() == "tray_open" {
+                show_main_window(app);
+            } else if event.id() == "tray_quit_stop" {
+                quit_lucidos(app.clone());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -531,19 +832,43 @@ pub fn run() {
             restart_app,
             restart_service,
             quit_lucidos,
+            uninstall_lucidos,
             open_url_external,
             show_native_notification,
+            updater::check_app_update,
+            updater::install_app_update_and_restart,
+            set_titlebar_color,
             mobile::get_connect_info,
             mobile::tailscale_up,
             mobile::tailscale_serve,
         ])
+        .on_window_event(|window, event| {
+            // Packaged: closing a window must NOT quit the client or stop the
+            // always-on service. Hide the main window instead of letting it close
+            // — the client stays resident in the menu bar (only the tray "Quit &
+            // Stop Background Service" tears down). Secondary windows close
+            // normally; dev keeps the default close-quits behavior so
+            // `tauri-dev.sh` returns when the window is closed.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if !tauri::is_dev() && window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .on_menu_event(|app, event| {
-            // "Quit Lucidos" stops the always-on service before exit; "New
-            // Window" opens another client window; every other menu item keeps
-            // its default behavior. Window close (red X / Cmd+W) is a window
-            // event, not a menu item, so it leaves the service running.
+            // "Quit & Stop Background Service" (quit_lucidos) is the only teardown;
+            // "Close Window" (Cmd+Q) hides the client like the red X; "New Window"
+            // opens another client window. Window close (red X / Cmd+W) is handled
+            // in on_window_event above, not here.
             if event.id() == "quit_lucidos" {
                 quit_lucidos(app.clone());
+            } else if event.id() == "close_main_window" {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.close();
+                }
+            } else if event.id() == "uninstall_lucidos" {
+                uninstall_lucidos(app.clone());
             } else if event.id() == "new_window" {
                 if let Err(e) = open_new_window(app) {
                     eprintln!("[Tauri] Failed to open new window: {e}");
@@ -553,22 +878,44 @@ pub fn run() {
         .on_page_load(|webview, payload| {
             if is_app_window(webview.label()) && matches!(payload.event(), PageLoadEvent::Started) {
                 let version = env!("LUCIDOS_APP_VERSION");
-                if let Err(e) =
-                    webview.eval(format!("window.__LUCIDOS_APP_VERSION__ = '{}';", version))
-                {
-                    eprintln!("[Tauri] Failed to inject app version: {e}");
+                // App version + (macOS) the title-bar inset, in one early eval so
+                // the reclaimed-band CSS var is set before first paint.
+                let script = format!(
+                    "window.__LUCIDOS_APP_VERSION__ = '{version}';{}",
+                    titlebar_inset_script()
+                );
+                if let Err(e) = webview.eval(script) {
+                    eprintln!("[Tauri] Failed to inject startup script: {e}");
                 }
             }
         })
         .setup(|app| {
             // Install the app menu. The standard edit/window items keep the
-            // usual shortcuts (Cmd+C/V, minimize…); the app submenu's Quit item
-            // is a CUSTOM "Quit Lucidos" (id `quit_lucidos`) so on_menu_event can
-            // stop the always-on service on an explicit quit — while window
-            // close leaves it running. Best-effort: a menu build failure must
+            // usual shortcuts; Cmd+Q maps to "Close Window" (hide the client) and
+            // the explicit "Quit & Stop Background Service" item drives
+            // on_menu_event → quit_lucidos. Best-effort: a menu build failure must
             // not block app startup.
             if let Err(e) = install_app_menu(app) {
                 eprintln!("[Tauri] Failed to install app menu: {e}");
+            }
+
+            // Tint the window background to match the in-app header (window layer
+            // only — no webview/page-bg flash). Under Overlay this is the
+            // behind-the-webview fallback for the reclaimed title-bar band. This is
+            // the default dark-theme blue; the frontend's applyTheme refines it to
+            // the exact per-theme color via set_titlebar_color once it knows the
+            // theme.
+            if let Ok(color) = TITLE_BAR_DEFAULT_COLOR.parse() {
+                paint_title_bars(app.handle(), color);
+            }
+
+            // Packaged: a menu-bar status item keeps the client resident after the
+            // window is dismissed and hosts the only full-teardown action. No-op
+            // in dev (there is no always-on service to represent).
+            if !tauri::is_dev() {
+                if let Err(e) = install_tray(app) {
+                    eprintln!("[Tauri] Failed to install tray icon: {e}");
+                }
             }
 
             // WKWebView crash recovery watchdog: if the JS heartbeat stops
@@ -581,7 +928,7 @@ pub fn run() {
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(15));
                     let elapsed = handle.state::<LastHeartbeat>().0.lock().unwrap().elapsed();
-                    if elapsed > std::time::Duration::from_secs(60) {
+                    if heartbeat_expired(elapsed) {
                         if let Some(ww) = handle.get_webview_window("main") {
                             eprintln!(
                                 "[Tauri] WKWebView heartbeat timeout ({:.0}s) — reloading",
@@ -604,26 +951,61 @@ pub fn run() {
             // Packaged build: boot the bundled Postgres + engine and point the
             // window at it. No-op in development (tauri-dev.sh supplies both).
             desktop::launch(app.handle());
-            // Packaged build: check GitHub Releases for an update in the
-            // background and prompt to restart if one is available.
-            updater::check_on_startup(app.handle());
+            // Update detection is surfaced INSIDE the workspace UI: the web app
+            // polls the `check_app_update` command and shows an in-app
+            // "Update & restart" toast (see updater.rs). No native launch dialog.
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_handle, _event| {
+        .run(|app_handle, event| {
             // The engine + Postgres run as a launchd service, independent of the
-            // window — so GUI exit (window close, Cmd+W) intentionally tears
-            // nothing down. The only stop path is the explicit "Quit Lucidos"
-            // menu item (see `quit_lucidos` / on_menu_event).
+            // client. Packaged: keep the client process alive when the last window
+            // is dismissed (so it can host the menu-bar item and be re-opened), and
+            // re-show the window on a Dock click. The explicit teardown
+            // (`quit_lucidos`) sets QUITTING so its app.exit(0) passes the guard.
+            match event {
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    if !tauri::is_dev() && !QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
+                        api.prevent_exit();
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                tauri::RunEvent::Reopen { .. } => {
+                    if !tauri::is_dev() {
+                        show_main_window(app_handle);
+                    }
+                }
+                _ => {}
+            }
         });
 }
 
 /// Build and install the macOS app menu. Mirrors the default menu (so standard
-/// shortcuts keep working) but replaces the app submenu's predefined Quit with
-/// a custom "Quit Lucidos" item routed through `on_menu_event` → `quit_lucidos`.
+/// shortcuts keep working) but maps Cmd+Q to "Close Window" (hides the client,
+/// leaving the always-on service running) and exposes the deliberate full
+/// teardown as a separate, unshortcutted "Quit & Stop Background Service" item
+/// (routed through `on_menu_event` → `quit_lucidos`; also in the menu-bar tray).
 fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
-    let quit = MenuItem::with_id(app, "quit_lucidos", "Quit Lucidos", true, Some("Cmd+Q"))?;
+    let uninstall = MenuItem::with_id(
+        app,
+        "uninstall_lucidos",
+        "Uninstall Lucidos…",
+        true,
+        None::<&str>,
+    )?;
+    // Cmd+Q closes the window (hides the client) rather than quitting — the
+    // always-on service must survive it. The deliberate full teardown is the
+    // separate, unshortcutted "Quit & Stop Background Service" (also in the tray).
+    let close_window =
+        MenuItem::with_id(app, "close_main_window", "Close Window", true, Some("Cmd+Q"))?;
+    let quit = MenuItem::with_id(
+        app,
+        "quit_lucidos",
+        "Quit & Stop Background Service",
+        true,
+        None::<&str>,
+    )?;
 
     let app_menu = Submenu::with_items(
         app,
@@ -636,6 +1018,9 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
             &PredefinedMenuItem::hide_others(app, None)?,
             &PredefinedMenuItem::show_all(app, None)?,
             &PredefinedMenuItem::separator(app)?,
+            &uninstall,
+            &PredefinedMenuItem::separator(app)?,
+            &close_window,
             &quit,
         ],
     )?;
@@ -672,4 +1057,44 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
     let menu = Menu::with_items(app, &[&app_menu, &file_menu, &edit_menu, &window_menu])?;
     app.set_menu(menu)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn is_app_window_distinguishes_app_windows_from_panel_previews() {
+        // The declared main window and New-Window children are app windows…
+        assert!(is_app_window("main"));
+        assert!(is_app_window("window-0"));
+        assert!(is_app_window("window-42"));
+        // …while panel URL previews and anything else are not.
+        assert!(!is_app_window("url-preview-3"));
+        assert!(!is_app_window("lucidos-tray"));
+        assert!(!is_app_window(""));
+    }
+
+    #[test]
+    fn safari_ua_carries_the_version_and_webkit_suffix() {
+        let ua = safari_ua("18.5");
+        // The whole point: WKWebView's default UA lacks the Version/… Safari/…
+        // suffix; ours must carry both, plus the AppleWebKit token.
+        assert!(ua.contains("Version/18.5 Safari/605.1.15"), "{ua}");
+        assert!(ua.contains("AppleWebKit/605.1.15"), "{ua}");
+        assert!(ua.starts_with("Mozilla/5.0 (Macintosh;"), "{ua}");
+        // A different version is interpolated verbatim.
+        assert!(safari_ua("17.0").contains("Version/17.0 Safari/605.1.15"));
+    }
+
+    #[test]
+    fn heartbeat_expired_fires_only_past_the_timeout() {
+        // Below and at the threshold: not expired (15s heartbeat cadence).
+        assert!(!heartbeat_expired(Duration::from_secs(59)));
+        assert!(!heartbeat_expired(HEARTBEAT_TIMEOUT));
+        // Strictly past the 60s timeout: reload.
+        assert!(heartbeat_expired(Duration::from_secs(61)));
+        assert!(heartbeat_expired(HEARTBEAT_TIMEOUT + Duration::from_millis(1)));
+    }
 }

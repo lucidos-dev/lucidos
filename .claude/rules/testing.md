@@ -10,10 +10,11 @@ globs:
 
 # E2E Testing
 
-Five test suites. The API + browser suites run against the e2e workspace
+Six test suites. The API + browser suites run against the e2e workspace
 (`~/workspaces/e2e-test`); the wasm + embedder suites are pure Rust integration
-tests that only need external setup (built WASM artifacts; downloaded ML model).
-Contract tests run inline as part of `cargo test`.
+tests that only need external setup (built WASM artifacts; downloaded ML model);
+the packaged-build smoke test boots the macOS `.app` itself. Contract tests run
+inline as part of `cargo test`.
 
 ## Browser E2E (Playwright)
 
@@ -152,6 +153,43 @@ deterministic, network-free, cosine reflects keyword overlap. Default
 `cargo test` stays offline; only add `#[cfg(feature = "real-embedder-tests")]`
 when the test genuinely depends on the model's semantic behavior.
 
+## Packaged Build Smoke Test (macOS)
+
+`scripts/e2e-packaged.sh` — boots the **packaged** macOS build end-to-end and
+asserts the chain that dev e2e never touches: staged Resources, the bundled
+gateway + engine binaries, relocatable **embedded** Postgres provisioning, a
+per-workspace database, the engine spawn, and static serving through the gateway
+proxy.
+
+```bash
+./scripts/e2e-packaged.sh            # reuse an existing .app, else build it
+./scripts/e2e-packaged.sh --rebuild  # force a fresh build-dmg.sh build first
+./scripts/e2e.sh --packaged          # run it as a final phase of the full suite
+```
+
+It runs the bundle's **headless service role** (`Lucidos --service`) under an
+isolated temp `HOME` + a free port + a seeded fastembed cache, then asserts over
+HTTP + on disk: gateway health (`/~/api/v1/health`) → picker → create a workspace
+→ poll it to `healthy` → engine health through the gateway (`/<slug>/api/v1/health`)
+→ app shell base href → embedded Postgres on disk. Graceful SIGTERM teardown
+verifies a clean stop (port freed, no `postmaster.pid`) and removes the temp `HOME`.
+
+It does **not** drive the WKWebView UI: Apple's WKWebView exposes no WebDriver and
+`tauri-driver` supports only Linux/Windows, so the packaged window can't be
+automated on macOS (ADR 0016). The Tauri layer's non-UI logic is unit-tested in
+`crates/lucidos-app` (`lib.rs` / `notifications.rs` / `desktop.rs`,
+`cargo test -p lucidos-app` — needs a built `crates/lucidos-app/dist/` for
+`generate_context!` to compile, so run a frontend build first).
+
+**macOS-only** (skips gracefully elsewhere) and **heavy** (full release + DMG
+build + a Postgres download) — so it is standalone and NOT in the default
+`e2e.sh` run; the nightly opts in via `--packaged` / `LUCIDOS_E2E_PACKAGED=1`.
+See `docs/e2e-test-decisions.md` for the rationale.
+
+**When to write:** changes to the packaged boot chain — `build-dmg.sh` resource
+staging, `crates/lucidos-app/src/desktop.rs` service/gateway wiring, the embedded
+Postgres provisioning, or the gateway's boot/control surface.
+
 ## Test Level Selection
 
 | Scenario | Test type |
@@ -163,7 +201,11 @@ when the test genuinely depends on the model's semantic behavior.
 | Shared Rust logic changed | Contract test |
 | Store/signal behavior | Vitest |
 | Rust engine logic | `cargo test` |
+| Packaged macOS build boots | Packaged build smoke test |
+| Native Tauri (non-UI) logic | `cargo test -p lucidos-app` |
 
 `./scripts/e2e.sh` runs API → browser → wasm → embedder back-to-back. The
 nightly trigger calls it; nothing else runs the wasm + embedder suites
-automatically, so don't bypass `./scripts/e2e.sh` in trigger pipelines.
+automatically, so don't bypass `./scripts/e2e.sh` in trigger pipelines. The
+packaged smoke test is opt-in (`./scripts/e2e.sh --packaged` /
+`LUCIDOS_E2E_PACKAGED=1`) because the full build is too heavy for every run.

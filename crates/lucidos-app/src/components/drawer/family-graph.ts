@@ -1,10 +1,11 @@
 import { computed } from '@preact/signals';
-import { effectiveThreadStatus, getThreadDisplaySection, threadMap, threadNeedsAttention, threadInReview, threadIsRunning } from '../../store/store';
+import { effectiveThreadStatus, getThreadDisplaySection, threadMap, threadNeedsAttention, threadInReview, threadIsRunning, type ThreadChannel } from '../../store/store';
 import { byRecent, byCreated, recencyKey, reviewTier, isExcludedFromSections } from '../../store/thread-events';
 import type { ThreadState } from '../../store/thread-events';
 import type { DisplaySection } from '../../generated/thread-lifecycle';
 import type { ThreadStatus } from '../../store/thread-events';
 import { draftPresentThreadIds } from '../../store/composeDrafts';
+import { threadPassesChannelFilter } from '../../store/threadFilter';
 
 // Pure family-graph / categorization logic for the thread drawer. Extracted
 // from ThreadDrawer.tsx (re-exported there); imported by drawer/*.test.ts.
@@ -235,14 +236,70 @@ export function categorizeThreads(
     return out;
 }
 
+/** Result of `computeDrawerCategorization`: the section buckets plus the family
+ *  graph and the lifted-parent decorations the drawer renders on top of them. */
+export type DrawerCategorization = {
+    categorized: ThreadSections;
+    familyGraph: FamilyGraph;
+    decorations: FamilyDecorations;
+};
+
+/** The drawer's categorization pass as one pure call: build the family graph,
+ *  filter to passing top-threads, route families to sections, and sort. Extracted
+ *  from `ThreadList` so the component can MEMOIZE it on its real inputs (the
+ *  loaded threads + the channel filter + the trigger/repo/app selections) instead
+ *  of re-running this whole O(threads) multi-pass on every render — including
+ *  renders triggered by signals it does NOT depend on (a section collapse, the
+ *  archive-count refresh, a pagination loading-flip). Output is identical to the
+ *  inlined sequence it replaced (pinned by `drawer-categorization-memo.test.ts`).
+ *  Collapse-filtering and nesting stay in the component — they key on the
+ *  collapsed-family set and are cheap over the already-categorized rendered set. */
+export function computeDrawerCategorization(
+    threads: ThreadState[],
+    channelFilter: ReadonlySet<ThreadChannel>,
+    triggerSelection: ReadonlySet<string>,
+    repoSelection: ReadonlySet<string>,
+    appSelection: ReadonlySet<string>,
+): DrawerCategorization {
+    // Filter at top-thread scope so a family is shown iff its top-thread passes —
+    // a per-thread filter would drop sub-threads while the parent row still
+    // advertised them via meta.totalChildrenCount. Share the one graph across
+    // routing, sort keys, decorations, and the collapse filter; rebuilding it for
+    // the filtered subset would double the per-render parent-walk cost.
+    //
+    // When a trigger/repo/app sub-selection is active, switch to any-member
+    // matching: the repo/app/trigger is a property of a specific coding-agent
+    // thread, not its (often chat/trigger) top-thread, so a coding-agent thread in
+    // the selected repo/app must surface with its family even when the root's
+    // channel is filtered out.
+    const subSelectionActive =
+        triggerSelection.size > 0 || repoSelection.size > 0 || appSelection.size > 0;
+    const familyGraph = computeFamilyGraph(threads);
+    const allThreads = filterByTopThread(threads, familyGraph, t =>
+        threadPassesChannelFilter(t, channelFilter, triggerSelection, repoSelection, appSelection),
+        subSelectionActive,
+    );
+    const familySections = computeFamilySections(allThreads, familyGraph);
+    const categorized = categorizeThreads(allThreads, familyGraph, familySections);
+    const decorations = computeFamilyDecorations(allThreads, familyGraph, familySections);
+    const familyKeys = computeFamilyKeys(allThreads, familyGraph);
+    // Current + Archive sort by creation time (newest first) — a stable order that
+    // doesn't reshuffle as agents churn or threads gain a CTA, and Archive's
+    // createdAt sort matches both the date each row displays and the axis
+    // `loadOlderThreads` pages by. Saved sorts by the family's freshest user
+    // action. (See `sortDrawerSections`.)
+    sortDrawerSections(categorized, familyKeys);
+    return { categorized, familyGraph, decorations };
+}
+
 /** Per-thread sort key computed over the whole family — the parent inherits the
  *  freshest user action from any descendant, so the family rises together. Every
  *  member of one family resolves to the same record. */
 export type FamilyKeys = {
-    /** Max last-user-action across the family (see `recencyKey`). Drives
-     *  Saved / Archive recency — the family rises to its freshest USER touch,
-     *  not the agent's last churn. (Current sorts by creation time instead, so
-     *  it doesn't consult this.) */
+    /** Max last-user-action across the family (see `recencyKey`). Drives the
+     *  Saved section's recency — the family rises to its freshest USER touch,
+     *  not the agent's last churn. (Current and Archive sort by creation time
+     *  instead, so they don't consult this.) */
     recentKey: string;
 };
 
@@ -264,10 +321,33 @@ export function orderedCurrentForReview(
     return nestByParent(current).map(n => n.thread);
 }
 
+/** Apply the drawer's per-section display sort in place.
+ *
+ *  Current and Archive order by creation time (newest first, see `byCreated`):
+ *  a stable order that doesn't reshuffle as a family's recency shifts, and —
+ *  crucially for Archive — matches the `createdAt` date each row displays.
+ *  Archive is also PAGED by `createdAt` (see `loadOlderThreads`), so display and
+ *  pagination share one axis and the section is gap-free as it scrolls.
+ *
+ *  Saved orders by the family's freshest user action (`byFamilyRecent` over
+ *  `familyKeys`) — an explicit-pin section, fully loaded, where bubbling the
+ *  family to its latest USER touch is wanted. `familyKeys` must cover every
+ *  thread in `sections.saved` (built by `computeFamilyKeys` over the full set). */
+export function sortDrawerSections(
+    sections: ThreadSections,
+    familyKeys: ReadonlyMap<string, FamilyKeys>,
+): void {
+    const byFamilyRecent = (a: ThreadState, b: ThreadState) =>
+        familyKeys.get(b.meta.id)!.recentKey.localeCompare(familyKeys.get(a.meta.id)!.recentKey);
+    sections.current.sort(byCreated);
+    sections.saved.sort(byFamilyRecent);
+    sections.archive.sort(byCreated);
+}
+
 /** Compute family-aware recency keys for every non-composing/non-discarded
  *  thread. Returns a Map keyed by thread id; every member of the same family
- *  maps to the same record (the family's freshest `recentKey`), so Saved /
- *  Archive sort families as a unit. Accepts an optional pre-built graph (see
+ *  maps to the same record (the family's freshest `recentKey`), so the Saved
+ *  section sorts families as a unit. Accepts an optional pre-built graph (see
  *  `computeFamilyGraph`) to share the parent walk with `categorizeThreads`. */
 export function computeFamilyKeys(
     threads: ThreadState[],

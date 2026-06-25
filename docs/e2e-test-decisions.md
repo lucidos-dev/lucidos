@@ -2,14 +2,30 @@
 
 Decisions and tradeoffs made while building the end-to-end test suite.
 
-## Architecture: Three Layers
+## Architecture: Layers
 
 1. **Browser E2E tests** (Playwright, `crates/lucidos-app/e2e/`) — drive a real browser against the running Lucidos UI. Three projects run by default: `chromium` (desktop), `mobile` (mobile Chromium), and `mobile-webkit` (iOS Safari emulation via WebKit).
 2. **HTTP API tests** (Rust, `crates/lucidos-e2e/tests/api_support/`, workspace member crate `lucidos-e2e`) — hit the API directly without a browser
+3. **Packaged build smoke test** (`scripts/e2e-packaged.sh`) — boots the macOS `.app` itself (service role + embedded Postgres) and asserts the packaged boot chain over HTTP + on disk. macOS-only, opt-in, does **not** drive the WKWebView (see below).
 
-All layers require a running Lucidos workspace (`~/workspaces/e2e-test` by default).
+The browser + API layers require a running dev workspace (`~/workspaces/e2e-test` by default). The packaged smoke test boots the bundle's own isolated stack instead.
 
 ## Key Decisions
+
+### Packaged build e2e is a boot smoke test, not UI automation
+The packaged build (macOS `.app`/`.dmg`) is a launchd **gateway** service with **embedded Postgres** plus a GUI **client** whose **WKWebView** points at the gateway. We cannot drive that window in CI: Apple's WKWebView exposes no WebDriver, and `tauri-driver` supports only Linux (WebKitGTK) + Windows. So `scripts/e2e-packaged.sh` is a **headless boot smoke test** of the service → gateway → embedded Postgres → engine → static-serving chain — the parts unique to packaging (staged Resources, the bundled binaries, the relocatable Postgres tree, the per-workspace DB, the engine spawn) that dev e2e (direct engine + Docker PG) never exercises. The load-bearing assertion: a freshly created workspace reaches `healthy` through the gateway and its engine answers, which can only happen if embedded Postgres provisioned, the DB was created, and the bundled engine spawned and served. Full rationale + roads-not-taken: ADR 0016.
+
+### Smoke test runs the bundle's service role under a temp HOME
+It launches `Contents/MacOS/Lucidos --service` (`desktop::run_service` → `spawn_gateway`), which never touches AppKit/Tauri/notifications/updater/tray/launchd — those are client-role only — so it is cleanly headless and scriptable, with no display and no launchd pollution. `app_data_dir_from_env()` derives the data dir from `$HOME`, so the test runs under a temp `HOME`: the embedded cluster + workspaces + logs are fully isolated from any real install and removed on teardown. A free ephemeral port (clear of dev 5251 / packaged 5252) is passed via `LUCIDOS_ENGINE_PORT`, and the dev workspace's `DATABASE_URL`/`PG*`/`LUCIDOS_*` env is scrubbed at launch so inherited CC-session values can't poison the packaged embedded path.
+
+### fastembed cache is seeded, not re-downloaded
+`spawn_gateway` pins `FASTEMBED_CACHE_DIR` to `<app-data>/fastembed`; under a temp `HOME` that is cold (~465 MB HF download + networked warmup at engine boot). The smoke test symlinks that dir to the machine-persistent shared cache the embedder e2e already seeds (`${XDG_CACHE_HOME:-$HOME/.cache}/lucidos/fastembed`), so a seeded host is offline/fast and a cold host downloads the model once (warming future runs).
+
+### Packaged smoke test is standalone + opt-in (heavy build)
+Building the `.app` is a full release engine+gateway build + a relocatable Postgres download + a frontend build + `cargo tauri build`. Too heavy for every run, so `e2e-packaged.sh` is a standalone script kept out of the default `e2e.sh`; the nightly opts in via `e2e.sh --packaged` / `LUCIDOS_E2E_PACKAGED=1`. It is macOS-only and skips gracefully elsewhere.
+
+### Native (Tauri) non-UI logic is unit-tested via pure-function extraction
+The Tauri command layer (`lib.rs`, `notifications.rs`) is mostly GUI/IPC glue that needs real webviews/windows, which a unit test can't supply. Following the established `desktop.rs` pattern, the load-bearing *decision* logic is extracted into named pure functions and unit-tested with no Tauri runtime: `safari_ua`/`heartbeat_expired`/`is_app_window` (`lib.rs`) and `link_identifier`/`is_dismiss_action` (`notifications.rs`, the notification tap-routing + replace-by-id semantics). **Rejected:** `tauri::test` MockRuntime tests — they add a `test` feature to the `tauri` dep and a brittle mock runtime for marginal gain, and keep `cargo test -p lucidos-app` slower/heavier. Note `cargo test -p lucidos-app` needs a built `crates/lucidos-app/dist/` for `generate_context!` to compile, so a frontend build must run first.
 
 ### Dual layout handling
 Lucidos renders desktop and mobile layouts simultaneously — every DOM element exists twice. All Playwright selectors use `.first()` and visibility checks via `getBoundingClientRect()` to target only the visible (desktop) element. The `openThreadDrawer()` helper uses `page.evaluate()` with rect checks rather than Playwright's `.isVisible()` to avoid false positives from the hidden mobile layout.

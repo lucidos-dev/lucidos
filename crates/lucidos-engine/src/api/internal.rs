@@ -63,6 +63,8 @@ pub(super) async fn permission_prompt(
         state.engine.pool(),
         &state.engine.event_bus,
         &state.engine.pending_cc_permission,
+        &state.engine.trigger_configs,
+        &state.workspace_path,
         thread_id,
         body.tool_use_id,
         body.tool_name,

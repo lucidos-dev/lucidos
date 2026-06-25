@@ -303,25 +303,16 @@ json_workspace_status() {
 }
 
 # --- JSON mode ---
+# Lists every workspace, including the caller's own — the control panel renders
+# the current workspace as the active row with a refresh control (parity with
+# the gateway picker), so the engine no longer passes -w to exclude itself.
 if [ -n "$JSON_MODE" ]; then
     ENTRIES=""
-    EXCLUDE_WS=""
-    if [ -n "$WORKSPACE" ]; then
-        # The exclude is opportunistic — engines pass an absolute workspace_path
-        # so it normally resolves; a missing shortname shouldn't be fatal in
-        # JSON mode (returns no exclude → may include the caller, harmless).
-        resolve_workspace_path 2>/dev/null || true
-        EXCLUDE_WS="$WORKSPACE"
-    fi
 
     while IFS= read -r ws_dir; do
         [ -z "$ws_dir" ] && continue
         if [ -n "$ws_dir" ]; then
             if [ -d "$ws_dir/.lucidos" ]; then
-                # Skip the requesting workspace
-                if [ -n "$EXCLUDE_WS" ] && [ "$ws_dir" = "$EXCLUDE_WS" ]; then
-                    continue
-                fi
                 if [ -n "$ENTRIES" ]; then
                     ENTRIES="$ENTRIES,"
                 fi

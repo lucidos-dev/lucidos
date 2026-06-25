@@ -140,3 +140,16 @@ interrupt arm drains the flag into `classify_result` (and the escalation
 fallback). `CancelCause` is not part of the generated TS contract, so this needed
 only the hand-maintained frontend `CancelCause` union — no `ThreadEvent` variant
 change. See `docs/plans/2026-06-21-codex-followup-redirect-label.md`.
+
+## Addendum (2026-06-25): unattended trigger sessions auto-resolve approvals
+
+The §2 approval bridge raises `CodingAgentPermissionRequest` and waits for a human
+to click the card. A Codex session spawned by a **trigger** has no human — so it
+hung forever on the first sandbox escalation. The approval flow now auto-resolves
+for unattended (trigger-rooted) sessions at the shared engine chokepoint
+(`engine::cc_permission::prompt_coding_agent_permission`): benign in-workspace work
+is allowed, an irreversible side-effect is allowed iff the originating trigger's
+*side-effect grant* covers it, and ungranted / catastrophic requests are denied —
+no card, never hangs. `approvalPolicy` stays `on-request` (an auto-**allowed**
+escalation must still `accept` so Codex re-runs the command escalated). Full
+decision: ADR 0002 (Phase 5 addendum, 2026-06-25).

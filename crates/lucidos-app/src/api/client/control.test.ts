@@ -66,12 +66,26 @@ describe('control client', () => {
 
   it('reads gateway self-update status from the sigil control route', async () => {
     const mock = withFetch(() =>
-      Promise.resolve(new Response('{"build_id":"abc123","update_available":true}', { status: 200 })),
+      Promise.resolve(
+        new Response('{"build_id":"abc123","update_available":true,"packaged":false}', { status: 200 }),
+      ),
     );
     const status = await getGatewayStatus();
     expect(String(mock.mock.calls[0][0])).toBe('/~/api/v1/control/gateway/status');
     expect(status.update_available).toBe(true);
     expect(status.build_id).toBe('abc123');
+    // `packaged` drives the picker's dev-only self-reload control gating.
+    expect(status.packaged).toBe(false);
+  });
+
+  it('reports packaged=true from the gateway status (picker hides the dev reload control)', async () => {
+    withFetch(() =>
+      Promise.resolve(
+        new Response('{"build_id":"abc123","update_available":false,"packaged":true}', { status: 200 }),
+      ),
+    );
+    const status = await getGatewayStatus();
+    expect(status.packaged).toBe(true);
   });
 
   it('reloads the gateway via POST to the sigil control route (202, bodyless)', async () => {

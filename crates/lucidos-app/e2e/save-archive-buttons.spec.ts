@@ -59,7 +59,7 @@ test.describe('Section-aware Save/Archive buttons', () => {
     }, threadId, { timeout: 10_000 });
   }
 
-  test('saving an archived thread moves it to the Saved section', async ({ page }) => {
+  test('pinning an archived thread moves it to the Pinned section', async ({ page }) => {
     await navigateToApp(page);
     const msg = uniqueMessage('arch-save');
     await sendMessage(page, `Echo "${msg}"`);
@@ -79,15 +79,15 @@ test.describe('Section-aware Save/Archive buttons', () => {
 
     await focusThreadFromDrawer(page, threadId);
 
-    await expect(page.locator('button[aria-label="Save thread"]:visible').first()).toBeVisible();
+    await expect(page.locator('button[aria-label="Pin thread"]:visible').first()).toBeVisible();
     expect(await page.locator('button[aria-label="Archive thread"]:visible').count()).toBe(0);
 
-    await page.locator('button[aria-label="Save thread"]:visible').first().click();
+    await page.locator('button[aria-label="Pin thread"]:visible').first().click();
     await waitForThreadInSection(page, threadId, 'saved');
     expect(await isThreadInSection(page, threadId, 'saved')).toBe(true);
   });
 
-  test('archiving a saved thread asks for confirmation and demotes to Archive', async ({ page }) => {
+  test('archiving a pinned thread asks for confirmation and demotes to Archive', async ({ page }) => {
     await navigateToApp(page);
     const msg = uniqueMessage('saved-arch');
     await sendMessage(page, `Echo "${msg}"`);
@@ -108,12 +108,12 @@ test.describe('Section-aware Save/Archive buttons', () => {
     await focusThreadFromDrawer(page, threadId);
 
     await expect(page.locator('button[aria-label="Archive thread"]:visible').first()).toBeVisible();
-    // Saved threads always carry the "✓ Saved" unsave toggle alongside Archive
+    // Pinned threads always carry the "✓ Pinned" unpin toggle alongside Archive
     // so the user can drop back to regular flow at any time.
     await expect(
-      page.locator('button[aria-label="Remove thread from Saved section"]:visible').first(),
+      page.locator('button[aria-label="Remove thread from Pinned section"]:visible').first(),
     ).toBeVisible();
-    expect(await page.locator('button[aria-label="Save thread"]:visible').count()).toBe(0);
+    expect(await page.locator('button[aria-label="Pin thread"]:visible').count()).toBe(0);
 
     await page.locator('button[aria-label="Archive thread"]:visible').first().click();
     await expect(

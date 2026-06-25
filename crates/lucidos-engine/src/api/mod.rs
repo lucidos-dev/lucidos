@@ -72,6 +72,7 @@ use std::sync::Arc;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tower::ServiceExt;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -854,13 +855,18 @@ async fn serve_frontend(static_dir: PathBuf, req: axum::extract::Request) -> Res
     }
 }
 
-/// Read `index.html` from `static_dir`, stamp `<base href>` for `prefix`, return
-/// it as `text/html`.
+/// Read `index.html` from `static_dir`, stamp `<base href>` for `prefix` and the
+/// gateway port (when behind a gateway), return it as `text/html`. The gateway
+/// port lets a page served on the engine's own port (direct access) build an
+/// absolute URL to the gateway picker — its origin differs from the engine's, so
+/// the relative `/~/` route can't reach it (ADR 0014).
 fn serve_shell(static_dir: &std::path::Path, prefix: &str) -> Response {
     let index = static_dir.join("index.html");
     match std::fs::read_to_string(&index) {
         Ok(html) => {
             let stamped = base_path::inject_base_href(&html, prefix);
+            let stamped =
+                base_path::inject_gateway_port(&stamped, base_path::gateway_port().as_deref());
             ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], stamped).into_response()
         }
         Err(_) => (StatusCode::NOT_FOUND, "frontend not built").into_response(),
@@ -956,6 +962,15 @@ pub fn create_router(
         // routes registered before the call, so this is applied after every
         // domain merge to guarantee it reaches all routes.
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
+        // Compress JSON responses (br/gzip per Accept-Encoding). The thread
+        // events snapshot (`GET /threads/:id/events`) ships the full event
+        // history uncompressed today — a heavy coding-agent thread is multiple
+        // MB on every open, dominating load latency over Tailscale / on mobile.
+        // The default predicate leaves the SSE stream untouched: it excludes
+        // `text/event-stream` (the plain SSE path) and skips responses that
+        // already carry `content-encoding` (the hand-rolled gzipped SSE in
+        // `history.rs`), so the existing streaming transport is unchanged.
+        .layer(CompressionLayer::new())
         .with_state(state);
 
     let router = Router::new()
@@ -986,13 +1001,26 @@ pub fn create_router(
     // files haven't changed, but never serves stale data after edits.
     // `if_not_present` preserves explicit headers (e.g. no-store on app UIs,
     // max-age on immutable static assets).
-    router
+    let router = router
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-cache"),
         ))
-        .layer(axum::middleware::from_fn(request_logger))
-        .layer(CorsLayer::permissive())
+        .layer(axum::middleware::from_fn(request_logger));
+
+    if permissive_cors_enabled() {
+        router.layer(CorsLayer::permissive())
+    } else {
+        router
+    }
+}
+
+fn permissive_cors_enabled() -> bool {
+    permissive_cors_enabled_value(std::env::var("LUCIDOS_PERMISSIVE_CORS").ok().as_deref())
+}
+
+fn permissive_cors_enabled_value(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1" | "true" | "yes" | "on"))
 }
 
 #[cfg(test)]
@@ -1014,6 +1042,16 @@ mod tests {
         ChatImage {
             base64: base64_data,
             mime_type: "image/png".to_string(),
+        }
+    }
+
+    #[test]
+    fn permissive_cors_is_disabled_unless_explicitly_enabled() {
+        for value in [None, Some(""), Some("0"), Some("false"), Some("off")] {
+            assert!(!permissive_cors_enabled_value(value), "value: {value:?}");
+        }
+        for value in [Some("1"), Some("true"), Some("yes"), Some("on")] {
+            assert!(permissive_cors_enabled_value(value), "value: {value:?}");
         }
     }
 

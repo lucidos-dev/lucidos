@@ -26,6 +26,12 @@ impl EventStore {
     /// Archive is capped because old archived threads aren't time-sensitive;
     /// the user can page back via `get_older_threads`.
     ///
+    /// The per-source archive window is ordered by `created_at DESC` (newest
+    /// created per source) — the SAME axis the drawer's Archive section sorts
+    /// and `get_older_threads` pages by, so the boundary between this initial
+    /// window and the first scroll-page is seamless. (The outer `ORDER BY` is
+    /// irrelevant — the frontend re-sorts every section.)
+    ///
     /// Also unconditionally includes active-status threads (`running`,
     /// `waiting_for_user_answer`) — a thread the user just started or that's
     /// blocked on user input must appear immediately, before any response
@@ -43,7 +49,7 @@ impl EventStore {
         ];
         let sql = format!(
             "SELECT {} FROM (\
-                SELECT *, ROW_NUMBER() OVER (PARTITION BY source ORDER BY last_user_action DESC) AS rn \
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY source ORDER BY created_at DESC) AS rn \
                 FROM thread_summaries \
                 WHERE has_response = TRUE OR status = ANY($1) OR coding_agent_proposed = TRUE\
             ) t \
@@ -66,9 +72,14 @@ impl EventStore {
     }
 
     /// Older threads for infinite scroll, newest-first below the `before` cursor.
-    /// `before` is a `last_user_action` timestamp — the drawer sorts by that
-    /// column, so the cursor must page through the same axis (the frontend sends
-    /// the oldest loaded thread's `last_user_action`). The channel / facet
+    /// `before` is a `created_at` timestamp — the drawer's Archive section sorts
+    /// by creation time (matching the date each row displays), so the cursor must
+    /// page through the same axis (the frontend sends the oldest loaded thread's
+    /// `created_at`). Paging and display share one axis precisely so a
+    /// recently-created-but-stale thread can't page in late and go missing from
+    /// the top of the created-sorted list. (Saved sorts by `last_user_action`,
+    /// but Saved is fully loaded via `get_saved_threads` — not paged here.) The
+    /// channel / facet
     /// predicate is `channel_facet_filter_sql` — the exact
     /// mirror of the frontend `threadPassesChannelFilter`, so pagination surfaces
     /// precisely the rows the drawer shows (and `count_archived_threads` counts):
@@ -100,13 +111,13 @@ impl EventStore {
         // filter helper and the has_response relaxation below.
         let sql = format!(
             "SELECT {cols} FROM thread_summaries t \
-             WHERE t.last_user_action < $1 \
+             WHERE t.created_at < $1 \
                AND (t.has_response = TRUE \
                     OR array_length($3::text[], 1) IS NOT NULL \
                     OR array_length($4::text[], 1) IS NOT NULL \
                     OR array_length($5::text[], 1) IS NOT NULL) \
                AND {filter} \
-             ORDER BY t.last_user_action DESC LIMIT $6",
+             ORDER BY t.created_at DESC LIMIT $6",
             cols = THREAD_COLS.as_str(),
             filter = channel_facet_filter_sql("t", 2, 3, 4, 5),
         );
@@ -190,15 +201,15 @@ impl EventStore {
 
     /// Load every family member (ancestor + descendant via `parent_thread_id`)
     /// of the given base set that isn't already in the base. Drives the
-    /// drawer's family-aware rendering: base pagination is per-thread by
-    /// `last_user_action DESC`, but `ThreadDrawer.tsx → categorizeThreads`
-    /// lifts a whole family up to the freshest member's recency. Without
-    /// this helper, a family member whose own recency falls below
-    /// the loaded window would silently vanish — the parent's badge would
-    /// say "N/N done" but `nestByParent` would only render the in-window
-    /// children. This extension is deliberately capped by `last_activity`
-    /// (not `last_user_action`): an actively-streaming agent sub-thread whose
-    /// last user action is old must still be retained under the cap. UNION
+    /// drawer's family-aware rendering: base Archive pagination is per-thread by
+    /// `created_at DESC` (Saved is fully loaded), but `ThreadDrawer.tsx →
+    /// nestByParent` renders a whole family together (and Saved lifts the family
+    /// to its freshest member). Without this helper, a family member whose own
+    /// `created_at` falls below the loaded window would silently vanish — the
+    /// parent's badge would say "N/N done" but `nestByParent` would only render
+    /// the in-window children. This extension is deliberately capped by
+    /// `last_activity` (not `created_at`): an actively-streaming agent sub-thread
+    /// created long ago must still be retained under the cap. UNION
     /// (not UNION ALL) terminates the recursive walk even
     /// on a corrupted parent cycle; the single walk uses an OR join to
     /// climb to ancestors AND descend to children in one pass.

@@ -139,6 +139,12 @@ fn sub_thread_request(child_thread_id: Uuid) -> ThreadQueueRequest {
     }
 }
 
+fn cron_request(trigger_id: &str) -> ThreadQueueRequest {
+    ThreadQueueRequest::Cron {
+        trigger_id: trigger_id.to_string(),
+    }
+}
+
 struct Fixture {
     pool: sqlx::PgPool,
     db: String,
@@ -177,6 +183,46 @@ async fn row_status(pool: &sqlx::PgPool, entry_id: Uuid) -> Option<String> {
         .fetch_optional(pool)
         .await
         .expect("thread_queue query")
+}
+
+async fn cron_row_count(pool: &sqlx::PgPool, trigger_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM thread_queue WHERE trigger_id = $1")
+        .bind(trigger_id)
+        .fetch_one(pool)
+        .await
+        .expect("thread_queue count query")
+}
+
+/// Emit a `ThreadQueued` (+ optional `ThreadQueueAdmitted`) for a cron trigger
+/// straight through the bus, creating a projection row WITHOUT going through
+/// `submit` (which now coalesces). Reproduces the pre-restart projection state a
+/// restart storm leaves behind — multiple cron rows for one trigger.
+async fn emit_cron_queued(bus: &EventBus, trigger_id: &str, admitted: bool) -> Uuid {
+    let entry_id = Uuid::new_v4();
+    let request = serde_json::to_value(cron_request(trigger_id)).expect("serialize cron request");
+    bus.emit(BusEvent::System(SystemEvent::ThreadQueued {
+        entry_id,
+        kind: ThreadQueueKind::Cron,
+        trigger_id: Some(trigger_id.to_string()),
+        trigger_name: Some(format!("Trigger {trigger_id}")),
+        thread_id: None,
+        summary: format!("{trigger_id} (scheduled)"),
+        request,
+        requeued: false,
+        actor: None,
+    }))
+    .await
+    .expect("ThreadQueued emit");
+    if admitted {
+        bus.emit(BusEvent::System(SystemEvent::ThreadQueueAdmitted {
+            entry_id,
+            thread_id: None,
+            actor: None,
+        }))
+        .await
+        .expect("ThreadQueueAdmitted emit");
+    }
+    entry_id
 }
 
 /// Poll until `cond` returns true (queue completion fans out through spawned
@@ -388,6 +434,142 @@ async fn per_trigger_fifo_and_drop_oldest_overflow() {
         .insert("trig-b".to_string(), test_trigger_config("trig-b"));
     let other = f.queue.submit(event_trigger_request("trig-b"), None, None).await;
     assert!(other.admitted, "other triggers admit independently");
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn cron_coalesces_redundant_fires_on_submit() {
+    let f = fixture(5).await;
+    f.trigger_configs
+        .write()
+        .unwrap()
+        .insert("trig-a".to_string(), test_trigger_config("trig-a"));
+
+    // First cron fire admits and runs (the executor parks it as the in-flight
+    // fire).
+    let a = f.queue.submit(cron_request("trig-a"), None, None).await;
+    assert!(a.admitted, "first cron fire admits");
+    assert_eq!(
+        row_status(&f.pool, a.entry_id).await.as_deref(),
+        Some("admitted")
+    );
+
+    // A second cron fire while one is active → coalesced: not admitted, no queue
+    // row, and its completion resolves immediately so the cron loop / missed-grace
+    // submitter proceeds to the next occurrence rather than hanging.
+    let b = f.queue.submit(cron_request("trig-a"), None, None).await;
+    assert!(!b.admitted, "redundant cron fire must not admit");
+    assert_eq!(b.position, 0);
+    assert_eq!(
+        row_status(&f.pool, b.entry_id).await,
+        None,
+        "a coalesced fire creates no thread_queue row"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), b.completion)
+        .await
+        .expect("coalesced completion must resolve immediately")
+        .expect("completion channel ok");
+
+    // A third fire also coalesces — the backlog can never grow past one.
+    let c = f.queue.submit(cron_request("trig-a"), None, None).await;
+    assert!(!c.admitted);
+    assert_eq!(row_status(&f.pool, c.entry_id).await, None);
+
+    // Only the first fire ever executed; exactly one cron row exists.
+    assert_eq!(f.executor.executed_ids(), vec![a.entry_id]);
+    assert_eq!(cron_row_count(&f.pool, "trig-a").await, 1);
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn cron_coalesces_against_a_queued_fire() {
+    let f = fixture(1).await; // single slot
+    f.trigger_configs
+        .write()
+        .unwrap()
+        .insert("trig-a".to_string(), test_trigger_config("trig-a"));
+
+    // Occupy the only slot with background work so the cron fire can't admit.
+    let blocker = f
+        .queue
+        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .await;
+    assert!(blocker.admitted);
+
+    // First cron fire queues (pool full).
+    let a = f.queue.submit(cron_request("trig-a"), None, None).await;
+    assert!(!a.admitted);
+    assert_eq!(row_status(&f.pool, a.entry_id).await.as_deref(), Some("queued"));
+
+    // Second cron fire coalesces against the queued one — no second row.
+    let b = f.queue.submit(cron_request("trig-a"), None, None).await;
+    assert!(!b.admitted);
+    assert_eq!(row_status(&f.pool, b.entry_id).await, None);
+    assert_eq!(
+        cron_row_count(&f.pool, "trig-a").await,
+        1,
+        "the queued cron backlog never deepens past one"
+    );
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn recover_collapses_duplicate_cron_rows_to_one() {
+    let f = fixture(5).await;
+    f.trigger_configs
+        .write()
+        .unwrap()
+        .insert("trig-a".to_string(), test_trigger_config("trig-a"));
+
+    // Simulate the projection state a restart storm leaves: three cron rows for
+    // one trigger (one in-flight `admitted` that died with the process, two
+    // still `queued`).
+    let admitted_id = emit_cron_queued(&f.bus, "trig-a", true).await;
+    let queued1 = emit_cron_queued(&f.bus, "trig-a", false).await;
+    let queued2 = emit_cron_queued(&f.bus, "trig-a", false).await;
+    assert_eq!(cron_row_count(&f.pool, "trig-a").await, 3);
+
+    // A fresh manager recovers over the same DB.
+    let queue2 = Arc::new(ThreadQueue::new(
+        f.pool.clone(),
+        f.bus.clone(),
+        f.trigger_configs.clone(),
+        test_policy(5),
+    ));
+    let executor2 = GatedExecutor::new();
+    queue2.set_executor(executor2.clone());
+    queue2.recover_persisted_entries().await;
+
+    // The duplicates are coalesced away — exactly one cron row survives (the
+    // oldest, re-queued), and a drain re-fires it exactly once.
+    assert_eq!(
+        cron_row_count(&f.pool, "trig-a").await,
+        1,
+        "recovery collapses duplicate cron fires to a single entry"
+    );
+    assert!(
+        row_status(&f.pool, queued1).await.is_none() && row_status(&f.pool, queued2).await.is_none(),
+        "the later duplicate cron rows are dropped"
+    );
+    assert_eq!(
+        row_status(&f.pool, admitted_id).await.as_deref(),
+        Some("queued"),
+        "the oldest cron fire is kept and re-queued"
+    );
+    // A drain re-fires exactly the single surviving cron entry (execution is
+    // spawned, so poll rather than assert synchronously).
+    queue2.drain().await;
+    wait_until(|| {
+        let ex = executor2.clone();
+        async move { ex.executed_ids() == vec![admitted_id] }
+    })
+    .await;
 
     f.pool.close().await;
     teardown_test_db(&f.db).await;
