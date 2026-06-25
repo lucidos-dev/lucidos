@@ -148,6 +148,41 @@ export function extractNavTargetFromHref(href: string): string | null {
   return NAV_TARGETS.has(candidate) ? candidate : null;
 }
 
+/** Recognize an href that points at a REAL local filesystem location the OS
+ *  should open directly — a `file://` URL or an absolute POSIX path
+ *  (`/Users/…/foo.dmg`, `/Applications/…`). The release flow hands the user a
+ *  link to a staged `.dmg` that lives OUTSIDE the workspace (under
+ *  `~/projects/lucidos/.lucidos/release-worktrees/<version>/…`); clicking it
+ *  must mount the image — or, for a folder, reveal it — via the OS, NOT route
+ *  through the in-app file preview or the engine's `/data/*` static mount.
+ *
+ *  Returns the path/URL to hand to the OS opener, or null when the href is a
+ *  workspace route or an external web URL:
+ *    - `file://…`                 → that URL (always a local file/dir)
+ *    - `/Users/…`, `/Applications/…`, any other absolute path → that path
+ *    - `/data/…`, `/data`         → null (engine static mount — artifact/nav own it)
+ *    - `/apps/…`, `/apps`         → null (app/nav handlers own it)
+ *    - `notifications`, `data/x`, `apps/x` (relative) → null (not absolute)
+ *    - `https://…`, `http://…`    → null (keep browser / panel-webview behavior)
+ *
+ *  This runs AFTER the app / nav extractors in the click handler, so the
+ *  workspace absolute routes they claim (`/apps/<id>/index.html`,
+ *  `/notifications`, …) never reach here; the `/data` and `/apps` guards below
+ *  cover the absolute sub-paths those extractors decline (an artifact sub-file
+ *  like `/apps/<id>/styles.css`) so they're never mistaken for a disk path. */
+export function extractLocalFileTarget(href: string): string | null {
+  // file:// URL — unambiguously a local file or directory.
+  if (/^file:\/\//i.test(href)) return href;
+  // Absolute POSIX path. Exclude the workspace's own absolute routes so a
+  // `/data/…` or `/apps/…` link is never handed to the OS as a disk path.
+  if (href.startsWith('/')) {
+    if (href === '/data' || href.startsWith('/data/')) return null;
+    if (href === '/apps' || href.startsWith('/apps/')) return null;
+    return href;
+  }
+  return null;
+}
+
 /** Mirror of `rewriteArtifactAnchor` / `rewriteAppAnchor` for navigation
  *  panels. Returns a replacement opening tag with
  *  `class="nav-link" data-nav-target="<target>"` so the chat click handler

@@ -13,6 +13,7 @@ import { listArtifacts, uploadFile } from '../../api/client';
 import { revealContentPane } from './pane';
 import { pushNavState } from './navigation';
 import { isTauri } from '../../utils/platform';
+import { openExternal } from '../../utils/tauri';
 import { errorDetail } from '../../utils/errorDetail';
 
 // The file-preview restore is a page-reload re-hydration step — it belongs to
@@ -182,6 +183,28 @@ export function openUrl(url: string): void {
   webviewInitialUrl.value = normalized;
   revealContentPane();
   pushNavState();
+}
+
+/** Open a REAL local filesystem location with the OS — mount a `.dmg`, reveal a
+ *  folder in Finder, etc. The desktop build routes through the Tauri
+ *  `open_url_external` command (macOS `open`, Windows `rundll32`, Linux
+ *  `xdg-open`), which handles `file://` URLs and bare absolute paths uniformly.
+ *
+ *  This is deliberately NOT `openUrl` / `openFilePreview`: the target lives
+ *  OUTSIDE the workspace (e.g. a staged release `.dmg`), so it must not go to
+ *  the in-app URL panel webview or the `/data/*` static mount. On a non-Tauri
+ *  web build there is no OS bridge — best-effort open in a new tab so we never
+ *  crash (browsers ignore `file://`; a real path just dead-ends, same as before
+ *  this branch existed). Caller is responsible for classifying the href as a
+ *  local file (see `extractLocalFileTarget`). */
+export function openLocalFile(target: string): void {
+  if (!isTauri()) {
+    window.open(target, '_blank', 'noopener');
+    return;
+  }
+  void openExternal(target).catch((err) =>
+    showToast(`Couldn't open ${target}: ${errorDetail(err)}`, 'error'),
+  );
 }
 
 /** Update panelUrl display from in-webview navigation (link clicks, history back/forward).

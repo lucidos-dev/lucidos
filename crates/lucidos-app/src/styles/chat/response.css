@@ -255,17 +255,11 @@
 /* Welcome message */
 .welcome-message {
     white-space: normal;
+    padding-top: 1.5rem;
 }
 
 .welcome-message h2 {
     margin: 0 0 0.25rem 0;
-}
-
-.welcome-message .tagline {
-    margin: 0 0 1rem 0;
-    color: var(--text-secondary);
-    font-style: italic;
-    font-size: 1.125rem;
 }
 
 .welcome-message p {

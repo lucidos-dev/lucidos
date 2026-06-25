@@ -649,21 +649,6 @@ export const activeThreadIsComposing = computed(() => {
   return threadMap.value.get(id)?.meta.state === 'composing';
 });
 
-/** True once the workspace holds any real conversation history — any thread
- *  that isn't a transient composing draft or a discarded one. Drives the
- *  new-workspace welcome + starter-suggestions gate: a pristine workspace (no
- *  history) shows the welcome; the moment one real thread exists it's retired.
- *  Deliberately keyed on threads, NOT on `data/` files: a stray config/script
- *  is not "conversation history", and the old artifact-presence gate wrongly
- *  suppressed the welcome on a freshly-made workspace that had any such file. */
-export const workspaceHasHistory = computed(() => {
-  for (const thread of threadMap.value.values()) {
-    const state = thread.meta.state;
-    if (state !== 'composing' && state !== 'discarded') return true;
-  }
-  return false;
-});
-
 // --- Split layout ---
 export const SPLIT_RATIO_KEY = 'lucidos-split-ratio';
 export const splitRatio = signal(

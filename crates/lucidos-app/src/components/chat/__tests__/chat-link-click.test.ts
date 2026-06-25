@@ -26,7 +26,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
-import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref } from '../../../utils/linkifyPaths';
+import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget } from '../../../utils/linkifyPaths';
 import { renderMarkdown } from '../../../utils/renderMarkdown';
 import type { App } from '../../../store/types';
 
@@ -91,6 +91,7 @@ type Callbacks = {
   openArtifact: (path: string) => void;
   openApp: (app: App) => void;
   navigate: (req: { target: string }) => void;
+  osOpen: (target: string) => void;
 };
 function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Callbacks): void {
   const t = e.target;
@@ -127,6 +128,12 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
       cb.navigate({ target: navName });
       return;
     }
+    const localFile = extractLocalFileTarget(href);
+    if (localFile) {
+      e.preventDefault();
+      cb.osOpen(localFile);
+      return;
+    }
   }
 }
 
@@ -136,6 +143,7 @@ describe('chat link click — the bug-report scenario', () => {
     openArtifact: ReturnType<typeof vi.fn>;
     openApp: ReturnType<typeof vi.fn>;
     navigate: ReturnType<typeof vi.fn>;
+    osOpen: ReturnType<typeof vi.fn>;
   };
 
   beforeEach(() => {
@@ -144,6 +152,7 @@ describe('chat link click — the bug-report scenario', () => {
       openArtifact: vi.fn() as Callbacks['openArtifact'] & ReturnType<typeof vi.fn>,
       openApp: vi.fn() as Callbacks['openApp'] & ReturnType<typeof vi.fn>,
       navigate: vi.fn() as Callbacks['navigate'] & ReturnType<typeof vi.fn>,
+      osOpen: vi.fn() as Callbacks['osOpen'] & ReturnType<typeof vi.fn>,
     };
   });
 
@@ -311,6 +320,92 @@ describe('chat link click — the bug-report scenario', () => {
     expect(html).toContain('data-nav-target="notifications"');
     expect(html).toContain('>Notifications</a>');
   });
+
+  // ---------------------------------------------------------------------------
+  // file:// + absolute-path bug report — the release flow hands the user a
+  // clickable link to a staged .dmg that lives OUTSIDE the workspace (under
+  // ~/…/.lucidos/release-worktrees/<version>/…). Those hrefs must open with the
+  // OS (mount the dmg / reveal the folder), NOT route through the in-app file
+  // preview, openApp, handleNavigationRequest, or the /data/* static mount.
+  // ---------------------------------------------------------------------------
+
+  it('OS-OPEN: file:///abs/path.dmg → osOpen, not navigate / openApp / openArtifact', () => {
+    const href = 'file:///Users/ken/.lucidos/release-worktrees/0.12.3/Lucidos_0.12.3_aarch64.dmg';
+    const e = mkEvent(mkAnchor(href));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.osOpen).toHaveBeenCalledWith(href);
+    expect(cb.navigate).not.toHaveBeenCalled();
+    expect(cb.openApp).not.toHaveBeenCalled();
+    expect(cb.openArtifact).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it('OS-OPEN: bare absolute path /Users/.../x.dmg → osOpen, not navigate / openArtifact', () => {
+    const href = '/Users/ken/Downloads/Lucidos_0.12.3_aarch64.dmg';
+    const e = mkEvent(mkAnchor(href));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.osOpen).toHaveBeenCalledWith(href);
+    expect(cb.navigate).not.toHaveBeenCalled();
+    expect(cb.openApp).not.toHaveBeenCalled();
+    expect(cb.openArtifact).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it('OS-OPEN: absolute folder path is revealed via the OS', () => {
+    const href = '/Users/ken/.lucidos/release-worktrees/0.12.3';
+    const e = mkEvent(mkAnchor(href));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.osOpen).toHaveBeenCalledWith(href);
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it.each([
+    // Absolute workspace routes are claimed by the app/nav extractors BEFORE
+    // the OS-open branch — they must never be handed to the OS as disk paths.
+    '/data/artifacts/report.pdf',
+    '/data',
+    '/apps/work-tracker/styles.css',
+    '/apps',
+  ])('OS-OPEN: workspace absolute route %s is NOT OS-opened', (href) => {
+    const e = mkEvent(mkAnchor(href));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.osOpen).not.toHaveBeenCalled();
+  });
+
+  it('OS-OPEN: an absolute /apps/<id>/index.html still opens the app (not OS-open)', () => {
+    // Regression guard: the app extractor runs first, so an entry-point under
+    // an absolute /apps/ path routes to openApp, never to the OS opener.
+    const e = mkEvent(mkAnchor('/apps/work-tracker/index.html'));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.openApp).toHaveBeenCalledWith(APPS[0]);
+    expect(cb.osOpen).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it('OS-OPEN: an absolute /notifications still navigates the panel (not OS-open)', () => {
+    const e = mkEvent(mkAnchor('/notifications'));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.navigate).toHaveBeenCalledWith({ target: 'notifications' });
+    expect(cb.osOpen).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it.each([
+    'https://example.com/Users/ken/foo.dmg',
+    'http://example.com/foo.dmg',
+  ])('OS-OPEN: external URL %s is NOT OS-opened (keeps browser behavior)', (href) => {
+    const e = mkEvent(mkAnchor(href));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.osOpen).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(false);
+  });
+
+  it('OS-OPEN: relative workspace path (data/…) is NOT OS-opened', () => {
+    const e = mkEvent(mkAnchor('data/artifacts/report.pdf'));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.osOpen).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(false);
+  });
 });
 
 describe('chat link click — handler structure pin', () => {
@@ -333,18 +428,32 @@ describe('chat link click — handler structure pin', () => {
     expect(body).toMatch(sequence);
   });
 
-  it('handleLinkClick uses extractAppIdFromHref and extractNavTargetFromHref in the fallback branch', () => {
-    expect(chatExchangeSource).toMatch(/import.*extractAppIdFromHref.*extractNavTargetFromHref.*from.*linkifyPaths/);
+  it('handleLinkClick uses extractAppIdFromHref, extractNavTargetFromHref, and extractLocalFileTarget in the fallback branch', () => {
+    expect(chatExchangeSource).toMatch(/import.*extractAppIdFromHref.*extractNavTargetFromHref.*extractLocalFileTarget.*from.*linkifyPaths/);
     expect(chatExchangeSource).toMatch(/extractAppIdFromHref\(rawHref\)/);
     expect(chatExchangeSource).toMatch(/extractNavTargetFromHref\(rawHref\)/);
+    expect(chatExchangeSource).toMatch(/extractLocalFileTarget\(rawHref\)/);
   });
 
-  it('fallback branch calls openApp and handleNavigationRequest with preventDefault', () => {
+  it('fallback branch calls openApp, handleNavigationRequest, and openLocalFile with preventDefault', () => {
     const m = chatExchangeSource.match(/closest\('a'\)[\s\S]*?\n  \}\n/);
     expect(m).not.toBeNull();
     const body = m![0];
     expect(body).toContain('openApp(app)');
     expect(body).toContain('handleNavigationRequest({ target: navName })');
+    expect(body).toContain('openLocalFile(localFile)');
     expect(body).toContain('e.preventDefault()');
+  });
+
+  it('the OS-open branch runs AFTER the app/nav extractors so workspace routes win', () => {
+    // extractLocalFileTarget must appear after both extractAppIdFromHref and
+    // extractNavTargetFromHref in the source, or an absolute /apps/… or
+    // /notifications href could be handed to the OS instead of routed in-app.
+    const appIdx = chatExchangeSource.indexOf('extractAppIdFromHref(rawHref)');
+    const navIdx = chatExchangeSource.indexOf('extractNavTargetFromHref(rawHref)');
+    const fileIdx = chatExchangeSource.indexOf('extractLocalFileTarget(rawHref)');
+    expect(appIdx).toBeGreaterThanOrEqual(0);
+    expect(navIdx).toBeGreaterThan(appIdx);
+    expect(fileIdx).toBeGreaterThan(navIdx);
   });
 });

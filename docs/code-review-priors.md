@@ -202,6 +202,25 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `hooks/useDelayedLoading.ts` even though `useDelayedFlag` is its only
   non-test consumer — it's the fake-timer-testable kernel of the spinner
   delay (this repo has no DOM test rig for hooks). Don't inline it back.
+- **`extractLocalFileTarget` excluding only `/data*` and `/apps*` (not
+  `/knowhow`, `/artifacts`, `/triggers`, …) is deliberate scope, not a leak.**
+  The helper (`utils/linkifyPaths.ts`) classifies a chat anchor href as a real
+  local-disk target to hand to the OS opener. It runs LAST in
+  `ChatExchange.handleLinkClick` — after the `.artifact-link`/`.app-link`/
+  `.nav-link` class handlers and after `extractAppIdFromHref`/
+  `extractNavTargetFromHref`. The `/data` and `/apps` guards exist only to catch
+  the absolute sub-paths those extractors *decline* (an artifact sub-file like
+  `/apps/<id>/styles.css`, or `/data/artifacts/x.pdf` when the artifact rewriter
+  didn't run). A bare-absolute workspace path under another prefix
+  (`/knowhow/x.md`, `/artifacts/x.pdf`) is NOT a shape the LLM/engine produces —
+  they emit `data/`-prefixed or relative paths, and a known artifact is
+  rewritten to `.artifact-link` (claimed by the earlier class handler) before
+  this fallback is reached. Such an href was ALSO already broken before this
+  branch existed (it 404'd against the app origin via the `/data/*`-only static
+  mount), so OS-opening it instead changes one dead link into another, not a
+  working path into a broken one. Re-flag only with a real producer that emits
+  an absolute `/knowhow|/artifacts|/triggers/…` anchor the user is expected to
+  click. (`utils/linkifyPaths.ts`, `components/chat/ChatExchange.tsx`.)
 - **The snapshot-staleness guards in `thread-loading.ts` (`upsertThread`
   status, `applyEventRows` overlay) keyed on `last_activity` do NOT miss
   status changes whose event omits `last_activity`** (e.g. `ChangeProposed`,

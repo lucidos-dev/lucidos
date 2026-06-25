@@ -6,6 +6,7 @@ use tauri::tray::TrayIconBuilder;
 use tauri::webview::PageLoadEvent;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 
 mod desktop;
 mod mobile;
@@ -91,6 +92,74 @@ const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60
 /// the watchdog thread.
 fn heartbeat_expired(elapsed: std::time::Duration) -> bool {
     elapsed > HEARTBEAT_TIMEOUT
+}
+
+/// Window state the app persists/restores via `tauri-plugin-window-state`.
+/// Deliberately EXCLUDES `VISIBLE` and `DECORATIONS`:
+/// - `VISIBLE`: the packaged client *hides* (never closes) its window — the
+///   always-on launchd service keeps the process resident. A geometry flush taken
+///   while the window is hidden would persist `visible: false`, and the plugin
+///   would then restore the window hidden on the next launch (the user opens the
+///   app and sees nothing). Leaving `VISIBLE` out means the plugin never forces
+///   the window hidden on restore; the config-declared `main` window stays visible.
+/// - `DECORATIONS`: toggling decorations on macOS rebuilds the NSWindow style mask
+///   and can drop our `titleBarStyle: "Overlay"` + hidden-title configuration,
+///   turning the reclaimed title-bar band back into an opaque bar after restore.
+///
+/// What's left — size, position, maximized, fullscreen — is exactly what the user
+/// expects remembered, including which screen (the plugin restores position only
+/// when a currently-connected monitor still contains the saved rect).
+fn window_state_flags() -> StateFlags {
+    StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED | StateFlags::FULLSCREEN
+}
+
+/// How long the window must sit still (no move/resize) before the debounced
+/// background flush writes `.window-state.json`. Short enough that a quick
+/// move-then-relaunch is remembered, long enough that a drag doesn't thrash the
+/// disk on every intermediate `Moved`/`Resized` event.
+const GEOMETRY_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// Coordinates the debounced geometry flush. The window-state plugin only writes
+/// to disk on `RunEvent::Exit`, which the packaged client deliberately never
+/// reaches (closing the window hides it; exit is prevented while the launchd
+/// service runs). So without this, a moved/resized window is remembered only
+/// in-memory and is lost on the next client launch. `Moved`/`Resized` events mark
+/// `dirty` + stamp `last_change`; a background thread flushes once the window has
+/// been quiet for [`GEOMETRY_SAVE_DEBOUNCE`] (see [`should_persist_geometry`]).
+struct GeometrySaver {
+    dirty: AtomicBool,
+    last_change: Mutex<Instant>,
+}
+
+/// Whether the debounced flush should run now: there is unsaved geometry (`dirty`)
+/// and the window has been quiet at least [`GEOMETRY_SAVE_DEBOUNCE`]. Pure so the
+/// debounce threshold is unit-testable without the background thread.
+fn should_persist_geometry(dirty: bool, since_last_change: std::time::Duration) -> bool {
+    dirty && since_last_change >= GEOMETRY_SAVE_DEBOUNCE
+}
+
+/// Persist window geometry, forcing the work onto the MAIN thread.
+///
+/// `tauri-plugin-window-state::save_window_state` holds an internal cache lock
+/// while it reads each window's live geometry (`inner_size` / `outer_position` /
+/// `is_maximized` / …). Off the main thread those getters block on a round-trip
+/// to the event loop — so a worker-thread save holds the cache lock across a wait
+/// for the main thread, while the main thread (delivering a `Moved`/`Resized`/
+/// `CloseRequested` to the plugin's own handlers) blocks taking that same lock:
+/// a full-UI deadlock. The plugin avoids it by only saving from `RunEvent::Exit`
+/// (after the loop stops). Callers NOT already on the main thread (the debounce
+/// thread, async commands) must route through here; the getters then resolve
+/// inline and the lock is never held across a cross-thread wait. Fire-and-forget
+/// — the save runs on the next main-loop turn.
+fn persist_window_state_on_main(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    if let Err(e) = app.run_on_main_thread(move || {
+        if let Err(e) = handle.save_window_state(window_state_flags()) {
+            eprintln!("[Tauri] Failed to persist window state: {e}");
+        }
+    }) {
+        eprintln!("[Tauri] Failed to schedule window-state save: {e}");
+    }
 }
 
 /// Counter for generating unique webview/window labels.
@@ -554,6 +623,13 @@ fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
 
     eprintln!("[Tauri] Restarting app: {:?} {:?}", exe, args);
 
+    // Persist geometry before the re-exec — the plugin's exit-time flush doesn't
+    // run on this path (we exec() over the process), so without this an in-session
+    // move/resize would be lost across the restart.
+    if let Err(e) = app.save_window_state(window_state_flags()) {
+        eprintln!("[Tauri] Failed to persist window state before restart: {e}");
+    }
+
     app.cleanup_before_exit();
 
     // On Unix, exec() replaces the process in-place. On other platforms, spawn + exit.
@@ -863,12 +939,20 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_window_state::Builder::new().build())
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                .with_state_flags(window_state_flags())
+                .build(),
+        )
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(PanelWebview(Mutex::new(None)))
         .manage(PanelContentChannel(Mutex::new(None)))
         .manage(LastHeartbeat(Mutex::new(Instant::now())))
+        .manage(GeometrySaver {
+            dirty: AtomicBool::new(false),
+            last_change: Mutex::new(Instant::now()),
+        })
         .invoke_handler(tauri::generate_handler![
             create_panel_webview,
             navigate_panel_webview,
@@ -899,17 +983,40 @@ pub fn run() {
             mobile::tailscale_serve,
         ])
         .on_window_event(|window, event| {
-            // Packaged: closing a window must NOT quit the client or stop the
-            // always-on service. Hide the main window instead of letting it close
-            // — the client stays resident in the menu bar (only the tray "Quit
-            // and Stop Background Service" tears down). Secondary windows close
-            // normally; dev keeps the default close-quits behavior so
-            // `tauri-dev.sh` returns when the window is closed.
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if !tauri::is_dev() && window.label() == "main" {
-                    api.prevent_close();
-                    let _ = window.hide();
+            let app = window.app_handle();
+            match event {
+                // Packaged: closing a window must NOT quit the client or stop the
+                // always-on service. Hide the main window instead of letting it
+                // close — the client stays resident in the menu bar (only the tray
+                // "Quit and Stop Background Service" tears down). Secondary windows
+                // close normally; dev keeps the default close-quits behavior so
+                // `tauri-dev.sh` returns when the window is closed.
+                //
+                // Flush window geometry synchronously here regardless of platform:
+                // the plugin's own disk write (RunEvent::Exit) is unreachable in the
+                // packaged client (we hide instead of exit), so this close is the
+                // moment the user expects their size/position remembered.
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    if let Err(e) = app.save_window_state(window_state_flags()) {
+                        eprintln!("[Tauri] Failed to persist window state on close: {e}");
+                    }
+                    if !tauri::is_dev() && window.label() == "main" {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
                 }
+                // Geometry changed — arm the debounced background flush. The plugin
+                // keeps its own in-memory cache up to date from these same events;
+                // we additionally schedule a disk write so the new geometry survives
+                // a relaunch even though RunEvent::Exit never fires.
+                tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)
+                    if is_app_window(window.label()) =>
+                {
+                    let saver = app.state::<GeometrySaver>();
+                    *saver.last_change.lock().unwrap() = Instant::now();
+                    saver.dirty.store(true, std::sync::atomic::Ordering::Release);
+                }
+                _ => {}
             }
         })
         .on_menu_event(|app, event| {
@@ -1000,6 +1107,27 @@ pub fn run() {
                 }
             });
 
+            // Debounced window-geometry flush. The window-state plugin only writes
+            // `.window-state.json` to disk on RunEvent::Exit, which the packaged
+            // client deliberately never reaches (closing hides the window; exit is
+            // prevented while the launchd service runs). Without this, a moved or
+            // resized window — including onto another screen — is remembered only
+            // in memory and lost on the next launch. This flushes shortly after the
+            // user stops dragging/resizing (see should_persist_geometry). The save
+            // itself is marshalled onto the main thread (persist_window_state_on_main)
+            // — saving from this worker thread directly would deadlock the UI.
+            let geometry_handle = app.handle().clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let saver = geometry_handle.state::<GeometrySaver>();
+                let dirty = saver.dirty.load(std::sync::atomic::Ordering::Acquire);
+                let since = saver.last_change.lock().unwrap().elapsed();
+                if should_persist_geometry(dirty, since) {
+                    saver.dirty.store(false, std::sync::atomic::Ordering::Release);
+                    persist_window_state_on_main(&geometry_handle);
+                }
+            });
+
             // Register the UserNotifications delegate + request notification
             // authorization. No-op in dev (unbundled binary). See notifications.rs.
             notifications::setup(app.handle());
@@ -1068,7 +1196,7 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
         "Lucidos",
         true,
         &[
-            &PredefinedMenuItem::about(app, Some("Lucidos"), None)?,
+            &PredefinedMenuItem::about(app, Some("About Lucidos"), None)?,
             &PredefinedMenuItem::separator(app)?,
             &PredefinedMenuItem::hide(app, None)?,
             &PredefinedMenuItem::hide_others(app, None)?,
@@ -1152,5 +1280,37 @@ mod tests {
         // Strictly past the 60s timeout: reload.
         assert!(heartbeat_expired(Duration::from_secs(61)));
         assert!(heartbeat_expired(HEARTBEAT_TIMEOUT + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn should_persist_geometry_waits_for_quiet_then_fires() {
+        // Nothing changed → never flush, however long it's been.
+        assert!(!should_persist_geometry(false, Duration::from_secs(10)));
+        // Dirty but the user is still moving/resizing (within the debounce) → wait.
+        assert!(!should_persist_geometry(true, Duration::from_millis(0)));
+        assert!(!should_persist_geometry(
+            true,
+            GEOMETRY_SAVE_DEBOUNCE - Duration::from_millis(1)
+        ));
+        // Dirty and quiet for at least the debounce window → flush to disk.
+        assert!(should_persist_geometry(true, GEOMETRY_SAVE_DEBOUNCE));
+        assert!(should_persist_geometry(
+            true,
+            GEOMETRY_SAVE_DEBOUNCE + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn window_state_flags_remembers_geometry_not_visibility() {
+        let flags = window_state_flags();
+        // The whole point: remember where/how big the window is, on which screen.
+        assert!(flags.contains(StateFlags::SIZE));
+        assert!(flags.contains(StateFlags::POSITION));
+        assert!(flags.contains(StateFlags::MAXIMIZED));
+        assert!(flags.contains(StateFlags::FULLSCREEN));
+        // But NOT VISIBLE (a flush taken while hidden would restore hidden) and
+        // NOT DECORATIONS (toggling it on macOS drops the Overlay title bar).
+        assert!(!flags.contains(StateFlags::VISIBLE));
+        assert!(!flags.contains(StateFlags::DECORATIONS));
     }
 }

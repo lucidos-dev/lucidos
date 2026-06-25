@@ -1,10 +1,14 @@
 /**
- * First-run provider onboarding (v0.12.0 release blocker): when no LLM provider
- * is configured, the welcome surface must guide the user to Settings → Models → Providers
- * instead of offering starter prompts that would chat into a "no provider"
- * error. These tests invoke the components directly and walk the returned VNode
- * tree (the repo idiom — no DOM render library), and unit-test the pure gating
- * predicate.
+ * Welcome surface: gating + provider-aware content.
+ *
+ * Gating is "show until dismissed" (`showWelcomeSurface` = isEmpty &&
+ * !welcomeDismissed; the dismissal lives in the DB-backed
+ * welcome_suggestions_dismissed preference). Content stays provider-aware: when
+ * no LLM provider is configured the welcome guides the user to Settings → Models
+ * → Providers instead of offering starter prompts that would chat into a "no
+ * provider" error. These tests invoke the components directly and walk the
+ * returned VNode tree (the repo idiom — no DOM render library), and unit-test
+ * the pure gating predicate.
  */
 import type { ComponentChildren, VNode } from 'preact';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -37,21 +41,18 @@ function textOf(node: ComponentChildren): string {
   return textOf(v.props.children as ComponentChildren);
 }
 
-describe('showWelcomeSurface — first-run welcome gating', () => {
+describe('showWelcomeSurface — show-until-dismissed gating', () => {
   it('hides whenever the compose view is not empty', () => {
-    expect(showWelcomeSurface({ isEmpty: false, isNewWorkspace: true, welcomeDismissed: false, needsProviderSetup: true })).toBe(false);
+    expect(showWelcomeSurface({ isEmpty: false, welcomeDismissed: false })).toBe(false);
+    expect(showWelcomeSurface({ isEmpty: false, welcomeDismissed: true })).toBe(false);
   });
 
-  it('shows the new-workspace welcome only when new + not dismissed', () => {
-    expect(showWelcomeSurface({ isEmpty: true, isNewWorkspace: true, welcomeDismissed: false, needsProviderSetup: false })).toBe(true);
-    expect(showWelcomeSurface({ isEmpty: true, isNewWorkspace: true, welcomeDismissed: true, needsProviderSetup: false })).toBe(false);
-    expect(showWelcomeSurface({ isEmpty: true, isNewWorkspace: false, welcomeDismissed: false, needsProviderSetup: false })).toBe(false);
-  });
-
-  it('shows provider onboarding regardless of history OR dismissal', () => {
-    // The whole point of bug #1's fix: no provider → onboarding appears even on a
-    // workspace with history and even after "Don't show this again".
-    expect(showWelcomeSurface({ isEmpty: true, isNewWorkspace: false, welcomeDismissed: true, needsProviderSetup: true })).toBe(true);
+  it('shows on the empty compose view until dismissed', () => {
+    // One rule: show until the user dismisses it (stored in the DB-backed
+    // welcome_suggestions_dismissed preference). No workspace-history or
+    // provider gating — the provider-aware variant is content, not gating.
+    expect(showWelcomeSurface({ isEmpty: true, welcomeDismissed: false })).toBe(true);
+    expect(showWelcomeSurface({ isEmpty: true, welcomeDismissed: true })).toBe(false);
   });
 });
 

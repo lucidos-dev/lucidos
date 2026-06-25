@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref } from './linkifyPaths';
+import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget } from './linkifyPaths';
 
 describe('extractNavTargetFromHref', () => {
   it.each([
@@ -102,6 +102,52 @@ describe('extractAppIdFromHref', () => {
     ['application:todo', null],
   ])('returns null for %s', (href, expected) => {
     expect(extractAppIdFromHref(href)).toBe(expected);
+  });
+});
+
+describe('extractLocalFileTarget', () => {
+  it.each([
+    // file:// URLs — always a local file/dir to hand to the OS
+    ['file:///Users/ken/Downloads/Lucidos_0.12.3_aarch64.dmg', 'file:///Users/ken/Downloads/Lucidos_0.12.3_aarch64.dmg'],
+    ['file:///Applications/Lucidos.app', 'file:///Applications/Lucidos.app'],
+    ['FILE:///tmp/x', 'FILE:///tmp/x'], // scheme is case-insensitive
+    // Bare absolute POSIX paths outside the workspace — a staged release dmg,
+    // an app folder, etc.
+    ['/Users/ken/.lucidos/release-worktrees/0.12.3/Lucidos_0.12.3_aarch64.dmg', '/Users/ken/.lucidos/release-worktrees/0.12.3/Lucidos_0.12.3_aarch64.dmg'],
+    ['/Applications', '/Applications'],
+    ['/tmp/build/out.dmg', '/tmp/build/out.dmg'],
+    // A directory whose name merely starts with data/apps but isn't the route
+    ['/data-backup/snapshot.tar', '/data-backup/snapshot.tar'],
+    ['/apps-archive/old.zip', '/apps-archive/old.zip'],
+  ])('extracts %s -> %s', (href, expected) => {
+    expect(extractLocalFileTarget(href)).toBe(expected);
+  });
+
+  it.each([
+    // Workspace absolute routes — owned by the artifact / app / nav handlers,
+    // must NOT be handed to the OS as a disk path
+    ['/data', null],
+    ['/data/artifacts/report.pdf', null],
+    ['/data/apps/todo/index.html', null],
+    ['/apps', null],
+    ['/apps/todo/index.html', null],
+    ['/apps/todo/styles.css', null],
+    // Relative paths are never OS targets (they're workspace-relative)
+    ['data/artifacts/report.pdf', null],
+    ['apps/todo/index.html', null],
+    ['notifications', null],
+    ['artifacts/notes.md', null],
+    // External web URLs keep their browser / panel-webview behavior
+    ['https://example.com/foo.dmg', null],
+    ['http://example.com/foo.dmg', null],
+    ['mailto:user@example.com', null],
+    // Custom schemes the other handlers / renderers own
+    ['app:todo', null],
+    ['thread:abc-123', null],
+    ['', null],
+    ['#anchor', null],
+  ])('returns null for %s', (href, expected) => {
+    expect(extractLocalFileTarget(href)).toBe(expected);
   });
 });
 

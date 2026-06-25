@@ -233,6 +233,20 @@
     flex: 0 0 auto;
 }
 
+/* When the welcome surface is present, the compose view has real content to
+   show. `.thread-content` is `position: absolute; inset: 0`, so it contributes
+   no height to its `flex: 0 0 auto` wrap — without this the welcome renders into
+   a zero-height, overflow-hidden box and is clipped to nothing (the "no welcome
+   on a fresh install" bug). Give the wrap the available column space so the
+   absolute content fills + scrolls and the prompt docks at the bottom, exactly
+   like a real thread. The wrap only contains `.thread-content.visible` when
+   `hasContent` is true (CreateThreadView), which in compose-empty mode means the
+   welcome is showing. */
+.compose-empty .thread-content-wrap:has(> .thread-content.visible) {
+    flex: 1;
+    min-height: 0;
+}
+
 .compose-empty .prompt-area {
     padding-top: 0;
     margin-top: 0;

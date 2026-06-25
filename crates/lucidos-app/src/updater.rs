@@ -58,6 +58,13 @@ pub async fn install_app_update_and_restart(app: AppHandle) -> Result<(), String
         .download_and_install(|_chunk, _total| {}, || {})
         .await
         .map_err(|e| e.to_string())?;
+    // Window geometry is already current on disk: the debounced flush in `run()`
+    // persists it ~600ms after the user stops moving/resizing, well within the
+    // multi-second download+install above. We deliberately do NOT call
+    // `save_window_state` here — this runs on a Tokio worker thread, off the main
+    // thread, where that call can deadlock the UI (see persist_window_state_on_main
+    // in lib.rs).
+    //
     // New bytes are on disk. Restart the whole background service onto them BEFORE
     // relaunching the client — `app.restart()` never returns.
     if let Err(e) = crate::desktop::restart_service() {

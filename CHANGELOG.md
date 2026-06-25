@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.12.4 — 2026-06-25
+
+**Fixed**
+- **Desktop window state persists across launches** — Tauri window size, position, and screen are restored on relaunch, and the window-state save is marshalled onto the main thread.
+- **Welcome message** now shows until dismissed and no longer clips the empty compose box; added top padding and dropped the tagline.
+- **App menu** "About" item is labelled **"About Lucidos"** instead of "Lucidos".
 ## v0.12.3 — 2026-06-25
 
 **Added**
@@ -16,6 +22,7 @@
 **Fixed**
 - Packaged builds no longer register the workspace as a "Lucidos source" repository.
 - Repo HTML shows as source (not a live render) in the file/diff preview.
+
 ## v0.12.2 — 2026-06-25
 
 **Added**

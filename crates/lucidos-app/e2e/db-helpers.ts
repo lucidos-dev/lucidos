@@ -63,6 +63,18 @@ export function clearNotifications(): void {
   ].join(';\n'));
 }
 
+/** Reset the welcome surface to its pristine (never-dismissed) state so the
+ *  welcome message shows again. The GET /preferences handler reads the
+ *  `preferences` projection table directly (no restart-spanning cache), so
+ *  deleting the row is honoured on the next fetch; the source `PreferencesChanged`
+ *  event is removed too so a projection rebuild can't resurrect the dismissal. */
+export function resetWelcomePreference(): void {
+  psql([
+    "DELETE FROM preferences WHERE key = 'welcome_suggestions_dismissed'",
+    "DELETE FROM events WHERE event_type = 'PreferencesChanged' AND payload->>'key' = 'welcome_suggestions_dismissed'",
+  ].join(';\n'));
+}
+
 /** Run SQL via stdin to avoid shell escaping issues with JSON payloads. */
 export function psql(sql: string): string {
   const dbPort = getDbPort();

@@ -10,7 +10,7 @@ import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, openImagePopupFromGroup, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { removeQueuedMessage } from '../../store/actions/chat';
 import { preserveOnToggle } from './scrollState';
-import { openFilePreview } from '../../store/actions/artifacts';
+import { openFilePreview, openLocalFile } from '../../store/actions/artifacts';
 import { openApp } from '../../store/actions/apps';
 import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
@@ -20,7 +20,7 @@ import { getEventToggleState, getCollapsedVisibleEvents, splitEventSections, has
 import { statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated } from '../../store/exchange-status';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
-import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref } from '../../utils/linkifyPaths';
+import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget } from '../../utils/linkifyPaths';
 import { handleNavigationRequest } from '../../store/actions/thread-sync';
 import { ChangeBody, CheckpointCard, ContinueButton, FileList, GeneratedImage, InitiatorPanel, InlineStep, MarkdownBlock, ResponsePanel, ResumeNoteBody, UserMessageBody, changeAccent, changeActions, describeExecutor } from './chat-exchange-parts';
 import { TrashIcon } from '../shared/icons';
@@ -194,6 +194,19 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       if (navName) {
         e.preventDefault();
         handleNavigationRequest({ target: navName });
+        return;
+      }
+      // A `file://` URL or an absolute filesystem path (a staged release .dmg
+      // under ~/…/.lucidos/release-worktrees/, an /Applications/… folder, …) —
+      // open it with the OS (mount the dmg / reveal the folder), NOT via the
+      // in-app file preview or the /data/* static mount (those are for
+      // workspace-relative paths only). Runs AFTER the app/nav extractors so
+      // their absolute routes (/apps/<id>/…, /notifications, …) keep working;
+      // http(s) URLs return null here and keep their browser/panel behavior.
+      const localFile = extractLocalFileTarget(rawHref);
+      if (localFile) {
+        e.preventDefault();
+        openLocalFile(localFile);
         return;
       }
     }
