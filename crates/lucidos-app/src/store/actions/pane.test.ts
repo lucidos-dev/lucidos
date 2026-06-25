@@ -9,7 +9,7 @@ import {
   DEFAULT_SPLIT_RATIO, KEYBOARD_RESIZE_STEP_PX, MIN_THREAD_PANE_PX, MIN_CONTENT_PANE_PX,
 } from '../../components/layout/splitHelpers';
 import {
-  navigateToPane, checkPaneConsistency, toggleThreads, focusPane,
+  navigateToPane, checkPaneConsistency, toggleThreads, focusPane, revealContentPane,
   toggleThreadPane, toggleContentPane, stepThreadPaneWidth, stepThreadDrawerWidth, resetPaneLayout,
 } from './pane';
 
@@ -298,6 +298,54 @@ describe('focusPane', () => {
     (globalThis as any).innerWidth = 375;
     focusPane('content');
     expect(focusedPane.value).toBe('thread');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// revealContentPane — every content navigation activates the Content pane group
+// so keyboard tabbing (handlePaneTab, anchored on focusedPane) lands on the
+// freshly-navigated view rather than the previously-focused pane.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('revealContentPane', () => {
+  beforeEach(() => {
+    resetState(); // focusedPane = 'thread'
+    splitRatio.value = 0.5;
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('desktop: activates the Content pane group (signal-only)', () => {
+    (globalThis as any).innerWidth = 1024;
+    revealContentPane();
+    expect(focusedPane.value).toBe('content');
+  });
+
+  it('desktop: re-expands a collapsed split (Threads group maximized)', () => {
+    (globalThis as any).innerWidth = 1024;
+    splitRatio.value = 1; // content collapsed
+    revealContentPane();
+    expect(focusedPane.value).toBe('content');
+    expect(splitRatio.value).toBe(DEFAULT_SPLIT_RATIO);
+  });
+
+  it('desktop: leaves an open split untouched (only focus moves)', () => {
+    (globalThis as any).innerWidth = 1024;
+    splitRatio.value = 0.5;
+    revealContentPane();
+    expect(splitRatio.value).toBe(0.5);
+  });
+
+  it('desktop: idempotent when already focused on content', () => {
+    (globalThis as any).innerWidth = 1024;
+    focusedPane.value = 'content';
+    revealContentPane();
+    expect(focusedPane.value).toBe('content');
+  });
+
+  it('mobile: navigates to the content pane and never touches focusedPane', () => {
+    (globalThis as any).innerWidth = 375;
+    revealContentPane();
+    expect(mobileView.value).toBe('content');
+    expect(focusedPane.value).toBe('thread'); // mobile navigates, never focuses
   });
 });
 

@@ -1,4 +1,4 @@
-import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, drawerView, threadSearchQuery, threadSearchResults } from '../store';
+import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, focusedPane, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, drawerView, threadSearchQuery, threadSearchResults } from '../store';
 import { navigateToPane } from './pane';
 import { isMobile } from '../../utils/viewport';
 import type { ThreadSection, ThreadState } from '../thread-events';
@@ -61,11 +61,19 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
 
   pushThreadNavState({ type: 'thread', id: threadId });
 
-  // On mobile, navigate to the thread pane so the focused thread is visible.
-  // Without this, callers like toast onClick and search would set the focused
-  // thread but leave the user on whichever pane they were on.
+  // Surface the focused thread on the pane the user is actually working in.
+  // Mobile: navigate to the thread pane so the thread is visible — without this,
+  // callers like toast onClick and search would set the focused thread but leave
+  // the user on whichever pane they were on. Desktop: when arriving from the
+  // Content pane group (e.g. Search Everywhere → a thread while viewing an
+  // app/Settings), re-activate the Threads pane group so keyboard tabbing lands
+  // on the conversation. Signal-only — handlePaneTab pulls DOM focus in on the
+  // first Tab. Only the cross-group case switches: an existing 'drawer'/'thread'
+  // focus is left alone so drawer ↑/↓ browsing (and its accent) isn't disturbed.
   if (isMobile()) {
     navigateToPane('thread');
+  } else if (focusedPane.value === 'content') {
+    focusedPane.value = 'thread';
   }
 
   if (targetEventId) {

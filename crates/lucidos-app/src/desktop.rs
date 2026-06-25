@@ -17,14 +17,14 @@
 //!    workspace; the smart root serves the picker). No window, no AppKit. On
 //!    crash launchd respawns the service (the
 //!    new gateway re-adopts already-running engines); on `launchctl bootout` (the
-//!    explicit "Quit & Stop Background Service") it tears the whole stack down and
+//!    explicit "Quit and Stop Background Service") it tears the whole stack down and
 //!    stays stopped.
 //!  * **Client** (the GUI app the user double-clicks): [`launch`] ensures the
 //!    service is installed + running, waits for `/~/api/v1/health` (the gateway),
 //!    then points the window at it (the gateway serves the workspace picker behind
 //!    the sigil namespace `/~/`). Closing the window and Cmd+Q only dismiss the
 //!    window — the client stays resident in the menu bar and the service keeps
-//!    running; only the menu-bar "Quit & Stop Background Service" tears it down.
+//!    running; only the menu-bar "Quit and Stop Background Service" tears it down.
 //!
 //! None of this runs in development — `scripts/tauri-dev.sh` keeps using Docker
 //! Postgres + a natively-built engine, and [`launch`] short-circuits on
@@ -95,7 +95,7 @@ impl GatewayService {
     /// Stop the gateway, then the engines it spawned, then the embedded Postgres
     /// cluster. Best-effort; logs failures.
     ///
-    /// This is the PERMANENT-stop teardown — "Quit & Stop Background Service"
+    /// This is the PERMANENT-stop teardown — "Quit and Stop Background Service"
     /// (`bootout`) and the supervised-exit path both route here. It is NOT reached by the gateway's
     /// in-place reload (`execv`, same PID), which deliberately leaves the cluster
     /// running so the re-exec'd image re-adopts it; stopping Postgres here would
@@ -159,7 +159,7 @@ fn embedded_pg_stop_command(pg_bin: &Path, pg_lib: &Path, data: &Path) -> Comman
 
 /// SIGUSR1 every workspace engine the gateway spawned (pidfiles under
 /// `<app-data>/workspaces/<id>/.lucidos/engine.pid`). Used on a full service stop
-/// ("Quit & Stop Background Service"); the gateway leaves them running on its own
+/// ("Quit and Stop Background Service"); the gateway leaves them running on its own
 /// SIGUSR1 so they
 /// can be re-adopted across a gateway restart, but an explicit stop tears the
 /// whole stack down.
@@ -610,7 +610,7 @@ pub fn restart_service() -> Result<(), String> {
 }
 
 /// Stop the always-on service entirely (`launchctl bootout`) — the explicit
-/// "Quit & Stop Background Service" path (menu-bar item / app menu). Removes the
+/// "Quit and Stop Background Service" path (menu-bar item / app menu). Removes the
 /// agent so it won't respawn; the next GUI launch re-installs and re-bootstraps
 /// it. No-op in development (no service).
 pub fn stop_service() {

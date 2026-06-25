@@ -33,7 +33,7 @@ window). On boot it:
    spawns one loopback-only `lucidos-engine` per running workspace,
 4. supervises the gateway; the gateway supervises workspace engines and can
    re-adopt already-running engines after a gateway restart. On explicit
-   `launchctl bootout` ("Quit & Stop Background Service"), the service tears down
+   `launchctl bootout` ("Quit and Stop Background Service"), the service tears down
    the gateway and every engine it spawned.
 
 **Client** (the GUI app the user double-clicks). On launch it:
@@ -275,7 +275,7 @@ Engine Statelessness).
   The Tauri window and the mobile PWA are both pure clients of it. The client
   uses a **menu-bar (tray) model**: window close / Cmd+W / Cmd+Q hide the window,
   the client process stays resident to host the menu-bar item, and that item's
-  **"Quit & Stop Background Service"** is the only teardown (`launchctl bootout`).
+  **"Quit and Stop Background Service"** is the only teardown (`launchctl bootout`).
   Closing the window never stops the service.
 - **Stable gateway port, not a random one.** The connect URL is stable across
   restarts. The packaged gateway owns the network-facing port; engines bind

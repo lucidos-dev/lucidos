@@ -8,7 +8,7 @@ import { highlightFileLines, CODE_EXTS } from '../../utils/syntaxHighlight';
 import { escapeHtml } from '../../utils/escapeHtml';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { renderCsvTable } from '../../utils/csv';
-import { RENDERABLE_EXTS, previewMediaKind } from './previewExts';
+import { REPO_RENDERABLE_EXTS, previewMediaKind } from './previewExts';
 import { isMobile, viewportIsMobile } from '../../utils/viewport';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
@@ -224,7 +224,10 @@ function RepoFileText({ repoId, path, changeId }: { repoId: string; path: string
 
   const ext = path.split('.').pop()?.toLowerCase() || '';
   const content = loadable.status === 'loaded' ? loadable.data : null;
-  const renderPreview = content !== null && !filePreviewSource.value && RENDERABLE_EXTS.includes(ext);
+  // REPO_RENDERABLE_EXTS (not RENDERABLE_EXTS): repo HTML is source under review,
+  // so it falls through to the syntax-highlighted source path below instead of a
+  // live srcDoc iframe that would show the app shell's boot splash.
+  const renderPreview = content !== null && !filePreviewSource.value && REPO_RENDERABLE_EXTS.includes(ext);
   const isCode = CODE_EXTS.includes(ext);
 
   const renderedHtml = useMemo(() => {
@@ -248,8 +251,9 @@ function RepoFileText({ repoId, path, changeId }: { repoId: string; path: string
   if (content === null) return showLoading ? <div class="loading-spinner" /> : null;
 
   if (renderPreview) {
+    // No html/htm branch: REPO_RENDERABLE_EXTS excludes them, so a repo HTML file
+    // never reaches here — it renders as syntax-highlighted source below.
     if (ext === 'md') return <div class="response-content markdown-content" dangerouslySetInnerHTML={{ __html: renderedHtml! }} />;
-    if (ext === 'html' || ext === 'htm') return <iframe srcDoc={content} style="width:100%;height:100%;border:none;background:#fff;" />;
     if (ext === 'csv') return <div dangerouslySetInnerHTML={{ __html: renderedHtml! }} />;
     if (ext === 'svg') return <img src={renderedHtml!} alt={path} style="max-width:100%;max-height:100%;object-fit:contain;" onClick={() => { if (isMobile()) openImagePopup(renderedHtml!); }} />;
   }

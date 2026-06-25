@@ -50,16 +50,24 @@ export function navigateToPane(view: MobileView) {
   setMobileView(view);
 }
 
-/** Make the content pane visible after opening something into it.
- *  Mobile: swipe to the content pane. Desktop: expand the split if collapsed.
+/** Make the content pane visible AND the focused pane after opening something
+ *  into it. Mobile: swipe to the content pane. Desktop: activate the Content
+ *  pane group (`focusedPane = 'content'`) so the per-pane Tab trap routes
+ *  keyboard tabbing into the freshly-navigated view, and expand the split if
+ *  collapsed. Navigation that lands content (Search Everywhere, a menu switch, a
+ *  deep link) never lands DOM focus in the content pane, so without setting the
+ *  focused pane group `focusedPane` stays 'thread' and Tab cycles the wrong
+ *  pane. Signal-only (like the pointer-down `focusPane`) — the first Tab pulls
+ *  DOM focus in via `handlePaneTab`, so we never yank focus mid-navigation.
  *  Always call this after setting `panelOverlay.value` so a click on a content
  *  link is never silently absorbed when the pane is closed. */
 export function revealContentPane() {
   if (isMobile()) {
     navigateToPane('content');
-  } else if (splitRatio.value >= 1) {
-    setSplitRatio(DEFAULT_SPLIT_RATIO);
+    return;
   }
+  focusedPane.value = 'content';
+  if (splitRatio.value >= 1) setSplitRatio(DEFAULT_SPLIT_RATIO);
 }
 
 /** Move desktop pane focus. No-op on mobile, where panes are navigated, not

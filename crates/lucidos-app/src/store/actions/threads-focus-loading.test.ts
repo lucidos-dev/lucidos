@@ -34,7 +34,7 @@ import { getResizeMode, notAtTop, scrolledUp } from '../../components/chat/scrol
 import { drawerOpen } from '../../components/layout/Drawer';
 import { threadScrollKey } from '../../hooks/useScrollMemory';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
-import { archiveThreadCount, archivingThreadIds, codingAgentPendingModel, codingAgentPendingReasoningEffort, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded } from '../store';
+import { archiveThreadCount, archivingThreadIds, codingAgentPendingModel, codingAgentPendingReasoningEffort, focusedPane, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded } from '../store';
 import { loadAllThreads } from './thread-loading';
 import { focusThread, handleSaveThread, unfocusThread } from './threads';
 
@@ -82,6 +82,7 @@ beforeEach(() => {
   resetCodingAgentPendingPreferences();
   generatedTitleIds.clear();
   archivingThreadIds.value = new Set();
+  focusedPane.value = 'thread';
   localStorage.removeItem('lucidos-focused-thread');
 });
 
@@ -191,6 +192,47 @@ describe('focusThread', () => {
       focusThread('t1');
       // On desktop, mobileView is unused — must not be mutated
       expect(mobileView.value).toBe('threads');
+    } finally {
+      (globalThis as any).innerWidth = origWidth;
+    }
+  });
+
+  // Pane-group activation: navigating to a thread must re-activate the Threads
+  // pane group when arriving from the Content group, so keyboard Tab (handlePaneTab,
+  // anchored on focusedPane) lands on the conversation rather than the content view.
+  it('desktop: re-activates the Threads pane group when arriving from content', () => {
+    const origWidth = globalThis.innerWidth;
+    (globalThis as any).innerWidth = 1024; // desktop
+    try {
+      focusedPane.value = 'content'; // user was viewing an app/Settings
+      focusThread('t1');
+      expect(focusedPane.value).toBe('thread');
+    } finally {
+      (globalThis as any).innerWidth = origWidth;
+    }
+  });
+
+  it('desktop: leaves drawer focus alone (drawer ↑/↓ browsing undisturbed)', () => {
+    const origWidth = globalThis.innerWidth;
+    (globalThis as any).innerWidth = 1024;
+    try {
+      focusedPane.value = 'drawer'; // browsing the thread list via keyboard
+      focusThread('t1');
+      // Only the cross-group (content) case switches; an intra-Threads-group
+      // focus must survive so Enter-to-peek keeps the drawer accent + arrow nav.
+      expect(focusedPane.value).toBe('drawer');
+    } finally {
+      (globalThis as any).innerWidth = origWidth;
+    }
+  });
+
+  it('mobile: never touches focusedPane (panes are navigated, not focused)', () => {
+    const origWidth = globalThis.innerWidth;
+    (globalThis as any).innerWidth = 375; // mobile
+    try {
+      focusedPane.value = 'content';
+      focusThread('t1');
+      expect(focusedPane.value).toBe('content'); // unchanged on mobile
     } finally {
       (globalThis as any).innerWidth = origWidth;
     }

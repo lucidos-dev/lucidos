@@ -566,40 +566,54 @@ impl LucidosEngine {
         // setup. Its id is derived from the repo's root-commit SHA (read from
         // disk), so a registry wipe / re-seed always recomputes the SAME id —
         // coding-agent threads bound to it never orphan.
-        let default_repo_root_commit = git_ops::root_commit_sha(&repo_root).await;
-        if let Err(e) = crate::core::repositories::RepositoryStore::ensure_exists(
-            &pool,
-            Self::DEFAULT_REPO_NAME,
-            &repo_root.to_string_lossy(),
-            default_repo_root_commit.as_deref(),
-        )
-        .await
-        {
-            log!(
-                "[Startup] Failed to register default Lucidos repository: {}",
-                e
-            );
-        }
-
-        // One-time, marker-guarded: re-point coding-agent threads orphaned by the
-        // old random-UUID registry onto the default repo's deterministic id (every
-        // lucidos/legacy thread targets the Lucidos source by definition). Must run
-        // AFTER ensure_exists above so the live row already carries the new id.
-        let default_repo_det_id = crate::core::repositories::deterministic_id(
-            default_repo_root_commit.as_deref(),
-            &repo_root.to_string_lossy(),
-        );
-        match event_store
-            .backfill_cc_repo_id_to_deterministic(default_repo_det_id)
+        //
+        // DEV-ONLY: gate on a genuine source checkout. On a packaged build
+        // `paths::repo_root()` errs (the signal `is_packaged()` keys on) and the
+        // `repo_root` above — from `main_worktree()` — falls back to the
+        // workspace dir. Registering THAT under the reserved name "Lucidos" would
+        // mis-label the user's workspace as the platform source (then hidden by
+        // the compose picker's reserved-name handling). There is no Lucidos
+        // source on packaged, so skip both the registration and the
+        // source-thread backfill below.
+        if crate::paths::repo_root().is_ok() {
+            let default_repo_root_commit = git_ops::root_commit_sha(&repo_root).await;
+            if let Err(e) = crate::core::repositories::RepositoryStore::ensure_exists(
+                &pool,
+                Self::DEFAULT_REPO_NAME,
+                &repo_root.to_string_lossy(),
+                default_repo_root_commit.as_deref(),
+            )
             .await
-        {
-            Ok(n) if n > 0 => log!(
-                "[Engine] Backfilled {} thread_summaries rows: cc_repo_id → deterministic repo id {}",
-                n,
-                default_repo_det_id
-            ),
-            Ok(_) => {}
-            Err(e) => log!("[Startup] cc_repo_id deterministic backfill failed: {}", e),
+            {
+                log!(
+                    "[Startup] Failed to register default Lucidos repository: {}",
+                    e
+                );
+            }
+
+            // One-time, marker-guarded: re-point coding-agent threads orphaned by
+            // the old random-UUID registry onto the default repo's deterministic
+            // id (every lucidos/legacy thread targets the Lucidos source by
+            // definition). Must run AFTER ensure_exists above so the live row
+            // already carries the new id.
+            let default_repo_det_id = crate::core::repositories::deterministic_id(
+                default_repo_root_commit.as_deref(),
+                &repo_root.to_string_lossy(),
+            );
+            match event_store
+                .backfill_cc_repo_id_to_deterministic(default_repo_det_id)
+                .await
+            {
+                Ok(n) if n > 0 => log!(
+                    "[Engine] Backfilled {} thread_summaries rows: cc_repo_id → deterministic repo id {}",
+                    n,
+                    default_repo_det_id
+                ),
+                Ok(_) => {}
+                Err(e) => log!("[Startup] cc_repo_id deterministic backfill failed: {}", e),
+            }
+        } else {
+            log!("[Startup] Packaged build (no source checkout) — skipping Lucidos source repo registration");
         }
 
         // Auto-commit safe files (docs) if dirty — a dirty working tree blocks

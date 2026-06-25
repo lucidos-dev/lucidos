@@ -234,13 +234,17 @@ pub enum FolderClassification {
 /// `folder_abs` path. Mirrors §3.2 step 3 of the design plan.
 ///
 /// `lucidos_repo_root` is the resolved path of the Lucidos source repo
-/// (from `RepositoryStore::get_by_name("Lucidos")`). `workspace_root` is the
-/// target workspace's root. `external_repo_match` returns the canonical
-/// registered-external-repo root if `folder_abs` equals one of them.
+/// (from `RepositoryStore::get_by_name("Lucidos")`), or `None` when there is no
+/// source checkout — a packaged build, where "Lucidos source" is not a thing.
+/// `None` means the Lucidos-source branch simply never matches (a would-be
+/// source path falls through to `UnrecognisedPath`); App + External still
+/// classify. `workspace_root` is the target workspace's root.
+/// `external_repo_match` returns the canonical registered-external-repo root if
+/// `folder_abs` equals one of them.
 pub fn classify_resolved_folder<F>(
     folder_abs: &Path,
     workspace_root: &Path,
-    lucidos_repo_root: &Path,
+    lucidos_repo_root: Option<&Path>,
     external_repo_match: F,
 ) -> Result<FolderClassification, FolderResolutionError>
 where
@@ -264,7 +268,7 @@ where
         // and can legitimately live under `/var/folders/T/...` on macOS or
         // any other system-shaped path the user picked.
         if !folder_abs.starts_with(workspace_root)
-            && !folder_abs.starts_with(lucidos_repo_root)
+            && !lucidos_repo_root.is_some_and(|root| folder_abs.starts_with(root))
         {
             let folder_str = folder_abs.to_string_lossy();
             for root in FORBIDDEN_SYSTEM_ROOTS {
@@ -291,11 +295,15 @@ where
         return Err(err_non_app_data_path(folder_abs, workspace_root));
     }
 
-    // Lucidos source repo: exact-match or descendant.
-    if folder_abs == lucidos_repo_root || folder_abs.starts_with(lucidos_repo_root) {
-        return Ok(FolderClassification::Lucidos {
-            repo_root: lucidos_repo_root.to_path_buf(),
-        });
+    // Lucidos source repo: exact-match or descendant. Skipped entirely when no
+    // source checkout exists (packaged) — the branch can't match, so a would-be
+    // source path falls through to the UnrecognisedPath refusal below.
+    if let Some(lucidos_repo_root) = lucidos_repo_root {
+        if folder_abs == lucidos_repo_root || folder_abs.starts_with(lucidos_repo_root) {
+            return Ok(FolderClassification::Lucidos {
+                repo_root: lucidos_repo_root.to_path_buf(),
+            });
+        }
     }
 
     // External repo registry: only exact-match counts (registered roots are
@@ -419,7 +427,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&target);
         let lucidos_root = ws.join("lucidos-source");
         let _ = std::fs::create_dir_all(&lucidos_root);
-        let res = classify_resolved_folder(&target, &ws, &lucidos_root, |_| None);
+        let res = classify_resolved_folder(&target, &ws, Some(&lucidos_root), |_| None);
         let err = res.expect_err("expected refusal").to_string();
         assert!(
             err.contains(".lucidos/"),
@@ -434,7 +442,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&target);
         let lucidos_root = ws.join("lucidos-source");
         let _ = std::fs::create_dir_all(&lucidos_root);
-        let res = classify_resolved_folder(&target, &ws, &lucidos_root, |_| None);
+        let res = classify_resolved_folder(&target, &ws, Some(&lucidos_root), |_| None);
         match res {
             Ok(FolderClassification::App { workspace_root, app_id }) => {
                 assert_eq!(workspace_root, ws);
@@ -451,7 +459,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&target);
         let lucidos_root = ws.join("lucidos-source");
         let _ = std::fs::create_dir_all(&lucidos_root);
-        let res = classify_resolved_folder(&target, &ws, &lucidos_root, |_| None);
+        let res = classify_resolved_folder(&target, &ws, Some(&lucidos_root), |_| None);
         let err = res.expect_err("expected refusal").to_string();
         assert!(
             err.contains("data/apps/<app_id>"),
@@ -466,7 +474,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&target);
         let lucidos_root = ws.join("lucidos-source");
         let _ = std::fs::create_dir_all(&lucidos_root);
-        let res = classify_resolved_folder(&target, &ws, &lucidos_root, |_| None);
+        let res = classify_resolved_folder(&target, &ws, Some(&lucidos_root), |_| None);
         let err = res.expect_err("expected refusal").to_string();
         assert!(
             err.contains("`lucidos` CLI"),
@@ -479,7 +487,7 @@ mod tests {
         let ws = std::env::temp_dir().join("classify_test_ws_lucidos");
         let lucidos_root = ws.join("lucidos");
         let _ = std::fs::create_dir_all(&lucidos_root);
-        let res = classify_resolved_folder(&lucidos_root, &ws, &lucidos_root, |_| None);
+        let res = classify_resolved_folder(&lucidos_root, &ws, Some(&lucidos_root), |_| None);
         match res {
             Ok(FolderClassification::Lucidos { repo_root }) => {
                 assert_eq!(repo_root, lucidos_root);
@@ -499,7 +507,7 @@ mod tests {
         let ext = ws.join("acme");
         let _ = std::fs::create_dir_all(&ext);
         let ext_ref = ext.clone();
-        let res = classify_resolved_folder(&ext, &ws, &lucidos_root, |p| {
+        let res = classify_resolved_folder(&ext, &ws, Some(&lucidos_root), |p| {
             if p == ext_ref {
                 Some(ext_ref.clone())
             } else {
@@ -522,11 +530,64 @@ mod tests {
         let _ = std::fs::create_dir_all(&target);
         let lucidos_root = ws.join("lucidos");
         let _ = std::fs::create_dir_all(&lucidos_root);
-        let res = classify_resolved_folder(&target, &ws, &lucidos_root, |_| None);
+        let res = classify_resolved_folder(&target, &ws, Some(&lucidos_root), |_| None);
         let err = res.expect_err("expected refusal").to_string();
         assert!(
             err.contains("not the Lucidos source repo"),
             "error must explain why the path was rejected: {err}",
+        );
+    }
+
+    // --- Packaged build: no Lucidos source repo registered (lucidos_repo_root = None) ---
+
+    #[test]
+    fn classify_app_without_lucidos_source() {
+        // Packaged: no source checkout, yet an app folder must still classify so
+        // app coding-agent spawns work (the regression this fix targets).
+        let ws = std::env::temp_dir().join("classify_test_ws_app_no_src");
+        let target = ws.join("data/apps/momentum");
+        let _ = std::fs::create_dir_all(&target);
+        let res = classify_resolved_folder(&target, &ws, None, |_| None);
+        match res {
+            Ok(FolderClassification::App { workspace_root, app_id }) => {
+                assert_eq!(workspace_root, ws);
+                assert_eq!(app_id, "momentum");
+            }
+            other => panic!("expected App, got {:?}", other.as_ref().err().map(|e| e.to_string())),
+        }
+    }
+
+    #[test]
+    fn classify_external_without_lucidos_source() {
+        // Packaged: a registered external repo must still classify with no source.
+        let ws = std::env::temp_dir().join("classify_test_ws_ext_no_src");
+        let ext = ws.join("acme");
+        let _ = std::fs::create_dir_all(&ext);
+        let ext_ref = ext.clone();
+        let res = classify_resolved_folder(&ext, &ws, None, |p| {
+            if p == ext_ref { Some(ext_ref.clone()) } else { None }
+        });
+        match res {
+            Ok(FolderClassification::External { repo_root }) => assert_eq!(repo_root, ext),
+            other => panic!(
+                "expected External, got {:?}",
+                other.as_ref().err().map(|e| e.to_string())
+            ),
+        }
+    }
+
+    #[test]
+    fn classify_would_be_source_falls_through_without_lucidos_source() {
+        // Packaged: a path that WOULD be the Lucidos source on a dev build must
+        // NOT be silently classified — with no source it's UnrecognisedPath.
+        let ws = std::env::temp_dir().join("classify_test_ws_src_falls_through");
+        let would_be_source = ws.join("lucidos");
+        let _ = std::fs::create_dir_all(&would_be_source);
+        let res = classify_resolved_folder(&would_be_source, &ws, None, |_| None);
+        let err = res.expect_err("expected refusal with no Lucidos source").to_string();
+        assert!(
+            err.contains("not the Lucidos source repo"),
+            "would-be source must fall through to the unrecognised-path refusal: {err}",
         );
     }
 }

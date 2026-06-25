@@ -2,6 +2,17 @@
 // path (markdown, slides, csv, html, svg) instead of raw text/diff.
 export const RENDERABLE_EXTS = ['md', 'html', 'htm', 'csv', 'svg', 'slides'];
 
+// Extensions the REPO file/diff preview renders richly. HTML is deliberately
+// excluded: a repo HTML file is application source under review, not a
+// self-contained document, so a live `srcDoc` render shows misleading
+// pre-hydration markup — e.g. the app shell's inlined boot splash ("Opening
+// your workspace…") for crates/lucidos-app/index.html — and its relative
+// asset/script refs can't resolve in srcDoc anyway. It's shown as
+// syntax-highlighted source instead. Markdown/CSV/SVG/slides are self-contained
+// and stay rendered. (The artifact viewer keeps HTML via RENDERABLE_EXTS —
+// artifacts are authored, standalone documents.)
+export const REPO_RENDERABLE_EXTS = RENDERABLE_EXTS.filter(e => e !== 'html' && e !== 'htm');
+
 // Binary-media extensions both file viewers render via a URL-pointed element
 // (<img>/<video>/<audio>/<iframe>), never by fetching the bytes as text. SVG is
 // deliberately NOT here — it's XML, so it gets the rich/source text path

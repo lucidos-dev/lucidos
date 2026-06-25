@@ -46,3 +46,4 @@ Keep entries scannable. A decision log nobody reads is just more drift.
 - [0014 — Multi-workspace redesign: standalone gateway crate, `/<workspace>` path prefix, shared Postgres cluster, engine-served frontend](0014-multi-workspace-redesign.md)
 - [0015 — Restore lives in the workspace picker: local-file only, run via the engine `restore-archive` subcommand](0015-restore-in-the-workspace-picker.md)
 - [0016 — Packaged Tauri e2e is a boot smoke test, not UI automation (no WebDriver for macOS WKWebView)](0016-packaged-tauri-e2e-boot-smoke-test.md)
+- [0017 — `ask_user_question` caps options at 4, inherited from Claude Code's `AskUserQuestion` schema](0017-ask-user-question-four-option-cap.md)

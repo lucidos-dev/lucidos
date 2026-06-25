@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.12.3 — 2026-06-25
+
+**Added**
+- **"See all statuses" shortcut** — empty status-filter views in the thread drawer now offer a one-click way to clear the filter and see every thread.
+
+**Changed**
+- **macOS menu-bar tray icon** rendered as a proper monochrome template glyph that fills the canvas (correct light/dark menu-bar appearance, no padding frame).
+- **Window dragging** works from the whole header strip, with maximize-on-strip and a focused-pane accent line under the header.
+- **Focused-pane marker** tuned to a full-width underline, muted in dark mode; navigating now activates the focused pane group.
+- **Quit menu item renamed**, and the app confirms before stopping the background service.
+- Chat agent now anchors on the currently open app/file for UI/copy requests.
+- README tagline sentence-cased ("If you can describe it, it exists").
+
+**Fixed**
+- Packaged builds no longer register the workspace as a "Lucidos source" repository.
+- Repo HTML shows as source (not a live render) in the file/diff preview.
 ## v0.12.2 — 2026-06-25
 
 **Added**

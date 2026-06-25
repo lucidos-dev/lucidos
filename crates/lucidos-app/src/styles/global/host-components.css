@@ -533,3 +533,10 @@ html[data-theme="dark"] .split-button.open::before {
 .list-row.flip-animating {
     transition: none;
 }
+
+/* "See all statuses" shortcut sitting under a status-filter view's empty-state
+   message (thread drawer). A small gap separates it from the message; the link
+   itself is .accent-link (shared). Host-chrome only. */
+.empty-state-action {
+    margin-top: 0.5rem;
+}

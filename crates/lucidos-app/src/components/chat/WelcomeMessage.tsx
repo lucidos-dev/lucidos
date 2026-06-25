@@ -31,7 +31,7 @@ export function ProviderSetupWelcome() {
   return (
     <div class="response-content markdown-content welcome-message">
       <h2>Welcome to Lucidos</h2>
-      <p class="tagline">If You Can Describe It, It Exists.</p>
+      <p class="tagline">If you can describe it, it exists.</p>
       <p>
         I'm the Lucidos Agent — but I can't answer yet. This workspace has no AI
         provider configured. Connect one and I'll be ready to research, schedule,
@@ -88,7 +88,7 @@ export function WelcomeMessage() {
   return (
     <div class="response-content markdown-content welcome-message">
       <h2>Welcome to Lucidos</h2>
-      <p class="tagline">If You Can Describe It, It Exists.</p>
+      <p class="tagline">If you can describe it, it exists.</p>
       <p>
         I'm the Lucidos Agent — I remember our conversations, keep your files
         and notes as artifacts, and act on your behalf: research, schedules,

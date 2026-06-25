@@ -2,7 +2,7 @@ import type { ComponentChildren } from 'preact';
 import { useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { signal } from '@preact/signals';
-import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerView, selectedCodingAgent, selectedScope, repositories } from '../../store/store';
+import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerView, setDrawerView, selectedCodingAgent, selectedScope, repositories } from '../../store/store';
 import { composeDraftContextName } from '../../store/composeDestination';
 import { threadPassesChannelFilter } from '../../store/threadFilter';
 import { navigateToPane, focusPane } from '../../store/actions/pane';
@@ -889,6 +889,26 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
     );
 }
 
+/** Empty-state for the four status-filter views (Drafts / Needs attention /
+ *  Review / Running). Below the "nothing here" message it offers a one-tap
+ *  shortcut back to the unfiltered "All statuses" view, so a user who landed on
+ *  an empty filter isn't stranded — the items they're after live under another
+ *  status. The all-statuses and search views don't use this: "All statuses" IS
+ *  the destination, and an empty search wants a different query, not a filter
+ *  reset. */
+function EmptyFilteredView({ message }: { message: string }) {
+    return (
+        <div class="empty-state">
+            {message}
+            <div class="empty-state-action">
+                <button type="button" class="accent-link" onClick={() => setDrawerView('all')}>
+                    See all statuses
+                </button>
+            </div>
+        </div>
+    );
+}
+
 /** Single-section view of every thread carrying an unsent draft. Bypasses the
  *  channel/trigger/repo filters and the four lifecycle sections — when the user
  *  toggles the drafts icon they want every draft, not just the ones the active
@@ -906,7 +926,7 @@ function DraftsList() {
 
     if (!hydrated) return null;
     if (drafts.length === 0) {
-        return <div class="empty-state">No drafts</div>;
+        return <EmptyFilteredView message="No drafts" />;
     }
     return (
         <div>
@@ -937,7 +957,7 @@ function AttentionList() {
 
     if (!hydrated) return null;
     if (threads.length === 0) {
-        return <div class="empty-state">Nothing needs attention</div>;
+        return <EmptyFilteredView message="Nothing needs attention" />;
     }
     return (
         <div>
@@ -964,7 +984,7 @@ function ReviewList() {
 
     if (!hydrated) return null;
     if (threads.length === 0) {
-        return <div class="empty-state">Nothing to review</div>;
+        return <EmptyFilteredView message="Nothing to review" />;
     }
     return (
         <div>
@@ -992,7 +1012,7 @@ function RunningList() {
 
     if (!hydrated) return null;
     if (threads.length === 0) {
-        return <div class="empty-state">Nothing running</div>;
+        return <EmptyFilteredView message="Nothing running" />;
     }
     return (
         <div>

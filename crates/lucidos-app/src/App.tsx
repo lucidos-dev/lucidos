@@ -1,4 +1,5 @@
 import { effect, signal } from '@preact/signals';
+import { useRef } from 'preact/hooks';
 import { SplitLayout } from './components/layout/SplitLayout';
 import { ThreadPane } from './components/layout/ThreadPane';
 import { ContentPane } from './components/layout/ContentPane';
@@ -17,6 +18,7 @@ import { useBootSplashReady } from './hooks/useBootSplashReady';
 import { useTooltip } from './hooks/useTooltip';
 import { useScrollLock } from './hooks/useScrollLock';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
+import { useWindowDragRegion } from './hooks/useWindowDragRegion';
 import { lazyComponent } from './utils/lazyComponent';
 import {
   fileSearchOpen,
@@ -66,12 +68,17 @@ export function App() {
   // to gate once: viewportIsMobile only flips on window resize, which never
   // fires in an iOS PWA.
   const mobile = viewportIsMobile.value;
+  // Reclaimed macOS title-bar band: drags the window and double-click-zooms it.
+  // Drag/zoom go through always-allowed app commands (useWindowDragRegion), since
+  // data-tauri-drag-region's window-plugin IPC is denied by our capability ACL.
+  const stripRef = useRef<HTMLDivElement>(null);
+  useWindowDragRegion(stripRef, { maximize: true });
   return (
     <>
       <div class="app-shell">
         {/* Reclaimed macOS title-bar band + window drag region. Collapses to 0px
             (and is inert) off the macOS Tauri build — see .titlebar-strip CSS. */}
-        <div class="titlebar-strip" data-tauri-drag-region />
+        <div ref={stripRef} class="titlebar-strip" />
         <AppHeader />
         <Drawer />
         {mobile ? (

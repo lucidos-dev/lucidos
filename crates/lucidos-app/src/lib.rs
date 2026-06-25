@@ -186,6 +186,32 @@ fn set_titlebar_color(app: tauri::AppHandle, color: String) -> Result<(), String
     Ok(())
 }
 
+/// Start a native window drag for the calling window. The frontend's
+/// `useWindowDragRegion` hook calls this once the pointer crosses a small
+/// movement threshold while pressed on a non-interactive area of the title-bar
+/// band, so plain clicks / double-clicks still reach the page's own handlers (the
+/// header's double-click → pane-maximize, etc.). This replaces
+/// `data-tauri-drag-region`, whose internal `plugin:window|start_dragging` IPC is
+/// denied by our capability ACL — only app-defined commands like this one bypass
+/// the ACL. `window` is the calling window, so New-Window windows drag themselves.
+#[tauri::command]
+fn start_window_drag(window: tauri::Window) -> Result<(), String> {
+    window.start_dragging().map_err(|e| format!("{e}"))
+}
+
+/// Toggle the calling window between maximized (macOS zoom) and restored. Bound to
+/// a double-click on the reclaimed title-bar strip only — the header keeps its own
+/// double-click → pane-maximize. Like `start_window_drag`, an app command so it
+/// isn't subject to the window-plugin ACL.
+#[tauri::command]
+fn toggle_window_maximize(window: tauri::Window) -> Result<(), String> {
+    if window.is_maximized().map_err(|e| format!("{e}"))? {
+        window.unmaximize().map_err(|e| format!("{e}"))
+    } else {
+        window.maximize().map_err(|e| format!("{e}"))
+    }
+}
+
 /// Open an additional top-level app window (File → New Window / Cmd+N). Every
 /// window is just another client of the same engine — the engine + Postgres run
 /// as a shared launchd service (see `desktop`), so all windows share one
@@ -551,19 +577,42 @@ fn restart_service() -> Result<(), String> {
     desktop::restart_service()
 }
 
-/// Full teardown: stop the always-on gateway service (`launchctl bootout`), then
-/// exit the client. This is the ONLY path that stops the service — closing the
-/// window / Cmd+Q merely hide the client (it stays resident in the menu bar), so
-/// triggers, scheduled tasks, coding-agent sessions, and push keep running.
-/// Reached from the menu-bar "Quit & Stop Background Service" item and the
-/// app-menu item of the same name. Sets `QUITTING` so the `ExitRequested` guard
-/// lets this exit through. The next app launch re-installs and re-bootstraps the
+/// Full teardown: confirm with the user, then stop the always-on gateway service
+/// (`launchctl bootout`) and exit the client. This is the ONLY path that stops
+/// the service — closing the window / Cmd+Q merely hide the client (it stays
+/// resident in the menu bar), so triggers, scheduled tasks, coding-agent
+/// sessions, and push keep running. Reached from the menu-bar "Quit and Stop
+/// Background Service" item and the app-menu item of the same name.
+///
+/// Because stopping the service silently halts all of that background work until
+/// the next launch, a native confirm spells out the consequence and points at
+/// the non-destructive alternative (close the window). Only on confirm does it
+/// set `QUITTING` (so the `ExitRequested` guard lets this exit through), stop the
+/// service, and exit. The next app launch re-installs and re-bootstraps the
 /// service.
 #[tauri::command]
 fn quit_lucidos(app: tauri::AppHandle) {
-    QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
-    desktop::stop_service();
-    app.exit(0);
+    let quit_app = app.clone();
+    app.dialog()
+        .message(
+            "Stopping the background service means your triggers and scheduled tasks won't \
+             run, coding-agent sessions will stop, and you won't receive notifications — \
+             until you open Lucidos again.\n\nTo keep them running, close the window instead. \
+             Lucidos stays in the menu bar.",
+        )
+        .title("Quit and Stop Background Service")
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Quit and Stop Service".to_string(),
+            "Cancel".to_string(),
+        ))
+        .show(move |proceed| {
+            if !proceed {
+                return; // Cancel / Escape — leave the client and service running.
+            }
+            QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
+            desktop::stop_service();
+            quit_app.exit(0);
+        });
 }
 
 /// Fully uninstall Lucidos from the GUI — modeled on Docker Desktop's uninstall
@@ -758,14 +807,18 @@ fn show_main_window(app: &tauri::AppHandle) {
 
 /// Install the macOS menu-bar (tray) status item — packaged builds only. It keeps
 /// the client resident after the window is dismissed: "Open Lucidos" re-shows the
-/// window and "Quit & Stop Background Service" is the only full teardown
+/// window and "Quit and Stop Background Service" is the only full teardown
 /// (`quit_lucidos` → `bootout` + exit). The always-on launchd service is
 /// unaffected by closing the window.
 fn install_tray(app: &tauri::App) -> tauri::Result<()> {
-    let Some(icon) = app.default_window_icon().cloned() else {
-        eprintln!("[Tauri] No default window icon available; skipping tray icon");
-        return Ok(());
-    };
+    // macOS menu-bar status items are *template images*: a transparent-background
+    // silhouette the system renders monochrome and inverts for light/dark bars.
+    // The full-colour app icon (`default_window_icon`) would otherwise sit in the
+    // menu bar as a lone blue square among the system's monochrome items. We embed
+    // a dedicated silhouette (the logo glyph from public/icons/icon-source.svg,
+    // no background) and flag it `icon_as_template` so macOS uses only its alpha.
+    // Asset: icons/tray-template.png — regenerate with icons/gen-tray-template.py.
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png"))?;
     let open = MenuItem::with_id(app, "tray_open", "Open Lucidos", true, None::<&str>)?;
     let status = MenuItem::with_id(
         app,
@@ -777,7 +830,7 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
     let quit = MenuItem::with_id(
         app,
         "tray_quit_stop",
-        "Quit & Stop Background Service",
+        "Quit and Stop Background Service",
         true,
         None::<&str>,
     )?;
@@ -793,6 +846,7 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
     )?;
     TrayIconBuilder::with_id("lucidos-tray")
         .icon(icon)
+        .icon_as_template(true)
         .tooltip("Lucidos")
         .menu(&menu)
         .on_menu_event(|app, event| {
@@ -838,6 +892,8 @@ pub fn run() {
             updater::check_app_update,
             updater::install_app_update_and_restart,
             set_titlebar_color,
+            start_window_drag,
+            toggle_window_maximize,
             mobile::get_connect_info,
             mobile::tailscale_up,
             mobile::tailscale_serve,
@@ -845,8 +901,8 @@ pub fn run() {
         .on_window_event(|window, event| {
             // Packaged: closing a window must NOT quit the client or stop the
             // always-on service. Hide the main window instead of letting it close
-            // — the client stays resident in the menu bar (only the tray "Quit &
-            // Stop Background Service" tears down). Secondary windows close
+            // — the client stays resident in the menu bar (only the tray "Quit
+            // and Stop Background Service" tears down). Secondary windows close
             // normally; dev keeps the default close-quits behavior so
             // `tauri-dev.sh` returns when the window is closed.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -857,7 +913,7 @@ pub fn run() {
             }
         })
         .on_menu_event(|app, event| {
-            // "Quit & Stop Background Service" (quit_lucidos) is the only teardown;
+            // "Quit and Stop Background Service" (quit_lucidos) is the only teardown;
             // "Close Window" (Cmd+Q) hides the client like the red X; "New Window"
             // opens another client window. Window close (red X / Cmd+W) is handled
             // in on_window_event above, not here.
@@ -892,7 +948,7 @@ pub fn run() {
         .setup(|app| {
             // Install the app menu. The standard edit/window items keep the
             // usual shortcuts; Cmd+Q maps to "Close Window" (hide the client) and
-            // the explicit "Quit & Stop Background Service" item drives
+            // the explicit "Quit and Stop Background Service" item drives
             // on_menu_event → quit_lucidos. Best-effort: a menu build failure must
             // not block app startup.
             if let Err(e) = install_app_menu(app) {
@@ -984,7 +1040,7 @@ pub fn run() {
 /// Build and install the macOS app menu. Mirrors the default menu (so standard
 /// shortcuts keep working) but maps Cmd+Q to "Close Window" (hides the client,
 /// leaving the always-on service running) and exposes the deliberate full
-/// teardown as a separate, unshortcutted "Quit & Stop Background Service" item
+/// teardown as a separate, unshortcutted "Quit and Stop Background Service" item
 /// (routed through `on_menu_event` → `quit_lucidos`; also in the menu-bar tray).
 fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
     let uninstall = MenuItem::with_id(
@@ -996,13 +1052,13 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
     )?;
     // Cmd+Q closes the window (hides the client) rather than quitting — the
     // always-on service must survive it. The deliberate full teardown is the
-    // separate, unshortcutted "Quit & Stop Background Service" (also in the tray).
+    // separate, unshortcutted "Quit and Stop Background Service" (also in the tray).
     let close_window =
         MenuItem::with_id(app, "close_main_window", "Close Window", true, Some("Cmd+Q"))?;
     let quit = MenuItem::with_id(
         app,
         "quit_lucidos",
-        "Quit & Stop Background Service",
+        "Quit and Stop Background Service",
         true,
         None::<&str>,
     )?;

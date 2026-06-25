@@ -437,13 +437,15 @@ impl LucidosEngine {
                         ));
                     };
                     // Resolve the Lucidos source repo root for the classifier.
+                    // Absent on a packaged build (no source checkout) — `None`
+                    // means the Lucidos-source branch can't match; App +
+                    // External still classify.
                     let lucidos_root = registered_repos
                         .iter()
                         .find(|r| r.name == "Lucidos")
-                        .map(|r| std::path::PathBuf::from(&r.path))
-                        .unwrap_or_else(|| self.repo_root().to_path_buf());
+                        .map(|r| std::path::PathBuf::from(&r.path));
                     let class =
-                        classify_resolved_folder(&folder_abs, &ws_root, &lucidos_root, |p| {
+                        classify_resolved_folder(&folder_abs, &ws_root, lucidos_root.as_deref(), |p| {
                             registered_repos
                                 .iter()
                                 .find(|r| std::path::Path::new(&r.path) == p)

@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
 import { ConnectionStatus } from './ConnectionStatus';
 import { panelOverlay, panelUrl, splitRatio, threadDrawerOpen, threadSearchQuery, mobileView, recoveryProgress, drawerView, attentionThreadCount } from '../../store/store';
 import { useHideOnScroll } from '../../hooks/useHideOnScroll';
+import { useWindowDragRegion } from '../../hooks/useWindowDragRegion';
 import { ThreadToggleButton } from '../shared/ThreadToggleButton';
 import { ComposeIcon, SearchIcon } from '../shared/icons';
 import { ThreadNav } from '../shared/ThreadNav';
@@ -96,6 +97,11 @@ function isInteractive(el: HTMLElement): boolean {
   return false;
 }
 
+/** Window-drag gate (Tauri desktop): the whole header band drags the window,
+ *  except presses on interactive controls. Module-level so it's a stable ref for
+ *  useWindowDragRegion's effect deps (window-zoom stays on the strip, not here). */
+const headerCanDragStart = (target: HTMLElement) => !isInteractive(target);
+
 const headerDblGate = createDblClickGate();
 
 function onHeaderClick(e: MouseEvent) {
@@ -174,6 +180,9 @@ export function AppHeader() {
   const headerRef = useRef<HTMLElement>(null);
   useHideOnScroll(headerRef);
   useHeaderPaneSwipe(headerRef);
+  // Docker-style: the whole header band drags the window (Tauri desktop). Window
+  // zoom stays on the strip — the header's double-click keeps doing pane-maximize.
+  useWindowDragRegion(headerRef, { canStart: headerCanDragStart });
 
   const url = panelUrl.value;
   const showUrlPreview = panelOverlay.value?.type === 'url-preview';
@@ -214,12 +223,12 @@ export function AppHeader() {
   return (
     <>
       <header ref={headerRef} class="pane-header app-header" data-mobile-view={mobileView.value} onClick={onHeaderClick} onDblClick={onHeaderDblClick}>
-        {/* Subtle background wash behind the focused pane's header region.
-            First child so DOM order keeps it under every header control (which
-            carry positive or later-in-DOM z-index) while still sitting above
-            the header's own background. Positioned + revealed entirely from CSS
-            via :root[data-focused-pane] (shell.css); desktop-only. */}
-        <div class="header-focus-bg" aria-hidden="true" />
+        {/* Focused-pane indicator: a smooth rounded accent line pinned to the
+            header's bottom edge, spanning the focused pane's segment. First child
+            so DOM order keeps it under every header control. Positioned +
+            revealed entirely from CSS via :root[data-focused-pane] (shell.css);
+            desktop-only. */}
+        <div class="header-focus-line" aria-hidden="true" />
         <MobileAppHeader />
 
         {/* ─── Desktop: full header ─── */}

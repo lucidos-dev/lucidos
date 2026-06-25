@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tauri = { version = "2", features = ["unstable", "tray-icon"] }
+# image-png: decode the embedded PNG menu-bar template icon via Image::from_bytes
+# (install_tray in lib.rs). Not in tauri's default feature set.
+tauri = { version = "2", features = ["unstable", "tray-icon", "image-png"] }
 tauri-plugin-window-state = "2"
 # Auto-update from GitHub Releases ("update available -> restart") + the confirm
 # dialog it shows. See src/updater.rs and tauri.conf.json plugins.updater.

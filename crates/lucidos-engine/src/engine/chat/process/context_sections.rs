@@ -165,31 +165,14 @@ impl LucidosEngine {
                 .join("knowhow");
             let app_knowhow = crate::core::knowhow::load_app_knowhow(&app_knowhow_dir);
 
-            format!(
-                "[ACTIVE APP UI]\n\
-                The user has the '{name}' app UI open. \
-                App files are at data/apps/{id}/. \
-                Use list_files and read_file to inspect the app's files as needed.\n\
-                {knowhow}\
-                [END ACTIVE APP UI]",
-                name = app_name,
-                id = ctx.app_id,
-                knowhow = app_knowhow
-            )
+            active_app_ui_section(&app_name, &ctx.app_id, &app_knowhow)
         } else {
             String::new()
         };
 
         // Handle file context when the user is viewing a specific file
         let file_context_section = if let Some(path) = file_context {
-            format!(
-                "[ACTIVE FILE CONTEXT]\n\
-The user currently has the file '{}' open in a preview window. \
-They may be asking about or wanting to modify this file. \
-Keep this in mind when interpreting their request.\n\
-[END FILE CONTEXT]",
-                path
-            )
+            active_file_context_section(path)
         } else {
             String::new()
         };
@@ -287,5 +270,110 @@ URL: {}\n\
             url_context_section,
             thread_depth_context,
         }
+    }
+}
+
+/// Shared anchoring clause appended to the `[ACTIVE APP UI]` and
+/// `[ACTIVE FILE CONTEXT]` sections. It leans the chat agent toward treating
+/// what the user has OPEN as the default subject of an ambiguous request —
+/// without forbidding anything. The motivating failure: a user editing their
+/// own `lucidos-me` site (a landing page *about* Lucidos) asked to fix a "logo
+/// tooltip on the Conversation & Canvas mark"; the chat agent took the
+/// Lucidos-flavoured vocabulary as a cue to go hunt and edit Lucidos's own
+/// product source checkout (grepping `crates/lucidos-app/src`, ballooning
+/// context past 600k tokens) instead of the open artifact. The clause is a
+/// DEFAULT, not a lock: the agent must still do anything the user clearly asks
+/// for a different target (another app, Lucidos itself, a workspace task).
+const ANCHOR_DEFAULT_RULE: &str = " This is a DEFAULT, not a restriction — you \
+can still do anything the user clearly asks (edit another app, work on Lucidos \
+the product itself, run a workspace task) when their request names a different \
+target. But don't jump to the Lucidos product source for a request that fits \
+what's open: words that also name Lucidos's own UI (\"logo\", \"mark\", \
+\"Conversation\", \"Canvas\", \"panes\", \"thread\") routinely appear in the \
+user's own app or site content — which may itself be about Lucidos — so they \
+are NOT by themselves a signal to read or edit Lucidos's source code. When the \
+target is genuinely unclear, default to what's open and switch only if the user \
+indicates otherwise.";
+
+/// Build the `[ACTIVE APP UI]` context section for an open app. Pure so the
+/// prompt text (including [`ANCHOR_DEFAULT_RULE`]) is unit-testable without a
+/// `LucidosEngine`/DB.
+fn active_app_ui_section(app_name: &str, app_id: &str, app_knowhow: &str) -> String {
+    format!(
+        "[ACTIVE APP UI]\n\
+        The user has the '{name}' app UI open. \
+        App files are at data/apps/{id}/. \
+        Use list_files and read_file to inspect the app's files as needed.\n\
+        DEFAULT TO THIS APP: Treat this app as the default subject of the \
+        user's request — especially for UI/copy/visual tweaks (text, wording, \
+        a label, a tooltip, a logo, layout, styling). Make the change in this \
+        app's files (data/apps/{id}/, or the artifact/site this app \
+        manages).{anchor}\n\
+        {knowhow}\
+        [END ACTIVE APP UI]",
+        name = app_name,
+        id = app_id,
+        anchor = ANCHOR_DEFAULT_RULE,
+        knowhow = app_knowhow
+    )
+}
+
+/// Build the `[ACTIVE FILE CONTEXT]` section for an open file/artifact. Pure
+/// (see [`active_app_ui_section`]).
+fn active_file_context_section(path: &str) -> String {
+    format!(
+        "[ACTIVE FILE CONTEXT]\n\
+The user currently has the file '{path}' open in a preview window. \
+They may be asking about or wanting to modify this file. \
+Keep this in mind when interpreting their request.\n\
+DEFAULT TO THIS FILE: Treat this file as the default subject of the user's \
+request — especially for UI/copy/visual tweaks (text, wording, a label, a \
+tooltip, a logo, styling). Edit THIS file.{anchor}\n\
+[END FILE CONTEXT]",
+        path = path,
+        anchor = ANCHOR_DEFAULT_RULE
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{active_app_ui_section, active_file_context_section};
+
+    #[test]
+    fn app_ui_section_anchors_on_open_app_without_forbidding_other_work() {
+        let section = active_app_ui_section("Site publisher", "site-publisher", "");
+        // Identifies the open app + its folder.
+        assert!(section.contains("[ACTIVE APP UI]"));
+        assert!(section.contains("'Site publisher'"));
+        assert!(section.contains("data/apps/site-publisher/"));
+        // Leans toward the open app as the default subject.
+        assert!(section.contains("DEFAULT TO THIS APP"));
+        assert!(section.contains("a tooltip"));
+        // Overlapping Lucidos vocabulary is explicitly NOT a cue to edit source.
+        assert!(section.contains("NOT by themselves a signal to read or edit Lucidos's source code"));
+        // But it's a default, not a lock — other work stays possible.
+        assert!(section.contains("DEFAULT, not a restriction"));
+        assert!(section.contains("work on Lucidos the product itself"));
+    }
+
+    #[test]
+    fn file_context_section_anchors_on_open_file() {
+        let section = active_file_context_section("artifacts/web/lucidos-me/index.html");
+        assert!(section.contains("[ACTIVE FILE CONTEXT]"));
+        assert!(section.contains("artifacts/web/lucidos-me/index.html"));
+        assert!(section.contains("DEFAULT TO THIS FILE"));
+        assert!(section.contains("Edit THIS file."));
+        assert!(section.contains("DEFAULT, not a restriction"));
+        assert!(section.contains("NOT by themselves a signal to read or edit Lucidos's source code"));
+    }
+
+    #[test]
+    fn app_knowhow_is_appended_inside_the_section() {
+        let section = active_app_ui_section("Demo", "demo", "[APP KNOWHOW]\nfoo\n");
+        assert!(section.contains("[APP KNOWHOW]\nfoo\n"));
+        // Knowhow sits before the closing marker.
+        let kh = section.find("[APP KNOWHOW]").unwrap();
+        let end = section.find("[END ACTIVE APP UI]").unwrap();
+        assert!(kh < end);
     }
 }

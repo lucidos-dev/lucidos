@@ -775,11 +775,14 @@ pub(super) async fn chat_submit(
                 (r.id, canon)
             })
             .collect();
-        let lucidos_repo_root = match registered_repos
+        // The Lucidos *source* repo is registered only on a dev build (a real
+        // source checkout). On a packaged build it is absent — `None` means the
+        // Lucidos-source classification branch can't match; App + External still
+        // classify, so app/external coding spawns work without a source repo.
+        let lucidos_repo_root = registered_repos
             .iter()
             .find(|r| r.name.eq_ignore_ascii_case(crate::engine::LucidosEngine::DEFAULT_REPO_NAME))
-        {
-            Some(repo) => {
+            .map(|repo| {
                 let raw = PathBuf::from(&repo.path);
                 match std::fs::canonicalize(&raw) {
                     Ok(p) => p,
@@ -788,12 +791,7 @@ pub(super) async fn chat_submit(
                         raw
                     }
                 }
-            }
-            None => {
-                log!("[Chat] Lucidos repo not registered — cannot classify folder");
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        };
+            });
         let lookup_repo_path = |id_or_name: &str| -> Result<Option<PathBuf>, String> {
             if let Ok(uuid) = Uuid::parse_str(id_or_name) {
                 if let Some(r) = registered_repos.iter().find(|r| r.id == uuid) {
@@ -827,7 +825,7 @@ pub(super) async fn chat_submit(
         let classification = match classify_resolved_folder(
             &folder_abs,
             &workspace_root,
-            &lucidos_repo_root,
+            lucidos_repo_root.as_deref(),
             external_repo_match,
         ) {
             Ok(c) => c,

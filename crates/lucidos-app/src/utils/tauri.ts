@@ -63,6 +63,23 @@ export function setTitlebarColor(color: string): Promise<void> {
 }
 
 /**
+ * Start a native drag of the calling window. Used by `useWindowDragRegion` once
+ * the pointer crosses the drag threshold over a non-interactive area of the
+ * title-bar band. App command (always allowed) — replaces the ACL-blocked
+ * `data-tauri-drag-region`. Best-effort; only call when isTauri() is true. */
+export function startWindowDrag(): Promise<void> {
+  return invoke('start_window_drag');
+}
+
+/**
+ * Toggle the calling window between maximized (macOS zoom) and restored. Bound to
+ * a double-click on the reclaimed title-bar strip only. Only call when isTauri()
+ * is true. */
+export function toggleWindowMaximize(): Promise<void> {
+  return invoke('toggle_window_maximize');
+}
+
+/**
  * Show a native macOS notification banner via the app's own
  * `show_native_notification` command (notifications.rs). We drive Apple's modern
  * `UserNotifications` framework (`UNUserNotificationCenter`) in Rust — not

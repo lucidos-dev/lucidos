@@ -6,7 +6,7 @@ import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, diffWholeFil
 import { closeUrl, refreshFilePreview } from '../../store/actions/artifacts';
 import { getAppFrameSrc, getVisibleAppFrame, exitPseudoFullscreen, refreshAppUI, toggleAppSearch } from '../../store/actions/apps';
 import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon, FileIcon, DiffIcon } from '../shared/icons';
-import { RENDERABLE_EXTS, isEditableDataFile } from '../files/previewExts';
+import { RENDERABLE_EXTS, REPO_RENDERABLE_EXTS, isEditableDataFile } from '../files/previewExts';
 import { isTauri, isIOSPwa } from '../../utils/platform';
 import { webviewReload } from '../../utils/tauri';
 import { openFileSearch } from '../files/fileSearchActions';
@@ -145,9 +145,11 @@ export function ContentHeaderActions() {
     );
   } else if (overlay?.type === 'file-preview') {
     const ext = overlay.path.split('.').pop()?.toLowerCase() || '';
-    const hasRendered = RENDERABLE_EXTS.includes(ext);
     const repo = parseRepoPath(overlay.path);
     const isDiff = repo?.mode === 'diff';
+    // Repo HTML has no rendered view (it shows as source — see REPO_RENDERABLE_EXTS),
+    // so the source/rendered toggle is suppressed for it.
+    const hasRendered = (repo ? REPO_RENDERABLE_EXTS : RENDERABLE_EXTS).includes(ext);
     // Repo files are read at a git ref (not the live workspace), so they're not
     // inline-editable; only data files under a mutable prefix are.
     const editable = !repo && isEditableDataFile(overlay.path);

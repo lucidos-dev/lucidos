@@ -1,5 +1,27 @@
 import { describe, it, expect } from 'vitest';
-import { isEditableDataFile, previewMediaKind } from './previewExts';
+import { isEditableDataFile, previewMediaKind, RENDERABLE_EXTS, REPO_RENDERABLE_EXTS } from './previewExts';
+
+describe('REPO_RENDERABLE_EXTS', () => {
+  // Regression: the repo file/diff preview rendered .html into a live srcDoc
+  // iframe, so toggling to the whole-file/rendered view on an app-shell HTML
+  // (crates/lucidos-app/index.html) showed its inlined boot splash ("Opening
+  // your workspace…") instead of the file. Repo HTML is source under review.
+  it('excludes html and htm (repo HTML shows as source, not a live render)', () => {
+    expect(REPO_RENDERABLE_EXTS).not.toContain('html');
+    expect(REPO_RENDERABLE_EXTS).not.toContain('htm');
+  });
+
+  it('keeps the self-contained rendered types (md, csv, svg, slides)', () => {
+    for (const ext of ['md', 'csv', 'svg', 'slides']) {
+      expect(REPO_RENDERABLE_EXTS).toContain(ext);
+    }
+  });
+
+  it('is exactly RENDERABLE_EXTS minus html/htm (artifact viewer still renders HTML)', () => {
+    expect(RENDERABLE_EXTS).toContain('html');
+    expect(REPO_RENDERABLE_EXTS).toEqual(RENDERABLE_EXTS.filter(e => e !== 'html' && e !== 'htm'));
+  });
+});
 
 describe('previewMediaKind', () => {
   // Regression: the repo file viewer (RepoFileContent) fetched EVERY file as

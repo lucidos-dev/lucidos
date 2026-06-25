@@ -202,10 +202,10 @@
     gap: 0.25rem;
 }
 
-/* Focused-pane header tint — desktop-only; positioned + revealed inside the
+/* Focused-pane indicator line — desktop-only; positioned + revealed inside the
    min-width:769px block below. Hidden by default so it never takes a flex slot
    in the mobile header. */
-.header-focus-bg {
+.header-focus-line {
     display: none;
 }
 
@@ -567,54 +567,72 @@
         pointer-events: auto;
     }
 
-    /* Focused-pane indicator: a subtle background wash filling the header
-       segment above the focused pane. It reuses the SAME geometry vars the
-       three header regions are positioned from (--co / --ddo / --divider-x),
-       so the wash lines up with — and slides in lockstep with — the region as
-       the split or drawer width changes; when focus moves between panes the
-       wash glides across (left/width transition), and it fades on show/hide
-       (opacity). It carries NO z-index and renders as the header's first child,
-       so it sits above the header's own background yet under every control (the
-       regions have positive or later-in-DOM z-index) — `.app-header` has no
-       z-index of its own, so a negative z-index here would fall behind the
-       opaque header background instead. Driven by data-focused-pane on :root
-       (set by SplitLayout); collapsed panes never show it (the :not() guards). */
-    .header-focus-bg {
-        /* Subtlety knob: the tint filling the focused pane's header segment.
-           The bar is brand-blue in both themes, so the focus cue is a faint
-           WHITE wash (an accent-blue wash would vanish into the blue bar) —
-           theme-independent, hence no light-mode override. */
-        --header-focus-bg-fill: rgba(255, 255, 255, 0.08);
+    /* Focused-pane indicator: a full-width rounded accent underline at the
+       header's bottom edge, spanning the focused pane's segment. The ELEMENT is
+       an invisible positioning box that reuses the SAME geometry vars the three
+       header regions are positioned from (--co / --ddo / --divider-x), so it
+       lines up with — and slides in lockstep with — the region as the split or
+       drawer width changes; focus moving between panes glides it across
+       (left/width transition) and it fades on show/hide (opacity). The visible
+       underline is drawn by ::after, pinned to the bottom edge and spanning the
+       box edge to edge. It carries NO z-index and renders as the header's first
+       child, so it sits above the header's own background yet under every
+       control (the regions have positive or later-in-DOM z-index). Driven by
+       data-focused-pane on :root (set by SplitLayout); collapsed panes never
+       show it (the :not() guards). */
+    .header-focus-line {
         display: block;
         position: absolute;
         top: 0;
         bottom: 0;
         left: 0;
         width: 0;
-        background: var(--header-focus-bg-fill);
         opacity: 0;
         pointer-events: none;
         transition: left var(--duration-slow) ease, width var(--duration-slow) ease,
                     opacity var(--duration-normal) ease;
     }
 
-    :root[data-focused-pane="drawer"][data-thread-drawer-open] .header-focus-bg {
+    /* The visible cue: a full-width, pill-rounded underline pinned to the
+       header's bottom edge, spanning the focused pane's header segment edge to
+       edge. The positioning box (above) spans that segment and slides between
+       panes, so left:0/right:0 fills whichever pane has focus. The bar is
+       brand-blue in both themes, so the line is white (an accent-blue line would
+       vanish into the blue bar); dark is the default theme and reads brighter
+       against the bar, so the base value is muted for dark and a light-mode
+       override restores a touch more presence. */
+    .header-focus-line::after {
+        content: "";
+        position: absolute;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        height: 0.125rem;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.38);
+    }
+
+    html[data-theme="light"] .header-focus-line::after {
+        background: rgba(255, 255, 255, 0.6);
+    }
+
+    :root[data-focused-pane="drawer"][data-thread-drawer-open] .header-focus-line {
         left: 0;
         width: var(--co);
         opacity: 1;
     }
 
-    :root[data-focused-pane="thread"]:not([data-thread-collapsed]) .header-focus-bg {
+    :root[data-focused-pane="thread"]:not([data-thread-collapsed]) .header-focus-line {
         left: calc(var(--co) + var(--ddo));
         width: calc(var(--divider-x) - var(--co) - var(--ddo));
         opacity: 1;
     }
 
-    /* Fill the content segment all the way to the header's right edge. The wash
+    /* Fill the content segment all the way to the header's right edge. The box
        spans the full padding box (the drawer case starts at left:0, covering the
        left padding), so the content case must reach 100% — subtracting
        --header-padding-x here left a gap of that width on the right. */
-    :root[data-focused-pane="content"]:not([data-content-collapsed]) .header-focus-bg {
+    :root[data-focused-pane="content"]:not([data-content-collapsed]) .header-focus-line {
         left: calc(var(--divider-x) + var(--divider-width));
         width: calc(100% - var(--divider-x) - var(--divider-width));
         opacity: 1;
@@ -633,7 +651,7 @@
     :root[data-pane-resizing] .app-header .pane-header-brand,
     :root[data-pane-resizing] .threads-header,
     :root[data-pane-resizing] .thread-drawer,
-    :root[data-pane-resizing] .header-focus-bg,
+    :root[data-pane-resizing] .header-focus-line,
     :root[data-pane-resizing] .split-layout.snap-animate .pane {
         transition: none;
     }
