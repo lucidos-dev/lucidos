@@ -1,4 +1,4 @@
-import { showToast, dismissToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, toasts, engineRestarting, engineVersion, latestEngineVersion, enginePackaged } from '../store';
+import { showToast, dismissToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, toasts, engineRestarting, engineStartedAt, engineVersion, latestEngineVersion, enginePackaged } from '../store';
 import { changeToastMessage } from './changeToast';
 import { toFailed } from '../types';
 import type { Loadable } from '../types';
@@ -22,6 +22,54 @@ export const RESTART_DISMISSED_FP_LS_KEY = 'lucidos-restart-dismissed-fp';
 
 export const RESTART_GROUPS_LS_KEY = 'lucidos-restart-groups';
 const LEGACY_RESTART_REASONS_LS_KEY = 'lucidos-restart-reasons';
+
+/** Marks that an engine restart is IN FLIGHT (vs. merely pending). `engineRestarting`
+ *  and the two-phase progress toast are in-memory only, so a page reload mid-restart
+ *  would otherwise lose them and `restoreRestartToast` would wrongly fall back to the
+ *  pre-restart "Engine restart required" warning. This key lets restore re-show the
+ *  PROGRESS toast instead. Payload: the engine's `started_at` BEFORE the restart (so
+ *  completion can be detected as a `started_at` change after reload — restore seeds
+ *  it back into engineStartedAt) and `packaged` (so the restored phase matches the
+ *  live initial message: packaged has no build step). */
+export const RESTART_IN_FLIGHT_LS_KEY = 'lucidos-restart-in-flight';
+
+interface RestartInFlight {
+  startedAt: string | null;
+  packaged: boolean;
+}
+
+/** Persist that a restart just started. Called from initiateEngineRestart. */
+function markRestartInFlight(): void {
+  const payload: RestartInFlight = {
+    startedAt: engineStartedAt.value,
+    packaged: enginePackaged.value,
+  };
+  localStorage.setItem(RESTART_IN_FLIGHT_LS_KEY, JSON.stringify(payload));
+}
+
+/** Clear the in-flight marker. MUST be called at every site where
+ *  `engineRestarting` flips back to false (reconnect success, restart timeout,
+ *  spawn-failure revert) so a restored progress toast can never hang. Exported
+ *  for connection.ts's completion/timeout paths. */
+export function clearRestartInFlight(): void {
+  localStorage.removeItem(RESTART_IN_FLIGHT_LS_KEY);
+}
+
+/** Read the in-flight marker, tolerant of a malformed/legacy value. */
+function readRestartInFlight(): RestartInFlight | null {
+  const raw = localStorage.getItem(RESTART_IN_FLIGHT_LS_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<RestartInFlight>;
+    return {
+      startedAt: typeof parsed.startedAt === 'string' ? parsed.startedAt : null,
+      packaged: parsed.packaged === true,
+    };
+  } catch {
+    localStorage.removeItem(RESTART_IN_FLIGHT_LS_KEY);
+    return null;
+  }
+}
 
 /** Record an applied change as part of a thread group, mark the engine as
  *  needing a restart, and refresh the toast. Merges into the existing group
@@ -98,6 +146,12 @@ export const RESTART_SWAP_MESSAGE = 'Starting and swapping to new engine…';
  *  `engineRestarting` on reconnect (started_at change). */
 export async function initiateEngineRestart(): Promise<void> {
   engineRestarting.value = true;
+  // Persist the in-flight state so a page reload mid-restart restores the
+  // PROGRESS toast (restoreRestartToast) instead of the pre-restart warning.
+  // Records the pre-restart started_at so reconnect detection still fires after
+  // the reload (the everOrRestarting gate in connection.ts). Cleared at every
+  // engineRestarting flip-false site below + in connection.ts.
+  markRestartInFlight();
   // Light, dismissible status toast — the UI is NOT deactivated during a restart
   // anymore (the gateway boot splash + GET-gate + SSE reconnect make it a
   // recoverable non-event), so this is just a "why is it briefly unresponsive"
@@ -125,6 +179,7 @@ export async function initiateEngineRestart(): Promise<void> {
       // Spawn-failure path: engine rejected restart and is still alive.
       // Revert the indicator so the UI doesn't freeze on "Restarting…".
       engineRestarting.value = false;
+      clearRestartInFlight();
       showToast(`Restart failed: ${e.reason}`, 'error', { key: RESTART_TOAST_KEY });
       return;
     }
@@ -132,6 +187,7 @@ export async function initiateEngineRestart(): Promise<void> {
       // restart_service (Tauri) rejects with a plain string. The service is
       // still alive — revert the indicator and surface the reason.
       engineRestarting.value = false;
+      clearRestartInFlight();
       showToast(`Restart failed: ${e}`, 'error', { key: RESTART_TOAST_KEY });
       return;
     }
@@ -179,15 +235,23 @@ export function dismissRestartToast(): void {
  *  the change set hasn't grown, stays hidden; otherwise the dismissal is
  *  cleared and the toast reappears. */
 export function syncRestartToast(): void {
+  // A restart in flight owns RESTART_TOAST_KEY via the two-phase progress toast
+  // (initiateEngineRestart, or restoreRestartToast after a reload mid-restart).
+  // Leave it untouched here: a re-sync (SSE reconnect, a startup/resume
+  // refreshChangesState, a freshly-applied ChangeApplied → addRestartGroup) must
+  // NEITHER clobber it with the "restart required" warning + Restart button
+  // (restartRequired still true — nagging the user to start something already
+  // underway) NOR dismiss it when the applied change drops out of the pending
+  // list (restartRequired flips false — that would wipe the build/swap progress
+  // toast mid-restart). checkConnection clears everything on reconnect
+  // (started_at change). Keep persisting RESTART_LS_KEY while a restart is
+  // pending so the warning still restores if the restart never completes.
+  if (engineRestarting.value) {
+    if (restartRequired.value) localStorage.setItem(RESTART_LS_KEY, 'true');
+    return;
+  }
   if (restartRequired.value) {
     localStorage.setItem(RESTART_LS_KEY, 'true');
-    // A restart is already in flight: the "Restarting engine..." status toast
-    // (initiateEngineRestart) owns RESTART_TOAST_KEY. restartRequired stays true
-    // until reconnect clears engineRestarting, so re-running this (SSE reconnect,
-    // a freshly-applied ChangeApplied → addRestartGroup) would otherwise clobber
-    // that status toast with the "restart required" warning + Restart button —
-    // nagging the user to start something already underway. Leave the key alone.
-    if (engineRestarting.value) return;
     const dismissedFp = localStorage.getItem(RESTART_DISMISSED_FP_LS_KEY);
     const currentFp = currentRestartFingerprint();
     if (dismissedFp !== null && dismissedFp === currentFp) {
@@ -214,18 +278,54 @@ export function syncRestartToast(): void {
   }
 }
 
-/** Restore the restart-required toast from localStorage on startup.
- *  Called before the async refreshChangesState() so the toast is visible
- *  immediately, even if the API call is slow or fails. */
+/** Rehydrate the per-thread restart groups from localStorage (best-effort). */
+function restoreRestartGroupsFromStorage(): void {
+  try {
+    const saved = localStorage.getItem(RESTART_GROUPS_LS_KEY);
+    if (saved) restartGroups.value = JSON.parse(saved) as RestartGroup[];
+  } catch {
+    localStorage.removeItem(RESTART_GROUPS_LS_KEY);
+  }
+}
+
+/** Restore the restart toast from localStorage on startup. Called before the
+ *  async refreshChangesState() so the toast is visible immediately, even if the
+ *  API call is slow or fails.
+ *
+ *  Two cases, in priority order:
+ *   1. A restart was IN FLIGHT when the page unloaded (the user reloaded
+ *      mid-restart). Restore the PROGRESS toast + `engineRestarting`, and resume
+ *      completion detection so checkConnection still fires "Engine restarted" on
+ *      reconnect. This takes precedence — re-showing the pre-restart warning here
+ *      would nag the user to start a restart already underway.
+ *   2. A restart is merely PENDING (`RESTART_LS_KEY`). Restore the
+ *      "Engine restart required" warning toast (its Restart button). */
 export function restoreRestartToast(): void {
   localStorage.removeItem(LEGACY_RESTART_REASONS_LS_KEY);
+
+  const inFlight = readRestartInFlight();
+  if (inFlight) {
+    restoreRestartGroupsFromStorage();
+    restartRequired.value = true;
+    engineRestarting.value = true;
+    // Seed the pre-restart started_at so checkConnection's completion check sees
+    // the new engine's started_at as a genuine restart (and NOT the dev build
+    // phase, where the old engine is still up with this same started_at). The
+    // restored `engineRestarting` itself unlocks that detection across the reload
+    // (see the everOrRestarting gate in connection.ts), so completion still fires
+    // and the flag can't hang.
+    engineStartedAt.value = inFlight.startedAt;
+    // Mirror initiateEngineRestart's initial phase; checkConnection advances
+    // build→swap when the old engine goes unreachable, and clears it all on
+    // reconnect. syncRestartToast is intentionally NOT called — the
+    // engineRestarting guard would suppress it anyway.
+    const message = inFlight.packaged ? RESTART_SWAP_MESSAGE : RESTART_BUILD_MESSAGE;
+    showToast(message, 'info', { key: RESTART_TOAST_KEY, showDuringRestart: true, spinning: true });
+    return;
+  }
+
   if (localStorage.getItem(RESTART_LS_KEY) === 'true') {
-    try {
-      const saved = localStorage.getItem(RESTART_GROUPS_LS_KEY);
-      if (saved) restartGroups.value = JSON.parse(saved) as RestartGroup[];
-    } catch {
-      localStorage.removeItem(RESTART_GROUPS_LS_KEY);
-    }
+    restoreRestartGroupsFromStorage();
     restartRequired.value = true;
     syncRestartToast();
   }

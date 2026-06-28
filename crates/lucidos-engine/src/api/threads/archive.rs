@@ -109,22 +109,28 @@ fn classify_archive_decision(family: &[FamilyRow], thread_uuid: Uuid) -> Archive
 
     // Parent gate: the parent is archivable unless one of:
     //   1. live work is running on it (Running) — reject `parent_not_archivable`
-    //   2. already archived — reject `parent_not_archivable` (idempotency)
-    //   3. in-workspace CC thread with a pending change — reject
+    //   2. in-workspace CC thread with a pending change — reject
     //      `parent_has_pending_changes`; user must Apply or Discard first.
     //      Aligns with `resolve_actions`, which already returns
     //      [Discard, Apply] (never Archive) in this state. External-repo CC
     //      is exempt — Apply can't merge into a foreign repo, so its only
     //      exit is Archive with the `external_repo_pending` cleanup path
     //      (`ChangeApplied` emitted before `ThreadArchived`).
+    // An already-archived parent is NOT a rejection — archive is idempotent.
+    // It falls through to Proceed; the `to_archive` filter below excludes
+    // already-archived rows, so the response is a no-op success (`archived:
+    // []`) or just any descendant that legitimately resurfaced to inbox.
+    // Rejecting here instead produced a stuck Archive button: a frontend whose
+    // `meta.section` had desynced to 'inbox' (a missed `ThreadArchived` SSE or
+    // a failed archive HTTP response on a flaky PWA — backend at 'archived',
+    // client at 'inbox') offered Archive, the 409 rolled the client's
+    // optimistic flip back to 'inbox', and the button reappeared on every tap.
     // WaitingForUserAnswer is admitted — the per-thread cascade step below
     // stamps the dangling QuestionCard as Canceled. Descendants are
     // re-validated separately below with the authoritative locked state via
     // `is_blocking` (which already rejects in-workspace CC descendants with
     // pending changes).
-    if parent_row.status_enum() == ThreadStatus::Running
-        || parent_row.archive_state_enum() == ArchiveState::Archived
-    {
+    if parent_row.status_enum() == ThreadStatus::Running {
         return ArchiveDecision::Reject {
             status: StatusCode::CONFLICT,
             body: serde_json::json!({
@@ -213,9 +219,10 @@ fn internal_json<E: std::fmt::Display>(e: E) -> (StatusCode, axum::Json<serde_js
 ///
 /// Inside one transaction the recursive CTE locks parent + all descendants
 /// (`FOR UPDATE`), then `classify_archive_decision` runs the parent gate
-/// (Running / Archived / in-workspace CC with pending change) and the
-/// per-descendant gate via `is_blocking`. If anyone blocks, the lock is
-/// dropped and the caller gets `409` with a structured body
+/// (Running / in-workspace CC with pending change — an already-archived parent
+/// is idempotent, not a rejection) and the per-descendant gate via
+/// `is_blocking`. If anyone blocks, the lock is dropped and the caller gets
+/// `409` with a structured body
 /// (`reason: parent_not_archivable | parent_has_pending_changes | descendants_blocking`).
 ///
 /// On success, the lock is committed (releasing FOR UPDATE — the actual event

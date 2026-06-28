@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.13.1 — 2026-06-28
+
+### Fixed
+- **Toast in light mode** — toasts read gray on a light background; now use a white fill so they render cleanly.
 ## v0.13.0 — 2026-06-28
 
 ### Added

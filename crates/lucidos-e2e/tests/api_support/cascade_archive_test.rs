@@ -187,6 +187,63 @@ async fn archive_cascade_archives_idle_descendants() {
     pool.close().await;
 }
 
+/// Idempotent re-archive: archiving an already-archived thread returns 200
+/// with an empty `archived` list and emits NO new `ThreadArchived` event —
+/// it is NOT a 409. This is the API-boundary guard for the stuck-Archive-button
+/// bug: a client whose `meta.section` desynced to 'inbox' (missed SSE / failed
+/// archive HTTP on a flaky PWA) re-POSTs archive; the old behaviour 409'd
+/// (`parent_not_archivable`), which the client rolled back into the button
+/// reappearing. Now the re-POST succeeds, so the client's optimistic
+/// 'archived' flip stands and the button disappears.
+#[tokio::test]
+async fn archive_already_archived_thread_is_idempotent() {
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+
+    let thread_id = Uuid::new_v4();
+    // Already-archived chat thread, idle, no descendants.
+    seed_thread(
+        &pool, thread_id, None, false, "idle", "archived", false, false,
+    )
+    .await;
+
+    let url = format!("{}/api/v1/threads/archive", base_url());
+    let resp = client
+        .post(&url)
+        .json(&json!({ "thread_id": thread_id.to_string() }))
+        .send()
+        .await
+        .expect("archive request failed");
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.expect("Invalid JSON");
+
+    assert_eq!(
+        status, 200,
+        "re-archiving an already-archived thread must be idempotent success, not 409: body={body:?}"
+    );
+    let archived = body["archived"]
+        .as_array()
+        .unwrap_or_else(|| panic!("response missing `archived` array: {body:?}"));
+    assert!(
+        archived.is_empty(),
+        "already-archived thread has nothing to re-emit: {archived:?}"
+    );
+
+    // No ThreadArchived event should have been emitted (the row was seeded
+    // directly without one, so the count must stay at zero).
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        count_thread_archived_events(&pool, thread_id).await,
+        0,
+        "idempotent re-archive must not emit a duplicate ThreadArchived event"
+    );
+
+    cleanup_threads(&pool, &[thread_id]).await;
+    pool.close().await;
+}
+
 /// Cascade reject: a Running CC sub-thread blocks the parent's archive with
 /// 409 `descendants_blocking`. NO `ThreadArchived` event lands.
 #[tokio::test]

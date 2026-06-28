@@ -2,7 +2,7 @@ import { connectionStatus, dismissToast, showToast, toasts, workspaceName, works
 import { checkHealth, API_BASE } from '../../api/client';
 import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearForcedRetries } from './thread-loading';
-import { refreshChangesState, RESTART_LS_KEY, RESTART_TOAST_KEY, RESTART_SWAP_MESSAGE } from './chat-changes';
+import { refreshChangesState, clearRestartInFlight, RESTART_LS_KEY, RESTART_TOAST_KEY, RESTART_SWAP_MESSAGE } from './chat-changes';
 import { loadUnreadNotifications } from './notifications';
 import { isNewerVersion } from '../../utils/version';
 import { syncClientUpdateFromBuild } from './client-update';
@@ -145,6 +145,9 @@ export async function handleRestartTimeout(): Promise<void> {
   // overlay can never hang on a reachable-but-not-restart-detected edge.
   const health = await checkHealth();
   engineRestarting.value = false;
+  // Timeout's contract is to always end the restart — drop the in-flight marker
+  // too so a reload after a timed-out restart won't restore the progress toast.
+  clearRestartInFlight();
   if (health.status === 'loaded') {
     // Engine is reachable — the restart completed while we were suspended /
     // foregrounded and we just hadn't noticed. Run the normal reconnect path
@@ -298,8 +301,17 @@ export async function checkConnection(): Promise<boolean> {
 
   // Detect engine restart: either we reconnected after a visible disconnect, or the
   // engine's started_at changed (fast restart within the polling interval).
-  const reconnected = !wasConnected && connected && hasEverConnected;
-  const engineRestarted = connected && hasEverConnected && !!health?.started_at && prevStartedAt !== health.started_at;
+  //
+  // `hasEverConnected` gates out a fresh cold start's first connect (not a
+  // restart). It resets on a page reload, so a reload mid-restart would normally
+  // strand the detection — but `engineRestarting` (restored from the in-flight
+  // marker by restoreRestartToast, which also seeds the pre-restart started_at)
+  // is an equally valid signal that a connect now is a restart completion. Either
+  // unlocks detection; the `started_at` comparison still distinguishes a genuine
+  // restart from the dev build phase (engine still up, same started_at).
+  const everOrRestarting = hasEverConnected || engineRestarting.value;
+  const reconnected = !wasConnected && connected && everOrRestarting;
+  const engineRestarted = connected && everOrRestarting && !!health?.started_at && prevStartedAt !== health.started_at;
 
   if (reconnected || engineRestarted) {
     // Only dismiss the restart toast when the engine actually restarted
@@ -309,6 +321,9 @@ export async function checkConnection(): Promise<boolean> {
     if (engineRestarted) {
       engineRestarting.value = false;
       localStorage.removeItem(RESTART_LS_KEY);
+      // The restart finished — drop the in-flight marker so a later reload won't
+      // restore a stale progress toast (restoreRestartToast in chat-changes.ts).
+      clearRestartInFlight();
       dismissToast('restart-required');
       // Plain, benign confirmation with NO Refresh action. After a pure
       // engine-only (Rust) restart the loaded client bundle is byte-identical to

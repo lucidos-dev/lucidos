@@ -560,8 +560,11 @@ impl GatewayState {
         };
 
         self.bring_up(ws.clone()).await;
-        let stacks = self.inner.stacks.lock().await;
-        let status = match stacks.get(&ws.id) {
+        // Clone the Arc out and drop the map lock before locking the stack — the
+        // supervisor holds stack→map, so map→stack here would deadlock (same
+        // ordering as restart/stop/delete).
+        let stack = self.inner.stacks.lock().await.get(&ws.id).cloned();
+        let status = match stack {
             Some(s) => s.lock().await.status(),
             None => WorkspaceStatus {
                 id: ws.id.clone(),
@@ -918,7 +921,11 @@ impl GatewayState {
             ws.name = name.to_string();
             reg.save(&self.inner.registry_path)?;
         }
-        if let Some(stack) = self.inner.stacks.lock().await.get(id) {
+        // Clone the Arc out and drop the map lock before locking the stack —
+        // the supervisor holds stack→map, so map→stack here would deadlock (see
+        // `set_autostart` / the restart/stop/delete pattern).
+        let stack = self.inner.stacks.lock().await.get(id).cloned();
+        if let Some(stack) = stack {
             stack.lock().await.ws.name = name.to_string();
         }
         crate::log!("[Gateway] renamed '{}' -> '{}'", id, name);
@@ -991,7 +998,12 @@ impl GatewayState {
             reg.save(&self.inner.registry_path)?;
         }
         // Keep a running stack's copy in sync so a later respawn carries it.
-        if let Some(stack) = self.inner.stacks.lock().await.get(id) {
+        // Clone the Arc out and DROP the map lock before locking the stack: the
+        // supervisor holds stack→map (briefly, in its apply phase), so holding
+        // map→stack here would be an AB-BA deadlock. Same ordering as
+        // restart/stop/delete.
+        let stack = self.inner.stacks.lock().await.get(id).cloned();
+        if let Some(stack) = stack {
             stack.lock().await.ws.autostart = enabled;
         }
         crate::log!("[Gateway] '{}' autostart = {}", id, enabled);
@@ -1113,28 +1125,68 @@ impl GatewayState {
     async fn supervise_once(&self) {
         let stacks: Vec<Arc<AsyncMutex<StackRuntime>>> =
             { self.inner.stacks.lock().await.values().cloned().collect() };
+
+        // Snapshot phase: capture each candidate stack's probe inputs under a
+        // BRIEF lock, then RELEASE it. The probe must not run with the stack lock
+        // held — `list_status` (the picker's 2s poll) and create/delete/restart
+        // take that same per-stack lock, so holding it across the up-to-5s probe
+        // stalls the picker for seconds whenever an engine is briefly slow to
+        // answer. The `StackRuntime` mutex protects in-memory state, not the
+        // network round-trip.
+        let mut candidates: Vec<ProbeTarget> = Vec::with_capacity(stacks.len());
         for stack in stacks {
-            let mut s = stack.lock().await;
+            let (id, port, last_spawn) = {
+                let s = stack.lock().await;
+                // A stack capped as Unhealthy is left for manual retry/delete.
+                if s.health == Health::Unhealthy {
+                    continue;
+                }
+                (s.ws.id.clone(), s.ws.port, s.last_spawn)
+            };
             // A concurrent delete may have removed this stack from the map (and
             // trashed its dir) while we held only the snapshot Arc. Don't
             // resurrect a deleted workspace's engine + Postgres — skip it.
-            if !self.inner.stacks.lock().await.contains_key(&s.ws.id) {
+            if !self.inner.stacks.lock().await.contains_key(&id) {
                 continue;
             }
-            // A stack capped as Unhealthy is left for manual retry/delete.
-            if s.health == Health::Unhealthy {
+            candidates.push(ProbeTarget {
+                stack,
+                id,
+                port,
+                last_spawn,
+            });
+        }
+
+        // Probe phase: run every candidate's health probe CONCURRENTLY with no
+        // stack lock held, so one slow engine never serializes the whole pass.
+        let scheme = self.engine_scheme();
+        let client = &self.inner.health_client;
+        let outcomes: Vec<ProbeOutcome> = futures::future::join_all(
+            candidates
+                .iter()
+                .map(|t| stack::probe_health(client, scheme, t.port)),
+        )
+        .await;
+
+        // Apply phase: re-acquire each stack briefly to write the result back.
+        for (t, outcome) in candidates.into_iter().zip(outcomes) {
+            let mut s = t.stack.lock().await;
+            // The lock was dropped across the probe, so the stack may have changed
+            // under us. Discard a stale result rather than apply it to a
+            // stopped/deleted/respawned/capped stack (see `probe_result_is_stale`).
+            // `contains_key` is checked WHILE holding the stack lock, matching the
+            // delete path's ordering so a concurrent delete is observed as absent.
+            let present = self.inner.stacks.lock().await.contains_key(&t.id);
+            if probe_result_is_stale(present, t.last_spawn, s.last_spawn, s.health) {
                 continue;
             }
-            let outcome =
-                stack::probe_health(&self.inner.health_client, self.engine_scheme(), s.ws.port)
-                    .await;
             if outcome == ProbeOutcome::Healthy {
                 s.health = Health::Healthy;
                 s.restart_attempts = 0;
                 s.health_misses = 0;
                 s.last_error = None;
                 // Booted — drop the boot phase so a later cold open starts clean.
-                self.clear_boot_phase(&s.ws.id);
+                self.clear_boot_phase(&t.id);
                 continue;
             }
 
@@ -1163,7 +1215,7 @@ impl GatewayState {
                     // Gave up auto-respawning — drop the phase; the last label
                     // would otherwise lie ("Downloading memory model…" on a dead
                     // engine). The splash falls back to the neutral default.
-                    self.clear_boot_phase(&s.ws.id);
+                    self.clear_boot_phase(&t.id);
                     if s.last_error.is_none() {
                         s.last_error = Some(
                             "engine failed to become healthy after repeated restarts".to_string(),
@@ -1171,14 +1223,14 @@ impl GatewayState {
                     }
                     crate::log!(
                         "[Gateway] '{}' marked unhealthy after {} restarts",
-                        s.ws.id,
+                        t.id,
                         s.restart_attempts
                     );
                 }
                 SuperviseAction::Respawn => {
                     crate::log!(
                         "[Gateway] respawning '{}' after {} missed probe(s) (outcome={:?}, alive={})",
-                        s.ws.id,
+                        t.id,
                         s.health_misses,
                         outcome,
                         alive
@@ -1188,6 +1240,39 @@ impl GatewayState {
             }
         }
     }
+}
+
+/// One stack's probe inputs, snapshotted under a brief lock so the health probe
+/// itself runs WITHOUT the stack lock held (see `supervise_once`). `last_spawn`
+/// is the generation marker used to discard a result whose engine was respawned
+/// during the unlocked probe window.
+struct ProbeTarget {
+    stack: Arc<AsyncMutex<StackRuntime>>,
+    id: String,
+    port: u16,
+    last_spawn: Option<Instant>,
+}
+
+/// Whether a health-probe result must be DISCARDED rather than applied to its
+/// stack. `supervise_once` releases the stack lock across the (up-to-5s) network
+/// probe so the picker's `list_status` never blocks behind it; on re-lock the
+/// stack may have changed under us. Discard if:
+///   * the stack was removed from the map by a concurrent stop/delete
+///     (`present == false`) — never resurrect a stopped/deleted engine;
+///   * the stack was respawned/restarted during the probe (`last_spawn` moved) —
+///     the probe described the OLD engine, so judging the fresh one off it would
+///     bounce a just-restarted workspace;
+///   * the stack is now capped `Unhealthy` — left for manual retry/delete.
+///
+/// `None == None` (a re-adopted engine that has never respawned) counts as
+/// "unchanged", so its healthy probes still apply.
+fn probe_result_is_stale(
+    present: bool,
+    last_spawn_before: Option<Instant>,
+    last_spawn_now: Option<Instant>,
+    health: Health,
+) -> bool {
+    !present || last_spawn_before != last_spawn_now || health == Health::Unhealthy
 }
 
 /// What the supervisor should do with one stack after a single health probe.
@@ -2191,5 +2276,54 @@ mod tests {
             ),
             SuperviseAction::MarkUnhealthy
         );
+    }
+
+    // ── Probe staleness guard (probe_result_is_stale) ──────────────────────
+    // The supervisor drops the stack lock across the (up-to-5s) probe so the
+    // picker's `list_status` never blocks behind it. On re-lock the stack may
+    // have changed under us; these pin which results must be DISCARDED.
+
+    #[test]
+    fn removed_stack_result_is_stale() {
+        // A concurrent stop/delete removed the stack from the map → never apply
+        // (never resurrect a stopped/deleted engine), regardless of generation.
+        let t0 = Instant::now();
+        assert!(probe_result_is_stale(false, Some(t0), Some(t0), Health::Booting));
+        assert!(probe_result_is_stale(false, None, None, Health::Healthy));
+    }
+
+    #[test]
+    fn respawned_stack_result_is_stale() {
+        // `last_spawn` moved during the probe → the probe described the OLD
+        // engine; applying it would bounce a just-restarted workspace.
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(probe_result_is_stale(true, Some(t0), Some(t1), Health::Booting));
+        // A re-adopted engine (None) that respawned during the probe (Some) too.
+        assert!(probe_result_is_stale(true, None, Some(t1), Health::Booting));
+    }
+
+    #[test]
+    fn capped_unhealthy_result_is_stale() {
+        // Capped Unhealthy while the probe was in flight → left for manual retry.
+        let t0 = Instant::now();
+        assert!(probe_result_is_stale(true, Some(t0), Some(t0), Health::Unhealthy));
+    }
+
+    #[test]
+    fn unchanged_present_result_applies() {
+        // Still present, same generation, not capped → apply the probe result.
+        let t0 = Instant::now();
+        assert!(!probe_result_is_stale(true, Some(t0), Some(t0), Health::Healthy));
+        assert!(!probe_result_is_stale(true, Some(t0), Some(t0), Health::Booting));
+    }
+
+    #[test]
+    fn readopted_engine_unchanged_applies() {
+        // A re-adopted engine keeps `last_spawn == None`; None == None counts as
+        // "unchanged", so its healthy probes still apply (else it never leaves
+        // Booting).
+        assert!(!probe_result_is_stale(true, None, None, Health::Booting));
+        assert!(!probe_result_is_stale(true, None, None, Health::Healthy));
     }
 }

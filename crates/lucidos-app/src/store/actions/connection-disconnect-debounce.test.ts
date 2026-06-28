@@ -34,6 +34,7 @@ vi.mock('./thread-loading', () => ({
 }));
 vi.mock('./chat-changes', () => ({
   refreshChangesState: vi.fn(),
+  clearRestartInFlight: vi.fn(),
   RESTART_LS_KEY: 'restart-required',
 }));
 vi.mock('./notifications', () => ({

@@ -420,6 +420,57 @@ async fn archive_rejects_when_parent_running() {
 }
 
 #[tokio::test]
+async fn archive_already_archived_parent_is_idempotent() {
+    // Archiving an already-archived thread is a no-op SUCCESS, not a 409.
+    // The parent gate rejects only live work (Running); an already-archived
+    // target falls through to Proceed with an empty `to_archive` (the filter
+    // already excludes already-archived rows). Without this, a frontend whose
+    // `meta.section` has desynced to 'inbox' (a missed `ThreadArchived` SSE or
+    // a failed archive HTTP response on a flaky PWA leaves the backend at
+    // 'archived' but the client at 'inbox') shows a stale Archive button that
+    // 409s on every tap; the client's catch then rolls the optimistic flip
+    // back to 'inbox', re-showing the button — a permanently stuck control.
+    // Idempotent archive lets the click converge to 'archived'.
+    let parent_id = Uuid::new_v4();
+    let family = vec![archived(parent_id)];
+    let ArchiveDecision::Proceed {
+        to_archive,
+        external_repo_pending,
+    } = classify_archive_decision(&family, parent_id)
+    else {
+        panic!("expected Proceed (idempotent) when the parent is already archived");
+    };
+    assert!(
+        to_archive.is_empty(),
+        "an already-archived parent has nothing to re-emit: {:?}",
+        to_archive
+    );
+    assert!(external_repo_pending.is_empty());
+}
+
+#[tokio::test]
+async fn archive_already_archived_parent_archives_resurfaced_descendant() {
+    // Partial-cascade state: the parent is already archived but a descendant
+    // resurfaced to inbox (e.g. a late `CodingAgentIdled` after the family was
+    // archived). Re-archiving the parent must archive the resurfaced
+    // descendant rather than reject — the idempotent parent gate is what makes
+    // this reachable (the old `archive_state == Archived` rejection 409'd the
+    // whole family and left the descendant stranded in Review).
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    let family = vec![archived(parent_id), idle_cc(child_id)];
+    let ArchiveDecision::Proceed {
+        to_archive,
+        external_repo_pending,
+    } = classify_archive_decision(&family, parent_id)
+    else {
+        panic!("expected Proceed with the resurfaced descendant");
+    };
+    assert_eq!(to_archive, vec![child_id]);
+    assert!(external_repo_pending.is_empty());
+}
+
+#[tokio::test]
 async fn archive_rejects_parent_cc_with_pending_changes() {
     // In-workspace CC parent with a pending change is NOT archivable. The
     // user must Apply or Discard the change first. Without this gate the

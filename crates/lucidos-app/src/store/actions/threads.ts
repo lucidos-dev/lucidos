@@ -138,12 +138,11 @@ function formatArchiveErrorToast(err: unknown): string {
       return "Can't archive yet — a sub-thread is still busy";
     }
     if (body.reason === 'parent_not_archivable') {
-      // parent_status === 'running' is the live-work case; any other status
-      // means the parent's archive_state was already 'archived' (the OR in
-      // `classify_archive_decision` rejected on the second clause).
-      const status = body.parent_status;
-      if (status === 'running') return "Can't archive yet — this thread is still running";
-      return 'This thread is already archived';
+      // Archive is idempotent: an already-archived target is a no-op success
+      // (200), not a 409, so `parent_not_archivable` is now raised ONLY for
+      // live work (status === 'running'). See `classify_archive_decision` in
+      // crates/lucidos-engine/src/api/threads/archive.rs.
+      return "Can't archive yet — this thread is still running";
     }
     if (body.reason === 'parent_has_pending_changes') {
       return "Can't archive — apply or discard the pending change first";

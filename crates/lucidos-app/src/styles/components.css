@@ -277,13 +277,14 @@
 }
 
 .toast {
-    /* Elevated surface: the fill sits one step above the app background
-       (--bg-tertiary, not the near-canvas --bg-secondary) and rides the
-       deeper --shadow-md, so the toast clearly floats above the chrome
-       instead of blending into it. Every toast keeps this plain theme bg; the
-       per-type rules below only add a frame (the border) in the toast's own
-       category colour, so the toast pops off the page via that frame, not the
-       fill. */
+    /* Elevated surface: in DARK mode the fill sits one step above the app
+       background (--bg-tertiary, not the near-canvas --bg-secondary) and rides
+       the deeper --shadow-md, so the toast clearly floats above the chrome
+       instead of blending into it. (Light mode inverts the bg ladder, so it
+       overrides this fill to white below — see the `html[data-theme="light"]
+       .toast` rule.) Every toast keeps this plain theme bg; the per-type rules
+       below only add a frame (the border) in the toast's own category colour, so
+       the toast pops off the page via that frame, not the fill. */
     background: var(--bg-tertiary);
     border: 0.15625rem solid var(--border-color);
     border-radius: 0.375rem;
@@ -426,6 +427,14 @@
 .toast-info    { --toast-accent: var(--accent); }
 .toast-warning { --toast-accent: color-mix(in srgb, var(--accent-yellow) 70%, var(--text-secondary)); }
 .toast-error   { --toast-accent: var(--accent-red); }
+
+/* Light-mode fill override: the bg ladder INVERTS between themes. In dark mode
+   surfaces get lighter as they rise (primary→secondary→tertiary), so the base
+   --bg-tertiary fill reads as "elevated". In light mode it inverts — tertiary
+   (#e1e4e8) is the DARKEST of the three, so that same fill renders the toast as a
+   gray slab. Elevation in light mode is toward white, so the toast sits on the
+   brightest surface (--bg-primary) and floats on its shadow + category border. */
+html[data-theme="light"] .toast { background: var(--bg-primary); }
 
 /* Light-mode warning override: the default mix muddies to brown in light mode
    because --text-secondary is dark there (#656d76) and --accent-yellow is already

@@ -59,6 +59,13 @@ export function useStartup(): void {
       setFocusedThread(savedThreadId);
     }
 
+    // Restore restart-toast state from localStorage BEFORE the first
+    // checkConnection: a reload mid-restart re-shows the progress toast and seeds
+    // engineRestarting + the pre-restart started_at, which checkConnection reads
+    // to detect the restart completion. (Cold start with only a pending restart
+    // re-shows the "restart required" warning.)
+    restoreRestartToast();  // Immediate — show from localStorage before async API
+
     // Initial loads
     checkConnection().then((connected) => {
       if (connected) {
@@ -96,7 +103,6 @@ export function useStartup(): void {
     // Capture wasAtBottom on tab-hide so we can re-pin to the new bottom on
     // return — covers the streaming-while-tabbed-away → frozen-scroll bug.
     const stopScrollVisibility = startScrollVisibilityHandler();
-    restoreRestartToast();  // Immediate — show from localStorage before async API
     refreshChangesState();
 
     // Global click handler for thread links, external URLs, and copy buttons

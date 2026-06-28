@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { restartRequired, restartGroups, toasts, showToast, engineVersion, latestEngineVersion, engineRestarting } from '../store';
-import { syncRestartToast, restoreRestartToast, addRestartGroup, dismissRestartToast, RESTART_LS_KEY, RESTART_DISMISSED_FP_LS_KEY } from '../actions/chat-changes';
+import { syncRestartToast, restoreRestartToast, addRestartGroup, dismissRestartToast, RESTART_LS_KEY, RESTART_IN_FLIGHT_LS_KEY, RESTART_DISMISSED_FP_LS_KEY } from '../actions/chat-changes';
 
 const RESTART_TOAST_KEY = 'restart-required';
 const RESTART_GROUPS_LS_KEY = 'lucidos-restart-groups';
@@ -16,6 +16,10 @@ beforeEach(() => {
   // toast while that flag is set, so reset it or later tests see no toasts.
   engineRestarting.value = false;
   localStorage.removeItem(RESTART_LS_KEY);
+  // initiateEngineRestart (fired by the "clicking Restart" test) persists this
+  // in-flight marker; clear it so a later test's restoreRestartToast doesn't take
+  // the progress-toast branch instead of the pre-restart warning branch.
+  localStorage.removeItem(RESTART_IN_FLIGHT_LS_KEY);
   localStorage.removeItem(RESTART_GROUPS_LS_KEY);
   localStorage.removeItem(LEGACY_REASONS_LS_KEY);
   localStorage.removeItem(RESTART_DISMISSED_FP_LS_KEY);

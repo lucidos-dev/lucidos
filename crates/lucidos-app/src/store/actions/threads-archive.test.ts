@@ -1049,18 +1049,21 @@ describe('handleArchiveThread — 409 error toasts', () => {
     expect(message).toBe("Can't archive yet — this thread is still running");
   });
 
-  it('formats parent_not_archivable when parent is already archived', async () => {
-    // The OR in `classify_archive_decision` rejects when archive_state is
-    // already 'archived' even if status is idle — parent_status comes back
-    // as something other than 'running' in that case.
-    const { ApiError } = await import('../../api/client');
+  it('archiving an already-archived thread is idempotent success, not a 409 toast', async () => {
+    // Archive is idempotent: the backend now treats an already-archived target
+    // as a no-op success (200 `{archived: []}`) rather than 409
+    // parent_not_archivable (see classify_archive_decision in
+    // crates/lucidos-engine/src/api/threads/archive.rs). This is what un-sticks
+    // the Archive button when the client's `meta.section` has desynced to
+    // 'inbox' while the backend is already 'archived' (a missed ThreadArchived
+    // SSE / failed archive HTTP on a flaky PWA): the optimistic flip to
+    // 'archived' stands instead of rolling back, the button disappears, and no
+    // error toast fires.
+    (archiveThread as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ archived: [] });
     seedReviewThread();
-    const message = await archiveAndGetToast(new ApiError(409, 'parent_not_archivable', {
-      reason: 'parent_not_archivable',
-      parent_status: 'idle',
-      has_pending_changes: false,
-    }));
-    expect(message).toBe('This thread is already archived');
+    await handleArchiveThread('parent');
+    expect(threadMap.value.get('parent')?.meta.section).toBe('archived');
+    expect(toasts.value.find(t => t.type === 'error')).toBeUndefined();
   });
 
   it('formats parent_has_pending_changes with the Apply/Discard hint', async () => {
