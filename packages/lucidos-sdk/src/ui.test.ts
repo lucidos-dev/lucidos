@@ -170,3 +170,116 @@ describe('ui.watchPreferences — live theme reaction wiring', () => {
     expect(mqChangeListeners).toHaveLength(1);
   });
 });
+
+describe('lucidos.ui.toast', () => {
+  let origParent: unknown;
+  let postMessage: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    origParent = (globalThis as { parent?: unknown }).parent;
+    postMessage = vi.fn();
+    // A non-self parent so window.parent !== window — drives the postMessage path.
+    (globalThis as { parent?: unknown }).parent = { postMessage };
+  });
+  afterEach(() => {
+    (globalThis as { parent?: unknown }).parent = origParent;
+    vi.unstubAllGlobals();
+  });
+
+  it('posts lucidos:ui:toast with the normalized payload and returns void', () => {
+    const ret = ui.toast('Saved', 'success', { durationMs: 2000, dismissable: false });
+    expect(ret).toBeUndefined();
+    expect(postMessage).toHaveBeenCalledWith(
+      { type: 'lucidos:ui:toast', payload: { message: 'Saved', type: 'success', durationMs: 2000, dismissable: false } },
+      '*',
+    );
+  });
+
+  it('defaults type to info and leaves opts undefined when omitted', () => {
+    ui.toast('Heads up');
+    expect(postMessage).toHaveBeenCalledWith(
+      { type: 'lucidos:ui:toast', payload: { message: 'Heads up', type: 'info', durationMs: undefined, dismissable: undefined } },
+      '*',
+    );
+  });
+
+  it('degrades an unknown type to info rather than failing', () => {
+    ui.toast('x', 'bogus' as unknown as 'info');
+    expect(postMessage.mock.calls[0][0].payload.type).toBe('info');
+  });
+
+  it('throws TypeError on an empty/non-string message (programming error)', () => {
+    expect(() => ui.toast('')).toThrow(TypeError);
+    expect(() => ui.toast(123 as unknown as string)).toThrow(TypeError);
+    expect(postMessage).not.toHaveBeenCalled();
+  });
+
+  it('standalone (no host parent): logs to console, never posts', () => {
+    (globalThis as { parent?: unknown }).parent = globalThis; // window.parent === window
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    ui.toast('all good', 'success');
+    ui.toast('broken', 'error');
+    expect(logSpy).toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalled();
+    expect(postMessage).not.toHaveBeenCalled();
+    logSpy.mockRestore();
+    errSpy.mockRestore();
+  });
+});
+
+describe('lucidos.ui.prompt', () => {
+  let origParent: unknown;
+  let postMessage: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    origParent = (globalThis as { parent?: unknown }).parent;
+    postMessage = vi.fn();
+    (globalThis as { parent?: unknown }).parent = { postMessage };
+  });
+  afterEach(() => {
+    (globalThis as { parent?: unknown }).parent = origParent;
+    vi.unstubAllGlobals();
+  });
+
+  // The SDK installs a single `message` listener; replay the host reply by
+  // dispatching a synthetic message event with the id the SDK just posted.
+  function replyToLastPrompt(value: unknown) {
+    const calls = postMessage.mock.calls;
+    const sent = calls[calls.length - 1][0] as { id: string };
+    globalThis.dispatchEvent(
+      Object.assign(new Event('message'), { data: { type: 'lucidos:ui:prompt:result', id: sent.id, value } }),
+    );
+  }
+
+  it('posts lucidos:ui:prompt and resolves the string returned by the host', async () => {
+    const p = ui.prompt({ message: 'Name?', defaultValue: 'Untitled' });
+    const sent = postMessage.mock.calls[0][0];
+    expect(sent.type).toBe('lucidos:ui:prompt');
+    expect(typeof sent.id).toBe('string');
+    expect(sent.payload).toMatchObject({ message: 'Name?', defaultValue: 'Untitled', okLabel: 'OK', cancelLabel: 'Cancel', multiline: false });
+    replyToLastPrompt('Alice');
+    await expect(p).resolves.toBe('Alice');
+  });
+
+  it('resolves null when the host reply carries a non-string value (cancel)', async () => {
+    const p = ui.prompt({ message: 'Name?' });
+    replyToLastPrompt(null);
+    await expect(p).resolves.toBeNull();
+  });
+
+  it('rejects when message is empty/non-string, without posting', async () => {
+    await expect(ui.prompt({ message: '' })).rejects.toThrow(TypeError);
+    await expect(ui.prompt({ message: 123 as unknown as string })).rejects.toThrow(TypeError);
+    expect(postMessage).not.toHaveBeenCalled();
+  });
+
+  it('standalone (no host parent): falls back to native window.prompt', async () => {
+    (globalThis as { parent?: unknown }).parent = globalThis; // window.parent === window
+    const nativePrompt = vi.fn(() => 'Bob');
+    vi.stubGlobal('prompt', nativePrompt);
+    await expect(ui.prompt({ message: 'Name?', defaultValue: 'd' })).resolves.toBe('Bob');
+    expect(nativePrompt).toHaveBeenCalledWith('Name?', 'd');
+    expect(postMessage).not.toHaveBeenCalled();
+  });
+});

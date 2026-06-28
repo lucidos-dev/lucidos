@@ -76,12 +76,25 @@ pub enum SystemEvent {
         progress: usize,
         total: usize,
     },
+    /// A backup run finished successfully. PERSISTED (unlike `BackupProgress`):
+    /// the events table is the durable history of every backup run (start /
+    /// finish / size), queried by `core::backup::load_recent_runs` and surfaced
+    /// by the `get_backup_status` tool.
     BackupCompleted {
         filename: String,
         size_bytes: u64,
+        /// When the backup pipeline started (RFC 3339).
+        started_at: chrono::DateTime<chrono::Utc>,
+        /// When it finished (RFC 3339). Duration = `finished_at - started_at`.
+        finished_at: chrono::DateTime<chrono::Utc>,
     },
+    /// A backup run failed. PERSISTED — see `BackupCompleted`.
     BackupFailed {
         error: String,
+        /// When the backup pipeline started (RFC 3339).
+        started_at: chrono::DateTime<chrono::Utc>,
+        /// When it failed (RFC 3339).
+        finished_at: chrono::DateTime<chrono::Utc>,
     },
     RecoveryProgress {
         completed: usize,
@@ -800,6 +813,10 @@ impl SystemEvent {
                 | Self::ThreadQueueDropped { .. }
                 | Self::ThreadQueueCompleted { .. }
                 | Self::CapacityPolicyChanged { .. }
+                // Terminal backup events are the durable run history (start /
+                // finish / size). BackupProgress stays transient (no row per tick).
+                | Self::BackupCompleted { .. }
+                | Self::BackupFailed { .. }
         )
     }
 

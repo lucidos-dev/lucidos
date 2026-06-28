@@ -23,7 +23,7 @@
  * `workspaceStorage.install.ts`, imported on the first line of `main.tsx`.
  */
 
-import { LAST_WORKSPACE_KEY } from './lastWorkspace';
+import { LAST_WORKSPACE_KEY, LAST_WORKSPACE_COUNT_KEY } from './lastWorkspace';
 
 /** Prefix for every namespaced key: `ws:<workspaceId>:<originalKey>`. */
 const NAMESPACE_PREFIX = 'ws:';
@@ -42,6 +42,9 @@ const MIGRATION_MARKER = '__migrated';
  *   • `lucidos-last-workspace` — the last-active workspace slug, written from
  *     inside a workspace and read by the picker; it spans workspaces by design,
  *     so it must stay raw on both ends (see `lastWorkspace.ts`).
+ *   • `lucidos-last-workspace-count` — the picker's last-known workspace count,
+ *     used to size its loading skeleton; a picker-surface key kept raw for the
+ *     same reason (see `lastWorkspace.ts`).
  */
 export const GLOBAL_KEYS: ReadonlySet<string> = new Set([
   'lucidos-device-id',
@@ -52,6 +55,7 @@ export const GLOBAL_KEYS: ReadonlySet<string> = new Set([
   'lucidos-sw-update-dismissed',
   'lucidos-chunk-reload-at',
   LAST_WORKSPACE_KEY,
+  LAST_WORKSPACE_COUNT_KEY,
 ]);
 
 /**

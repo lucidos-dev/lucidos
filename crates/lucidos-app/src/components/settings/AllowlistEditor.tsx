@@ -5,6 +5,8 @@ import { errorDetail } from '../../utils/errorDetail';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { toFailed, type Loadable } from '../../store/types';
 import { LoadableError } from '../shared/LoadableError';
+import { ListSkeleton } from '../shared/ListSkeleton';
+import { LoadingFade } from '../shared/LoadingFade';
 
 interface AllowlistEditorProps {
   /** Section heading (a `settings-section-title`). */
@@ -115,78 +117,75 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
       </div>
     );
   }
-  if (loadable.status !== 'loaded') {
-    if (!showLoading) return null;
-    return (
-      <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor={props.anchor}>{props.title}</div>
-        <div class="loading-spinner" />
-      </div>
-    );
-  }
 
-  const dirty = serializeAllowlist(header, patterns) !== loadable.data;
+  const dirty = loadable.status === 'loaded' && serializeAllowlist(header, patterns) !== loadable.data;
 
   return (
     <div class="settings-section">
       <div class="settings-section-title" data-search-anchor={props.anchor}>{props.title}</div>
-      <p class="settings-section-desc">{props.description}</p>
-      <div class="allowlist-rows">
-        {patterns.length === 0 && (
-          <div class="allowlist-empty">No patterns yet. Use the <strong>Always allow</strong> buttons on permission prompts, or add one below.</div>
-        )}
-        {patterns.map((pattern, i) => (
-          // Positional key: rows have no stable id and edits mutate in place
-          // rather than reorder, so the index is a correct identity here.
-          <div class="allowlist-row" key={i}>
-            <input
-              class="allowlist-row-input"
-              type="text"
-              spellcheck={false}
-              autocomplete="off"
-              autocorrect="off"
-              autocapitalize="off"
-              placeholder={props.placeholder}
-              value={pattern}
-              onInput={(e) => setPatternAt(i, (e.target as HTMLInputElement).value)}
-            />
-            <button
-              type="button"
-              class="action-btn action-btn-danger"
-              aria-label={`Delete pattern ${pattern || '(empty)'}`}
-              onClick={() => void deletePatternAt(i)}
-            >
-              Delete
-            </button>
-          </div>
-        ))}
-      </div>
-      <div class="allowlist-actions">
-        <button
-          type="button"
-          class="action-btn"
-          onClick={() => setPatterns((prev) => [...prev, ''])}
-        >
-          Add pattern
-        </button>
-        <span class="allowlist-actions-spacer" />
-        <button
-          type="button"
-          class="action-btn"
-          disabled={!dirty || saving}
-          onClick={revert}
-        >
-          Revert
-        </button>
-        <button
-          type="button"
-          class="action-btn action-btn-confirm"
-          disabled={!dirty || saving}
-          onClick={save}
-        >
-          {saving ? 'Saving...' : 'Save'}
-        </button>
-      </div>
+      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+        {loadable.status === 'loaded' ? (
+          <>
+            <p class="settings-section-desc">{props.description}</p>
+            <div class="allowlist-rows">
+              {patterns.length === 0 && (
+                <div class="allowlist-empty">No patterns yet. Use the <strong>Always allow</strong> buttons on permission prompts, or add one below.</div>
+              )}
+              {patterns.map((pattern, i) => (
+                // Positional key: rows have no stable id and edits mutate in place
+                // rather than reorder, so the index is a correct identity here.
+                <div class="allowlist-row" key={i}>
+                  <input
+                    class="allowlist-row-input"
+                    type="text"
+                    spellcheck={false}
+                    autocomplete="off"
+                    autocorrect="off"
+                    autocapitalize="off"
+                    placeholder={props.placeholder}
+                    value={pattern}
+                    onInput={(e) => setPatternAt(i, (e.target as HTMLInputElement).value)}
+                  />
+                  <button
+                    type="button"
+                    class="action-btn action-btn-danger"
+                    aria-label={`Delete pattern ${pattern || '(empty)'}`}
+                    onClick={() => void deletePatternAt(i)}
+                  >
+                    Delete
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div class="allowlist-actions">
+              <button
+                type="button"
+                class="action-btn"
+                onClick={() => setPatterns((prev) => [...prev, ''])}
+              >
+                Add pattern
+              </button>
+              <span class="allowlist-actions-spacer" />
+              <button
+                type="button"
+                class="action-btn"
+                disabled={!dirty || saving}
+                onClick={revert}
+              >
+                Revert
+              </button>
+              <button
+                type="button"
+                class="action-btn action-btn-confirm"
+                disabled={!dirty || saving}
+                onClick={save}
+              >
+                {saving ? 'Saving...' : 'Save'}
+              </button>
+            </div>
+          </>
+        ) : null}
+      </LoadingFade>
     </div>
   );
 }

@@ -35,7 +35,7 @@ const BASE: BackupStatus = {
 function recentBackup(ageSeconds: number) {
   return {
     id: 'b1',
-    filename: 'lucidos-backup-personal-20260530-031500.enc',
+    filename: 'lucidos-backup-myws-20260530-031500.enc',
     size_bytes: 42_000_000,
     created_at: new Date(Date.now() - ageSeconds * 1000).toISOString(),
   };
@@ -93,7 +93,7 @@ describe('backupHealthCard', () => {
   it('last-run failure surfaces the error inside the red error span', () => {
     const status = loaded({
       ...BASE,
-      last_run: { status: 'failure', at: new Date().toISOString(), filename: null, size_bytes: null, error: 'pg_dump failed' },
+      last_run: { status: 'failure', at: new Date().toISOString(), started_at: null, filename: null, size_bytes: null, error: 'pg_dump failed' },
       latest_backup: recentBackup(3600),
       age_seconds: 3600,
       stale: false,
@@ -112,7 +112,7 @@ describe('backupHealthCard', () => {
     // soft-yellow stale box.
     const status = loaded({
       ...BASE,
-      last_run: { status: 'failure', at: new Date().toISOString(), filename: null, size_bytes: null, error: 'Drive is full' },
+      last_run: { status: 'failure', at: new Date().toISOString(), started_at: null, filename: null, size_bytes: null, error: 'Drive is full' },
       latest_backup: recentBackup(30 * 3600),
       age_seconds: 30 * 3600,
       stale: true,
@@ -125,7 +125,7 @@ describe('backupHealthCard', () => {
   it('last-run success shows a succeeded line', () => {
     const status = loaded({
       ...BASE,
-      last_run: { status: 'success', at: new Date().toISOString(), filename: 'x.enc', size_bytes: 1, error: null },
+      last_run: { status: 'success', at: new Date().toISOString(), started_at: null, filename: 'x.enc', size_bytes: 1, error: null },
       latest_backup: recentBackup(3600),
       age_seconds: 3600,
       stale: false,

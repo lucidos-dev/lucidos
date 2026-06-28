@@ -30,13 +30,25 @@ pub struct InstalledPluginSummary {
     pub source: Option<String>,
     /// The Lucidos Agent setup thread spawned at install time, when the plugin
     /// shipped `setup` instructions. Recorded in the `PluginInstalled` payload;
-    /// drives the App Store card's Setup→Open button across reloads.
+    /// drives the Plugins panel card's Setup→Open button across reloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_thread_id: Option<String>,
     /// The plugin's primary app (`data/apps/<id>/`), if it installs one. The
     /// card's "Open" button launches it; plugins with no app have `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
+    /// Content-dir kinds this plugin shipped (`apps`/`knowhow`/`triggers`/
+    /// `scripts`/`auth-modules`), derived from its recorded `files`. Drives the
+    /// content chips on the Plugins → Installed row. Empty for legacy records
+    /// whose `PluginInstalled` payload didn't list files.
+    #[serde(default)]
+    pub content: Vec<String>,
+    /// Every `data/`-relative path the plugin installed, from the
+    /// `PluginInstalled` payload. Lets Plugins → Installed link straight to each
+    /// shipped file (open the app, preview the knowhow/script). Empty for legacy
+    /// records that didn't list files.
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -58,6 +70,12 @@ pub struct MarketplacePlugin {
     pub source: String,
     pub manifest: serde_json::Value,
     pub content: Vec<String>,
+    /// Topical categories (the *controlled vocabulary* — see
+    /// `crate::core::plugins::PLUGIN_CATEGORIES`). Only recognised values appear
+    /// here; an author's unknown tag is dropped and reported in `errors`. Drives
+    /// the Store tab's category filter/chips.
+    #[serde(default)]
+    pub categories: Vec<String>,
     pub files_count: usize,
     pub status: MarketplacePluginStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -183,7 +201,10 @@ pub fn scan_catalog(
 
     for marketplace in &registry.marketplaces {
         match scan_one_marketplace(workspace_path, marketplace, &installed_by_id) {
-            Ok(mut found) => plugins.append(&mut found),
+            Ok((mut found, mut warns)) => {
+                plugins.append(&mut found);
+                errors.append(&mut warns);
+            }
             Err(error) => errors.push(MarketplaceScanError {
                 marketplace_id: marketplace.id.clone(),
                 marketplace_name: marketplace.name.clone(),
@@ -233,7 +254,7 @@ fn scan_one_marketplace(
     workspace_path: &Path,
     marketplace: &PluginMarketplace,
     installed_by_id: &BTreeMap<String, InstalledPluginSummary>,
-) -> Result<Vec<MarketplacePlugin>, String> {
+) -> Result<(Vec<MarketplacePlugin>, Vec<MarketplaceScanError>), String> {
     let parsed = parse_marketplace_source(&marketplace.source)?;
     let (scratch, root, actual_branch) = clone_marketplace(workspace_path, &parsed)?;
     let manifest_roots = find_manifest_roots(&root)?;
@@ -241,6 +262,9 @@ fn scan_one_marketplace(
         drop(scratch);
         return Err("no plugin manifest.toml files found".to_string());
     }
+    // Per-plugin non-blocking warnings (e.g. unknown categories): the plugin
+    // still lists, the warning surfaces in the catalog's `errors`.
+    let mut warnings: Vec<MarketplaceScanError> = Vec::new();
 
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
@@ -276,6 +300,22 @@ fn scan_one_marketplace(
         let source = install_source(&parsed, &actual_branch, &rel)
             .ok_or_else(|| format!("cannot construct install source for {}", rel))?;
         let content = content_dirs_from_files(planned.iter().map(|p| p.data_relative.as_str()));
+        let (categories, unknown_categories) =
+            crate::core::plugins::partition_categories(&manifest.categories);
+        if !unknown_categories.is_empty() {
+            warnings.push(MarketplaceScanError {
+                marketplace_id: marketplace.id.clone(),
+                marketplace_name: marketplace.name.clone(),
+                source: source.clone(),
+                error: format!(
+                    "plugin '{}': ignored unknown categor{} [{}] (allowed: {})",
+                    manifest.id,
+                    if unknown_categories.len() == 1 { "y" } else { "ies" },
+                    unknown_categories.join(", "),
+                    crate::core::plugins::PLUGIN_CATEGORIES.join(", "),
+                ),
+            });
+        }
         let installed = installed_by_id.get(&manifest.id);
         let status = match installed {
             Some(inst)
@@ -297,6 +337,7 @@ fn scan_one_marketplace(
             source,
             manifest: manifest.raw,
             content,
+            categories,
             files_count: planned.len(),
             status,
             installed_version: installed.map(|p| p.version.clone()),
@@ -314,7 +355,7 @@ fn scan_one_marketplace(
     }
 
     drop(scratch);
-    Ok(out)
+    Ok((out, warnings))
 }
 
 fn parse_marketplace_source(source: &str) -> Result<MarketplaceSource, String> {
@@ -539,7 +580,7 @@ fn source_to_registration_url(source: &MarketplaceSource) -> String {
     }
 }
 
-fn content_dirs_from_files<'a>(files: impl Iterator<Item = &'a str>) -> Vec<String> {
+pub(crate) fn content_dirs_from_files<'a>(files: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut out = BTreeSet::new();
     for file in files {
         if let Some(first) = file.split('/').next() {

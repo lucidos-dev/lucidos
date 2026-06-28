@@ -23,7 +23,7 @@ vi.mock('../../api/threads', () => ({
   fetchThreadEvents: vi.fn().mockResolvedValue([]),
 }));
 
-import { discardCompose, ensureFocusedComposeThread, pendingComposePuts, prefillCompose, sendCompose, sendFollowup, updateCompose, applyRemoteCompose } from './compose';
+import { composeEditedAt, discardCompose, ensureFocusedComposeThread, pendingComposePuts, prefillCompose, sendCompose, sendFollowup, updateCompose, applyRemoteCompose } from './compose';
 import { focusThread, unfocusThread } from './threads';
 import { codingAgentPendingModel, codingAgentPendingReasoningEffort, connectionStatus, focusedThreadId, inputMode, threadMap, FOCUSED_THREAD_KEY, toasts } from '../store';
 import {
@@ -566,6 +566,68 @@ describe('updateCompose does not mutate threadMap (perf isolation)', () => {
     const before = threadMap.value;
     applyRemoteCompose('t-1', { text: 'from peer', image_hashes: [], mode: null });
     expect(threadMap.value).toBe(before);
+  });
+});
+
+/** The SSE `ThreadComposeChanged` path (applyRemoteCompose) is the second of two
+ *  places that apply a server compose snapshot to the local draft signal — the
+ *  first being stageDraftFromApi (thread-loading.ts), guarded since the session-5
+ *  drafts:65 fix. A remote EMPTY snapshot must never clear a non-empty draft this
+ *  device authored: the only emitter is the compose PUT handler, and a PUT that
+ *  fired before the device-id header was available broadcasts origin=None, which
+ *  bypasses the SSE self-echo suppression (thread-sync.ts only suppresses when
+ *  origin is present) and reaches applyRemoteCompose. Without the guard that empty
+ *  echo blanks the just-typed draft — the value='' face of mobile-webkit
+ *  drafts.spec.ts:65. See docs/plans/2026-06-28-drafts-sse-empty-clear-guard.md. */
+describe('applyRemoteCompose empty-clear guard (drafts:65)', () => {
+  beforeEach(() => {
+    _resetComposeDraftsForTesting();
+    composeEditedAt.delete('t-1');
+    const map = new Map<string, ThreadState>();
+    map.set('t-1', makeActiveThread());
+    threadMap.value = map;
+    connectionStatus.value = 'connected';
+    focusedThreadId.value = 't-1';
+  });
+
+  afterEach(() => {
+    composeEditedAt.delete('t-1');
+    _resetComposeDraftsForTesting();
+    connectionStatus.value = 'disconnected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+  });
+
+  it('INV1: a remote empty snapshot does not clear a locally-edited non-empty draft', () => {
+    setDraft('t-1', { text: 'thread draft text', image_hashes: [], mode: null });
+    composeEditedAt.set('t-1', Date.now());
+
+    // The device's own / non-attributable empty echo arriving after the local edit.
+    applyRemoteCompose('t-1', { text: '', image_hashes: [], mode: null });
+
+    // Without the guard this reads '' (clearDraft fired) — the value='' flake.
+    expect(getDraft('t-1').text).toBe('thread draft text');
+  });
+
+  it('INV2: a remote empty snapshot still clears a draft not edited on this device', () => {
+    // Server-originated / peer-seeded draft: present locally but no local edit,
+    // so composeEditedAt is intentionally absent for t-1.
+    setDraft('t-1', { text: 'server seeded', image_hashes: [], mode: null });
+
+    applyRemoteCompose('t-1', { text: '', image_hashes: [], mode: null });
+
+    expect(getDraft('t-1').text).toBe('');
+    expect(getDraft('t-1').image_hashes).toHaveLength(0);
+  });
+
+  it('INV3: a remote NON-empty edit still replaces even a locally-edited draft', () => {
+    setDraft('t-1', { text: 'mine', image_hashes: [], mode: null });
+    composeEditedAt.set('t-1', Date.now());
+
+    // The guard skips only the EMPTY clear — a peer's non-empty edit still wins.
+    applyRemoteCompose('t-1', { text: 'from peer', image_hashes: [], mode: null });
+
+    expect(getDraft('t-1').text).toBe('from peer');
   });
 });
 

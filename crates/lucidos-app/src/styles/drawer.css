@@ -417,6 +417,21 @@
     transition: color var(--duration-fast) ease;
 }
 
+/* Keyboard focus: the shared soft accent ring (--focus-ring, see base.css /
+ * .icon-btn:focus-visible) so Tab onto the sub-thread disclosure shows the same
+ * custom focus border as every other control. :focus-visible (not :focus) keeps
+ * a mouse click quiet, matching the icon/action buttons. The button has no base
+ * border-radius (it wraps a bare ▴ glyph / pill count badge), so round the ring
+ * here to match the icon buttons' soft ring rather than a boxy rectangle — this
+ * has no other visual effect (no background/border to round) and no layout
+ * impact (outline + box-shadow paint outside the box). The transparent outline
+ * is the forced-colors fallback, where box-shadow is stripped. */
+.family-disclosure:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+    border-radius: 0.375rem;
+}
+
 /* The expanded-state chevron is sized to match the collapsed-state count badge
  * (a 1rem box) so toggling a family open/closed swaps the two controls in place
  * with no jump in size or vertical position: both ride `.family-disclosure`
@@ -561,14 +576,19 @@ html[data-theme="dark"] .collapse-count-badge {
 }
 
 /* The repo / app / trigger NAME chip, shown under the channel/type tag. Muted
- * so the type tag stays the primary label; truncates long repo names rather than
- * forcing the row wider. The detail times live in the row's long-press/hover
- * tooltip (see threadRowInfo.ts), so this column is type + name only. */
+ * so the type tag stays the primary label; a long name (e.g. a trigger like
+ * "NIGHTLY BUILD → HARDEN → E2E") WRAPS onto extra lines within the chip's
+ * max-width rather than truncating to an ellipsis or forcing the row wider — the
+ * chip grows taller, not wider. The max-width is kept deliberately narrow so a
+ * long name breaks early (the trigger above wraps after "NIGHTLY BUILD →")
+ * instead of running most of the row's width before wrapping; because both this
+ * max-width and the `.label` font-size are in rem, the wrap point stays the same
+ * across UI scales. The detail times live in the row's long-press/hover tooltip
+ * (see threadRowInfo.ts), so this column is type + name only. */
 .thread-row-context {
-    max-width: 9rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    max-width: 7rem;
+    white-space: normal;
+    overflow-wrap: anywhere;
     color: var(--text-secondary);
     background: var(--bg-tertiary);
 }
@@ -599,6 +619,13 @@ html[data-theme="dark"] .collapse-count-badge {
     .thread-row-action {
         opacity: 1;
     }
+}
+
+/* Keep the overflow trigger visible while its menu is open: the open overlay
+ * makes `.app-shell` inert, suppressing `:hover`, so the trigger would otherwise
+ * fade out from under its own popover. */
+.thread-row-action[aria-expanded="true"] {
+    opacity: 1;
 }
 
 .thread-status {
@@ -643,13 +670,11 @@ html[data-theme="dark"] .collapse-count-badge {
 }
 
 @media (min-width: 769px) {
-    /* Don't pin actions to the row's bottom — sit them just below the time so
-     * the label-to-icons gap stays tight even when the left column is short. */
-    .thread-row-actions {
-        margin-top: 0;
-        gap: 0.25rem;
-    }
-
+    /* Pin actions (pin + overflow) to the row bottom on desktop too — the base
+     * `.thread-row-actions { margin-top: auto }` already does this (relies on
+     * `.thread-row-right { align-self: stretch }` for the free space to consume),
+     * so no desktop override is needed; an earlier `margin-top: 0` here defeated
+     * it and floated the icons just below the chips instead. */
     .thread-row-actions .icon-btn.header-icon {
         width: 1.25rem;
         height: 1.25rem;
@@ -854,6 +879,17 @@ html[data-theme="dark"] .collapse-count-badge {
 .thread-drawer .list-section-title {
     background: none;
     padding: 0.5rem 1rem 0.375rem 1.25rem;
+    /* Mirror `.thread-row`'s right inset (its `margin-right: 0.5rem`) so the
+       keyboard-highlight band painted on a focused header
+       (`.list-section-title-highlighted`) stops at the SAME x as a focused /
+       highlighted thread-row's background — instead of bleeding full-width to
+       the drawer's right edge (toward/under the scrollbar). Left already matches:
+       neither carries a left margin, so both bands start flush at the drawer's
+       left edge. Margin (not padding) is what owns the band's right edge, and
+       it rides the base rule (not the `-highlighted` state) — exactly like
+       `.thread-row` — so the box width is constant across highlight states and
+       toggling focus never shifts the box or perturbs the FLIP measurement. */
+    margin-right: 0.5rem;
     color: var(--text-primary);
     font-weight: 700;
     font-size: 0.8125rem;
@@ -911,6 +947,17 @@ html[data-theme="dark"] .collapse-count-badge {
     }
 }
 
+/* Keyboard highlight on a section header — the ←/→ tree nav lands here when a
+   section is collapsed (or descended from / ascended to). Reads exactly like the
+   thread-row keyboard highlight: the subtle --bg-secondary fill (not --bg-hover,
+   which is dark enough to merge with the row divider into one band). Equal
+   specificity to the base `.thread-drawer .list-section-title { background: none }`
+   rule above, so source order (this rule is later) makes it win. */
+.thread-drawer .list-section-title-highlighted {
+    background: var(--bg-secondary);
+    border-radius: 0.25rem;
+}
+
 
 /* --- Thread focused view --- */
 
@@ -928,11 +975,29 @@ html[data-theme="dark"] .collapse-count-badge {
     /* Right padding matches `.pane-header`'s `--header-padding-x` so the action
      * icons land in the same horizontal slot as the AppHeader icons above. */
     padding: 0.25rem 0.625rem 0.25rem 1rem;
-    /* Transparent background — the header blends into the content below. */
-    background: transparent;
+    /* Faint neutral tint (--bg-secondary, one step up from the page) so the title
+     * row reads as the conversation's header band, anchored by the hairline below
+     * (::after). Kept to a quiet elevation that doesn't compete with the vivid blue
+     * app-header strip above. position:relative anchors that pseudo-element. */
+    position: relative;
+    background: var(--bg-secondary);
     -webkit-user-select: none;
     user-select: none;
     flex-shrink: 0;
+}
+
+/* Hairline divider under the thread title row: a plain full-width 1px line in the
+ * subtle border token, so the header reads as separated from the transcript.
+ * Desktop-only by construction — the mobile app header hides .thread-view-header. */
+.thread-view-header::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 1px;
+    background: var(--border-color);
+    pointer-events: none;
 }
 
 /* While editing, the suggestion is rendered below the input but pulled out of
@@ -987,6 +1052,12 @@ html[data-theme="dark"] .collapse-count-badge {
     .thread-view-header .thread-view-header-actions .icon-btn {
         opacity: 1;
     }
+}
+
+/* Keep the overflow trigger visible while its menu is open (see the same rule
+ * for `.thread-row-action` — the open overlay's inert-behind kills `:hover`). */
+.thread-view-header .thread-view-header-actions .icon-btn[aria-expanded="true"] {
+    opacity: 1;
 }
 
 /* position:relative so the edit <input> can absolutely-position over the display textarea. */

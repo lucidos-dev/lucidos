@@ -112,7 +112,7 @@ fn reset_per_turn_flags_clears_all_flags() {
     let mut last_terminal_kind = Some(TerminalKind::Generated);
     let mut cancel_actor = Some(crate::engine::thread_events::MessageOrigin::Device {
         device_id: "ios-1".into(),
-        label: "Kenneth's iPhone".into(),
+        label: "My iPhone".into(),
     });
 
     reset_per_turn_flags(

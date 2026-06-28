@@ -61,10 +61,13 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // separate "Switch thread view" button anymore.
     expect(empty!.hasSeparateSelector, 'no separate view-selector button').toBe(false);
     expect(empty!.filterWidth, 'single Filter button is visible').toBeGreaterThan(20);
-    // The Filter button sits left of the Threads title, which packs left beside it.
+    // The Filter button sits left of the Threads title box (the title is flex:1,
+    // so its box starts right after the button).
     expect(empty!.filterRight, 'Filter button sits left of the Threads title')
       .toBeLessThanOrEqual(empty!.titleLeft + 1);
-    expect(empty!.titleTextAlign, 'Threads title text left-aligns beside the Filter button').toBe('left');
+    // The title centres in the gap between the Filter button and the Search icon
+    // (079672700 — "center Threads title between Filter and Search icons").
+    expect(empty!.titleTextAlign, 'Threads title text centres between Filter and Search').toBe('center');
 
     // The needs-attention badge is absolutely positioned, so even a draft that
     // surfaces per-view counts in the menu must not move the title.

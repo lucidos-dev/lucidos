@@ -1,10 +1,20 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { preferences } from '../../store/store';
 import { getSettingsSearchResults, findSettingsEntry } from './searchIndex';
+
+const originalInnerWidth = window.innerWidth;
+
+function setViewportWidth(px: number): void {
+  Object.defineProperty(window, 'innerWidth', { value: px, configurable: true, writable: true });
+}
 
 beforeEach(() => {
   // Default bindings (no overrides) — searchEverywhere = mod+Shift+S.
   preferences.value = { status: 'not-loaded' };
+});
+
+afterEach(() => {
+  setViewportWidth(originalInnerWidth);
 });
 
 describe('settings search — keyboard shortcuts', () => {
@@ -59,6 +69,27 @@ describe('settings search — Permissions section', () => {
     expect(findSettingsEntry('permissions:lucidos')?.subview).toBe('permissions');
     expect(findSettingsEntry('permissions:lucidos')?.anchor).toBe('permissions:lucidos');
     expect(findSettingsEntry('permissions:claude-code')?.anchor).toBe('permissions:claude-code');
+  });
+});
+
+describe('settings search — mobile-only rows', () => {
+  it('hides the "Keep header visible" mobile row from search on a desktop viewport', () => {
+    setViewportWidth(1280);
+    const results = getSettingsSearchResults('keep header visible', 20);
+    expect(results.some((r) => r.id === 'appearance:mobile-header-sticky')).toBe(false);
+    // The "Mobile" section row is mobile-only too.
+    expect(getSettingsSearchResults('mobile', 20).some((r) => r.id === 'appearance:mobile')).toBe(false);
+  });
+
+  it('surfaces the "Keep header visible" mobile row in search on a mobile viewport', () => {
+    setViewportWidth(375);
+    const results = getSettingsSearchResults('keep header visible', 20);
+    expect(results.some((r) => r.id === 'appearance:mobile-header-sticky')).toBe(true);
+  });
+
+  it('keeps the entry resolvable by id regardless of viewport (navigation by recents)', () => {
+    setViewportWidth(1280);
+    expect(findSettingsEntry('appearance:mobile-header-sticky')?.subview).toBe('appearance');
   });
 });
 

@@ -52,11 +52,11 @@ lucidos data write artifacts/report.html --from /tmp/report.html
 Print the absolute path that `<relative>` resolves to inside the parent workspace's `data/` directory. Same normalization as the JS SDK / artifacts UI: paths starting with `artifacts/`, `knowhow/`, `apps/`, or `triggers/` are kept as-is; anything else is prefixed with `artifacts/`.
 
 ```bash
-$ lucidos data path ua-analysis/foo/report.html
-/Users/.../workspaces/work/data/artifacts/ua-analysis/foo/report.html
+$ lucidos data path data-analysis/foo/report.html
+/Users/.../workspaces/myws/data/artifacts/data-analysis/foo/report.html
 
 $ lucidos data path knowhow/my-app/notes.md --mkdir
-/Users/.../workspaces/work/data/knowhow/my-app/notes.md
+/Users/.../workspaces/myws/data/knowhow/my-app/notes.md
 ```
 
 ### `lucidos data write <relative> [--from <path> | -]`
@@ -65,7 +65,7 @@ Write content to the resolved absolute path. Creates parent directories. Reads f
 
 ```bash
 # from a file you generated in /tmp
-$ lucidos data write artifacts/ua-analysis/2026-04-20/report.html --from /tmp/report.html
+$ lucidos data write artifacts/data-analysis/2026-04-20/report.html --from /tmp/report.html
 
 # from stdin
 $ echo '{"hello": "world"}' | lucidos data write artifacts/foo.json
@@ -78,7 +78,7 @@ POST a domain event to the parent workspace's event store. Event types are Pasca
 ```bash
 $ lucidos events emit AnalysisCompleted \
     --summary "UA analysis for 2026-04-20 finished" \
-    --payload '{"artifact": "artifacts/ua-analysis/2026-04-20/report.html", "rows": 1240}'
+    --payload '{"artifact": "artifacts/data-analysis/2026-04-20/report.html", "rows": 1240}'
 ```
 
 ### `lucidos events query [--type T] [--since iso] [--until iso] [--limit N]`
@@ -135,7 +135,7 @@ The CLI reads `$LUCIDOS_WORKSPACE`, `$LUCIDOS_THREAD_ID`, `$LUCIDOS_EVENT_ID`, a
 
 #### `--repo <name>` — pick the repo (multi-repo workspaces)
 
-A workspace can host worktrees from multiple repos (e.g. `work` may carry `user-acquisition`, `user-acquisition-knowledge`, and `lucidos`). The CLI resolves the spawned thread's worktree against:
+A workspace can host worktrees from multiple repos (e.g. `myws` may carry `example-repo`, `example-repo-knowledge`, and `lucidos`). The CLI resolves the spawned thread's worktree against:
 
 1. `--repo <name-or-uuid>` if you pass it explicitly (case-insensitive name match, or UUID).
 2. `$LUCIDOS_REPO`, the env var the engine sets on every CC subprocess to the calling thread's repo name. So a CC sub-thread defaults to *your* repo, not the workspace's default.
@@ -169,7 +169,7 @@ lucidos spawn-thread --relation top --to "$(basename "$LUCIDOS_WORKSPACE")" --cc
 Cross-workspace CC spawn into a specific repo (top, no callback — `--relation top` is the default for cross-workspace so omitted here):
 
 ```bash
-lucidos spawn-thread --to work --cc --repo user-acquisition \
+lucidos spawn-thread --to myws --cc --repo example-repo \
   --message "task description" --title "Short title"
 ```
 
@@ -215,7 +215,7 @@ This is the canonical end of an analysis or report-generation session:
 python my-analysis.py > /tmp/report.html
 
 # 2. Write it under data/ where the dev server can serve it.
-ARTIFACT="artifacts/ua-analysis/$(date +%Y-%m-%d)/report.html"
+ARTIFACT="artifacts/data-analysis/$(date +%Y-%m-%d)/report.html"
 lucidos data write "$ARTIFACT" --from /tmp/report.html
 
 # 3. Tell the workspace it's ready.

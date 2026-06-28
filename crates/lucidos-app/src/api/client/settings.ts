@@ -319,6 +319,9 @@ export async function createBackup(provider: string): Promise<void> {
 export interface BackupLastRun {
   status: 'success' | 'failure';
   at: string;
+  /** When the run started (RFC 3339); null for records predating duration
+   *  tracking. Duration = `at - started_at`. */
+  started_at: string | null;
   filename: string | null;
   size_bytes: number | null;
   error: string | null;

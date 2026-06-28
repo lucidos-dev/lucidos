@@ -76,14 +76,14 @@ describe('handleGlobalEvent — Backup terminal events', () => {
 
   it('BackupCompleted clears progress, toasts once, and bumps the status version', () => {
     handleGlobalEvent('BackupCompleted', {
-      filename: 'lucidos-backup-personal-20260504-090000.enc',
+      filename: 'lucidos-backup-myws-20260504-090000.enc',
       size_bytes: 927_401_289,
     });
 
     expect(backupProgress.value).toBeNull();
     expect(backupStatusVersion.value).toBe(1);
     expect(showToast).toHaveBeenCalledExactlyOnceWith(
-      'Backup created: lucidos-backup-personal-20260504-090000.enc (884 MB)',
+      'Backup created: lucidos-backup-myws-20260504-090000.enc (884 MB)',
       'success',
     );
   });

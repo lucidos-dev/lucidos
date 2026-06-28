@@ -32,3 +32,8 @@ export const lucidos = {
 
 export { SdkError };
 export type * from './types';
+
+// Generated navigation contract (source of truth: the engine `navigate_ui`
+// tool). Exposed as runtime values so the host app can cross-check them against
+// its own renderable nav set — see `crates/lucidos-engine/src/llm/tools/misc.rs`.
+export { NAVIGATE_TARGETS, SETTINGS_VIEW_TARGETS } from './generated/navigate-targets';

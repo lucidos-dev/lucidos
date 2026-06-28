@@ -352,6 +352,58 @@ impl ArtifactManager {
         full_path.exists()
     }
 
+    /// Resolve `relative_path` to the next non-colliding artifact path,
+    /// Finder/browser style: if a file already exists at that path, insert a
+    /// numeric suffix before the final extension (`Brev.pdf` → `Brev (1).pdf`
+    /// → `Brev (2).pdf`; `README` → `README (1)`). Only the final extension is
+    /// preserved, matching `Path::file_stem`/`Path::extension`
+    /// (`archive.tar.gz` → `archive.tar (1).gz`). Returns the original path
+    /// unchanged when there is no collision; never overwrites an existing file.
+    ///
+    /// Existence is checked against the real on-disk artifact path (the same
+    /// root `write_artifact` writes to), so both import entry points stay
+    /// consistent. The loop is bounded so a pathological directory can't spin
+    /// forever — it errors instead of looping past `MAX_COLLISION_SUFFIX`.
+    pub fn resolve_collision_free_path(
+        &self,
+        relative_path: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        /// Upper bound on suffix attempts. Far beyond any realistic number of
+        /// same-name imports; exists only to make the search terminate.
+        const MAX_COLLISION_SUFFIX: usize = 10_000;
+
+        if !self.artifact_exists(relative_path) {
+            return Ok(relative_path.to_string());
+        }
+
+        // Keep the directory prefix (with trailing '/') and split the leaf with
+        // Path semantics so only the final extension is preserved.
+        let (dir_prefix, leaf) = match relative_path.rfind('/') {
+            Some(idx) => (&relative_path[..=idx], &relative_path[idx + 1..]),
+            None => ("", relative_path),
+        };
+        let leaf_path = Path::new(leaf);
+        let stem = leaf_path.file_stem().and_then(|s| s.to_str()).unwrap_or(leaf);
+        let ext = leaf_path.extension().and_then(|e| e.to_str());
+
+        for n in 1..=MAX_COLLISION_SUFFIX {
+            let candidate_leaf = match ext {
+                Some(ext) => format!("{} ({}).{}", stem, n, ext),
+                None => format!("{} ({})", stem, n),
+            };
+            let candidate = format!("{}{}", dir_prefix, candidate_leaf);
+            if !self.artifact_exists(&candidate) {
+                return Ok(candidate);
+            }
+        }
+
+        Err(format!(
+            "Could not find a free name for {} after {} attempts",
+            relative_path, MAX_COLLISION_SUFFIX
+        )
+        .into())
+    }
+
     /// Delete artifact and commit the deletion
     pub async fn delete_and_commit(
         &self,
@@ -579,6 +631,127 @@ mod tests {
         let commit_sha = manager.commit("test.txt", "Add test file").await.unwrap();
 
         assert!(!commit_sha.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_collision_free_path_no_collision() {
+        let dir = tempdir().unwrap();
+        let manager = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
+
+        // Nothing on disk yet — the path is returned unchanged.
+        assert_eq!(
+            manager
+                .resolve_collision_free_path("imported/Brev.pdf")
+                .unwrap(),
+            "imported/Brev.pdf"
+        );
+    }
+
+    #[test]
+    fn test_resolve_collision_free_path_suffixes_in_sequence() {
+        let dir = tempdir().unwrap();
+        let manager = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
+
+        // First collision → "(1)".
+        manager.write_artifact("imported/Brev.pdf", "first").unwrap();
+        assert_eq!(
+            manager
+                .resolve_collision_free_path("imported/Brev.pdf")
+                .unwrap(),
+            "imported/Brev (1).pdf"
+        );
+
+        // "(1)" also taken → "(2)".
+        manager
+            .write_artifact("imported/Brev (1).pdf", "second")
+            .unwrap();
+        assert_eq!(
+            manager
+                .resolve_collision_free_path("imported/Brev.pdf")
+                .unwrap(),
+            "imported/Brev (2).pdf"
+        );
+    }
+
+    #[test]
+    fn test_resolve_collision_free_path_no_extension() {
+        let dir = tempdir().unwrap();
+        let manager = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
+
+        manager.write_artifact("imported/README", "x").unwrap();
+        assert_eq!(
+            manager
+                .resolve_collision_free_path("imported/README")
+                .unwrap(),
+            "imported/README (1)"
+        );
+    }
+
+    #[test]
+    fn test_resolve_collision_free_path_multi_dot_keeps_final_ext() {
+        let dir = tempdir().unwrap();
+        let manager = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
+
+        // Only the final extension is preserved, per Path semantics.
+        manager
+            .write_artifact("imported/archive.tar.gz", "x")
+            .unwrap();
+        assert_eq!(
+            manager
+                .resolve_collision_free_path("imported/archive.tar.gz")
+                .unwrap(),
+            "imported/archive.tar (1).gz"
+        );
+    }
+
+    /// Mirrors what `import_file_from_path` does: resolve a collision-free dest,
+    /// then write+commit to it. Three same-name imports must land at the base
+    /// name, "(1)", and "(2)" with every earlier file preserved untouched.
+    #[tokio::test]
+    async fn test_import_flow_auto_suffixes_and_preserves_existing() {
+        let dir = tempdir().unwrap();
+        let manager = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
+
+        // First import: lands at the base name.
+        let dest1 = manager
+            .resolve_collision_free_path("imported/Brev.pdf")
+            .unwrap();
+        assert_eq!(dest1, "imported/Brev.pdf");
+        manager
+            .write_and_commit(&dest1, "first", "Import Brev.pdf")
+            .await
+            .unwrap();
+
+        // Second import, same source name: auto-suffixed to "(1)".
+        let dest2 = manager
+            .resolve_collision_free_path("imported/Brev.pdf")
+            .unwrap();
+        assert_eq!(dest2, "imported/Brev (1).pdf");
+        manager
+            .write_and_commit(&dest2, "second", "Import Brev.pdf")
+            .await
+            .unwrap();
+
+        // Third import: "(2)".
+        let dest3 = manager
+            .resolve_collision_free_path("imported/Brev.pdf")
+            .unwrap();
+        assert_eq!(dest3, "imported/Brev (2).pdf");
+        manager
+            .write_and_commit(&dest3, "third", "Import Brev.pdf")
+            .await
+            .unwrap();
+
+        // All three exist; earlier files were never overwritten.
+        assert_eq!(manager.read_artifact("imported/Brev.pdf").unwrap(), "first");
+        assert_eq!(
+            manager.read_artifact("imported/Brev (1).pdf").unwrap(),
+            "second"
+        );
+        assert_eq!(
+            manager.read_artifact("imported/Brev (2).pdf").unwrap(),
+            "third"
+        );
     }
 
     #[tokio::test]

@@ -130,6 +130,15 @@
     border-radius: 0.25rem;
 }
 
+/* Invisible stand-in for the Diff/Revert buttons of a ChangeApplied panel
+   while its Change row is still loading on first open. Occupies the exact
+   button-row height so the real actions slot in without a vertical shift
+   (see changeActions' reserveWhileLoading). */
+.change-actions-placeholder {
+    visibility: hidden;
+    pointer-events: none;
+}
+
 /* User message sent to Claude Code (shown inline in streaming area) */
 .claude-code-user-msg {
     background: var(--bg-tertiary);
@@ -273,6 +282,170 @@
     line-height: 1.5;
 }
 
+/* Fixed prose with one short inline link — wrap only at spaces so "MIT" never
+   splits mid-word. The shared .markdown-content rules set word-break: break-all
+   on links (and break-word on the container) to break long URLs/tokens in agent
+   responses; neither applies to this known-short license copy, where break-all
+   would split the "MIT license" link as "MI" / "T". The `a` override is the
+   load-bearing one — break-all sits directly on the anchor, so a value on the
+   parent <p> alone can't reach it. */
+.welcome-message .disclaimer,
+.welcome-message .disclaimer a {
+    word-break: normal;
+}
+
+/* ── Welcome entrance ──
+   The welcome eases in (fade + a small upward slide) AFTER the prompt textarea
+   has finished sliding up to its resting position — never at the same time.
+   CreateThreadView holds back the `.welcome-revealing` class until the prompt's
+   FLIP move completes (the `promptAnimating` signal clears on the transform's
+   transitionend), so the surface starts hidden and animates in once the textarea
+   has settled. The base `opacity: 0` prevents any flash before the class lands;
+   `.thread-content` flows at natural height with `overflow: visible` in the
+   compose-empty layout (shell.css), so the 0.5rem slide is never clipped. Matches
+   the `.thread-view.revealing` slide-in's duration/easing (input-messages.css). */
+.thread-content .welcome-message {
+    opacity: 0;
+}
+
+.thread-content.welcome-revealing .welcome-message {
+    animation: welcome-enter var(--duration-slow) ease-out both;
+}
+
+@keyframes welcome-enter {
+    from {
+        opacity: 0;
+        transform: translateY(0.5rem);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* Reduced motion: entrance is instant — no fade, no slide, and never held
+   hidden (the keyframe is off, so force the surface fully visible). */
+@media (prefers-reduced-motion: reduce) {
+    .thread-content .welcome-message {
+        opacity: 1;
+    }
+
+    .thread-content.welcome-revealing .welcome-message {
+        animation: none;
+    }
+}
+
+/* --- Thread-open skeleton ---------------------------------------------------
+   Placeholder bubbles shown while a thread's events load (ThreadSkeleton.tsx),
+   instead of a blank gap or a spinner that flashes on slow loads. Reuses the
+   global `shimmer` keyframes (drawer.css). Rendered inside ThreadSkeletonOverlay
+   (a fading sibling of the scroll container) so it crossfades OUT as the real
+   exchanges appear underneath. */
+.thread-skeleton {
+    display: flex;
+    flex-direction: column;
+    gap: 1.75rem;
+    padding: 1.25rem 0.25rem;
+}
+
+/* Fading skeleton overlay over the scroll area. Absolute inside the
+   position:relative `.thread-content-wrap`, opaque, and pointer-events:none so
+   it never blocks scrolling/taps; it covers the (empty) scroll area while the
+   load is in flight, then fades out over the rendered exchanges (is-fading).
+   The inner skeleton is width-capped + centered to match `.thread-content > *`
+   so its bubbles line up with where the real messages land. */
+.thread-skeleton-overlay {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    padding: 0.5rem 0.75rem 0.75rem;
+    background: var(--bg-primary);
+    pointer-events: none;
+    opacity: 1;
+    transition: opacity var(--duration-normal) ease;
+}
+
+.thread-skeleton-overlay > .thread-skeleton {
+    max-width: var(--content-max-width);
+    margin-left: auto;
+    margin-right: auto;
+}
+
+.thread-skeleton-overlay.is-fading {
+    opacity: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .thread-skeleton-overlay {
+        transition: none;
+    }
+}
+
+.thread-skeleton-exchange {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+}
+
+.thread-skeleton-lines {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+}
+
+.thread-skeleton-block {
+    border-radius: 0.4rem;
+    background: linear-gradient(
+        90deg,
+        var(--bg-tertiary) 25%,
+        color-mix(in srgb, var(--accent) 18%, var(--bg-tertiary)) 50%,
+        var(--bg-tertiary) 75%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+}
+
+.thread-skeleton-user {
+    align-self: flex-end;
+    width: 42%;
+    height: 2.25rem;
+    border-radius: 0.75rem;
+}
+
+.thread-skeleton-line {
+    height: 0.85rem;
+    width: 92%;
+}
+
+.thread-skeleton-line-short {
+    width: 56%;
+}
+
+/* Content fade-in on first appearance (skeleton/empty → exchanges). Opacity-only
+   so it never perturbs the scroll container's metrics (scroll-to-bottom, saved
+   scroll, deep-link, window expansion all read .thread-content scrollTop/Height);
+   added imperatively in a layout effect (ThreadView) BEFORE paint so content
+   never flashes at full opacity first. The class lingers harmlessly after the
+   one-shot animation; the next open removes+reflows+re-adds it to replay. */
+.thread-content.content-entering {
+    animation: thread-content-enter var(--duration-normal) ease-out;
+}
+
+@keyframes thread-content-enter {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .thread-skeleton-block {
+        animation: none;
+    }
+
+    .thread-content.content-entering {
+        animation: none;
+    }
+}
+
 /* First-run provider onboarding (no LLM provider configured) */
 .welcome-provider-setup {
     margin: 1.25rem 0;
@@ -320,7 +493,7 @@
 
 .welcome-hero h2 {
     margin: 0 0 0.5rem 0;
-    font-size: 1.25rem;
+    font-size: 1.125rem;
     font-weight: 600;
 }
 
@@ -341,37 +514,72 @@
     margin: 0 0 1.25rem 0;
 }
 
-/* Bare chevrons — no button chrome (no box, border, or fill), just the
-   clickable glyph. Still a <button> for keyboard + a11y. */
+/* Circular bordered chevrons — same treatment as the notification detail nav
+   (.notification-detail-nav in panels/content.css) and the thread-view scroll
+   chevrons. Mounted always with a fixed slot (flex: none) so the disabled-at-end
+   state can't shift the centered suggestion. Both chevrons stay on screen on
+   every step; the inapplicable one is `:disabled` (greyed) rather than hidden. */
 .welcome-carousel-nav {
-    flex: 0 0 auto;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0.25rem;
-    background: none;
-    border: none;
+    flex: none;
+    width: 2rem;
+    height: 2rem;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
+    backdrop-filter: blur(0.5rem);
+    -webkit-backdrop-filter: blur(0.5rem);
+    border: 0.125rem solid var(--border-color);
     color: var(--text-secondary);
     cursor: pointer;
-    transition: color var(--duration-fast) ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.85;
+    transition: opacity 0.2s, background-color 0.15s, color 0.15s, border-color 0.15s;
 }
 
-.welcome-carousel-nav:hover:not(:disabled) {
-    color: var(--text-primary);
-}
-
-/* Disabled at the ends — dimmed, non-interactive ("when applicable"). */
+/* Disabled "when applicable" — kept on screen, greyed and non-interactive at the
+   first / last suggestion (mirrors .icon-btn:disabled). */
 .welcome-carousel-nav:disabled {
     opacity: 0.3;
     cursor: default;
+    pointer-events: none;
 }
 
-/* The current suggestion. Higher specificity than `.welcome-message p`
-   (0,2,0 > 0,1,1) so its margin wins. */
-.welcome-hero .welcome-carousel-item {
+@media (hover: hover) {
+    .welcome-carousel-nav:not(:disabled):hover {
+        opacity: 1;
+        background: var(--bg-hover);
+        color: var(--text-primary);
+        border-color: var(--text-muted);
+    }
+}
+
+/* Carousel viewport: takes the flex space between the chevrons and stacks every
+   suggestion in a SINGLE grid cell. The row track therefore sizes to the tallest
+   suggestion (hidden cards stay laid out and still contribute their height), so
+   the viewport height is stable across slides and the vertically-centered
+   chevrons no longer bounce as the visible card's length changes. */
+.welcome-carousel-viewport {
     flex: 1 1 auto;
     min-width: 0;
+    display: grid;
+}
+
+/* The suggestions — tappable cards flanked by the chevrons. Resets the native
+   <button> chrome (font-family doesn't inherit on buttons) and adopts the same
+   translucent-bordered treatment as the chevron nav so it reads as interactive
+   without a hover (mobile has none). Clicking the current one prefills the prompt.
+   All cards share the grid cell (`grid-area: 1 / 1`) and the default grid
+   `stretch` so every card renders at the uniform tallest-card height; the flex
+   centering keeps shorter text vertically centered within that height. */
+.welcome-hero .welcome-carousel-item {
+    grid-area: 1 / 1;
+    min-width: 0;
     margin: 0;
+    padding: 0.5rem 0.75rem;
+    display: flex;
+    align-items: center;
+    font-family: inherit;
     /* Primary (near-black) so the suggestion stands out by contrast rather than
        size — the small italic copy still reads as the focal line. */
     color: var(--text-primary);
@@ -379,33 +587,59 @@
     font-style: italic;
     line-height: 1.45;
     text-align: left;
+    cursor: pointer;
+    background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
+    border: 0.0625rem solid var(--border-color);
+    border-radius: 0.625rem;
+    -webkit-tap-highlight-color: transparent;
+    transition: background-color 0.15s, color 0.15s, border-color 0.15s;
 }
 
-/* Dismiss: a quiet pill pinned to the top-right of the welcome surface.
-   `.welcome-hero` is `position: relative`, so this anchors to the centered
-   content box — landing the pill at the content's top-right edge (aligned with
-   the prompt's right edge), not the full-width pane corner. */
+/* Non-current cards stay laid out (so they keep driving the track height) but are
+   removed from sight and hit-testing — the markup also drops them from the tab
+   order and the a11y tree (aria-hidden / tabindex in WelcomeMessage.tsx). */
+.welcome-hero .welcome-carousel-item[aria-hidden="true"] {
+    visibility: hidden;
+    pointer-events: none;
+}
+
+@media (hover: hover) {
+    .welcome-hero .welcome-carousel-item:hover {
+        background: var(--bg-hover);
+        border-color: var(--text-muted);
+    }
+}
+
+/* Dismiss: a sleek, chrome-less ghost control pinned to the top-right of the
+   welcome surface. No border or fill at rest — just a quiet, compact label that
+   lifts into a soft fully-rounded pill on hover. `.welcome-hero` is
+   `position: relative`, so this anchors to the centered content box — landing at
+   the content's top-right edge (aligned with the prompt's right edge), not the
+   full-width pane corner. */
 .welcome-dismiss {
     position: absolute;
     top: 0;
     right: 0;
     z-index: 1;
-    padding: 0.3125rem 0.625rem;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.375rem;
+    padding: 0.25rem 0.625rem;
+    background: transparent;
+    border: none;
+    border-radius: 999px;
     color: var(--text-muted);
-    font-size: 0.75rem;
+    font-size: 0.6875rem;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    opacity: 0.75;
     cursor: pointer;
     transition: color var(--duration-fast) ease,
                 background var(--duration-fast) ease,
-                border-color var(--duration-fast) ease;
+                opacity var(--duration-fast) ease;
 }
 
 .welcome-dismiss:hover {
     color: var(--text-secondary);
-    background: var(--bg-tertiary);
-    border-color: var(--text-muted);
+    background: var(--bg-hover);
+    opacity: 1;
 }
 
 /* Error state */
@@ -421,8 +655,9 @@
 
 /* Thread empty state — fallback when no exchanges render. The error/empty
    paths use real text content so iOS Safari can't show blank; the loading
-   path is deliberately blank for the first SPINNER_DELAY_MS (DelayedSpinner)
-   so fast loads never flash a spinner. */
+   skeleton lives in ThreadSkeletonOverlay (gated by useDelayedFlag, so it's
+   deliberately blank for the first SPINNER_DELAY_MS) and crossfades out as the
+   exchanges appear. */
 .thread-empty-state {
     display: flex;
     flex-direction: column;

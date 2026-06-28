@@ -20,8 +20,14 @@ import { useSignal } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
 import type { Loadable } from '../../store/types';
 import { Overlay } from '../shared/Overlay';
+import { LoadingFade } from '../shared/LoadingFade';
 import { dismissBootSplash } from '../../utils/bootSplash';
-import { recallLastWorkspace, forgetLastWorkspace } from '../../utils/lastWorkspace';
+import {
+  recallLastWorkspace,
+  forgetLastWorkspace,
+  rememberLastWorkspaceCount,
+  recallLastWorkspaceCount,
+} from '../../utils/lastWorkspace';
 import {
   listWorkspaces,
   createWorkspace,
@@ -183,10 +189,33 @@ function TrashIcon() {
   );
 }
 
+/** Brand-matched loading placeholder for the workspace list — shimmer rows that
+ *  mirror the real row's three-cell layout (dot · name · actions) so the
+ *  skeleton→list handoff doesn't reflow. Kept local + self-contained like the
+ *  rest of the picker; decorative → aria-hidden. Shown immediately while the
+ *  list loads and crossfaded into it via `<LoadingFade>`. */
+function PickerSkeleton({ rows = 3 }: { rows?: number }) {
+  return (
+    <ul class="ws-picker-list ws-picker-skel" aria-hidden="true">
+      {Array.from({ length: rows }, (_, i) => (
+        <li class="ws-picker-row" key={i}>
+          <div class="ws-picker-open">
+            <span class="ws-picker-skel-dot" />
+            <span class="ws-picker-skel-name" />
+            <span class="ws-picker-skel-action" />
+          </div>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 export function WorkspacePicker() {
   const workspaces = useSignal<Loadable<WorkspaceStatus[]>>({ status: 'not-loaded' });
   const busy = useSignal(false);
   const error = useSignal<string | null>(null);
+  // Skeleton row count, captured once at mount (see where it's read below).
+  const skeletonRowsRef = useRef<number | undefined>(undefined);
   // Inline form state.
   const creating = useSignal(false);
   const newName = useSignal('');
@@ -234,6 +263,9 @@ export function WorkspacePicker() {
     const list = await listWorkspaces();
     workspaces.value = { status: 'loaded', data: list };
     error.value = null;
+    // Remember the count so a future load can size its skeleton to this list
+    // (no skeleton→list bounce on the next visit).
+    rememberLastWorkspaceCount(list.length);
   }
 
   async function fetchRestoreStatus(): Promise<void> {
@@ -449,6 +481,22 @@ export function WorkspacePicker() {
   }
 
   const v = workspaces.value;
+  // Show the skeleton immediately while the list loads — no delay gate. The
+  // picker is a full-screen surface whose only alternative is a blank blue panel,
+  // and <LoadingFade> crossfades the skeleton into the list, so showing it on
+  // every open reads as intentional rather than as a flash. (The usual
+  // SPINNER_DELAY_MS gate exists to avoid flashing a loader over already-visible
+  // content; there is none here, and a fast local gateway otherwise suppressed
+  // the skeleton entirely.)
+  const showListSkeleton = v.status === 'loading' || v.status === 'not-loaded';
+  // Size the skeleton to the last-known workspace count so the skeleton→list
+  // handoff doesn't bounce (each skeleton row matches a real row's height).
+  // Captured once at mount so it stays stable while the skeleton fades out
+  // (LoadingFade) after the fresh count is recorded; first-ever visit → 3.
+  if (skeletonRowsRef.current === undefined) {
+    skeletonRowsRef.current = recallLastWorkspaceCount() ?? 3;
+  }
+  const skeletonRows = skeletonRowsRef.current;
   // Predict a slug collision so the picker can warn before uploading (the
   // gateway re-checks authoritatively). Compares the typed name's slug against
   // the loaded workspace ids.
@@ -524,10 +572,8 @@ export function WorkspacePicker() {
         {v.status === 'failed' && (
           <div class="ws-picker-error">Failed to load workspaces: {v.error}</div>
         )}
-        {(v.status === 'loading' || v.status === 'not-loaded') && (
-          <div class="ws-picker-empty">Loading…</div>
-        )}
 
+        <LoadingFade showSkeleton={showListSkeleton} skeleton={<PickerSkeleton rows={skeletonRows} />}>
         {v.status === 'loaded' && v.data.length === 0 && (
           <div class="ws-picker-empty">
             {creating.value
@@ -732,6 +778,7 @@ export function WorkspacePicker() {
             })}
           </ul>
         )}
+        </LoadingFade>
 
         {restore && restore.status === 'running' && (
           <div class="ws-picker-restore-banner" data-state="running">

@@ -842,3 +842,52 @@ describe('exchangeStatus — CC follow-up abort scenarios', () => {
   });
 });
 
+describe('CodingAgentThoughtStreamed reasoning rendering', () => {
+  it('accumulates reasoning deltas into the Thinking step and resolves on text', () => {
+    const thread = makeThreadState();
+    thread.meta.channel = 'claude_code';
+    const map = new Map([['thread-1', thread]]);
+
+    handleEvent(map, 'thread-1', 1, { type: 'MessageReceived', text: 'fix it' } as ThreadEvent, '2026-04-04T10:00:00Z');
+    handleEvent(map, 'thread-1', 2, { type: 'SessionStarted', session_id: 's1' } as ThreadEvent, '2026-04-04T10:00:01Z');
+    handleEvent(map, 'thread-1', 3, { type: 'CodingAgentPromptSent', text: 'fix it' } as ThreadEvent, '2026-04-04T10:00:02Z');
+    handleEvent(map, 'thread-1', 4, { type: 'CodingAgentThoughtStreamed', text: 'Let me ' } as ThreadEvent, '2026-04-04T10:00:03Z');
+    handleEvent(map, 'thread-1', 5, { type: 'CodingAgentThoughtStreamed', text: 'check the tokens.' } as ThreadEvent, '2026-04-04T10:00:04Z');
+    handleEvent(map, 'thread-1', 6, { type: 'CodingAgentTextStreamed', text: 'Done!' } as ThreadEvent, '2026-04-04T10:00:05Z');
+    handleEvent(map, 'thread-1', 7, { type: 'CodingAgentIdled' } as ThreadEvent, '2026-04-04T10:00:06Z');
+
+    const exchanges = groupIntoExchanges(map.get('thread-1')!.events);
+    const events = exchangeResponseEvents(exchanges[0]);
+    const thinking = events.find(e => e.type === 'step' && e.description === 'Thinking') as
+      | { thinkingText?: string; success: boolean | null }
+      | undefined;
+    expect(thinking).toBeDefined();
+    // Both deltas coalesced onto the one Thinking step, in order.
+    expect(thinking!.thinkingText).toBe('Let me check the tokens.');
+    // Visible text resolved the Thinking step (no dangling spinner).
+    expect(thinking!.success).not.toBeNull();
+  });
+
+  it('opens a Thinking step from reasoning when no CodingAgentPromptSent fired (resumed initial prompt)', () => {
+    const thread = makeThreadState();
+    thread.meta.channel = 'claude_code';
+    const map = new Map([['thread-1', thread]]);
+
+    // Resume-after-cancel: the follow-up is the resumed session's initial prompt,
+    // so NO CodingAgentPromptSent is emitted — reasoning is the first activity.
+    handleEvent(map, 'thread-1', 1, { type: 'MessageReceived', text: 'redirect' } as ThreadEvent, '2026-04-04T10:00:00Z');
+    handleEvent(map, 'thread-1', 2, { type: 'SessionStarted', session_id: 's1' } as ThreadEvent, '2026-04-04T10:00:01Z');
+    handleEvent(map, 'thread-1', 3, { type: 'CodingAgentThoughtStreamed', text: 'Reasoning hard…' } as ThreadEvent, '2026-04-04T10:00:02Z');
+
+    const exchanges = groupIntoExchanges(map.get('thread-1')!.events);
+    const events = exchangeResponseEvents(exchanges[0]);
+    const thinking = events.find(e => e.type === 'step' && e.description === 'Thinking') as
+      | { thinkingText?: string; success: boolean | null }
+      | undefined;
+    expect(thinking).toBeDefined();
+    expect(thinking!.thinkingText).toBe('Reasoning hard…');
+    // Still streaming — the step is live (spinner), not resolved.
+    expect(thinking!.success).toBeNull();
+  });
+});
+

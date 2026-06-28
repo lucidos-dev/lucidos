@@ -521,6 +521,11 @@ export function BackupSection() {
           />
         )}
       </div>
+      {scheduleLoaded && schedule !== 'off' && (
+        <div style="font-size: 0.6875rem; color: var(--text-muted); margin-top: 0.25rem;">
+          Scheduled backups run at the selected time in your timezone (set in Settings → System → Locale).
+        </div>
+      )}
 
       {/* Live backup progress is shown by the health card at the top of this
           section (backupHealthCard's running branch) — no duplicate bar here. */}

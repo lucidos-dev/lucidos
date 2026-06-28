@@ -30,7 +30,6 @@ vi.mock('../store', () => ({
   appRefreshKey: signal(0),
   wipPreviewThreadId: signal(null),
   threadMap: signal(new Map()),
-  appsTab: signal('installed'),
   appSearchOpen: signal(false),
   appSearchQuery: signal(''),
 }));

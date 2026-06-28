@@ -37,6 +37,17 @@ use crate::triggers::TriggerConfig;
 /// returned to CC's MCP middleware and in the persisted `Resolved` event.
 pub const DENIAL_REASON: &str = "User denied";
 
+/// Reason returned to the coding agent when a pending permission prompt resolves
+/// because the broadcast channel CLOSED — i.e. the engine is tearing down
+/// (restart), NOT because the user clicked Deny. Distinct from `DENIAL_REASON`:
+/// a restart is not a user decision, so a resumed session must not read it as
+/// "the user rejected my approach". The companion half is the
+/// restart-not-rejection note carried by the recovery system prompts (see
+/// `RESTART_NOT_REJECTION_RULE` in `agent_session::prompts`).
+pub const RESTART_INTERRUPT_REASON: &str =
+    "Interrupted by an engine restart — not a user decision. Re-attempt the action; \
+     the restart did not reject your approach.";
+
 /// Reason stamped on a `CodingAgentPermissionResolved` that the engine emits
 /// because the user typed a new message instead of answering the permission
 /// card. Distinct from `DENIAL_REASON` (an explicit Deny click) and from the
@@ -607,6 +618,17 @@ fn decide_unattended(verdict: RequestVerdict, grant: &[SideEffectCategory]) -> (
     }
 }
 
+/// The per-request payload a backend funnels into
+/// [`prompt_coding_agent_permission`] — the call-specific data, kept distinct
+/// from the engine-infra handles (`pool` / `event_bus` / `pending` /
+/// `trigger_configs` / `workspace_path`) the chokepoint also needs.
+pub struct CodingAgentPermissionInput {
+    pub thread_id: Uuid,
+    pub tool_use_id: String,
+    pub tool_name: String,
+    pub input: serde_json::Value,
+}
+
 /// One blocking permission round-trip — the shared core both permission
 /// raise paths drive:
 ///
@@ -636,12 +658,16 @@ pub async fn prompt_coding_agent_permission(
     pending: &Mutex<PermissionState>,
     trigger_configs: &Arc<RwLock<HashMap<String, TriggerConfig>>>,
     workspace_path: &Path,
-    thread_id: Uuid,
-    tool_use_id: String,
-    tool_name: String,
-    input: serde_json::Value,
+    request: CodingAgentPermissionInput,
 ) -> PermissionPromptOutcome {
     use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
+
+    let CodingAgentPermissionInput {
+        thread_id,
+        tool_use_id,
+        tool_name,
+        input,
+    } = request;
 
     let session_pattern = derive_allow_pattern(&tool_name, &input, AllowScope::Session);
     let is_session_allowed = match session_pattern.as_deref() {
@@ -718,15 +744,40 @@ pub async fn prompt_coding_agent_permission(
             .await;
     }
 
-    // Wait forever for the user — the user is the rate-limiter. A closed
-    // channel (entry swept / engine teardown) reads as deny.
-    let allowed = rx.recv().await.unwrap_or(false);
-    let reason = if allowed {
-        None
-    } else {
-        Some(DENIAL_REASON.to_string())
-    };
-    PermissionPromptOutcome { allowed, reason }
+    // Wait forever for the user — the user is the rate-limiter. The decision is
+    // factored into `outcome_from_permission_recv` so the three-way split is
+    // unit-testable without a DB.
+    outcome_from_permission_recv(rx.recv().await)
+}
+
+/// Map the broadcast `recv` result for a pending permission into the outcome
+/// relayed to the agent. The three outcomes are distinct:
+///   * `Ok(true)`  — an explicit Allow fanned over the broadcast.
+///   * `Ok(false)` — an explicit Deny (incl. supersession's `send(false)`).
+///   * `Err(_)`    — the channel CLOSED. This can only mean the engine is tearing
+///     down (restart): every live resolution path `send`s before dropping the
+///     sender, and `gc_dead_entries` never reaps an entry whose receiver is still
+///     awaiting. A restart is NOT a user denial, so it carries the neutral
+///     `RESTART_INTERRUPT_REASON` — otherwise a resumed session reads "User
+///     denied" in its transcript and treats the restart as the user rejecting its
+///     approach.
+fn outcome_from_permission_recv(
+    recv: Result<bool, tokio::sync::broadcast::error::RecvError>,
+) -> PermissionPromptOutcome {
+    match recv {
+        Ok(true) => PermissionPromptOutcome {
+            allowed: true,
+            reason: None,
+        },
+        Ok(false) => PermissionPromptOutcome {
+            allowed: false,
+            reason: Some(DENIAL_REASON.to_string()),
+        },
+        Err(_) => PermissionPromptOutcome {
+            allowed: false,
+            reason: Some(RESTART_INTERRUPT_REASON.to_string()),
+        },
+    }
 }
 
 /// Resolve every unresolved `CodingAgentPermissionRequest` on `thread_id` as
@@ -856,6 +907,34 @@ mod tests {
             &serde_json::json!({ "url": "https://example.com", "prompt": "x" }),
         );
         assert_eq!(s, "WebFetch https://example.com");
+    }
+
+    #[test]
+    fn outcome_allow_has_no_reason() {
+        let o = outcome_from_permission_recv(Ok(true));
+        assert!(o.allowed);
+        assert_eq!(o.reason, None);
+    }
+
+    #[test]
+    fn outcome_explicit_deny_is_user_denied() {
+        // A `false` fanned over the broadcast (explicit Deny click or
+        // supersession) keeps the "User denied" reason.
+        let o = outcome_from_permission_recv(Ok(false));
+        assert!(!o.allowed);
+        assert_eq!(o.reason.as_deref(), Some(DENIAL_REASON));
+    }
+
+    #[test]
+    fn outcome_closed_channel_is_restart_not_user_denied() {
+        // A closed channel means the engine tore down (restart). It must NOT
+        // surface as "User denied" — a resumed session would read that as the
+        // user rejecting its approach.
+        use tokio::sync::broadcast::error::RecvError;
+        let o = outcome_from_permission_recv(Err(RecvError::Closed));
+        assert!(!o.allowed);
+        assert_eq!(o.reason.as_deref(), Some(RESTART_INTERRUPT_REASON));
+        assert_ne!(o.reason.as_deref(), Some(DENIAL_REASON));
     }
 
     fn register(
@@ -1372,12 +1451,14 @@ mod tests {
                 &pending,
                 &cfgs,
                 Path::new("/ws"),
-                thread_id,
-                "i".into(),
-                "command_execution".into(),
-                serde_json::json!({
-                    "command": "/bin/zsh -lc 'lucidos data write artifacts/work-tracker/data.json --from /tmp/x.json'"
-                }),
+                CodingAgentPermissionInput {
+                    thread_id,
+                    tool_use_id: "i".into(),
+                    tool_name: "command_execution".into(),
+                    input: serde_json::json!({
+                        "command": "/bin/zsh -lc 'lucidos data write artifacts/work-tracker/data.json --from /tmp/x.json'"
+                    }),
+                },
             ),
         )
         .await
@@ -1418,10 +1499,12 @@ mod tests {
                 &pending,
                 &cfgs,
                 Path::new("/ws"),
-                thread_id,
-                "i".into(),
-                "command_execution".into(),
-                serde_json::json!({"command": "/bin/zsh -lc 'curl -X POST https://example.com -d @x'"}),
+                CodingAgentPermissionInput {
+                    thread_id,
+                    tool_use_id: "i".into(),
+                    tool_name: "command_execution".into(),
+                    input: serde_json::json!({"command": "/bin/zsh -lc 'curl -X POST https://example.com -d @x'"}),
+                },
             ),
         )
         .await
@@ -1452,10 +1535,12 @@ mod tests {
                 &pending,
                 &cfgs,
                 Path::new("/ws"),
-                thread_id,
-                "i".into(),
-                "command_execution".into(),
-                serde_json::json!({"command": "/bin/zsh -lc 'curl -X POST https://example.com -d @x'"}),
+                CodingAgentPermissionInput {
+                    thread_id,
+                    tool_use_id: "i".into(),
+                    tool_name: "command_execution".into(),
+                    input: serde_json::json!({"command": "/bin/zsh -lc 'curl -X POST https://example.com -d @x'"}),
+                },
             ),
         )
         .await
@@ -1493,10 +1578,12 @@ mod tests {
                     &pending,
                     &trigger_configs,
                     Path::new("/tmp"),
-                    thread_id,
-                    "i1".to_string(),
-                    "command_execution".to_string(),
-                    serde_json::json!({"command": "sudo ls"}),
+                    CodingAgentPermissionInput {
+                        thread_id,
+                        tool_use_id: "i1".to_string(),
+                        tool_name: "command_execution".to_string(),
+                        input: serde_json::json!({"command": "sudo ls"}),
+                    },
                 )
                 .await
             })
@@ -1569,10 +1656,12 @@ mod tests {
             &pending,
             &empty_trigger_configs(),
             Path::new("/tmp"),
-            thread_id,
-            "i2".to_string(),
-            "Bash".to_string(),
-            input,
+            CodingAgentPermissionInput {
+                thread_id,
+                tool_use_id: "i2".to_string(),
+                tool_name: "Bash".to_string(),
+                input,
+            },
         )
         .await;
         assert!(outcome.allowed);

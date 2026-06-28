@@ -61,7 +61,12 @@ vi.mock('./notifications', () => ({ handleNotificationSSE: vi.fn() }));
 vi.mock('./chat-changes', () => ({ syncRestartToast: vi.fn(), addRestartGroup: vi.fn() }));
 vi.mock('./preferences', () => ({ loadPreferences: vi.fn() }));
 vi.mock('./push', () => ({ initPushSubscription: vi.fn() }));
-vi.mock('./devices', () => ({ getDeviceId: vi.fn(), toggleDevicePush: vi.fn() }));
+// Default device id for this page; device-scoping tests vary the event's actor
+// against it. `./devices` is pulled in during the static import phase (via
+// `../store`), so the mock fn must be vi.hoisted — a plain const isn't
+// initialized yet when the hoisted factory runs.
+const { getDeviceId } = vi.hoisted(() => ({ getDeviceId: vi.fn(() => 'this-device') }));
+vi.mock('./devices', () => ({ getDeviceId, toggleDevicePush: vi.fn() }));
 vi.mock('../../components/chat/scrollState', () => ({ scrollToBottom: vi.fn() }));
 vi.mock('./repositories', () => ({ refreshRepoView: vi.fn() }));
 vi.mock('./entityReferences', () => ({ processSSEForReferences: vi.fn() }));
@@ -209,6 +214,18 @@ function navEvent(sourceThreadId: string) {
   };
 }
 
+// An agent (navigate_ui) navigate carries the originating device as `actor`.
+function navEventFromDevice(sourceThreadId: string, deviceId: string) {
+  return {
+    thread_id: sourceThreadId,
+    event: {
+      type: 'NavigationRequested',
+      payload: JSON.stringify({ target: 'app', app_id: 'demo-director' }),
+      actor: { kind: 'device', device_id: deviceId, label: deviceId },
+    },
+  };
+}
+
 describe('NavigationRequested scoping', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -249,5 +266,41 @@ describe('NavigationRequested scoping', () => {
     toasts.value[0].action!.onClick();
     expect(focusThread).toHaveBeenCalledWith('thread-B');
     expect(openAppById).toHaveBeenCalledWith('demo-director', expect.any(String));
+  });
+
+  // Agent navigate carries its originating device. It must act only on THAT
+  // device — never the user's other devices, even ones viewing the same thread.
+  it('acts when the agent navigate names THIS device (focused thread)', () => {
+    getDeviceId.mockReturnValue('this-device');
+    focusedThreadId.value = 'thread-A';
+    handleThreadEvent(navEventFromDevice('thread-A', 'this-device'));
+    expect(openAppById).toHaveBeenCalledWith('demo-director', expect.any(String));
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  it('ignores an agent navigate naming a DIFFERENT device, even with the thread focused (no nav, no offer)', () => {
+    getDeviceId.mockReturnValue('this-device');
+    focusedThreadId.value = 'thread-A';
+    handleThreadEvent(navEventFromDevice('thread-A', 'other-device'));
+    expect(openAppById).not.toHaveBeenCalled();
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  it('ignores a different-device navigate from a non-focused thread (no jump offer)', () => {
+    getDeviceId.mockReturnValue('this-device');
+    focusedThreadId.value = 'thread-A';
+    handleThreadEvent(navEventFromDevice('thread-B', 'other-device'));
+    expect(openAppById).not.toHaveBeenCalled();
+    expect(focusThread).not.toHaveBeenCalled();
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  it('still offers to jump for an actor-less navigate from a non-focused thread (trigger/background)', () => {
+    getDeviceId.mockReturnValue('this-device');
+    focusedThreadId.value = 'thread-A';
+    handleThreadEvent(navEvent('thread-B'));
+    // No device actor → device scope doesn't apply → existing offer behavior.
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].key).toBe('nav-offer-thread-B');
   });
 });

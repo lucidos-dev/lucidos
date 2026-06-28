@@ -74,7 +74,7 @@ async fn backfill_trigger_id_rewrites_v5_hashes_to_config_ids() {
     teardown_test_db(&db).await;
 }
 
-/// Regression for the work-workspace bug where every trigger thread
+/// Regression for the bug where every trigger thread
 /// rendered with NULL `trigger_id` because the
 /// `20260429214800_addtriggeridtothreadsummaries.sql` backfill only read
 /// `payload->>'trigger_id'` and ignored legacy events that stored the id
@@ -168,7 +168,7 @@ async fn backfill_trigger_id_from_events_reads_legacy_task_id() {
     teardown_test_db(&db).await;
 }
 
-/// Reproduce the original work-workspace bug end-to-end: a legacy event
+/// Reproduce the original bug end-to-end: a legacy event
 /// with `task_id` set to the v5 hash of `config.id`, and a NULL row in
 /// `thread_summaries`. After both backfills run in startup order the
 /// dropdown filter (which sends `config.id`) must match.
@@ -185,7 +185,7 @@ async fn both_backfills_compose_legacy_task_id_to_config_id() {
              VALUES ($1, 'TriggerCreated', $2, 'trigger', $3)",
     )
     .bind(Uuid::new_v4())
-    .bind(serde_json::json!({"trigger_id": config_id, "name": "UA Analysis Runner"}))
+    .bind(serde_json::json!({"trigger_id": config_id, "name": "Data Analysis Runner"}))
     .bind(config_id)
     .execute(&pool)
     .await
@@ -197,7 +197,7 @@ async fn both_backfills_compose_legacy_task_id_to_config_id() {
         thread,
         serde_json::json!({
             "task_id": v5_hash,
-            "task_name": "UA Analysis Runner",
+            "task_name": "Data Analysis Runner",
         }),
     )
     .await;

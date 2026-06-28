@@ -36,12 +36,6 @@ This is the preferred channel because it keeps the report confidential, gives us
 private space to discuss and fix the issue, and lets us coordinate disclosure and
 credit through a GitHub security advisory.
 
-<!-- TODO: Once the lucidos.dev domain and mailbox are set up, security@lucidos.dev
-     becomes the SECONDARY reporting channel (email fallback for reporters who
-     prefer not to use GitHub). Until then, GitHub private vulnerability reporting
-     above is the only channel — there is no security@lucidos.dev mailbox yet, so
-     do not advertise one. -->
-
 > **Secondary channel (not yet available):** an email fallback at
 > `security@lucidos.dev` is planned and will be added once the `lucidos.dev`
 > domain and mailbox exist. **It does not work yet** — until then, use the GitHub

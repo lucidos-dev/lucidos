@@ -116,7 +116,7 @@ describe('TerminatedQuestionBody', () => {
 
 describe('question text — URL linkification', () => {
   const QUESTION =
-    'Draft PR #1488 is ready: https://github.com/m10s-green/user-acquisition/pull/1488 — mark it ready?';
+    'Draft PR #1488 is ready: https://github.com/example-org/example-repo/pull/1488 — mark it ready?';
 
   it('renders a bare URL in the question as a clickable new-tab link (terminated body)', () => {
     const text = vnodeToText(TerminatedQuestionBody({
@@ -125,7 +125,7 @@ describe('question text — URL linkification', () => {
       multiSelect: false,
     }));
     expect(text).toContain(
-      '<a href="https://github.com/m10s-green/user-acquisition/pull/1488" target="_blank" rel="noopener">',
+      '<a href="https://github.com/example-org/example-repo/pull/1488" target="_blank" rel="noopener">',
     );
   });
 
@@ -136,7 +136,7 @@ describe('question text — URL linkification', () => {
       multiSelect: false,
       resolved: { kind: 'Selected', option_id: 'a' },
     }));
-    expect(text).toContain('href="https://github.com/m10s-green/user-acquisition/pull/1488"');
+    expect(text).toContain('href="https://github.com/example-org/example-repo/pull/1488"');
     expect(text).toContain('target="_blank"');
   });
 });

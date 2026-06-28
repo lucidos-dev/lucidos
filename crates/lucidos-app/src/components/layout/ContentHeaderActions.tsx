@@ -213,13 +213,14 @@ export function ContentHeaderActions() {
         <SearchIcon />
       </button>,
     );
-  } else if (!overlay && activeMenuItem.value === 'apps') {
+  } else if (!overlay && (activeMenuItem.value === 'apps' || activeMenuItem.value === 'plugins')) {
+    const searchLabel = activeMenuItem.value === 'plugins' ? 'Search plugins' : 'Search apps';
     addAction('search',
       <button
         class={`icon-btn header-icon apps-search-btn${appSearchOpen.value ? ' filter-active' : ''}`}
         onClick={toggleAppSearch}
-        aria-label="Search apps"
-        data-tooltip="Search apps"
+        aria-label={searchLabel}
+        data-tooltip={searchLabel}
       >
         <SearchIcon />
       </button>,

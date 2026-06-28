@@ -16,6 +16,19 @@ tests that only need external setup (built WASM artifacts; downloaded ML model);
 the packaged-build smoke test boots the macOS `.app` itself. Contract tests run
 inline as part of `cargo test`.
 
+**The e2e engine builds + runs in RELEASE by default** (`scripts/lib/e2e.sh` sets
+`RELEASE=1`; `docs/plans/2026-06-28-e2e-always-release-build.md`). The debug engine's
+CPU cost was the dominant driver of the mobile-webkit WebContent cold-start
+contention wedge — release eliminates that flake class and matches the
+packaged/prod engine. For fast local single-spec iteration on the debug build, set
+`LUCIDOS_E2E_DEBUG=1` (the opt-out is authoritative; an explicit `RELEASE=` is
+otherwise honored). The release compile caps `CARGO_BUILD_JOBS` at half the cores
+to avoid a host OOM during codegen. Test-only seams that production must not expose
+(e.g. `POST /api/v1/internal/seed-change-for-test`) are gated on
+`cfg!(any(debug_assertions, feature = "e2e-test-hooks"))` so they survive the
+release e2e build — which passes `--features e2e-test-hooks` — while a plain
+`cargo build --release` / `cargo tauri build` (no feature) still 404s them.
+
 ## Browser E2E (Playwright)
 
 Tests in `crates/lucidos-app/e2e/`. Chat, streaming, cancellation, CC sessions, changes UI, threads, reload resilience.

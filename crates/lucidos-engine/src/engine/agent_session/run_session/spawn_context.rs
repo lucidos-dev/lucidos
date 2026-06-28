@@ -245,7 +245,7 @@ impl LucidosEngine {
                         Err(mismatch) => {
                             // External repos: a skill may legitimately have
                             // created a feature branch off our tracked one
-                            // (e.g. `git checkout -b UA-1234`). Adopt it
+                            // (e.g. `git checkout -b feature-1234`). Adopt it
                             // when its history contains our last commit.
                             // Internal threads keep the strict refusal so
                             // Apply has a stable claude-code/<id> branch.
@@ -501,15 +501,28 @@ impl LucidosEngine {
             }
 
             // Copy node_modules from main repo to worktree so frontend tests work.
-            // Much faster than `npm ci` (~2s copy vs 2-10min install).
-            // Can't symlink: npm install in the worktree follows the symlink
-            // and corrupts/deletes the main repo's real node_modules.
+            // Much faster than `npm ci` (~1-2s hardlink vs 2-10min install).
+            //
+            // The repo is an npm WORKSPACE (root package.json `workspaces:
+            // [crates/lucidos-app, packages/lucidos-sdk]`), so node_modules is
+            // hoisted to the REPO ROOT (`<repo>/node_modules`); there is NO
+            // `crates/lucidos-app/node_modules`. Provision the root tree — its
+            // workspace-member symlinks (e.g. `lucidos-app -> ../crates/lucidos-app`)
+            // are relative and resolve inside the worktree, and Node resolution
+            // walks up to `<wt>/node_modules`, so the members need no own copy.
+            // (Pointing at crates/lucidos-app here is what silently killed the
+            // fast path after the workspace migration: the marker was never
+            // found, so every CC worktree fell back to a cold `npm ci` that
+            // saturated disk I/O and timed out the concurrent git checkout —
+            // see docs/plans/2026-06-27-mobile-webkit-shard-contention.md.)
+            // Can't symlink the tree itself: npm install in the worktree would
+            // follow it and corrupt/delete the main repo's real node_modules.
             // Apps don't share Lucidos's node_modules — they're standalone
             // static folders. Skip the copy.
             if !is_external_repo && !is_app_spawn {
-                let wt_node_modules = wt_path.join("crates/lucidos-app/node_modules");
+                let wt_node_modules = wt_path.join("node_modules");
                 if !has_install_marker(&wt_node_modules) {
-                    let src_node_modules = repo_root.join("crates/lucidos-app/node_modules");
+                    let src_node_modules = repo_root.join("node_modules");
                     if has_install_marker(&src_node_modules) {
                         // `cp src dst` nests as `dst/src` when dst already
                         // exists, so any partial dir (e.g. Vite's `.vite/`
@@ -567,13 +580,15 @@ impl LucidosEngine {
                         }
                     } else {
                         // npm ci wipes node_modules itself, so any stale Vite
-                        // cache here is fine to leave.
+                        // cache here is fine to leave. Run it at the WORKSPACE
+                        // ROOT so every member installs correctly — the repo is
+                        // an npm workspace, so `npm ci` inside a member is wrong.
                         log!(
                             "[AgentSession] No node_modules in main repo to copy, running npm ci..."
                         );
                         match tokio::process::Command::new("npm")
                             .args(["ci", "--prefer-offline"])
-                            .current_dir(wt_path.join("crates/lucidos-app"))
+                            .current_dir(&wt_path)
                             .output()
                             .await
                         {

@@ -20,6 +20,7 @@ pub mod oauth;
 pub mod pinned_apps;
 pub mod plugin_marketplaces;
 pub mod plugins;
+pub mod preference_catalog;
 pub mod preferences;
 pub mod repositories;
 pub mod store;
@@ -387,6 +388,74 @@ fn commit_new_lucidos_toml(
     Ok(())
 }
 
+/// Open the workspace repo at `workspace_path`, stage the given `data/`-relative
+/// paths (additions/modifications), and commit them in one commit. Returns the
+/// commit sha.
+///
+/// This is the workspace-repo, fresh-handle sibling of
+/// [`crate::core::ArtifactManager::commit_data_paths`] (which commits through the
+/// engine's shared `Arc<Mutex<Repository>>`). Plugin install uses this so the
+/// files it writes into `data/` are version-controlled exactly like
+/// write_file/edit_file commits. Callers that may run concurrently with other
+/// workspace-repo mutations MUST hold `lock_workspace_repo` (the install/uninstall
+/// confirm flows do).
+pub fn commit_data_paths_added(
+    workspace_path: &std::path::Path,
+    data_relative_paths: &[String],
+    message: &str,
+) -> Result<String, git2::Error> {
+    let repo = git2::Repository::open(workspace_path)?;
+    let mut index = repo.index()?;
+    reset_index_to_head(&repo, &mut index)?;
+    for p in data_relative_paths {
+        if is_path_traversal(p) {
+            return Err(git2::Error::from_str(&format!(
+                "Path traversal not allowed: {}",
+                p
+            )));
+        }
+        index.add_path(std::path::Path::new(&format!("data/{}", p)))?;
+    }
+    index.write()?;
+    commit_index(&repo, message)
+}
+
+/// Open the workspace repo, stage the deletion of the given `data/`-relative
+/// paths (already removed from disk), and commit. Returns `Ok(None)` when none
+/// of the paths were tracked — nothing to commit (e.g. a legacy plugin whose
+/// files were never committed because of the install git-tracking bug this is
+/// the uninstall counterpart of). Paths not present in the index are skipped so
+/// a mix of tracked and never-committed files commits the tracked deletions
+/// without erroring on the rest.
+pub fn commit_data_paths_removed(
+    workspace_path: &std::path::Path,
+    data_relative_paths: &[String],
+    message: &str,
+) -> Result<Option<String>, git2::Error> {
+    let repo = git2::Repository::open(workspace_path)?;
+    let mut index = repo.index()?;
+    reset_index_to_head(&repo, &mut index)?;
+    let mut staged_any = false;
+    for p in data_relative_paths {
+        if is_path_traversal(p) {
+            continue;
+        }
+        // `remove_path` errors when the entry isn't in the index (untracked /
+        // never-committed file) — tolerate that and keep going.
+        if index
+            .remove_path(std::path::Path::new(&format!("data/{}", p)))
+            .is_ok()
+        {
+            staged_any = true;
+        }
+    }
+    if !staged_any {
+        return Ok(None);
+    }
+    index.write()?;
+    commit_index(&repo, message).map(Some)
+}
+
 /// Create a commit from the current index state.
 pub fn commit_index(repo: &git2::Repository, message: &str) -> Result<String, git2::Error> {
     let mut index = repo.index()?;
@@ -728,6 +797,13 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             "Setting environment variable {}...",
             args["name"].as_str().unwrap_or("variable")
         ),
+        // set_language / set_timezone / enable_push_notifications above are kept
+        // for replaying historical events; new writes go through set_preference.
+        "set_preference" => format!(
+            "Updating {} setting...",
+            args["key"].as_str().unwrap_or("preference")
+        ),
+        "get_preferences" => "Reading preferences...".to_string(),
         "fetch_news" => format!(
             "Fetching news about '{}'...",
             args["topic"].as_str().unwrap_or("topic")
@@ -931,7 +1007,58 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             Some(event_type) => format!("Counting {} events...", event_type),
             None => "Counting events...".to_string(),
         },
-        "read_notifications" => "Reading notifications...".to_string(),
+        "notifications" | "read_notifications" => match args["action"].as_str() {
+            Some("mark_read") => "Marking notification read...".to_string(),
+            Some("mark_all_read") => "Marking all notifications read...".to_string(),
+            // `list` and the legacy `read_notifications` alias (no action).
+            _ => "Reading notifications...".to_string(),
+        },
+        // Grouped manifest tools — the flat per-verb arms above stay for the
+        // back-compat aliases; these arms label the consolidated tool by action.
+        "triggers" => match args["action"].as_str() {
+            Some("create") => format!(
+                "Creating trigger '{}'...",
+                args["name"].as_str().unwrap_or("trigger")
+            ),
+            Some("update") => "Updating trigger...".to_string(),
+            Some("delete") => "Deleting trigger...".to_string(),
+            Some("pause") => "Pausing trigger...".to_string(),
+            Some("resume") => "Resuming trigger...".to_string(),
+            _ => "Listing triggers...".to_string(),
+        },
+        "trigger_groups" => match args["action"].as_str() {
+            Some("create") => format!(
+                "Creating trigger group '{}'...",
+                args["name"].as_str().unwrap_or("group")
+            ),
+            Some("rename") => format!(
+                "Renaming trigger group to '{}'...",
+                args["name"].as_str().unwrap_or("group")
+            ),
+            Some("reorder") => "Reordering trigger groups...".to_string(),
+            Some("delete") => "Deleting trigger group...".to_string(),
+            _ => "Listing trigger groups...".to_string(),
+        },
+        "preferences" => match args["action"].as_str() {
+            Some("set") => format!(
+                "Updating {} setting...",
+                args["key"].as_str().unwrap_or("preference")
+            ),
+            _ => "Reading preferences...".to_string(),
+        },
+        // The flat `set_environment_variable` alias is labelled by its own arm
+        // above (no `action`); these arms label the grouped `env_vars` tool.
+        "env_vars" => match args["action"].as_str() {
+            Some("set") => format!(
+                "Setting environment variable {}...",
+                args["name"].as_str().unwrap_or("variable")
+            ),
+            Some("delete") => format!(
+                "Deleting environment variable {}...",
+                args["name"].as_str().unwrap_or("variable")
+            ),
+            _ => "Listing environment variables...".to_string(),
+        },
         "manage_repositories" => match args["action"].as_str() {
             Some("add") => format!(
                 "Adding repository '{}'...",
@@ -943,6 +1070,84 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             ),
             Some("list") => "Listing repositories...".to_string(),
             _ => "Managing repositories...".to_string(),
+        },
+        "manage_models" => match args["action"].as_str() {
+            Some("add") => format!("Adding model '{}'...", args["id"].as_str().unwrap_or("model")),
+            Some("remove") => format!("Removing model '{}'...", args["id"].as_str().unwrap_or("model")),
+            Some("enable") => format!("Enabling model '{}'...", args["id"].as_str().unwrap_or("model")),
+            Some("disable") => format!("Disabling model '{}'...", args["id"].as_str().unwrap_or("model")),
+            Some("list") => "Listing models...".to_string(),
+            _ => "Managing models...".to_string(),
+        },
+        "events" => match args["action"].as_str() {
+            Some("emit") => format!(
+                "Emitting {} event...",
+                args["event_type"].as_str().unwrap_or("event")
+            ),
+            Some("count") => match args["event_type"].as_str() {
+                Some(event_type) => format!("Counting {} events...", event_type),
+                None => "Counting events...".to_string(),
+            },
+            // `query` (and any unrecognised action) → query label.
+            _ => format!(
+                "Querying {} events...",
+                args["event_type"].as_str().unwrap_or("all")
+            ),
+        },
+        "changes" => match args["action"].as_str() {
+            Some("apply") => "Applying change...".to_string(),
+            _ => "Listing changes...".to_string(),
+        },
+        "thread_queue" => match args["action"].as_str() {
+            Some("update_policy") => "Updating Thread Queue policy...".to_string(),
+            Some("run_now") => "Running queued entry now...".to_string(),
+            Some("drop") => "Dropping queued entry...".to_string(),
+            _ => "Listing Thread Queue...".to_string(),
+        },
+        // Grouped `memory` tool exposes only the correction actions to the LLM
+        // (correct / correct_by_id); both render the same label.
+        "memory" => "Updating memory...".to_string(),
+        "threads" => match args["action"].as_str() {
+            Some("count") => "Counting threads...".to_string(),
+            _ => "Listing threads...".to_string(),
+        },
+        "mcp" => match args["action"].as_str() {
+            Some("setup") => format!(
+                "Setting up MCP server '{}'...",
+                args["name"].as_str().unwrap_or("server")
+            ),
+            Some("start") => format!(
+                "Starting MCP server '{}'...",
+                args["id"].as_str().unwrap_or("server")
+            ),
+            Some("stop") => format!(
+                "Stopping MCP server '{}'...",
+                args["id"].as_str().unwrap_or("server")
+            ),
+            Some("remove") => format!(
+                "Removing MCP server '{}'...",
+                args["id"].as_str().unwrap_or("server")
+            ),
+            _ => "Listing MCP servers...".to_string(),
+        },
+        "plugins" => match args["action"].as_str() {
+            Some("install") => format!(
+                "Installing plugin from {}...",
+                args["source"].as_str().unwrap_or("source")
+            ),
+            Some("register_marketplace") => format!(
+                "Registering marketplace {}...",
+                args["source"].as_str().unwrap_or("source")
+            ),
+            Some("update") => format!(
+                "Updating plugin '{}'...",
+                args["id"].as_str().unwrap_or("plugin")
+            ),
+            Some("uninstall") => format!(
+                "Uninstalling plugin '{}'...",
+                args["id"].as_str().unwrap_or("plugin")
+            ),
+            _ => "Checking plugins for updates...".to_string(),
         },
         "browser_forget_login" => format!(
             "Forgetting login for {}...",

@@ -53,15 +53,15 @@ describe('control client', () => {
 
   it('restores via multipart POST to the sigil restore route', async () => {
     const mock = withFetch(() =>
-      Promise.resolve(new Response('{"id":"personal","name":"personal"}', { status: 200 })),
+      Promise.resolve(new Response('{"id":"myws","name":"myws"}', { status: 200 })),
     );
-    const file = new File([new Uint8Array([1, 2, 3])], 'lucidos-backup-personal-20260601-040254.enc');
-    const started = await restoreBackup(file, 'a-key', 'personal');
+    const file = new File([new Uint8Array([1, 2, 3])], 'lucidos-backup-myws-20260601-040254.enc');
+    const started = await restoreBackup(file, 'a-key', 'myws');
     expect(String(mock.mock.calls[0][0])).toBe('/~/api/v1/control/workspaces/restore');
     expect(mock.mock.calls[0][1]?.method).toBe('POST');
     // Multipart: the body is FormData (browser sets the boundary), not JSON.
     expect(mock.mock.calls[0][1]?.body).toBeInstanceOf(FormData);
-    expect(started.id).toBe('personal');
+    expect(started.id).toBe('myws');
   });
 
   it('reads gateway self-update status from the sigil control route', async () => {
@@ -98,12 +98,12 @@ describe('control client', () => {
   it('surfaces a 409 collision as an Error carrying the server message', async () => {
     withFetch(() =>
       Promise.resolve(
-        new Response('{"error":"A workspace named \\"personal\\" already exists — choose a different name."}', {
+        new Response('{"error":"A workspace named \\"myws\\" already exists — choose a different name."}', {
           status: 409,
         }),
       ),
     );
-    const file = new File([new Uint8Array([1])], 'lucidos-backup-personal-20260601-040254.enc');
+    const file = new File([new Uint8Array([1])], 'lucidos-backup-myws-20260601-040254.enc');
     await expect(restoreBackup(file, 'a-key')).rejects.toThrow(/already exists/);
   });
 });
@@ -122,10 +122,10 @@ describe('restore name helpers', () => {
   });
 
   it('parseWorkspaceNameFromArchive extracts the name or returns null', () => {
-    expect(parseWorkspaceNameFromArchive('lucidos-backup-personal-20260601-040254.enc')).toBe('personal');
+    expect(parseWorkspaceNameFromArchive('lucidos-backup-myws-20260601-040254.enc')).toBe('myws');
     expect(parseWorkspaceNameFromArchive('lucidos-backup-e2e-test-20260601-040254.enc')).toBe('e2e-test');
     expect(parseWorkspaceNameFromArchive('random.enc')).toBeNull();
-    expect(parseWorkspaceNameFromArchive('lucidos-backup-personal.enc')).toBeNull();
-    expect(parseWorkspaceNameFromArchive('lucidos-backup-personal-20260601.enc')).toBeNull();
+    expect(parseWorkspaceNameFromArchive('lucidos-backup-myws.enc')).toBeNull();
+    expect(parseWorkspaceNameFromArchive('lucidos-backup-myws-20260601.enc')).toBeNull();
   });
 });

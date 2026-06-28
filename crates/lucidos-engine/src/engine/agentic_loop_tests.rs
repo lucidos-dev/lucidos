@@ -1,6 +1,6 @@
 //! Regression tests for the agentic loop's terminator-emission and
 //! injection-event-id contracts. Both bugs surfaced together when a
-//! personal-workspace thread silently went zombie after hitting the
+//! long-running thread silently went zombie after hitting the
 //! per-turn iteration cap (no terminator → UI stuck on "running"),
 //! and every follow-up the user typed collided with the original
 //! `MessageReceived` row on `events_pkey` because the optimistic
@@ -358,7 +358,7 @@ async fn ensure_terminator_emitted_is_idempotent_when_terminator_exists() {
 /// "any terminator on the thread". A previous exchange's
 /// `ResponseGenerated` must not satisfy the check for a later exchange
 /// that died silently — otherwise the guard would never fire on
-/// long-running threads (which is exactly the personal-workspace shape).
+/// long-running threads (which is exactly the long-lived-thread shape).
 #[tokio::test]
 async fn ensure_terminator_emitted_scopes_check_to_request_event_id() {
     let (pool, db_name) = setup_test_db().await;

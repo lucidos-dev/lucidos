@@ -8,13 +8,14 @@ import {
   showToast,
   dismissToast,
 } from '../store';
-import { loadedOr, toFailed, setLoadingIfFresh } from '../types';
+import { toFailed, setLoadingIfFresh } from '../types';
 import { listArtifacts, uploadFile } from '../../api/client';
 import { revealContentPane } from './pane';
 import { pushNavState } from './navigation';
 import { isTauri } from '../../utils/platform';
 import { openExternal } from '../../utils/tauri';
 import { errorDetail } from '../../utils/errorDetail';
+import { currentInAppBrowser } from './preferences';
 
 // The file-preview restore is a page-reload re-hydration step — it belongs to
 // the FIRST loadArtifacts() after a fresh load, never to the SSE-driven
@@ -62,10 +63,6 @@ export async function loadArtifacts(): Promise<void> {
   }
 }
 
-function getArtifactPaths(): string[] {
-  return loadedOr(artifacts.value, []);
-}
-
 export function toggleFolder(path: string): void {
   const newSet = new Set(expandedFolders.value);
   if (newSet.has(path)) {
@@ -76,28 +73,9 @@ export function toggleFolder(path: string): void {
   expandedFolders.value = newSet;
 }
 
-export function expandAllFolders(): void {
-  const tree = buildFolderTree(getArtifactPaths());
-  const allPaths = new Set<string>();
-  collectAllPaths(tree, allPaths);
-  expandedFolders.value = allPaths;
-}
-
-export function collapseAllFolders(): void {
-  expandedFolders.value = new Set();
-}
-
-function collectAllPaths(node: FolderNode, paths: Set<string>): void {
-  for (const folderName of Object.keys(node.children)) {
-    const child = node.children[folderName];
-    if (child.path) paths.add(child.path);
-    collectAllPaths(child, paths);
-  }
-}
-
 const UPLOAD_TOAST_KEY = 'upload-progress';
 
-export async function uploadFiles(files: FileList): Promise<void> {
+export async function uploadFiles(files: FileList | File[]): Promise<void> {
   const fileList = Array.from(files);
   const total = fileList.length;
   let succeeded = 0;
@@ -176,6 +154,16 @@ export function openUrl(url: string): void {
   const normalized = normalizeUrl(url);
   if (!isTauri()) {
     window.open(normalized, '_blank', 'noopener');
+    return;
+  }
+  // Experimental in-app browser (the Tauri native webview) is opt-in. Off by
+  // default → open in the system browser via the OS opener, the same path
+  // openLocalFile uses. Only when the user has enabled it do we mount the
+  // in-app url-preview panel below.
+  if (!currentInAppBrowser()) {
+    void openExternal(normalized).catch((err) =>
+      showToast(`Couldn't open ${normalized}: ${errorDetail(err)}`, 'error'),
+    );
     return;
   }
   localStorage.removeItem('file-preview-open');

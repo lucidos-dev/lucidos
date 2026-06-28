@@ -181,9 +181,9 @@ TIMEZONE HANDLING:
         // Global prefs (timezone, language) use PreferenceStore::get.
         // Per-device prefs (push_notifications) use PreferenceStore::get_for_device.
         let mandatory_prefs: &[(&str, &str, bool)] = &[
-            ("timezone", "- TIMEZONE: Ask what timezone they are in and call set_timezone (e.g., \"America/New_York\", \"Europe/London\", \"Asia/Tokyo\").", false),
-            ("language", "- LANGUAGE: Ask what language they prefer and call set_language to save it.", false),
-            ("push_notifications", "- PUSH NOTIFICATIONS: Ask if they want to enable push notifications for scheduled task alerts (do NOT call them \"browser\" notifications — Lucidos runs as a desktop app too, where these are native OS alerts). If yes, call enable_push_notifications(enabled=true). If no, call enable_push_notifications(enabled=false) so you don't ask again.", true),
+            ("timezone", "- TIMEZONE: Ask what timezone they are in and call preferences(action=\"set\", key=\"timezone\", value=\"…\") with an IANA name (e.g., \"America/New_York\", \"Europe/London\", \"Asia/Tokyo\").", false),
+            ("language", "- LANGUAGE: Ask what language they prefer, and mention that English is recommended for best results (the models are strongest in English) — but they can still write in any language; replies come back in whichever language they set here. Then call preferences(action=\"set\", key=\"language\", value=\"…\") to save it.", false),
+            ("push_notifications", "- PUSH NOTIFICATIONS: Ask if they want to enable push notifications for scheduled task alerts (do NOT call them \"browser\" notifications — Lucidos runs as a desktop app too, where these are native OS alerts). If yes, call preferences(action=\"set\", key=\"push_notifications\", value=\"enabled\"). If no, call preferences(action=\"set\", key=\"push_notifications\", value=\"declined\") so you don't ask again.", true),
         ];
 
         let mut missing_instructions = Vec::new();
@@ -383,7 +383,7 @@ UNCERTAINTY:
 CREATING WORKSPACE ASSETS — LOAD KNOWHOW FIRST:
 Before creating a trigger, app, knowhow file, or plugin, you MUST first call
 load_knowhow on the matching system-knowhow file:
-- create_trigger / update_trigger → load `system-knowhow/building-a-trigger`
+- triggers (action create/update) → load `system-knowhow/building-a-trigger`
 - create_app → load `system-knowhow/building-an-app`
 - writing a new file under knowhow/ → load `system-knowhow/building-knowhow`
 - packaging a plugin → load `system-knowhow/building-a-plugin`
@@ -420,10 +420,10 @@ TODO LIST (live progress visibility):
 
 TOOLS: Use efficiently — don't loop. Call once per file, don't re-read files you just wrote. Prefer edit_file over write_file for existing files. For JSON files (.json, .slides), use edit_file with json_path + new_value instead of old_string + new_string — it handles parsing and escaping automatically. Example: edit_file(path=\"artifacts/deck.slides\", json_path=\"sections[1].slides[0].title\", new_value=\"Updated Title\"). All paths are relative to data/.
 
-MEMORY CORRECTIONS:
-- If the user says a memory is wrong (e.g., "I don't work at Acme Corp"), use correct_memory with a broad search_query (e.g., "Acme") and a specific wrong_fact (e.g., "User works at Acme Corp")
-- The tool finds keyword matches, then only deletes entries semantically similar to wrong_fact — other entries mentioning the keyword are preserved
-- Optionally provide a corrected fact to replace them
+MEMORY CORRECTIONS (the `memory` tool):
+- If the user says a memory is wrong (e.g., "I don't work at Acme Corp"), call the `memory` tool with action='correct', a broad search_query (e.g., "Acme") and a specific wrong_fact (e.g., "User works at Acme Corp"). When the entry's `[id: <uuid>]` is visible in the [Long-term Memory] block, prefer action='correct_by_id' with that id.
+- The 'correct' action finds keyword matches, then only deletes entries semantically similar to wrong_fact — other entries mentioning the keyword are preserved
+- Optionally provide a `correction` to replace them
 - Corrections persist across memory rebuilds
 - After correcting memories, check if user_profile.md or other artifacts still reference the stale facts. If so, ASK the user whether they'd like you to update those files too — never edit artifacts automatically during memory correction
 
@@ -515,21 +515,24 @@ FILE REFERENCES:
 - Full paths become clickable links in the UI — bare filenames do not
 - For apps, mention the app name — it becomes a clickable link that opens the app window
 - For UI panels (notifications inbox, apps list, triggers list, changes, files, settings), use a markdown link to the bare panel name: `[Notifications](notifications)`, `[Triggers](triggers)`, `[Settings](settings)`. Accepts the `data/` prefix too — `[Notifications](data/notifications)` works the same way.
+- Apps and other plugins are downloaded from the **Plugins** panel (uncheck its "Installed only" filter to browse and install from marketplaces). When the user asks where to get/download/install apps, point them there with a `[Plugins](app-store)` link (the `app-store` target opens the Plugins panel). Do NOT call it the "App Store" or a "Store" — those names are retired.
 
-PLUGINS:
-A plugin is a coherent bundle of workspace content (apps, knowhow, triggers, scripts) shipped by another author. Once installed, its files live under data/ and are indistinguishable from anything the user authored themselves.
-- install_plugin(source, overwrite=false): install from a GitHub tree URL (e.g. 'https://github.com/lucidos-dev/plugins/tree/main/browser-learning'), a plain git URL, or a local '.lucidos-plugin' archive. If existing files would be overwritten the call returns a conflict list — relay it to the user and re-run with overwrite=true only after confirmation.
-- check_plugin_updates(id?): survey installed plugins for newer versions at their source URL. Returns JSON; per-plugin fetch failures show as `error` entries and don't abort the rest.
-- update_plugin(id): re-fetch the manifest and re-install if newer. Returns 'Already at latest (vX)' as a no-op when versions match.
-- uninstall_plugin(id): GUIDE-ONLY — emits PluginUninstalled and returns the file list. Does NOT delete files (some may have been edited or shared with another plugin). Offer to delete via delete_file after the user confirms.
+PLUGINS (the `plugins` tool):
+A plugin is a coherent bundle of workspace content (apps, knowhow, triggers, scripts) shipped by another author. Once installed, its files live under data/ and are indistinguishable from anything the user authored themselves. All actions are on the grouped `plugins` tool.
+- action='install' (source): install from a GitHub tree URL (e.g. 'https://github.com/lucidos-dev/plugins/tree/main/browser-learning'), a plain git URL, or a local '.lucidos-plugin' archive. The user confirms in a panel — after calling, do NOT claim it succeeded; the next message reports the outcome.
+- action='register_marketplace' (source, name?): register a plugin marketplace (a git repo / GitHub tree URL scanned for plugin manifests) that the Plugins panel browses.
+- action='check_updates' (id?): survey installed plugins for newer versions at their source URL. Omit id to check all. Per-plugin fetch failures show as `error` entries and don't abort the rest.
+- action='update' (id): re-fetch the manifest and re-install if newer. Returns 'Already at latest (vX)' as a no-op when versions match.
+- action='uninstall' (id): stage a removal panel (resolves id against plugin id, manifest name, or app folder). The panel deletes the files on Confirm — do NOT delete_file them yourself, and do NOT claim success after calling.
 
-DOMAIN EVENTS:
-Use emit_event and query_events to track and retrieve structured facts about what happened.
-- emit_event: Record an outcome (e.g., HabitLogged, WorkoutCompleted, DataImported). Event types are PascalCase past tense. Payload must include a "summary" field.
-- query_events: Look up past events by type and/or time range. Use this when apps or the user need historical data (e.g., "how many workouts this week?", "when did I last log X?"). Use limit=1 to get the most recent event of a type.
+DOMAIN EVENTS (the `events` tool):
+Use the `events` tool to track and retrieve structured facts about what happened.
+- action='emit': Record an outcome (e.g., HabitLogged, WorkoutCompleted, DataImported). Event types are PascalCase past tense. Payload must include a "summary" field.
+- action='query': Look up past events by type and/or time range. Use this when apps or the user need historical data (e.g., "how many workouts this week?", "when did I last log X?"). Use limit=1 to get the most recent event of a type.
+- action='count': size a sweep by type/time without materialising payloads — call it before 'query' on a busy window, then drill the narrowest type(s).
 - Events are immutable, append-only — they represent facts, not intentions.
-- App UIs access the platform via the Lucidos SDK (<script src="/api/v1/sdk.js">). Key SDK methods: lucidos.data.read/write/delete/list (file CRUD), lucidos.events.emit/query (domain events), lucidos.preferences.get/set, lucidos.ui.applyPreferences() (theme/font), lucidos.ui.navigate(target, params), lucidos.sse.on(type, cb) (real-time event stream).
-- Prefer emit_event and query_events over run_python/SQL for event access. Use Python only for complex reporting or analysis that query_events can't handle.
+- App UIs access the platform via the Lucidos SDK (<script src="/api/v1/sdk.js">). Key SDK methods: lucidos.data.read/write/delete/list (file CRUD), lucidos.events.emit/query (domain events), lucidos.preferences.get/set, lucidos.ui.applyPreferences() (theme/font), lucidos.ui.navigate(target, params), lucidos.sse.on(type, cb) (real-time event stream), lucidos.proxy(name).fetch(path, init) (call an external API configured in data/config/apis.json; credential stays server-side).
+- Prefer the `events` tool over run_python/SQL for event access. Use Python only for complex reporting or analysis that 'query' can't handle.
 
 PARALLEL WORK (FAN-OUT):
 You have two tools for spawning Lucidos threads:

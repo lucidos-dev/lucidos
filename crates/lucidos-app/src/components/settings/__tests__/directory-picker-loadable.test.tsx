@@ -21,9 +21,10 @@ function vnodeToText(node: ComponentChildren): string {
 
 const NOOP = () => {};
 
-function callBody(data: Loadable<BrowseResult>, currentPath = '/some/path') {
+function callBody(data: Loadable<BrowseResult>, currentPath = '/some/path', showLoading = false) {
   return directoryPickerBody({
     data,
+    showLoading,
     currentPath,
     selectedIndex: -1,
     onGoUp: NOOP,
@@ -33,10 +34,16 @@ function callBody(data: Loadable<BrowseResult>, currentPath = '/some/path') {
 }
 
 describe('directoryPickerBody (Loadable discipline)', () => {
-  it('loading state renders a distinct skeleton (NOT the empty class)', () => {
-    const text = vnodeToText(callBody({ status: 'loading' }));
+  it('shows the skeleton only once the delay has elapsed (showLoading=true)', () => {
+    const text = vnodeToText(callBody({ status: 'loading' }, '/some/path', true));
     expect(text).toContain('loading-skeleton');
     expect(text).toMatch(/data-state="loading"/);
+  });
+
+  it('loading before the delay (showLoading=false) renders nothing — no skeleton flash', () => {
+    const text = vnodeToText(callBody({ status: 'loading' }, '/some/path', false));
+    expect(text).not.toContain('loading-skeleton');
+    expect(text).toBe('');
   });
 
   it('failed state renders an error UI (distinct from empty + carries the error message)', () => {

@@ -200,7 +200,7 @@ fn engine_mode_without_parent_thread_id_returns_400() {
 #[test]
 fn engine_mode_with_caller_workspace_is_valid() {
     let mut req = base_req(ActorMode::Engine);
-    req.caller_workspace = Some("personal".into());
+    req.caller_workspace = Some("dev".into());
     assert!(validate_mode_and_spawn(&req).is_ok());
 }
 
@@ -256,7 +256,7 @@ fn chat_request_accepts_legacy_use_claude_code_alias() {
 #[test]
 fn caller_workspace_with_parent_thread_id_returns_400() {
     let mut req = base_req(ActorMode::Agent);
-    req.caller_workspace = Some("personal".into());
+    req.caller_workspace = Some("dev".into());
     req.parent_thread_id = Some(Uuid::new_v4().to_string());
     assert_eq!(validate_mode_and_spawn(&req), Err(StatusCode::BAD_REQUEST));
 }
@@ -264,7 +264,7 @@ fn caller_workspace_with_parent_thread_id_returns_400() {
 #[test]
 fn caller_workspace_with_spawning_event_id_returns_400() {
     let mut req = base_req(ActorMode::Agent);
-    req.caller_workspace = Some("personal".into());
+    req.caller_workspace = Some("dev".into());
     req.spawning_event_id = Some(Uuid::new_v4().to_string());
     assert_eq!(validate_mode_and_spawn(&req), Err(StatusCode::BAD_REQUEST));
 }
@@ -288,7 +288,7 @@ fn caller_event_id_without_caller_workspace_returns_400() {
 #[test]
 fn caller_thread_id_invalid_uuid_returns_400() {
     let mut req = base_req(ActorMode::Agent);
-    req.caller_workspace = Some("personal".into());
+    req.caller_workspace = Some("dev".into());
     req.caller_thread_id = Some("not-a-uuid".into());
     assert_eq!(validate_mode_and_spawn(&req), Err(StatusCode::BAD_REQUEST));
 }
@@ -296,7 +296,7 @@ fn caller_thread_id_invalid_uuid_returns_400() {
 #[test]
 fn caller_event_id_invalid_uuid_returns_400() {
     let mut req = base_req(ActorMode::Agent);
-    req.caller_workspace = Some("personal".into());
+    req.caller_workspace = Some("dev".into());
     req.caller_event_id = Some("not-a-uuid".into());
     assert_eq!(validate_mode_and_spawn(&req), Err(StatusCode::BAD_REQUEST));
 }
@@ -306,7 +306,7 @@ fn caller_workspace_with_only_workspace_field_is_valid() {
     // Caller workspace alone is fine — caller_thread_id / caller_event_id
     // are optional. Common case: human curl from another workspace.
     let mut req = base_req(ActorMode::Human);
-    req.caller_workspace = Some("personal".into());
+    req.caller_workspace = Some("dev".into());
     let v = validate_mode_and_spawn(&req).unwrap();
     assert_eq!(v.parent_thread_id, None);
     assert_eq!(v.spawning_event_id, None);
@@ -315,7 +315,7 @@ fn caller_workspace_with_only_workspace_field_is_valid() {
 #[test]
 fn caller_workspace_with_all_three_fields_is_valid() {
     let mut req = base_req(ActorMode::Agent);
-    req.caller_workspace = Some("personal".into());
+    req.caller_workspace = Some("dev".into());
     req.caller_thread_id = Some(Uuid::new_v4().to_string());
     req.caller_event_id = Some(Uuid::new_v4().to_string());
     assert!(validate_mode_and_spawn(&req).is_ok());

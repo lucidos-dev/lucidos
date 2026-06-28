@@ -1,4 +1,13 @@
 import { searchEverywhereOpen } from '../../store/store';
+import type { FocusedPane } from '../../store/store';
+
+/** The pane a selected search result navigates into — used to move real DOM
+ *  focus there after navigating (see `handleSelect` in `SearchEverywhere`).
+ *  Threads open in the conversation (thread) pane; every other category
+ *  (apps, files, settings, triggers, changes) lands in the content pane. */
+export function searchResultDestinationPane(category: string): FocusedPane {
+  return category === 'threads' ? 'thread' : 'content';
+}
 
 /** iOS keyboard nudge: focus a hidden input within the user-gesture call stack
  *  so the keyboard opens before the SearchEverywhere modal mounts. The modal's

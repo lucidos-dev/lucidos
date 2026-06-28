@@ -70,6 +70,11 @@ const PROVIDERS: &[BackupProviderEntry] = &[
     }),
 ];
 
+/// The valid backup provider ids — the agent-settable `backup_provider`
+/// preference enum (see `core::preference_catalog`). Kept in sync with
+/// [`PROVIDERS`] above by `provider_ids_match_registry` in the tests.
+pub const PROVIDER_IDS: &[&str] = &["google_drive", "dropbox"];
+
 /// Provider metadata including the OAuth provider name for readiness checks.
 pub struct ProviderMeta {
     pub id: &'static str,
@@ -146,6 +151,11 @@ pub struct BackupLastRun {
     pub status: BackupRunStatus,
     /// When the run reached its terminal state (RFC 3339).
     pub at: DateTime<Utc>,
+    /// When the run STARTED (RFC 3339). `None` for records written before
+    /// start-time tracking existed (`#[serde(default)]` keeps them readable); the
+    /// duration is `at - started_at` when present.
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
     /// Filename of the produced backup (success only).
     pub filename: Option<String>,
     /// Size of the produced backup in bytes (success only).
@@ -155,22 +165,25 @@ pub struct BackupLastRun {
 }
 
 impl BackupLastRun {
-    /// Build a success record from the produced backup entry.
-    pub fn success(entry: &BackupEntry) -> Self {
+    /// Build a success record from the produced backup entry and the run's
+    /// start time (the terminal time is stamped now).
+    pub fn success(entry: &BackupEntry, started_at: DateTime<Utc>) -> Self {
         Self {
             status: BackupRunStatus::Success,
             at: Utc::now(),
+            started_at: Some(started_at),
             filename: Some(entry.filename.clone()),
             size_bytes: Some(entry.size_bytes),
             error: None,
         }
     }
 
-    /// Build a failure record from the error message.
-    pub fn failure(error: &str) -> Self {
+    /// Build a failure record from the error message and the run's start time.
+    pub fn failure(error: &str, started_at: DateTime<Utc>) -> Self {
         Self {
             status: BackupRunStatus::Failure,
             at: Utc::now(),
+            started_at: Some(started_at),
             filename: None,
             size_bytes: None,
             error: Some(error.to_string()),
@@ -203,6 +216,100 @@ pub async fn load_last_run(pool: &PgPool) -> Option<BackupLastRun> {
             crate::log!("[Backup] Ignoring malformed {PREF_BACKUP_LAST_RUN}: {e}");
             None
         }
+    }
+}
+
+/// One historical backup run, reconstructed from a persisted `BackupCompleted` /
+/// `BackupFailed` event. The `events` table IS the durable run history (start /
+/// finish / size); this is its read model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupRunSummary {
+    pub status: BackupRunStatus,
+    /// When the run started (RFC 3339); `None` only for malformed/legacy rows.
+    pub started_at: Option<DateTime<Utc>>,
+    /// When the run reached its terminal state.
+    pub finished_at: DateTime<Utc>,
+    /// Produced archive filename (success only).
+    pub filename: Option<String>,
+    /// Encrypted archive size in bytes (success only).
+    pub size_bytes: Option<u64>,
+    /// Error message (failure only).
+    pub error: Option<String>,
+}
+
+/// Load the most recent backup runs (newest first, capped at `limit`) from the
+/// persisted `BackupCompleted` / `BackupFailed` events — the durable run history.
+/// A query error logs and returns an empty list rather than failing the caller
+/// (the status surface degrades to "no history", never an error).
+pub async fn load_recent_runs(pool: &PgPool, limit: i64) -> Vec<BackupRunSummary> {
+    use sqlx::Row;
+
+    let rows = match sqlx::query(
+        "SELECT event_type, payload, created FROM events \
+         WHERE event_type IN ('BackupCompleted', 'BackupFailed') \
+         ORDER BY created DESC LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            crate::log!("[Backup] Failed to load recent runs: {e}");
+            return Vec::new();
+        }
+    };
+
+    rows.iter()
+        .filter_map(|row| {
+            let event_type: String = row.get("event_type");
+            let payload: serde_json::Value = row.get("payload");
+            let created: DateTime<Utc> = row.get("created");
+            backup_run_from_event(&event_type, &payload, created)
+        })
+        .collect()
+}
+
+/// Reconstruct a [`BackupRunSummary`] from one persisted backup event row. Pure
+/// (no DB) so the payload-shape parsing is unit-testable. System events persist
+/// as `{ "type": .., "data": { .. } }` (the `#[serde(tag = "type", content =
+/// "data")]` shape); a bare data object is tolerated too. `created` is the
+/// fallback for `finished_at` if the payload lacks it.
+fn backup_run_from_event(
+    event_type: &str,
+    payload: &serde_json::Value,
+    created: DateTime<Utc>,
+) -> Option<BackupRunSummary> {
+    let data = payload.get("data").unwrap_or(payload);
+    let parse_ts = |key: &str| {
+        data.get(key)
+            .and_then(|v| v.as_str())
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc))
+    };
+    let started_at = parse_ts("started_at");
+    let finished_at = parse_ts("finished_at").unwrap_or(created);
+    match event_type {
+        "BackupCompleted" => Some(BackupRunSummary {
+            status: BackupRunStatus::Success,
+            started_at,
+            finished_at,
+            filename: data
+                .get("filename")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            size_bytes: data.get("size_bytes").and_then(|v| v.as_u64()),
+            error: None,
+        }),
+        "BackupFailed" => Some(BackupRunSummary {
+            status: BackupRunStatus::Failure,
+            started_at,
+            finished_at,
+            filename: None,
+            size_bytes: None,
+            error: data.get("error").and_then(|v| v.as_str()).map(String::from),
+        }),
+        _ => None,
     }
 }
 
@@ -288,11 +395,12 @@ pub fn parse_workspace_name_from_archive(filename: &str) -> Option<String> {
 ///   * **No provider / download** — the archive is already on disk (`encrypted_path`).
 ///   * **No `init-workspace.sh` / `~/workspaces/{name}`** — the gateway owns
 ///     provisioning and the dir (which may live under the gateway app-data dir).
-///   * **No `user_dir/` extraction over `~/.lucidos`.** The archive carries the
-///     source machine's `~/.lucidos` under `user_dir/`; applying it on restore
-///     would CLOBBER the target's gateway registry
-///     (`~/.lucidos/gateway/config/workspaces.json`) and other machine-global
-///     state. We drop `user_dir/` from the staging tree before moving files in.
+///   * **No `user_dir/` extraction over `~/.lucidos`.** Current backups no longer
+///     include `~/.lucidos` at all (see `tar_and_compress`). LEGACY archives
+///     carry it under `user_dir/`; applying that on restore would CLOBBER the
+///     target's gateway registry (`~/.lucidos/gateway/config/workspaces.json`)
+///     and other machine-global state, so we drop any `user_dir/` from the
+///     staging tree before moving files in.
 ///   * **No migrations** — the engine server the gateway spawns afterward runs
 ///     `sqlx::migrate!()` at construction, upgrading an older-schema restore.
 pub async fn restore_archive_into(
@@ -354,9 +462,12 @@ pub async fn restore_archive_into(
                 archive.unpack(&staging_dir)?;
             }
 
-            // Drop the archive's `user_dir/` (the source's ~/.lucidos) so it is
-            // neither applied over the target's ~/.lucidos (which would clobber
-            // the gateway registry) nor littered into the restored workspace.
+            // Drop any `user_dir/` (the source's ~/.lucidos) so it is neither
+            // applied over the target's ~/.lucidos (which would clobber the
+            // gateway registry) nor littered into the restored workspace. Current
+            // backups no longer include `user_dir/` at all (see
+            // `tar_and_compress`); this stays as defense for LEGACY archives that
+            // still carry it.
             let user_dir_staging = staging_dir.join("user_dir");
             if user_dir_staging.exists() {
                 std::fs::remove_dir_all(&user_dir_staging)?;
@@ -468,16 +579,7 @@ pub async fn create_backup(
             crate::log!("[Backup] Phase 2/4: tar + zstd compress");
             progress("compressing", dump_end, 100);
             let compressed_path = temp_path.join("backup.tar.zst");
-            let user_dir = std::env::var("HOME")
-                .ok()
-                .map(|h| std::path::PathBuf::from(h).join(".lucidos"));
-            tar_and_compress(
-                &workspace,
-                &dump_path,
-                &compressed_path,
-                user_dir.as_deref(),
-                &ignore,
-            )?;
+            tar_and_compress(&workspace, &dump_path, &compressed_path, &ignore)?;
 
             // Phase 3: encrypt with per-chunk progress (compress_end% → encrypt_end%)
             crate::log!("[Backup] Phase 3/4: encrypt");
@@ -544,7 +646,7 @@ pub async fn create_backup(
 /// (8 digits, a hyphen, 6 digits) — the shape `create_backup` stamps via
 /// `Utc::now().format("%Y%m%d-%H%M%S")`. Validating it lets the archive matcher
 /// reject files whose name merely shares a workspace's prefix (e.g. workspace
-/// `personal` vs `personal-2`, where `lucidos-backup-personal-2-…` belongs to
+/// `myws` vs `myws-2`, where `lucidos-backup-myws-2-…` belongs to
 /// the latter).
 fn is_backup_timestamp(s: &str) -> bool {
     match s.split_once('-') {
@@ -1156,11 +1258,18 @@ fn append_file<W: std::io::Write>(
 ///
 /// Streams tar entries directly through zstd to a file — never holds the full
 /// archive in memory.
+///
+/// The workspace's own `.git/` IS included (artifact version history); only
+/// `.lucidos/`, `data/postgres*`, and `data/.backupignore` entries are excluded
+/// (see [`is_excluded_workspace_path`]). The user-level `~/.lucidos/` is
+/// deliberately NOT included: `restore_archive_into` unconditionally discards any
+/// `user_dir/` (it would clobber the target's machine-global gateway registry),
+/// so backing it up was multi-GB of dead weight (the gateway's `deleted/` stashes
+/// alone can be several GB). It is not backed up at all.
 fn tar_and_compress(
     workspace: &Path,
     sql_dump: &Path,
     output: &Path,
-    user_dir: Option<&Path>,
     ignore: &BackupIgnore,
 ) -> Result<(), BoxError> {
     let file = std::fs::File::create(output)?;
@@ -1193,26 +1302,6 @@ fn tar_and_compress(
         Path::new("lucidos_backup.dump"),
         &sql_metadata,
     )?;
-
-    // Add user-level shared data (~/.lucidos/) under "user_dir/" prefix in the archive
-    if let Some(user_dir) = user_dir {
-        if user_dir.exists() {
-            for path in walkdir(user_dir)? {
-                let rel = path.strip_prefix(user_dir)?;
-                // Skip .git/ in user dir (not useful in backup, takes space)
-                if rel.starts_with(".git") {
-                    continue;
-                }
-                let Some(metadata) = skip_if_vanished(&path, std::fs::metadata(&path))? else {
-                    continue;
-                };
-                if metadata.is_file() {
-                    let archive_path = std::path::Path::new("user_dir").join(rel);
-                    append_file(&mut builder, &path, &archive_path, &metadata)?;
-                }
-            }
-        }
-    }
 
     let encoder = builder.into_inner()?;
     encoder.finish()?;

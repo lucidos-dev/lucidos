@@ -177,10 +177,13 @@ pub fn starting_page(label: &str) -> Response {
 /// The brand boot splash as a self-contained HTML page: a full-screen gradient
 /// wash with the white Lucidos mark playing its reveal animation, and `label`
 /// shown beneath it. The reusable background — every boot-window surface passes
-/// its own text. Mirrored from `components/shared/BootSplash.tsx`,
-/// `LucidosMark.tsx`, and the `.lucidos-mark-animated` rules in
-/// `crates/lucidos-app/src/styles/components.css`; self-contained so it renders
-/// before any engine is reachable. The 2s meta-refresh that polls for the booted
+/// its own text. The mark is the brand glyph from
+/// `crates/lucidos-app/src/components/shared/LucidosMark.tsx`; its per-tile reveal
+/// keyframes (`tile-in`/`spark-in`) are self-contained inline below so the page
+/// renders before any engine — or the app stylesheet — is reachable. The label
+/// styling matches the frontend boot splash (`crates/lucidos-app/index.html`
+/// `.boot-splash-status`) so the text does not jump across the cold-boot→workspace
+/// seam — see the `.mark-label` rule below. The 2s meta-refresh that polls for the booted
 /// engine doubles as the animation loop. The `<link rel="icon">` is an inline
 /// `data:` URI mirror of `crates/lucidos-app/public/favicon.svg` (gradient tile
 /// on a rounded square) — inlined rather than referenced because the splash must
@@ -213,7 +216,12 @@ splash status uses (crates/lucidos-app/index.html `.boot-splash-status`) so the
 status renders the same across the cold-boot→workspace seam. Keep in sync. */
 font-family:ui-monospace,SFMono-Regular,'SF Mono',Menlo,'Fira Code','JetBrains Mono',Monaco,Consolas,monospace}
 .mark{width:min(46vmin,15rem);height:min(46vmin,15rem)}
-.mark-label{margin-top:1.25rem;font-size:.95rem;letter-spacing:.02em;opacity:.85}
+/* font-size, letter-spacing and color match the frontend boot-splash status
+(crates/lucidos-app/index.html `.boot-splash-status`) so the label does not
+change size/spacing/color across the cold-boot→workspace seam. The margin
+mirrors that splash's 1.5rem mark↔status gap (and zeros the default <p> bottom
+margin so vertical centering matches). Keep all four values in sync. */
+.mark-label{margin:1.5rem 0 0;font-size:.9375rem;letter-spacing:.01em;opacity:.82}
 .lmk-tile,.lmk-spark{transform-box:fill-box;transform-origin:center}
 .lmk-tile{animation:tile-in .5s cubic-bezier(.34,1.56,.64,1) both}
 .lmk-tile-1{animation-delay:.15s}.lmk-tile-2{animation-delay:.28s}.lmk-tile-3{animation-delay:.41s}

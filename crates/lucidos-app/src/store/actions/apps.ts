@@ -10,11 +10,10 @@ import {
   appRefreshKey,
   wipPreviewThreadId,
   threadMap,
-  appsTab,
   appSearchOpen,
   appSearchQuery,
+  setFocusedThread,
 } from '../store';
-import type { AppsTab } from '../store';
 import { clearWipIfMatches } from './wipPreview';
 import { toFailed, setLoadingIfFresh } from '../types';
 import type { App } from '../types';
@@ -266,12 +265,6 @@ export async function refreshAppUI(appId?: string, options: RefreshAppUiOptions 
   }, REFRESH_DEBOUNCE_MS);
 }
 
-/** Switch the Apps section tab (Installed ↔ Store) and remember it for reload. */
-export function setAppsTab(tab: AppsTab): void {
-  appsTab.value = tab;
-  localStorage.setItem('lucidos-apps-tab', tab);
-}
-
 /** Open the inline apps search bar. The bar focuses itself on mount. */
 export function openAppSearch(): void {
   appSearchOpen.value = true;
@@ -300,6 +293,12 @@ export function createNewApp(): void {
 
 export function submitNewApp(name: string, description: string): void {
   closeInlineForm();
+  // Creating an app is always a fresh conversation, never a follow-up. Clear
+  // the focused thread first so the queued message starts a NEW thread:
+  // PromptInput's pendingChatMessage consumer calls sendMessage with no
+  // explicit threadId, which otherwise falls back to focusedThreadId and would
+  // append the create-app prompt to whatever thread the user had open.
+  setFocusedThread(null);
   pendingChatMessage.value = `Create a new app called "${name}": ${description}`;
 }
 

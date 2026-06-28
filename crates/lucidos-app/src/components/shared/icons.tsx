@@ -43,6 +43,26 @@ export function DownloadIcon() {
   );
 }
 
+export function MoreIcon() {
+  return (
+    <svg viewBox="0 0 16 16" fill="currentColor">
+      <circle cx="8" cy="3.25" r="1.4" />
+      <circle cx="8" cy="8" r="1.4" />
+      <circle cx="8" cy="12.75" r="1.4" />
+    </svg>
+  );
+}
+
+export function InfoIcon() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="8" cy="8" r="6.25" />
+      <path d="M8 7.25v3.5" />
+      <circle cx="8" cy="5" r="0.6" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
 export function ClearIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

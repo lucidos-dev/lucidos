@@ -20,6 +20,7 @@ The blocklist contains exactly the per-token streaming variants — many fires p
 - `TextStreamed`
 - `ThoughtStreamed`
 - `CodingAgentTextStreamed`
+- `CodingAgentThoughtStreamed`
 
 Per-action variants with high cardinality (`ToolCalled`, `ToolResult`, `CodingAgentToolCalled`, `CodingAgentToolResult`, `ContextCaptured`, `MemorySearched`, `ImageDescribed`, `UserPromptInjected`, `CodingAgentPromptSent`) are **triggerable** — fire once per discrete action, scope with per-entry `condition:` filters (e.g. `name: "Bash"`, `args.command: { $regex: "git push" }`, `estimated_total_tokens: { $gt: 150000 }`).
 
@@ -29,7 +30,7 @@ That means right now (each example below is one entry inside a trigger's `on` li
 - `event_type: CodingAgentPermissionRequest` / `CommandPermissionRequested` / `McpPermissionRequested` / `CredentialRequested` — **work**. These are the other blocking-request events that should wake the user. `CommandPermissionRequested` is the chat command-guard card (ADR 0002); `McpPermissionRequested` is the chat MCP-tool card.
 - `event_type: ResponseGenerated` / `ResponseFailed` / `CodingAgentIdled` / `ChangeApplied` / `ChangeHardened` / `TriggerCompleted` / `BackgroundBashCompleted` / every `Change*` / every `Thread*` lifecycle event — **work**.
 - `event_type: ToolCalled` / `CodingAgentToolCalled` / `ContextCaptured` / `ImageDescribed` etc. — **work**. Use a per-entry `condition:` filter to scope; without one a chatty per-action variant will fire the trigger many times per turn.
-- `event_type: TextStreamed` / `ThoughtStreamed` / `CodingAgentTextStreamed` — does not fire. The trigger config will validate and the trigger row will be persisted, but the matcher never sees the event. Don't subscribe to per-token streaming variants — they'd saturate whatever they're wired to.
+- `event_type: TextStreamed` / `ThoughtStreamed` / `CodingAgentTextStreamed` / `CodingAgentThoughtStreamed` — does not fire. The trigger config will validate and the trigger row will be persisted, but the matcher never sees the event. Don't subscribe to per-token streaming variants — they'd saturate whatever they're wired to.
 - `event_type: <a workspace-emitted DomainEvent>` — works. `SystemEvent::DomainEvent` (emitted via `lucidos events emit` / the `emit_event` LLM tool) flows through the matcher unconditionally. This is the supported path for "trigger on something my workspace observes."
 
 If you add a new per-token streaming variant to `ThreadEvent`, add it to `ThreadEvent::is_per_token_streaming` in the same change. Lifecycle / one-per-turn / per-action variants need no scheduler change — they flow through by default.
@@ -64,7 +65,7 @@ Used in every table below. Pick the right class before subscribing a trigger.
 - **lifecycle** — fires once at a moment in a thread's life (creation, archive, terminal). Safe to trigger on directly.
 - **one-per-turn** — fires at most once per chat / coding-agent turn. Safe to trigger on, with a `condition` if needed.
 - **per-action** — fires once per discrete user/agent action (one tool call, one message, one captured context). Triggerable, but always pair with a `condition` filter — without one, a chatty per-action variant will fire the trigger many times per turn.
-- **high-volume-streaming** — many fires per turn (per token chunk). **Blocked by the scheduler** (`TextStreamed`, `ThoughtStreamed`, `CodingAgentTextStreamed`); the matcher never sees them. Subscribing is a no-op.
+- **high-volume-streaming** — many fires per turn (per token chunk). **Blocked by the scheduler** (`TextStreamed`, `ThoughtStreamed`, `CodingAgentTextStreamed`, `CodingAgentThoughtStreamed`); the matcher never sees them. Subscribing is a no-op.
 - **transient-SSE-only** — never persisted; cannot trigger.
 
 ## Chat / agentic loop
@@ -112,6 +113,7 @@ The umbrella `CodingAgent*` family covers Claude Code and Codex (the variants ca
 | `CodingAgentUserMessageSent` | A user message was relayed into the agent's input stream. | one-per-turn | yes | yes |
 | `CodingAgentPromptSent` | An engine-synthesized prompt was injected (orphan-recovery, hardening retrigger, merge-conflict explainer, post-question continuation). Carries `origin: Option<MessageOrigin>`. Audit-only, not rendered in chat. | per-action | yes | yes (use condition) |
 | `CodingAgentTextStreamed` | One chunk of the coding agent's assistant text. | high-volume-streaming | yes | **no (blocked)** |
+| `CodingAgentThoughtStreamed` | One chunk of the coding agent's streamed reasoning/thinking (CC's `thinking_delta`; Codex's `item/reasoning/*Delta` or `reasoning` item). Coalesced before persistence. Rendered as the live "Thinking" step's content. | high-volume-streaming | yes | **no (blocked)** |
 | `CodingAgentToolCalled` | One coding-agent tool invocation. Carries `name`, `args`, optional `description`, `tool_use_id`. | per-action | yes | yes (use condition) |
 | `CodingAgentToolResult` | The result returned to the coding agent for a prior `CodingAgentToolCalled`. Same `tool_use_id`. | per-action | yes | yes (use condition) |
 | `CodingAgentIdled` | **The coding-agent turn-boundary marker.** Emitted at the end of every coding-agent turn whose Result wasn't an engine-shutdown abort. Carries `has_changes`, `is_external_repo`, `requires_restart`, `cc_session_id`, `coding_agent`, optional `reason`, optional `worktree_path`, optional `worktree_head_sha`, `bg_bash_pending` (recorded-history flag: true when the turn idled with a chat-agent `run_bash_background` task still running; **no longer gates proposal or drives any UI** — the change proposes at idle regardless of background bash, and correctness is covered by harden-at-apply). | one-per-turn | yes | yes |
@@ -200,7 +202,7 @@ All transient names are past tense (events-only model). They cannot trigger (the
 | `FileRefreshRequested` | Tells the frontend / open editors to re-read a file at `path`. Emitted by `agentic_loop_special_tool`. Legacy alias: `RefreshFile`. | per-action |
 | `AppUiRefreshRequested` | Tells any open app iframe with `app_id` to reload itself. Legacy alias: `RefreshAppUI`. | per-action |
 | `AppUiCaptureRequested` | Asks an open app iframe to capture state for `request_id`. The reply lands via the SDK capture path. Legacy alias: `CaptureAppUI`. | per-action |
-| `NavigationRequested` | Tells the frontend to navigate (URL, intra-app route, etc.). Carries `payload: String`. | per-action |
+| `NavigationRequested` | Tells the frontend to navigate (URL, intra-app route, etc.). Carries `payload: String`. An agent navigate (`navigate_ui`) also carries an optional `actor` (the originating device — the device that sent the prompt that triggered the turn); the frontend scopes the navigate to that device so it doesn't land on the user's other devices. Absent for trigger/background turns and the SDK app-iframe (nil-thread) path. | per-action |
 | `CodingAgentThreadSpawned` | A child coding-agent thread (spawned via `run_coding_agent` / `run_thread`) has started. Carries `cc_thread_id`, `title`, `agent`. SSE-only — the persisted record of the child is its own thread row. Alias: `CcThreadSpawned`. | per-action |
 | `CodingAgentDiffChanged` | A coding-agent worktree post-commit hook reconciled `coding_agent_has_diff` and the value changed. Carries `has_diff` and a full thread aggregate on SSE so the frontend can show or hide the Diff button immediately. Does **not** imply `ChangeProposed` / Apply readiness. | per-action |
 | `ChildrenCountChanged` | A parent or ancestor thread's aggregate metadata changed. Carries the full updated aggregate (`active_children_count`, `total_children_count`, `blocking_descendant_count`, `attention_descendant_count`, …). Fires when (a) a direct child terminates and the parent's active/total counts shift, or (b) any descendant's "blocking" or "attention-needing" predicate flips (Running, WaitingForUserAnswer, or `has_pending_changes` && CodingAgent — see `is_blocking` / `is_attention_needing`), in which case every ancestor on the chain receives the broadcast with its updated counts. Drives the "Active children" badge, the cascading-archive button-hide (via `blocking_descendant_count`), and the Current-bubble routing in `display_section` (via `attention_descendant_count`). | per-action |
@@ -222,7 +224,7 @@ For `CodingAgentIdled`, `UserQuestionAsked`, `UserQuestionAnswered`, and the `Co
     "text": "Summarize my open PRs.",
     "user_image_hashes": [],
     "device_id": "device-abc123",
-    "device": "Kenneth's MacBook",
+    "device": "My MacBook",
     "parent_thread_id": null,
     "spawning_event_id": null,
     "mode": "human",
@@ -231,7 +233,7 @@ For `CodingAgentIdled`, `UserQuestionAsked`, `UserQuestionAnswered`, and the `Co
     "origin": {
       "kind": "device",
       "device_id": "device-abc123",
-      "label": "Kenneth's MacBook"
+      "label": "My MacBook"
     }
   }
 }
@@ -265,7 +267,7 @@ Set when the engine recognised the request as coming from a Lucidos-spawned subp
     "actor": {
       "kind": "device",
       "device_id": "device-abc123",
-      "label": "Kenneth's MacBook"
+      "label": "My MacBook"
     }
   }
 }
@@ -448,7 +450,7 @@ Multiple events with the same `change_id` arrive for a branch (one per commit). 
     "client_update": false,
     "commits": ["docs: add thread-events reference"],
     "thread_title": "Document all ThreadEvents",
-    "actor": { "kind": "device", "device_id": "device-abc123", "label": "Kenneth's MacBook" },
+    "actor": { "kind": "device", "device_id": "device-abc123", "label": "My MacBook" },
     "pre_merge_sha": "9b38db1b4…",
     "post_merge_sha": "a1b2c3d4e…",
     "path": ""

@@ -5,6 +5,11 @@ const apiAnswerThreadQuestion = vi.fn(async () => true);
 const scrollToBottom = vi.fn();
 const markThreadAnswering = vi.fn();
 const clearThreadAnswering = vi.fn();
+const markThreadRerenderStart = vi.fn();
+const clearThreadRerenderStart = vi.fn();
+// Focused thread is 't1' (the id the tests answer on) so the perf re-render mark
+// is stamped on the focused path.
+const focusedThreadId = { value: 't1' };
 
 class ApiError extends Error {
   constructor(public readonly httpCode: number, public readonly reason: string) {
@@ -12,12 +17,14 @@ class ApiError extends Error {
   }
 }
 
-vi.mock('../store', () => ({ showToast, markThreadAnswering, clearThreadAnswering }));
+vi.mock('../store', () => ({ showToast, markThreadAnswering, clearThreadAnswering, focusedThreadId }));
 vi.mock('../../api/client', () => ({
   answerThreadQuestion: apiAnswerThreadQuestion,
   ApiError,
 }));
 vi.mock('../../components/chat/scrollState', () => ({ scrollToBottom }));
+vi.mock('../../utils/threadOpenMarks', () => ({ markThreadRerenderStart, clearThreadRerenderStart }));
+vi.mock('../../utils/renderPhaseTimers', () => ({ currentPerfBaseline: () => ({ start: 0, md: 0, link: 0 }) }));
 vi.mock('./thread-sync', () => ({}));
 vi.mock('./threads', () => ({}));
 
@@ -48,6 +55,9 @@ describe('answerThreadQuestion', () => {
     // On success the PromptInput effect clears it once status leaves
     // waiting_for_user_answer — the action must NOT clear it itself.
     expect(clearThreadAnswering).not.toHaveBeenCalled();
+    // Perf: the re-render mark is stamped (focused thread) and NOT cleared on success.
+    expect(markThreadRerenderStart).toHaveBeenCalledWith('t1', expect.objectContaining({ cause: 'answer' }));
+    expect(clearThreadRerenderStart).not.toHaveBeenCalled();
   });
 
   it('clears the optimistic answering flag on a 409 (stale/duplicate, no resume coming)', async () => {
@@ -57,6 +67,8 @@ describe('answerThreadQuestion', () => {
     expect(ok).toBe(false);
     expect(markThreadAnswering).toHaveBeenCalledWith('t1');
     expect(clearThreadAnswering).toHaveBeenCalledWith('t1');
+    // Perf: no resume render is coming → the stale re-render mark is dropped.
+    expect(clearThreadRerenderStart).toHaveBeenCalledWith('t1');
   });
 
   it('still pins to bottom on API failure, clears the flag, and shows the error toast at the bottom', async () => {
@@ -66,6 +78,7 @@ describe('answerThreadQuestion', () => {
     expect(ok).toBe(false);
     expect(scrollToBottom).toHaveBeenCalledTimes(1);
     expect(clearThreadAnswering).toHaveBeenCalledWith('t1');
+    expect(clearThreadRerenderStart).toHaveBeenCalledWith('t1');
     expect(showToast).toHaveBeenCalledTimes(1);
     expect(showToast.mock.calls[0][0]).toContain('boom');
   });

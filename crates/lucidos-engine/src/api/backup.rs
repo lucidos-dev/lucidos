@@ -546,6 +546,8 @@ mod tests {
             BusEvent::System(SystemEvent::BackupCompleted {
                 filename: "lucidos-backup-test.enc".to_string(),
                 size_bytes: 1024,
+                started_at: chrono::Utc::now(),
+                finished_at: chrono::Utc::now(),
             }),
             "[Backup] BackupCompleted",
         )
@@ -625,7 +627,7 @@ mod tests {
         let now = Utc::now();
         let status = build_backup_status(
             false,
-            Some(backup::BackupLastRun::failure("disk full")),
+            Some(backup::BackupLastRun::failure("disk full", now)),
             Err("Drive unreachable".to_string()),
             now,
         );

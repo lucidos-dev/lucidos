@@ -60,6 +60,17 @@ pub enum AgentEvent {
     },
     /// Streamed assistant text fragment.
     Message { role: String, text: String },
+    /// Streamed reasoning/thinking fragment — human-readable extended-thinking
+    /// text the agent emitted before (or between) its visible output. CC sends it
+    /// as a `stream_event` → `content_block_delta` with `delta.type:
+    /// "thinking_delta"`; Codex sends it as `item/reasoning/{textDelta,
+    /// summaryTextDelta}` (app-server) or a `reasoning` item (exec). Surfaced
+    /// separately from `Message` so the consumer can emit
+    /// `CodingAgentThoughtStreamed` and render a live "Thinking" step, instead of
+    /// leaving a long reasoning pass as a silent "Working" gap. The *persisted* CC
+    /// session JSONL keeps only the encrypted thinking signature, so this plaintext
+    /// exists only on the live stream — capture it here or it is lost.
+    Thought { text: String },
     /// Liveness ping — the agent emitted an intermediate streaming delta (CC's
     /// `stream_event` wrapper) that carries no content to persist: the complete
     /// text and tool calls arrive separately as `Message` / `ToolUse`. Its sole
@@ -167,7 +178,7 @@ pub struct SpawnArgs<'a> {
     /// originating event id otherwise.
     pub spawning_event_id: Option<Uuid>,
     /// Name of the repository this Claude Code session is running in (e.g.
-    /// `"user-acquisition"`, `"Lucidos"`). Forwarded as `LUCIDOS_REPO` so
+    /// `"example-repo"`, `"Lucidos"`). Forwarded as `LUCIDOS_REPO` so
     /// `lucidos spawn-thread` defaults `--repo` to it — a CC sidequest stays
     /// in the same repo as its caller without the model having to thread the
     /// value through every invocation.

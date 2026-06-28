@@ -33,7 +33,7 @@ while [[ $# -gt 0 ]]; do
             echo "  GOOGLE_APPLICATION_CREDENTIALS  Path to GCP credentials"
             echo ""
             echo "Example:"
-            echo "  $0 -w ~/.lucidos/workspaces/personal"
+            echo "  $0 -w ~/.lucidos/workspaces/myws"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -51,7 +51,7 @@ if [ -z "$WORKSPACE" ]; then
         echo "Usage: $0 -w <workspace>"
         echo ""
         echo "Example:"
-        echo "  $0 -w ~/.lucidos/workspaces/personal"
+        echo "  $0 -w ~/.lucidos/workspaces/myws"
         exit 1
     fi
 fi

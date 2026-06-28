@@ -45,7 +45,7 @@ impl EventStore {
                 HAVING COUNT(DISTINCT m.pattern) = $3\
             ), entity_matches AS (\
                 /* Drive from memory_entries (the small side) and join into events; \
-                   joining the other way produces a ~58M-row nested loop on personal. */\
+                   joining the other way produces a ~58M-row nested loop on a large workspace. */\
                 SELECT m.thread_id, 0.7::float8 AS match_score FROM (\
                     SELECT e.thread_id, t.pattern \
                     FROM memory_entries me \

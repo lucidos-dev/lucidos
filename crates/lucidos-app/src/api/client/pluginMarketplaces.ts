@@ -1,5 +1,6 @@
 import { API, json } from './_core';
 import type {
+  InstalledPlugin,
   MarketplaceCatalog,
   PluginInstallRequest,
   PluginMarketplace,
@@ -38,6 +39,12 @@ export function removePluginMarketplace(id: string): Promise<RemoveMarketplaceRe
 
 export function fetchPluginCatalog(): Promise<MarketplaceCatalog> {
   return json(`${API}/plugins/catalog`);
+}
+
+/** Installed plugins from the event projection (no marketplace scan). Backs the
+ *  Plugins → Installed tab. */
+export function fetchInstalledPlugins(): Promise<{ plugins: InstalledPlugin[] }> {
+  return json(`${API}/plugins/installed`);
 }
 
 export function stagePluginInstall(source: string): Promise<PluginInstallRequest> {

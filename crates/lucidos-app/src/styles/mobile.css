@@ -184,16 +184,16 @@
         display: none;
     }
 
+    /* The content-dissolve fade (background + upward bg-colored box-shadow)
+       now lives in the base .prompt-area rule (panels/content.css) so it
+       renders on desktop too. Mobile keeps only its layout-specific overrides. */
     .prompt-area {
         margin-bottom: 0;
         padding-left: 0.75rem;
         padding-right: 0.75rem;
         padding-bottom: 0.5rem;
-        background: var(--bg-primary);
         /* Above edge-swipe-zone (z-index: 1) so prompt buttons are clickable */
-        position: relative;
         z-index: 2;
-        box-shadow: 0 -0.75rem 0.75rem 0 var(--bg-primary);
     }
 
     /* Rounder textarea corners to match phone screen rounding */
@@ -515,11 +515,13 @@
          * Symmetric 0.5rem top/bottom — just the title's own padding, with no
          * extra gap before the first message. */
         padding: 0.5rem 0.625rem 0.5rem 1rem;
-        /* Opaque page background (no accent tint, matches the desktop header) so
-         * content is cleanly covered behind the title text as it scrolls under
-         * the sticky bar. The fade that dissolves content just below the bar is
-         * the ::after overlay — kept out of the box so it adds no at-rest gap. */
-        background: var(--bg-primary);
+        /* Faint neutral tint (--bg-secondary, one step up from the page) so the
+         * sticky title reads as a header band, matching the desktop header. Opaque,
+         * so content is cleanly covered behind the title text as it scrolls under
+         * the sticky bar. The fade that dissolves content just below the bar is the
+         * ::after overlay (dissolving into the page background) — kept out of the
+         * box so it adds no at-rest gap. */
+        background: var(--bg-secondary);
         -webkit-user-select: none;
         user-select: none;
         -webkit-tap-highlight-color: transparent;
@@ -535,6 +537,24 @@
         margin-right: -0.75rem;
         /* No margin-bottom — the title's 0.5rem bottom padding is the only space
          * before the first message. */
+    }
+
+    /* Hairline divider under the sticky title bar — the mobile counterpart of the
+       desktop `.thread-view-header::after`, a plain full-width 1px line in the
+       subtle border token so the header reads as separated from the transcript on
+       mobile too (the desktop element is display:none here). Always visible, like
+       desktop — independent of `.scrolled`. `::before` because `::after` is the
+       scroll-fade gradient below; absolute (no layout height) so the
+       --mobile-thread-title-height scroll offset is unchanged. */
+    .mobile-swipe-pane .mobile-thread-title-row::before {
+        content: '';
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        height: 1px;
+        background: var(--border-color);
+        pointer-events: none;
     }
 
     /* Fade transition below the sticky title: while the transcript is scrolled,

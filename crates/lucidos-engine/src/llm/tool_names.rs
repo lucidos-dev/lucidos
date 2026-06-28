@@ -48,7 +48,11 @@ pub const SAVE_EMAIL_ATTACHMENT: &str = "save_email_attachment";
 pub const IMPORT_FILE: &str = "import_file";
 pub const GIT_CLONE: &str = "git_clone";
 
-// Triggers
+// Triggers — grouped `triggers` tool (create/list/update/delete/pause/resume),
+// built from the capability parity manifest. The flat per-verb names below stay
+// as back-compat aliases that dispatch to the same handler. See
+// `crate::capability_manifest`.
+pub const TRIGGERS: &str = "triggers";
 pub const CREATE_TRIGGER: &str = "create_trigger";
 pub const LIST_TRIGGERS: &str = "list_triggers";
 pub const UPDATE_TRIGGER: &str = "update_trigger";
@@ -56,17 +60,28 @@ pub const DELETE_TRIGGER: &str = "delete_trigger";
 pub const PAUSE_TRIGGER: &str = "pause_trigger";
 pub const RESUME_TRIGGER: &str = "resume_trigger";
 
-// Trigger groups (user-visible folders that organize triggers in the panel)
+// Trigger groups (user-visible folders that organize triggers in the panel) —
+// grouped `trigger_groups` tool (list/create/rename/reorder/delete) from the
+// manifest; flat names below are back-compat aliases.
+pub const TRIGGER_GROUPS: &str = "trigger_groups";
 pub const LIST_TRIGGER_GROUPS: &str = "list_trigger_groups";
 pub const CREATE_TRIGGER_GROUP: &str = "create_trigger_group";
 pub const RENAME_TRIGGER_GROUP: &str = "rename_trigger_group";
 pub const REORDER_TRIGGER_GROUPS: &str = "reorder_trigger_groups";
 pub const DELETE_TRIGGER_GROUP: &str = "delete_trigger_group";
 
-// Preferences
-pub const SET_LANGUAGE: &str = "set_language";
-pub const SET_TIMEZONE: &str = "set_timezone";
-pub const ENABLE_PUSH_NOTIFICATIONS: &str = "enable_push_notifications";
+// Preferences — grouped `preferences` tool (get/set) from the manifest. The
+// flat get_preferences/set_preference names stay as back-compat aliases.
+// (set_preference folds in the former set_language / set_timezone /
+// enable_push_notifications tools; the catalog of settable keys lives in
+// core/preference_catalog.rs.)
+pub const PREFERENCES: &str = "preferences";
+pub const SET_PREFERENCE: &str = "set_preference";
+pub const GET_PREFERENCES: &str = "get_preferences";
+pub const GET_BACKUP_STATUS: &str = "get_backup_status";
+// Grouped env-var tool (list/set/delete). `set_environment_variable` stays wired
+// as a back-compat alias to the `set` action.
+pub const ENV_VARS: &str = "env_vars";
 pub const SET_ENVIRONMENT_VARIABLE: &str = "set_environment_variable";
 
 // Credentials & OAuth
@@ -89,24 +104,37 @@ pub const RUN_CODING_AGENT: &str = "run_coding_agent";
 pub const RUN_CLAUDE_LEGACY: &str = "run_claude";
 pub const RUN_THREAD: &str = "run_thread";
 
-// Memory
+// Memory — grouped `memory` tool (correct/correct_by_id) from the capability
+// parity manifest; the flat names below stay as back-compat aliases. (The CLI's
+// read ops — stats/entries/source — have no LLM tool.)
+pub const MEMORY: &str = "memory";
 pub const CORRECT_MEMORY: &str = "correct_memory";
 pub const CORRECT_MEMORY_BY_ID: &str = "correct_memory_by_id";
 
-// Events
+// Events — grouped `events` tool (emit/query/count) from the capability parity
+// manifest; the flat per-verb names below stay as back-compat aliases.
+pub const EVENTS: &str = "events";
 pub const EMIT_EVENT: &str = "emit_event";
 pub const QUERY_EVENTS: &str = "query_events";
 pub const COUNT_EVENTS: &str = "count_events";
 
-// Thread queries (script/trigger-facing introspection)
+// Thread queries (script/trigger-facing introspection) — grouped `threads` tool
+// (list/count) from the capability parity manifest; the flat names below stay as
+// back-compat aliases. (Spawning is the standalone run_thread/run_coding_agent.)
+pub const THREADS: &str = "threads";
 pub const LIST_THREADS: &str = "list_threads";
 pub const COUNT_THREADS: &str = "count_threads";
 
-// Changes (pending coding-agent-proposed changes — list + apply)
+// Changes (pending coding-agent-proposed changes) — grouped `changes` tool
+// (list/apply) from the capability parity manifest; flat names below are aliases.
+pub const CHANGES: &str = "changes";
 pub const LIST_CHANGES: &str = "list_changes";
 pub const APPLY_CHANGE: &str = "apply_change";
 
-// Thread Queue (background admission-control policy + live queue)
+// Thread Queue (background admission-control policy + live queue) — grouped
+// `thread_queue` tool (list/update_policy) from the capability parity manifest;
+// the flat names below stay as back-compat aliases. (run-now/drop are CLI-only.)
+pub const THREAD_QUEUE: &str = "thread_queue";
 pub const LIST_THREAD_QUEUE: &str = "list_thread_queue";
 pub const UPDATE_THREAD_QUEUE_POLICY: &str = "update_thread_queue_policy";
 
@@ -118,6 +146,11 @@ pub const TODO_WRITE: &str = "todo_write";
 
 // Notifications & UI
 pub const SEND_NOTIFICATION: &str = "send_notification";
+/// Grouped notification-inbox tool (list / mark_read / mark_all_read), built
+/// from the capability parity manifest. See `crate::capability_manifest`.
+pub const NOTIFICATIONS: &str = "notifications";
+/// Retired flat list-only tool name; still dispatches to the grouped handler
+/// (action defaults to `list`) for back-compat. See `Domain::llm_aliases`.
 pub const READ_NOTIFICATIONS: &str = "read_notifications";
 pub const NAVIGATE_UI: &str = "navigate_ui";
 pub const ASK_USER_QUESTION: &str = "ask_user_question";
@@ -128,7 +161,10 @@ pub const SAVE_THREAD_IMAGE: &str = "save_thread_image";
 // Pull an image posted earlier in the thread back into the model's vision.
 pub const VIEW_IMAGE: &str = "view_image";
 
-// MCP server management
+// MCP server management — grouped `mcp` tool (setup/list/start/stop/remove) from
+// the capability parity manifest; the flat per-verb names below stay as
+// back-compat aliases that dispatch to the same handler.
+pub const MCP: &str = "mcp";
 pub const SETUP_MCP_SERVER: &str = "setup_mcp_server";
 pub const LIST_MCP_SERVERS: &str = "list_mcp_servers";
 pub const START_MCP_SERVER: &str = "start_mcp_server";
@@ -138,7 +174,13 @@ pub const REMOVE_MCP_SERVER: &str = "remove_mcp_server";
 // Repository management
 pub const MANAGE_REPOSITORIES: &str = "manage_repositories";
 
-// Plugins
+// Model registry management (chat model picker — add/enable/disable/remove)
+pub const MANAGE_MODELS: &str = "manage_models";
+
+// Plugins — grouped `plugins` tool (install/register_marketplace/check_updates/
+// update/uninstall) from the capability parity manifest; the flat per-verb names
+// below stay as back-compat aliases that dispatch to the same handler.
+pub const PLUGINS: &str = "plugins";
 pub const INSTALL_PLUGIN: &str = "install_plugin";
 pub const REGISTER_PLUGIN_MARKETPLACE: &str = "register_plugin_marketplace";
 pub const CHECK_PLUGIN_UPDATES: &str = "check_plugin_updates";

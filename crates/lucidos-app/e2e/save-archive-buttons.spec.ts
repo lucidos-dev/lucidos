@@ -79,10 +79,15 @@ test.describe('Section-aware Save/Archive buttons', () => {
 
     await focusThreadFromDrawer(page, threadId);
 
-    await expect(page.locator('button[aria-label="Pin thread"]:visible').first()).toBeVisible();
+    // Scope pin selectors to the focused thread's header actions — the drawer
+    // rows each carry their own pin button now, and the drawer is open here (and
+    // always mounted on mobile), so an unscoped selector counts/clicks drawer-row
+    // pins of OTHER threads. Archive lives only in the prompt row, so its
+    // aria-label is unambiguous and stays unscoped.
+    await expect(page.locator('.thread-view-header-actions button[aria-label="Pin thread"]:visible').first()).toBeVisible();
     expect(await page.locator('button[aria-label="Archive thread"]:visible').count()).toBe(0);
 
-    await page.locator('button[aria-label="Pin thread"]:visible').first().click();
+    await page.locator('.thread-view-header-actions button[aria-label="Pin thread"]:visible').first().click();
     await waitForThreadInSection(page, threadId, 'saved');
     expect(await isThreadInSection(page, threadId, 'saved')).toBe(true);
   });
@@ -111,9 +116,9 @@ test.describe('Section-aware Save/Archive buttons', () => {
     // Pinned threads always carry the "✓ Pinned" unpin toggle alongside Archive
     // so the user can drop back to regular flow at any time.
     await expect(
-      page.locator('button[aria-label="Remove thread from Pinned section"]:visible').first(),
+      page.locator('.thread-view-header-actions button[aria-label="Remove thread from Pinned section"]:visible').first(),
     ).toBeVisible();
-    expect(await page.locator('button[aria-label="Pin thread"]:visible').count()).toBe(0);
+    expect(await page.locator('.thread-view-header-actions button[aria-label="Pin thread"]:visible').count()).toBe(0);
 
     await page.locator('button[aria-label="Archive thread"]:visible').first().click();
     await expect(

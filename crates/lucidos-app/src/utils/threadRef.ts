@@ -18,3 +18,10 @@ export function copyThreadRef(threadId: string, title: string): void {
         () => showToast('Failed to copy reference', 'error'),
     );
 }
+
+export function copyThreadTitle(title: string): void {
+    navigator.clipboard.writeText(title || 'Untitled Thread').then(
+        () => showToast('Thread title copied', 'success'),
+        () => showToast('Failed to copy title', 'error'),
+    );
+}

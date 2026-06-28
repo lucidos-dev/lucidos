@@ -186,9 +186,10 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // ToolResult already covers that for the started case, and
         // completion happens outside any LLM turn).
         "BackgroundBashStarted" | "BackgroundBashCompleted" => EventClass::Metadata,
-        "CodingAgentTextStreamed" | "CodingAgentToolCalled" | "CodingAgentToolResult" => {
-            EventClass::Activity
-        }
+        "CodingAgentTextStreamed"
+        | "CodingAgentThoughtStreamed"
+        | "CodingAgentToolCalled"
+        | "CodingAgentToolResult" => EventClass::Activity,
         "CodingAgentPromptSent" => EventClass::Activity,
         "CredentialRequested" | "McpConsentRequested" => EventClass::Activity,
         // Terminal
@@ -268,6 +269,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "ContinuationStarted",
         "SessionEnded",
         "CodingAgentTextStreamed",
+        "CodingAgentThoughtStreamed",
         "CodingAgentToolCalled",
         "CodingAgentToolResult",
         "CodingAgentUserMessageSent",
@@ -402,6 +404,7 @@ pub fn resolve_transition(
         "SessionStarted"
         | "SessionEnded"
         | "CodingAgentTextStreamed"
+        | "CodingAgentThoughtStreamed"
         | "CodingAgentToolCalled"
         | "CodingAgentToolResult"
         | "CodingAgentUserMessageSent"
@@ -810,6 +813,7 @@ pub const LAST_ACTIVITY_EVENTS: &[&str] = &[
     "ThoughtStreamed",
     "MemorySearched",
     "CodingAgentTextStreamed",
+    "CodingAgentThoughtStreamed",
     "CodingAgentToolCalled",
     "CodingAgentToolResult",
 ];
@@ -1151,6 +1155,13 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
         ),
         (
             "CodingAgentTextStreamed",
+            StatusTransition {
+                status: StatusRule::Set(ThreadStatus::Running),
+                cc_flags: CcFlagRule::None,
+            },
+        ),
+        (
+            "CodingAgentThoughtStreamed",
             StatusTransition {
                 status: StatusRule::Set(ThreadStatus::Running),
                 cc_flags: CcFlagRule::None,

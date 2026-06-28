@@ -106,6 +106,7 @@ impl ThreadEvent {
             Self::SessionStarted { .. } => "SessionStarted",
             Self::SessionEnded { .. } => "SessionEnded",
             Self::CodingAgentTextStreamed { .. } => "CodingAgentTextStreamed",
+            Self::CodingAgentThoughtStreamed { .. } => "CodingAgentThoughtStreamed",
             Self::CodingAgentToolCalled { .. } => "CodingAgentToolCalled",
             Self::CodingAgentToolResult { .. } => "CodingAgentToolResult",
             Self::CodingAgentUserMessageSent { .. } => "CodingAgentUserMessageSent",
@@ -180,6 +181,7 @@ impl ThreadEvent {
             Self::TextStreamed { .. }
                 | Self::ThoughtStreamed { .. }
                 | Self::CodingAgentTextStreamed { .. }
+                | Self::CodingAgentThoughtStreamed { .. }
         )
     }
 

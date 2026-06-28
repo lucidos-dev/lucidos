@@ -119,10 +119,16 @@
           system: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
           inter: "'Inter', system-ui, sans-serif",
           'jetbrains-mono': "'JetBrains Mono', monospace",
-          'ibm-plex-mono': "'IBM Plex Mono', monospace"
+          'ibm-plex-mono': "'IBM Plex Mono', monospace",
+          'fira-code': "'Fira Code', monospace"
         };
         var fontKey = localStorage.getItem('lucidos-font-family');
         d.style.setProperty('--font-ui', FONTS[fontKey] || FONTS.monospace);
+        // Programming ligatures, only for fonts that ship them (Fira Code);
+        // every other font gets `normal` (CSS initial → unchanged). Mirrors
+        // FONT_FEATURES in preferences.ts and the same map in api/sdk_prefs.rs.
+        var FEATURES = { 'fira-code': '"liga" 1, "calt" 1' };
+        d.style.setProperty('font-feature-settings', FEATURES[fontKey] || 'normal');
         var scale = localStorage.getItem('lucidos-ui-scale');
         if (scale) {
           // Snap to the 12.5% grid (see UI_SCALE_STEP) so a pre-grid saved
@@ -277,9 +283,18 @@
            instantly with no swap, and is the same stack the gateway 503 starting
            splash uses (crates/lucidos-gateway/src/proxy.rs `.mark-label`), so the
            status renders identically across the picker→workspace reload seam.
-           Keep the two stacks in sync. */
+           Keep this fully in sync with that `.mark-label`: not just the font
+           stack but font-size, letter-spacing (0.01em), color (white at 0.82
+           alpha), and the 1.5rem mark↔status gap — drift on any of those makes
+           "Starting engine…" jump size/spacing at the seam.
+           Font-size is a FIXED 15px, deliberately NOT 0.9375rem: this app's
+           <html> font-size is scaled by var(--user-ui-scale) (base.css), so a
+           rem value would grow with the user's UI scale (e.g. 22.5px at 150%)
+           while the gateway splash — an isolated document with no access to the
+           scale — stays at 0.9375rem × 16px = 15px. Pinning 15px keeps the
+           status the same size as the gateway one regardless of UI scale. */
         font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
-        font-size: 0.9375rem;
+        font-size: 15px;
         letter-spacing: 0.01em;
         color: rgba(255, 255, 255, 0.82);
         /* Constant size — reserved identically whether the text is present,

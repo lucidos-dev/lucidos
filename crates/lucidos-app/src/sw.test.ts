@@ -403,7 +403,7 @@ describe('Service Worker fetch handler — navigation shell (network-first)', ()
 
   it('built: navigate to an app-UI iframe (/app/<id>/) is NOT treated as the shell', () => {
     const sw = loadSw({ buildId: STAMPED_BUILD });
-    const event = makeEvent('https://example.com/app/momentum/', 'GET', 'navigate');
+    const event = makeEvent('https://example.com/app/habit-tracker/', 'GET', 'navigate');
     sw.handlers.fetch(event);
     expect(event.respondWith).not.toHaveBeenCalled();
   });

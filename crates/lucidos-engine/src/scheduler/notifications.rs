@@ -91,6 +91,7 @@ pub enum NavigateTarget {
     Files,
     Apps,
     AppStore,
+    Plugins,
     Triggers,
     ThreadQueue,
     Changes,

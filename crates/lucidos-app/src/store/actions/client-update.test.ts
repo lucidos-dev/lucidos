@@ -77,7 +77,7 @@ describe('syncClientUpdateFromBuild — toast', () => {
     await syncClientUpdateFromBuild();
     const toast = toasts.value.find((t) => t.key === 'update-available');
     expect(toast).toBeTruthy();
-    expect(toast?.message).toBe('New version available');
+    expect(toast?.message).toBe('New version available — refresh to sync');
     expect(toast?.action?.label).toBe('Refresh');
   });
 
@@ -102,11 +102,22 @@ describe('syncClientUpdateFromBuild — toast', () => {
   });
 
   it('does not stack on top of an existing refresh/restart toast', async () => {
-    // The "Engine restarted" reconnect toast already offers a Refresh action.
-    showToast('Engine restarted', 'success', { action: { label: 'Refresh', onClick: () => {} } });
+    // The pre-restart "Engine restart required" toast already offers a Restart
+    // action, so this prompt is held back (the badge still reflects the update).
+    showToast('Engine restart required to apply changes.', 'warning', { action: { label: 'Restart', onClick: () => {} } });
     mockGetServedBuildId.mockResolvedValue('server999');
     await syncClientUpdateFromBuild();
     expect(toasts.value.some((t) => t.key === 'update-available')).toBe(false);
     expect(updateAvailable.value).toBe(true); // badge still reflects the available update
+  });
+
+  it('DOES surface alongside the action-less "Engine restarted" confirmation', async () => {
+    // A restart that also rebuilt the client must still tell the user to refresh.
+    // The "Engine restarted" toast carries no action, so it doesn't suppress the
+    // genuine staleness prompt (the "new client → sync" case).
+    showToast('Engine restarted', 'success', { autoDismissMs: 5_000 });
+    mockGetServedBuildId.mockResolvedValue('server999');
+    await syncClientUpdateFromBuild();
+    expect(toasts.value.some((t) => t.key === 'update-available')).toBe(true);
   });
 });

@@ -116,8 +116,16 @@ test.describe('Cascading archive — Archive button gating', () => {
     // "not present" assertion.
     const archiveBtn = page.locator('button.action-btn:text-is("Archive"):visible');
     await expect(archiveBtn).toHaveCount(0, { timeout: 5_000 });
-    await expect(page.locator('button[aria-label="Pin thread"]:visible').first())
-      .toBeVisible();
+    // Scope the Pin selector to the focused-thread header — the overflow-menu +
+    // separate-pin-icon refactor (ef9bd150d) added pin buttons to drawer rows
+    // too, so a bare `aria-label="Pin thread"` can match an off-screen drawer
+    // row. `.thread-view-header-actions` is the focused thread's header, matching
+    // pinning.spec.ts / save-archive-buttons.spec.ts.
+    await expect(
+      page
+        .locator('.thread-view-header-actions button[aria-label="Pin thread"]:visible')
+        .first(),
+    ).toBeVisible();
 
     // Flip the child to idle and zero the parent's blocking count — what the
     // projection would do on the child's `CodingAgentIdled`. The frontend

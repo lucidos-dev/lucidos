@@ -119,25 +119,96 @@
     min-height: 0;
 }
 
-.notification-detail-toolbar {
+/* Nav row above the title: prev/next chevrons at the ends with the date
+ * centered between them. The date flexes to fill the middle so it stays centered
+ * regardless of the chevrons' fade state; align-items:center sits the single-line
+ * date vertically against the 2rem chevrons. */
+.notification-detail-header {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-    padding: 0.5rem 1rem 0;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem 0;
 }
 
 .notification-detail-date {
-    margin-left: auto;
+    flex: 1;
+    text-align: center;
     font-size: 0.625rem;
     color: var(--text-muted);
+}
+
+/* Title heading below the nav row — left-aligned to share a left edge with the
+ * markdown body below it (both at 1rem horizontal padding); wraps multi-line. */
+.notification-detail-title {
+    margin: 0;
+    padding: 0.5rem 1rem 0;
+    font-size: 1rem;
+    font-weight: 600;
+    line-height: 1.3;
+    color: var(--text-primary);
+    text-align: left;
+    overflow-wrap: anywhere;
+}
+
+/* Prev/next chevrons at the ends of the nav row, mirroring the thread-view
+ * scroll chevrons (.scroll-to-top / .scroll-to-bottom in chat/input-messages.css)
+ * but pointing left/right. Always rendered with a fixed slot (flex: none) so the
+ * centered date never shifts; they sit `:disabled` (greyed, no pointer events) at
+ * the first / last notification rather than fading out. */
+.notification-detail-nav {
+    flex: none;
+    width: 2rem;
+    height: 2rem;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
+    backdrop-filter: blur(0.5rem);
+    -webkit-backdrop-filter: blur(0.5rem);
+    border: 0.125rem solid var(--border-color);
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.85;
+    transition: opacity 0.2s, background-color 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.notification-detail-nav:disabled {
+    opacity: 0.3;
+    cursor: default;
+    pointer-events: none;
+}
+
+/* iOS PWA back-swipe gutter clearance. The content pane is flush to the screen
+ * edge on mobile (no .content-pane-body inset), so the default 1rem header
+ * padding put the prev chevron's left edge ~16px from the edge — inside iOS's
+ * left-edge back-swipe gesture zone, which intermittently swallowed taps on it
+ * (the "back chevron doesn't always react; works if I tap toward its centre"
+ * report). Inset both chevrons symmetrically so the whole button sits past the
+ * gutter while the date stays centred between them; max() keeps the notch
+ * safe-area inset in landscape. Mobile-only — desktop has no edge gesture. */
+@media (max-width: 768px) {
+    .notification-detail-header {
+        padding-left: max(2.25rem, env(safe-area-inset-left, 0px));
+        padding-right: max(2.25rem, env(safe-area-inset-right, 0px));
+    }
+}
+
+@media (hover: hover) {
+    .notification-detail-nav:hover {
+        opacity: 1;
+        background: var(--bg-hover);
+        color: var(--text-primary);
+        border-color: var(--text-muted);
+    }
 }
 
 /* Markdown rules inherited from .markdown-content in global.css */
 .notification-detail-body {
     padding: 1rem;
-    font-size: 0.6875rem;
-    color: var(--text-secondary);
-    line-height: 1.4;
+    font-size: 0.8125rem;
+    color: var(--text-primary);
+    line-height: 1.5;
     min-width: 0;
 }
 
@@ -160,6 +231,7 @@
 
 .notification-detail-actions {
     display: flex;
+    justify-content: center;
     gap: 0.5rem;
     padding: 0.75rem 1rem;
 }
@@ -195,10 +267,13 @@
     color: var(--text-muted);
 }
 
-/* Clickable dashed-border import box — also the panel's drop target hint */
+/* Clickable dashed-border import box — also the panel's drop target hint.
+ * Lives in the top switcher row; margin-left:auto pins it to the top-right
+ * (the source switcher selector, when present, owns the top-left). */
 .files-import-dropzone {
     display: inline-flex;
     align-items: center;
+    margin-left: auto;
     font-size: 0.6875rem;
     color: var(--text-muted);
     border: 1px dashed var(--border-color);
@@ -750,4 +825,15 @@
     padding: 0 1.15rem 0.75rem 0.75rem;
     flex-shrink: 0;
     margin-top: auto;
+    /* Dissolve transcript content into the prompt: an opaque base plus a
+       bg-colored shadow cast UPWARD over the bottom of the scroll area, so
+       any thread content fades out as it nears the prompt instead of cutting
+       off at a hard edge. Base rule (all viewports) — mobile keeps only its
+       layout-specific overrides. Previously this lived in the mobile-only
+       @media block, so the fade rendered on iOS Safari but not on desktop
+       Chrome/Safari. Tuned gradient-dominant (small 0.5rem solid offset, longer
+       1rem blur) to read as gently as the title-header fade rather than a hard
+       bg band. */
+    background: var(--bg-primary);
+    box-shadow: 0 -0.5rem 1rem 0 var(--bg-primary);
 }

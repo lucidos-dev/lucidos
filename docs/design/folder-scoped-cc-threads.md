@@ -8,7 +8,7 @@
 
 The `run_claude` LLM tool today takes a `repo` parameter resolved through `manage_repositories`. Every session is "a registered git repo + an isolated worktree of it". That model fits editing the Lucidos source tree cleanly. It does NOT fit editing a Lucidos **app** that lives in a workspace data dir (`<workspace>/data/apps/<name>/`), because:
 
-- The user's "I want CC to fix momentum" intent is "edit a folder", not "edit a registered repo".
+- The user's "I want CC to fix habit-tracker" intent is "edit a folder", not "edit a registered repo".
 - Each workspace's `data/` is its own git, so commits already land in the right destination if CC just edits the folder in place.
 - The current workaround — omit `repo`, use absolute paths in the prompt, let CC edit outside the worktree — makes the worktree abstraction a lie: `git diff main` in the worktree is empty, the Apply button has nothing to apply, and `/harden` Phase 4.5 scans a worktree with zero relevant changes.
 
@@ -114,9 +114,9 @@ Every layer — tool schema, handler, session-spawn, worktree creation, system p
 
 Accepted `folder` values:
 
-1. **Absolute path** — `/Users/.../workspaces/personal/data/apps/momentum` or `~/IdeaProjects/lucidos/crates/lucidos-engine/src/api`.
+1. **Absolute path** — `/Users/.../workspaces/myws/data/apps/habit-tracker` or `~/IdeaProjects/lucidos/crates/lucidos-engine/src/api`.
 2. **Registered repo name or UUID** — back-compat. Resolved to `repo.path`.
-3. **Workspace-relative path** — `data/apps/momentum` (resolved against the *target* workspace's root, same workspace if `workspace=` is omitted).
+3. **Workspace-relative path** — `data/apps/habit-tracker` (resolved against the *target* workspace's root, same workspace if `workspace=` is omitted).
 
 The folder is the **scope** — what CC is being asked to edit and where its cwd lands. The engine decides what to *do* with that folder (worktree it, edit in place, refuse) based on **detected mode** (§2.3).
 
@@ -186,7 +186,7 @@ Three subtleties:
 
 - `SessionStarted` event gains `folder: Option<String>` and `mode: SessionMode` (`worktree` / `in_place` / `no_git`). `branch` becomes optional (empty for `in_place` and `no_git`; populated for both Lucidos and data worktrees).
 - `thread_summaries` gains `cc_folder: Option<String>` and `cc_mode: TEXT`. The existing `cc_repo_id` continues to point at registered external repos (NULL for Lucidos source AND for data worktrees) — a new `cc_kind` column (`lucidos` / `data` / `external` / `in_place` / `no_git`) is the cleanest distinguisher; alternatively, derive `kind` from `(cc_repo_id, cc_folder, cc_mode)` in the projection.
-- Branch chip: data-tree threads look like Lucidos threads — same `claude-code/<ts>-<uuid>` chip, same Apply button. Add a small kind indicator next to the chip ("data: apps/momentum" or just an app icon) so the user can tell what's being applied. `in_place` and `no_git` threads show a folder chip with no branch, and no Apply button.
+- Branch chip: data-tree threads look like Lucidos threads — same `claude-code/<ts>-<uuid>` chip, same Apply button. Add a small kind indicator next to the chip ("data: apps/habit-tracker" or just an app icon) so the user can tell what's being applied. `in_place` and `no_git` threads show a folder chip with no branch, and no Apply button.
 - Change panel: shown for all `worktree`-mode threads (Lucidos, data, external — though external's "Apply" is a no-op today). Hidden for `in_place` / `no_git`.
 - Repo dropdown in compose view: rename to "scope" picker. Top: Lucidos (default). Next: registered repos. Submenu: "App in this workspace" → `data/apps/*` plus "Other data folder" → picker for `data/triggers/*`, `data/knowhow/*`. The LLM-only path (absolute folder via tool args) doesn't need a UI affordance. Path persisted to `localStorage` as `lucidos-cc-last-folder` (back-compat: migrate `lucidos-cc-last-repo` once).
 
@@ -196,7 +196,7 @@ Unchanged in shape: outbound POSTs to target's `/api/v1/chat/stream`. Inbound re
 
 ### 2.8 Permissions / sandboxing
 
-- `worktree` mode is naturally sandboxed in all three flavors (Lucidos, data, external) — CC cannot escape the worktree without absolute paths. For data worktrees this is the big win over the original in_place proposal: a session asked to edit `data/apps/momentum` can technically still write to `<worktree>/apps/anything-else`, but the Apply review surface shows every file changed across the worktree, so accidental cross-app edits are visible at Apply time rather than silently landing on main.
+- `worktree` mode is naturally sandboxed in all three flavors (Lucidos, data, external) — CC cannot escape the worktree without absolute paths. For data worktrees this is the big win over the original in_place proposal: a session asked to edit `data/apps/habit-tracker` can technically still write to `<worktree>/apps/anything-else`, but the Apply review surface shows every file changed across the worktree, so accidental cross-app edits are visible at Apply time rather than silently landing on main.
 - `in_place` mode gives CC write access to the entire unregistered git. **Risk:** the same cross-folder write risk as the old in_place mode, now scoped to the rare unregistered-git case. System-prompt warning only. Mitigation deferred to v2.
 - `no_git` mode trusts the user's path choice. Refuse system paths (`/`, `~`, `~/.ssh`, `/etc`, `/System`, `/usr`). Refuse anything under `<workspace>/.lucidos/`.
 
@@ -324,7 +324,7 @@ Numbered. For each: the question, recommended answer, the trade-off.
 
 ### Q16. Cross-workspace + relative folder path?
 
-**Recommendation:** Allow `folder="data/apps/momentum"` with `workspace="personal"`. The target resolves the relative path against its own root. Absolute paths are evaluated on the target's filesystem.
+**Recommendation:** Allow `folder="data/apps/habit-tracker"` with `workspace="myws"`. The target resolves the relative path against its own root. Absolute paths are evaluated on the target's filesystem.
 **Trade-off:** Slight ambiguity if the caller assumes the path is relative to the caller's workspace. Mitigation: the tool description must explicitly say "folder resolves on the target".
 
 ### Q17. What does the diff viewer show for a data-worktree thread vs an in_place thread?
@@ -366,7 +366,7 @@ Numbered. For each: the question, recommended answer, the trade-off.
 -    "repo":       { "type": "string", "description": "Repository ID or name from manage_repositories — resolved in the target workspace's repo registry... REQUIRED whenever the work targets anything outside the Lucidos source tree... Omit ONLY when editing Lucidos itself." },
 +    "folder":     {
 +      "type": "string",
-+      "description": "Where Claude Code should run. Accepts (a) an absolute path like `/Users/.../workspaces/personal/data/apps/momentum`, (b) a workspace-relative path like `data/apps/momentum` (resolved against the target workspace's root), or (c) a registered repository name or UUID from `manage_repositories` (resolved to the repo's path). The engine picks the spawn mode automatically: folders inside the Lucidos source, the root of a registered external repo, OR anywhere under the target workspace's `data/` tree get an isolated git worktree on a fresh `claude-code/...` branch (with a pending-change row, an Apply gate that ff-merges to the enclosing git's main, and — for Lucidos source only — a `/harden` discipline before Apply). Folders inside an unregistered git outside those categories are edited in place (commits land on the current branch, no Apply gate). Folders outside any git are edited with no commits. Omit to edit Lucidos itself. Required whenever the work targets anything outside the Lucidos source tree — without it the session lands in the Lucidos worktree and edits go to the wrong place."
++      "description": "Where Claude Code should run. Accepts (a) an absolute path like `/Users/.../workspaces/myws/data/apps/habit-tracker`, (b) a workspace-relative path like `data/apps/habit-tracker` (resolved against the target workspace's root), or (c) a registered repository name or UUID from `manage_repositories` (resolved to the repo's path). The engine picks the spawn mode automatically: folders inside the Lucidos source, the root of a registered external repo, OR anywhere under the target workspace's `data/` tree get an isolated git worktree on a fresh `claude-code/...` branch (with a pending-change row, an Apply gate that ff-merges to the enclosing git's main, and — for Lucidos source only — a `/harden` discipline before Apply). Folders inside an unregistered git outside those categories are edited in place (commits land on the current branch, no Apply gate). Folders outside any git are edited with no commits. Omit to edit Lucidos itself. Required whenever the work targets anything outside the Lucidos source tree — without it the session lands in the Lucidos worktree and edits go to the wrong place."
 +    },
 +    "repo":       {
 +      "type": "string",
@@ -394,7 +394,7 @@ The companion narrative in the tool *description* changes too: the "BEFORE CALLI
 1. **The workspace data git's branch history accumulates `claude-code/...` branches.** Every coding-agent thread on an app creates a feature branch on the data git. After many sessions, `git log --graph --all` on the data git is noisy with merged-and-deleted CC branches (post-Apply cleanup removes them, but reflog and `git log --all` retain the history). *Accepted* in exchange for the staging gate; the data git is rarely browsed manually.
 2. **No engine-enforced harden discipline for app changes.** Apply on an app `ChangeProposed` clicks through without checking that the app's own tests passed. Per the user directive, apps own their hardening. A user who clicks Apply on a buggy app change has no engine-side safety net beyond CC's own bug-check pass during the session. *Accepted by directive*.
 3. **`in_place` commit races on the unregistered git.** Concurrent in_place sessions on the same unregistered git can conflict at commit time. v1 ships without a mutex. CC surfaces the failure; the user retries. *Accepted, documented*. Less of a concern than the original design because in_place is the minority case.
-4. **No path enforcement inside a worktree.** A session asked to edit `data/apps/momentum/` can still write to `<worktree>/apps/anything-else/`. Mitigation: the Apply review surface shows every changed file, so accidental cross-app writes are visible BEFORE Apply rather than landing silently on data git main. *Accepted*.
+4. **No path enforcement inside a worktree.** A session asked to edit `data/apps/habit-tracker/` can still write to `<worktree>/apps/anything-else/`. Mitigation: the Apply review surface shows every changed file, so accidental cross-app writes are visible BEFORE Apply rather than landing silently on data git main. *Accepted*.
 5. **Cross-workspace trust is filesystem-based.** Same as today. A target workspace evaluates the folder against its own FS and trusts whatever the caller asked for. *Pre-existing, unchanged*.
 6. **The `branch` field on `SessionStarted` becomes optional.** Downstream consumers (`MessageRoutePanel.tsx`, `thread_summaries` projection, the route-panel branch chip) need to handle absence for `in_place` and `no_git` threads. Code paths that today assume `branch.is_some()` need an audit. *Tracked work*.
 7. **`thread_summaries.cc_repo_id` becomes ambiguous.** NULL today for Lucidos; NULL also for data-tree worktrees and in_place threads. The distinguisher is the new `cc_kind` column (`lucidos` / `data` / `external` / `in_place` / `no_git`). Consumers that read `cc_repo_id` to mean "is this an external-repo thread?" need to read `cc_kind` instead. *Tracked work*.

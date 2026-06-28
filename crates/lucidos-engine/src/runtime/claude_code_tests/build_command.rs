@@ -222,14 +222,14 @@ fn build_command_sets_lucidos_repo_when_repo_name_set() {
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
     let cmd = build_command(
-        &test_spawn_args_with_repo(p, p, thread_id, Some("user-acquisition")),
+        &test_spawn_args_with_repo(p, p, thread_id, Some("example-repo")),
         None,
     );
     let env = collect_envs(&cmd);
     let value = env
         .get(std::ffi::OsStr::new("LUCIDOS_REPO"))
         .expect("LUCIDOS_REPO must be set when repo_name is provided");
-    assert_eq!(value, std::ffi::OsStr::new("user-acquisition"));
+    assert_eq!(value, std::ffi::OsStr::new("example-repo"));
 }
 
 #[test]

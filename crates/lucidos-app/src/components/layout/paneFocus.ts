@@ -49,6 +49,21 @@ export function focusPaneMainControl(pane: FocusedPane): void {
   });
 }
 
+/** Move real DOM focus to the first visible focusable element within `el` — the
+ *  element-scoped analog of `focusPaneMainControl`, for navigation that lands on
+ *  a specific control rather than a whole pane (e.g. a Search Everywhere jump to
+ *  a Settings row focusing that row's dropdown). No-op when `el` has no visible
+ *  focusable child — a section-title anchor — which is the "(if any)" case.
+ *  Desktop-only (mobile auto-focus pops the on-screen keyboard) and deferred one
+ *  frame so a just-rendered target is laid out; `preventScroll` so it never
+ *  fights a concurrent `scrollIntoView`. */
+export function focusFirstFocusableWithin(el: HTMLElement): void {
+  if (isMobile()) return;
+  requestAnimationFrame(() => {
+    visibleFocusables(el)[0]?.focus({ preventScroll: true });
+  });
+}
+
 /** Pure boundary logic for the per-pane Tab trap: given the count of tabbable
  *  elements, the active element's index among them, and whether Shift is held,
  *  return the index to WRAP to, or `null` when no wrap is needed (the browser's

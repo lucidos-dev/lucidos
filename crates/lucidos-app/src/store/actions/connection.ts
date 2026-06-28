@@ -5,7 +5,6 @@ import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearForcedRetri
 import { refreshChangesState, RESTART_LS_KEY, RESTART_TOAST_KEY, RESTART_SWAP_MESSAGE } from './chat-changes';
 import { loadUnreadNotifications } from './notifications';
 import { isNewerVersion } from '../../utils/version';
-import { refreshClient } from '../../hooks/sw-update';
 import { syncClientUpdateFromBuild } from './client-update';
 
 /** User-facing copy when `submitChat` couldn't reach the engine — laptop
@@ -311,20 +310,26 @@ export async function checkConnection(): Promise<boolean> {
       engineRestarting.value = false;
       localStorage.removeItem(RESTART_LS_KEY);
       dismissToast('restart-required');
-      // Frontend code MAY have changed — Vite HMR is dead after restart, so the
-      // client needs a reload to pick up new assets. refreshClient() (not a bare
-      // reload) so the new sw.js is picked up and the cache-first /assets/* graph
-      // doesn't serve a stale bundle back after the reload.
+      // Plain, benign confirmation with NO Refresh action. After a pure
+      // engine-only (Rust) restart the loaded client bundle is byte-identical to
+      // what's served — client and engine are in sync — so a refresh here is a
+      // no-op nag. The refresh prompt is owned SOLELY by the honest
+      // client-staleness check (syncClientUpdateFromBuild below): it surfaces the
+      // "New version available" Refresh toast only when the served BUILD_ID
+      // actually differs from the loaded one. So when a restart ALSO rebuilt the
+      // client (mixed change), the user still gets told to refresh — via that
+      // toast, which (now that this one carries no action) is no longer
+      // suppressed by hasRefreshToast.
       showToast('Engine restarted', 'success', {
-        action: { label: 'Refresh', onClick: () => refreshClient() },
         autoDismissMs: TOAST_AUTO_DISMISS_MS,
       });
-      // Light the update badge only if the frontend bundle ACTUALLY rebuilt
-      // (BUILD_ID changed), not for every restart — an engine-only (Rust) change
-      // bumps the engine but leaves the bundle untouched, so a blind set here
-      // nagged for a refresh that does nothing. The build-watch rebuild lands a
-      // few seconds after the restart, so re-check on the scheduled SW nudges
-      // too; this catches a rebuild that already completed.
+      // Light the update badge / surface the refresh toast only if the frontend
+      // bundle ACTUALLY rebuilt (BUILD_ID changed), not for every restart — an
+      // engine-only change bumps the engine but leaves the bundle untouched. The
+      // build-watch rebuild lands a few seconds after the restart, so the
+      // scheduled SW nudges (scheduleServiceWorkerUpdateChecks, fired from the
+      // ChangeApplied arm) re-run this check too; this catches a rebuild that
+      // already completed.
       void syncClientUpdateFromBuild();
     }
     runResumeSync();

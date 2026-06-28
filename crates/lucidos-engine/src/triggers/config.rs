@@ -41,7 +41,7 @@ fn supported_extensions_display() -> String {
 
 /// What a trigger executes — either an LLM intent or a deterministic script.
 /// The tagged union enforces mutual exclusivity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum TriggerRun {
     #[serde(rename = "intent", alias = "prompt")]
@@ -59,7 +59,7 @@ pub enum TriggerRun {
 /// condition (if set) evaluates true against the payload. Conditions are
 /// per-entry so a single trigger can subscribe to events with different
 /// payload shapes without one filter constraining the other.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventSubscription {
     pub event_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,6 +143,12 @@ pub struct TriggerConfig {
     /// irreversible side-effect — the command guard fails the trigger if its
     /// intent tries to. Only consulted when the `command_guard` preference is on.
     pub side_effect_grant: Vec<SideEffectCategory>,
+    /// **Plugin provenance** (ADR 0019): the id of the *plugin* that
+    /// auto-registered this trigger at install, or `None` for a user-created
+    /// trigger. Plugin uninstall removes exactly the triggers carrying its id;
+    /// plugin update re-syncs them by `(plugin_id, slug)`. A user trigger
+    /// (`None`) is never touched by a plugin's lifecycle.
+    pub plugin_id: Option<String>,
 }
 
 /// Convert a human-facing trigger name to a stable kebab-case slug.
@@ -284,6 +290,13 @@ impl TriggerConfig {
             .map(String::from)
             .unwrap_or_else(|| slugify_trigger_name_with_fallback(&name, &id));
         let side_effect_grant = parse_side_effect_grant(payload.get("side_effect_grant"));
+        // Plugin provenance (ADR 0019) — present only on plugin-auto-registered
+        // triggers; absent on user-created ones (→ None, never plugin-managed).
+        let plugin_id = payload
+            .get("plugin_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
 
         Ok(TriggerConfig {
             id,
@@ -299,6 +312,7 @@ impl TriggerConfig {
             go_to_review,
             group_id,
             side_effect_grant,
+            plugin_id,
         })
     }
 
@@ -433,6 +447,15 @@ impl TriggerConfig {
         // HTTP layer always sends the whole array on a change, mirroring `on`.
         if payload.get("side_effect_grant").is_some() {
             self.side_effect_grant = parse_side_effect_grant(payload.get("side_effect_grant"));
+        }
+        // plugin_id (ADR 0019): a string sets/updates provenance (plugin update
+        // re-sync re-stamps it); absent leaves it as-is. Deliberately NOT
+        // clearable here — a user edit (no plugin_id in payload) must not strip a
+        // plugin trigger's provenance, or uninstall could no longer reclaim it.
+        if let Some(s) = payload.get("plugin_id").and_then(|v| v.as_str()) {
+            if !s.is_empty() {
+                self.plugin_id = Some(s.to_string());
+            }
         }
     }
 }

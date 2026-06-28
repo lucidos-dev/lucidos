@@ -5,9 +5,10 @@
  * Wired at the SSE dispatch level in thread-sync.ts, NOT as a side-effect of
  * handleThreadEvent or handleGlobalEvent.
  */
-import { panelOverlay, appsList, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, artifacts, llmConfigured, configuredProviders } from '../store';
+import { panelOverlay, appsList, installedPlugins, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, artifacts, llmConfigured, configuredProviders } from '../store';
 import { checkHealth } from '../../api/client';
 import { loadApps } from './apps';
+import { loadInstalledPlugins } from './plugins';
 import { loadChatModels } from './models';
 import { loadTriggers } from './triggers';
 import { loadThreadQueue } from './threadQueue';
@@ -184,6 +185,7 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     case 'PluginUninstalled':
       if (appsList.value.status === 'loaded') void loadApps();
       if (triggers.value.status === 'loaded') void loadTriggers();
+      if (installedPlugins.value.status === 'loaded') void loadInstalledPlugins();
       break;
     // Settings-page caches — gated on `status === 'loaded'` (same as Plugin*
     // above) so cross-device events don't warm caches the user hasn't asked

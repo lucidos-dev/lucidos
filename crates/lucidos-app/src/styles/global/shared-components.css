@@ -200,13 +200,26 @@ h4, h5, h6 { font-size: 0.8125rem; }
 }
 
 .action-btn-confirm {
-    background-color: var(--accent-green);
+    /* Base + hover both derive from --confirm-bg so the two stay in lockstep when
+       a theme overrides it (dark mode below). Defaults to the family --accent-green
+       so diff markers / status dots that use --accent-green are untouched. */
+    --confirm-bg: var(--accent-green);
+    background-color: var(--confirm-bg);
 }
 
 @media (hover: hover) {
     .action-btn-confirm:hover {
-        background-color: color-mix(in srgb, var(--accent-green) 80%, #fff);
+        background-color: color-mix(in srgb, var(--confirm-bg) 80%, #fff);
     }
+}
+
+/* Dark mode tones the confirm green down a step — the bright --accent-green reads
+   too vivid as a filled CTA against the near-black app (and darker lifts the white
+   label's contrast). Only the button shifts; other green UI keeps --accent-green.
+   :not([data-theme="light"]) matches the dark default + explicit dark; "system" is
+   always resolved to an explicit data-theme, so light mode never matches. */
+html:not([data-theme="light"]) .action-btn-confirm {
+    --confirm-bg: #2ea043;
 }
 
 .action-btn-danger {

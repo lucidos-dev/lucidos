@@ -104,6 +104,12 @@
     color: var(--accent);
 }
 
+/* "from <plugin>" provenance chip on a plugin-installed trigger (ADR 0019). */
+.trigger-plugin-chip {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
+}
+
 .trigger-event-list {
     list-style: none;
     padding: 0;

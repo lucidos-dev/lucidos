@@ -203,6 +203,7 @@ impl EventStore {
     ///    isn't orphaned (no badge) and must not be rewritten; this also shields
     ///    a still-registered external repo whose earliest threads predate the
     ///    external flag column.
+    ///
     /// App threads (kind `'app'`, NULL `cc_repo_id`) are untouched. Once-only —
     /// guarded by a marker.
     pub async fn backfill_cc_repo_id_to_deterministic(

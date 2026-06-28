@@ -2,9 +2,9 @@
 # Tail the Lucidos engine log for a workspace.
 #
 # Usage:
-#   tail.sh personal               # recent log lines from ~/workspaces/personal
+#   tail.sh myws                   # recent log lines from ~/workspaces/myws
 #   tail.sh test -f                 # follow live
-#   tail.sh personal -g error       # filter for errcmtnpush aors
+#   tail.sh myws -g error           # filter for error lines
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

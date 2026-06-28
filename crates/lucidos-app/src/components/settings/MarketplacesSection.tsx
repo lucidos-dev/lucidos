@@ -2,12 +2,14 @@ import { useEffect, useState } from 'preact/hooks';
 import { marketplaceCatalog } from '../../store/store';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
+import { ListSkeleton } from '../shared/ListSkeleton';
+import { LoadingFade } from '../shared/LoadingFade';
 import {
   addPluginMarketplaceAction,
   loadPluginCatalog,
   removePluginMarketplaceAction,
 } from '../../store/actions/plugin-marketplaces';
-import { AddOfficialMarketplaceButton } from '../apps/AddOfficialMarketplaceButton';
+import { AddOfficialMarketplaceButton } from '../plugins/AddOfficialMarketplaceButton';
 
 /** Settings → Marketplaces. Add/remove the git repositories (plugin
  *  marketplaces) the Store scans for installable plugins. Moved here out of the
@@ -67,35 +69,39 @@ export function MarketplacesSection() {
 
       {loadable.status === 'failed' ? (
         <LoadableError noun="marketplaces" error={loadable.error} />
-      ) : loadable.status !== 'loaded' ? (
-        showLoading ? <div class="loading-spinner" /> : null
-      ) : loadable.data.marketplaces.length === 0 ? (
-        <div class="app-store-empty-suggest app-store-empty-suggest-settings">
-          <div class="app-store-muted-row">No marketplaces registered.</div>
-          <AddOfficialMarketplaceButton />
-        </div>
       ) : (
-        <div class="list-rows app-store-marketplaces">
-          {loadable.data.marketplaces.map((marketplace) => (
-            <div class="list-row app-store-marketplace-row" key={marketplace.id}>
-              <div class="list-row-info">
-                <div class="title list-row-name">{marketplace.name}</div>
-                <code class="app-store-source-value" data-tooltip={marketplace.source}>
-                  {marketplace.source}
-                </code>
+        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+          {loadable.status === 'loaded' ? (
+            loadable.data.marketplaces.length === 0 ? (
+              <div class="app-store-empty-suggest app-store-empty-suggest-settings">
+                <div class="app-store-muted-row">No marketplaces registered.</div>
+                <AddOfficialMarketplaceButton />
               </div>
-              <div class="list-row-actions">
-                <button
-                  class="action-btn action-btn-danger"
-                  type="button"
-                  onClick={() => void removePluginMarketplaceAction(marketplace.id)}
-                >
-                  Remove
-                </button>
+            ) : (
+              <div class="list-rows app-store-marketplaces">
+                {loadable.data.marketplaces.map((marketplace) => (
+                  <div class="list-row app-store-marketplace-row" key={marketplace.id}>
+                    <div class="list-row-info">
+                      <div class="title list-row-name">{marketplace.name}</div>
+                      <code class="app-store-source-value" data-tooltip={marketplace.source}>
+                        {marketplace.source}
+                      </code>
+                    </div>
+                    <div class="list-row-actions">
+                      <button
+                        class="action-btn action-btn-danger"
+                        type="button"
+                        onClick={() => void removePluginMarketplaceAction(marketplace.id)}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  </div>
+                ))}
               </div>
-            </div>
-          ))}
-        </div>
+            )
+          ) : null}
+        </LoadingFade>
       )}
 
       {loadable.status === 'loaded' && loadable.data.errors.length > 0 && (

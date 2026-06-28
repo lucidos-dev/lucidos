@@ -387,7 +387,8 @@
     word-break: break-word;
 }
 
-.step-detail-full {
+.step-detail-full,
+.step-detail-reasoning {
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
     border-radius: 0.375rem;
@@ -400,6 +401,11 @@
     margin: 0;
     max-height: 25rem;
     overflow-y: auto;
+}
+
+/* Reasoning reads as secondary to the answer — slightly muted. */
+.step-detail-reasoning {
+    color: var(--text-secondary);
 }
 
 .step-detail-close {

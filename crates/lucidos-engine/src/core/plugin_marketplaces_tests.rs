@@ -158,6 +158,7 @@ fn catalog_plugin(
             "description": "Test plugin"
         }),
         content: vec!["knowhow".to_string()],
+        categories: vec![],
         files_count: 1,
         status,
         installed_version: Some("0.1.0".to_string()),

@@ -47,10 +47,16 @@ const SDK_PREFS_JS: &str = r##"(function() {
     system: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
     inter: "'Inter', system-ui, sans-serif",
     "jetbrains-mono": "'JetBrains Mono', monospace",
-    "ibm-plex-mono": "'IBM Plex Mono', monospace"
+    "ibm-plex-mono": "'IBM Plex Mono', monospace",
+    "fira-code": "'Fira Code', monospace"
   };
   var fontKey = localStorage.getItem("lucidos-font-family");
   d.style.setProperty("--font-ui", FONTS[fontKey] || FONTS.monospace);
+  // Programming ligatures, only for fonts that ship them (Fira Code); every
+  // other font gets `normal` (CSS initial -> unchanged). Mirrors FONT_FEATURES
+  // in preferences.ts and the same map in the index.html FOUC IIFE.
+  var FEATURES = { "fira-code": '"liga" 1, "calt" 1' };
+  d.style.setProperty("font-feature-settings", FEATURES[fontKey] || "normal");
   var scale = localStorage.getItem("lucidos-ui-scale");
   if (scale) {
     // Mirrors clampUiScale in preferences.ts — keep (75, 200, 12.5) in sync.
@@ -101,6 +107,23 @@ mod tests {
     #[test]
     fn script_reads_ui_scale_from_localstorage() {
         assert!(SDK_PREFS_JS.contains("localStorage.getItem(\"lucidos-ui-scale\")"));
+    }
+
+    #[test]
+    fn script_maps_fira_code_font() {
+        // The FONTS map must carry every font-family option; a missing key
+        // falls back to monospace, so an app iframe would show the wrong font
+        // on first paint when the user picked Fira Code.
+        assert!(SDK_PREFS_JS.contains("\"fira-code\": \"'Fira Code', monospace\""));
+    }
+
+    #[test]
+    fn script_sets_font_feature_settings_for_ligatures() {
+        // Fira Code's ligatures are gated to the fira-code key; every other
+        // font resolves to `normal` (CSS initial), leaving its rendering
+        // unchanged. Mirrors FONT_FEATURES in preferences.ts + index.html FOUC.
+        assert!(SDK_PREFS_JS.contains("setProperty(\"font-feature-settings\""));
+        assert!(SDK_PREFS_JS.contains("\"fira-code\": '\"liga\" 1, \"calt\" 1'"));
     }
 
     #[test]

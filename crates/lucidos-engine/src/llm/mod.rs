@@ -30,8 +30,7 @@ pub use provider_selection::{select_provider, ProviderSelection, ProviderSelecti
 pub use routing::RoutingProvider;
 pub use unconfigured::{UnconfiguredProvider, NO_PROVIDER_MESSAGE};
 pub use tools::{
-    get_default_tools, get_image_generation_tool, get_manage_repositories_tool, get_mcp_tools,
-    get_navigate_ui_tool, get_notification_tool, get_read_notifications_tool,
+    get_default_tools, get_image_generation_tool, get_navigate_ui_tool, get_notification_tool,
     get_save_thread_image_tool, get_view_image_tool,
 };
 pub use vertex::VertexProvider;

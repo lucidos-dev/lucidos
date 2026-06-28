@@ -167,7 +167,7 @@ fn message_origin_legacy_parent_thread_kind_deserializes_as_thread_link() {
 
 #[test]
 fn message_origin_workspace_defaults_mode_to_human_when_missing() {
-    let json = r#"{ "kind": "workspace", "workspace": "personal" }"#;
+    let json = r#"{ "kind": "workspace", "workspace": "dev" }"#;
     let parsed: MessageOrigin = serde_json::from_str(json).unwrap();
     match parsed {
         MessageOrigin::Workspace { mode, .. } => assert_eq!(mode, ActorMode::Human),

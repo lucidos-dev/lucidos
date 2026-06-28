@@ -35,7 +35,7 @@ import { formatThreadLabel } from './thread-label';
 import { refreshRepoView } from './repositories';
 import { processSSEForReferences } from './entityReferences';
 import { loadAllThreads, refreshThreadEvents, loadThreadEvents } from './thread-loading';
-import { applyRemoteCompose, pendingComposePuts } from './compose';
+import { applyRemoteCompose, pendingComposePuts, hasLocalDraftEdit } from './compose';
 import { clearDraft, setDraft } from '../composeDrafts';
 import { removeThreadNavEntries } from './thread-navigation';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
@@ -71,6 +71,10 @@ let resyncInFlight: Promise<void> | null = null;
 const APPLY_NOW_CLEAR_EVENTS = new Set([
   'ChangeApplied', 'ChangeApplyFailed',
   'MergeConflictDetected', 'CodingAgentToolCalled', 'CodingAgentTextStreamed',
+  // Reasoning is the EARLIEST "agent resumed working" signal (it precedes
+  // text/tools), so clear the stranded Apply-Now state on it too — otherwise a
+  // long reasoning pass holds the state ~minutes longer than its siblings would.
+  'CodingAgentThoughtStreamed',
   'CodingAgentUserMessageSent', 'CodingAgentPromptSent', 'MessageReceived',
 ]);
 
@@ -451,17 +455,24 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     }
   }
 
-  // Compose-clear must yield to a user actively typing here. Two layers:
+  // Compose-clear must yield to a user actively typing here. Three layers:
   //   1. Origin-device echo: when the send/discard came from this device,
   //      sendCompose/discardCompose already mutated local compose state
   //      synchronously. The SSE echo arrives later and would blank any text
   //      the user has started typing for the next message — drop it.
-  //   2. Focused textarea (cross-device fallback): when a peer device sends
-  //      and this user is mid-keystroke, dropping the inbound clear preserves
-  //      the local PUT that may not have round-tripped yet.
+  //   2. Locally-edited draft: a non-empty draft this device authored is the
+  //      user's unsent intent and must never be blanked by an inbound echo —
+  //      the same `hasLocalDraftEdit` empty-clear invariant stageDraftFromApi
+  //      and applyRemoteCompose enforce. This covers the ACTIVE-thread
+  //      follow-up draft the old `isComposeFocusedHere`-only guard missed: an
+  //      echoed MessageReceived whose device_id didn't match (e2e / cross-device)
+  //      wiped a just-typed follow-up after the user navigated away — the
+  //      value='' face of drafts.spec.ts:65 (docs/plans/2026-06-27-mobile-webkit-shard-contention.md).
+  //   3. Focused textarea (cross-device fallback): clearComposeIfUnfocused keeps
+  //      a draft the user is mid-keystroke on in the focused composing textarea.
   if (event.type === 'MessageReceived') {
     if (thread.meta.state !== 'active') { thread.meta.state = 'active'; metaChanged = true; }
-    if (!isFromThisDevice(event)) clearComposeIfUnfocused(threadId);
+    if (!isFromThisDevice(event) && !hasLocalDraftEdit(threadId)) clearComposeIfUnfocused(threadId);
   }
   if (event.type === 'ThreadDiscarded') {
     if (thread.meta.state !== 'discarded') { thread.meta.state = 'discarded'; metaChanged = true; }
@@ -896,7 +907,14 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
     // every compose PUT. Routed to compose.ts which writes the threadMap
     // entry's compose fields. Three guards layered together:
     //   1. origin_device_id — server rebroadcasts to all devices including
-    //      the originator; ignore our own echo.
+    //      the originator; ignore our own echo. NOTE: this only suppresses a
+    //      PRESENT origin equal to self. A broadcast with an ABSENT origin (a
+    //      PUT that fired before the device-id header was available) bypasses
+    //      this check; for the dangerous case — an empty payload that would
+    //      clear a locally-typed draft — applyRemoteCompose's own guard is the
+    //      backstop (see docs/plans/2026-06-28-drafts-sse-empty-clear-guard.md).
+    //      A non-empty absent-origin update still applies (it carries content),
+    //      which is why this check is not widened to break on absent origin.
     //   2. pendingComposePuts — a debounced PUT may already be in flight
     //      with newer text; the SSE event for our previous PUT could clobber
     //      it on arrival otherwise.
@@ -1039,6 +1057,15 @@ function handleTransientSideEffects(event: ThreadEvent | TransientEvent, sourceT
         showToast('Failed to handle navigation request from engine', 'error');
         break;
       }
+      // Device scope: an agent navigate (navigate_ui) carries the originating
+      // device — the device that sent the prompt that triggered the turn (engine
+      // stamps it in execute_navigate_ui). Such a navigate must act ONLY on that
+      // device, not every device viewing the thread. So if the event names a
+      // device that isn't this one, drop it entirely — no navigate, no offer.
+      // Navigations with no device actor (trigger/background turns; the SDK
+      // app-iframe nil-thread path) fall through to the thread/app scoping below.
+      const navActor = (event as { actor?: { kind?: string; device_id?: string } }).actor;
+      if (navActor?.kind === 'device' && navActor.device_id !== getDeviceId()) break;
       // Scope: a navigate acts on this page directly only when it originates
       // from the thread the user is currently viewing (LLM navigate_ui in the
       // focused thread) OR from an app iframe — the SDK `lucidos.ui.navigate`

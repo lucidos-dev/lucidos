@@ -7,27 +7,41 @@ export interface AnchorPosition {
   placement: 'bottom-start' | 'top-start';
 }
 
+/** Horizontal alignment of the panel relative to its anchor.
+ *  - `'start'` (default): the panel's LEFT edge aligns with the anchor's left
+ *    edge and the panel grows rightward — the natural fit for a left-positioned
+ *    trigger (select-style dropdowns, the message-route button).
+ *  - `'end'`: the panel's RIGHT edge aligns with the anchor's right edge and the
+ *    panel grows leftward — the conventional fit for an overflow (⋯) trigger
+ *    pinned to the far right of a row/header, where `'start'` would push a wide
+ *    menu off-screen and the viewport clamp would then strand it near the left
+ *    edge, detached from the trigger. */
+export type AnchorAlign = 'start' | 'end';
+
 /** Compute a fixed-positioned popover offset relative to an anchor element.
  *  Defaults to placing the popover *below* the anchor; flips to *above* when
- *  there isn't enough vertical room. Horizontally clamps `left` so the panel
- *  stays inside `container` (or the viewport when no container is given) —
- *  necessary on narrow viewports where an anchor near the right edge would
- *  otherwise push the panel off-screen, and to keep the popover visually
- *  contained within its originating pane. Returns viewport-coordinate offsets
- *  ready for `style.top` / `style.left`. */
+ *  there isn't enough vertical room. Horizontally aligns per `align` (see
+ *  {@link AnchorAlign}), then clamps `left` so the panel stays inside
+ *  `container` (or the viewport when no container is given) — necessary on
+ *  narrow viewports where an anchor near the right edge would otherwise push the
+ *  panel off-screen, and to keep the popover visually contained within its
+ *  originating pane. Returns viewport-coordinate offsets ready for `style.top` /
+ *  `style.left`. */
 export function computeAnchorPosition(
   anchor: HTMLElement,
   panelHeight: number,
   panelWidth: number,
   container?: HTMLElement | null,
+  align: AnchorAlign = 'start',
 ): AnchorPosition {
   const rect = anchor.getBoundingClientRect();
   const wantBelow = rect.bottom + panelHeight + 8 <= window.innerHeight;
   const top = wantBelow ? rect.bottom + 4 : rect.top - panelHeight - 4;
   const placement: AnchorPosition['placement'] = wantBelow ? 'bottom-start' : 'top-start';
   const bounds = container?.getBoundingClientRect();
+  const desiredLeft = align === 'end' ? rect.right - panelWidth : rect.left;
   const left = clampLeftWithin(
-    rect.left,
+    desiredLeft,
     panelWidth,
     bounds?.left ?? 0,
     bounds?.right ?? window.innerWidth,
@@ -62,6 +76,7 @@ export function useAnchoredPosition(
   anchor: HTMLElement | null,
   panelRef: { current: HTMLElement | null },
   containerSelector?: string,
+  align: AnchorAlign = 'start',
 ): AnchorPosition | null {
   const [pos, setPos] = useState<AnchorPosition | null>(null);
   useEffect(() => {
@@ -75,7 +90,7 @@ export function useAnchoredPosition(
       rafId = null;
       const panel = panelRef.current;
       if (!panel) return;
-      const next = computeAnchorPosition(anchor, panel.offsetHeight, panel.offsetWidth, container);
+      const next = computeAnchorPosition(anchor, panel.offsetHeight, panel.offsetWidth, container, align);
       setPos(prev =>
         prev && prev.top === next.top && prev.left === next.left && prev.placement === next.placement
           ? prev
@@ -115,7 +130,7 @@ export function useAnchoredPosition(
         vv.removeEventListener('scroll', schedule);
       }
     };
-  }, [anchor, panelRef, containerSelector]);
+  }, [anchor, panelRef, containerSelector, align]);
   return pos;
 }
 

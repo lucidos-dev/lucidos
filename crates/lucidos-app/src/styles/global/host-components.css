@@ -323,6 +323,138 @@ html[data-theme="dark"] .split-button.open::before {
     z-index: var(--z-dropdown);
 }
 
+/* Per-thread overflow (⋯) menu — a sleek icon-list popover (ThreadOverflowMenu).
+ * Portaled to <body> with `position: fixed` offsets from `useAnchoredPosition`
+ * (set inline via panelStyle), so this rule owns only the box + rows, not
+ * placement. Being a <body> child it must out-rank the header chrome
+ * (--z-control-panel) to paint above it — same as `.nav-history-menu`. */
+.thread-overflow-menu {
+    /* Shrink-to-fit on the longest row, NOT the container width. The menu is
+     * portaled to <body> and measured (offsetWidth) by useAnchoredPosition while
+     * still in normal block flow (position is only applied once `pos` is
+     * computed) — a bare `display: block` child of <body> fills the viewport
+     * width, so the measured width came back ~viewport-wide. With `align: 'end'`
+     * (right edge pinned under the ⋯ trigger) that poisons
+     * `desiredLeft = rect.right - panelWidth` to a negative value, which the
+     * clamp then strands at the left margin. On desktop the drawer is a narrow
+     * left pane so the stranded menu still landed near the trigger; on mobile the
+     * full-width row puts the ⋯ at the far right, exposing the misalignment.
+     * `max-content` makes offsetWidth equal the rendered content width. */
+    width: max-content;
+    min-width: 12rem;
+    padding: 0.25rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    box-shadow: var(--shadow-md);
+    z-index: calc(var(--z-control-panel) + 1);
+}
+
+.thread-overflow-item {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    width: 100%;
+    padding: 0.5rem 0.625rem;
+    background: none;
+    border: none;
+    border-radius: 0.375rem;
+    color: var(--text-primary);
+    font-size: 0.8125rem;
+    font-family: var(--font-ui);
+    text-align: left;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.thread-overflow-item svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+    flex-shrink: 0;
+    color: var(--text-muted);
+}
+
+@media (hover: hover) {
+    .thread-overflow-item:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.thread-overflow-item:focus-visible {
+    background: var(--bg-hover);
+    outline: none;
+}
+
+.thread-overflow-divider {
+    height: 1px;
+    margin: 0.25rem 0.375rem;
+    background: var(--border-color);
+}
+
+/* Thread Info popover (ThreadOverflowMenu's Info item) — a small anchored panel
+ * of the thread's structured details, replacing the drawer row's old hover
+ * tooltip. Same box treatment as the overflow menu; the rows mirror the
+ * structured-tooltip grid (#tooltip-text.tooltip-rows) so the two read alike. */
+.thread-info-popover {
+    width: max-content;
+    min-width: 12rem;
+    padding: 0.625rem 0.75rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    box-shadow: var(--shadow-md);
+    z-index: calc(var(--z-control-panel) + 1);
+}
+
+/* `display: contents` on each row lets its label/value join the parent grid so
+ * the two columns stay aligned across every row. */
+.thread-info-rows {
+    display: grid;
+    grid-template-columns: auto auto;
+    column-gap: 1.5rem;
+    row-gap: 0.375rem;
+    white-space: nowrap;
+    font-size: 0.8125rem;
+}
+
+.thread-info-row {
+    display: contents;
+}
+
+.thread-info-label {
+    color: var(--text-muted);
+}
+
+.thread-info-value {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    justify-self: end;
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+.thread-info-dot {
+    flex: none;
+    width: 0.4rem;
+    height: 0.4rem;
+    border-radius: 50%;
+    background: var(--text-muted);
+}
+
+.thread-info-dot-running { background: var(--accent); }
+.thread-info-dot-changes { background: var(--accent-green); }
+.thread-info-dot-waiting { background: var(--accent-yellow); }
+.thread-info-dot-failed { background: var(--accent-red); }
+
+/* Saved pin (PinThreadButton): the icon is already filled (PinIcon filled) —
+ * the accent-colored filled silhouette alone signals the pinned state. No
+ * frame/background tint (the hover background still applies transiently, like
+ * every icon-btn). Shared across the drawer row + thread title headers. */
+.pin-thread-btn.active {
+    color: var(--accent);
+}
+
 /* Back/forward history popover — long-press or right-click on a nav chevron
    (NavChevron). Reuses the .dropdown-menu surface + .dropdown-option rows;
    constrains width so long thread / content titles ellipsize instead of shoving

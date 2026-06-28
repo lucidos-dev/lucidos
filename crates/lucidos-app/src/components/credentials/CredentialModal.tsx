@@ -16,7 +16,7 @@ import { isMobile } from '../../utils/viewport';
 import { pickCredentialAutofocus } from './credentialAutofocus';
 import { parseSecret, buildSecret, emptyFields, type CredentialFields } from './credentialSecret';
 import { LoadableError } from '../shared/LoadableError';
-import { DelayedSpinner } from '../shared/DelayedSpinner';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 
 /** Strip the `email:` prefix the engine uses for email-account credentials. */
 function emailAccountName(service: string): string {
@@ -91,6 +91,12 @@ function CredentialEditLoader({ editing }: { editing: string }) {
     // existingCred identity changes only with the credentials list / editing key.
   }, [credLoadable.status, editing, existingCred?.auth_type]);
 
+  // Delay the spinner so a fast secret fetch never flashes it. The failed
+  // branches below render first.
+  const showLoading = useDelayedFlag(
+    credLoadable.status !== 'loaded' || data.status !== 'loaded' || !existingCred,
+  );
+
   if (credLoadable.status === 'failed') {
     return (
       <div class="inline-form">
@@ -105,12 +111,16 @@ function CredentialEditLoader({ editing }: { editing: string }) {
       </div>
     );
   }
-  if (credLoadable.status !== 'loaded' || data.status !== 'loaded' || !existingCred) {
+  if (showLoading) {
     return (
       <div class="inline-form">
-        <DelayedSpinner />
+        <div class="loading-spinner" />
       </div>
     );
+  }
+  if (credLoadable.status !== 'loaded' || data.status !== 'loaded' || !existingCred) {
+    // Pre-delay window — keep the container mounted but show nothing yet.
+    return <div class="inline-form" />;
   }
 
   return (

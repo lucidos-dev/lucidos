@@ -396,7 +396,7 @@ async fn cleanup_sql_drops_external_repo_changes_keeps_internal() {
 
     for (cid, tid, branch) in [
         (internal_change, internal_thread, "claude-code/internal"),
-        (external_change, external_thread, "feature/UA-1764"),
+        (external_change, external_thread, "feature/ticket-123"),
     ] {
         sqlx::query(
                 "INSERT INTO changes \

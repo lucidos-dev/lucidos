@@ -12,7 +12,7 @@ import { pushNavState } from './navigation';
 import { revealContentPane } from './pane';
 
 /** The official Lucidos plugin marketplace. Suggested as a one-click add in the
- *  App Store and Settings → Marketplaces empty states so a fresh workspace has a
+ *  Plugins panel catalog and Settings → Marketplaces empty states so a fresh workspace has a
  *  marketplace to install plugins from without hunting for a URL. */
 export const OFFICIAL_MARKETPLACE = {
   source: 'https://github.com/lucidos-dev/plugins',

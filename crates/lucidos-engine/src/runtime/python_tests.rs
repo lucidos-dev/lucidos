@@ -458,7 +458,7 @@ fn module_not_found_realistic_shape() {
     // Under the 4-frame threshold + under byte budget → return
     // verbatim. We want the truncator to NOT trim this case.
     let tb = "Traceback (most recent call last):\n\
-              \x20 File \"/x/data/apps/momentum/scripts/_smoke_abs.py\", line 5, in <module>\n\
+              \x20 File \"/x/data/apps/habit-tracker/scripts/_smoke_abs.py\", line 5, in <module>\n\
               \x20   import big_candle_backtest as bcb\n\
               ModuleNotFoundError: No module named 'big_candle_backtest'";
     assert_eq!(truncate_python_error(tb), tb);

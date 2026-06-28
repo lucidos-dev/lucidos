@@ -80,11 +80,12 @@ const CARD_STATUS: Record<VisualStatus, { word: string; tone: StatusTone }> = {
   waiting_for_user_answer: { word: 'Waiting for you', tone: 'waiting' },
 };
 
-/** Structured rows for a thread row's tooltip, rendered as a two-column
- *  label/value grid by the global tooltip system (`data-tooltip-rows`).
- *  `status` is the effective status the caller already derived for the row's
- *  dot, so the tooltip and the dot can't disagree. */
-export function threadRowTooltip(meta: ThreadMeta, status: ThreadStatus): TooltipRow[] {
+/** Structured rows describing a started thread, rendered as a two-column
+ *  label/value grid by the thread overflow menu's Info popover. `status` is the
+ *  effective status the caller already derived for the row's dot, so the Status
+ *  word and the dot can't disagree. (Drafts use `draftRowTooltip` instead — a
+ *  draft has no overflow menu, so it keeps its hover/long-press tooltip.) */
+export function threadInfoRows(meta: ThreadMeta, status: ThreadStatus): TooltipRow[] {
   // Fall back to createdAt/updatedAt if the attributed-recency fields are absent
   // (test fixtures); production always has them.
   const userAt = meta.lastUserAction || meta.createdAt;
@@ -116,11 +117,11 @@ function draftContextRow(mode: ComposeChannelMode, scope: Scope, contextName: st
 }
 
 /** Structured tooltip rows for a compose draft row, the draft counterpart of
- *  `threadRowTooltip`. A draft has no agent activity or exchanges yet, so the
+ *  `threadInfoRows`. A draft has no agent activity or exchanges yet, so the
  *  tooltip is the meaningful subset: its Draft status, where it's headed, and
  *  when it was created. A draft is "Created" but never "Started" — being
  *  started is the first send, which is exactly the moment it stops being a
- *  draft (so `threadRowTooltip` says "Started" and this says "Created"). */
+ *  draft (so `threadInfoRows` says "Started" and this says "Created"). */
 export function draftRowTooltip(
   mode: ComposeChannelMode,
   scope: Scope,

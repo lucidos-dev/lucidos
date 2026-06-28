@@ -124,7 +124,7 @@ test.describe('Changes panel infinite scroll', () => {
       // Land directly on the Changes panel (content pane on mobile).
       await page.addInitScript(() => {
         localStorage.setItem('lucidos-active-menu-item', 'changes');
-        sessionStorage.setItem('lucidos-mobile-view', 'content');
+        localStorage.setItem('lucidos-mobile-view', 'content');
       });
       await gotoWithRetry(page, '/');
 

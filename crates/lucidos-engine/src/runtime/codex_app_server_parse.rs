@@ -443,6 +443,20 @@ impl AppServerTracker {
                     text: delta,
                 }]
             }
+            // Streamed reasoning. Codex emits raw reasoning (`textDelta`) or a
+            // reasoning summary (`summaryTextDelta`) depending on the model /
+            // `model_reasoning_summary` config; both carry a `delta` string. We
+            // surface either as a `Thought` so a long reasoning pass renders as a
+            // live "Thinking" step instead of a silent gap. The completed
+            // `reasoning` item is left in the catch-all below — the content already
+            // streamed here, so re-emitting it on completion would duplicate.
+            "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
+                let delta = str_field(params, "delta");
+                if delta.is_empty() {
+                    return Vec::new();
+                }
+                vec![AgentEvent::Thought { text: delta }]
+            }
             "item/started" | "item/completed" => {
                 let completed = method == "item/completed";
                 let Some(item) = params.get("item") else {

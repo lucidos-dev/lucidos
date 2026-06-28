@@ -296,11 +296,11 @@ mod tests {
     #[test]
     fn user_content_with_suggest_title_summary_format() {
         // This mirrors the summary format built by suggest_title in api/threads.rs
-        let summary = "legg inn denne i familiekalenderen\n[Attached image: A movie ticket for Super Mario Galaxy Filmen]\n---\nKino med Emil! La meg legge det inn.";
+        let summary = "legg inn denne i familiekalenderen\n[Attached image: A movie ticket for Super Mario Galaxy Filmen]\n---\nKino i kveld! La meg legge det inn.";
         let body = build_title_user_content(summary, None);
         assert!(body.contains("Super Mario Galaxy Filmen"));
         assert!(body.contains("familiekalenderen"));
-        assert!(body.contains("Kino med Emil"));
+        assert!(body.contains("Kino i kveld"));
     }
 
     /// A thread reference pasted via the copy-ref button arrives as

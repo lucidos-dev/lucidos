@@ -366,6 +366,11 @@ pub(super) async fn handle_trigger_event(
                     let mut configs = trigger_configs.write().unwrap();
                     configs.insert(trigger_id.to_string(), config.clone());
                 }
+                // Mirror the definition to disk (derived read-model — ADR 0019).
+                crate::triggers::definition::write_trigger_definition(
+                    engine.workspace_path(),
+                    &config,
+                );
                 if should_register {
                     register_and_track(
                         &config,
@@ -385,9 +390,11 @@ pub(super) async fn handle_trigger_event(
         }
         "TriggerUpdated" => {
             let config_snapshot;
+            let mut old_slug = None;
             {
                 let mut configs = trigger_configs.write().unwrap();
                 if let Some(config) = configs.get_mut(trigger_id) {
+                    old_slug = Some(config.slug.clone());
                     config.apply_update(payload);
                     config_snapshot = Some(config.clone());
                 } else {
@@ -395,6 +402,20 @@ pub(super) async fn handle_trigger_event(
                 }
             }
             if let Some(config) = config_snapshot {
+                // Re-project to disk; a slug rename leaves a stale file, so drop
+                // the old one (derived read-model — ADR 0019).
+                if let Some(old) = old_slug {
+                    if old != config.slug {
+                        crate::triggers::definition::remove_trigger_definition(
+                            engine.workspace_path(),
+                            &old,
+                        );
+                    }
+                }
+                crate::triggers::definition::write_trigger_definition(
+                    engine.workspace_path(),
+                    &config,
+                );
                 cancel_tracked_task(tracked_tasks, task_uuid).await;
                 if !config.paused && !config.schedule.is_empty() {
                     register_and_track(
@@ -413,9 +434,15 @@ pub(super) async fn handle_trigger_event(
             }
         }
         "TriggerDeleted" => {
-            {
+            let removed_slug = {
                 let mut configs = trigger_configs.write().unwrap();
-                configs.remove(trigger_id);
+                configs.remove(trigger_id).map(|c| c.slug)
+            };
+            if let Some(slug) = removed_slug {
+                crate::triggers::definition::remove_trigger_definition(
+                    engine.workspace_path(),
+                    &slug,
+                );
             }
             let self_deleting = payload
                 .get("self_deleting")

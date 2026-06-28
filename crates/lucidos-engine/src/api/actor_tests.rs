@@ -39,7 +39,7 @@ fn build_origin_user_with_caller_yields_workspace() {
         None,
         None,
         caller(
-            "personal",
+            "dev",
             Some(src_thread),
             Some(src_event),
             ActorMode::Human,
@@ -53,7 +53,7 @@ fn build_origin_user_with_caller_yields_workspace() {
             user_agent,
             mode: _,
         }) => {
-            assert_eq!(workspace, "personal");
+            assert_eq!(workspace, "dev");
             assert_eq!(thread_id, Some(src_thread));
             assert_eq!(event_id, Some(src_event));
             assert_eq!(user_agent.as_deref(), Some("lucidos-engine/0.1"));
@@ -73,7 +73,7 @@ fn build_origin_user_caller_takes_precedence_over_device() {
         None,
         None,
         None,
-        caller("work", None, None, ActorMode::Human),
+        caller("myws", None, None, ActorMode::Human),
     );
     assert!(matches!(origin, Some(MessageOrigin::Workspace { .. })));
 }
@@ -168,13 +168,13 @@ fn build_origin_human_mode_with_caller_yields_workspace_human_mode() {
         None,
         None,
         None,
-        caller("personal", None, None, ActorMode::Human),
+        caller("dev", None, None, ActorMode::Human),
     );
     match origin {
         Some(MessageOrigin::Workspace {
             workspace, mode, ..
         }) => {
-            assert_eq!(workspace, "personal");
+            assert_eq!(workspace, "dev");
             assert_eq!(mode, ActorMode::Human);
         }
         other => panic!("expected Workspace, got {:?}", other),
@@ -194,7 +194,7 @@ fn build_origin_agent_mode_with_caller_yields_workspace_agent_mode() {
         None,
         None,
         None,
-        caller("personal", None, None, ActorMode::Agent),
+        caller("dev", None, None, ActorMode::Agent),
     );
     match origin {
         Some(MessageOrigin::Workspace { mode, .. }) => assert_eq!(mode, ActorMode::Agent),
@@ -213,7 +213,7 @@ fn build_origin_engine_mode_with_caller_yields_workspace_engine_mode() {
         None,
         None,
         None,
-        caller("personal", None, None, ActorMode::Engine),
+        caller("dev", None, None, ActorMode::Engine),
     );
     match origin {
         Some(MessageOrigin::Workspace { mode, .. }) => assert_eq!(mode, ActorMode::Engine),
@@ -788,7 +788,7 @@ fn build_origin_cross_workspace_caller_still_wins_over_subprocess() {
         None,
         None,
         None,
-        caller("personal", None, None, ActorMode::Human),
+        caller("dev", None, None, ActorMode::Human),
     );
     assert!(
         matches!(origin, Some(MessageOrigin::Workspace { .. })),

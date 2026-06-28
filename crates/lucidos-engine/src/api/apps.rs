@@ -46,7 +46,7 @@ async fn resolve_preview_root(
     }
     // folder is `<workspace>/data/apps/<id>/` — make sure the app id matches
     // what the caller is requesting; without this, a thread spawned for
-    // `momentum` could be used to preview `habit-tracker`'s URL.
+    // `demo-director` could be used to preview `habit-tracker`'s URL.
     let folder_path = std::path::Path::new(&folder);
     let recorded_app_id = folder_path
         .file_name()

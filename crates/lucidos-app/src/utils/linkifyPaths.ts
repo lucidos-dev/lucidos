@@ -3,6 +3,8 @@
  * Tracks <a> and <code> nesting to avoid nested anchors and linkifying code content.
  */
 
+import { addLinkifyMs } from './renderPhaseTimers';
+
 // Cap how many alternatives go into a single regex. WebKit's YARR throws
 // "Invalid regular expression: regular expression too large" on big alternations;
 // V8 has no such limit. With ~50 chars per escaped path, 500 entries → ~25 KB
@@ -101,7 +103,8 @@ const DATA_NAV_TARGET_ATTR = /\sdata-nav-target\s*=\s*(?:"[^"]*"|'[^']*')/i;
  *  Mirrors the side-drawer menu items — the same names the `navigate_ui` LLM
  *  tool accepts for the panel targets and that `handleNavigationRequest` routes.
  *  Most route via `switchMenuItem`; `app-store` is a retained alias that lands
- *  on the Apps section's Store tab. Kept in sync by hand: short and stable. */
+ *  on the Plugins panel (with its full marketplace catalog showing). Kept in
+ *  sync by hand: short and stable. */
 const NAV_TARGETS: ReadonlySet<string> = new Set([
   'notifications',
   'apps',
@@ -227,8 +230,8 @@ function rewriteNavAnchor(tag: string): string | null {
  *  narrow enough to coexist with the artifact rewriter.
  *
  *  Why the `app:<id>` scheme: LLMs invent it by analogy to the documented
- *  `thread:<UUID>` scheme — bug report was `[Momentum app](app:momentum)`
- *  rendered as `<a href="app:momentum">` that dead-ended on macOS Chrome
+ *  `thread:<UUID>` scheme — bug report was `[Habit Tracker app](app:habit-tracker)`
+ *  rendered as `<a href="app:habit-tracker">` that dead-ended on macOS Chrome
  *  because no handler claimed the unknown URL scheme. Accepting it here
  *  routes the click through `openApp` the same way the long form does.
  *
@@ -345,15 +348,22 @@ function rewriteBareAppAnchorByText(
   return stripped.replace(/^<a/i, `<a href="#" class="app-link" data-app-id="${escapedId}"`);
 }
 
-export function linkifyPaths(
-  html: string,
+/** The invariant regex batches + lookups linkify needs for a given (paths, apps)
+ *  set. Building these is the bulk of a linkify call, but they don't depend on the
+ *  html — so they're built once per (paths, apps) and reused across every block /
+ *  exchange in a render (see `getCompiled`). */
+interface CompiledLinkify {
+  pathPatterns: RegExp[];
+  pathLookup: Map<string, string> | undefined;
+  appPatterns: RegExp[];
+  appTextToId: Map<string, string> | undefined;
+  appIds: Set<string> | undefined;
+}
+
+function buildCompiled(
   paths: string[],
   apps: { name: string; id: string }[],
-): string {
-  const segments = html.split(/(<[^>]+>)/);
-
-  // Pre-build pattern batches outside the loop — they're invariant across segments.
-
+): CompiledLinkify {
   let pathPatterns: RegExp[] = [];
   // Single map keyed by every form a path may appear in (full path AND bare —
   // i.e. with the `artifacts/` prefix stripped, since LLMs sometimes write
@@ -390,6 +400,94 @@ export function linkifyPaths(
     appPatterns = buildBatchedPatterns(appEscaped, (alt) => `\\b(${alt})\\b`);
     appIds = new Set(apps.map((s) => s.id));
   }
+
+  return { pathPatterns, pathLookup, appPatterns, appTextToId, appIds };
+}
+
+// Build the invariant patterns ONCE per (paths, apps) set instead of once per
+// call. Every exchange in a render passes the SAME `artifactPaths`/`apps` array
+// references (loadedOr returns the signal's `.data` or a stable NO_* constant),
+// so a 1-entry by-reference memo hits for every call after the first — and across
+// renders until the artifact/app list changes. `generation` bumps on each rebuild
+// and folds into the output-cache key below so a list change invalidates output.
+let cachedPaths: string[] | null = null;
+let cachedApps: { name: string; id: string }[] | null = null;
+let cachedCompiled: CompiledLinkify | null = null;
+let generation = 0;
+
+function getCompiled(paths: string[], apps: { name: string; id: string }[]): CompiledLinkify {
+  if (paths === cachedPaths && apps === cachedApps && cachedCompiled) return cachedCompiled;
+  cachedCompiled = buildCompiled(paths, apps);
+  cachedPaths = paths;
+  cachedApps = apps;
+  generation++;
+  return cachedCompiled;
+}
+
+// Output LRU cache — mirrors renderMarkdown's. linkify output is a pure function
+// of (html, paths, apps); keyed on `${generation}\0${html}` so a (paths, apps)
+// change (new generation) invalidates. A hit is O(1) — this is what makes a
+// re-render (which busts the per-exchange useMemo in ChatExchange and re-linkifies
+// every block) cheap instead of the hundreds of ms the profile measured.
+const LINKIFY_CACHE_MAX = 400;
+const linkifyCache = new Map<string, string>();
+
+/** Test-only: clear the output cache + compiled memo so module-level state can't
+ *  leak between tests. Not part of the runtime surface. */
+export function _resetLinkifyCacheForTesting(): void {
+  linkifyCache.clear();
+  cachedPaths = null;
+  cachedApps = null;
+  cachedCompiled = null;
+  generation = 0;
+}
+
+/** Post-process rendered HTML to linkify artifact paths, app names, and bare URLs.
+ *  Pure in (html, paths, apps); LRU-cached so a re-render that re-invokes it with
+ *  unchanged content is O(1). `opts.cache: false` opts out (used for the live
+ *  streaming buffer, whose html changes every token — caching it would only thrash
+ *  the LRU). try/finally records elapsed linkify time for the perf phase split
+ *  (utils/renderPhaseTimers.ts) and re-throws unchanged. */
+export function linkifyPaths(
+  html: string,
+  paths: string[],
+  apps: { name: string; id: string }[],
+  opts?: { cache?: boolean },
+): string {
+  const start = performance.now();
+  try {
+    const useCache = opts?.cache !== false;
+    // Build/reuse the patterns first — this may bump `generation`, which the
+    // cache key below must reflect.
+    const compiled = getCompiled(paths, apps);
+    const key = useCache ? `${generation}\0${html}` : '';
+    if (useCache) {
+      const hit = linkifyCache.get(key);
+      if (hit !== undefined) {
+        // LRU touch: move to most-recently-used.
+        linkifyCache.delete(key);
+        linkifyCache.set(key, hit);
+        return hit;
+      }
+    }
+    const out = applyCompiled(html, compiled);
+    if (useCache) {
+      linkifyCache.set(key, out);
+      if (linkifyCache.size > LINKIFY_CACHE_MAX) {
+        // Evict the least-recently-used (first key in insertion order).
+        const oldest = linkifyCache.keys().next().value;
+        if (oldest !== undefined) linkifyCache.delete(oldest);
+      }
+    }
+    return out;
+  } finally {
+    addLinkifyMs(performance.now() - start);
+  }
+}
+
+function applyCompiled(html: string, compiled: CompiledLinkify): string {
+  const { pathPatterns, pathLookup, appPatterns, appTextToId, appIds } = compiled;
+  const segments = html.split(/(<[^>]+>)/);
 
   const urlPattern = /https?:\/\/[^\s<>"')\]]+/g;
 

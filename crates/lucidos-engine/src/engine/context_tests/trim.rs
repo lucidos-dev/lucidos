@@ -438,8 +438,8 @@ fn test_pass2_keeps_image_message_below_protected_after_injection() {
     }
 }
 
-/// Regression for the "Set Up Spotify on Sonos Mobile" thread (personal
-/// workspace, 2026-05-24). A long turn 1 left ~13 resume tool pairs in
+/// Regression for a real long-running thread (2026-05-24). A long turn 1
+/// left ~13 resume tool pairs in
 /// `messages` for turn 2. As turn 2's tool loop appended assistant/user pairs
 /// the current user message slid out of the last `PRESERVE_RECENT_MESSAGES`
 /// slots; with no `protected_idx` guard pass 2 eventually removed it, leaving

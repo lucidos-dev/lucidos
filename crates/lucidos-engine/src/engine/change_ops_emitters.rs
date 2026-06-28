@@ -578,16 +578,16 @@ mod tests {
         let pre_sha = init_repo(ws).await;
 
         // Simulate CC's effect: write the app's files into main post-merge.
-        write_app_manifest(ws, "momentum-autoresearch", "Momentum Autoresearch");
-        let post_sha = commit_all(ws, "Create app momentum-autoresearch").await;
+        write_app_manifest(ws, "habit-tracker", "Habit Tracker");
+        let post_sha = commit_all(ws, "Create app habit-tracker").await;
 
         let events = compute_entity_events_for_change_apply(
             ws,
             Some(&pre_sha),
             Some(&post_sha),
             &[
-                "data/apps/momentum-autoresearch/manifest.json".to_string(),
-                "data/apps/momentum-autoresearch/index.html".to_string(),
+                "data/apps/habit-tracker/manifest.json".to_string(),
+                "data/apps/habit-tracker/index.html".to_string(),
             ],
             None,
         )
@@ -596,8 +596,8 @@ mod tests {
         assert_eq!(events.len(), 1, "expected exactly one app event, got {:?}", events);
         match &events[0] {
             SystemEvent::AppCreated { app_id, name, .. } => {
-                assert_eq!(app_id, "momentum-autoresearch");
-                assert_eq!(name.as_deref(), Some("Momentum Autoresearch"));
+                assert_eq!(app_id, "habit-tracker");
+                assert_eq!(name.as_deref(), Some("Habit Tracker"));
             }
             other => panic!("expected AppCreated, got {:?}", other),
         }

@@ -246,6 +246,38 @@ describe('unfocusThread', () => {
     unfocusThread();
     expect(focusedThreadId.value).toBeNull();
   });
+
+  it('desktop: reveals the thread pane group when arriving from content', () => {
+    focusedPane.value = 'content'; // user was viewing an app/Settings
+    unfocusThread();
+    expect(focusedPane.value).toBe('thread');
+  });
+
+  it('mobile: swipes to the thread pane (new-chat / compose lands there)', () => {
+    const origWidth = globalThis.innerWidth;
+    (globalThis as any).innerWidth = 375;
+    try {
+      mobileView.value = 'content';
+      unfocusThread();
+      expect(mobileView.value).toBe('thread');
+    } finally {
+      (globalThis as any).innerWidth = origWidth;
+    }
+  });
+
+  it('revealPane:false leaves the visible pane alone (stale-pointer cleanup)', () => {
+    // ThreadView's render-phase cleanup passes this so a background-mounted pane
+    // on mobile can't yank a user off the content pane.
+    const origWidth = globalThis.innerWidth;
+    (globalThis as any).innerWidth = 375;
+    try {
+      mobileView.value = 'content';
+      unfocusThread({ revealPane: false });
+      expect(mobileView.value).toBe('content');
+    } finally {
+      (globalThis as any).innerWidth = origWidth;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -847,6 +879,158 @@ describe('loadAllThreads — compose preservation', () => {
       composeEditedAt.delete('t1');
       pendingComposePuts.delete('t1');
     }
+  });
+
+  // "thread draft persists when switching to compose and back" (drafts.spec.ts:65)
+  // flake. The previous two tests cover the case where the edit happens AT or
+  // AFTER the GET went out (composeEditedAt >= requestStartedAt catches it). This
+  // covers the INVERSE order: the user types the draft FIRST, then a resync
+  // loadAllThreads starts, and its slow GET — whose server snapshot was read
+  // before the debounced PUT committed — lands after the PUT settled and
+  // pendingComposePuts cleared. Now composeEditedAt is OLDER than
+  // requestStartedAt, so neither the focus, pending-PUT, nor edited-since-request
+  // guard fires; only the PUT-settle guard prevents the stale empty snapshot
+  // from blanking the restored draft.
+  it('preserves local composeText when the edit precedes a resync whose stale response lands after the PUT settles', async () => {
+    const { updateCompose, pendingComposePuts, composeEditedAt, composePutSettledAt } = await import('./compose');
+
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', { meta: { state: 'active', composeText: '' } }));
+    threadMap.value = map;
+    focusedThreadId.value = 't1';
+    unfocusPrompt(); // user clicked away (compose) and back — textarea not focused
+
+    // 1. User types the follow-up draft FIRST: optimistic local write, pending
+    //    mark, 250ms debounced PUT.
+    updateCompose('t1', { text: 'thread draft text' });
+    expect(pendingComposePuts.has('t1')).toBe(true);
+
+    // 2. A real delay so the resync's requestStartedAt is STRICTLY after the
+    //    edit — otherwise composeEditedAt >= requestStartedAt would mask the hole
+    //    via the existing guard, not the PUT-settle one under test.
+    await new Promise((r) => setTimeout(r, 20));
+
+    // 3. Resync loadAllThreads starts; its GET is gated to land late and carries
+    //    the server's pre-PUT empty snapshot.
+    let releaseFetch: (() => void) | null = null;
+    const fetchGate = new Promise<void>((resolve) => { releaseFetch = resolve; });
+    (fetchThreads as any).mockImplementationOnce(async () => {
+      await fetchGate;
+      return {
+        saved: [],
+        active_threads: [],
+        composing: [],
+        active: [],
+        archive: [{
+          thread_id: 't1',
+          title: 'T',
+          channel: 'chat',
+          last_activity: '2026-03-15T18:00:00Z',
+          created_at: '2026-03-15T18:00:00Z',
+          message_count: 0,
+          section: 'archived',
+          status: 'idle',
+          coding_agent_proposed: false,
+          coding_agent_requires_restart: false,
+          coding_agent_is_external_repo: false,
+          coding_agent_applying: false,
+          last_revived_at: null,
+          active_children_count: 0,
+          state: 'active',
+          compose_text: '', // STALE — read before the PUT committed
+          compose_images: [],
+          compose_mode: null,
+        }],
+      };
+    });
+
+    try {
+      // Kick off loadAllThreads; its HTTP is gated in flight.
+      const loadPromise = loadAllThreads();
+
+      // 4. Drain the debounce + pushNow so the PUT settles AFTER the GET started.
+      //    pendingComposePuts clears and composePutSettledAt is stamped.
+      await new Promise((r) => setTimeout(r, 300));
+      expect(pendingComposePuts.has('t1')).toBe(false);
+      expect(composePutSettledAt.get('t1') ?? 0).toBeGreaterThan(0);
+
+      // 5. The stale empty response lands now. Without the PUT-settle guard,
+      //    upsertThread blanks the draft (the drafts:65 "got ''" flake).
+      releaseFetch!();
+      await loadPromise;
+
+      expect(getDraft('t1').text).toBe('thread draft text');
+    } finally {
+      composeEditedAt.delete('t1');
+      composePutSettledAt.delete('t1');
+      pendingComposePuts.delete('t1');
+    }
+  });
+
+  // drafts.spec.ts:65 value='' — the RESIDUAL empty-clobber the composePutSettledAt
+  // guard does NOT catch. The previous test covers a resync whose GET fired BEFORE
+  // the PUT settled (composePutSettledAt >= requestStartedAt saves it). This covers
+  // a compose PUT that never actually persisted (failed / timed out under host
+  // contention — composePutSettledAt is stamped even then) followed by a resync
+  // whose GET fired AFTER that settle stamp: composePutSettledAt < requestStartedAt
+  // and composeEditedAt < requestStartedAt, so neither timing guard fires, the
+  // textarea isn't focused, no PUT is pending — and the server (which never got the
+  // text) returns an empty compose. Only the "never clear a non-empty locally-edited
+  // draft via a bulk snapshot" rule in stageDraftFromApi preserves it.
+  it('preserves a locally-edited draft when an empty resync lands AFTER the PUT settled (failed/never-committed PUT)', async () => {
+    const { updateCompose, pendingComposePuts, composeEditedAt, composePutSettledAt } = await import('./compose');
+
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', { meta: { state: 'active', composeText: '' } }));
+    threadMap.value = map;
+    focusedThreadId.value = 't1';
+    unfocusPrompt(); // user clicked away (compose) and back — textarea not focused
+
+    // 1. User types the follow-up draft: optimistic local write, pending mark,
+    //    250ms debounced PUT.
+    updateCompose('t1', { text: 'thread draft text' });
+    expect(pendingComposePuts.has('t1')).toBe(true);
+
+    try {
+      // 2. Drain the debounce so the PUT settles FIRST. composePutSettledAt is
+      //    stamped and pendingComposePuts clears — exactly the post-settle state a
+      //    failed/never-committed PUT also leaves behind (the server has no text).
+      await new Promise((r) => setTimeout(r, 300));
+      expect(pendingComposePuts.has('t1')).toBe(false);
+      expect(composePutSettledAt.get('t1') ?? 0).toBeGreaterThan(0);
+
+      // 3. A resync starts NOW — its requestStartedAt is strictly AFTER the settle
+      //    stamp, so putSettledSinceRequest is false (the guard the prior test
+      //    relies on does NOT fire here). The server snapshot is empty.
+      mockComposeApiResponse('t1', '');
+      await loadAllThreads();
+
+      // Without the stageDraftFromApi rule, this empty snapshot blanks the draft
+      // (the drafts:65 "got ''" flake). With it, the locally-typed draft survives.
+      expect(getDraft('t1').text).toBe('thread draft text');
+    } finally {
+      composeEditedAt.delete('t1');
+      composePutSettledAt.delete('t1');
+      pendingComposePuts.delete('t1');
+    }
+  });
+
+  // The guard is scoped to LOCALLY-edited drafts: a server-originated draft
+  // (loaded cross-device, never edited on this device → no composeEditedAt entry)
+  // must STILL be clearable by a bulk snapshot, so a peer's clear that arrives via
+  // a resync (e.g. the SSE clear was missed while disconnected) still applies.
+  it('still clears a server-originated draft (never edited here) when the snapshot is empty', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', { meta: { state: 'active', composeText: 'from a peer device' } }));
+    threadMap.value = map;
+    unfocusPrompt();
+    // No updateCompose on this device → composeEditedAt has no entry for t1.
+
+    mockComposeApiResponse('t1', ''); // peer cleared it; resync carries empty
+
+    await loadAllThreads();
+
+    expect(getDraft('t1').text).toBe('');
   });
 });
 

@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.13.0 — 2026-06-28
+
+### Added
+- **Capability-parity manifest + grouped agent tools** — a single capability manifest is the source of truth for the agent's tool surface, with Rust→TS codegen keeping the LLM tools, the `lucidos` CLI, and the JS SDK in sync. Many narrow tools are consolidated into grouped tools — `triggers`, `trigger_groups`, `preferences`, `events`, `changes`, `mcp`, `plugins`, `threads`, `thread_queue`, `memory`, `manage_models`, `manage_repositories`, `env_vars`, `notifications`, and an `apps` domain — each gaining matching CLI subcommands and SDK methods.
+- **Agent-configurable settings** — the agent reads and changes user preferences via `get_preferences` / `set_preference` (theme, language, timezone, push, welcome message, chat model, reasoning effort, UI scale, font, …), validated against one catalog and routed through a single write chokepoint so per-device scope and live-apply are handled automatically. The narrow `set_language` / `set_timezone` / `enable_push_notifications` tools fold into `set_preference`. A `manage_models` tool adds/enables/disables/removes chat models in the picker. Language + timezone also get human controls under **Settings → System → Locale** (with IANA timezone validation). The command guard stays human-only.
+- **Dedicated Plugins panel** — browse, install, and update plugins with an "Installed only" filter (default shows all), controlled-vocabulary categories, plugin updates appliable from the list, and provenance-tracked auto-registration of plugin triggers. Installed/uninstalled files are git-committed into the workspace repo.
+- **Coding-agent reasoning in the timeline** — streamed model reasoning is captured as `CodingAgentThoughtStreamed` and rendered as a live "Thinking" step with full persisted text.
+- **Loading-state overhaul** — a `ListSkeleton` primitive plus skeleton-by-default loaders, a 300/500 minimum-visible standard (retiring `DelayedSpinner`), and skeleton + fade-in + prefetch for the thread-open transition; loaders crossfade out via `LoadingFade`.
+- **Settings → System → Debugging** panel with a default-off perf-instrumentation toggle; thread-open render/paint timing is instrumented and flushed via a batched `/internal/client-logs` telemetry endpoint.
+- **Thread overflow (⋯) menu** with a separate pin icon — Archive and thread Info (moved out of the hover tooltip) live in the menu; Archive first, Info last.
+- **SDK `ui.toast` + `ui.prompt`** host-bridged components for apps.
+- **Fira Code font option** with programming ligatures.
+- **`get_backup_status` tool + backups knowhow** — timezone-aware backup scheduling, agent-readable/writable backup settings, and persisted run history.
+- **Targetable memory entries** — entry IDs surface in the `[Long-term Memory]` block and the Memory settings view (copyable), plus `correct_memory_by_id` to delete/replace one memory by id.
+
+### Changed
+- **Welcome screen redesign** — compact "Hi, there!" hero with a chevron suggestion carousel (one idea at a time), conversational clickable starter suggestions that prefill the prompt, and a top-right dismiss pill.
+- **Toast redesign** — elevated surface with a thin per-type category-colored border on a plain theme background, clean amber warning in light mode, full-width centering, per-theme tint strength, and the "New version available" toast replaced by the refreshing spinner.
+- Files panel: "Drop or click to import" pinned to the top-right of the source-switcher row; Expand/Collapse-all removed; empty repo Files toolbar no longer rendered.
+- Settings: Animation speed moved from Appearance to System → Debugging; Environment Variables indexed in search; redundant subpanel titles dropped.
+- Notifications: detail chevron navigation walks the whole inbox (not one page); detail panel uses larger body text and primary color; chevron layout refined for two-line titles and the iOS-PWA back-swipe gutter.
+- Drawer/Archive: Archive pile is a single global created-at window (gap-free, chronological); long context-name chips wrap instead of truncating; tree-style ←/→ keyboard navigation.
+- Mobile pane state persists in localStorage so a PWA close reopens where you left off.
+- "App Store" wording retired in favor of the plugin **Store**; English recommended in the language setup prompt and under the Language setting.
+- E2E suite runs against a release build by default.
+
+### Fixed
+- **Security hardening** — guard path traversal in the intent loader and browser screenshot path; floor char boundaries on OpenAI streaming token slices; scrub private/internal data from public-shipping sources, docs, system-knowhow, and test fixtures, backed by a fail-closed private-data release guard.
+- **Drafts** — a locally-edited draft is no longer blanked by a `MessageReceived` echo or a bulk SSE resync (drafts:65 `value=''`).
+- **Coding agent** — worktree `node_modules` provisioned from the hoisted root (npm workspaces); engine restart during a resumed session no longer read as a user rejection; idle-termination and question-answer-resume races closed; run-loop flags reset on resume.
+- **Gateway** never respawns an alive engine, only a dead one.
+- **Apply** — an already-merged branch is marked applied (instead of stranded as failed) and pushes main on a no-op.
+- Chat: no spurious "No changes" flash in Changes-mode; no open-jump on change-applied threads; pending messages survive a transient safety-refetch failure; iOS open-path repaint hardened.
+- macOS app menu derived from the system default so arrow keys move the cursor; About item labeled "About Lucidos".
+- Numerous UI fixes: dark-mode green confirm buttons, boot-splash label/sizing aligned to the gateway, header divider/tooltip behavior, and welcome carousel chevron/height stability.
+
+### Removed
+- Retired flat/narrow agent tools now superseded by grouped tools; dead components (`DelayedSpinner`, `StoreTab`, `ExportThreadButton`, `CopyThreadRefButton`).
 ## v0.12.5 — 2026-06-25
 
 ### Added
@@ -326,7 +364,7 @@ Three weeks of work since v0.9.6 (1111 non-merge commits). Headline themes: a fu
 - **Title generation** — skip opaque IDs (UUIDs, hashes), reject empty LLM responses, reject titles that echo the prompt instruction, instruction moved to system prompt.
 - **Compose race** — await thread-create before pasting an image; await thread-start POST before debounced compose PUT; `pendingComposePuts` leak plugged; PUT skipped on discarded thread.
 - **Drawer pagination** — gated on `archive` (renamed from `history` since v0.7.2); regression tests tightened.
-- **`HEAD` is current** — re-applied lost Akram fixes (Ctrl+Shift+O on Mac, history-collapsed pagination guard) with regression tests.
+- **`HEAD` is current** — re-applied lost contributor fixes (Ctrl+Shift+O on Mac, history-collapsed pagination guard) with regression tests.
 - **`ResponseFailed` on empty CC Result text** — surfaced explicitly.
 - **CC context** — sums `input + cache_read + cache_write` for total prompt size.
 - **Stale `apply` timeouts** — extended so backend doesn't outlive client `AbortController`.

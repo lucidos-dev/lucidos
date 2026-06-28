@@ -16,6 +16,33 @@ export LUCIDOS_MODEL="${LUCIDOS_MODEL:-mock}"
 # Playwright tests assert against. See system-knowhow/notifications.md §5.4.
 export ENGINE_BUILD_FEATURES="${ENGINE_BUILD_FEATURES:-e2e-test-hooks}"
 
+# e2e runs on a RELEASE engine by default (docs/plans/2026-06-28-e2e-always-release-build.md).
+# The debug engine's CPU cost is the dominant driver of the mobile-webkit
+# WebContent cold-start contention wedge — running release eliminates that flake
+# class and matches the packaged/prod engine (which IS release). The test-only
+# `seed-change-for-test` endpoint stays reachable on release because it is gated on
+# `cfg!(any(debug_assertions, feature = "e2e-test-hooks"))` and the e2e build passes
+# that feature (ENGINE_BUILD_FEATURES above). `build_or_find_engine` reads $RELEASE.
+#   - LUCIDOS_E2E_DEBUG=1 → fall back to the fast debug build for local single-spec
+#     iteration (the opt-out is authoritative).
+#   - otherwise RELEASE defaults to 1; an explicit caller RELEASE is honored.
+if [ -n "${LUCIDOS_E2E_DEBUG:-}" ]; then
+    export RELEASE=""
+else
+    export RELEASE="${RELEASE:-1}"
+fi
+
+# Cap cargo parallelism for the release compile so a full-core release codegen
+# (wasmtime / aws-lc / ravif each eat 1–2 GB) can't blow past RAM into swap and
+# hang the host (seen 2026-06-28 during this campaign). Half the cores by default;
+# override with CARGO_BUILD_JOBS. Only applied to the release build path.
+if [ -n "$RELEASE" ] && [ -z "${CARGO_BUILD_JOBS:-}" ]; then
+    _e2e_cores="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+    _e2e_jobs=$(( _e2e_cores / 2 ))
+    [ "$_e2e_jobs" -lt 1 ] && _e2e_jobs=1
+    export CARGO_BUILD_JOBS="$_e2e_jobs"
+fi
+
 # Source shared infrastructure — provides detect_tls, setup_postgres, start_engine,
 # start_vite, etc. Set the globals workspace.sh expects from its caller.
 SCRIPT_DIR="$_E2E_SCRIPTS_DIR"

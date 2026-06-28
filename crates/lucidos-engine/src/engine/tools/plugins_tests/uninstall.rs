@@ -316,6 +316,121 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// Regression test for the uninstall half of the plugin git-tracking bug:
+/// uninstall deleted the plugin's files from `data/` but never committed the
+/// deletion, leaving the removal unrecorded in git history. This is the
+/// symmetric counterpart of `install_commits_written_files_so_working_tree_is_clean`.
+///
+/// Installs (which now commits the files), then uninstalls and asserts the
+/// removal lands in ONE commit, the files leave the HEAD tree, and the working
+/// tree is left clean (no uncommitted deletions / ghosts).
+#[tokio::test]
+async fn uninstall_commits_deletions_so_working_tree_is_clean() {
+    const MANIFEST: &str = r#"
+id = "uninstall-track-plugin"
+version = "1.2.0"
+name = "Uninstall Track Plugin"
+description = "test"
+source = "https://github.com/x/uninstall-track"
+"#;
+    let scratch = fresh_workspace();
+    let archive_dir = scratch.join("archive");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    let archive = build_archive(
+        &archive_dir,
+        "uninstall-track.lucidos-plugin",
+        MANIFEST,
+        &[
+            ("apps/uninstall-track-plugin/index.html", b"<h1>hi</h1>"),
+            ("knowhow/uninstall-track.md", b"# how"),
+        ],
+    );
+    let unpacked = extract_to(&archive_dir, &archive);
+
+    let bus = MockEventBus::new();
+    let (_msg, installed_files) = install_from_unpacked_with_bus(
+        &scratch,
+        &bus,
+        &unpacked,
+        SourceType::Archive,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("install");
+
+    // Sanity: install committed the files (covered in depth by the install
+    // regression test) — so the uninstall has a tracked deletion to make.
+    let repo = git2::Repository::open(&scratch).unwrap();
+    for rel in &installed_files {
+        assert!(
+            repo.status_file(std::path::Path::new(&format!("data/{}", rel)))
+                .unwrap()
+                .is_empty(),
+            "precondition: install must leave {} tracked & clean",
+            rel
+        );
+    }
+
+    let pending = PendingUninstall {
+        plugin_id: "uninstall-track-plugin".to_string(),
+        plugin_version: "1.2.0".to_string(),
+        plugin_name: "Uninstall Track Plugin".to_string(),
+        files_present: installed_files.clone(),
+        files_missing: Vec::new(),
+        created_at: chrono::Utc::now(),
+    };
+    let outcome = uninstall_with_bus(&scratch, &bus, &pending, None)
+        .await
+        .expect("uninstall");
+    assert_eq!(outcome.files_deleted.len(), installed_files.len());
+
+    // Files gone from disk.
+    for rel in &installed_files {
+        assert!(
+            !scratch.join("data").join(rel).exists(),
+            "uninstall must delete {}",
+            rel
+        );
+    }
+
+    // HEAD now records the uninstall, and the deleted files are gone from its
+    // tree — the deletion is version-controlled, not just a dirty working tree.
+    let head = repo.head().and_then(|h| h.peel_to_commit()).unwrap();
+    assert_eq!(
+        head.message().unwrap_or(""),
+        "Uninstall plugin: uninstall-track-plugin v1.2.0",
+        "uninstall commit must name the plugin and version"
+    );
+    let tree = head.tree().unwrap();
+    for rel in &installed_files {
+        assert!(
+            tree.get_path(std::path::Path::new(&format!("data/{}", rel)))
+                .is_err(),
+            "uninstall commit tree must NOT contain {}",
+            rel
+        );
+    }
+
+    // Working tree is clean: no staged-or-unstaged deletions left dangling.
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(false);
+    let dirty: Vec<String> = repo
+        .statuses(Some(&mut opts))
+        .unwrap()
+        .iter()
+        .filter_map(|e| e.path().map(str::to_string))
+        .collect();
+    assert!(
+        dirty.is_empty(),
+        "working tree must be clean after uninstall commit, dirty: {:?}",
+        dirty
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 // ---- uninstall confirm-flow unit tests ------------------------------
 
 #[test]

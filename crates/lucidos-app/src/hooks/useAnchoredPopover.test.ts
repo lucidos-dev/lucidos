@@ -84,6 +84,46 @@ describe('computeAnchorPosition', () => {
     );
     expect(pos.left).toBe(80);
   });
+
+  it("align 'end' aligns the panel's right edge with the anchor's right edge", () => {
+    setViewport(1280, 800);
+    // Anchor (⋯ trigger) on the right; a 300px menu should hang its right edge
+    // under the trigger's right edge: 1040 - 300 = 740.
+    const pos = computeAnchorPosition(
+      fakeAnchor({ top: 100, bottom: 120, left: 1010, right: 1040 }),
+      200,
+      300,
+      null,
+      'end',
+    );
+    expect(pos.left).toBe(740);
+    expect(pos.left + 300).toBe(1040); // right edge pinned to the anchor
+  });
+
+  it("align 'end' stays anchored to the trigger on a narrow mobile viewport (the bug fix)", () => {
+    setViewport(393, 852); // iPhone 14 Pro
+    const anchor = fakeAnchor({ top: 100, bottom: 120, left: 350, right: 380 });
+    // 'start' clamps a 320px menu to 393 - 320 - 8 = 65 — detached from the
+    // trigger near the left edge. 'end' pins its right edge under the trigger.
+    const start = computeAnchorPosition(anchor, 200, 320);
+    const end = computeAnchorPosition(anchor, 200, 320, null, 'end');
+    expect(start.left).toBe(65);
+    expect(end.left).toBe(60); // 380 - 320
+    expect(end.left + 320).toBe(380); // right edge under the trigger
+  });
+
+  it("align 'end' still clamps to the left margin when the panel is wider than the viewport", () => {
+    setViewport(360, 800);
+    const pos = computeAnchorPosition(
+      fakeAnchor({ top: 100, bottom: 120, left: 320, right: 350 }),
+      200,
+      380,
+      null,
+      'end',
+    );
+    // desiredLeft = 350 - 380 = -30; clamp pins to the left margin.
+    expect(pos.left).toBe(8);
+  });
 });
 
 describe('isOutsidePointerTarget', () => {

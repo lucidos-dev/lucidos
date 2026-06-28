@@ -629,7 +629,7 @@ async fn check_plugin_updates_skips_plugin_when_files_are_all_missing_from_disk(
 
 /// The install-time `setup_thread_id` must round-trip through the
 /// `PluginInstalled` payload into the installed-plugin summary (it drives the
-/// App Store card's Setup→Open button), and `app_id` must surface the app the
+/// Plugins panel card's Setup→Open button), and `app_id` must surface the app the
 /// "Open" button launches.
 #[tokio::test]
 async fn installed_summary_surfaces_setup_thread_and_app_id() {

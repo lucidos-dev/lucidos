@@ -7,19 +7,27 @@ import { rebuildCorruptedThreadEvents } from '../../store/actions/thread-sync';
 import { useAutoScroll, renderExchanges, ScrollControls } from './CreateThreadView';
 import { ThreadStatusIcon, threadVisualStatus } from '../shared/ThreadStatusIcon';
 import { ThreadTitleEditor } from './ThreadTitleEditor';
-import { CopyThreadRefButton } from '../shared/CopyThreadRefButton';
-import { ExportThreadButton } from '../shared/ExportThreadButton';
+import { PinThreadButton } from '../shared/PinThreadButton';
+import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
 import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
 import { computeExchanges, hasContentEvents } from '../../store/thread-events';
 import { awayFromBottom, notAtTop, scrollToBottom, scrolledUp, hasPendingEventScroll, deepLinkRenderAll } from './scrollState';
 import { INITIAL_WINDOW, computeRenderFromIndex, hasMoreAbove, expandRenderCount, WINDOW_EXPAND_MARGIN_PX } from './threadWindow';
 import { useScrollMemory, hasSavedScroll, threadScrollKey } from '../../hooks/useScrollMemory';
-import { useDelayedFlag } from '../../hooks/useDelayedLoading';
-import { DelayedSpinner } from '../shared/DelayedSpinner';
-import { forceIOSRepaint, createRepaintThrottle } from '../../utils/iosRepaint';
+import { useDelayedFlag, useLingeringFlag } from '../../hooks/useDelayedLoading';
+import { ThreadSkeleton } from './ThreadSkeleton';
+import { forceIOSRepaint, forceIOSRepaintBurst, createRepaintThrottle } from '../../utils/iosRepaint';
 import { onPageResume } from '../../utils/pageResume';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { refreshClient } from '../../hooks/sw-update';
+import { recordPerfSample } from '../../utils/perfQueue';
+import { takeThreadOpenStart, takeThreadRerenderStart } from '../../utils/threadOpenMarks';
+import { readRenderPhaseTotals } from '../../utils/renderPhaseTimers';
+
+/** Only sample a grouping fold this slow (ms) — keeps cheap incremental folds
+ *  (streaming tokens) out of the perf log; we only want the expensive full
+ *  rebuilds that the user actually feels on open / answer. */
+const PERF_GROUP_THRESHOLD_MS = 20;
 
 // Module-level tracking survives component unmount/remount (e.g. Thread A → CreateThread → Thread B).
 // Using a ref would reset on remount, causing the fade-in to be skipped.
@@ -80,14 +88,17 @@ const STREAM_REPAINT_THROTTLE_MS = 200;
  *  (e.g. "loaded with events but animating") can't be constructed. */
 export type EmptyReason =
     | { kind: 'loading'; threadId: string }
+    | { kind: 'animating' }
     | { kind: 'failed'; threadId: string }
     | { kind: 'corrupt'; threadId: string }
     | { kind: 'empty' };
 
-/** Derive the empty reason from thread state. During animation, returns
- *  'loading' — rendered as the delayed spinner — which prevents the error
- *  state from flashing when events arrive via SSE before the animation gate
- *  lifts.
+/** Derive the empty reason from thread state. During the compose→thread send
+ *  animation, returns 'animating' — rendered as nothing — which both prevents
+ *  the error/empty states from flashing when events arrive via SSE before the
+ *  animation gate lifts AND keeps the loading skeleton (a "fetching an existing
+ *  conversation" affordance) from showing on a brand-new thread's first prompt
+ *  send, where the content is the just-sent message, not a DB fetch.
  *
  *  `hasContent` is true iff the thread has at least one event that should
  *  contribute to a rendered exchange (see hasContentEvents). A composing draft
@@ -102,7 +113,7 @@ export function emptyReason(
     hasContent: boolean,
     threadId: string,
 ): EmptyReason {
-    if (animating) return { kind: 'loading', threadId };
+    if (animating) return { kind: 'animating' };
     if (eventsLoadFailed) return { kind: 'failed', threadId };
     if (eventsLoaded && hasContent) return { kind: 'corrupt', threadId };
     if (eventsLoaded) return { kind: 'empty' };
@@ -110,11 +121,20 @@ export function emptyReason(
 }
 
 function ThreadEmptyState({ reason }: { reason: EmptyReason }) {
-    // Both call sites key this component by threadId, so the spinner delay
-    // (inside DelayedSpinner) and this reload timeout restart per thread.
+    // Both call sites key this component by threadId, so this timer restarts per
+    // thread. The loading SKELETON is no longer rendered here — it's a fading
+    // overlay in `.thread-content-wrap` (ThreadSkeletonOverlay) so it can
+    // crossfade out as the exchanges appear, instead of a hard swap inside the
+    // scroll container. This component only owns the terminal text states + the
+    // 8s "stuck load" reload affordance (a delay-only fuse).
     const showReload = useDelayedFlag(reason.kind === 'loading', RELOAD_TIMEOUT);
 
     switch (reason.kind) {
+        case 'animating':
+            // Content is gated by the compose→thread send FLIP, not a DB fetch —
+            // render nothing so a brand-new thread's first send doesn't flash a
+            // placeholder. The just-sent message appears when the gate lifts.
+            return null;
         case 'failed':
         case 'corrupt': {
             const message = reason.kind === 'failed' ? 'Failed to load messages' : 'Messages could not be displayed';
@@ -133,17 +153,33 @@ function ThreadEmptyState({ reason }: { reason: EmptyReason }) {
                 </div>
             );
         case 'loading':
-            return (
+            // The skeleton is the overlay; here only the 8s reload affordance
+            // appears if the load is genuinely stuck.
+            return showReload ? (
                 <div class="thread-empty-state">
-                    <DelayedSpinner />
-                    {showReload && (
-                        <button class="thread-empty-reload" onClick={() => refreshClient()}>
-                            Taking too long? Tap to reload
-                        </button>
-                    )}
+                    <button class="thread-empty-reload" onClick={() => refreshClient()}>
+                        Taking too long? Tap to reload
+                    </button>
                 </div>
-            );
+            ) : null;
     }
+}
+
+/** The thread-open loading skeleton, as a fading overlay over the scroll area
+ *  (a sibling of `.thread-content` in the position:relative `.thread-content-wrap`).
+ *  Living outside the scroll container lets it linger and crossfade OUT as the
+ *  exchanges render underneath, rather than hard-swapping. `show` is the
+ *  delay-gated loading flag; the overlay then lingers SKELETON_FADE_OUT_MS while
+ *  fading. Decorative + pointer-events:none so it never blocks the content. */
+const SKELETON_FADE_OUT_MS = 250;
+function ThreadSkeletonOverlay({ show }: { show: boolean }) {
+    const mounted = useLingeringFlag(show, SKELETON_FADE_OUT_MS);
+    if (!mounted) return null;
+    return (
+        <div class={`thread-skeleton-overlay${show ? '' : ' is-fading'}`} aria-hidden="true">
+            <ThreadSkeleton />
+        </div>
+    );
 }
 
 export function ThreadView() {
@@ -175,12 +211,111 @@ export function ThreadView() {
     // ThreadView to this thread's stream activity AND invalidates the memo on
     // every event arrival. See `~/.claude/plans/generic-sparking-garden.md`.
     const eventsBump = threadId ? getThreadEventsBump(threadId) : 0;
+    // Time the grouping fold (the suspected O(n) cost behind both "clicking into
+    // a thread" and "answering a question" lag — both re-run computeExchanges).
+    // The fold snapshots its own duration + size into groupSampleRef so the
+    // post-commit effect below records a SELF-CONSISTENT sample (recording inside
+    // a memo would be an impure side-effect; reading eventCount/exchanges at
+    // effect time could pair a stale duration with a different render). Cleared
+    // by the effect after it fires. See utils/perfQueue.ts.
+    const groupSampleRef = useRef<{ groupMs: number; eventCount: number; exchangeCount: number } | null>(null);
     const exchanges = useMemo(
-        () => hasContent && !animating && eventThread
-            ? computeExchanges(eventThread) : [],
+        () => {
+            if (!(hasContent && !animating && eventThread)) return [];
+            const t0 = performance.now();
+            const result = computeExchanges(eventThread);
+            groupSampleRef.current = {
+                groupMs: performance.now() - t0,
+                eventCount,
+                exchangeCount: result.length,
+            };
+            return result;
+        },
         [threadId, eventCount, pendingCount, hasContent, animating, eventsBump],
     );
     const streamingBuffer = animating ? '' : activeStreamingBuffer.value;
+
+    // Perf instrumentation: when a grouping fold was slow, sample it (with the
+    // size captured alongside it) after commit. Keyed on `exchanges` so it fires
+    // once per actual recompute, not on unrelated re-renders. Threshold keeps
+    // cheap incremental folds (streaming tokens) out of the log — only the
+    // expensive full rebuilds that the user feels get recorded. Fire-and-forget.
+    useEffect(() => {
+        const s = groupSampleRef.current;
+        if (s && s.groupMs > PERF_GROUP_THRESHOLD_MS && threadId) {
+            recordPerfSample('group', {
+                threadId,
+                eventCount: s.eventCount,
+                exchangeCount: s.exchangeCount,
+                groupMs: Math.round(s.groupMs),
+            });
+        }
+        groupSampleRef.current = null;
+    }, [exchanges]);
+
+    // Perf instrumentation: record the open→paint span ONCE per thread open. The
+    // open-start was stamped when this thread's real event load began
+    // (loadThreadEvents → utils/threadOpenMarks). Fire on the FIRST content
+    // render — when exchanges first appear — and take() the mark so streaming
+    // appends / scroll-window growth don't re-fire it (a later render finds no
+    // mark). The rAF runs just before the browser paints this committed render,
+    // so renderMs ≈ open→paint. Pure render/paint is derived in analysis by
+    // subtracting the paired thread-load fetchMs/applyMs (and the group mark's
+    // groupMs) for this threadId. Telemetry carve-out (.claude/rules/frontend.md):
+    // strictly fire-and-forget — no toast; recordPerfSample swallows internally
+    // and nothing here can throw into the render path. See utils/perfQueue.ts.
+    useLayoutEffect(() => {
+        if (!threadId || exchanges.length === 0) return;
+        const base = takeThreadOpenStart(threadId);
+        if (base === undefined) return; // already fired, or open not stamped
+        const exchangeCount = exchanges.length;
+        const events = eventCount;
+        requestAnimationFrame(() => {
+            // Split the open span: markdown/linkify are the deltas in the phase
+            // timers since open-start; the DOM/reconciliation remainder is derived
+            // in analysis as renderMs − fetchMs − applyMs − markdownMs − linkifyMs.
+            const totals = readRenderPhaseTotals();
+            recordPerfSample('thread-render', {
+                threadId,
+                eventCount: events,
+                exchangeCount,
+                renderMs: Math.round(performance.now() - base.start),
+                markdownMs: Math.round(totals.markdownMs - base.md),
+                linkifyMs: Math.round(totals.linkifyMs - base.link),
+            });
+        });
+    }, [threadId, exchanges.length]);
+
+    // Perf instrumentation: record a user-initiated RE-RENDER (follow-up send or
+    // answering a question) ONCE, with the same markdown/linkify split. The mark
+    // is stamped at the action (chat.ts addPendingMessage / chat-claude-code.ts
+    // answerThreadQuestion) right before the state change that triggers the
+    // re-render, so the FIRST render after is the laggy one we want. No deps array
+    // (runs after every commit) so the fire is independent of WHAT changed — the
+    // answer flips `answeringThreadIds` (not an exchange-count/eventsBump signal),
+    // so a deps-gated effect would miss it. The guard is a cheap take(): a no-op
+    // (one Map.get) on the vast majority of renders that have no pending mark, and
+    // the take clears it so streaming re-renders don't re-fire. Same telemetry
+    // carve-out (.claude/rules/frontend.md) as the open mark.
+    useLayoutEffect(() => {
+        if (!threadId || exchanges.length === 0) return;
+        const mark = takeThreadRerenderStart(threadId);
+        if (mark === undefined) return; // no pending user-initiated re-render
+        const exchangeCount = exchanges.length;
+        const events = eventCount;
+        requestAnimationFrame(() => {
+            const totals = readRenderPhaseTotals();
+            recordPerfSample('thread-rerender', {
+                threadId,
+                cause: mark.cause,
+                eventCount: events,
+                exchangeCount,
+                rerenderMs: Math.round(performance.now() - mark.start),
+                markdownMs: Math.round(totals.markdownMs - mark.md),
+                linkifyMs: Math.round(totals.linkifyMs - mark.link),
+            });
+        });
+    });
 
     // --- Thread-render windowing (perf) ---
     // A large focused thread used to render — and markdown-parse — every exchange
@@ -302,6 +437,11 @@ export function ThreadView() {
     // cached compositor texture so DOM-present-but-black content shows.
     // Called on data changes AND on resume from background.
     const forceRepaint = () => forceIOSRepaint(areaRef.current);
+    // Drop-resilient variant for the thread-OPEN path: a single toggle there has
+    // no retry (unlike the streaming throttle and the resume re-fires), so a
+    // cold open whose two rAF frames iOS drops/coalesces stays blank until a
+    // manual scroll. The burst spreads several toggles over a few hundred ms.
+    const forceRepaintBurst = () => forceIOSRepaintBurst(areaRef.current);
 
     // Scroll to bottom when events finish loading for the focused thread.
     // focusThread() calls scrollToBottom() but its ResizeObserver suppression
@@ -321,6 +461,40 @@ export function ThreadView() {
     // SSE-delivered events, the compositor layer may still hold a blank
     // texture. This dep ensures a repaint fires on the 0→N transition.
     const hasExchanges = exchanges.length > 0;
+
+    // Drives the fading skeleton overlay (ThreadSkeletonOverlay): we're in the
+    // 'loading' empty state — no exchanges yet, and not animating / failed /
+    // loaded-empty. Delay-gated so a fast / prefetched open never shows it. This
+    // mirrors emptyReason(...).kind === 'loading' but is also valid before the
+    // thread is in the map (cold start: eventsLoaded/eventsLoadFailed are false).
+    const isThreadLoadingNow = !hasExchanges && !animating && !eventsLoadFailed && !eventsLoaded;
+    const showThreadSkeleton = useDelayedFlag(isThreadLoadingNow);
+    // Remember whether the skeleton was shown for this thread, so the content
+    // fade-in below can step aside and let the overlay crossfade do the reveal.
+    const skeletonShownRef = useRef<string | null>(null);
+    if (showThreadSkeleton && threadId) skeletonShownRef.current = threadId;
+
+    // Content fade-in: play a one-shot opacity fade on the content area the first
+    // time a thread's exchanges are present. Opacity-only on the scroll container so
+    // scroll math (scroll-to-bottom, saved-scroll, deep-link, window expansion) is
+    // untouched; runs in a layout effect (before paint) so content never flashes
+    // at full opacity first. Tracked per thread so streaming appends don't re-fade
+    // and a re-open replays; reduced-motion disables it via CSS. SKIPPED when the
+    // skeleton overlay was shown — then the exchanges render at full opacity
+    // beneath the overlay, which crossfades out to reveal them (no double fade /
+    // blank frame). The fade is therefore for the fast/no-skeleton open only.
+    const enteredThreadRef = useRef<string | null>(null);
+    useLayoutEffect(() => {
+        if (!threadId || !hasExchanges || enteredThreadRef.current === threadId) return;
+        const el = areaRef.current;
+        if (!el) return; // content div not mounted yet — retry on the next render
+        enteredThreadRef.current = threadId;
+        if (skeletonShownRef.current === threadId) return; // overlay crossfade owns the reveal
+        el.classList.remove('content-entering');
+        void el.offsetHeight; // reflow so re-adding replays the one-shot animation
+        el.classList.add('content-entering');
+    }, [threadId, hasExchanges]);
+
     const savedScrollKey = threadId ? threadScrollKey(threadId) : null;
 
     // Mark the user as scrolled-up synchronously when a saved scroll exists.
@@ -350,7 +524,14 @@ export function ThreadView() {
             // ResizeObserver fire escalated scrolledUp=true (see the comment
             // above) — a scrolledUp gate would defeat that recovery.
             if (eventsLoaded && !hasSavedScroll(savedScrollKey) && !hasPendingEventScroll()) scrollToBottom();
-            return forceRepaint();
+            // Burst (not a single toggle): this is the open path's ONLY repaint
+            // for an idle thread — once content is in the DOM no eventsBump tick
+            // re-fires the streaming throttle, and the thread may never go to
+            // background to trigger the resume path. A cold open whose one toggle
+            // iOS drops/coalesces (or fires before the layer blanks) would then
+            // stay black until a manual scroll. The burst's spaced retries
+            // recover it. cleanup cancels any pending retries on dep change.
+            return forceRepaintBurst();
         }
     }, [threadId, eventsLoaded, hasExchanges]);
 
@@ -373,16 +554,22 @@ export function ThreadView() {
     // fired — the content stays in the DOM (still scrollable, chevron shows) but
     // renders black until a manual scroll. eventsBump ticks on every append to
     // THIS thread (tokens, tool events, CC text), so repaint on a throttle as
-    // content streams in. Fire-and-forget on purpose: this stream-driven repaint
-    // has no lifecycle to clean up. The gate keeps it to one repaint per ~200ms,
-    // and forceIOSRepaint supersedes an overlapping toggle (reusing the captured
-    // baseline) so nothing accumulates; forceRepaint is iOS-gated and null-safe.
+    // content streams in. The gate keeps the LEADING edge to one repaint per
+    // ~200ms (forceIOSRepaint supersedes an overlapping toggle so nothing
+    // accumulates; forceRepaint is iOS-gated and null-safe), and its TRAILING
+    // edge fires once after the stream pauses — load-bearing for the "click Less
+    // on the last running result blanks the pane" report: the toggle's own
+    // restore() repaints the collapse shrink, but the next streamed mutation
+    // re-blanks the layer a beat later; without the trailing edge that request is
+    // throttled away, and if CC then pauses (a tool call running) the pane stays
+    // black. The trailing repaint clears it. cancel() on unmount so a pending
+    // trailing fire can't run against a torn-down element.
     const streamRepaintGate = useMemo(() => createRepaintThrottle(STREAM_REPAINT_THROTTLE_MS), []);
     useEffect(() => {
         if (!hasExchanges) return;
-        if (!streamRepaintGate(performance.now())) return;
-        forceRepaint();
+        streamRepaintGate.request(performance.now(), forceRepaint);
     }, [eventsBump, hasExchanges]);
+    useEffect(() => () => streamRepaintGate.cancel(), [streamRepaintGate]);
 
     // Self-healing watchdog: if a thread has CONTENT events but exchanges are
     // empty, rebuild the events Map and re-fetch from the API. iOS Safari can
@@ -480,8 +667,12 @@ export function ThreadView() {
     if (!eventThread) {
         // Don't unfocus if threads haven't loaded yet — the thread may appear
         // once loadAllThreads completes. Only unfocus after threads are loaded.
+        // revealPane:false — this is stale-pointer cleanup during render, not a
+        // navigation. ThreadView is mounted in the background on mobile (all
+        // three panes mount), so revealing the thread pane here would swipe a
+        // user on the content pane away mid-render.
         if (threadsLoaded.value) {
-            unfocusThread();
+            unfocusThread({ revealPane: false });
         }
         // Waiting for the thread to appear in the map — same delayed-spinner
         // empty state as the events-loading path, including the 8s "Taking too
@@ -495,6 +686,7 @@ export function ThreadView() {
                     <div class="thread-content visible">
                         <ThreadEmptyState key={threadId} reason={{ kind: 'loading', threadId }} />
                     </div>
+                    <ThreadSkeletonOverlay show={showThreadSkeleton} />
                 </div>
             </div>
         );
@@ -508,8 +700,10 @@ export function ThreadView() {
                 <ThreadStatusIcon status={visualStatus} />
                 <ThreadTitleEditor threadId={threadId} title={threadTitle} />
                 <span class="thread-view-header-actions">
-                    <CopyThreadRefButton threadId={threadId} title={threadTitle} />
-                    <ExportThreadButton threadId={threadId} title={threadTitle} />
+                    {eventThread.meta.state !== 'composing' && (
+                        <PinThreadButton threadId={threadId} saved={eventThread.meta.saved} />
+                    )}
+                    <ThreadOverflowMenu threadId={threadId} title={threadTitle} />
                 </span>
             </div>
             <div class="thread-content-wrap">
@@ -522,6 +716,7 @@ export function ThreadView() {
                         renderExchanges(exchanges, threadId!, streamingBuffer, renderFromIndex)
                     )}
                 </div>
+                <ThreadSkeletonOverlay show={showThreadSkeleton} />
                 <ScrollControls
                     showUp={isNotAtTop}
                     showDown={isUp}

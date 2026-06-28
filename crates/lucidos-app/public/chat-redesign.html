@@ -364,90 +364,90 @@
     const vcol = (t) => `var(${VAR[t.variant]})`;
 
     const STEPS_FULL = [
-      { ok: true, d: 'Memory searched', m: '— fullmakt nav skatteetaten foreldre, tilgang til nav og skatteetaten for pappa' },
+      { ok: true, d: 'Memory searched', m: '— weekly metrics, report recipients, dashboard preferences' },
       { ok: true, d: 'Thinking', m: '67k / 1000k (7%)' },
       { ok: true, d: "Loading know-how 'pdf'..." },
       { ok: true, d: 'Thinking', m: '70k / 1000k (7%)' },
     ];
 
-    // One long, realistic multi-actor thread (the pappa / fullmakt context
-    // from the screenshot) that naturally surfaces every initiator-panel type
-    // in the order they'd actually occur: trigger → agent → question → user →
-    // agent → child-completed → change-applied → … → merge/hardening (the CC
+    // One long, realistic multi-actor thread (a generic weekly-report context)
+    // that naturally surfaces every initiator-panel type in the order they'd
+    // actually occur: trigger → agent → question → user → agent →
+    // child-completed → change-applied → … → merge/hardening (the CC
     // sub-thread) → change-applied/failed/discarded → agent wrap-up.
     const THREAD = [
       { variant: 'trigger', icon: '⏰', name: 'Lucidos Engine', kind: 'initiator', time: '08:00',
         summary: 'Trigger fired', reason: 'trigger',
-        html: `<p>Morgenbrief: sjekk innboksen for nye brev fra NAV og Skatteetaten og oppsummer.</p>` },
+        html: `<p>Morning brief: check the inbox for new analytics reports and summarize.</p>` },
 
       { variant: 'lucidos', icon: '✨', name: 'Lucidos Agent', kind: 'response', time: '08:00',
         status: { kind: 'done', label: 'Done' },
-        steps: [{ ok: true, d: 'Searched email', m: '— nav.no, skatteetaten.no, siste 24t' }, { ok: true, d: 'Memory searched', m: '— fullmakt, pappa, tilgang' }, { ok: true, d: 'Thinking', m: '18k / 1000k (2%)' }],
-        html: `<p>To nye brev i natt: NAV ber om bekreftelse på fremtidsfullmakten, og Skatteetaten har åpnet for delegering. Begge trenger samme dokument.</p>` },
+        steps: [{ ok: true, d: 'Searched email', m: '— analytics, dashboards, last 24h' }, { ok: true, d: 'Memory searched', m: '— weekly metrics, recipients' }, { ok: true, d: 'Thinking', m: '18k / 1000k (2%)' }],
+        html: `<p>Two new reports overnight: the traffic dashboard refreshed and the revenue export is ready. Both feed the same weekly summary.</p>` },
 
       { variant: 'lucidos', icon: '✨', name: 'Lucidos Agent', kind: 'question', time: '08:01',
         status: { kind: 'awaiting', label: 'Needs your answer' },
-        question: 'Vil du at jeg lager én PDF av fremtidsfullmakten du kan sende til begge?',
-        options: [{ label: 'Lag PDF nå', desc: 'Generer én PDF med Statsforvalterens stadfesting.' }, { label: 'Bare påminnelse', desc: 'Sett en påminnelse om å fullføre tilgangen senere.' }] },
+        question: 'Want me to compile one PDF summary you can send to the team?',
+        options: [{ label: 'Build PDF now', desc: 'Generate one PDF with the week\'s charts.' }, { label: 'Just a reminder', desc: 'Set a reminder to finish the summary later.' }] },
 
       { variant: 'user', icon: PERSON, name: 'You', kind: 'message', time: '08:03',
-        html: `<p>lag pdf jeg kan sende begge du</p>` },
+        html: `<p>yes build a pdf i can send to everyone</p>` },
 
       { variant: 'lucidos', icon: '✨', name: 'Lucidos Agent', kind: 'response', time: '08:03',
         status: { kind: 'working', label: 'Working' }, steps: STEPS_FULL,
-        html: `<p>Jeg lager én PDF med fremtidsfullmakten du kan sende til både NAV og Skatteetaten. Den får en kort følgetekst øverst og plass til stadfestingen.</p>` },
+        html: `<p>I'm compiling one PDF with the weekly summary you can send to the team. It gets a short intro at the top and space for the charts.</p>` },
 
       { variant: 'lucidos', icon: '✨', name: 'Lucidos Agent', kind: 'initiator', time: '08:05',
-        childStatus: 'success', childTitle: 'Generate fullmakt PDF',
-        childSummary: 'Bygget PDF-en fra malen og la den i pappa-prosjektet.' },
+        childStatus: 'success', childTitle: 'Generate weekly summary PDF',
+        childSummary: 'Built the PDF from the template and saved it to the reports project.' },
 
       { variant: 'system', icon: PERSON, name: 'You', kind: 'initiator', time: '08:06',
         summary: 'Change applied', reason: 'applied',
-        change: { desc: 'feat(pappa): add fullmakt.pdf artifact', files: 1 } },
+        change: { desc: 'feat(reports): add weekly-summary.pdf artifact', files: 1 } },
 
       { variant: 'user', icon: PERSON, name: 'You', kind: 'message', time: '08:11',
-        html: `<p>fint. lag en liten app som holder styr på hvilke tilganger som er på plass</p>` },
+        html: `<p>nice. build a small app that tracks which reports are done each week</p>` },
 
       { variant: 'lucidos', icon: '✨', name: 'Lucidos Agent', kind: 'response', time: '08:11',
         status: { kind: 'done', label: 'Done' },
-        steps: [{ ok: true, d: 'Loading know-how', m: "'building-an-app'" }, { ok: true, d: 'Spawned coding-agent thread', m: 'access-tracker' }],
-        html: `<p>Starter en kodeoppgave som bygger en liten «Tilgang»-app. Jeg gir beskjed når den er klar til å tas i bruk.</p>` },
+        steps: [{ ok: true, d: 'Loading know-how', m: "'building-an-app'" }, { ok: true, d: 'Spawned coding-agent thread', m: 'report-tracker' }],
+        html: `<p>Starting a coding task that builds a small "Reports" app. I'll let you know when it's ready to use.</p>` },
 
       { variant: 'system', icon: '⬡', name: 'Lucidos Engine', kind: 'initiator', time: '08:18',
         summary: 'Merging changes from main',
-        files: ['data/apps/access-tracker/manifest.json', 'data/apps/access-tracker/index.html'] },
+        files: ['data/apps/report-tracker/manifest.json', 'data/apps/report-tracker/index.html'] },
 
       { variant: 'system', icon: '⬡', name: 'Lucidos Engine', kind: 'initiator', time: '08:19',
         summary: 'Hardening required' },
 
       { variant: 'lucidos', icon: '✨', name: 'Lucidos Agent', kind: 'initiator', time: '08:24',
-        childStatus: 'success', childTitle: 'Build access-tracker app',
-        childSummary: 'La til app med oversikt over NAV/Skatt-tilganger og status per instans.' },
+        childStatus: 'success', childTitle: 'Build report-tracker app',
+        childSummary: 'Added an app with an overview of weekly reports and status per recipient.' },
 
       { variant: 'system', icon: PERSON, name: 'You', kind: 'initiator', time: '08:25',
         summary: 'Change applied', reason: 'applied',
-        change: { desc: 'feat(app): access-tracker — NAV/Skatt tilgangsoversikt', files: 6 } },
+        change: { desc: 'feat(app): report-tracker — weekly report overview', files: 6 } },
 
       { variant: 'system', icon: PERSON, name: 'You', kind: 'initiator', time: '08:26',
         summary: 'Change failed', reason: 'failed',
-        change: { desc: 'chore(app): tweak access-tracker styling', files: 2, error: 'merge conflict in data/apps/access-tracker/index.html' } },
+        change: { desc: 'chore(app): tweak report-tracker styling', files: 2, error: 'merge conflict in data/apps/report-tracker/index.html' } },
 
       { variant: 'system', icon: PERSON, name: 'You', kind: 'initiator', time: '08:27',
         summary: 'Change discarded', reason: 'muted',
-        change: { desc: 'experiment: alternativ layout', files: 1 } },
+        change: { desc: 'experiment: alternative layout', files: 1 } },
 
       { variant: 'lucidos', icon: '✨', name: 'Lucidos Agent', kind: 'response', time: '08:28',
         status: { kind: 'done', label: 'Done' },
-        html: `<p>«Tilgang»-appen er live. PDF-en er klar til å sendes, og appen viser at NAV venter på bekreftelse mens Skatteetaten er åpnet.</p>` },
+        html: `<p>The "Reports" app is live. The PDF is ready to send, and the app shows which reports are done and which are still pending.</p>` },
 
       { variant: 'lucidos', icon: '✨', name: 'Lucidos Agent', kind: 'question', time: '08:29',
-        status: { kind: 'done', label: 'Answered' }, answer: 'Send på e-post nå',
-        question: 'Vil du at jeg sender PDF-en til deg på e-post nå?',
-        options: [{ label: 'Send på e-post nå', desc: 'Send fullmakt.pdf til din registrerte adresse.' }, { label: 'Vent litt', desc: 'Jeg sender den senere når du sier fra.' }] },
+        status: { kind: 'done', label: 'Answered' }, answer: 'Send by email now',
+        question: 'Want me to email the PDF to you now?',
+        options: [{ label: 'Send by email now', desc: 'Send weekly-summary.pdf to your registered address.' }, { label: 'Hold off', desc: 'I\'ll send it later when you say so.' }] },
 
       { variant: 'lucidos', icon: '✨', name: 'Lucidos Agent', kind: 'response', time: '08:29',
         status: { kind: 'done', label: 'Done' },
-        html: `<p>Sendt — PDF-en ligger nå i innboksen din, klar til å videresendes til NAV og Skatteetaten.</p>` },
+        html: `<p>Sent — the PDF is now in your inbox, ready to forward to the team.</p>` },
     ];
 
     // ---- Body fragments (shared by every design) ------------------------
@@ -467,7 +467,7 @@
     function originDetail(t) {
       if (t.detail) return t.detail;
       if (t.name === 'You') return 'iPhone 15 · Lucidos PWA';
-      if (t.variant === 'trigger') return 'Morgenbrief · kl. 08:00 daglig';
+      if (t.variant === 'trigger') return 'Morning brief · 08:00 daily';
       if (t.name === 'Lucidos Agent') return 'claude-opus-4-8 · default';
       return 'Engine-initiated';
     }

@@ -54,7 +54,14 @@ pub(crate) async fn run_backup(
 
     let progress = crate::api::backup::progress_sender(engine.event_bus.clone());
 
-    match backup::create_backup(workspace, database_url, key, provider, progress).await {
+    // Capture start/finish so the persisted terminal event + last_run record the
+    // run's duration (the durable backup history — see `BackupLastRun` /
+    // `load_recent_runs`).
+    let started_at = chrono::Utc::now();
+    let result = backup::create_backup(workspace, database_url, key, provider, progress).await;
+    let finished_at = chrono::Utc::now();
+
+    match result {
         Ok(entry) => {
             log!(
                 "[Backup] Completed: {} ({:.1} MB)",
@@ -64,7 +71,7 @@ pub(crate) async fn run_backup(
             // Persist outcome and clear the in-progress flag BEFORE the
             // terminal SSE so any status refetch triggered by the event
             // sees both running=false and the fresh last_run.
-            persist_last_run(pool, &backup::BackupLastRun::success(&entry)).await;
+            persist_last_run(pool, &backup::BackupLastRun::success(&entry, started_at)).await;
             drop(guard);
             engine
                 .event_bus
@@ -72,6 +79,8 @@ pub(crate) async fn run_backup(
                     BusEvent::System(SystemEvent::BackupCompleted {
                         filename: entry.filename.clone(),
                         size_bytes: entry.size_bytes,
+                        started_at,
+                        finished_at,
                     }),
                     "[Backup] BackupCompleted",
                 )
@@ -88,12 +97,16 @@ pub(crate) async fn run_backup(
         Err(e) => {
             let msg = e.to_string();
             log!("[Backup] Failed: {}", msg);
-            persist_last_run(pool, &backup::BackupLastRun::failure(&msg)).await;
+            persist_last_run(pool, &backup::BackupLastRun::failure(&msg, started_at)).await;
             drop(guard);
             engine
                 .event_bus
                 .emit_or_log(
-                    BusEvent::System(SystemEvent::BackupFailed { error: msg.clone() }),
+                    BusEvent::System(SystemEvent::BackupFailed {
+                        error: msg.clone(),
+                        started_at,
+                        finished_at,
+                    }),
                     "[Backup] BackupFailed",
                 )
                 .await;

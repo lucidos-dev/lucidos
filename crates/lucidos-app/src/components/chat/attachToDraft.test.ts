@@ -63,34 +63,30 @@ describe('splitDroppedFiles', () => {
     expect(split.skipped).toEqual([]);
   });
 
-  it('skips non-image files and records their names', () => {
-    const files = makeFakeFileList([
-      makeFakeFile('doc.pdf', 'application/pdf'),
-      makeFakeFile('notes.txt', 'text/plain'),
-    ]);
-    const split = splitDroppedFiles(files);
+  it('skips non-image files and keeps the File objects', () => {
+    const doc = makeFakeFile('doc.pdf', 'application/pdf');
+    const notes = makeFakeFile('notes.txt', 'text/plain');
+    const split = splitDroppedFiles(makeFakeFileList([doc, notes]));
     expect(split.images).toEqual([]);
     expect(split.plugins).toEqual([]);
-    expect(split.skipped).toEqual(['doc.pdf', 'notes.txt']);
+    expect(split.skipped).toEqual([doc, notes]);
   });
 
   it('handles a mix of image and non-image files', () => {
     const img = makeFakeFile('photo.png', 'image/png');
-    const files = makeFakeFileList([
-      img,
-      makeFakeFile('archive.zip', 'application/zip'),
-    ]);
-    const split = splitDroppedFiles(files);
+    const zip = makeFakeFile('archive.zip', 'application/zip');
+    const split = splitDroppedFiles(makeFakeFileList([img, zip]));
     expect(split.images).toEqual([img]);
     expect(split.plugins).toEqual([]);
-    expect(split.skipped).toEqual(['archive.zip']);
+    expect(split.skipped).toEqual([zip]);
   });
 
   it('treats files with no MIME type as non-image', () => {
-    const split = splitDroppedFiles(makeFakeFileList([makeFakeFile('mystery', '')]));
+    const mystery = makeFakeFile('mystery', '');
+    const split = splitDroppedFiles(makeFakeFileList([mystery]));
     expect(split.images).toEqual([]);
     expect(split.plugins).toEqual([]);
-    expect(split.skipped).toEqual(['mystery']);
+    expect(split.skipped).toEqual([mystery]);
   });
 
   it('classifies .lucidos-plugin files as plugins regardless of MIME', () => {
@@ -109,41 +105,63 @@ describe('splitDroppedFiles', () => {
     const split = splitDroppedFiles(makeFakeFileList([img, plug, other]));
     expect(split.images).toEqual([img]);
     expect(split.plugins).toEqual([plug]);
-    expect(split.skipped).toEqual(['notes.pdf']);
+    expect(split.skipped).toEqual([other]);
   });
 });
 
 describe('attachDroppedFilesToDraft', () => {
-  it('does not attach non-image files and shows a toast naming the file', async () => {
+  it('offers to import a single non-image file and imports it on confirm', async () => {
     const attachImage = vi.fn().mockResolvedValue(undefined);
     const installPlugin = vi.fn().mockResolvedValue(undefined);
+    const importFiles = vi.fn().mockResolvedValue(undefined);
+    const confirm = vi.fn().mockResolvedValue(true);
+    const pdf = makeFakeFile('report.pdf', 'application/pdf');
     await attachDroppedFilesToDraft(
-      makeFakeFileList([makeFakeFile('report.pdf', 'application/pdf')]),
+      makeFakeFileList([pdf]),
       attachImage,
       installPlugin,
+      importFiles,
+      confirm,
     );
     expect(attachImage).not.toHaveBeenCalled();
     expect(installPlugin).not.toHaveBeenCalled();
-    expect(toasts.value).toHaveLength(1);
-    expect(toasts.value[0].message).toContain('report.pdf');
-    expect(toasts.value[0].type).toBe('warning');
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(confirm.mock.calls[0][0]).toContain('report.pdf');
+    expect(importFiles).toHaveBeenCalledWith([pdf]);
+    // No warning toast — the confirm dialog replaces it.
+    expect(toasts.value).toEqual([]);
   });
 
-  it('shows a single aggregated toast when multiple non-image files are dropped', async () => {
-    const attachImage = vi.fn().mockResolvedValue(undefined);
-    const installPlugin = vi.fn().mockResolvedValue(undefined);
+  it('does not import when the user cancels the confirm', async () => {
+    const importFiles = vi.fn().mockResolvedValue(undefined);
+    const confirm = vi.fn().mockResolvedValue(false);
     await attachDroppedFilesToDraft(
-      makeFakeFileList([
-        makeFakeFile('a.pdf', 'application/pdf'),
-        makeFakeFile('b.zip', 'application/zip'),
-      ]),
-      attachImage,
-      installPlugin,
+      makeFakeFileList([makeFakeFile('report.pdf', 'application/pdf')]),
+      vi.fn().mockResolvedValue(undefined),
+      vi.fn().mockResolvedValue(undefined),
+      importFiles,
+      confirm,
     );
-    expect(attachImage).not.toHaveBeenCalled();
-    expect(installPlugin).not.toHaveBeenCalled();
-    expect(toasts.value).toHaveLength(1);
-    expect(toasts.value[0].message).toContain('2 non-image files');
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(importFiles).not.toHaveBeenCalled();
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('asks once with an aggregated message when multiple non-image files are dropped', async () => {
+    const importFiles = vi.fn().mockResolvedValue(undefined);
+    const confirm = vi.fn().mockResolvedValue(true);
+    const a = makeFakeFile('a.pdf', 'application/pdf');
+    const b = makeFakeFile('b.zip', 'application/zip');
+    await attachDroppedFilesToDraft(
+      makeFakeFileList([a, b]),
+      vi.fn().mockResolvedValue(undefined),
+      vi.fn().mockResolvedValue(undefined),
+      importFiles,
+      confirm,
+    );
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(confirm.mock.calls[0][0]).toContain('2 files');
+    expect(importFiles).toHaveBeenCalledWith([a, b]);
   });
 
   it('attaches image files via the supplied attacher', async () => {
@@ -163,40 +181,54 @@ describe('attachDroppedFilesToDraft', () => {
     expect(toasts.value).toEqual([]);
   });
 
-  it('attaches images and shows toast for skipped files in a mixed drop', async () => {
+  it('attaches images and offers to import skipped files in a mixed drop', async () => {
     const attachImage = vi.fn().mockResolvedValue(undefined);
     const installPlugin = vi.fn().mockResolvedValue(undefined);
+    const importFiles = vi.fn().mockResolvedValue(undefined);
+    const confirm = vi.fn().mockResolvedValue(true);
     const img = makeFakeFile('cat.png', 'image/png');
+    const pdf = makeFakeFile('notes.pdf', 'application/pdf');
     await attachDroppedFilesToDraft(
-      makeFakeFileList([img, makeFakeFile('notes.pdf', 'application/pdf')]),
+      makeFakeFileList([img, pdf]),
       attachImage,
       installPlugin,
+      importFiles,
+      confirm,
     );
     expect(attachImage).toHaveBeenCalledOnce();
     expect(attachImage).toHaveBeenCalledWith(img);
     expect(installPlugin).not.toHaveBeenCalled();
-    expect(toasts.value).toHaveLength(1);
-    expect(toasts.value[0].message).toContain('notes.pdf');
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(confirm.mock.calls[0][0]).toContain('notes.pdf');
+    expect(importFiles).toHaveBeenCalledWith([pdf]);
   });
 
   it('routes .lucidos-plugin drops to the install handler instead of skipping', async () => {
     const attachImage = vi.fn().mockResolvedValue(undefined);
     const installPlugin = vi.fn().mockResolvedValue(undefined);
+    const importFiles = vi.fn().mockResolvedValue(undefined);
+    const confirm = vi.fn().mockResolvedValue(true);
     const plug = makeFakeFile('thing-0.1.0.lucidos-plugin', 'application/octet-stream');
     await attachDroppedFilesToDraft(
       makeFakeFileList([plug]),
       attachImage,
       installPlugin,
+      importFiles,
+      confirm,
     );
     expect(attachImage).not.toHaveBeenCalled();
     expect(installPlugin).toHaveBeenCalledOnce();
     expect(installPlugin).toHaveBeenCalledWith(plug);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(importFiles).not.toHaveBeenCalled();
     expect(toasts.value).toEqual([]);
   });
 
   it('handles a mixed drop of image, plugin, and unsupported file', async () => {
     const attachImage = vi.fn().mockResolvedValue(undefined);
     const installPlugin = vi.fn().mockResolvedValue(undefined);
+    const importFiles = vi.fn().mockResolvedValue(undefined);
+    const confirm = vi.fn().mockResolvedValue(true);
     const img = makeFakeFile('cat.png', 'image/png');
     const plug = makeFakeFile('p.lucidos-plugin', '');
     const other = makeFakeFile('readme.txt', 'text/plain');
@@ -204,11 +236,14 @@ describe('attachDroppedFilesToDraft', () => {
       makeFakeFileList([img, plug, other]),
       attachImage,
       installPlugin,
+      importFiles,
+      confirm,
     );
     expect(attachImage).toHaveBeenCalledWith(img);
     expect(installPlugin).toHaveBeenCalledWith(plug);
-    expect(toasts.value).toHaveLength(1);
-    expect(toasts.value[0].message).toContain('readme.txt');
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(confirm.mock.calls[0][0]).toContain('readme.txt');
+    expect(importFiles).toHaveBeenCalledWith([other]);
   });
 });
 

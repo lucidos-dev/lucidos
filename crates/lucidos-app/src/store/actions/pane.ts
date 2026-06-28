@@ -70,6 +70,27 @@ export function revealContentPane() {
   if (splitRatio.value >= 1) setSplitRatio(DEFAULT_SPLIT_RATIO);
 }
 
+/** Mirror of `revealContentPane` for navigation that lands on a THREAD — an
+ *  existing thread (focusThread), the empty compose view (unfocusThread), or a
+ *  brand-new thread spawned from another pane (sendMessage's raw-new-thread
+ *  path, e.g. the new-app form in the content pane). Mobile: swipe to the thread
+ *  (conversation) pane so the focused thread/compose is visible. Desktop:
+ *  re-activate the Threads pane group (`focusedPane = 'thread'`) — but ONLY from
+ *  the cross-group case (arriving from the Content pane group), so an existing
+ *  'drawer'/'thread' focus is left alone and drawer ↑/↓ browsing isn't
+ *  disturbed. Signal-only on desktop (like `focusPane`): the first Tab pulls DOM
+ *  focus in via `handlePaneTab`, so focus is never yanked mid-navigation. Unlike
+ *  a raw `navigateToPane('thread')` this keeps the desktop half (focused pane
+ *  group) honest — the reason a bare mobile-gated navigate is wrong here, the
+ *  same way it is for content (see frontend.md). */
+export function revealThreadPane(): void {
+  if (isMobile()) {
+    navigateToPane('thread');
+  } else if (focusedPane.value === 'content') {
+    focusedPane.value = 'thread';
+  }
+}
+
 /** Move desktop pane focus. No-op on mobile, where panes are navigated, not
  *  focused. Called on a pointer-down inside a pane BODY (SplitLayout panes /
  *  thread drawer) and on CLICK inside a header region — the header doubles as the

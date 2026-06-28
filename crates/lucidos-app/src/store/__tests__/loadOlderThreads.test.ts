@@ -133,6 +133,38 @@ describe('loadOlderThreads', () => {
     );
   });
 
+  it('a failed archived thread participates in the archive cursor (no outlier skipping)', async () => {
+    // `get_recent_threads` no longer injects any archived row out of its
+    // created_at position (the actionable / proposed bypasses were removed), so a
+    // `failed` archived row in the map is a legitimate contiguous member of the
+    // Archive pile — it must drive the cursor like any other archived row, not be
+    // skipped. (Previously it was excluded to avoid an out-of-window outlier
+    // collapsing the cursor; with no outliers, skipping it would instead STALL
+    // pagination by leaving `before` at the recent row and re-fetching the same
+    // page.) The oldest loaded archived row (the failed one) is the cursor.
+    const oldFailed = makeOptimisticThreadState({
+      id: 'old-failed', title: 'Old failed', channel: 'chat', initiator: 'user',
+      eventsLoaded: false, timestamp: '2026-02-24T00:00:00Z',
+    });
+    oldFailed.meta.section = 'archived';
+    oldFailed.meta.createdAt = '2026-02-24T00:00:00Z';
+    oldFailed.meta.status = 'failed';
+    const recent = loaded(makeOptimisticThreadState({
+      id: 'recent', title: 'Recent archived', channel: 'chat', initiator: 'user',
+      eventsLoaded: false,
+    }), '2026-06-26T00:00:00Z');
+    recent.meta.section = 'archived';
+    threadMap.value = new Map([['old-failed', oldFailed], ['recent', recent]]);
+
+    await loadOlderThreads();
+
+    // Cursor is the OLDEST loaded archived thread — the failed one — so the next
+    // page continues chronologically below it, gap-free.
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      '2026-02-24T00:00:00Z', 15, undefined, undefined, undefined, undefined,
+    );
+  });
+
   it('a family-extension thread does not advance the cursor on the next page', async () => {
     // A trigger parent with a much-older child: the first pagination call
     // returns the parent's sibling (`base-1`) as a base thread plus the

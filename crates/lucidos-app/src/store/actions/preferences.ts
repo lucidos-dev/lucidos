@@ -9,7 +9,7 @@ import { isIOS, isTauri } from '../../utils/platform';
 import { setTitlebarColor } from '../../utils/tauri';
 
 export type Theme = 'light' | 'dark' | 'system';
-export type FontFamily = 'monospace' | 'system' | 'inter' | 'jetbrains-mono' | 'ibm-plex-mono';
+export type FontFamily = 'monospace' | 'system' | 'inter' | 'jetbrains-mono' | 'ibm-plex-mono' | 'fira-code';
 export type ImageModel = 'auto' | 'imagen-4' | 'gpt-image-1' | 'gpt-image-1.5' | 'gpt-image-2';
 
 export const UI_SCALE_MIN = 75;
@@ -27,12 +27,24 @@ const FONT_FAMILY_VALUES: Record<FontFamily, string> = {
   inter: "'Inter', system-ui, sans-serif",
   'jetbrains-mono': "'JetBrains Mono', monospace",
   'ibm-plex-mono': "'IBM Plex Mono', monospace",
+  'fira-code': "'Fira Code', monospace",
 };
 
 const GOOGLE_FONT_URLS: Partial<Record<FontFamily, string>> = {
   inter: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap',
   'jetbrains-mono': 'https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap',
   'ibm-plex-mono': 'https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap',
+  'fira-code': 'https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&display=swap',
+};
+
+// Programming ligatures, enabled ONLY for fonts that ship them and that the
+// user explicitly picked for them (Fira Code's signature feature: => != === ).
+// Every other font sets `normal` (the CSS initial), so their rendering is
+// unchanged. `font-feature-settings` is inherited, so setting it on <html>
+// cascades to all text — mirrored in the FOUC scripts (index.html,
+// api/sdk_prefs.rs) and the SDK (packages/lucidos-sdk/src/ui.ts).
+const FONT_FEATURES: Partial<Record<FontFamily, string>> = {
+  'fira-code': '"liga" 1, "calt" 1',
 };
 
 const loadedFonts = new Set<string>();
@@ -216,6 +228,10 @@ export function applyFontFamily(font: FontFamily): void {
   localStorage.setItem('lucidos-font-family', font);
   const value = FONT_FAMILY_VALUES[font] || FONT_FAMILY_VALUES.monospace;
   document.documentElement.style.setProperty('--font-ui', value);
+  document.documentElement.style.setProperty(
+    'font-feature-settings',
+    FONT_FEATURES[font] || 'normal',
+  );
 }
 
 export function currentFontFamily(): FontFamily {
@@ -273,6 +289,32 @@ export function setReasoningEffort(effort: string): Promise<void> {
   return savePreference('chat_reasoning_effort', effort, () => {
     reasoningEffort.value = effort;
   });
+}
+
+// --- Locale (language + timezone) ---
+//
+// Both are GLOBAL (workspace-wide, not device-scoped). Writing them goes through
+// PUT /preferences → the engine's apply_preference_write chokepoint, which
+// refreshes the engine's in-memory user_language/user_timezone and emits
+// LanguageSet/TimezoneSet — so the change takes effect with no restart, and the
+// frontend live-refreshes (thread-sync reloads preferences on those events).
+
+export function currentLanguage(): string {
+  if (preferences.value.status !== 'loaded') return '';
+  return preferences.value.data['language'] || '';
+}
+
+export function setLanguage(language: string): Promise<void> {
+  return savePreference('language', language.trim());
+}
+
+export function currentTimezone(): string {
+  if (preferences.value.status !== 'loaded') return '';
+  return preferences.value.data['timezone'] || '';
+}
+
+export function setTimezone(timezone: string): Promise<void> {
+  return savePreference('timezone', timezone);
 }
 
 // --- Load all preferences ---
@@ -343,6 +385,22 @@ export function currentCaptureContext(): boolean {
 
 export function setCaptureContext(enabled: boolean): Promise<void> {
   return savePreference('capture_context', enabled ? 'true' : 'false');
+}
+
+// --- Experimental: in-app browser (Tauri native webview) ---
+
+/** Whether URL previews open in the in-app native webview ("Tauri browser")
+ *  instead of the system browser. Experimental and desktop-only — the native
+ *  webview exists only under Tauri; web/PWA always opens a new tab. Defaults to
+ *  false (off): URLs open in the system browser unless the user opts in. Only an
+ *  explicit `'true'` enables the in-app webview. */
+export function currentInAppBrowser(): boolean {
+  if (preferences.value.status !== 'loaded') return false;
+  return preferences.value.data['experimental_in_app_browser'] === 'true';
+}
+
+export function setInAppBrowser(enabled: boolean): Promise<void> {
+  return savePreference('experimental_in_app_browser', enabled ? 'true' : 'false');
 }
 
 // --- Mobile header sticky ---

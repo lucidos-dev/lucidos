@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences } from '../store';
-import { applyTheme, applyFontFamily, applyUiScale, currentTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions } from './preferences';
+import { applyTheme, applyFontFamily, applyUiScale, currentTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser } from './preferences';
 import * as apiClient from '../../api/client';
 
 const platformMocks = vi.hoisted(() => ({ isIOS: false, isTauri: false }));
@@ -386,5 +386,44 @@ describe('welcomeSuggestionsDismissed — new-workspace welcome gate', () => {
     await dismissWelcomeSuggestions();
 
     expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+describe('currentInAppBrowser — experimental in-app browser, off by default', () => {
+  beforeEach(() => {
+    preferences.value = { status: 'not-loaded' };
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('is off while preferences are not loaded (fails safe to the system browser)', () => {
+    expect(currentInAppBrowser()).toBe(false);
+  });
+
+  it('is off on a loaded workspace with the preference unset', () => {
+    preferences.value = { status: 'loaded', data: {} };
+    expect(currentInAppBrowser()).toBe(false);
+  });
+
+  it('is on only when explicitly set to "true"', () => {
+    preferences.value = { status: 'loaded', data: { experimental_in_app_browser: 'true' } };
+    expect(currentInAppBrowser()).toBe(true);
+  });
+
+  it('treats any non-"true" value as off', () => {
+    preferences.value = { status: 'loaded', data: { experimental_in_app_browser: 'false' } };
+    expect(currentInAppBrowser()).toBe(false);
+  });
+
+  it('setInAppBrowser persists the boolean as a string preference', async () => {
+    preferences.value = { status: 'loaded', data: {} };
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue(undefined as never);
+
+    await setInAppBrowser(true);
+
+    expect(spy).toHaveBeenCalledWith('experimental_in_app_browser', 'true', undefined);
+    expect((preferences.value as { data: Record<string, string> }).data.experimental_in_app_browser).toBe('true');
   });
 });

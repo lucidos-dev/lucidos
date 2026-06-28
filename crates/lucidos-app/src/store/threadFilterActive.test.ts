@@ -116,13 +116,13 @@ describe('threadFilterActive', () => {
   });
 
   it('is true when the coding-agent channel is on and any app is selected', () => {
-    selectedAppIds.value = new Set(['momentum']);
+    selectedAppIds.value = new Set(['habit-tracker']);
     expect(threadFilterActive.value).toBe(true);
   });
 
   it('is true when both a repo and an app are selected under Coding Agent', () => {
     selectedRepoIds.value = new Set(['r1']);
-    selectedAppIds.value = new Set(['momentum']);
+    selectedAppIds.value = new Set(['habit-tracker']);
     expect(threadFilterActive.value).toBe(true);
   });
 

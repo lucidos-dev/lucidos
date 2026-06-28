@@ -9,7 +9,9 @@ import { rememberLastWorkspace } from './utils/lastWorkspace';
 import { updateAvailable } from './store/store';
 import { installActionBtnBlurListener } from './components/chat/promptFocus';
 import { installNoAutofill } from './utils/noAutofill';
+import { installNoDrag } from './utils/noDrag';
 import { isTouchDevice } from './utils/viewport';
+import { isIOSPwa } from './utils/platform';
 import { openAppById } from './store/actions/apps';
 import { startPerfProbe } from './utils/perfProbe';
 import './styles/global.css';
@@ -32,11 +34,23 @@ if (isTouchDevice()) {
   document.body.classList.add('is-touch');
 }
 
+// iPhone OLED panels emit saturated deep blues with a violet tint, so the
+// blue header chrome reads slightly purple in the iOS PWA while looking correct
+// on desktop. Tag the root so base.css can nudge the dark-mode brand blues
+// toward cyan for this context only — desktop/Android stay pixel-identical.
+if (isIOSPwa()) {
+  document.documentElement.classList.add('ios-pwa');
+}
+
 installActionBtnBlurListener();
 // Suppress WebKit's saved-value autofill dropdown (+ its white→dark flash) and
 // autocorrect/autocapitalize on every text field — App and Picker both. See
 // utils/noAutofill.ts.
 installNoAutofill();
+// Tauri desktop only: stop WebKit's native content drag (the green-"+" copy
+// badge + translucent text/image ghost) that otherwise flashes while dragging
+// the window by the header. See utils/noDrag.ts. No-op off Tauri.
+installNoDrag();
 
 // E2E test hook — Playwright opens an app by id from `page.evaluate`. The
 // real `openApp(app: App)` requires an `App` object that the test doesn't

@@ -1,5 +1,5 @@
 import { test, expect, Page } from './fixtures';
-import { navigateToApp, assertHealthy, clickVisibleElement, isMobileViewport } from './helpers';
+import { navigateToApp, assertHealthy, waitForEventStream } from './helpers';
 
 /** Thread Queue panel end-to-end: hold all background admission via the
  *  capacity policy (`max_concurrent_total: 0`), fire an event trigger so a
@@ -10,26 +10,19 @@ import { navigateToApp, assertHealthy, clickVisibleElement, isMobileViewport } f
 const PROBE_EVENT = 'E2eThreadQueueProbe';
 const TRIGGER_NAME = 'E2E thread-queue probe';
 
-/** Navigate to the Thread Queue panel via the nav drawer (same dance as
- *  openTriggersPanel in trigger-side-effects.spec.ts — drawer is hidden on
- *  both layouts; on mobile swipe to the content pane first). */
+/** Navigate to the Thread Queue panel. Thread Queue moved under Settings →
+ *  System (8c7818a10), so it's no longer a top-level drawer item; deep-link to
+ *  it via the stable `thread-queue` NavigateTarget — the engine emits
+ *  NavigationRequested over SSE and the page's handleNavigationRequest lands on
+ *  Settings → System → Thread Queue (revealing the content pane on mobile too).
+ *  Same SSE-delivered path as settings-backup-navigation-desktop.spec.ts. */
 async function openThreadQueuePanel(page: Page): Promise<void> {
-  if (isMobileViewport(page)) {
-    await page.evaluate(() => {
-      const dot = document.querySelector('button.mobile-dot[aria-label="content view"]');
-      if (dot) (dot as HTMLElement).click();
-    });
-    await page.waitForTimeout(300);
-  }
-  await clickVisibleElement(page, '.hamburger-panel');
-  await page.waitForFunction(() => {
-    const items = document.querySelectorAll('.drawer-item');
-    return Array.from(items).some(el => {
-      const rect = el.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0;
-    });
-  }, undefined, { timeout: 5_000 });
-  await clickVisibleElement(page, '.drawer-item', 'Thread Queue');
+  await waitForEventStream(page);
+  const res = await page.request.post('/api/v1/ui/navigate', {
+    headers: { 'content-type': 'application/json' },
+    data: { target: 'thread-queue' },
+  });
+  expect(res.ok(), `POST /api/v1/ui/navigate -> ${res.status()}`).toBeTruthy();
   // Section headers render only once the queue state has loaded.
   await expect(page.locator('.thread-queue-section-title').first()).toBeVisible({
     timeout: 10_000,

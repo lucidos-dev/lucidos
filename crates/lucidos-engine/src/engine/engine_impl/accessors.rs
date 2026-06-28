@@ -217,6 +217,14 @@ impl LucidosEngine {
         &self.pool
     }
 
+    /// The user's IANA timezone (e.g. "Europe/Oslo"), loaded at construction
+    /// from the `timezone` preference and refreshed by the `Timezone` preference
+    /// side-effect. Empty when unset. Read by the scheduler to register the
+    /// backup cron in the user's timezone (the same way triggers schedule).
+    pub(crate) async fn user_timezone(&self) -> String {
+        self.user_timezone.read().await.clone()
+    }
+
     /// Record that `(repo_root, branch_name)` has been hardened at `head_sha`.
     /// Called by the `/api/v1/internal/mark-hardened` endpoint that the
     /// `mark-harden.sh` hook hits via `lucidos hardened mark`.

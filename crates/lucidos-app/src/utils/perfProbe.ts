@@ -9,7 +9,7 @@
  *  - Long tasks: fallback duration when LoAF is unavailable.
  *
  * Quiet by default — only logs at/above the thresholds, so a snappy workspace
- * (e.g. personal) stays silent. No `import.meta.env.DEV` gate: `web-dev.sh`
+ * stays silent. No `import.meta.env.DEV` gate: `web-dev.sh`
  * serves a production-style `vite build` where DEV is false. REMOVE once the
  * cause is found.
  */

@@ -87,6 +87,11 @@ pub(super) fn extract_to(tmp: &Path, archive: &Path) -> PathBuf {
 pub(super) fn fresh_workspace() -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!("lucidos_plugins_int_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(p.join("data")).unwrap();
+    // Production workspaces are git repos rooted at the workspace dir (the
+    // ArtifactManager opens/inits one), and plugin install now commits the
+    // files it writes into `data/`. Init a repo here so the writer's commit
+    // step has somewhere to land — matching the real workspace layout.
+    git2::Repository::init(&p).unwrap();
     p
 }
 

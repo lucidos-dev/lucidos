@@ -1,15 +1,11 @@
-/** Diagnostic-only telemetry to detect iOS WKWebView content-process crashes
- *  that don't fire pagehide/beforeunload. Writes a heartbeat to localStorage
- *  every few seconds while visible; on startup, computes how long the prior
- *  page was actually dead by anchoring on `performance.timeOrigin` (the new
- *  navigation's start time) rather than `Date.now()` — that strips out the
- *  ~10–20s cold-reload cost on iOS PWA, which would otherwise bury every
- *  mid-use kill above the 7s crash threshold and mislabel it as `bg_resume`.
+/** iOS-PWA liveness diagnostic — heartbeat + startup classification + uncaught-error
+ *  breadcrumbs that detect iOS WKWebView content-process crashes (which don't fire
+ *  pagehide/beforeunload). Reads as engine.log `[Client/lifecycle]` / `[Client/error]`
+ *  lines; grep `"kind":"likely_crash"` to count crash recoveries.
  *
- *  Reads as engine.log lines: `[Client/lifecycle] startup {...}`. Grep for
- *  `"kind":"likely_crash"` to count crash recoveries.
- *
- *  TODO: remove after the iOS-PWA blackout investigation is closed. */
+ *  TEMPORARY MEASURE — pure telemetry, removable once the cause is fixed. Tracked in
+ *  docs/temporary-measures.md → "iOS-PWA liveness diagnostic" (parent investigation
+ *  `ios-pwa-blackout`), which carries the concrete removal condition. */
 
 import { focusedThreadId } from '../store/store';
 import { composeDrafts } from '../store/composeDrafts';

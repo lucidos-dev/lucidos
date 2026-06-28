@@ -89,9 +89,17 @@ interface Props {
   threadAwaitingAnswer: boolean;
   /** Lifted from `cancelingThreadIds.value.has(threadId)`. */
   threadCanceling: boolean;
+  /** First line of the in-thread `ChangeProposed` description + its file count
+   *  for this exchange's change_id (built once per thread in `renderExchanges`).
+   *  Seeds <ChangeBody> so a change-lifecycle panel paints at its final height
+   *  on first open, before the per-id `Change` lazy-fetch lands — fixing the
+   *  open-path jump. Undefined for non-change exchanges (and when no matching
+   *  ChangeProposed rode the thread). Primitives, so the memo stays cheap. */
+  proposedChangeDesc?: string;
+  proposedChangeFileCount?: number;
 }
 
-function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, imageOffset = 0, priorModel, priorEffort, isUnresumedAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling }: Props) {
+function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, imageOffset = 0, priorModel, priorEffort, isUnresumedAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, proposedChangeDesc, proposedChangeFileCount }: Props) {
   const rootRef = useRef<HTMLDivElement>(null);
   const showDetails = detailsExpanded.value;
   const showSteps = stepsExpanded.value;
@@ -283,6 +291,24 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     return { visibleEvents: visible, collapsedFallbackText: fallback };
   }, [hasEvents, showDetails, showMoreToggle, events, responseHtmlCombined]);
 
+  // Sections (split on section_break) tagged with each section's base index in
+  // visibleEvents, so `renderResponseEvents` can key rows by a stable index even
+  // when the list grows during streaming. `splitEventSections` drops the break
+  // markers, so re-walk `visibleEvents` to recover each section's offset (the
+  // while-loop handles consecutive breaks). The whole exchange renders — the open
+  // cost is bounded at the LOAD layer (the snapshot tail window) instead, so a
+  // huge coding-agent turn only ever holds a tail of its events.
+  const renderedSections = useMemo(() => {
+    const sections = splitEventSections(visibleEvents);
+    let cursor = 0;
+    return sections.map((events) => {
+      while (cursor < visibleEvents.length && visibleEvents[cursor].type === 'section_break') cursor++;
+      const base = cursor;
+      cursor += events.length;
+      return { events, base };
+    });
+  }, [visibleEvents]);
+
   // Exactly one running-text shimmer at a time: if an in-progress step is
   // visible on screen, its own shimmer is the "live" affordance, so the
   // "Working" status label below drops to a plain, static label. Otherwise —
@@ -310,15 +336,18 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   );
 
   const responseHtmlLinkified = useMemo(
-    () => linkifyPaths(responseHtmlCombined, artifactPaths, apps),
-    [responseHtmlCombined, artifactPaths, apps],
+    // The streaming buffer's html changes every token — opt its linkify out of
+    // the LRU cache (mirrors renderMarkdown's cache:false for the same buffer
+    // above) so per-token html doesn't thrash the cache and evict stable entries.
+    () => linkifyPaths(responseHtmlCombined, artifactPaths, apps, { cache: !streamingBuffer }),
+    [responseHtmlCombined, artifactPaths, apps, streamingBuffer],
   );
 
   const responseTerminated = isTerminated(status) || exchange.questionOvertaken === true;
 
   const initiator = useMemo(
-    () => describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent),
-    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent],
+    () => describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount),
+    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount],
   );
   const canCollapseInitiator = !!initiator.summary || !!initiator.details;
   const isInitiatorCollapsed = canCollapseInitiator
@@ -381,21 +410,32 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     initiatorActions = changeActions(
       (exchange.userEvent as { change_id?: string }).change_id,
       exchange.userEvent.type === 'ChangeApplyFailed',
+      // ChangeApplied always resolves to at least a Revert button — reserve the
+      // footer row while the Change row loads so the buttons don't shift the
+      // panel down on first open (mirrors the body's ChangeProposed seed).
+      exchange.userEvent.type === 'ChangeApplied',
     );
   } else if (isAbortPanel && isUnresumedAbort) {
     initiatorActions = <ContinueButton threadId={threadId} />;
   }
   const executor = describeExecutor(threadIsCC, threadCodingAgent);
 
-  function renderResponseEvents(eventsList: ResponseEvent[]) {
+  function renderResponseEvents(eventsList: ResponseEvent[], baseIndex = 0) {
     return eventsList.map((evt, i) => {
+      // Key by ABSOLUTE index in visibleEvents (baseIndex + i), not the local
+      // per-section slice index: `splitEventSections` hands each section its base
+      // offset, so a row's key is stable across renders even as earlier sections
+      // grow during streaming — which keeps the visible rows stable instead of
+      // re-rendering the whole tail (and re-setting every
+      // `dangerouslySetInnerHTML`) on each streamed event.
+      const k = baseIndex + i;
       if (evt.type === 'text' && evt.md?.trim()) {
-        return <div key={`t${i}`} dangerouslySetInnerHTML={{ __html: visibleTextHtmls.get(evt)! }} />;
+        return <div key={`t${k}`} dangerouslySetInnerHTML={{ __html: visibleTextHtmls.get(evt)! }} />;
       }
-      if (evt.type === 'step' && showSteps) return <InlineStep key={`s${i}`} event={evt} />;
-      if (evt.type === 'image') return <GeneratedImage key={`img${i}`} event={evt} />;
-      if (evt.type === 'checkpoint') return <CheckpointCard key={`cp${i}`} event={evt} />;
-      if (evt.type === 'empty') return <div key={`e${i}`} class="response-empty-note">{'The model returned an empty response.'}</div>;
+      if (evt.type === 'step' && showSteps) return <InlineStep key={`s${k}`} event={evt} />;
+      if (evt.type === 'image') return <GeneratedImage key={`img${k}`} event={evt} />;
+      if (evt.type === 'checkpoint') return <CheckpointCard key={`cp${k}`} event={evt} />;
+      if (evt.type === 'empty') return <div key={`e${k}`} class="response-empty-note">{'The model returned an empty response.'}</div>;
       return null;
     });
   }
@@ -453,10 +493,10 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
             : undefined}
         >
           {hasEvents && hasSections ? (
-            splitEventSections(visibleEvents).map((section, sIdx) => (
-              <div class="response-content markdown-content" key={`sec${sIdx}`} onClick={handleLinkClick}>
+            renderedSections.map(({ events: section, base }, sIdx) => (
+              <div class="response-content markdown-content" key={`sec-${base}`} onClick={handleLinkClick}>
                 {sIdx === 0 && renderToggles()}
-                {renderResponseEvents(section)}
+                {renderResponseEvents(section, base)}
               </div>
             ))
           ) : (
@@ -530,6 +570,8 @@ function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.threadIdle !== next.threadIdle) return false;
   if (prev.threadAwaitingAnswer !== next.threadAwaitingAnswer) return false;
   if (prev.threadCanceling !== next.threadCanceling) return false;
+  if (prev.proposedChangeDesc !== next.proposedChangeDesc) return false;
+  if (prev.proposedChangeFileCount !== next.proposedChangeFileCount) return false;
   const a = prev.exchange;
   const b = next.exchange;
   if (a.userSeq !== b.userSeq) return false;
@@ -725,6 +767,11 @@ export function describeInitiator(
    *  dividers. */
   threadIsCC: boolean = false,
   threadCodingAgent: CodingAgent = 'claude-code',
+  /** First line of the in-thread `ChangeProposed` description + its file count,
+   *  forwarded to <ChangeBody> for the change-lifecycle arms so the body paints
+   *  at full height on first open (before the per-id Change fetch lands). */
+  proposedChangeDesc?: string,
+  proposedChangeFileCount?: number,
 ): InitiatorDescriptor {
   const ev = exchange.userEvent;
   const summary = initiatorSummary(ev);
@@ -793,14 +840,14 @@ export function describeInitiator(
         variant: 'system', accent: changeAccent(ev.type),
         ...actorInitiator(ev.actor),
         summary,
-        details: <ChangeBody changeId={ev.change_id} />,
+        details: <ChangeBody changeId={ev.change_id} seedDescription={proposedChangeDesc} seedFileCount={proposedChangeFileCount} />,
       };
     case 'ChangeApplyFailed':
       return {
         variant: 'system', accent: 'change-failed',
         ...actorInitiator(ev.actor),
         summary,
-        details: <ChangeBody changeId={ev.change_id} error={ev.error} />,
+        details: <ChangeBody changeId={ev.change_id} error={ev.error} seedDescription={proposedChangeDesc} seedFileCount={proposedChangeFileCount} />,
       };
     case 'UserPromptInjected':
       // Legacy rows lack `origin` and fall back to the engine label. A

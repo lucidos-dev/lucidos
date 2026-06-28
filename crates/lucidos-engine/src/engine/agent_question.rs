@@ -793,6 +793,15 @@ pub async fn answer_pending_question(
     emit_resume_marker_for_cc_answer(&engine.event_bus, thread_id, &answer, actor.clone(), coding_agent)
         .await;
 
+    // Arm the run-loop resume signal on a live subprocess BEFORE waking its hook.
+    // The answer reaches CC through the PreToolUse hook (notify below), not via
+    // `msg_tx`, so it never hits the `msg_rx` arm's `reset_per_turn_flags` — the
+    // only place the run loop clears `emitted_terminal_event`. Without this the
+    // continued turn's output is dropped as "post-terminal stragglers" (see
+    // `AgentSession::question_resume_pending`). Set before notify so the flag is
+    // visible before CC's first post-answer event reaches the loop.
+    arm_question_resume_if_live(&engine.agent_sessions, thread_id, &answer).await;
+
     // Wake the blocked hook (if any). No-op if nothing is registered:
     // - Engine restart killed the hook; on resume the endpoint's crash-recovery
     //   path reads the just-persisted UserQuestionAnswered from the DB instead.
@@ -929,6 +938,39 @@ async fn ensure_resume_after_answer(
     )
     .await;
     true
+}
+
+/// Arm the run-loop resume signal on a *live* coding-agent subprocess so the turn
+/// it continues after a question answer re-arms event emission. The answer is
+/// delivered to CC via its PreToolUse hook (`notify_and_release_waiter`), not via
+/// `msg_tx`, so it never reaches the `msg_rx` arm's `reset_per_turn_flags` — the
+/// only place the run loop clears `emitted_terminal_event`. Setting
+/// `question_resume_pending` lets the loop self-heal: it reads-and-clears the flag
+/// on the per-event lock it already takes and, if the turn was terminal-armed,
+/// resets the per-turn flags before matching CC's first post-answer event instead
+/// of dropping it as a "post-terminal straggler".
+///
+/// Must run BEFORE `notify_and_release_waiter` so the flag is visible before CC
+/// resumes. No-op for `AnswerKind::Canceled` (the thread is being torn down) and
+/// for a dead/absent subprocess (that path spawns a fresh `--resume` turn via
+/// `ensure_resume_after_answer`, whose new run loop starts with clean flags).
+/// Returns whether a live subprocess was armed.
+async fn arm_question_resume_if_live(
+    agent_sessions: &Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
+    thread_id: Uuid,
+    answer: &AnswerKind,
+) -> bool {
+    if matches!(answer, AnswerKind::Canceled) {
+        return false;
+    }
+    let mut sessions = agent_sessions.lock().await;
+    match sessions.get_mut(&thread_id) {
+        Some(s) if !s.process_exited => {
+            s.question_resume_pending = true;
+            true
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]

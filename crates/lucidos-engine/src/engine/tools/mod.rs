@@ -5,12 +5,16 @@ mod browser;
 mod bulk_limits;
 pub(crate) mod credentials;
 mod email;
+mod env_vars;
 pub(crate) mod files;
+mod grouped;
 mod http;
 pub(crate) mod image;
 mod import;
 mod mcp;
 mod memory;
+mod models;
+mod notifications;
 pub(crate) mod plugins;
 mod preferences;
 mod proxy;
@@ -71,6 +75,22 @@ impl LucidosEngine {
         cancel_token: &tokio_util::sync::CancellationToken,
         thread_id: uuid::Uuid,
     ) -> ToolOutcome {
+        // Phase 5 grouped manifest tools delegate to their flat-alias handlers:
+        // resolve `action` to the legacy flat tool name (validated against the
+        // capability parity manifest) and fall through to that name's arm below.
+        // The flat arms stay wired as back-compat aliases for cached prompts /
+        // in-flight threads. Domains with bespoke handling (notifications /
+        // preferences / triggers / trigger_groups) keep their own arms below.
+        let name: &str = match name {
+            tn::MCP
+            | tn::PLUGINS
+            | tn::EVENTS
+            | tn::CHANGES
+            | tn::THREADS
+            | tn::THREAD_QUEUE
+            | tn::MEMORY => grouped::grouped_legacy_name(name, args)?,
+            other => other,
+        };
         match name {
             tn::READ_FILE
             | tn::WRITE_FILE
@@ -104,6 +124,14 @@ impl LucidosEngine {
             tn::IMPORT_FILE | tn::GIT_CLONE => {
                 to_outcome(self.execute_import_tool(name, args, extraction_ctx).await)
             }
+            // Grouped manifest tools (consolidated surface the model sees).
+            tn::TRIGGERS | tn::TRIGGER_GROUPS => {
+                self.execute_scheduler_grouped(name, args).await
+            }
+            tn::PREFERENCES => self.execute_preferences_grouped(args, device_id).await,
+            // Flat per-verb names: back-compat aliases that still dispatch to the
+            // same handlers (consolidated into the grouped tools above, but kept
+            // so cached prompts/in-flight threads don't break).
             tn::CREATE_TRIGGER
             | tn::LIST_TRIGGERS
             | tn::UPDATE_TRIGGER
@@ -115,12 +143,16 @@ impl LucidosEngine {
             | tn::RENAME_TRIGGER_GROUP
             | tn::REORDER_TRIGGER_GROUPS
             | tn::DELETE_TRIGGER_GROUP => to_outcome(self.execute_scheduler_tool(name, args).await),
-            tn::SET_LANGUAGE | tn::SET_TIMEZONE | tn::ENABLE_PUSH_NOTIFICATIONS => {
+            tn::SET_PREFERENCE | tn::GET_PREFERENCES => {
                 to_outcome(self.execute_preferences_tool(name, args, device_id).await)
             }
-            tn::SET_ENVIRONMENT_VARIABLE => {
-                to_outcome(self.execute_environment_variable_tool(args).await)
+            tn::GET_BACKUP_STATUS => to_outcome(self.execute_get_backup_status().await),
+            // Grouped env-var tool (list/set/delete). `set_environment_variable`
+            // stays wired as a back-compat alias → dispatched as action "set".
+            tn::ENV_VARS | tn::SET_ENVIRONMENT_VARIABLE => {
+                self.execute_env_vars(name, args).await
             }
+            tn::MANAGE_MODELS => to_outcome(self.execute_manage_models(args).await),
             tn::WEB_SEARCH | tn::FETCH_NEWS => to_outcome(self.execute_web_tool(name, args).await),
             tn::REQUEST_CREDENTIAL | tn::CONNECT_OAUTH_ACCOUNT => {
                 to_outcome(self.execute_credential_tool(name, args).await)
@@ -156,9 +188,11 @@ impl LucidosEngine {
                 to_outcome(self.execute_save_thread_image(args, thread_id).await)
             }
             tn::VIEW_IMAGE => to_outcome(self.execute_view_image(args, thread_id).await),
-            tn::NAVIGATE_UI => self.execute_navigate_ui(args, thread_id).await,
+            tn::NAVIGATE_UI => self.execute_navigate_ui(args, thread_id, device_id).await,
             tn::SEND_NOTIFICATION => self.execute_send_notification(args, thread_id).await,
-            tn::READ_NOTIFICATIONS => self.execute_read_notifications(args).await,
+            tn::NOTIFICATIONS | tn::READ_NOTIFICATIONS => {
+                self.execute_notifications(name, args).await
+            }
             tn::EMIT_EVENT => self.execute_emit_event(args).await,
             tn::QUERY_EVENTS => self.execute_query_events(args).await,
             tn::COUNT_EVENTS => self.execute_count_events(args).await,
@@ -212,18 +246,38 @@ impl LucidosEngine {
         &self,
         args: &serde_json::Value,
         thread_id: uuid::Uuid,
+        device_id: Option<&str>,
     ) -> ToolOutcome {
         let target = match args.get("target").and_then(|v| v.as_str()) {
             Some(t) if !t.is_empty() => t,
             _ => return Err("Error: target is required".to_string()),
         };
         log!(
-            "[Navigate] navigate_ui thread={} target={} app_id={:?} id={:?}",
+            "[Navigate] navigate_ui thread={} target={} app_id={:?} id={:?} device={:?}",
             thread_id,
             target,
             args.get("app_id").and_then(|v| v.as_str()),
-            args.get("id").and_then(|v| v.as_str())
+            args.get("id").and_then(|v| v.as_str()),
+            device_id
         );
+        // Stamp the originating device (the device that sent the prompt that
+        // triggered this turn) so the frontend can scope the navigate to it —
+        // an agent navigate must act only on the device the thread is being used
+        // from, not every device viewing the thread. A turn with no device
+        // (trigger / scheduled / background) leaves the actor None, so the
+        // frontend falls back to its focused-thread / offer behavior.
+        let actor = match device_id {
+            Some(did) => {
+                let label = crate::core::DeviceStore::display_name(&self.pool, did)
+                    .await
+                    .unwrap_or_else(|| crate::core::devices::resolve_device_name(None, did));
+                Some(crate::engine::thread_events::MessageOrigin::Device {
+                    device_id: did.to_string(),
+                    label,
+                })
+            }
+            None => None,
+        };
         if let Err(e) = self
             .event_bus
             .emit(crate::engine::event_bus::BusEvent::Thread {
@@ -231,7 +285,7 @@ impl LucidosEngine {
                 event: crate::engine::thread_events::ThreadEvent::NavigationRequested {
                     payload: serde_json::to_string(args).unwrap_or_default(),
                 },
-                meta: crate::engine::thread_events::EventMeta::NONE,
+                meta: crate::engine::thread_events::EventMeta::with_actor(actor),
             })
             .await
         {
@@ -240,6 +294,16 @@ impl LucidosEngine {
 
         // Return contextual help so the LLM knows what the UI offers
         let settings_view = args.get("settings_view").and_then(|v| v.as_str());
+        if target == "settings" && settings_view == Some("models") {
+            return Ok("Navigated to Settings → Models. The UI shows:\n\
+                - The active Chat & Triggers model (the model picker) and reasoning effort\n\
+                - Image generation and background-task models (title, image description, memory)\n\
+                - Providers (Anthropic, OpenAI, OpenRouter, local) and the model registry\n\
+                Tell the user they can change the active model from the picker here. To switch \
+                it for them instead, use set_preference(key='chat_model'); to add a model to the \
+                picker, use manage_models."
+                .to_string());
+        }
         if target == "settings" && settings_view == Some("backup") {
             return Ok("Navigated to Backup & Restore settings. The UI shows:\n\
                 - Connected backup providers (e.g. Google Drive)\n\
@@ -440,48 +504,6 @@ impl LucidosEngine {
         });
 
         Ok(notification_id)
-    }
-
-    async fn execute_read_notifications(&self, args: &serde_json::Value) -> ToolOutcome {
-        let filter = args
-            .get("filter")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unread");
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(20)
-            .clamp(1, 50);
-
-        let notifications = match crate::scheduler::NotificationStore::get_filtered(
-            &self.pool, filter, limit, None,
-        )
-        .await
-        {
-            Ok(n) => n,
-            Err(e) => return Err(format!("Error: failed to read notifications: {}", e)),
-        };
-
-        if notifications.is_empty() {
-            return Ok(format!("No {} notifications.", filter));
-        }
-
-        let items: Vec<serde_json::Value> = notifications
-            .iter()
-            .map(|n| {
-                serde_json::json!({
-                    "id": n.id.to_string(),
-                    "title": n.title,
-                    "message": n.message,
-                    "read": n.read,
-                    "created_at": n.created_at.to_rfc3339(),
-                    "task_id": n.task_id.map(|id| id.to_string()),
-                })
-            })
-            .collect();
-
-        serde_json::to_string_pretty(&items)
-            .map_err(|e| format!("Error: failed to serialise notifications: {}", e))
     }
 
     async fn execute_emit_event(&self, args: &serde_json::Value) -> ToolOutcome {

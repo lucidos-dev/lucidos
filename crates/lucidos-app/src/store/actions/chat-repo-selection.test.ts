@@ -154,13 +154,13 @@ describe('sendMessage scope selection (regression: dropdown ignored)', () => {
   });
 
   it('new CC thread with app scope sends folder=data/apps/<id>', async () => {
-    selectedScope.value = { kind: 'app', appId: 'momentum' };
+    selectedScope.value = { kind: 'app', appId: 'habit-tracker' };
 
     await sendMessage('fix the chart bug', undefined, { useCodingAgent: true });
 
     const body = lastBody();
     expect(body.use_coding_agent).toBe(true);
-    expect(body.folder).toBe('data/apps/momentum');
+    expect(body.folder).toBe('data/apps/habit-tracker');
     expect(body.repo_id).toBeUndefined();
   });
 
@@ -200,7 +200,7 @@ describe('sendMessage scope selection (regression: dropdown ignored)', () => {
       channel: 'claude_code',
       messageCount: 1,
       codingAgentKind: 'app',
-      codingAgentFolder: '/some/workspace/data/apps/momentum',
+      codingAgentFolder: '/some/workspace/data/apps/habit-tracker',
     });
     selectedScope.value = { kind: 'lucidos' };
 
@@ -208,7 +208,7 @@ describe('sendMessage scope selection (regression: dropdown ignored)', () => {
 
     const body = lastBody();
     expect(body.use_coding_agent).toBe(true);
-    expect(body.folder).toBe('data/apps/momentum');
+    expect(body.folder).toBe('data/apps/habit-tracker');
     expect(body.repo_id).toBeUndefined();
   });
 });
@@ -236,13 +236,13 @@ describe('sendCompose carries dropdown scope through to chat body (real flow)', 
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'claude_code' });
     setDraft(draftId, { text: 'fix it', image_hashes: [], mode: 'claude_code' });
-    selectedScope.value = { kind: 'app', appId: 'momentum' };
+    selectedScope.value = { kind: 'app', appId: 'habit-tracker' };
 
     await sendCompose(draftId, { useCodingAgent: true });
 
     const body = lastBody();
     expect(body.use_coding_agent).toBe(true);
-    expect(body.folder).toBe('data/apps/momentum');
+    expect(body.folder).toBe('data/apps/habit-tracker');
     expect(body.repo_id).toBeUndefined();
   });
 

@@ -22,16 +22,23 @@ export function openPluginUninstallRequest(request: PluginUninstallRequest): voi
   revealContentPane();
 }
 
-/** App Store "Uninstall" button. Stages the uninstall from the UI (the same
- *  confirm panel the `uninstall_plugin` LLM tool produces) and opens it. The
- *  panel's Confirm deletes the recorded files; nothing is touched until then. */
-export async function uninstallMarketplacePlugin(plugin: MarketplacePlugin): Promise<void> {
+/** Stage a plugin uninstall by id and open the confirm panel — the same
+ *  confirm panel the `uninstall_plugin` LLM tool produces. The panel's Confirm
+ *  deletes the recorded files (and auto-deletes the plugin's triggers); nothing
+ *  is touched until then. Shared by the Store card and the Plugins → Installed
+ *  row, which hold different shapes but only need the plugin id. */
+export async function uninstallPluginById(id: string): Promise<void> {
   try {
-    const request = await stagePluginUninstall(plugin.id);
+    const request = await stagePluginUninstall(id);
     openPluginUninstallRequest(request);
   } catch (e) {
     showToast(`Failed to stage plugin uninstall: ${errorDetail(e)}`, 'error');
   }
+}
+
+/** Store "Uninstall" button. */
+export function uninstallMarketplacePlugin(plugin: MarketplacePlugin): Promise<void> {
+  return uninstallPluginById(plugin.id);
 }
 
 /** User clicked Confirm — engine deletes the recorded files from `data/`,

@@ -4,7 +4,7 @@ Commit and push all changes in the lucidos repo. Follow these steps exactly:
 
 2. **Check for unpushed commits**: Run `git log @{u}..HEAD --oneline` to see if there are commits that haven't been pushed yet. These may be from other sessions.
 
-3. **Workspace changes check**: If any changed files are under a workspace directory (e.g., `~/workspaces/test/`, `~/workspaces/personal/`, or any path containing `/workspaces/`), ALERT the user about them but do NOT stage or commit them. List the workspace files and say "Workspace changes detected — not committed."
+3. **Workspace changes check**: If any changed files are under a workspace directory (e.g., `~/workspaces/test/`, `~/workspaces/myws/`, or any path containing `/workspaces/`), ALERT the user about them but do NOT stage or commit them. List the workspace files and say "Workspace changes detected — not committed."
 
 4. **Other sessions check**: If on the main working tree (not a worktree), run `pgrep -af 'claude'` to check for other Claude processes. If other sessions are running, STOP and warn:
    - "⚠️ Other Claude sessions are active. Uncommitted changes may belong to another session's in-progress work."

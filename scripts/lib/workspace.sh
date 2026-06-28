@@ -57,7 +57,7 @@ parse_dev_args() {
                 echo ""
                 echo "Examples:"
                 echo "  $SCRIPT_NAME -w dev               # ~/workspaces/dev"
-                echo "  $SCRIPT_NAME -w personal -b       # ~/workspaces/personal, build first"
+                echo "  $SCRIPT_NAME -w myws -b           # ~/workspaces/myws, build first"
                 echo "  $SCRIPT_NAME -w dev -f             # start and tail the engine log"
                 echo "  $SCRIPT_NAME -w /some/path -b -r  # absolute path, release build"
                 exit 0
@@ -73,7 +73,7 @@ parse_dev_args() {
         echo ""
         echo "Examples:"
         echo "  $SCRIPT_NAME -w dev"
-        echo "  $SCRIPT_NAME -w ~/workspaces/personal"
+        echo "  $SCRIPT_NAME -w ~/workspaces/myws"
         exit 1
     fi
 }
@@ -1674,6 +1674,17 @@ start_gateway() {
     # directly, in addition to `…:$GATEWAY_PORT/<slug>/` through the gateway
     # (ADR 0014 §4 — loopback-only is the packaged posture, not dev).
     export LUCIDOS_GATEWAY_ENGINE_LOOPBACK="0"
+    # …and the gateway itself binds all interfaces in dev — the sibling opt-in to
+    # the engine bind above. The gateway defaults to loopback-only (the packaged
+    # security posture; "deployments that intentionally front Lucidos on the
+    # network must opt in explicitly" — crates/lucidos-gateway/src/server.rs).
+    # Dev IS such a deployment: the engines are already all-interfaces and the
+    # user reaches the picker + `/<slug>/` routing from other devices (e.g. an
+    # iOS PWA over Tailscale). Without this opt-in a gateway rebuild+reload comes
+    # up on 127.0.0.1 only and the gateway is unreachable remotely. Packaged
+    # (desktop.rs::spawn_gateway, LUCIDOS_PACKAGED=1) does NOT run start_gateway,
+    # so it stays loopback-only.
+    export LUCIDOS_GATEWAY_BIND_ALL="1"
     # The gateway serves the picker from dist/ and passes LUCIDOS_STATIC_DIR
     # through to the engines it spawns so they serve dist/ too (set by swap_ports;
     # re-exported here for clarity).

@@ -76,6 +76,44 @@ fn drain_startup_failure_reason(
 }
 
 impl LucidosEngine {
+    /// Flush any reasoning accumulated in `buf` past `last_len` as a
+    /// `CodingAgentThoughtStreamed`, advancing `last_len`. Idempotent (emits only
+    /// the new tail; no-op when nothing new). Coalesces CC's per-token
+    /// `thinking_delta`s — and Codex's reasoning deltas — into a handful of rows
+    /// per turn, mirroring the assistant-text flush path. The buffer is sliced on
+    /// a char boundary so multi-byte reasoning never panics.
+    async fn flush_coding_agent_thought(
+        &self,
+        thread_id: Uuid,
+        buf: &str,
+        last_len: &mut usize,
+        coding_agent: crate::runtime::CodingAgent,
+        meta: &crate::engine::thread_events::EventMeta,
+    ) {
+        if buf.len() <= *last_len {
+            return;
+        }
+        let delta = &buf[buf.floor_char_boundary(*last_len)..];
+        if delta.is_empty() {
+            return;
+        }
+        self.event_bus
+            .emit_or_log(
+                crate::engine::event_bus::BusEvent::Thread {
+                    thread_id,
+                    event:
+                        crate::engine::thread_events::ThreadEvent::CodingAgentThoughtStreamed {
+                            text: delta.to_string(),
+                            coding_agent,
+                        },
+                    meta: meta.clone(),
+                },
+                "[AgentSession] CodingAgentThoughtStreamed",
+            )
+            .await;
+        *last_len = buf.len();
+    }
+
     // Bridges every per-session input (thread / user msg / images / origin /
     // cancel / recovery / repo / prompt / resume / CC model+effort + worktree)
     // to the agent runtime; a builder would just shuffle the same fields.
@@ -697,6 +735,7 @@ impl LucidosEngine {
                 current_model: normalized_model.clone(),
                 current_reasoning_effort: cc_reasoning_effort.clone(),
                 pending_followups: pending_followups.clone(),
+                question_resume_pending: false,
                 tools_in_flight: tools_in_flight_shared.clone(),
                 coding_agent,
             };
@@ -814,6 +853,14 @@ impl LucidosEngine {
         let mut result_texts: Vec<String> = Vec::new();
         let mut claude_text_buf = String::new();
         let mut last_text_persisted_len: usize = 0;
+        // Reasoning/thinking stream buffer (coalesced like the text buffer above).
+        // CC's `thinking_delta`s arrive per-token, so we flush on a paragraph
+        // boundary OR once `THOUGHT_FLUSH_THRESHOLD` chars accumulate — the latter
+        // bounds latency so a long unbroken reasoning paragraph still streams live
+        // (the frozen-"Working" bug) instead of landing only at turn end.
+        let mut claude_thought_buf = String::new();
+        let mut last_thought_persisted_len: usize = 0;
+        const THOUGHT_FLUSH_THRESHOLD: usize = 240;
         let mut is_waiting = false;
         let mut proposed_change = false;
         let mut emitted_terminal_event = false; // Track whether ResponseGenerated/ResponseCanceled was emitted
@@ -880,6 +927,16 @@ impl LucidosEngine {
                     };
                     if let AgentEvent::Exited { killed_by_signal: ev_killed_by_signal } = ev {
                         killed_by_signal = ev_killed_by_signal;
+                        // Final flush of any pending reasoning (process exited
+                        // mid-think — surface what it reasoned before dying).
+                        self.flush_coding_agent_thought(
+                            thread_id,
+                            &claude_thought_buf,
+                            &mut last_thought_persisted_len,
+                            coding_agent,
+                            &meta,
+                        )
+                        .await;
                         // Final flush of any pending text
                         if !claude_text_buf.is_empty() {
                             let delta = &claude_text_buf[claude_text_buf.floor_char_boundary(last_text_persisted_len)..];
@@ -957,12 +1014,44 @@ impl LucidosEngine {
                         );
                         break;
                     }
-                    // Stamp liveness — used by apply_now's timeout
-                    {
-                        let guard = self.agent_sessions.lock().await;
-                        if let Some(s) = guard.get(&thread_id) {
+                    // Stamp liveness — used by apply_now's timeout. Also drain the
+                    // question-answer resume signal in the SAME lock: a live
+                    // subprocess woken by an answered AskUserQuestion continues its
+                    // turn via the PreToolUse hook, never touching `msg_tx`, so the
+                    // run loop never hit `reset_per_turn_flags` (the only place
+                    // `emitted_terminal_event` clears). If the turn was
+                    // terminal-armed, re-arm emission below so CC's first
+                    // post-answer event is processed instead of dropped as a
+                    // "post-terminal straggler" (see `question_resume_pending`).
+                    let resume_after_answer = {
+                        let mut guard = self.agent_sessions.lock().await;
+                        if let Some(s) = guard.get_mut(&thread_id) {
                             s.last_event_at.store(now_epoch_millis(), std::sync::atomic::Ordering::Relaxed);
+                            let armed = std::mem::take(&mut s.question_resume_pending);
+                            let reset = armed && emitted_terminal_event;
+                            if reset {
+                                // Mirror the msg_rx arm's session-side clear.
+                                s.is_waiting = false;
+                            }
+                            reset
+                        } else {
+                            false
                         }
+                    };
+                    if resume_after_answer {
+                        log!(
+                            "[AgentSession] Question answered on a terminal-armed turn for thread {} — re-arming emission for the resumed turn",
+                            thread_id
+                        );
+                        reset_per_turn_flags(
+                            &mut is_waiting,
+                            &mut last_emitted_idle,
+                            &mut emitted_terminal_event,
+                            &mut user_hit_stop,
+                            &mut interrupt_is_redirect,
+                            &mut last_terminal_kind,
+                            &mut meta.actor,
+                        );
                     }
                     match ev {
                         AgentEvent::Init { session_id: cc_sid, model: init_model, slash_commands: cmds, skills } => {
@@ -1066,6 +1155,17 @@ impl LucidosEngine {
                                 let mut sessions = self.agent_sessions.lock().await;
                                 if let Some(s) = sessions.get_mut(&thread_id) { s.is_waiting = false; }
                             }
+                            // Reasoning precedes the answer — flush any pending
+                            // thought so the "Thinking" step resolves before the
+                            // text it was reasoning toward.
+                            self.flush_coding_agent_thought(
+                                thread_id,
+                                &claude_thought_buf,
+                                &mut last_thought_persisted_len,
+                                coding_agent,
+                                &meta,
+                            )
+                            .await;
                             claude_text_buf.push_str(&text);
                             // Persist + broadcast at natural boundaries
                             if should_flush(&claude_text_buf) {
@@ -1078,6 +1178,39 @@ impl LucidosEngine {
                                     }, "[AgentSession] CodingAgentTextStreamed (Message flush)").await;
                                     last_text_persisted_len = claude_text_buf.len();
                                 }
+                            }
+                        }
+                        // Reasoning/thinking stream. Same post-terminal straggler
+                        // guard as Message/ToolUse: CodingAgentThoughtStreamed is
+                        // per-token-streaming, and its projection arm bumps
+                        // status='running', so a thought arriving after the turn's
+                        // terminal event would resurrect an idled thread. Drop it.
+                        AgentEvent::Thought { .. } if emitted_terminal_event => {}
+                        AgentEvent::Thought { text } => {
+                            // A thought is the first sign of life on a resumed turn —
+                            // clear waiting state like Message/ToolUse do.
+                            if is_waiting {
+                                is_waiting = false;
+                                let mut sessions = self.agent_sessions.lock().await;
+                                if let Some(s) = sessions.get_mut(&thread_id) { s.is_waiting = false; }
+                            }
+                            claude_thought_buf.push_str(&text);
+                            // Flush on a paragraph boundary OR once enough has piled
+                            // up — the threshold bounds latency so a long unbroken
+                            // reasoning paragraph still streams live instead of
+                            // landing only at turn end (the frozen-"Working" bug).
+                            if should_flush(&claude_thought_buf)
+                                || claude_thought_buf.len() - last_thought_persisted_len
+                                    >= THOUGHT_FLUSH_THRESHOLD
+                            {
+                                self.flush_coding_agent_thought(
+                                    thread_id,
+                                    &claude_thought_buf,
+                                    &mut last_thought_persisted_len,
+                                    coding_agent,
+                                    &meta,
+                                )
+                                .await;
                             }
                         }
                         // Straggler guard (see the Message arm above): a tool call
@@ -1098,6 +1231,16 @@ impl LucidosEngine {
                                 let mut sessions = self.agent_sessions.lock().await;
                                 if let Some(s) = sessions.get_mut(&thread_id) { s.is_waiting = false; }
                             }
+                            // Interleaved-thinking turns reason right up to a tool
+                            // call — flush any pending thought before the tool step.
+                            self.flush_coding_agent_thought(
+                                thread_id,
+                                &claude_thought_buf,
+                                &mut last_thought_persisted_len,
+                                coding_agent,
+                                &meta,
+                            )
+                            .await;
                             {
                                 let delta = &claude_text_buf[claude_text_buf.floor_char_boundary(last_text_persisted_len)..];
                                 if !delta.is_empty() {
@@ -1262,6 +1405,17 @@ impl LucidosEngine {
                         AgentEvent::Result { text, error: cc_error, .. } => {
                                         let err_suffix = cc_error.as_deref().map(|e| format!(" (error: {})", e)).unwrap_or_default();
                                         log!("[AgentSession] Result event received — entering waiting state{}", err_suffix);
+                                        // Final flush of any pending reasoning (a turn
+                                        // that reasoned then ended without text/tools,
+                                        // or the tail below the coalescing threshold).
+                                        self.flush_coding_agent_thought(
+                                            thread_id,
+                                            &claude_thought_buf,
+                                            &mut last_thought_persisted_len,
+                                            coding_agent,
+                                            &meta,
+                                        )
+                                        .await;
                                         // Final flush of any pending text
                                         if !claude_text_buf.is_empty() {
                                             // The Result.text may contain text beyond what was
@@ -1423,6 +1577,8 @@ impl LucidosEngine {
                                         interrupt_escalate_at = None;
                                         claude_text_buf.clear();
                                         last_text_persisted_len = 0;
+                                        claude_thought_buf.clear();
+                                        last_thought_persisted_len = 0;
                                         // Auto-commit any dirty files before checking for changes.
                                         // CC may create/edit files via Bash without committing. Without
                                         // this, the three-dot diff below sees no committed changes and
@@ -1620,13 +1776,29 @@ impl LucidosEngine {
                                                 break 'event_loop;
                                             }
                                             IdleAction::ExitSubprocess => {
+                                                // Hold the `agent_sessions` lock across the whole
+                                                // read-decide-act so the chat fast-path's
+                                                // check-increment-send (`chat::process`, which
+                                                // takes the SAME lock) is mutually exclusive with
+                                                // this terminate decision. Without that serialization
+                                                // a follow-up could `fetch_add` + `msg_tx.send` into
+                                                // a subprocess this arm is about to cancel — the
+                                                // idle-termination race that silently drops the
+                                                // follow-up (the subprocess dies before producing a
+                                                // Result; see docs/plans/2026-06-27-cc-idle-
+                                                // termination-followup-race.md). No `.await` runs
+                                                // inside this section other than the lock acquire,
+                                                // and every operation (swap / decide / field set /
+                                                // notify / cancel / log) is sync, so holding the
+                                                // lock cannot deadlock.
+                                                let mut sessions = self.agent_sessions.lock().await;
                                                 // `swap(0)` resets per-Result (turn boundary).
                                                 // AcqRel pairs with the fast-path `fetch_add` in
                                                 // `chat::process` so a racing increment is
-                                                // observed. The pure decision lives in
-                                                // `terminate_decision` so the precedence rules
-                                                // and the per-reason log line both read from one
-                                                // place (see `TerminateDecision` variants).
+                                                // observed; now serialized by the lock above. The
+                                                // pure decision lives in `terminate_decision` so the
+                                                // precedence rules and the per-reason log line both
+                                                // read from one place (see `TerminateDecision`).
                                                 let prev = pending_followups
                                                     .swap(0, std::sync::atomic::Ordering::AcqRel);
                                                 match terminate_decision(
@@ -1640,6 +1812,18 @@ impl LucidosEngine {
                                                         log!("[AgentSession] Skipping subprocess termination for thread {} — background bash still running (auto-wake will resume CC on completion)", thread_id);
                                                     }
                                                     TerminateDecision::Terminate => {
+                                                        // Mark the session exited BEFORE cancelling
+                                                        // so a follow-up landing during the graceful-
+                                                        // shutdown window (process is alive until
+                                                        // `AgentEvent::Exited`, up to ~3s later) sees
+                                                        // `process_exited == true` and routes via the
+                                                        // slow `--resume` path instead of `msg_tx`
+                                                        // into the dying subprocess. Mirrors the
+                                                        // pre-exit mark in `completion.rs`.
+                                                        if let Some(s) = sessions.get_mut(&thread_id) {
+                                                            s.process_exited = true;
+                                                            s.idle_notify.notify_waiters();
+                                                        }
                                                         log!("[AgentSession] Idle reached — terminating the coding-agent subprocess for thread {} so next turn resumes via --resume", thread_id);
                                                         agent_cancel.cancel();
                                                     }
@@ -1692,10 +1876,12 @@ impl LucidosEngine {
                                         &pending,
                                         &trigger_configs,
                                         &workspace_path,
-                                        thread_id,
-                                        req.id,
-                                        req.tool_name,
-                                        req.input,
+                                        crate::engine::cc_permission::CodingAgentPermissionInput {
+                                            thread_id,
+                                            tool_use_id: req.id,
+                                            tool_name: req.tool_name,
+                                            input: req.input,
+                                        },
                                     ) => {
                                         // Send failure = driver died between answer
                                         // and delivery; nothing to deliver to.
@@ -1743,6 +1929,18 @@ impl LucidosEngine {
                         let mut sessions = self.agent_sessions.lock().await;
                         if let Some(s) = sessions.get_mut(&thread_id) { s.is_waiting = false; }
                     }
+                    // Flush any pending reasoning before the new user input opens a
+                    // fresh turn, then reset so the next turn's thinking starts clean.
+                    self.flush_coding_agent_thought(
+                        thread_id,
+                        &claude_thought_buf,
+                        &mut last_thought_persisted_len,
+                        coding_agent,
+                        &meta,
+                    )
+                    .await;
+                    claude_thought_buf.clear();
+                    last_thought_persisted_len = 0;
                     if !claude_text_buf.is_empty() {
                         let delta = &claude_text_buf[claude_text_buf.floor_char_boundary(last_text_persisted_len)..];
                         if !delta.is_empty() {

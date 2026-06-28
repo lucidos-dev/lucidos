@@ -38,35 +38,61 @@ impl LucidosEngine {
 
                 match client.get(&gdelt_url).send().await {
                     Ok(response) => {
-                        if let Ok(body) = response.text().await {
-                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                                if let Some(articles) = json["articles"].as_array() {
-                                    for article in articles.iter().take(max_articles) {
-                                        let title = article["title"].as_str().unwrap_or("Untitled");
-                                        let url = article["url"].as_str().unwrap_or("");
-                                        let source =
-                                            article["domain"].as_str().unwrap_or("Unknown");
-                                        let date = article["seendate"].as_str().unwrap_or("");
-                                        let date_formatted = if date.chars().count() >= 8 {
-                                            let chars: Vec<char> = date.chars().take(8).collect();
-                                            let yyyy: String = chars[..4].iter().collect();
-                                            let mm: String = chars[4..6].iter().collect();
-                                            let dd: String = chars[6..8].iter().collect();
-                                            format!("{}-{}-{}", yyyy, mm, dd)
-                                        } else {
-                                            date.to_string()
-                                        };
-                                        all_articles.push(format!(
-                                            "**[{}]** {} ({})\n  {}",
-                                            source, title, date_formatted, url
-                                        ));
-                                    }
+                        let status = response.status();
+                        if !status.is_success() {
+                            return Ok(format!(
+                                "Error: news search failed: GDELT returned HTTP {}",
+                                status
+                            ));
+                        }
+                        let body = match response.text().await {
+                            Ok(body) => body,
+                            Err(e) => {
+                                return Ok(format!(
+                                    "Error: news search failed reading the GDELT response: {}",
+                                    e
+                                ));
+                            }
+                        };
+                        // GDELT returns an empty/whitespace body for a genuine
+                        // no-results query; only a non-empty body that won't parse
+                        // signals an upstream problem worth surfacing (vs. silently
+                        // reporting "no news", which masks the failure from the LLM).
+                        if !body.trim().is_empty() {
+                            let json = match serde_json::from_str::<serde_json::Value>(&body) {
+                                Ok(json) => json,
+                                Err(e) => {
+                                    return Ok(format!(
+                                        "Error: news search failed parsing the GDELT response: {}",
+                                        e
+                                    ));
+                                }
+                            };
+                            if let Some(articles) = json["articles"].as_array() {
+                                for article in articles.iter().take(max_articles) {
+                                    let title = article["title"].as_str().unwrap_or("Untitled");
+                                    let url = article["url"].as_str().unwrap_or("");
+                                    let source = article["domain"].as_str().unwrap_or("Unknown");
+                                    let date = article["seendate"].as_str().unwrap_or("");
+                                    let date_formatted = if date.chars().count() >= 8 {
+                                        let chars: Vec<char> = date.chars().take(8).collect();
+                                        let yyyy: String = chars[..4].iter().collect();
+                                        let mm: String = chars[4..6].iter().collect();
+                                        let dd: String = chars[6..8].iter().collect();
+                                        format!("{}-{}-{}", yyyy, mm, dd)
+                                    } else {
+                                        date.to_string()
+                                    };
+                                    all_articles.push(format!(
+                                        "**[{}]** {} ({})\n  {}",
+                                        source, title, date_formatted, url
+                                    ));
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        log!(@fetch_news, "GDELT request failed: {}", e);
+                        return Ok(format!("Error: news search request failed: {}", e));
                     }
                 }
 

@@ -6,11 +6,14 @@ import {
   changes,
   markThreadAnswering,
   clearThreadAnswering,
+  focusedThreadId,
 } from '../store';
 import { loadedOr } from '../types';
 import { applyNow, applyChange, answerThreadQuestion as apiAnswerThreadQuestion, discardCCChanges, sendControlRequest, ApiError } from '../../api/client';
 import type { AnswerKind } from '../thread-events';
 import { scrollToBottom } from '../../components/chat/scrollState';
+import { markThreadRerenderStart, clearThreadRerenderStart } from '../../utils/threadOpenMarks';
+import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { changeToastMessage } from './changeToast';
 import { focusThread } from './threads';
 import { errorDetail } from '../../utils/errorDetail';
@@ -135,6 +138,14 @@ export async function answerThreadQuestion(
   toolUseId: string,
   answer: AnswerKind,
 ): Promise<boolean> {
+  // Perf: stamp the re-render span for the `thread-rerender` mark — answering a
+  // question on the focused thread flips `answeringThreadIds`, busting every
+  // exchange memo → full re-render. ThreadView fires once on the next render.
+  // Focused-only; fire-and-forget telemetry (utils/threadOpenMarks.ts +
+  // utils/renderPhaseTimers.ts).
+  if (focusedThreadId.value === threadId) {
+    markThreadRerenderStart(threadId, { ...currentPerfBaseline(), cause: 'answer' });
+  }
   // Pin to bottom before the QuestionCard re-renders from option buttons to
   // its answered (height-shrunk) form — otherwise ResizeObserver flips
   // scrolledUp=true and the streaming continuation never auto-scrolls.
@@ -147,10 +158,14 @@ export async function answerThreadQuestion(
   markThreadAnswering(threadId);
   try {
     const ok = await apiAnswerThreadQuestion(threadId, toolUseId, answer);
-    if (!ok) clearThreadAnswering(threadId); // 409 — stale/duplicate, no resume
+    if (!ok) {
+      clearThreadAnswering(threadId); // 409 — stale/duplicate, no resume
+      clearThreadRerenderStart(threadId); // no render coming → don't mis-fire later
+    }
     return ok;
   } catch (err) {
     clearThreadAnswering(threadId);
+    clearThreadRerenderStart(threadId);
     const detail = err instanceof ApiError ? err.reason : 'unknown error';
     showToast(`Failed to send answer: ${detail}`, 'error');
     return false;

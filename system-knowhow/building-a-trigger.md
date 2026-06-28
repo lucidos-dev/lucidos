@@ -5,7 +5,17 @@ description: Use when the user wants something to happen automatically — "ever
 
 # Building a Trigger
 
-How to guide a user from "I want this to happen automatically" to a working trigger. Cron format, frontmatter, and field reference live in the engine system prompt and the `create_trigger` tool description — don't restate them. The CLAUDE.md "trigger intent vs. procedure" rule is summarized below; see `docs/taxonomy.md` § Triggers for the worked example.
+How to guide a user from "I want this to happen automatically" to a working trigger. Cron format, frontmatter, and field reference live in the engine system prompt and the grouped `triggers` tool description — don't restate them. The CLAUDE.md "trigger intent vs. procedure" rule is summarized below; see `docs/taxonomy.md` § Triggers for the worked example.
+
+> **Tool surface.** Triggers are managed through the grouped **`triggers`** tool
+> (`action: create | list | update | delete | pause | resume`) and the grouped
+> **`trigger_groups`** tool (`action: list | create | rename | reorder |
+> delete`). Throughout this guide, a bare verb like `update_trigger` /
+> `list_trigger_groups` is shorthand for that tool with the matching `action`
+> (e.g. `update_trigger(trigger_id, …)` = `triggers(action="update",
+> trigger_id, …)`). The old flat tool names still work as back-compat aliases,
+> but the grouped tools are the surface the model sees. The CLI mirrors them as
+> `lucidos triggers …` / `lucidos trigger-groups …` (see `lucidos-cli.md`).
 
 ## When a trigger is the right answer
 
@@ -296,6 +306,27 @@ A one-shot trigger does **not** self-clean. After firing, the cron expression no
 2. **Ask the trigger to delete itself.** Add a sentence in the user's voice to the intent — e.g. `"Send me a hello notification, then delete this trigger."` Keep it user-voice; don't name `delete_trigger` or paste in the trigger id. The engine wraps each trigger fire in an envelope that already tells the running LLM its own id and that self-deletion is permitted, so the intent doesn't need to repeat any of that. Then confirm to the user that the trigger will delete itself after firing.
 
 Don't claim "I'll delete it after it runs" without doing one of the above — see "Promising behavior the trigger doesn't have" below.
+
+## On-disk trigger definition (`trigger.toml`)
+
+Every trigger has a **derived read-model** of its definition at
+`data/triggers/<slug>/trigger.toml`, mirroring the durable subset of its config
+(`name`, `slug`, `schedule`, `timezone`, `run`, `on`, `app_id`, `go_to_review`,
+`group_id`, `side_effect_grant`). It's maintained by the engine from the trigger
+events — written on create/update, removed on delete, and fully rebuilt from
+events on boot (ADR 0019).
+
+It is **NOT the source of truth and NOT version-controlled**: events are
+authoritative (the scheduler runs off the event-replayed config, never the file),
+and the engine adds `data/triggers/*/trigger.toml` to the workspace repo's local
+`.git/info/exclude`. **Don't hand-edit it** — a change is overwritten on the next
+trigger event or restart; edit triggers via `create_trigger`/`update_trigger`
+(or the UI), which emit the events the projection follows. Runtime/identity
+fields (`id`, `last_run`, `paused`) are deliberately omitted.
+
+The file exists so a trigger is inspectable (the Plugins panel's installed-plugin
+file links point at it for plugin-shipped triggers) and so a *plugin* can SHIP a
+trigger by declaring one — see `building-a-plugin.md`.
 
 ## Setup checklist
 

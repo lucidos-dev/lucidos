@@ -49,6 +49,37 @@ export function computeTooltipAnchor(
   };
 }
 
+/** Breathing room (px) between the tooltip and its target, and between the
+ *  tooltip's top edge and the unsafe top inset / viewport top. */
+export const TOOLTIP_GAP_PX = 8;
+
+/** Decide the tooltip's vertical placement. Prefer ABOVE the anchor; flip to
+ *  BELOW when placing above would push the tooltip's top into the unsafe top
+ *  inset — `safeTop` is env(safe-area-inset-top) (the iOS status bar / notch /
+ *  Dynamic Island), 0 on devices without one. `forceBelow` (data-tooltip-below)
+ *  always places below. Returns the viewport `top` and whether the tooltip ended
+ *  up above (drives the CSS arrow flip).
+ *
+ *  The safe-top clamp fixes a header-title tooltip rendering UP into the Dynamic
+ *  Island: the old code flipped below only when the above position was `< 8`, a
+ *  hardcoded margin that ignored the notch, so a tooltip landing at top:10 sat
+ *  hidden behind the camera strip instead of flipping down. On a notchless
+ *  device (safeTop 0) the threshold collapses back to the original 8px. */
+export function computeTooltipVerticalPlacement(
+  anchorTop: number,
+  anchorBottom: number,
+  tooltipHeight: number,
+  safeTop: number,
+  forceBelow: boolean,
+  gap = TOOLTIP_GAP_PX,
+): { top: number; above: boolean } {
+  if (!forceBelow) {
+    const aboveTop = anchorTop - tooltipHeight - gap;
+    if (aboveTop >= safeTop + gap) return { top: aboveTop, above: true };
+  }
+  return { top: anchorBottom + gap, above: false };
+}
+
 /** Compute a new anchor point so the tooltip stays glued to the same spot on
  *  its target after the page (or any scroll container) has scrolled. The
  *  offset is captured at show-time relative to the target's top-left. */
@@ -144,6 +175,9 @@ export function useTooltip() {
     let arrowEl: HTMLDivElement | null = null;
     let titleEl: HTMLDivElement | null = null;
     let textEl: HTMLDivElement | null = null;
+    // Hidden probe whose padding-top is env(safe-area-inset-top); JS can't read
+    // env() directly, so we measure the notch / Dynamic Island inset off it.
+    let safeAreaProbe: HTMLDivElement | null = null;
     let showTimer: number | null = null;
     let currentTarget: HTMLElement | null = null;
     // Anchor offset relative to the target's top-left at show time, so we can
@@ -165,7 +199,20 @@ export function useTooltip() {
         tipEl.appendChild(titleEl);
         tipEl.appendChild(textEl);
         document.body.appendChild(tipEl);
+
+        safeAreaProbe = document.createElement('div');
+        safeAreaProbe.setAttribute('aria-hidden', 'true');
+        safeAreaProbe.style.cssText =
+          'position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none;padding-top:env(safe-area-inset-top,0px);';
+        document.body.appendChild(safeAreaProbe);
       }
+    }
+
+    /** env(safe-area-inset-top) in px, measured off the hidden probe. 0 on
+     *  devices without a notch. Re-read each call so orientation changes apply. */
+    function readSafeAreaTop(): number {
+      if (!safeAreaProbe) return 0;
+      return parseFloat(getComputedStyle(safeAreaProbe).paddingTop) || 0;
     }
 
     function isVisible(): boolean {
@@ -200,7 +247,6 @@ export function useTooltip() {
 
       const tipRect = tipEl.getBoundingClientRect();
       const targetRect = target.getBoundingClientRect();
-      const gap = 8;
 
       // Anchor to the element's border by default (so the tooltip always sits
       // outside the element, even a tall wrapped-title drawer row); only elements
@@ -209,22 +255,14 @@ export function useTooltip() {
       const followCursor = target.hasAttribute('data-tooltip-follow-cursor');
       const { anchorX, anchorTop, anchorBottom } = computeTooltipAnchor(targetRect, mouseX, mouseY, followCursor);
 
-      // Vertical: prefer above, fall back to below.
-      // data-tooltip-below forces below (useful for elements at top of viewport).
+      // Vertical: prefer above, flip below when above would collide with the
+      // unsafe top inset (status bar / notch / Dynamic Island) — so a header
+      // title's tooltip never renders up behind the camera strip on iOS.
+      // data-tooltip-below forces below.
       const forceBelow = target.hasAttribute('data-tooltip-below');
-      let top: number;
-      let above: boolean;
-      if (forceBelow) {
-        top = anchorBottom + gap;
-        above = false;
-      } else {
-        top = anchorTop - tipRect.height - gap;
-        above = true;
-        if (top < 8) {
-          top = anchorBottom + gap;
-          above = false;
-        }
-      }
+      const { top, above } = computeTooltipVerticalPlacement(
+        anchorTop, anchorBottom, tipRect.height, readSafeAreaTop(), forceBelow,
+      );
 
       // Horizontal: center on the anchor, clamp to viewport.
       const left = clampToViewportX(anchorX - tipRect.width / 2, tipRect.width);
@@ -377,6 +415,12 @@ export function useTooltip() {
       if (isTouchSwipe(touchStartX, touchStartY, touch.clientX, touch.clientY)) {
         touchMoved = true;
         clearLongPress(); // a swipe cancels the pending long-press reveal
+        // A swipe (pane navigation, scroll) dismisses a tooltip already revealed
+        // by tap/long-press — otherwise it stays stuck floating over the target
+        // that just swiped away (e.g. swiping the content header to the thread
+        // view left its title tooltip hanging). We don't preventDefault, so the
+        // swipe itself still navigates.
+        if (isVisible()) hide();
       }
     }
 
@@ -436,6 +480,7 @@ export function useTooltip() {
       document.removeEventListener('touchmove', onTouchMove, passiveCapture);
       document.removeEventListener('touchend', onTouchEnd, passiveCapture);
       if (tipEl?.parentNode) tipEl.parentNode.removeChild(tipEl);
+      if (safeAreaProbe?.parentNode) safeAreaProbe.parentNode.removeChild(safeAreaProbe);
     };
   }, []);
 }

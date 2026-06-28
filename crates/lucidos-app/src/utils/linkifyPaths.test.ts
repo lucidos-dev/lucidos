@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget } from './linkifyPaths';
+import { describe, it, expect, beforeEach } from 'vitest';
+import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, _resetLinkifyCacheForTesting } from './linkifyPaths';
 
 describe('extractNavTargetFromHref', () => {
   it.each([
@@ -54,7 +54,7 @@ describe('extractAppIdFromHref', () => {
     ['/apps/todo/index.html', 'todo'],
     ['data/apps/todo/index.html', 'todo'],
     ['/data/apps/todo/index.html', 'todo'],
-    ['apps/momentum-autoresearch/index.html', 'momentum-autoresearch'],
+    ['apps/habit-tracker/index.html', 'habit-tracker'],
     // Query string / fragment on entry-point hrefs must be stripped before
     // matching — otherwise `apps.find(a => a.id === 'todo?refresh=1')`
     // always misses.
@@ -63,14 +63,14 @@ describe('extractAppIdFromHref', () => {
     ['apps/todo/index.html?v=2', 'todo'],
     ['apps/todo/index.html#anchor', 'todo'],
     // `app:<id>` custom-scheme shorthand. LLMs invent this by analogy to the
-    // documented `thread:<UUID>` scheme — the bug report was a Momentum-app
-    // link rendered as `[Momentum app](app:momentum)` that dead-ended on
+    // documented `thread:<UUID>` scheme — the bug report was a Habit Tracker-app
+    // link rendered as `[Habit Tracker app](app:habit-tracker)` that dead-ended on
     // macOS Chrome because no handler recognized the scheme.
     ['app:todo', 'todo'],
     ['app:todo/', 'todo'],
     ['app:todo?refresh=1', 'todo'],
     ['app:todo#section', 'todo'],
-    ['app:momentum-autoresearch', 'momentum-autoresearch'],
+    ['app:habit-tracker', 'habit-tracker'],
   ])('extracts %s -> %s', (href, expected) => {
     expect(extractAppIdFromHref(href)).toBe(expected);
   });
@@ -108,12 +108,12 @@ describe('extractAppIdFromHref', () => {
 describe('extractLocalFileTarget', () => {
   it.each([
     // file:// URLs — always a local file/dir to hand to the OS
-    ['file:///Users/ken/Downloads/Lucidos_0.12.3_aarch64.dmg', 'file:///Users/ken/Downloads/Lucidos_0.12.3_aarch64.dmg'],
+    ['file:///Users/me/Downloads/Lucidos_0.12.3_aarch64.dmg', 'file:///Users/me/Downloads/Lucidos_0.12.3_aarch64.dmg'],
     ['file:///Applications/Lucidos.app', 'file:///Applications/Lucidos.app'],
     ['FILE:///tmp/x', 'FILE:///tmp/x'], // scheme is case-insensitive
     // Bare absolute POSIX paths outside the workspace — a staged release dmg,
     // an app folder, etc.
-    ['/Users/ken/.lucidos/release-worktrees/0.12.3/Lucidos_0.12.3_aarch64.dmg', '/Users/ken/.lucidos/release-worktrees/0.12.3/Lucidos_0.12.3_aarch64.dmg'],
+    ['/Users/me/.lucidos/release-worktrees/0.12.3/Lucidos_0.12.3_aarch64.dmg', '/Users/me/.lucidos/release-worktrees/0.12.3/Lucidos_0.12.3_aarch64.dmg'],
     ['/Applications', '/Applications'],
     ['/tmp/build/out.dmg', '/tmp/build/out.dmg'],
     // A directory whose name merely starts with data/apps but isn't the route
@@ -252,7 +252,7 @@ describe('linkifyPaths', () => {
   });
 
   it('rewrites anchors with data/notifications href to nav-link (the bug-report shape)', () => {
-    // Real shape from the bug report — last response in the personal thread
+    // Real shape from the bug report — last response in the thread
     // 664b657a-... wrote:
     //   Open it: [Notifications](data/notifications)
     // pulldown_cmark renders that as
@@ -347,17 +347,17 @@ describe('linkifyPaths', () => {
 
   it('REGRESSION: apps/<id>/index.html beats artifact-link even when path is in the artifact list', () => {
     // Real-world scenario the unit tests missed: lucidos.data.list() returns
-    // ALL files under data/, NOT just artifacts/. So the personal-workspace
+    // ALL files under data/, NOT just artifacts/. So a real workspace's
     // `paths` array contains apps/<id>/index.html for every app. Without
     // the app-rewriter taking precedence, rewriteArtifactAnchor matches
     // first → .artifact-link → openFilePreview → user sees the rendered HTML
     // file in the preview panel instead of the running app.
-    const paths = ['artifacts/notes.md', 'apps/momentum-autoresearch/index.html'];
-    const apps = [{ name: 'Momentum Autoresearch', id: 'momentum-autoresearch' }];
-    const html = '<p>Watch it in <a href="apps/momentum-autoresearch/index.html">Momentum Autoresearch</a>.</p>';
+    const paths = ['artifacts/notes.md', 'apps/habit-tracker/index.html'];
+    const apps = [{ name: 'Habit Tracker', id: 'habit-tracker' }];
+    const html = '<p>Watch it in <a href="apps/habit-tracker/index.html">Habit Tracker</a>.</p>';
     const result = linkifyPaths(html, paths, apps);
     expect(result).toContain('class="app-link"');
-    expect(result).toContain('data-app-id="momentum-autoresearch"');
+    expect(result).toContain('data-app-id="habit-tracker"');
     expect(result).not.toContain('class="artifact-link"');
   });
 
@@ -365,28 +365,28 @@ describe('linkifyPaths', () => {
     // Inverse: sub-files under an app's folder are real files; clicking
     // should preview them, not open the app. Only the canonical entry
     // (id, id/, id/index.html) routes to the app.
-    const paths = ['apps/momentum-autoresearch/scripts/run.sh'];
-    const apps = [{ name: 'Momentum Autoresearch', id: 'momentum-autoresearch' }];
-    const html = '<p><a href="apps/momentum-autoresearch/scripts/run.sh">run.sh</a></p>';
+    const paths = ['apps/habit-tracker/scripts/run.sh'];
+    const apps = [{ name: 'Habit Tracker', id: 'habit-tracker' }];
+    const html = '<p><a href="apps/habit-tracker/scripts/run.sh">run.sh</a></p>';
     const result = linkifyPaths(html, paths, apps);
     expect(result).toContain('class="artifact-link"');
-    expect(result).toContain('data-path="apps/momentum-autoresearch/scripts/run.sh"');
+    expect(result).toContain('data-path="apps/habit-tracker/scripts/run.sh"');
     expect(result).not.toContain('class="app-link"');
   });
 
   it('rewrites anchors with apps/<id>/index.html href to app-link (bare prefix)', () => {
     // Real shape from the bug report: LLM wrote
-    //   [Momentum Autoresearch](apps/momentum-autoresearch/index.html)
+    //   [Habit Tracker](apps/habit-tracker/index.html)
     // pulldown_cmark renders that as
-    //   <a href="apps/momentum-autoresearch/index.html">Momentum Autoresearch</a>
+    //   <a href="apps/habit-tracker/index.html">Habit Tracker</a>
     // Without rewriting, the click hits the engine's /data/* static mount as a
     // top-level navigation and the user sees a file preview, not the running app.
-    const html = '<p>Watch it in <a href="apps/momentum-autoresearch/index.html">Momentum Autoresearch</a>.</p>';
-    const result = linkifyPaths(html, [], [{ name: 'Momentum Autoresearch', id: 'momentum-autoresearch' }]);
+    const html = '<p>Watch it in <a href="apps/habit-tracker/index.html">Habit Tracker</a>.</p>';
+    const result = linkifyPaths(html, [], [{ name: 'Habit Tracker', id: 'habit-tracker' }]);
     expect(result).toContain('class="app-link"');
-    expect(result).toContain('data-app-id="momentum-autoresearch"');
-    expect(result).not.toContain('href="apps/momentum-autoresearch/index.html"');
-    expect(result).toContain('>Momentum Autoresearch</a>');
+    expect(result).toContain('data-app-id="habit-tracker"');
+    expect(result).not.toContain('href="apps/habit-tracker/index.html"');
+    expect(result).toContain('>Habit Tracker</a>');
   });
 
   it('rewrites anchors with /apps/<id>/index.html href (leading slash)', () => {
@@ -436,18 +436,18 @@ describe('linkifyPaths', () => {
 
   it('rewrites anchors with app:<id> custom-scheme href to app-link', () => {
     // Real shape from the bug-report thread: LLM wrote
-    //   Open the [Momentum app](app:momentum) and switch to the Backtest tab.
+    //   Open the [Habit Tracker app](app:habit-tracker) and switch to the Backtest tab.
     // pulldown_cmark renders that as
-    //   <a href="app:momentum">Momentum app</a>
+    //   <a href="app:habit-tracker">Habit Tracker app</a>
     // Without rewriting, the click falls through to the browser's default
     // navigation, which tries to open the unknown `app:` URL scheme — Chrome
     // on macOS shows "address not understood".
-    const html = '<p>Open the <a href="app:momentum">Momentum app</a>.</p>';
-    const result = linkifyPaths(html, [], [{ name: 'Momentum', id: 'momentum' }]);
+    const html = '<p>Open the <a href="app:habit-tracker">Habit Tracker app</a>.</p>';
+    const result = linkifyPaths(html, [], [{ name: 'Habit Tracker', id: 'habit-tracker' }]);
     expect(result).toContain('class="app-link"');
-    expect(result).toContain('data-app-id="momentum"');
-    expect(result).not.toContain('href="app:momentum"');
-    expect(result).toContain('>Momentum app</a>');
+    expect(result).toContain('data-app-id="habit-tracker"');
+    expect(result).not.toContain('href="app:habit-tracker"');
+    expect(result).toContain('>Habit Tracker app</a>');
   });
 
   it.each([
@@ -596,7 +596,7 @@ describe('linkifyPaths', () => {
   });
 
   it('linkifies paths correctly when path list is very large', () => {
-    // Simulates a workspace with thousands of artifacts — personal workspace had 7458
+    // Simulates a workspace with thousands of artifacts — a real workspace had 7458
     // when WebKit's YARR threw "regular expression too large" at runtime.
     const paths = Array.from(
       { length: 5000 },
@@ -649,5 +649,41 @@ describe('linkifyPaths', () => {
     expect(sources.length).toBeGreaterThan(0);
     const maxSource = Math.max(...sources);
     expect(maxSource).toBeLessThan(MAX_SAFE_SOURCE);
+  });
+});
+
+describe('linkifyPaths caching', () => {
+  beforeEach(() => _resetLinkifyCacheForTesting());
+
+  it('a cached call returns output identical to a fresh compute', () => {
+    const html = '<p>See user_profile.md and visit https://example.com</p>';
+    const paths = ['user_profile.md'];
+    const apps: { name: string; id: string }[] = [];
+    const first = linkifyPaths(html, paths, apps); // miss → computes + caches
+    const second = linkifyPaths(html, paths, apps); // hit
+    expect(second).toBe(first);
+    // And it matches a from-scratch compute (cache cleared) — proves the cached
+    // value isn't stale/wrong.
+    _resetLinkifyCacheForTesting();
+    expect(linkifyPaths(html, paths, apps)).toBe(first);
+  });
+
+  it('invalidates when the artifact/app list changes (new reference, new content)', () => {
+    const html = '<p>Open Habit Tracker</p>';
+    // No apps → app name is NOT linkified.
+    const before = linkifyPaths(html, [], []);
+    expect(before).not.toContain('data-app-id');
+    // App list now contains the app → must reflect it, not the cached miss.
+    const after = linkifyPaths(html, [], [{ name: 'Habit Tracker', id: 'habit-tracker' }]);
+    expect(after).toContain('data-app-id="habit-tracker"');
+  });
+
+  it('cache:false produces the same output as the cached path but is not stored', () => {
+    const html = '<p>See user_profile.md</p>';
+    const paths = ['user_profile.md'];
+    const cached = linkifyPaths(html, paths, []);
+    _resetLinkifyCacheForTesting();
+    const uncached = linkifyPaths(html, paths, [], { cache: false });
+    expect(uncached).toBe(cached);
   });
 });

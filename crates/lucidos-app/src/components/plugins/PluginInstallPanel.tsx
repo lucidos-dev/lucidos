@@ -30,7 +30,7 @@ export function PluginInstallPanel() {
   async function handleConfirm() {
     setBusy(true);
     try {
-      await confirmPluginInstallAction(req.install_id, req.plugin_name);
+      await confirmPluginInstallAction(req.install_id, req.plugin_name, req.plugin_version);
     } finally {
       setBusy(false);
     }

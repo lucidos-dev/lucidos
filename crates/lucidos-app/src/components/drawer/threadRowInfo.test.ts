@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { threadContextName, threadRowTooltip, draftRowTooltip, type TooltipRow } from './threadRowInfo';
+import { threadContextName, threadInfoRows, draftRowTooltip, type TooltipRow } from './threadRowInfo';
 import type { ThreadMeta } from '../../store/thread-events';
 
 describe('threadContextName', () => {
@@ -19,7 +19,7 @@ describe('threadContextName', () => {
   });
 });
 
-describe('threadRowTooltip', () => {
+describe('threadInfoRows', () => {
   const base = {
     channel: 'claude_code',
     repoName: 'lucidos',
@@ -35,7 +35,7 @@ describe('threadRowTooltip', () => {
     rows.find((r) => r.label === label);
 
   it('emits Status / You / Agent / Context / Exchanges / Started rows', () => {
-    const rows = threadRowTooltip(base, 'idle');
+    const rows = threadInfoRows(base, 'idle');
     expect(rows.map((r) => r.label)).toEqual(['Status', 'You', 'Agent', 'Repository', 'Exchanges', 'Started']);
     expect(byLabel(rows, 'You')?.value).toMatch(/ago$/);
     expect(byLabel(rows, 'Agent')?.value).toMatch(/ago$/);
@@ -47,32 +47,32 @@ describe('threadRowTooltip', () => {
   });
 
   it('reads "Changes ready" (changes tone) when a change is proposed and not running', () => {
-    const rows = threadRowTooltip({ ...base, codingAgentProposed: true } as ThreadMeta, 'idle');
+    const rows = threadInfoRows({ ...base, codingAgentProposed: true } as ThreadMeta, 'idle');
     expect(byLabel(rows, 'Status')?.value).toBe('Changes ready');
     expect(byLabel(rows, 'Status')?.tone).toBe('changes');
   });
 
   it('marks a running thread with the running tone', () => {
-    const rows = threadRowTooltip({ ...base, messageCount: 1 } as ThreadMeta, 'running');
+    const rows = threadInfoRows({ ...base, messageCount: 1 } as ThreadMeta, 'running');
     expect(byLabel(rows, 'Exchanges')?.value).toBe('1');
     expect(byLabel(rows, 'Status')?.value).toBe('Running');
     expect(byLabel(rows, 'Status')?.tone).toBe('running');
   });
 
   it('reads "Waiting" when idle with active children (matches the status dot)', () => {
-    const rows = threadRowTooltip({ ...base, activeChildrenCount: 2 } as ThreadMeta, 'idle');
+    const rows = threadInfoRows({ ...base, activeChildrenCount: 2 } as ThreadMeta, 'idle');
     expect(byLabel(rows, 'Status')?.value).toBe('Waiting');
     expect(byLabel(rows, 'Status')?.tone).toBe('waiting');
   });
 
   it('lets the thread\'s own running state win over active children', () => {
-    const rows = threadRowTooltip({ ...base, activeChildrenCount: 2 } as ThreadMeta, 'running');
+    const rows = threadInfoRows({ ...base, activeChildrenCount: 2 } as ThreadMeta, 'running');
     expect(byLabel(rows, 'Status')?.value).toBe('Running');
     expect(byLabel(rows, 'Status')?.tone).toBe('running');
   });
 
   it('reads "Waiting for you" when paused on a question', () => {
-    const rows = threadRowTooltip(base, 'waiting_for_user_answer');
+    const rows = threadInfoRows(base, 'waiting_for_user_answer');
     expect(byLabel(rows, 'Status')?.value).toBe('Waiting for you');
     expect(byLabel(rows, 'Status')?.tone).toBe('waiting');
   });

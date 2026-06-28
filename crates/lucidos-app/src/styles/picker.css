@@ -205,6 +205,53 @@
   text-align: center;
 }
 
+/* ── Loading skeleton ────────────────────────────────────────────────────────
+   Shimmer placeholders shown while the workspace list loads (immediately, then
+   crossfaded into the list by <LoadingFade>). Skeleton rows reuse the real
+   `.ws-picker-row`/`.ws-picker-open` wrapper, so each row's height is fixed by
+   its tallest cell — the 2rem action placeholder, matching the real row's 2rem
+   `.ws-picker-icon` — giving an identical 3.25rem row height (2rem + 1.25rem
+   padding) so the skeleton→list handoff doesn't reflow. White-on-blue
+   translucent fill matching the picker's brand language; reuses the global
+   `shimmer` keyframes (drawer.css). */
+.ws-picker-skel-dot,
+.ws-picker-skel-name,
+.ws-picker-skel-action {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.08) 25%,
+    rgba(255, 255, 255, 0.2) 50%,
+    rgba(255, 255, 255, 0.08) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+/* Matches .ws-picker-dot */
+.ws-picker-skel-dot {
+  flex: 0 0 auto;
+  width: 0.625rem;
+  height: 0.625rem;
+  border-radius: 50%;
+}
+
+/* A partial name bar; margin-right:auto pushes the action placeholder to the
+   row's right edge, the way the flex-grow name cell does in a real row. */
+.ws-picker-skel-name {
+  flex: 0 1 9rem;
+  height: 0.875rem;
+  border-radius: 0.4375rem;
+  margin-right: auto;
+}
+
+/* Matches the .ws-picker-icon pill (the play/stop control). */
+.ws-picker-skel-action {
+  flex: 0 0 auto;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 0.5rem;
+}
+
 /* ── List / rows (flat, no card) ─────────────────────────────────────────── */
 
 .ws-picker-list {
@@ -628,7 +675,10 @@
   .ws-rv-final,
   .ws-picker-dot-booting,
   .ws-picker-restore-spinner,
-  .ws-picker-reload.is-reloading svg {
+  .ws-picker-reload.is-reloading svg,
+  .ws-picker-skel-dot,
+  .ws-picker-skel-name,
+  .ws-picker-skel-action {
     animation: none;
   }
 }

@@ -5,7 +5,7 @@
 use crate::engine::{InjectedPrompt, InjectedPromptKind};
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
-use crate::llm::{get_default_tools, get_notification_tool, get_read_notifications_tool};
+use crate::llm::{get_default_tools, get_notification_tool};
 use crate::llm::{ContentBlock, Message, MessageContent};
 use std::collections::HashSet;
 use tokio_util::sync::CancellationToken;
@@ -442,7 +442,9 @@ pub(crate) fn build_intent_tools() -> Vec<ToolDefinition> {
         .filter(|t| t.name != tn::EXECUTE_INTENT)
         .collect();
     tools.push(get_notification_tool());
-    tools.push(get_read_notifications_tool());
+    // Grouped notification-inbox tool (list / mark_read / mark_all_read) +
+    // any other manifest-declared LLM tools — single source of truth.
+    tools.extend(crate::capability_manifest::llm_tools());
     tools
 }
 

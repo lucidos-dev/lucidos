@@ -36,6 +36,11 @@ export function TriggerItem({ trigger }: Props) {
           <span class="label">
             {trigger.run.type === 'script' ? 'script' : 'LLM'}
           </span>
+          {trigger.plugin_id && (
+            <span class="label trigger-plugin-chip" data-tooltip={`Installed by the "${trigger.plugin_id}" plugin`}>
+              from {trigger.plugin_id}
+            </span>
+          )}
         </div>
         {trigger.cron_expressions.length > 0 && (
           <ul class="trigger-cron-list">

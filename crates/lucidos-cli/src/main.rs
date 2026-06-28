@@ -26,6 +26,10 @@ mod coding_agent_diff_hook;
 mod data;
 mod data_store;
 mod events;
+/// Manifest-generated subcommands (one per `cli = true` capability domain).
+/// AUTO-GENERATED content; wire each enum below. See
+/// `crates/lucidos-engine/src/capability_manifest/`.
+mod generated;
 mod hardened;
 mod http;
 mod knowhow;
@@ -185,6 +189,93 @@ enum Command {
     Knowhow {
         #[command(subcommand)]
         action: KnowhowCmd,
+    },
+    /// Read and clear the notification inbox (`list` / `read --id <uuid>` /
+    /// `read-all`). Generated from the capability parity manifest and routed
+    /// through the gateway-safe HTTP client — use this instead of hand-rolled
+    /// `curl` (which has to reverse-engineer the engine port + gateway prefix).
+    /// Mirrors the chat agent's grouped `notifications` tool.
+    Notifications {
+        #[command(subcommand)]
+        action: generated::NotificationsCmd,
+    },
+    /// Read and change user preferences (`get` / `set --key K --value V`).
+    /// Generated from the capability parity manifest; routed through the
+    /// gateway-safe HTTP client. Mirrors the chat agent's grouped `preferences`
+    /// tool and the SDK `lucidos.preferences` namespace.
+    Preferences {
+        #[command(subcommand)]
+        action: generated::PreferencesCmd,
+    },
+    /// Create and manage triggers — scheduled (cron) and/or event-driven
+    /// automations (`create` / `list` / `update` / `delete`). Generated from the
+    /// capability parity manifest; routed through the gateway-safe HTTP client.
+    /// Mirrors the chat agent's grouped `triggers` tool and the SDK
+    /// `lucidos.triggers` namespace. (Pause/resume a trigger via `update --id
+    /// <uuid> --paused true|false`.)
+    Triggers {
+        #[command(subcommand)]
+        action: generated::TriggersCmd,
+    },
+    /// Manage trigger groups — the user-visible folders that organize triggers
+    /// in the panel (`list` / `create` / `rename` / `reorder` / `delete`).
+    /// Generated from the capability parity manifest; routed through the
+    /// gateway-safe HTTP client. Mirrors the chat agent's grouped
+    /// `trigger_groups` tool.
+    #[command(name = "trigger-groups")]
+    TriggerGroups {
+        #[command(subcommand)]
+        action: generated::TriggerGroupsCmd,
+    },
+    /// Manage apps — `list` all apps, `get` one by id, `update` an app's
+    /// name/description, or `delete` an app. Generated from the capability
+    /// parity manifest; routed through the gateway-safe HTTP client. (Creating
+    /// an app is the chat agent's `create_app` tool; editing app source is done
+    /// in the app's coding-agent worktree.)
+    Apps {
+        #[command(subcommand)]
+        action: generated::AppsCmd,
+    },
+    /// Inspect the Thread Queue (background admission control) — `list` the live
+    /// queue + capacity policy, force-admit a queued entry with `run-now
+    /// --entry-id <uuid>`, or `drop --entry-id <uuid>`. Generated from the
+    /// capability parity manifest; routed through the gateway-safe HTTP client.
+    /// (Mirrors the chat agent's grouped `thread_queue` tool. Changing the
+    /// capacity policy is the LLM tool's `update_policy` action — kept off the
+    /// CLI because the raw HTTP PUT would reset omitted caps to defaults.)
+    #[command(name = "thread-queue")]
+    ThreadQueue {
+        #[command(subcommand)]
+        action: generated::ThreadQueueCmd,
+    },
+    /// Read long-term memory — `stats` (index counts), `entries` (paginated
+    /// long-term-memory entries), or `source` (the originating event/artifact for
+    /// one memory). Generated from the capability parity manifest; routed through
+    /// the gateway-safe HTTP client. (Correcting memory is the chat agent's
+    /// grouped `memory` tool; reading is the agent's injected context.)
+    Memory {
+        #[command(subcommand)]
+        action: generated::MemoryCmd,
+    },
+    /// Manage non-secret environment variables injected into every subprocess
+    /// Lucidos spawns — `list`, `set --name N --value V`, or `delete --name N`.
+    /// Generated from the capability parity manifest; routed through the
+    /// gateway-safe HTTP client. (For secrets use a credential, not this.)
+    #[command(name = "env-vars")]
+    EnvVars {
+        #[command(subcommand)]
+        action: generated::EnvVarsCmd,
+    },
+    /// Manage the chat-model registry (Settings → Models) — `list`, `add --id
+    /// <id> --provider <p> [--label L] [--sort-order N]`, `update --id <id> …`,
+    /// or `delete --id <id>`. Generated from the capability parity manifest;
+    /// routed through the gateway-safe HTTP client. Mirrors the chat agent's
+    /// `manage_models` tool. (To switch the ACTIVE model, set the `chat_model`
+    /// preference; builtins can be disabled via `update --enabled false`, not
+    /// deleted.)
+    Models {
+        #[command(subcommand)]
+        action: generated::ModelsCmd,
     },
 }
 
@@ -365,7 +456,7 @@ impl CliCodingAgent {
 
 #[derive(Args)]
 pub(crate) struct SpawnThreadArgs {
-    /// Target workspace name (e.g. "dev", "personal"). Resolved relative to
+    /// Target workspace name (e.g. "dev", "myws"). Resolved relative to
     /// $LUCIDOS_WORKSPACES_ROOT (or `~/workspaces` if unset). Pass an absolute
     /// path to bypass the root lookup.
     #[arg(long)]
@@ -401,7 +492,7 @@ pub(crate) struct SpawnThreadArgs {
     #[arg(long)]
     pub(crate) repo: Option<String>,
     /// Target a folder instead of a repo — creates an *app coding-agent
-    /// thread*. Accepts a workspace-relative path (`data/apps/momentum`), an
+    /// thread*. Accepts a workspace-relative path (`data/apps/habit-tracker`), an
     /// absolute path, or a registered repo name; resolved on the TARGET
     /// workspace (`--to`). With `--cc`, `--codex`, or `--coding-agent`, a
     /// `data/apps/<id>` value spawns a sparse-checkout worktree narrowed to
@@ -787,6 +878,51 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                 KnowhowCmd::List => knowhow::cmd_list(&ws)?,
                 KnowhowCmd::Read { id } => knowhow::cmd_read(&ws, &id)?,
             }
+            Ok(0)
+        }
+        Command::Notifications { action } => {
+            let ws = resolve_from_env()?;
+            generated::dispatch_notifications(&ws, action)?;
+            Ok(0)
+        }
+        Command::Preferences { action } => {
+            let ws = resolve_from_env()?;
+            generated::dispatch_preferences(&ws, action)?;
+            Ok(0)
+        }
+        Command::Triggers { action } => {
+            let ws = resolve_from_env()?;
+            generated::dispatch_triggers(&ws, action)?;
+            Ok(0)
+        }
+        Command::TriggerGroups { action } => {
+            let ws = resolve_from_env()?;
+            generated::dispatch_trigger_groups(&ws, action)?;
+            Ok(0)
+        }
+        Command::Apps { action } => {
+            let ws = resolve_from_env()?;
+            generated::dispatch_apps(&ws, action)?;
+            Ok(0)
+        }
+        Command::ThreadQueue { action } => {
+            let ws = resolve_from_env()?;
+            generated::dispatch_thread_queue(&ws, action)?;
+            Ok(0)
+        }
+        Command::Memory { action } => {
+            let ws = resolve_from_env()?;
+            generated::dispatch_memory(&ws, action)?;
+            Ok(0)
+        }
+        Command::EnvVars { action } => {
+            let ws = resolve_from_env()?;
+            generated::dispatch_env_vars(&ws, action)?;
+            Ok(0)
+        }
+        Command::Models { action } => {
+            let ws = resolve_from_env()?;
+            generated::dispatch_models(&ws, action)?;
             Ok(0)
         }
     }

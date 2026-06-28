@@ -21,6 +21,47 @@ fn from_created_event_prompt() {
 }
 
 #[test]
+fn plugin_id_provenance_round_trips_and_defaults_none() {
+    // User trigger: no plugin_id → None.
+    let user = TriggerConfig::from_created_payload(&json!({
+        "trigger_id": "t1", "name": "User", "schedule": [], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "hi" },
+        "on": [{ "event_type": "X" }],
+    }))
+    .unwrap();
+    assert_eq!(user.plugin_id, None);
+
+    // Plugin trigger: plugin_id carried through.
+    let plug = TriggerConfig::from_created_payload(&json!({
+        "trigger_id": "t2", "name": "Plug", "schedule": [], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "hi" },
+        "on": [{ "event_type": "X" }],
+        "plugin_id": "browser-learning",
+    }))
+    .unwrap();
+    assert_eq!(plug.plugin_id.as_deref(), Some("browser-learning"));
+}
+
+#[test]
+fn apply_update_sets_plugin_id_but_a_user_edit_never_strips_it() {
+    let mut config = TriggerConfig::from_created_payload(&json!({
+        "trigger_id": "t", "name": "T", "schedule": [], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "hi" }, "on": [{ "event_type": "X" }],
+        "plugin_id": "my-plugin",
+    }))
+    .unwrap();
+
+    // A user edit (no plugin_id in payload) must preserve provenance, else
+    // uninstall could no longer reclaim the trigger.
+    config.apply_update(&json!({ "name": "Renamed" }));
+    assert_eq!(config.plugin_id.as_deref(), Some("my-plugin"));
+
+    // A re-sync update can (re-)stamp it.
+    config.apply_update(&json!({ "plugin_id": "my-plugin" }));
+    assert_eq!(config.plugin_id.as_deref(), Some("my-plugin"));
+}
+
+#[test]
 fn from_created_event_script() {
     let payload = json!({
         "trigger_id": "oura-import",

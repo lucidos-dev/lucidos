@@ -8,6 +8,9 @@ import { openAppById } from '../../store/actions/apps';
 import { switchMenuItem, openSettingsSubview } from '../../store/actions/menu';
 import { viewChangeDiffById } from '../../store/actions/repositories';
 import { navigateToTrigger } from '../../store/actions/triggers';
+import { focusPaneMainControl } from '../layout/paneFocus';
+import { searchResultDestinationPane } from './searchEverywhereActions';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { RECENTS_KEY } from '../../store/actions/entityReferences';
 import { SearchIcon, CloseIcon, ClearIcon } from '../shared/icons';
 import { CategoryIcon } from '../shared/CategoryIcon';
@@ -145,6 +148,10 @@ export function SearchEverywhere() {
   const resultsRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Delay the inline search spinner (300ms) so quick searches don't flash it.
+  // Intentionally no crossfade/lingering here — incremental search must show
+  // results the instant they arrive, so the spinner just disappears on results.
+  const showSearchLoading = useDelayedFlag(loading);
 
   const isOpen = searchEverywhereOpen.value;
 
@@ -234,20 +241,35 @@ export function SearchEverywhere() {
   function handleSelect(item: SearchResultItem) {
     saveRecent(item);
     close();
+    // After navigating, move real DOM focus into the destination pane's main
+    // control (the message input for a thread; the first focusable / iframe for
+    // an app, file, trigger, settings, or change) so a keyboard-driven selection
+    // continues there instead of stranding focus on <body> when the modal closes.
+    // Desktop-only and a no-op when nothing is focusable — both the "(if any)"
+    // cases — are handled inside focusPaneMainControl. Async navigations
+    // (app/trigger/change resolve their target before revealing the content pane)
+    // chain the focus off their promise so it lands after the destination renders.
+    const focusDest = () => focusPaneMainControl(searchResultDestinationPane(item.category));
     switch (item.category) {
-      case 'threads': focusThreadOrBootstrap(item.id); break;
-      case 'files': openFilePreview(item.id); break;
-      case 'apps': void openAppById(item.id); break;
-      case 'triggers': void navigateToTrigger(item.id); break;
+      case 'threads': focusThreadOrBootstrap(item.id); focusDest(); break;
+      case 'files': openFilePreview(item.id); focusDest(); break;
+      case 'apps': void openAppById(item.id).then(focusDest); break;
+      case 'triggers': void navigateToTrigger(item.id).then(focusDest); break;
       case 'settings': {
         const entry = findSettingsEntry(item.id);
         if (!entry) break;
         switchMenuItem('settings');
         openSettingsSubview(entry.subview);
+        // An anchored entry scrolls to a specific row; SettingsView's scroll
+        // effect lands focus on that row's control (e.g. the Language dropdown).
+        // A top-level subview entry has no anchor — focus its first control via
+        // the pane instead. Calling focusDest for an anchored entry would grab
+        // the panel's first control and fight the row focus.
         if (entry.anchor) settingsScrollTarget.value = entry.anchor;
+        else focusDest();
         break;
       }
-      case 'changes': void viewChangeDiffById(item.id); break;
+      case 'changes': void viewChangeDiffById(item.id).then(focusDest); break;
     }
   }
 
@@ -359,7 +381,9 @@ export function SearchEverywhere() {
         </div>
         <div class="search-everywhere-results" ref={resultsRef}>
           {loading && !isRecentsMode ? (
-            <div class="search-everywhere-loading"><span class="mini-spinner" /></div>
+            // Pre-delay window renders nothing (not the "No results" empty state)
+            // so a fast search neither flashes the spinner nor flashes "empty".
+            showSearchLoading ? <div class="search-everywhere-loading"><span class="mini-spinner" /></div> : null
           ) : !hasResults ? (
             <div class="search-everywhere-empty">
               {query ? `No results for "${query}"` : category === 'all' ? 'No recent items' : `No ${CATEGORIES.find(c => c.id === category)!.label.toLowerCase()}`}

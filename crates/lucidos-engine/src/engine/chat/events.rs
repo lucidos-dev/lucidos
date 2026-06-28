@@ -396,7 +396,7 @@ mod origin_invariants {
     #[test]
     fn workspace_origin_with_matching_mode_ok() {
         let origin = MessageOrigin::Workspace {
-            workspace: "personal".into(),
+            workspace: "dev".into(),
             thread_id: None,
             event_id: None,
             user_agent: None,
@@ -421,7 +421,7 @@ mod origin_invariants {
     #[test]
     fn workspace_origin_with_mismatched_mode_rejected() {
         let origin = MessageOrigin::Workspace {
-            workspace: "personal".into(),
+            workspace: "dev".into(),
             thread_id: None,
             event_id: None,
             user_agent: None,

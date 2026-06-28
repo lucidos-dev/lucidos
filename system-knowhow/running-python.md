@@ -83,7 +83,7 @@ Apps that ship Python helpers put them under `data/apps/<app-id>/scripts/`. The 
 
 ```python
 import os, sys
-sys.path.insert(0, os.path.join(os.environ["LUCIDOS_WORKSPACE"], "data/apps/momentum/scripts"))
+sys.path.insert(0, os.path.join(os.environ["LUCIDOS_WORKSPACE"], "data/apps/habit-tracker/scripts"))
 
 import strategy_params      # now resolves
 import big_candle_backtest  # now resolves

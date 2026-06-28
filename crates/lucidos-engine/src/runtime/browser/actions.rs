@@ -1,5 +1,5 @@
 use super::*;
-use crate::core::ARTIFACTS_DIR;
+use crate::core::{is_path_traversal, ARTIFACTS_DIR};
 use chrono::Local;
 use std::path::Path;
 use std::time::Duration;
@@ -465,6 +465,16 @@ impl BrowserRuntime {
         selector: Option<&str>,
         full_page: bool,
     ) -> Result<String, String> {
+        // The screenshot `path` is LLM-provided and joined under ARTIFACTS_DIR
+        // below. Reject traversal (`..`, leading `/` or `\`) so a crafted path
+        // can't escape the artifacts directory and overwrite arbitrary files.
+        if is_path_traversal(path) {
+            return Err(format!(
+                "Invalid screenshot path '{}': must be relative to artifacts/ (no '..', leading '/' or '\\')",
+                path
+            ));
+        }
+
         let mut instances = self.instances.lock().await;
         let browser_state = instances
             .get_mut(session_key)

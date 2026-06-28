@@ -7,6 +7,7 @@ Read the project rules and build two focused checklists — one for Rust agents,
 - `CLAUDE.md` — core principles, code style
 - `.claude/rules/rust.md` — Rust conventions
 - `.claude/rules/frontend.md` — frontend conventions
+- `.claude/rules/no-private-data.md` — applies to BOTH checklists (it ships publicly; the scan must flag private/personal/company-internal data in any shipping file)
 
 For each checklist, list the specific patterns agents must scan for. Examples:
 
@@ -45,12 +46,13 @@ Each agent prompt must be **self-contained** (agents have no conversation contex
 1. **Role**: "You are hardening the `{chunk}` module of Lucidos."
 2. **Directories**: exact paths this agent owns
 3. **Rules checklist**: the full language-specific checklist from Phase 1
-4. **5-point scan** — check every file for ALL of these:
+4. **6-point scan** — check every file for ALL of these:
    - **Rules compliance** — violations of the checklist rules
    - **Dead code** — unused functions, imports, types, exports, variables → delete entirely (don't comment out or `_` prefix)
    - **Bug patterns** — code that will crash or produce wrong results
    - **DRY violations** — duplicated logic within the module → extract into shared function
    - **Code quality** — unclear names, unnecessary complexity, stale/wrong comments → fix
+   - **Private data** — per `.claude/rules/no-private-data.md`, any real personal/family/company-internal data or machine path in a shipping file (test fixtures and comments included) → replace with the approved generic placeholder; leave legitimate attribution (the carve-out) alone
 5. **How to work**:
    - Use Glob to list all source files in your directories
    - Read every file
@@ -82,6 +84,37 @@ After all 8 module agents complete, launch ONE agent to find cross-module issues
 - **Duplicate definitions**: same type or function defined in multiple modules
 
 Use Grep across `crates/` to verify each item. Be conservative — only fix items confirmed dead.
+
+## Phase 3.5: Temporary-measures Reconciliation
+
+The whole-tree face of the **temporary-measures & marker-hygiene** check (the
+per-change face lives in `/harden` Phase 2 Agent 2 — same registry, same markers,
+same inclusion test, same "register it" escape valve; this one just sweeps the
+whole tree instead of a diff). It is a **reporting** pass — surface findings in the
+final summary; don't silently delete impermanent code or registry rows.
+
+Read `docs/temporary-measures.md` (governed by `.claude/rules/temporary-measures.md`),
+then check **both directions**:
+
+1. **Overdue cleanup — entries whose removal condition appears already met.** For
+   each `active` / `open` entry, read its removal/resolution condition and check the
+   tree for whether it's now satisfiable: the upstream bug it worked around is
+   fixed, the feature flag's cleanup is done, the model reliably emits the canonical
+   form, the investigation looks closeable. Flag any entry that reads as ready to
+   retire — with the evidence — so a human can flip its status to `removed` /
+   `resolved` (kept as history, never deleted) and do the paired cleanup the entry
+   names. Closing an investigation flags every measure tagged with its id.
+
+2. **Impermanent code missing a row.** Grep the tree for impermanent-looking things
+   NOT in the registry: `TODO` / `FIXME` / `HACK` / `XXX` markers, and
+   `remove after` / `temporary` / `diagnostic-only` / `workaround until` comments,
+   feature flags / kill-switches, and sunset back-compat shims. For each that meets
+   the inclusion test (*meant to go away, with a concrete condition for when*),
+   flag it as needing a registry row — the fix is to **register it**, not to launder
+   the marker. Skip anything on the rule's OUT list (permanent back-compat / old-data
+   tolerance, site-local `#[allow(...)]` / `@ts-expect-error` / `eslint-disable`
+   suppressions, ADR-recorded design decisions, open-ended tech debt with no concrete
+   end condition) — those are tracked elsewhere or not at all.
 
 ## Phase 4: Verify
 

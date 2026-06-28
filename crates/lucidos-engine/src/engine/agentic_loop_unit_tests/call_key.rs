@@ -16,12 +16,15 @@ mod intent_loop_tools_tests {
     }
 
     #[test]
-    fn intent_loop_tools_include_read_notifications() {
+    fn intent_loop_tools_include_notifications() {
         let tools = super::super::build_intent_tools();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        // The grouped notifications tool (list / mark_read / mark_all_read)
+        // replaced the flat read_notifications tool; it must still be present in
+        // the intent loop.
         assert!(
-            names.contains(&tn::READ_NOTIFICATIONS),
-            "Intent loop tools must include read_notifications, got: {:?}",
+            names.contains(&tn::NOTIFICATIONS),
+            "Intent loop tools must include the grouped notifications tool, got: {:?}",
             names
         );
     }

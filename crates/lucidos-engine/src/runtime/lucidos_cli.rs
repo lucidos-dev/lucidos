@@ -28,7 +28,7 @@ pub fn lucidos_cli_dir() -> Option<&'static Path> {
 ///
 /// Why walk up: production engine binary lives at `target/release/lucidos-engine`
 /// (sibling to `lucidos`), but `cargo test` binaries live at
-/// `target/debug/deps/<test-XXX>` — one level deeper than `lucidos`. Both must
+/// `target/debug/deps/<test-hash>` — one level deeper than `lucidos`. Both must
 /// resolve correctly.
 pub(crate) fn find_lucidos_cli_dir(start: &Path) -> Option<PathBuf> {
     let mut dir = Some(start);

@@ -1,5 +1,6 @@
 pub mod condition;
 pub mod config;
+pub mod definition;
 pub mod groups;
 pub mod replay;
 pub mod summary;
@@ -66,6 +67,7 @@ mod tests {
             go_to_review: false,
             group_id: None,
             side_effect_grant: vec![],
+            plugin_id: None,
         }
     }
 
@@ -174,6 +176,7 @@ mod tests {
             go_to_review: false,
             group_id: None,
             side_effect_grant: vec![],
+            plugin_id: None,
         };
         configs.insert("cron-only".into(), cron_trigger);
 

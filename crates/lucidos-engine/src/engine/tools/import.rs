@@ -86,6 +86,17 @@ impl LucidosEngine {
                     .map(|s| format!("imported/{}", s.trim_start_matches("imported/")))
                     .unwrap_or_else(|| format!("imported/{}", filename));
 
+                // Finder-style auto-suffix on collision: never overwrite an
+                // existing artifact. Resolve before the binary/text branch so
+                // every write/commit/event below uses the same final path.
+                let dest_relative = match self
+                    .artifact_manager
+                    .resolve_collision_free_path(&dest_relative)
+                {
+                    Ok(d) => d,
+                    Err(e) => return Ok(format!("Error: {}", e)),
+                };
+
                 // Check if file is binary by extension
                 let extension = source
                     .extension()
@@ -547,12 +558,14 @@ impl LucidosEngine {
 
     /// Import a file from a given path (used by upload API)
     /// Import a file into the artifact store (write + git commit + event).
-    /// Returns `(result_message, commit_sha)`.
+    /// Returns `(result_message, commit_sha, resolved_dest_relative)` — the
+    /// resolved path can differ from the requested one when a Finder-style
+    /// auto-suffix was applied to avoid overwriting an existing artifact.
     pub async fn import_file_from_path(
         &self,
         source: &std::path::Path,
         dest_relative: &str,
-    ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(String, String, String), Box<dyn std::error::Error + Send + Sync>> {
         // Check file exists
         if !source.exists() {
             return Err(format!("File not found: {:?}", source).into());
@@ -560,6 +573,13 @@ impl LucidosEngine {
         if !source.is_file() {
             return Err(format!("Not a file: {:?}", source).into());
         }
+
+        // Finder-style auto-suffix on collision: never overwrite an existing
+        // artifact. Resolve once up front so the write/commit, the commit
+        // message, the event, and the returned message all use the final path.
+        let dest_relative = self
+            .artifact_manager
+            .resolve_collision_free_path(dest_relative)?;
 
         // Determine if binary by extension
         let extension = source
@@ -573,13 +593,13 @@ impl LucidosEngine {
         let commit_sha = if is_binary {
             let bytes = std::fs::read(source)?;
             self.artifact_manager
-                .write_and_commit(dest_relative, &bytes, &format!("Import {}", dest_relative))
+                .write_and_commit(&dest_relative, &bytes, &format!("Import {}", dest_relative))
                 .await?
         } else {
             let content = std::fs::read_to_string(source)?;
             self.artifact_manager
                 .write_and_commit(
-                    dest_relative,
+                    &dest_relative,
                     &content,
                     &format!("Import {}", dest_relative),
                 )
@@ -589,7 +609,7 @@ impl LucidosEngine {
 
         self.event_bus
             .emit(BusEvent::System(SystemEvent::ArtifactImported {
-                artifact_path: dest_relative.to_string(),
+                artifact_path: dest_relative.clone(),
                 source_type: "local_file".into(),
                 source_detail: source.to_string_lossy().to_string(),
                 commit_hash: commit_sha.clone(),
@@ -602,6 +622,6 @@ impl LucidosEngine {
             dest_relative,
             &commit_sha[..commit_sha.floor_char_boundary(7)]
         );
-        Ok((msg, commit_sha))
+        Ok((msg, commit_sha, dest_relative))
     }
 }

@@ -24,10 +24,10 @@ describe('resolveOrigin', () => {
       type: 'MessageReceived',
       text: 'hi',
       mode: 'human',
-      origin: { kind: 'workspace', workspace: 'personal', thread_id: 't1', event_id: 'e1' },
+      origin: { kind: 'workspace', workspace: 'myws', thread_id: 't1', event_id: 'e1' },
     };
     const o = resolveOrigin(exch(ev));
-    expect(o).toEqual({ kind: 'workspace', workspace: 'personal', thread_id: 't1', event_id: 'e1' });
+    expect(o).toEqual({ kind: 'workspace', workspace: 'myws', thread_id: 't1', event_id: 'e1' });
   });
 
   it('synthesizes a Device origin when only legacy device_id is set', () => {
@@ -530,9 +530,9 @@ describe('renderChannelSection', () => {
   });
   it('workspace origin renders workspace name', () => {
     const node = renderChannelSection({
-      kind: 'workspace', workspace: 'personal', mode: 'agent',
+      kind: 'workspace', workspace: 'myws', mode: 'agent',
     });
-    expect(JSON.stringify(node)).toContain('personal');
+    expect(JSON.stringify(node)).toContain('myws');
   });
   it('workspace origin with thread_id renders a thread link (short id when title unresolved)', () => {
     // No getLiveTitle and an empty current-workspace name (the test default) →
@@ -540,12 +540,12 @@ describe('renderChannelSection', () => {
     // so the link is never blank.
     const node = renderChannelSection({
       kind: 'workspace',
-      workspace: 'personal',
+      workspace: 'myws',
       thread_id: '12345678-aaaa-bbbb-cccc-dddddddddddd',
       mode: 'agent',
     });
     const s = JSON.stringify(node);
-    expect(s).toContain('personal');
+    expect(s).toContain('myws');
     expect(s).toContain('thread 12345678');
   });
   it('workspace origin renders the live thread name when the source thread is local', () => {

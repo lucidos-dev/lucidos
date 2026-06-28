@@ -10,7 +10,7 @@ use serde_json::json;
 pub fn get_notification_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::SEND_NOTIFICATION.to_string(),
-        description: "Send a notification to the user. The notification always lands in the inbox where the user can read it. When push notifications are enabled the user is also pushed on their devices. The push/in-app tap routing is controlled by `tap`, a structured `{kind, to?}` object: `{\"kind\":\"modal\"}` (default) opens the inbox modal so the user can read the message and decide what to do; `{\"kind\":\"none\"}` is passive (no destination, marks itself read on display); `{\"kind\":\"navigate\",\"to\":{...}}` delegates to the same router the `navigate_ui` tool uses — pass the same arg shape (target + target-specific sub-fields) so a tap can deep-link to any panel/app/file/thread/url reachable via navigate_ui. Use `app_id` to identify which app a notification is about — it powers the modal's \"Open <app>\" button.".to_string(),
+        description: "Send a notification to the user. The notification always lands in the inbox where the user can read it. How it ALSO surfaces depends on whether the user is actively viewing Lucidos: if the user has the app open/focused on ANY device, the OS push is suppressed on EVERY device and the active device(s) show an in-app toast instead — a device never gets both a push and a toast. An OS push only fires (to devices with push notifications enabled) when NO device is active — app backgrounded, screen off, or closed. Practical consequence: if the user is chatting with you right now, they are active, so they'll see this as an in-app toast on the device in front of them, NOT an OS push — do not tell them to 'check your device for the push'. The push only reaches their other, idle devices (or this one once they put it down). The push/in-app tap routing is controlled by `tap`, a structured `{kind, to?}` object: `{\"kind\":\"modal\"}` (default) opens the inbox modal so the user can read the message and decide what to do; `{\"kind\":\"none\"}` is passive (no destination, marks itself read on display); `{\"kind\":\"navigate\",\"to\":{...}}` delegates to the same router the `navigate_ui` tool uses — pass the same arg shape (target + target-specific sub-fields) so a tap can deep-link to any panel/app/file/thread/url reachable via navigate_ui. Use `app_id` to identify which app a notification is about — it powers the modal's \"Open <app>\" button.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -44,43 +44,13 @@ pub fn get_notification_tool() -> ToolDefinition {
     }
 }
 
-/// Tool for reading notifications (past notifications, unread count, etc.).
-pub fn get_read_notifications_tool() -> ToolDefinition {
-    ToolDefinition {
-        name: tn::READ_NOTIFICATIONS.to_string(),
-        description: "Read notifications from the notification inbox. Use this to check what notifications have been sent (including task error notifications), see unread counts, or review notification history.".to_string(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "filter": {
-                    "type": "string",
-                    "enum": ["unread", "all"],
-                    "description": "Filter: 'unread' for only unread notifications, 'all' for all. Default: 'unread'."
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of notifications to return (1-50, default 20)."
-                }
-            }
-        }),
-    }
-}
+// Reading / clearing the inbox (list / mark_read / mark_all_read) is the grouped
+// `notifications` tool, built from the capability parity manifest
+// (`crate::capability_manifest::build_llm_tool`). The retired flat
+// `read_notifications` tool name still dispatches to that handler for back-compat
+// (see `Domain::llm_aliases`). Only the *send* tool remains hand-written here,
+// because its rich structured `tap` schema is a poor fit for the grouped union.
 
-pub(super) fn enable_push_tools() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: tn::ENABLE_PUSH_NOTIFICATIONS.to_string(),
-            description: "Enable or decline push notifications. Call with enabled=true if the user wants OS-level alerts for triggered tasks, or enabled=false if they decline.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "enabled": {
-                        "type": "boolean",
-                        "description": "true to enable push notifications, false to decline (won't ask again)"
-                    }
-                },
-                "required": ["enabled"]
-            }),
-        },
-    ]
-}
+// Push notifications are no longer a standalone tool — enabling/declining them is
+// `set_preference(key="push_notifications", value="enabled"|"declined")`, which
+// keeps the [PUSH_NOTIFICATION_REQUEST] handshake. See core/preference_catalog.rs.

@@ -11,7 +11,7 @@ use crate::engine::thread_events::{ActorMode, EventChannel, MessageOrigin};
 use crate::engine::types::*;
 use crate::engine::LucidosEngine;
 use crate::llm::{
-    get_default_tools, get_image_generation_tool, get_mcp_tools, get_notification_tool,
+    get_default_tools, get_image_generation_tool, get_notification_tool,
     get_save_thread_image_tool, get_view_image_tool, Message,
 };
 use tokio_util::sync::CancellationToken;
@@ -373,7 +373,8 @@ impl LucidosEngine {
                     // escalation hard-kills a non-idling turn (→ process_exited),
                     // and REDIRECT_INTERRUPT_MAX_WAIT is the backstop above that.
                     // If the session died, the msg_tx send below fails and the
-                    // existing emit_routing_failure path tells the user to retry.
+                    // lost-race fall-through below routes the follow-up via the
+                    // slow `--resume` path instead of dropping it.
                     let redirect_deadline = std::time::Instant::now()
                         + super::super::process_helpers::REDIRECT_INTERRUPT_MAX_WAIT;
                     loop {
@@ -431,7 +432,8 @@ impl LucidosEngine {
                     (Some(id), AgentInputKind::WakeFromChild)
                 } else {
                     use crate::engine::thread_events::EventMeta;
-                    self.event_bus
+                    let emit_result = self
+                        .event_bus
                         .emit(crate::engine::event_bus::BusEvent::Thread {
                             thread_id,
                             event: make_message_received(
@@ -439,7 +441,10 @@ impl LucidosEngine {
                                 user_message,
                                 user_images,
                                 device_id,
-                                device_name,
+                                // Clone, not move: the `!send_ok` branch below now
+                                // falls through to the slow path, which reuses
+                                // `device_name` (and so does the non-CC fast-path).
+                                device_name.clone(),
                                 parent_thread_id,
                                 spawning_event_id,
                                 mode,
@@ -454,8 +459,16 @@ impl LucidosEngine {
                             },
                         })
                         .await?;
+                    // Stash the emitted id so a lost-race fall-through to the slow
+                    // path (below) doesn't re-emit MessageReceived — mirrors the
+                    // non-CC injection fast-path. On the success path we return
+                    // before the slow path reads it, so this is harmless there.
+                    if let Some(result) = emit_result {
+                        pre_emitted_origin = Some(result.event_id);
+                    }
                     (
-                        event_id.and_then(|s| uuid::Uuid::parse_str(s).ok()),
+                        pre_emitted_origin
+                            .or_else(|| event_id.and_then(|s| uuid::Uuid::parse_str(s).ok())),
                         AgentInputKind::User,
                     )
                 };
@@ -495,34 +508,35 @@ impl LucidosEngine {
                     }
                 };
 
-                if !send_ok {
-                    // `emit_routing_failure` lands the terminator and returns
-                    // Ok; the explicit Ok(ProcessResult) return below keeps
-                    // the outer api/chat handler from emitting a second one
-                    // from its Err branch.
-                    emit_routing_failure(
-                        &self.event_bus,
-                        thread_id,
-                        "Coding agent session ended while routing message. Please try again.",
-                    )
-                    .await?;
-                    log!(
-                        "[Chat] CC follow-up routing failed for thread {} — emitted ResponseFailed",
-                        thread_id,
-                    );
-                } else {
+                if send_ok {
                     log!("[Chat] CC follow-up routed via msg_tx for thread {} (bypassed register_thread_queued)", thread_id);
+                    return Ok(ProcessResult {
+                        response: String::new(),
+                        steps: vec![],
+                        images: vec![],
+                        request_id,
+                        thread_id,
+                        proposed_change: false,
+                        auto_apply: false,
+                        orphaned_injections: vec![],
+                    });
                 }
-                return Ok(ProcessResult {
-                    response: String::new(),
-                    steps: vec![],
-                    images: vec![],
-                    request_id,
-                    thread_id,
-                    proposed_change: false,
-                    auto_apply: false,
-                    orphaned_injections: vec![],
-                });
+
+                // The live session went away or is terminating between the
+                // has_session check and the send — most commonly the idle-
+                // termination race: the session loop set `process_exited` and
+                // cancelled the subprocess (see the ExitSubprocess arm in
+                // run_session/run.rs) while this follow-up was in flight. Don't
+                // emit a routing failure ("please try again") and don't drop the
+                // message — fall through to the slow path so it spawns a fresh
+                // `--resume` session and runs as the next turn. MessageReceived
+                // was already emitted above (`pre_emitted_origin` is set), so the
+                // slow path won't re-emit it. Mirrors the non-CC injection
+                // fast-path's lost-race fallback below.
+                log!(
+                    "[Chat] CC follow-up lost the live-session race for thread {} — falling back to slow path (resume)",
+                    thread_id
+                );
             }
         }
 
@@ -897,9 +911,12 @@ impl LucidosEngine {
 
         let mut tools = get_default_tools();
         tools.push(get_notification_tool());
-        tools.push(crate::llm::get_read_notifications_tool());
+        // Grouped notification-inbox tool (list / mark_read / mark_all_read) +
+        // any other manifest-declared LLM tools — single source of truth.
+        tools.extend(crate::capability_manifest::llm_tools());
         tools.push(crate::llm::get_navigate_ui_tool());
-        tools.push(crate::llm::get_manage_repositories_tool());
+        // manage_models / manage_repositories are now manifest-built grouped tools
+        // contributed by llm_tools() above (no longer spliced here).
         tools.push(get_save_thread_image_tool());
         // view_image re-loads an earlier thread image into vision — it needs no
         // image *generation* provider, so it's always available (unlike generate_image).
@@ -907,8 +924,9 @@ impl LucidosEngine {
         if image_provider_available {
             tools.push(get_image_generation_tool());
         }
-        tools.extend(get_mcp_tools());
-        // Add discovered tools from running MCP servers
+        // MCP server management is the grouped `mcp` manifest tool (spliced via
+        // llm_tools() above). Discovered tools from running MCP servers are added
+        // separately below.
         tools.extend(self.mcp_manager.get_tool_definitions().await);
 
         let response_channel: Option<EventChannel> = if is_trigger {

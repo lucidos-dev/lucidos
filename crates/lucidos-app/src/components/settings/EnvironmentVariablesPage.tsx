@@ -6,8 +6,9 @@ import {
   deleteEnvironmentVariable,
 } from '../../store/actions/environmentVariables';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
-import { DelayedSpinner } from '../shared/DelayedSpinner';
 import { LoadableError } from '../shared/LoadableError';
+import { ListSkeleton } from '../shared/ListSkeleton';
+import { LoadingFade } from '../shared/LoadingFade';
 import type { EnvironmentVariable } from '../../api/types';
 
 const NAME_HINT = 'Uppercase letters, digits and underscores; must start with a letter or underscore (e.g. LUCIDOS_REPO). Reserved names are rejected by the server.';
@@ -155,28 +156,26 @@ export function EnvironmentVariablesPage() {
       </div>
     );
   }
-  if (loadable.status !== 'loaded') {
-    if (!showLoading) return null;
-    return (
-      <div class="settings-section">
-        <DelayedSpinner />
-      </div>
-    );
-  }
 
   return (
     <div class="settings-section">
-      <p class="settings-section-desc">
-        User-managed environment variables made available to agent scripts and tools.
-      </p>
-      <div class="list-rows">
-        {loadable.data.length === 0 ? (
-          <div class="empty-state">No environment variables yet.</div>
-        ) : (
-          loadable.data.map((envVar) => <EnvVarRow key={envVar.id} envVar={envVar} />)
-        )}
-        <AddEnvVarForm />
-      </div>
+      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+        {loadable.status === 'loaded' ? (
+          <>
+            <p class="settings-section-desc">
+              User-managed environment variables made available to agent scripts and tools.
+            </p>
+            <div class="list-rows">
+              {loadable.data.length === 0 ? (
+                <div class="empty-state">No environment variables yet.</div>
+              ) : (
+                loadable.data.map((envVar) => <EnvVarRow key={envVar.id} envVar={envVar} />)
+              )}
+              <AddEnvVarForm />
+            </div>
+          </>
+        ) : null}
+      </LoadingFade>
     </div>
   );
 }

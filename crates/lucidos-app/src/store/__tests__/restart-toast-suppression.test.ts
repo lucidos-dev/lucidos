@@ -39,11 +39,11 @@ describe('toast suppression while engine is restarting', () => {
     // activates a new service worker, which would otherwise stack a Refresh
     // toast on top of the "Restarting engine..." status.
     engineRestarting.value = true;
-    showToast('New version available', 'info', {
+    showToast('New version available — refresh to sync', 'info', {
       key: 'update-available',
       action: { label: 'Refresh', onClick: () => {} },
     });
-    expect(toasts.value.some(t => t.message === 'New version available')).toBe(false);
+    expect(toasts.value.some(t => t.message === 'New version available — refresh to sync')).toBe(false);
   });
 
   it('does NOT update an existing keyed toast while restarting', () => {
@@ -73,10 +73,10 @@ describe('toast suppression while engine is restarting', () => {
     expect(toasts.value).toHaveLength(0);
 
     // connection.ts / UiBlockingOverlay clear the flag before emitting their toasts.
+    // The real "Engine restarted" toast carries no action (the refresh prompt is
+    // owned solely by the build-id staleness check).
     engineRestarting.value = false;
-    showToast('Engine restarted', 'success', {
-      action: { label: 'Refresh', onClick: () => {} },
-    });
+    showToast('Engine restarted', 'success', { autoDismissMs: 5_000 });
     expect(toasts.value.some(t => t.message === 'Engine restarted')).toBe(true);
   });
 });

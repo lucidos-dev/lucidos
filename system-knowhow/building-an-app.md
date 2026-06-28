@@ -122,7 +122,7 @@ Before you call the app done, check it against this list. A "no" on any line mea
 - Any **`px` sizing** beyond `1px` borders? → convert to `rem` / `--space-*` / `--radius-*`.
 - Any **plain `<button>`** (or a hand-rolled outlined button) instead of `.action-btn` / `.action-btn-secondary`?
 - Does **every** `.action-btn-confirm` / `.action-btn-danger` / `.action-btn-secondary` still carry the base `.action-btn`? A lone variant (`class="action-btn-secondary"`) renders as a plain grey browser button — the variants are additive modifiers.
-- Only **real theme tokens**? The token set is closed — `--space-{xs,sm,md,lg,xl}`, `--radius-{sm,md,lg}`, `--font-ui` / `--font-mono` (full list in `js-sdk.md` § Theme variables). Don't invent `--space-2xl` or `--font-family` — an undefined `var()` silently drops the rule.
+- Only **real theme tokens**? The token set is closed — `--space-{xs,sm,md,lg,xl}`, `--radius-{sm,md,lg}`, `--font-ui` / `--font-mono` (full list in `js-sdk.md` § Theme variables). Don't invent tokens like `--space-2xl` — an undefined `var()` silently drops the rule. The UI font is **`--font-ui`** (`--font-family` / `--font` are tolerated aliases so the common mis-guess still resolves, but write `--font-ui`); you usually don't need to set the font at all, since `body` already inherits it from `sdk-iframe.css`.
 - Is there **one clear focal point**, generous whitespace, and a consistent spacing rhythm — or a cramped grid of equal-weight widgets?
 - Dropped into Lucidos next to the host UI, **would it look like it belongs** — or like a bolted-on web page?
 - **Inline `<script>` for small apps.** Split into `app.js` only when the script grows past ~100 lines or you want to share it with another script.
@@ -132,6 +132,49 @@ Before you call the app done, check it against this list. A "no" on any line mea
   - `fetch('https://<external-host>/...')` from the iframe — mixed-content / CORS will block it, and any credential is sitting in the iframe.
   - `fetch('/api/v1/proxy/<name>/...')` from the iframe — same-origin so it *runs*, but it's the proxy URL the SDK helper builds for you. Constructing it by hand makes the proxy name a magic string and skips any future SDK-side concerns (timeouts, retries, response parsing, error shape). Use the helper.
 - **Manifest description matters.** It's how the user finds the app in the launcher and how the engine LLM knows what the app is for. Write it like a one-line README, not a tagline.
+
+## Interaction primitives — use the shell's, not the browser's
+
+An app runs in an iframe, and the browser's built-in interactions don't belong there. `window.confirm` / `window.alert` / `window.prompt` and a native `<select>` all draw **OS chrome** that ignores the user's Lucidos theme, font, and scale — and the dialogs throw a system modal that doesn't sit above your app correctly. `lucidos.ui.*` gives you themed equivalents the **host shell** renders *above* the iframe, so they inherit the user's light/dark + font + scale for free and look native. Reach for these by default; the browser's primitives are a smell. The full reference — every signature, option, and return type — lives in [`system-knowhow/js-sdk.md`](./js-sdk.md) § lucidos.ui; the four you'll reach for most:
+
+- **Toast — transient feedback** (instead of a hand-rolled banner). `lucidos.ui.toast(message, type?, opts?)` is fire-and-forget: a brief themed banner above the app for success/error/info/warning. Reach for it after a save, a failed request, a copy-to-clipboard. `type` ∈ `'success' | 'info' | 'warning' | 'error'` (default `'info'`); `opts` is `{ durationMs?, dismissable? }`. It returns nothing, and **action-button callbacks can't cross the iframe boundary** — a toast is a message, not a prompt.
+
+  ```js
+  lucidos.ui.toast('Saved', 'success');
+  lucidos.ui.toast('Could not reach the server', 'error');
+  ```
+
+- **Confirm — yes/no** (instead of `window.confirm()`). `lucidos.ui.confirm({ title?, message, okLabel?, cancelLabel?, danger? })` → `Promise<boolean>` (`true` on OK/Enter, `false` on Cancel/Esc/backdrop). Set `danger: true` to render the OK button red for a destructive action.
+
+  ```js
+  if (await lucidos.ui.confirm({
+    message: 'Delete this board and its 3 cards?',
+    okLabel: 'Delete', danger: true,
+  })) {
+    // proceed with deletion
+  }
+  ```
+
+- **Prompt — one line of text** (instead of `window.prompt()`). `lucidos.ui.prompt({ message, title?, defaultValue?, placeholder?, okLabel?, cancelLabel?, multiline? })` → `Promise<string | null>` (the entered string, or `null` on cancel). Pass `multiline: true` for a textarea.
+
+  ```js
+  const name = await lucidos.ui.prompt({ message: 'New name:', defaultValue: 'Untitled' });
+  if (name === null) return;  // user cancelled
+  ```
+
+- **Select — a themed dropdown** (instead of a native `<select>`). A native `<select>`'s popup is drawn by the OS and **cannot be themed** — it's the one control that breaks the "looks native to Lucidos" bar even when everything else is perfect. Two ways in:
+  - **Declarative** — give your `<select>` the `lucidos-select` class and call `lucidos.ui.enhanceSelects()` once. The native element stays in the DOM (hidden), so its `value` and `change` events keep firing — existing form code is untouched.
+  - **Programmatic** — `lucidos.ui.Select.create({ options, value?, onChange? })` returns an instance; insert `instance.element` into the DOM and drive it with `setValue` / `setOptions` / `destroy`.
+
+  ```html
+  <select class="lucidos-select" data-placeholder="Status…">
+    <option value="todo">To do</option>
+    <option value="done">Done</option>
+  </select>
+  <script>lucidos.ui.enhanceSelects();</script>
+  ```
+
+These four are the everyday set; navigation (`lucidos.ui.navigate`), opening a fresh chat (`lucidos.ui.startThread`), and theme application (`applyPreferences` / `watchPreferences`) round out `lucidos.ui` — see `js-sdk.md` § lucidos.ui for all of it.
 
 ## Updating an app
 
@@ -153,6 +196,7 @@ While the app coding-agent thread is open the user can preview the in-flight app
 - **Hardcoding colors / shipping a light-only (or dark-only) app.** New apps inherit the Lucidos theme by default (see *Scaffolding defaults*): include the theme assets, call `lucidos.ui.applyPreferences()` + `lucidos.ui.watchPreferences()`, and style with the theme CSS variables (`var(--bg-primary)`, `var(--text-primary)`, `var(--accent)`, `var(--border-color)`, …) instead of hex literals. Hardcoded colors ignore the user's OS light/dark setting — a light-mode workspace gets a jarring dark app, or vice versa. This is the single most common theming regression.
 - **Sizing in `px` instead of `rem`.** The user's font-size / UI-scale preference is applied as the root font-size, so `px` values don't scale with it and the app ignores the setting. Size in `rem` (and the `--space-*` / `--radius-*` tokens); `1px` borders are the only acceptable exception. (See *Scaffolding defaults* item 5.)
 - **Hand-rolling a secondary button — *or* writing `.action-btn-secondary` without the base class.** The shared layer ships `.action-btn` (+ `.action-btn-confirm` / `.action-btn-danger`) and `.action-btn-secondary`. Don't invent your own outlined/ghost button with `var(--accent)` — use `.action-btn-secondary`. But the variants are **additive**: write `class="action-btn action-btn-secondary"`, not `class="action-btn-secondary"` alone. A lone variant matches no `.action-btn` rule and falls back to a plain grey browser button — the "weird-looking secondary button" bug. (This is the standard base-plus-modifier shape, like Bootstrap's `btn btn-secondary`; see *Scaffolding defaults* item 4.)
+- **Using the browser's dialogs or a native `<select>` instead of `lucidos.ui.*`.** `window.confirm()` / `window.alert()` / `window.prompt()`, a hand-rolled toast banner, and a native `<select>` all draw OS chrome that ignores the user's theme, font, and scale — and the dialogs throw a jarring system modal that doesn't sit above the app correctly. A native `<select>`'s popup in particular **can't be styled at all**, so it breaks the "looks native" bar on its own. Use `lucidos.ui.toast` / `lucidos.ui.confirm` / `lucidos.ui.prompt` / `lucidos.ui.Select` (or `enhanceSelects()`) — themed and rendered by the host shell above your iframe. See *Interaction primitives — use the shell's, not the browser's* above and `system-knowhow/js-sdk.md` § lucidos.ui.
 - **Creating an app for a one-shot.** If the user only wants the answer once, just give it.
 - **Inventing SDK calls — or guessing the surface, then checking later.** Load `system-knowhow/js-sdk.md` **before** you write the first SDK call or theme-CSS `var()`, not after the scaffold is written. The surface is small and stable but easy to misremember, and a scaffold written from memory tends to ship several guesses at once: e.g. there is no `lucidos.chat` namespace (`lucidos.chat.send` doesn't exist — open a chat with the typed `lucidos.ui.startThread({ prompt })`, the preferred wrapper over the low-level `lucidos.ui.navigate('new-chat', …)`), and `lucidos.data.read()` returns a **string** — `JSON.parse` it on read and `JSON.stringify` on write. Checking *after* you've written the JS catches the calls but tends to miss the CSS (the markup class / token errors hide in a later pass).
 - **Hand-rolling the proxy URL with raw `fetch`.** Both `fetch('https://<external-host>/...')` (mixed-content / CORS will block it) and `fetch('/api/v1/proxy/<name>/...')` (same-origin so it runs, but constructs the helper's URL by hand and bypasses the SDK) are wrong. Use `lucidos.proxy(name).fetch(path, init)` and configure the backend in `data/config/apis.json` — one shape, no string-building.

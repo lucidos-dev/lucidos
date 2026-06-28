@@ -119,10 +119,10 @@ mod tests {
     #[test]
     fn resolves_workspace_with_well_formed_ports_file() {
         let tmp = TempDir::new().unwrap();
-        write_ports(tmp.path(), "personal", "API_PORT=5174\nVITE_PORT=5174\n");
-        let target = resolve_workspace("personal", Some(tmp.path())).unwrap();
+        write_ports(tmp.path(), "dev", "API_PORT=5174\nVITE_PORT=5174\n");
+        let target = resolve_workspace("dev", Some(tmp.path())).unwrap();
         assert_eq!(target.api_port, 5174);
-        assert_eq!(target.workspace_path, tmp.path().join("personal"));
+        assert_eq!(target.workspace_path, tmp.path().join("dev"));
         assert_eq!(target.proto, "https");
     }
 

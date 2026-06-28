@@ -136,7 +136,7 @@ impl LucidosEngine {
                 // Check if timezone is set - required for triggers
                 let tz_val = self.user_timezone.read().await.clone();
                 if tz_val.is_empty() {
-                    return Ok("Error: User timezone is not set. Use set_timezone tool first to set the user's timezone before creating triggers.".to_string());
+                    return Ok("Error: User timezone is not set. Call set_preference(key=\"timezone\", value=\"…\") first to set the user's timezone before creating triggers.".to_string());
                 }
 
                 // Emit via EventBus — persists to events table AND notifies scheduler instantly

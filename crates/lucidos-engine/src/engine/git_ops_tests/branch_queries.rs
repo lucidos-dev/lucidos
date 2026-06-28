@@ -231,7 +231,7 @@ async fn commit_plus_revert_branch_has_no_changed_files() {
 /// (`default_diff_base`), so the `coding_agent_has_diff` gate it feeds can never
 /// disagree with the diff the button renders.
 ///
-/// Regression for the `user-acquisition` migration report: a migration tool
+/// Regression for the `example-repo` migration report: a migration tool
 /// rewrote the user's local default branch so `origin/<default>` (the PR
 /// branch's true fork point) is no longer an ancestor of local `main`. Diffing
 /// against local `main` reported 53 changed files; the Diff button (diffing

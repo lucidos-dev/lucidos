@@ -65,7 +65,7 @@ The flat one-to-one mapping means there is no separate "install destination" que
 
 ## `manifest.toml` schema
 
-Four required fields, two optional. Unknown extra fields are accepted and round-trip into the `PluginInstalled` event payload's `manifest` so future additive fields stay compatible with old install records.
+Four required fields, three optional. Unknown extra fields are accepted and round-trip into the `PluginInstalled` event payload's `manifest` so future additive fields stay compatible with old install records.
 
 | Field | Required | Type | Notes |
 |---|---|---|---|
@@ -75,6 +75,9 @@ Four required fields, two optional. Unknown extra fields are accepted and round-
 | `description` | yes | string | One-line summary. Free text. If your plugin pairs well with a cron trigger, mention it here (e.g. "Ask Lucidos to set up a daily reflection trigger after install") so the install-time LLM offers to wire one up -- see "What doesn't belong in a plugin" below. |
 | `source` | no | string | Git remote URL where the plugin lives. Used by `check_plugin_updates` and `update_plugin` to re-fetch the manifest. Omit for archive-only sharing -- the plugin still installs and uninstalls correctly, but updates cannot be fetched (the update tools will return an explanatory error). When present, it must look like a git remote (`https://`, `http://`, `git@`, or ending in `.git`). |
 | `engine` | no | string | Semver constraint (e.g. `">=0.5.0"`). Parsed and stored but the v1 install path does not enforce it -- use it as documentation for now. |
+| `categories` | no | array of string | Topical tags for browsing the **Store** (the Plugins panel's category filter). A **controlled vocabulary** (see below) — pick from the allowed set. Normalised to lowercase on parse; an unknown value is **dropped and flagged** at catalog-scan time (it appears in the catalog's `errors`), never blocking install. |
+
+**Plugin categories — the controlled vocabulary.** The allowed values are: `productivity`, `finance`, `health`, `developer-tools`, `data`, `communication`, `automation`, `lifestyle`, `research`, `fun` (kebab-case). The catalog offers a filter pill per category that actually appears in the catalog, and each card shows its category chips. The set is intentionally small and curated so categories stay browsable — a free-form tag would fragment (`finance` vs `money` vs `budgeting`). Tag a plugin with the one or few that fit; omit `categories` entirely if none do. (Source of truth: `PLUGIN_CATEGORIES` in `crates/lucidos-engine/src/core/plugins.rs`.)
 
 Worked example (`browser-learning/manifest.toml`):
 
@@ -84,6 +87,7 @@ version = "0.1.0"
 name = "Browser Learning"
 description = "Self-healing site knowhow for browser automation. Agents emit observations during tasks; a reflection recipe folds them into per-domain knowhow so the next agent visits with better priors."
 source = "https://github.com/lucidos-dev/plugins/tree/main/browser-learning"
+categories = ["automation", "developer-tools"]
 ```
 
 The `source` may be the GitHub tree URL the user copied from the address bar -- the install tool parses it back into a git remote + branch + subpath. For a single-repo plugin, use the bare git URL.
@@ -97,9 +101,9 @@ The `source` may be the GitHub tree URL the user copied from the address bar -- 
 - Every `data/`-relative path the install will write (overwrites called out separately in yellow)
 - The `setup` field rendered as markdown, if present
 
-The user clicks **Confirm** (writes files, emits `PluginInstalled`, auto-reloads WASM signers if any `auth-modules/` files were touched) or **Cancel** (drops staging, emits `PluginInstallCanceled`). Until they click, no bytes hit `data/`.
+The user clicks **Confirm** (writes files, **commits them to the workspace git repo in one commit** — `"Install plugin: <id> v<version>"` — emits `PluginInstalled`, auto-reloads WASM signers if any `auth-modules/` files were touched) or **Cancel** (drops staging, emits `PluginInstallCanceled`). Until they click, no bytes hit `data/`. The install commit means a plugin's files are version-controlled exactly like `write_file`/`edit_file` writes — with history, recoverable on a hard reset, and visible to git-based backups. Uninstall is symmetric: confirming it deletes the recorded files and commits the deletion (`"Uninstall plugin: <id> v<version>"`) before emitting `PluginUninstalled`.
 
-**Setup runs on confirm — but only when there's *new* setup to run.** If the manifest carried a non-empty `setup` field, confirming the install spawns a **Lucidos Agent setup thread** seeded with the setup instructions and the user is navigated straight into it, so the author's "ask the user / wire this up" steps actually happen instead of sitting inert as panel text. This fires for **both** the App Store button and the agent's `install_plugin` tool (they share the confirm endpoint). The spawned thread's id is recorded in the `PluginInstalled` event (`manifest.setup_thread_id`) so the App Store card can resolve it later. On an **update**, the setup thread spawns only when the new version's `setup` text actually **differs** (after trimming) from the currently-installed version's — a version bump that left `setup` unchanged re-runs nothing and navigates nowhere, since re-doing identical setup on every update is noise. A fresh install (or an update whose `setup` is new/changed) always spawns. The engine's background marketplace **update check** only notifies — it never installs — so it never spawns a setup thread.
+**Setup runs on confirm — but only when there's *new* setup to run.** If the manifest carried a non-empty `setup` field, confirming the install spawns a **Lucidos Agent setup thread** seeded with the setup instructions and the user is navigated straight into it, so the author's "ask the user / wire this up" steps actually happen instead of sitting inert as panel text. This fires for **both** the Plugins panel's Install button and the agent's `install_plugin` tool (they share the confirm endpoint). The spawned thread's id is recorded in the `PluginInstalled` event (`manifest.setup_thread_id`) so the plugin's card can resolve it later. On an **update**, the setup thread spawns only when the new version's `setup` text actually **differs** (after trimming) from the currently-installed version's — a version bump that left `setup` unchanged re-runs nothing and navigates nowhere, since re-doing identical setup on every update is noise. A fresh install (or an update whose `setup` is new/changed) always spawns. The engine's background marketplace **update check** only notifies — it never installs — so it never spawns a setup thread.
 
 What this means for plugin authors:
 
@@ -108,9 +112,9 @@ What this means for plugin authors:
 - **Updates inherit the same panel.** `update_plugin` re-fetches the source and routes through the same staging path -- the user reviews the new version's file list (added/changed/removed -- well, "would overwrite" for changed) before any bytes are written.
 - **Staged installs expire after 1 hour.** A panel left open longer is silently discarded; the user has to re-call `install_plugin`. Engine restarts also drop in-flight stagings (the staged temp dir is gone). Don't author flows that expect the panel to sit open for a full day.
 
-## App Store and marketplaces
+## The Plugins panel and marketplaces
 
-The App Store is the **Store** tab of the Apps section — the browser UI for plugin discovery (the Installed tab beside it lists the workspace's apps). A **marketplace** is a git repository (or GitHub tree URL) registered in the workspace at `data/config/plugin-marketplaces.json`, added/removed under **Settings → Marketplaces**. The Store clones each registered marketplace on refresh (the catalog re-scans whenever the Store tab opens), scans for valid `manifest.toml` plugin roots, compares each manifest version against currently installed `PluginInstalled` events, and shows each plugin as a card. Clicking `Install`/`Update` stages the exact same install confirmation panel described above; the Store never writes plugin files directly.
+Plugins — and the *apps* they ship — are discovered and installed in the **Plugins panel**, the browser UI for plugin discovery. The panel is one unified list with an **Installed only** filter (checked by default): checked, it lists every plugin on disk *regardless of what it ships* (read from the `PluginInstalled` projection via `GET /api/v1/plugins/installed`, so it works offline and still lists a plugin whose marketplace was later removed); unchecked, it widens to the full catalog (installed + available from registered marketplaces). The installed-plugins view is the home for plugins that ship **no app** — knowhow-, trigger-, script-, or auth-module-only bundles — showing each plugin's content kinds + shipped files (each file links to a preview) and an **Uninstall** button. When a registered marketplace offers a newer version, the row also shows an **Update available** chip and an **Update** button — resolved by cross-referencing the catalog by plugin *id* (not `app_id`), so it works for app-less plugins too; clicking stages the same confirmation panel as any install. (A plugin's *app*, if it ships one, still lives in the separate **Apps** panel — which has its own **Update** shortcut on the app row — but the plugin itself is managed here.) A **marketplace** is a git repository (or GitHub tree URL) registered in the workspace at `data/config/plugin-marketplaces.json`, added/removed under **Settings → Marketplaces**. The catalog clones each registered marketplace on refresh (it re-scans whenever it is shown — the panel opens or **Installed only** is unchecked), scans for valid `manifest.toml` plugin roots, compares each manifest version against currently installed `PluginInstalled` events, and shows each plugin as a card. Clicking `Install`/`Update` stages the exact same install confirmation panel described above; the catalog never writes plugin files directly.
 
 Each card has a primary button that progresses **Install → Setup → Open**, plus an **Uninstall** button once the plugin is on disk:
 
@@ -119,9 +123,9 @@ Each card has a primary button that progresses **Install → Setup → Open**, p
 - **Open** — shown once setup is finished (or the plugin had none); launches the plugin's primary app (`data/apps/<id>/`). Plugins that ship no app show a disabled **Installed** instead.
 - **Uninstall** — stages the uninstall confirmation panel (the same one the `uninstall_plugin` LLM tool produces). The card re-fetches the catalog on every mount, so the Setup→Open transition shows up when the user returns from finishing setup.
 
-**Plugin uninstall is the single removal authority for a plugin's app.** A plugin-installed app cannot be removed by the **Delete** button on the Installed tab — that would `rm -rf` only the `apps/<id>/` dir and leave the plugin registered as installed with its sibling `triggers/`/`knowhow/`/`scripts/` orphaned. So `DELETE /api/v1/app?id=...` returns **409** with `{ error, plugin_id, plugin_name }` when the app belongs to an installed plugin (the app-level mirror of the `delete_file` guard, which already refuses raw deletes of plugin-owned files). The UI catches the 409 and routes the user to the plugin **Uninstall** panel instead — which removes the whole plugin tree and emits `PluginUninstalled`. Standalone apps (no `PluginInstalled` record) keep deleting directly.
+**Plugin uninstall is the single removal authority for a plugin's app.** A plugin-installed app cannot be removed by the **Delete** button on the Apps panel — that would `rm -rf` only the `apps/<id>/` dir and leave the plugin registered as installed with its sibling `triggers/`/`knowhow/`/`scripts/` orphaned. So `DELETE /api/v1/app?id=...` returns **409** with `{ error, plugin_id, plugin_name }` when the app belongs to an installed plugin (the app-level mirror of the `delete_file` guard, which already refuses raw deletes of plugin-owned files). The UI catches the 409 and routes the user to the plugin **Uninstall** panel instead — which removes the whole plugin tree and emits `PluginUninstalled`. Standalone apps (no `PluginInstalled` record) keep deleting directly.
 
-Installed marketplace plugins are **not** auto-updated — the engine notifies, the user decides. Registered marketplaces are scanned at startup, after a marketplace is registered or renamed, and every five minutes. When a scanned marketplace has a newer version of an already-installed plugin, the engine emits a single deduplicated `NotificationCreated` ("Plugin update(s) available") whose tap deep-links to the Apps section; it does NOT install anything. The user applies the update from the Store card (or the installed app's **Update** button on the Installed tab), which stages the same confirmation panel as any install. Dedup is tracked in a `.lucidos/plugin-update-notice.json` marker so the five-minute re-scan only re-notifies when a *new* update appears (a fresh plugin or a bumped version), not every cycle.
+Installed marketplace plugins are **not** auto-updated — the engine notifies, the user decides. Registered marketplaces are scanned at startup, after a marketplace is registered or renamed, and every five minutes. When a scanned marketplace has a newer version of an already-installed plugin, the engine emits a single deduplicated `NotificationCreated` ("Plugin update(s) available") whose tap deep-links to the Plugins panel's installed list (the **Installed only** filter on) and scrolls to / pulse-highlights the plugin with the pending update (carried as the navigate `id`; with several updates it focuses the alphabetically-first by name, the rest stay chipped); it does NOT install anything. The user applies the update from that row's **Update button** (works for *any* plugin, app or not), the catalog card (with **Installed only** unchecked), or — for a plugin that ships an app — the app row's **Update** button on the Apps panel; each stages the same confirmation panel as any install. Dedup is tracked in a `.lucidos/plugin-update-notice.json` marker so the five-minute re-scan only re-notifies when a *new* update appears (a fresh plugin or a bumped version), not every cycle.
 
 Marketplace HTTP surface:
 
@@ -129,24 +133,55 @@ Marketplace HTTP surface:
 - `POST /api/v1/plugins/marketplaces` with `{ "source": "...", "name"?: "..." }` -> register or rename a marketplace.
 - `DELETE /api/v1/plugins/marketplaces/{id}` -> unregister a marketplace.
 - `GET /api/v1/plugins/catalog` -> live scan result `{ marketplaces, plugins, errors }`. Each installed plugin row also carries `setup_thread_id`, `setup_complete`, and `app_id` to drive the card's Install→Setup→Open button.
+- `GET /api/v1/plugins/installed` -> `{ plugins }` from the `PluginInstalled` projection (no marketplace scan). Each row carries `id`, `name`, `version`, `source?`, `app_id?`, `content` (the shipped content-dir kinds), and `files` (every installed `data/`-relative path). Backs the Plugins panel's installed-plugins view (the default **Installed only** filter) so it works offline and lists plugins whose marketplace was removed.
 - `POST /api/v1/plugins/install-request` with `{ "source": "..." }` -> stage an install request payload for the existing confirmation panel.
 - `POST /api/v1/plugins/uninstall-request` with `{ "id": "..." }` -> stage an uninstall request payload (resolves the plugin id, partitions its files into present/missing) for the uninstall confirmation panel. The button counterpart of the `uninstall_plugin` LLM tool.
 
 Marketplace LLM surface:
 
-- `register_plugin_marketplace(source, name?)` registers or renames the same App Store marketplace registry, commits `data/config/plugin-marketplaces.json`, and kicks off the marketplace scan / update-check pass (which notifies the user of any available plugin updates rather than applying them). Use it when a user asks conversationally to add a plugin repo, marketplace, plugin marketplace, or App Store source.
+- `register_plugin_marketplace(source, name?)` registers or renames the same plugin marketplace registry the Plugins panel browses, commits `data/config/plugin-marketplaces.json`, and kicks off the marketplace scan / update-check pass (which notifies the user of any available plugin updates rather than applying them). Use it when a user asks conversationally to add a plugin repo, marketplace, or plugin marketplace source.
 
 For GitHub monorepo marketplaces, register either the repo URL (`https://github.com/lucidos-dev/plugins`) or a tree URL (`https://github.com/lucidos-dev/plugins/tree/main/community`). The scanner turns discovered subdirectory plugins into installable GitHub tree URLs. For non-GitHub monorepos, use one repo per plugin or provide a GitHub tree URL equivalent; the install tool only knows how to install a subdirectory when it has a GitHub tree URL.
 
+## Shipping triggers (auto-registration)
+
+A plugin ships a trigger by declaring it in a **`trigger.toml`** at
+`triggers/<slug>/trigger.toml` — mirroring how an app is its own folder
+(`apps/<id>/manifest.json`). The file is a *trigger definition* (see
+`building-a-trigger.md` § "On-disk trigger definition"): `name`, `run`
+(`intent` or `script`), `on` (event subscriptions), and the usual optional
+fields (`app_id`, `go_to_review`, `group_id`, `side_effect_grant`). Put any
+procedure the trigger needs in `triggers/<slug>/knowhow/`, beside it.
+
+What install does (ADR 0019):
+
+- **Auto-registers** each `trigger.toml` — emits `TriggerCreated` stamped with
+  the plugin's id (provenance), so the trigger is **live immediately** (no agent
+  step needed). The Triggers panel shows a "from \<plugin\>" chip on it.
+- **Event-driven only.** A `trigger.toml` that declares a cron `schedule` is
+  **rejected at install** (nothing is written) — cron is workspace state, not
+  plugin content. Ship `on:` subscriptions; if the plugin pairs well with a cron
+  cadence, say so in the manifest `description` so the install-time LLM offers to
+  set one up conversationally.
+- **Uninstall** auto-deletes exactly the triggers carrying this plugin's id
+  (user-created triggers are never touched).
+- **Update** re-syncs by `(plugin_id, slug)`: a still-declared slug is updated in
+  place (preserving the user's paused state), a new slug is created, a dropped
+  slug is removed.
+
+The user sees the `trigger.toml` files in the install confirmation panel's file
+list (with their `side_effect_grant` visible in the parsed definition) before
+confirming, so activation is never silent.
+
 ## What doesn't belong in a plugin
 
-The four content directories make almost anything technically packageable, but apply judgment to `triggers/`. Apps, knowhow, and **event-driven (`on_event`) triggers** belong in plugins -- they are reference material or part of the plugin's own mechanism. An `on_event` trigger that reacts to events the plugin's apps/knowhow emit ships naturally inside `triggers/`: install lands the file under `data/triggers/...` and uninstall removes it like any other shipped content.
+The four content directories make almost anything technically packageable, but apply judgment to `triggers/`. Apps, knowhow, and **event-driven (`on_event`) triggers** belong in plugins -- they are reference material or part of the plugin's own mechanism. An `on_event` trigger that reacts to events the plugin's apps/knowhow emit ships as a `triggers/<slug>/trigger.toml` declaration: install **auto-registers** it (stamped with the plugin id) and uninstall removes it — see "Shipping triggers" above.
 
 **Cron triggers, OAuth credentials, and personal data do not ship in plugins.** They are workspace state -- WHEN something runs on a clock, WHO owns the account, WHAT the user has accumulated. Cron triggers in particular get singled out -- four reasons:
 
 1. **Cadence is user-specific.** Heavy users want it every 6h, light users weekly. Hardcoding `0 0 4 * * *` in the bundle makes that decision for them.
 2. **The schedule is workspace state, not reference material.** A plugin shipping a cron entry is the equivalent of a library shipping a crontab line -- wrong layer. Knowhow is "how to do this well", cron triggers are "when I want it to happen".
-3. **`PluginUninstalled` is guide-only.** If the install instructions create a cron trigger as a side effect (rather than as a file), it does not appear in the install record -- uninstall does not know to remove it, and the workspace ends up with an orphaned cron entry pointing at deleted knowhow. (Event triggers shipped as files in `triggers/` avoid this: the install record cleans them up alongside the rest of the plugin's tree.)
+3. **Orphaned cron entries.** If the install instructions create a cron trigger as a side effect (asking an agent to call `create_trigger`), it carries no plugin provenance, so uninstall does not know to remove it — the workspace ends up with an orphaned cron entry pointing at deleted knowhow. (Event-driven triggers declared as `triggers/<slug>/trigger.toml` avoid this: install auto-registers them stamped with the plugin id, and uninstall auto-deletes exactly those — see "Shipping triggers".)
 4. **Install-time prompt is the right UX.** When `install_plugin` lands the knowhow, the LLM tells the user *"This plugin works best with a reflection trigger. Want me to set one up? Daily at 4am is a good default."* Conversational, opinionated default, but the user owns the schedule.
 
 Concretely:

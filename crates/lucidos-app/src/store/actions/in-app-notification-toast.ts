@@ -13,36 +13,15 @@ import {
   resolveDeepLink,
   type DeepLinkTarget,
 } from './notification-deeplink';
-import { dismissToast, showToast, toasts, focusedThreadId, threadMap, threadsLoaded, unreadNotifications, TOAST_AUTO_DISMISS_MS } from '../store';
+import { dismissToast, showToast, toasts, focusedThreadId, threadMap, threadsLoaded, TOAST_AUTO_DISMISS_MS } from '../store';
 import { isInViewport } from '../../utils/viewport';
 import { isPageActive } from '../../utils/pageActive';
-import { isIOSPwa } from '../../utils/platform';
 import { postClientLog } from '../../utils/liveness';
 
 const NOTIFICATION_TOAST_PREFIX = 'notification-';
 const OVERFLOW_TOAST_KEY = 'notifications-overflow';
 const MAX_INDIVIDUAL_TOASTS = 4;
 const OVERFLOW_COUNT_PATTERN = /^\+(\d+) /;
-
-/** PWA best-effort window (plan 2026-06-19-ios-native-apns-app Phase 0). On an
- *  iOS PWA the WebKit bug can swallow a push tap (it just focuses the app and
- *  drops the deep link). On resume we surface recent UNREAD navigate-kind
- *  notifications as a tappable in-app affordance so the deep link is still one
- *  in-app tap away. 24h covers an overnight notification tapped the next morning
- *  while excluding ancient unread; the unread set is already capped at ~100. */
-const RESUME_AFFORDANCE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-
-/** Session-scoped set of notification ids already surfaced in-app (by the §4
- *  toast OR a prior resume affordance), so the resume affordance never re-nags
- *  the same notification on every wake. Worked taps self-exclude separately:
- *  they mark the notification read, dropping it from the unread set. */
-const surfacedNotificationIds = new Set<string>();
-
-/** Mark a notification id as already surfaced in-app so the resume affordance
- *  (surfaceResumeNotificationAffordance) won't re-surface it. */
-export function markNotificationSurfaced(id: string): void {
-  surfacedNotificationIds.add(id);
-}
 
 /** Spec §4 row labels. Row 5 (offline) doesn't apply — we only run when
  *  an SSE event landed, meaning the page is online by definition. */
@@ -72,13 +51,6 @@ export function classifyInAppRow(target: DeepLinkTarget): InAppRow {
  *  the navigation). The source notification id always flips to read on tap. */
 export function dispatchDeepLink(target: DeepLinkTarget): boolean {
   const action = resolveDeepLink(target);
-  // The deep link is now being acted on (navigate / open modal / mark-read), so
-  // the resume affordance must NOT also surface a toast for this same
-  // notification. Stamp it surfaced here — a local check that doesn't depend on
-  // the read-state round-trip. Without this, when an iOS tap DID deep-link, the
-  // affordance's own unread reload could still see the row as unread (mark-read
-  // POST not yet landed) and pop a redundant toast on top of the navigation.
-  if (target.notification) markNotificationSurfaced(target.notification);
   // Diagnostic breadcrumb (best-effort telemetry, no user intent): records which
   // dispatcher branch ran for a tap. For navigate-kind it also records whether
   // the destination thread is ALREADY in the loaded map — at cold-start (iOS
@@ -113,105 +85,6 @@ export function dispatchDeepLink(target: DeepLinkTarget): boolean {
     case 'noop':
       return false;
   }
-}
-
-/** PWA best-effort deep-link rescue (plan 2026-06-19-ios-native-apns-app Phase 0).
- *
- *  Call on PWA resume / cold-start AFTER the unread set is (re)loaded. On iOS the
- *  WebKit bug can swallow a push tap — it just focuses the app and never delivers
- *  the deep link (no `notificationclick`, no declarative navigate applied). This
- *  surfaces a SINGLE still-unread navigate-kind notification as a tappable,
- *  dismissible in-app affordance whose tap routes through `dispatchDeepLink` — an
- *  in-app tap works even though the OS tap didn't.
- *
- *  Only the single-notification case is shown — it's the only one that can
- *  deep-link to a target. A backlog of 2+ fresh unread surfaces nothing (the
- *  bell badge already covers it); the old "+N more notifications" overflow was a
- *  recurring nag that reopened the inbox without ever resolving.
- *
- *  Strictly non-hijacking: it NEVER auto-navigates (navigate-on-resume would yank
- *  a user who reopened the app for an unrelated reason). It only ever shows a
- *  dismissible toast.
- *
- *  Self-de-duping:
- *   - A tap that DID work marks its notification read → it's not in the unread
- *     set → not surfaced.
- *   - `surfacedNotificationIds` stops the same unread row from re-nagging on every
- *     wake (and the §4 toast marks its rows surfaced too).
- *   - Only `tap.kind === 'navigate'` rows qualify — `modal`/`none` need no
- *     deep-link rescue (the bell/inbox already reaches them).
- *   - A 24h age cap keeps a cold load from surfacing ancient unread.
- *   - 2+ fresh unread surfaces nothing (no deep-link target to rescue). */
-export function surfaceResumeNotificationAffordance(): void {
-  // iOS standalone PWA ONLY. The swallowed-push-tap WebKit bug this rescues is
-  // iOS-PWA-specific; everywhere else the OS push tap delivers the deep link
-  // (notificationclick in the SW) and the bell badge already reflects unread.
-  // Running it on a desktop browser was pure noise: clicking the affordance
-  // opens the inbox / nothing but never marks the unread read, so it re-surfaced
-  // on every reload (the "+N more notifications" toast that won't go away).
-  if (!isIOSPwa()) return;
-  const set = unreadNotifications.value;
-  if (set.status !== 'loaded') {
-    // Diagnostic (best-effort telemetry, no user intent): confirms Phase 0 ran
-    // on the device and why it surfaced nothing — the affordance is otherwise
-    // invisible in logs (see plan 2026-06-19-ios-native-apns-app Phase 0).
-    postClientLog('deeplink', 'resume_affordance', { status: set.status, surfaced: 'none' });
-    return;
-  }
-  const now = Date.now();
-  const navigateUnread = set.data.filter(
-    (n) => !n.read && (n.tap?.kind ?? 'modal') === 'navigate',
-  ).length;
-  const fresh = set.data.filter((n) => {
-    if (n.read) return false;
-    if ((n.tap?.kind ?? 'modal') !== 'navigate') return false;
-    if (surfacedNotificationIds.has(n.id)) return false;
-    const createdMs = new Date(n.created_at).getTime();
-    if (!Number.isFinite(createdMs) || now - createdMs > RESUME_AFFORDANCE_MAX_AGE_MS) return false;
-    return true;
-  });
-  // Diagnostic: total unread / navigate-kind unread / how many were fresh (not
-  // already-surfaced + within the age cap) / what we surfaced. Tells us on the
-  // next iOS tap whether Phase 0 fired and why it did or didn't show anything.
-  // Only the single-fresh case surfaces a toast (the "+N more" overflow was
-  // removed — see below), so 0 or 2+ fresh both report 'none'.
-  postClientLog('deeplink', 'resume_affordance', {
-    total_unread: set.data.length,
-    navigate_unread: navigateUnread,
-    fresh: fresh.length,
-    surfaced: fresh.length === 1 ? 'single' : 'none',
-  });
-  // ONLY the single-notification case is surfaced. It's the only one that
-  // delivers the actual rescue: tap → deep-link straight to the thread the
-  // swallowed push tap should have opened. Two-or-more fresh unread can't
-  // deep-link to one target, so the old "+N more notifications" overflow just
-  // reopened the inbox (which the bell badge already does) WITHOUT marking
-  // anything read — so it re-surfaced on every cold-start/resume: a recurring
-  // nag with no rescue, and a confusing label standalone ("+2 more" — more than
-  // what?). Drop it. The bell badge already surfaces a multi-notification
-  // backlog. We do NOT stamp the 2+ set into surfacedNotificationIds, so if it
-  // later drops to a single fresh unread, that one still gets its rescue toast.
-  if (fresh.length !== 1) return;
-  const n = fresh[0];
-  surfacedNotificationIds.add(n.id);
-  const target: DeepLinkTarget = {
-    notification: n.id,
-    thread: n.thread_id ?? null,
-    event: n.event_id ?? null,
-    tap: n.tap ?? null,
-  };
-  const toastKey = `${NOTIFICATION_TOAST_PREFIX}${n.id}`;
-  let opened = false;
-  const safeTitle = n.title && n.title.length > 0 ? n.title : 'Notification';
-  showToast(n.message ? `${safeTitle}: ${n.message}` : safeTitle, 'info', {
-    key: toastKey,
-    onClick: () => {
-      if (opened) return;
-      opened = true;
-      dismissToast(toastKey);
-      dispatchDeepLink(target);
-    },
-  });
 }
 
 interface InAppNotificationToastInput {
@@ -250,9 +123,6 @@ export function showInAppNotificationToast({ title, body, target }: InAppNotific
   // detail panel for the same title + body the toast already renders.
   const resolved = resolveDeepLink(target);
   const hasNavigationTarget = resolved.type === 'navigate';
-  // This notification is being surfaced in-app now, so the resume affordance
-  // (surfaceResumeNotificationAffordance) must not re-surface it on the next wake.
-  if (target.notification) markNotificationSurfaced(target.notification);
   // tap.kind === 'none': the notification is passive by contract — no
   // follow-up required. Mark read immediately, BEFORE the overflow guard,
   // so a pile-up doesn't leave passive rows sitting unread in the inbox

@@ -13,6 +13,7 @@ function plugin(overrides: Partial<MarketplacePlugin>): MarketplacePlugin {
     source: 'https://example.com/p',
     manifest: {},
     content: ['apps'],
+    categories: [],
     files_count: 1,
     status: 'installed',
     app_id: 'p',

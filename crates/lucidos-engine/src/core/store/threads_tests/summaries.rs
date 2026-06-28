@@ -266,60 +266,68 @@ async fn thread_summary_and_aggregate_include_attributed_recency() {
     teardown_test_db(&db).await;
 }
 
-/// `get_recent_threads` must surface every thread that NEEDS user action
-/// (`coding_agent_proposed=TRUE`, `status='waiting_for_user_answer'`, `status='failed'`)
-/// even when the per-source `rn <= per_source` window would otherwise drop it.
+/// An ARCHIVED actionable thread beyond the contiguous newest-by-`created_at`
+/// window is NOT injected by `get_recent_threads` — the outer `WHERE` has no
+/// out-of-window bypass, so archived `failed` / `waiting_for_user_answer` /
+/// `coding_agent_proposed` rows reach the drawer only via `get_older_threads`
+/// pagination, at their true date. This keeps the Archive pile gap-free: the old
+/// `status = ANY(...)` / `coding_agent_proposed` bypasses jammed months-old failed
+/// threads directly under the newest window (the "26 Jun → 15 Apr gap" report).
 ///
-/// REVIEW is a "needs attention" pile. Without this guarantee, a CC thread
-/// pushed past the per-source window vanishes from the drawer entirely —
-/// the user has no way to Apply/Discard the changes, no way to see them in
-/// REVIEW, no Diff button. The `changes` data still exists in the DB but
-/// the thread carrying it is invisible until the user manually scrolls
-/// far enough to trigger `get_older_threads`.
-///
-/// Regression: 2026-04-25 dev workspace had four CC threads with pending
-/// changes at rn=17, 18, 19, 40 — all hidden from /api/v1/threads.
+/// Archived-proposed is itself an impossible state (a pending change blocks the
+/// Archive action; external-repo archiving applies the change first), but we still
+/// insert one to lock the contract that NOTHING archived bypasses the window.
 #[tokio::test]
-async fn get_recent_threads_always_includes_actionable_threads_beyond_window() {
+async fn get_recent_threads_excludes_actionable_threads_beyond_window() {
     let (pool, db) = setup_test_db().await;
     let store = EventStore::new(pool.clone());
 
-    // 18 CC threads with descending last_activity. The three at i=15..17
-    // carry actionable signals — each picks an inert status so the only
-    // thing that lets it bypass the rn<=15 cap is the predicate under
-    // test: coding_agent_proposed (#15), waiting_for_user_answer (#16),
-    // failed (#17). One distinct second per row stabilizes the ranking.
+    // 15 window-filling archived idle rows with the NEWEST created_at (rn 1..15),
+    // then 3 archived actionable rows OLDER than every window row (rn 16..18). The
+    // window ranks by created_at, so the actionable rows fall beyond rn<=15 and
+    // must be omitted despite their actionable signals. has_response=TRUE on all,
+    // so they're inner candidates — the WINDOW (not the inner filter) excludes them.
     let now = chrono::Utc::now();
-    let mut ids = Vec::with_capacity(18);
-    for i in 0..18 {
-        let id = Uuid::new_v4();
-        ids.push(id);
-        let last_activity = now - chrono::Duration::seconds(i as i64);
-        let (status, coding_agent_proposed, section) = match i {
-            15 => (ThreadStatus::Idle.as_str(), true, "inbox"),
-            16 => (ThreadStatus::WaitingForUserAnswer.as_str(), false, "inbox"),
-            17 => (ThreadStatus::Failed.as_str(), false, "inbox"),
-            _ => (ThreadStatus::Idle.as_str(), false, "archived"),
-        };
+    for i in 0..15 {
+        let created_at = now - chrono::Duration::seconds(i as i64);
         sqlx::query(
             "INSERT INTO thread_summaries \
-                 (thread_id, title, source, message_count, last_activity, has_response, \
-                  status, coding_agent_proposed, archive_state) \
-                 VALUES ($1, $2, 'claude_code', 1, $3, TRUE, $4, $5, $6)",
+                 (thread_id, title, source, message_count, created_at, last_activity, \
+                  has_response, status, coding_agent_proposed, archive_state) \
+                 VALUES ($1, $2, 'claude_code', 1, $3, $3, TRUE, 'idle', FALSE, 'archived')",
         )
-        .bind(id)
-        .bind(format!("Thread {}", i))
-        .bind(last_activity)
-        .bind(status)
-        .bind(coding_agent_proposed)
-        .bind(section)
+        .bind(Uuid::new_v4())
+        .bind(format!("Window thread {}", i))
+        .bind(created_at)
         .execute(&pool)
         .await
-        .expect("insert thread_summaries");
+        .expect("insert window thread");
     }
-    let pending_changes = ids[15];
-    let needs_answer = ids[16];
-    let failed = ids[17];
+
+    // Older than every window row (secs ≥ 100 > the 0..14 window offsets): one
+    // per actionable signal.
+    let actionable: [(Uuid, &str, bool, i64); 3] = [
+        (Uuid::new_v4(), ThreadStatus::Idle.as_str(), true, 100), // coding_agent_proposed
+        (Uuid::new_v4(), ThreadStatus::WaitingForUserAnswer.as_str(), false, 101),
+        (Uuid::new_v4(), ThreadStatus::Failed.as_str(), false, 102),
+    ];
+    for (id, status, proposed, secs) in actionable {
+        let created_at = now - chrono::Duration::seconds(secs);
+        sqlx::query(
+            "INSERT INTO thread_summaries \
+                 (thread_id, title, source, message_count, created_at, last_activity, \
+                  has_response, status, coding_agent_proposed, archive_state) \
+                 VALUES ($1, $2, 'claude_code', 1, $3, $3, TRUE, $4, $5, 'archived')",
+        )
+        .bind(id)
+        .bind(format!("Beyond {}", status))
+        .bind(created_at)
+        .bind(status)
+        .bind(proposed)
+        .execute(&pool)
+        .await
+        .expect("insert beyond-window actionable thread");
+    }
 
     let recent = store
         .get_recent_threads(15)
@@ -328,24 +336,20 @@ async fn get_recent_threads_always_includes_actionable_threads_beyond_window() {
 
     let returned: std::collections::HashSet<&str> =
         recent.iter().map(|t| t.thread_id.as_str()).collect();
-    let pending = pending_changes.to_string();
-    let answer = needs_answer.to_string();
-    let fail = failed.to_string();
-    assert!(
-            returned.contains(pending.as_str()),
-            "thread with coding_agent_proposed=TRUE at rn>per_source must surface (Apply/Discard buttons live here); returned {} entries",
+    for (id, status, _, _) in actionable {
+        let id = id.to_string();
+        assert!(
+            !returned.contains(id.as_str()),
+            "archived {status} thread beyond the window must NOT be injected (reachable only via pagination); got {} entries",
             recent.len()
         );
-    assert!(
-            returned.contains(answer.as_str()),
-            "thread with status=waiting_for_user_answer at rn>per_source must surface (Question card lives here); returned {} entries",
-            recent.len()
-        );
-    assert!(
-            returned.contains(fail.as_str()),
-            "thread with status=failed at rn>per_source must surface (error indicator lives here); returned {} entries",
-            recent.len()
-        );
+    }
+    assert_eq!(
+        recent.len(),
+        15,
+        "exactly the 15 window rows come back; got {}",
+        recent.len()
+    );
 
     teardown_test_db(&db).await;
 }
@@ -407,28 +411,66 @@ async fn get_recent_threads_returns_all_inbox_threads_beyond_window() {
     teardown_test_db(&db).await;
 }
 
-/// Archive (archived threads) stays capped per source so the drawer
-/// doesn't load the whole archive on refresh; `get_older_threads` pages
-/// backward through what this omits.
+/// An inbox `coding_agent_proposed` thread with `has_response = FALSE` and an
+/// inert status still surfaces: the INNER candidate filter
+/// (`... OR coding_agent_proposed = TRUE`) makes it a candidate, and the
+/// unbounded inbox clause returns it. Removing the OUTER bypasses must not drop
+/// this real inbox path (a freshly-proposed coding-agent thread before any
+/// response row).
 #[tokio::test]
-async fn get_recent_threads_caps_archived_threads_at_per_source() {
+async fn get_recent_threads_returns_inbox_proposed_without_response() {
     let (pool, db) = setup_test_db().await;
     let store = EventStore::new(pool.clone());
 
-    // 20 archived idle chats with no actionable signal — only the top 15
-    // per source should come back.
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO thread_summaries \
+             (thread_id, title, source, message_count, has_response, \
+              status, coding_agent_proposed, archive_state) \
+             VALUES ($1, 'Proposed inbox', 'claude_code', 1, FALSE, 'idle', TRUE, 'inbox')",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .expect("insert inbox proposed thread");
+
+    let recent = store
+        .get_recent_threads(15)
+        .await
+        .expect("get_recent_threads");
+    let returned: std::collections::HashSet<&str> =
+        recent.iter().map(|t| t.thread_id.as_str()).collect();
+    assert!(
+        returned.contains(id.to_string().as_str()),
+        "inbox coding_agent_proposed thread with no response must surface; got {} entries",
+        recent.len()
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// Archive (archived threads) stays capped at `archive_limit` so the drawer
+/// doesn't load the whole archive on refresh; `get_older_threads` pages
+/// backward through what this omits.
+#[tokio::test]
+async fn get_recent_threads_caps_archived_threads_at_limit() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    // 20 archived idle chats with no actionable signal — only the newest 15
+    // should come back.
     let now = chrono::Utc::now();
     for i in 0..20 {
-        let last_activity = now - chrono::Duration::seconds(i as i64);
+        let created_at = now - chrono::Duration::seconds(i as i64);
         sqlx::query(
             "INSERT INTO thread_summaries \
-                 (thread_id, title, source, message_count, last_activity, has_response, \
+                 (thread_id, title, source, message_count, created_at, last_activity, has_response, \
                   status, coding_agent_proposed, archive_state) \
-                 VALUES ($1, $2, 'chat', 1, $3, TRUE, 'idle', FALSE, 'archived')",
+                 VALUES ($1, $2, 'chat', 1, $3, $3, TRUE, 'idle', FALSE, 'archived')",
         )
         .bind(Uuid::new_v4())
         .bind(format!("Archived chat {}", i))
-        .bind(last_activity)
+        .bind(created_at)
         .execute(&pool)
         .await
         .expect("insert thread_summaries");
@@ -441,8 +483,120 @@ async fn get_recent_threads_caps_archived_threads_at_per_source() {
     let chat_count = recent.iter().filter(|t| t.channel == "chat").count();
     assert_eq!(
         chat_count, 15,
-        "archived threads must stay capped at per_source; got {}",
+        "archived threads must stay capped at archive_limit; got {}",
         chat_count
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// The Archive window is a SINGLE GLOBAL `created_at DESC` slice, NOT per-source.
+/// With chat threads all newer-CREATED than coding-agent threads and a small
+/// `archive_limit`, the window must be the newest chats *globally* — never
+/// 1-of-each-source. (The old `PARTITION BY source` window returned one chat AND
+/// one coding-agent thread, which dragged the global pagination cursor down to the
+/// sparse source's old boundary and skipped every intervening chat — the bug.)
+#[tokio::test]
+async fn get_recent_threads_archive_window_is_global_not_per_source() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    // Two chats created most-recently, then a coding-agent thread created earlier.
+    // created_at: chat_new (Jun 25) > chat_mid (Jun 24) > cc_old (Jun 10).
+    let chat_new = Uuid::new_v4();
+    let chat_mid = Uuid::new_v4();
+    let cc_old = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO thread_summaries \
+             (thread_id, title, source, message_count, has_response, archive_state, created_at, last_activity) \
+         VALUES \
+             ($1, 'Chat new', 'chat',        1, TRUE, 'archived', TIMESTAMPTZ '2026-06-25 00:00:00Z', TIMESTAMPTZ '2026-06-25 00:00:00Z'), \
+             ($2, 'Chat mid', 'chat',        1, TRUE, 'archived', TIMESTAMPTZ '2026-06-24 00:00:00Z', TIMESTAMPTZ '2026-06-24 00:00:00Z'), \
+             ($3, 'CC old',   'claude_code', 1, TRUE, 'archived', TIMESTAMPTZ '2026-06-10 00:00:00Z', TIMESTAMPTZ '2026-06-10 00:00:00Z')",
+    )
+    .bind(chat_new)
+    .bind(chat_mid)
+    .bind(cc_old)
+    .execute(&pool)
+    .await
+    .expect("insert thread_summaries");
+
+    // archive_limit=2 → the two newest-CREATED archived rows GLOBALLY = both chats.
+    let recent = store.get_recent_threads(2).await.expect("get_recent_threads");
+    let returned: std::collections::HashSet<&str> =
+        recent.iter().map(|t| t.thread_id.as_str()).collect();
+    assert!(
+        returned.contains(chat_new.to_string().as_str())
+            && returned.contains(chat_mid.to_string().as_str()),
+        "the two newest-CREATED archived threads (both chats) must be in the global window"
+    );
+    assert!(
+        !returned.contains(cc_old.to_string().as_str()),
+        "the older coding-agent thread must fall outside the global window — a per-source \
+         window would wrongly include it as the newest of its source"
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// The initial-window → first-scroll-page seam is gap-free: the window is a
+/// contiguous `created_at` prefix, so paging `get_older_threads(before =
+/// window-oldest.created_at)` returns the immediately-next archived rows with
+/// nothing skipped. (The pre-fix per-source window left chats in the gap between
+/// the dense chat boundary and the sparse coding-agent boundary unreachable.)
+#[tokio::test]
+async fn get_recent_threads_archive_window_seam_is_gap_free() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    // Five archived threads across two sources, strictly decreasing created_at.
+    // Jun 25 (chat) > Jun 24 (chat) > Jun 23 (cc) > Jun 22 (chat) > Jun 21 (cc).
+    let d1 = Uuid::new_v4(); // Jun 25 chat
+    let d2 = Uuid::new_v4(); // Jun 24 chat
+    let d3 = Uuid::new_v4(); // Jun 23 cc
+    let d4 = Uuid::new_v4(); // Jun 22 chat
+    let d5 = Uuid::new_v4(); // Jun 21 cc
+    sqlx::query(
+        "INSERT INTO thread_summaries \
+             (thread_id, title, source, message_count, has_response, archive_state, created_at, last_activity) \
+         VALUES \
+             ($1, 'd1', 'chat',        1, TRUE, 'archived', TIMESTAMPTZ '2026-06-25 00:00:00Z', TIMESTAMPTZ '2026-06-25 00:00:00Z'), \
+             ($2, 'd2', 'chat',        1, TRUE, 'archived', TIMESTAMPTZ '2026-06-24 00:00:00Z', TIMESTAMPTZ '2026-06-24 00:00:00Z'), \
+             ($3, 'd3', 'claude_code', 1, TRUE, 'archived', TIMESTAMPTZ '2026-06-23 00:00:00Z', TIMESTAMPTZ '2026-06-23 00:00:00Z'), \
+             ($4, 'd4', 'chat',        1, TRUE, 'archived', TIMESTAMPTZ '2026-06-22 00:00:00Z', TIMESTAMPTZ '2026-06-22 00:00:00Z'), \
+             ($5, 'd5', 'claude_code', 1, TRUE, 'archived', TIMESTAMPTZ '2026-06-21 00:00:00Z', TIMESTAMPTZ '2026-06-21 00:00:00Z')",
+    )
+    .bind(d1)
+    .bind(d2)
+    .bind(d3)
+    .bind(d4)
+    .bind(d5)
+    .execute(&pool)
+    .await
+    .expect("insert thread_summaries");
+
+    // Window of 2 = the two newest (d1, d2).
+    let window = store.get_recent_threads(2).await.expect("get_recent_threads");
+    let window_ids: std::collections::HashSet<&str> =
+        window.iter().map(|t| t.thread_id.as_str()).collect();
+    assert!(
+        window_ids.contains(d1.to_string().as_str()) && window_ids.contains(d2.to_string().as_str()),
+        "window must be the two newest-created archived rows"
+    );
+
+    // Page below the window's oldest loaded archived row (d2 @ Jun 24).
+    let before = chrono::DateTime::parse_from_rfc3339("2026-06-24T00:00:00Z")
+        .expect("parse cursor")
+        .with_timezone(&chrono::Utc);
+    let older = store
+        .get_older_threads(before, 15, None, None, None, None)
+        .await
+        .expect("get_older_threads");
+    let order: Vec<&str> = older.iter().map(|t| t.thread_id.as_str()).collect();
+    assert_eq!(
+        order,
+        vec![d3.to_string(), d4.to_string(), d5.to_string()],
+        "the next page must be the contiguous older archived rows (d3, d4, d5) with no gap; got {order:?}"
     );
 
     teardown_test_db(&db).await;
@@ -909,7 +1063,7 @@ async fn fetch_family_extension_terminates_on_cycle() {
 /// `max_family` caps the result, keeping the newest members first. Without
 /// this cap a pathological fan-out root (one chat spawning hundreds of CC /
 /// trigger children) balloons the initial `/api/v1/threads` payload — the bug
-/// that motivated the cap was personal-ws hitting 401 family threads behind
+/// that motivated the cap was a workspace hitting 401 family threads behind
 /// 24 base rows.
 #[tokio::test]
 async fn fetch_family_extension_respects_max_family() {

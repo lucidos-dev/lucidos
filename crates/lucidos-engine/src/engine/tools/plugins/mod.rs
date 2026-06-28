@@ -302,7 +302,7 @@ pub(crate) async fn stage_install_request(engine: &LucidosEngine, source_str: &s
     }
 }
 
-/// Stage an uninstall from the App Store UI (the uninstall counterpart of
+/// Stage an uninstall from the Plugins panel (the uninstall counterpart of
 /// [`stage_install_request`]). Resolves `id`, builds a `PendingUninstall`, and
 /// returns the `[PLUGIN_UNINSTALL_REQUEST]` sentinel for the HTTP handler to
 /// unwrap — the same staging the `uninstall_plugin` LLM tool produces, so both
@@ -642,8 +642,21 @@ pub async fn confirm_pending_uninstall(
             .ok_or_else(|| format!("no pending uninstall with id '{}'", uninstall_id))?
     };
 
-    let outcome = uninstall_with_bus(&engine.workspace_path, &engine.event_bus, &pending, actor)
-        .await?;
+    let outcome = {
+        // Held across the delete+commit so the dirty check in
+        // `change_ops::apply_change` (which also takes this lock) never observes
+        // a half-written repo, and so this commit can't race a concurrent
+        // write_file/edit_file commit. Mirrors the install confirm flow.
+        let _repo_guard = engine.lock_workspace_repo().await;
+        uninstall_with_bus(&engine.workspace_path, &engine.event_bus, &pending, actor.clone())
+            .await?
+    };
+
+    // Auto-delete the plugin's auto-registered triggers (ADR 0019) — scoped by
+    // plugin_id, so user-created triggers are untouched. Emitted after the
+    // PluginUninstalled so the scheduler unregisters them + drops their
+    // trigger.toml projection.
+    delete_plugin_triggers(engine, &pending.plugin_id, actor).await;
 
     let auth_prefix = format!("{}/", AUTH_MODULES_DIR);
     if outcome
@@ -739,6 +752,25 @@ pub(crate) async fn uninstall_with_bus(
         }
     }
 
+    // Commit the deletions into the workspace git repo BEFORE emitting
+    // PluginUninstalled — the symmetric counterpart of the install commit, so a
+    // plugin's removal is version-controlled the same way write_file/edit_file
+    // deletions are. `Ok(None)` (nothing was tracked) is fine: a plugin
+    // installed before the install-commit fix had untracked files, so there's
+    // nothing to stage. The confirm flow holds `lock_workspace_repo` around
+    // this call.
+    if !files_deleted.is_empty() {
+        crate::core::commit_data_paths_removed(
+            workspace_path,
+            &files_deleted,
+            &format!(
+                "Uninstall plugin: {} v{}",
+                pending.plugin_id, pending.plugin_version
+            ),
+        )
+        .map_err(|e| format!("commit uninstalled plugin files: {}", e))?;
+    }
+
     let mut all_files = pending.files_present.clone();
     for f in &pending.files_missing {
         if !all_files.contains(f) {
@@ -798,6 +830,184 @@ pub struct ConfirmedInstall {
 /// `actor` is the device/user who clicked Confirm; it's stamped onto the
 /// resulting `PluginInstalled` event so the popover shows a real device
 /// label instead of `device-<short>`.
+/// Emit one trigger lifecycle event, logging (not propagating) an emit error —
+/// trigger sync is a best-effort side effect of install/uninstall, never a
+/// reason to fail the whole operation.
+async fn emit_trigger_event(engine: &LucidosEngine, event: SystemEvent, ctx: &str) {
+    if let Err(e) = engine.event_bus.emit(BusEvent::System(event)).await {
+        log!("[Plugins] {} emit failed: {}", ctx, e);
+    }
+}
+
+/// Re-sync a plugin's auto-registered triggers to its shipped `trigger.toml`
+/// set (ADR 0019). Matched by `(plugin_id, slug)`:
+/// - a declared slug that already exists → `TriggerUpdated` (re-stamps the
+///   definition; omits `paused` so a user's pause survives);
+/// - a new declared slug → `TriggerCreated` (event-driven, live immediately);
+/// - an existing plugin trigger whose slug is no longer declared → `TriggerDeleted`.
+///
+/// On a fresh install `existing` is empty (pure creates); on update it diffs.
+/// The scheduler subscriber turns these into registrations + the on-disk
+/// projection. Best-effort throughout.
+async fn resync_plugin_triggers(
+    engine: &LucidosEngine,
+    plugin_id: &str,
+    installed_files: &[String],
+    actor: Option<MessageOrigin>,
+) {
+    let data_dir = engine.workspace_path.join(DATA_DIR);
+
+    // Declared = the plugin's shipped trigger.toml files, parsed, with a stable
+    // resolved slug (author slug, else derived from name).
+    let mut resolved: Vec<(String, crate::triggers::definition::TriggerDefinition)> = Vec::new();
+    for rel in installed_files {
+        // The DIRECTORY segment (`triggers/<slug>/trigger.toml`) is authoritative
+        // for a plugin trigger: it's the recorded install path, the per-trigger
+        // knowhow dir, AND the projection key. Overriding any divergent body
+        // `slug` keeps all three in lockstep — otherwise the projection would
+        // write a second file under the body-slug dir and the boot rebuild would
+        // later prune the plugin's recorded file as a false orphan.
+        let Some(dir_slug) = plugin_trigger_slug(rel) else {
+            continue;
+        };
+        let slug = dir_slug.to_string();
+        let abs = data_dir.join(rel);
+        let text = match std::fs::read_to_string(&abs) {
+            Ok(t) => t,
+            Err(e) => {
+                log!("[Plugins] read trigger {} failed: {}", rel, e);
+                continue;
+            }
+        };
+        let mut def = match crate::triggers::definition::TriggerDefinition::from_toml(&text) {
+            Ok(d) => d,
+            Err(e) => {
+                log!("[Plugins] skip unparseable trigger {}: {}", rel, e);
+                continue;
+            }
+        };
+        if !def.slug.is_empty() && def.slug != slug {
+            log!(
+                "[Plugins] trigger {} body slug '{}' differs from its directory '{}' — using the directory",
+                rel,
+                def.slug,
+                slug
+            );
+        }
+        def.slug = slug.clone();
+        // Drop a second trigger.toml that resolved to the same slug within this
+        // plugin (author error) — keeping it would mint two triggers writing one
+        // shared data/triggers/<slug>/ projection.
+        if resolved.iter().any(|(s, _)| s == &slug) {
+            log!("[Plugins] skip duplicate plugin trigger slug '{}' ({})", slug, rel);
+            continue;
+        }
+        resolved.push((slug, def));
+    }
+
+    // One read pass: this plugin's currently-registered triggers (id + slug) for
+    // the diff, AND the slugs owned by ANY OTHER trigger (user or another plugin)
+    // so we never auto-register onto a slug that's already taken — that would
+    // clobber a shared data/triggers/<slug>/ projection + per-trigger knowhow dir.
+    let (existing, foreign_slugs): (Vec<(String, String)>, std::collections::HashSet<String>) = {
+        let configs = engine.trigger_configs.read().unwrap();
+        let mut existing = Vec::new();
+        let mut foreign = std::collections::HashSet::new();
+        for c in configs.values() {
+            if c.plugin_id.as_deref() == Some(plugin_id) {
+                existing.push((c.id.clone(), c.slug.clone()));
+            } else {
+                foreign.insert(c.slug.clone());
+            }
+        }
+        (existing, foreign)
+    };
+    let declared_slugs: std::collections::HashSet<&str> =
+        resolved.iter().map(|(s, _)| s.as_str()).collect();
+
+    for (slug, def) in &resolved {
+        if let Some((existing_id, _)) = existing.iter().find(|(_, s)| s == slug) {
+            let payload = def.to_trigger_payload(existing_id, plugin_id);
+            emit_trigger_event(
+                engine,
+                SystemEvent::TriggerUpdated {
+                    trigger_id: existing_id.clone(),
+                    payload,
+                    actor: actor.clone(),
+                },
+                "TriggerUpdated (plugin resync)",
+            )
+            .await;
+        } else if foreign_slugs.contains(slug) {
+            // Slug already belongs to a user trigger or another plugin — refuse
+            // to hijack it. The plugin's other triggers still register.
+            log!(
+                "[Plugins] skip plugin '{}' trigger '{}' — slug already in use by another trigger",
+                plugin_id,
+                slug
+            );
+            continue;
+        } else {
+            let new_id = uuid::Uuid::new_v4().to_string();
+            let payload = def.to_trigger_payload(&new_id, plugin_id);
+            emit_trigger_event(
+                engine,
+                SystemEvent::TriggerCreated {
+                    trigger_id: new_id,
+                    payload,
+                    actor: actor.clone(),
+                },
+                "TriggerCreated (plugin auto-register)",
+            )
+            .await;
+        }
+    }
+    for (existing_id, slug) in &existing {
+        if !declared_slugs.contains(slug.as_str()) {
+            emit_trigger_event(
+                engine,
+                SystemEvent::TriggerDeleted {
+                    trigger_id: existing_id.clone(),
+                    payload: serde_json::json!({ "trigger_id": existing_id }),
+                    actor: actor.clone(),
+                },
+                "TriggerDeleted (plugin resync)",
+            )
+            .await;
+        }
+    }
+}
+
+/// Delete every trigger a plugin auto-registered (ADR 0019) — emitted on
+/// uninstall so the plugin's triggers don't outlive it. Scoped strictly by
+/// `plugin_id`, so user-created triggers (`plugin_id == None`) are never touched.
+async fn delete_plugin_triggers(
+    engine: &LucidosEngine,
+    plugin_id: &str,
+    actor: Option<MessageOrigin>,
+) {
+    let owned: Vec<String> = {
+        let configs = engine.trigger_configs.read().unwrap();
+        configs
+            .values()
+            .filter(|c| c.plugin_id.as_deref() == Some(plugin_id))
+            .map(|c| c.id.clone())
+            .collect()
+    };
+    for id in owned {
+        emit_trigger_event(
+            engine,
+            SystemEvent::TriggerDeleted {
+                trigger_id: id.clone(),
+                payload: serde_json::json!({ "trigger_id": id }),
+                actor: actor.clone(),
+            },
+            "TriggerDeleted (plugin uninstall)",
+        )
+        .await;
+    }
+}
+
 pub async fn confirm_pending_install(
     engine: &LucidosEngine,
     install_id: &str,
@@ -818,7 +1028,7 @@ pub async fn confirm_pending_install(
     // `setup` instructions differ from the currently-installed version's. A
     // version bump that left `setup` unchanged re-runs nothing (no thread, no
     // navigation) — re-doing identical setup on every update is noise. The
-    // recorded id is what lets the App Store card resolve the right thread for
+    // recorded id is what lets the Plugins panel card resolve the right thread for
     // its Setup→Open state after a reload.
     //
     // `latest_install` here still sees the *previous* version — the new
@@ -854,6 +1064,12 @@ pub async fn confirm_pending_install(
     };
 
     reload_auth_modules_if_needed(engine, &installed_files).await;
+
+    // Auto-register the plugin's shipped event-driven triggers (ADR 0019),
+    // stamped with the plugin id. On an update this re-syncs against the prior
+    // version's set (add/update/remove by slug). They go live immediately; the
+    // user already saw the trigger.toml files in the confirm panel's file list.
+    resync_plugin_triggers(engine, &pending.plugin_id, &installed_files, actor.clone()).await;
 
     // A plugin author's `setup` field is "ask the user / wire this up" work —
     // inert until an agent runs it. Spawn a Lucidos Agent thread seeded with
@@ -1014,6 +1230,40 @@ pub(crate) async fn cancel_pending_install_with_bus(
 /// Returns the install summary text plus the `data/`-relative paths that
 /// were written; the confirm endpoint uses the file list verbatim (no
 /// re-walk) for the auto-reload decision and the HTTP response.
+/// The `<slug>` of a `data/`-relative path iff it is `triggers/<slug>/trigger.toml`.
+fn plugin_trigger_slug(data_relative: &str) -> Option<&str> {
+    let parts: Vec<&str> = data_relative.split('/').collect();
+    match parts.as_slice() {
+        ["triggers", slug, "trigger.toml"] if !slug.is_empty() => Some(slug),
+        _ => None,
+    }
+}
+
+/// Reject install if any shipped `trigger.toml` declares a cron `schedule` (or
+/// fails to parse). Plugins ship event-driven triggers only (ADR 0019). Reads
+/// from the staged `plugin_root` (via each `PlannedFile.source`), so it runs
+/// before any file is copied.
+fn validate_plugin_triggers_event_driven(planned: &[PlannedFile]) -> Result<(), String> {
+    for pf in planned {
+        let Some(slug) = plugin_trigger_slug(&pf.data_relative) else {
+            continue;
+        };
+        let text = std::fs::read_to_string(&pf.source)
+            .map_err(|e| format!("read trigger definition {}: {}", pf.data_relative, e))?;
+        let def = crate::triggers::definition::TriggerDefinition::from_toml(&text)
+            .map_err(|e| format!("invalid trigger '{}' ({}): {}", slug, pf.data_relative, e))?;
+        if !def.schedule.is_empty() {
+            return Err(format!(
+                "plugin trigger '{}' declares a cron schedule; plugins may only ship \
+                 event-driven (on:) triggers — cron triggers are workspace state. \
+                 Remove `schedule` from {}.",
+                slug, pf.data_relative
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn install_from_unpacked_with_bus(
     workspace_path: &Path,
     bus: &dyn EventBusEmitter,
@@ -1022,13 +1272,19 @@ pub(crate) async fn install_from_unpacked_with_bus(
     overwrite: bool,
     actor: Option<MessageOrigin>,
     // The setup thread spawned for this install, recorded in the
-    // `PluginInstalled` payload so the App Store card's Setup→Open state
+    // `PluginInstalled` payload so the Plugins panel card's Setup→Open state
     // survives reloads. `None` when the plugin shipped no `setup` field, or
     // for the silent background auto-update path (no user is watching).
     setup_thread_id: Option<uuid::Uuid>,
 ) -> Result<(String, Vec<String>), String> {
     let (manifest, planned) = validate_tree(plugin_root).map_err(|e| e.to_string())?;
     let data_dir = workspace_path.join(DATA_DIR);
+
+    // Plugins may only ship event-driven (`on:`) triggers — reject a shipped
+    // `trigger.toml` with a cron `schedule` BEFORE any file is written (clean
+    // failure, nothing copied). Cron is workspace state, not plugin content
+    // (ADR 0019, building-a-plugin.md "What doesn't belong in a plugin").
+    validate_plugin_triggers_event_driven(&planned)?;
 
     let conflicts = detect_conflicts(&planned, &data_dir);
     if !conflicts.is_empty() && !overwrite {
@@ -1056,6 +1312,21 @@ pub(crate) async fn install_from_unpacked_with_bus(
         })?;
         installed_files.push(data_relative.clone());
     }
+
+    // Commit the freshly-written files into the workspace git repo BEFORE
+    // emitting PluginInstalled — every other data-writing path (write_file /
+    // edit_file / data writes / marketplace registration) version-controls what
+    // it writes, and install must too. Without this the plugin's files sit
+    // untracked forever (no history, lost on a hard reset, invisible to
+    // git-based backups). One commit covers all content dirs (apps/, knowhow/,
+    // triggers/, scripts/, auth-modules/). The confirm flow holds
+    // `lock_workspace_repo` around this call so it can't race other repo writes.
+    crate::core::commit_data_paths_added(
+        workspace_path,
+        &installed_files,
+        &format!("Install plugin: {} v{}", manifest.id, manifest.version),
+    )
+    .map_err(|e| format!("commit installed plugin files: {}", e))?;
 
     let installed_at = chrono::Utc::now().to_rfc3339();
     let from = manifest
@@ -1132,3 +1403,7 @@ mod uninstall_tests;
 #[cfg(test)]
 #[path = "../plugins_tests/query.rs"]
 mod query_tests;
+
+#[cfg(test)]
+#[path = "../plugins_tests/triggers.rs"]
+mod triggers_tests;

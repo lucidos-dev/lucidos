@@ -3,12 +3,10 @@ import type { DeepLinkTarget } from './notification-deeplink';
 
 const isPageActiveMock = vi.fn(() => true);
 const isInViewportMock = vi.fn(() => false);
-const isIOSPwaMock = vi.fn(() => true);
 const focusedThreadIdSignal = { value: null as string | null };
 
 vi.mock('../../utils/pageActive', () => ({ isPageActive: isPageActiveMock }));
 vi.mock('../../utils/viewport', () => ({ isInViewport: isInViewportMock }));
-vi.mock('../../utils/platform', () => ({ isIOSPwa: isIOSPwaMock }));
 vi.mock('../store', async () => {
   // Pull in the rest of the store so the toast module's other imports
   // (showToast, dismissToast, toasts) still resolve.
@@ -34,7 +32,6 @@ function target(opts: {
 beforeEach(() => {
   isPageActiveMock.mockReset().mockReturnValue(true);
   isInViewportMock.mockReset().mockReturnValue(false);
-  isIOSPwaMock.mockReset().mockReturnValue(true);
   focusedThreadIdSignal.value = null;
 });
 
@@ -111,115 +108,5 @@ describe('§4 in-app surface matrix', () => {
     expect(classifyInAppRow(target({ thread: null, event: 'e-1' }))).toBe(
       'row2_or_3_toast_and_badge',
     );
-  });
-});
-
-// Phase 0 PWA best-effort deep-link rescue (plan 2026-06-19-ios-native-apns-app).
-// On resume the iOS WebKit bug may have swallowed a push tap; the affordance
-// surfaces recent UNREAD navigate-kind notifications as a tappable, dismissible
-// toast (never an auto-navigation).
-describe('surfaceResumeNotificationAffordance (PWA best-effort)', () => {
-  const recentIso = () => new Date(Date.now() - 1000).toISOString();
-  const oldIso = () => new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
-
-  type N = {
-    id: string; title: string; message: string; created_at: string;
-    read: boolean; tap?: { kind: string; to?: unknown }; thread_id?: string;
-  };
-  function notif(over: Partial<N> & { id: string }): N {
-    return {
-      title: 'T', message: 'B', created_at: recentIso(), read: false,
-      tap: { kind: 'navigate', to: { target: 'thread', id: 'th-1' } }, ...over,
-    };
-  }
-
-  async function setUnread(data: N[]) {
-    const store = await import('../store');
-    store.unreadNotifications.value = { status: 'loaded', data: data as never };
-    store.toasts.value = [];
-    return store;
-  }
-
-  test('recent unread navigate → surfaces one tappable toast (no auto-nav)', async () => {
-    const store = await setUnread([notif({ id: 'r-single' })]);
-    const { surfaceResumeNotificationAffordance } = await importModule();
-    surfaceResumeNotificationAffordance();
-    expect(store.toasts.value).toHaveLength(1);
-    const t = store.toasts.value[0];
-    expect(t.key).toBe('notification-r-single');
-    expect(typeof t.onClick).toBe('function'); // tappable; navigation only on tap
-  });
-
-  test('read notification is never surfaced', async () => {
-    const store = await setUnread([notif({ id: 'r-read', read: true })]);
-    const { surfaceResumeNotificationAffordance } = await importModule();
-    surfaceResumeNotificationAffordance();
-    expect(store.toasts.value).toHaveLength(0);
-  });
-
-  test('modal-kind unread is not surfaced (no deep-link to rescue)', async () => {
-    const store = await setUnread([notif({ id: 'r-modal', tap: { kind: 'modal' } })]);
-    const { surfaceResumeNotificationAffordance } = await importModule();
-    surfaceResumeNotificationAffordance();
-    expect(store.toasts.value).toHaveLength(0);
-  });
-
-  test('unread older than the 24h window is not surfaced', async () => {
-    const store = await setUnread([notif({ id: 'r-old', created_at: oldIso() })]);
-    const { surfaceResumeNotificationAffordance } = await importModule();
-    surfaceResumeNotificationAffordance();
-    expect(store.toasts.value).toHaveLength(0);
-  });
-
-  test('multiple recent unread → nothing surfaced (no deep-link target, bell badge covers it)', async () => {
-    const store = await setUnread([notif({ id: 'r-m1' }), notif({ id: 'r-m2' })]);
-    const { surfaceResumeNotificationAffordance } = await importModule();
-    surfaceResumeNotificationAffordance();
-    expect(store.toasts.value).toHaveLength(0);
-  });
-
-  test('2+ unread is not stamped surfaced → a later single fresh unread still gets its rescue toast', async () => {
-    // A backlog of 2+ shows nothing but must NOT mark those ids surfaced, or a
-    // notification that later becomes the sole fresh unread would be silently
-    // skipped — losing the rescue it's entitled to.
-    const store = await setUnread([notif({ id: 'r-b1' }), notif({ id: 'r-b2' })]);
-    const { surfaceResumeNotificationAffordance } = await importModule();
-    surfaceResumeNotificationAffordance();
-    expect(store.toasts.value).toHaveLength(0);
-    // One gets read elsewhere; only r-b2 remains fresh on the next resume.
-    store.unreadNotifications.value = { status: 'loaded', data: [notif({ id: 'r-b2' })] as never };
-    surfaceResumeNotificationAffordance();
-    expect(store.toasts.value).toHaveLength(1);
-    expect(store.toasts.value[0].key).toBe('notification-r-b2');
-  });
-
-  test('already-surfaced notification does not re-nag on the next resume', async () => {
-    const store = await setUnread([notif({ id: 'r-dedup' })]);
-    const { surfaceResumeNotificationAffordance } = await importModule();
-    surfaceResumeNotificationAffordance();
-    expect(store.toasts.value).toHaveLength(1);
-    store.toasts.value = []; // simulate the toast being dismissed before the next wake
-    surfaceResumeNotificationAffordance();
-    expect(store.toasts.value).toHaveLength(0);
-  });
-
-  test('a notification the deep link already handled is not also surfaced (no nav+toast double)', async () => {
-    // When an iOS tap DID deep-link, dispatchDeepLink stamps the notification via
-    // markNotificationSurfaced. Even if the affordance's unread reload still shows
-    // it unread (the mark-read POST hasn't landed — the race that produced a
-    // redundant toast on top of the navigation), the surfaced stamp skips it.
-    const { surfaceResumeNotificationAffordance, markNotificationSurfaced } = await importModule();
-    markNotificationSurfaced('r-handled');
-    const store = await setUnread([notif({ id: 'r-handled' })]);
-    surfaceResumeNotificationAffordance();
-    expect(store.toasts.value).toHaveLength(0);
-  });
-
-  test('no-op on a non-iOS-PWA platform (desktop browser gets no resume toast)', async () => {
-    isIOSPwaMock.mockReturnValue(false);
-    const store = await setUnread([notif({ id: 'r-desktop' })]);
-    const { surfaceResumeNotificationAffordance } = await importModule();
-    surfaceResumeNotificationAffordance();
-    expect(store.toasts.value).toHaveLength(0);
   });
 });

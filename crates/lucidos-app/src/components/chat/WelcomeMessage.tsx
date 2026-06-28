@@ -1,6 +1,8 @@
 import { useSignal } from '@preact/signals';
 import { dismissWelcomeSuggestions } from '../../store/actions/preferences';
 import { openProviderSettings } from '../../store/actions/menu';
+import { prefillCompose } from '../../store/actions/compose';
+import { composeHandlers } from './promptFocus';
 import { llmConfigured } from '../../store/store';
 import { ChevronLeftIcon, ChevronRightIcon } from '../shared/icons';
 
@@ -8,7 +10,7 @@ import { ChevronLeftIcon, ChevronRightIcon } from '../shared/icons';
 function WelcomeDisclaimer() {
   return (
     <p class="disclaimer">
-      Provided as is under the{' '}
+      This software is provided as is under the{' '}
       <a
         href="https://github.com/lucidos-dev/lucidos/blob/main/LICENSE"
         target="_blank"
@@ -56,14 +58,15 @@ export function ProviderSetupWelcome() {
 }
 
 /** Conversational starter ideas — example things to ask the Lucidos Agent.
- *  These are illustrative copy, not interactive: the user reads them and types
- *  their own request. Shown one at a time in a chevron carousel (SuggestionCarousel). */
+ *  Clicking a suggestion prefills it into the prompt (via `prefillCompose`) so
+ *  the user can edit and send, rather than retyping it. Shown one at a time in a
+ *  chevron carousel (SuggestionCarousel). */
 const IDEAS: string[] = [
   'Build me an app that tracks my reading list.',
   'Send a summary of my emails for review every weekday at 8am.',
   'Research e-bike options under €3000 and write up what you find — then set up a daily web scraper for relevant bargains and notify me when a good one comes up.',
   'Tell me how to set up Lucidos for mobile access.',
-  'Show me the app store.',
+  'Where can I download apps?',
 ];
 
 /** Pure view-model for {@link SuggestionCarousel}: clamps `index` into range and
@@ -79,9 +82,23 @@ export function suggestionView(ideas: string[], index: number) {
   };
 }
 
-/** One suggestion at a time, flanked by ‹ › chevrons. The chevrons are disabled
- *  at the ends ("when applicable"). Kept in its own component so WelcomeMessage
- *  stays hook-free (the welcome tests invoke it as a plain function). */
+/** One suggestion at a time, flanked by ‹ › chevrons. Both chevrons stay mounted
+ *  on every step — the inapplicable one (at the first / last suggestion) is
+ *  `disabled` (greyed, non-interactive) rather than hidden, so the carousel
+ *  controls never disappear. Same circular nav treatment as the notification
+ *  detail chevrons. The suggestion itself is a button: clicking it prefills the
+ *  prompt (focus-first via `composeHandlers` so the iOS keyboard opens within the
+ *  tap gesture). Kept in its own component so WelcomeMessage stays hook-free (the
+ *  welcome tests invoke it as a plain function).
+ *
+ *  All suggestions are rendered stacked in a single CSS grid cell
+ *  (`.welcome-carousel-viewport`) so the viewport's height is driven by the
+ *  TALLEST suggestion, not the currently-visible one. Suggestions vary in length,
+ *  so a viewport sized to the visible card would change height per slide and the
+ *  vertically-centered chevrons would bounce with it. Only the current suggestion
+ *  is visible and interactive; the rest stay laid out (so they still size the
+ *  track) but are hidden from sight, hit-testing, the tab order, and the a11y
+ *  tree (CSS owns the visibility — see response.css). */
 export function SuggestionCarousel() {
   const index = useSignal(0);
   const view = suggestionView(IDEAS, index.value);
@@ -94,9 +111,26 @@ export function SuggestionCarousel() {
         disabled={!view.hasPrev}
         onClick={() => { index.value = view.index - 1; }}
       >
-        <ChevronLeftIcon size="1rem" />
+        <ChevronLeftIcon />
       </button>
-      <p class="welcome-carousel-item">{view.current}</p>
+      <div class="welcome-carousel-viewport">
+        {IDEAS.map((idea, i) => {
+          const active = i === view.index;
+          return (
+            <button
+              key={idea}
+              type="button"
+              class="welcome-carousel-item"
+              aria-hidden={active ? undefined : 'true'}
+              tabIndex={active ? undefined : -1}
+              aria-label={`Use this suggestion: ${idea}`}
+              {...composeHandlers(() => { prefillCompose(idea); })}
+            >
+              {idea}
+            </button>
+          );
+        })}
+      </div>
       <button
         type="button"
         class="welcome-carousel-nav"
@@ -104,7 +138,7 @@ export function SuggestionCarousel() {
         disabled={!view.hasNext}
         onClick={() => { index.value = view.index + 1; }}
       >
-        <ChevronRightIcon size="1rem" />
+        <ChevronRightIcon />
       </button>
     </div>
   );

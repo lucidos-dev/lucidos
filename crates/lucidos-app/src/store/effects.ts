@@ -1,5 +1,5 @@
 import { effect, untracked } from '@preact/signals';
-import { pageTitle, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, diffWholeFile, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY, MOBILE_VIEW_KEY } from './store';
+import { pageTitle, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, diffWholeFile, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY } from './store';
 import { clientRefreshing } from '../hooks/sw-update';
 import { cancelApplyAllBatch } from './actions/chat-changes';
 import { handleRestartTimeout } from './actions/connection';
@@ -17,9 +17,6 @@ localStorage.removeItem('lucidos-reasoning-effort');
 // `unreadCount` computed), not a cached number — drop the legacy persisted key
 // so a stale value can't linger in storage.
 localStorage.removeItem('lucidos-unread-count');
-// mobile-view moved from localStorage to sessionStorage so a cold PWA launch
-// doesn't strand the user on a pane they last viewed days ago.
-localStorage.removeItem(MOBILE_VIEW_KEY);
 // Legacy key from when the toggle used a different shape — drop so it can't
 // shadow the current 'lucidos-input-mode' payload.
 localStorage.removeItem('lucidos-input-target');
@@ -139,12 +136,23 @@ effect(() => {
 // home deliberately avoids. dismissable/showDuringRestart match the restart
 // toast: it can't be closed mid-reload, and it survives the showToast
 // engine-restart suppression in the rare refresh-during-restart overlap.
-// `untracked` keeps the effect's only dependency `clientRefreshing` — showToast
-// reads AND writes the `toasts` signal, so tracking it here would make the
-// effect re-trigger itself (a signals "Cycle detected").
+//
+// A refresh always supersedes the "New version available" prompt — that prompt's
+// whole job is to start a refresh, which is now in flight — so dismiss it here
+// rather than leaving it stacked above the spinner. This covers every refresh
+// entry point (the toast's own Refresh button, the control panel, the
+// applied-change / reconnect toasts), so the update prompt is replaced by the
+// spinner regardless of how the refresh was triggered.
+//
+// `untracked` keeps the effect's only dependency `clientRefreshing` — showToast /
+// dismissToast read AND write the `toasts` signal, so tracking them here would
+// make the effect re-trigger itself (a signals "Cycle detected").
 effect(() => {
   if (!clientRefreshing.value) return;
-  untracked(() => showToast('Refreshing...', 'info', { key: 'refreshing', spinning: true, dismissable: false, showDuringRestart: true }));
+  untracked(() => {
+    dismissToast('update-available');
+    showToast('Refreshing...', 'info', { key: 'refreshing', spinning: true, dismissable: false, showDuringRestart: true });
+  });
 });
 
 // Sticky spinner toast for the lifetime of an Apply All batch. applyAllInProgress

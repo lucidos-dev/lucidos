@@ -144,6 +144,24 @@ html, html[data-theme="dark"] {
     --titlebar-strip-bg: #15549e;
 }
 
+/* iOS PWA dark-mode brand-blue correction (iPhone OLED).
+   The dark-mode brand blues above are genuine blue (~212° hue), but iPhone OLED
+   panels emit *saturated deep* blue with a violet bias, so the blue header
+   chrome reads slightly purple in the iOS PWA while looking correct on every
+   other display. `main.tsx` adds `.ios-pwa` to <html> only for an iOS standalone
+   PWA (isIOSPwa()), so this nudges ONLY the deep header blues a couple of degrees
+   toward cyan for that context — desktop, Android, and iOS-in-Safari are
+   pixel-identical. The nudge is deliberately faint (~a quarter off the base
+   blue): the same shift reads far stronger on the large header slab.
+   `--accent` is intentionally NOT overridden — the lighter sky-blue accent does
+   not pick up the OLED violet, and nudging it shifted accent-derived chrome
+   (the --focus-ring band and the info-toast border) off the app's standard blue.
+   Higher specificity than the `html, html[data-theme="dark"]` block above. */
+html.ios-pwa[data-theme="dark"] {
+    --header-gradient: linear-gradient(180deg, #15579c 0%, #0b3a66 100%);
+    --titlebar-strip-bg: #15579c;
+}
+
 /* Light theme */
 html[data-theme="light"] {
     color-scheme: light;

@@ -14,6 +14,7 @@ import { loadDevices } from './devices';
 import { loadNotifications } from './notifications';
 import { loadTriggers } from './triggers';
 import { loadApps } from './apps';
+import { loadInstalledPlugins } from './plugins';
 import { loadPluginCatalog } from './plugin-marketplaces';
 import { pushNavState } from './navigation';
 
@@ -49,6 +50,7 @@ export function switchMenuItem(item: MenuItem) {
 
   // Each loader sets its own Loadable failed state on error.
   if (item === 'apps') void loadApps();
+  if (item === 'plugins') void loadInstalledPlugins();
   if (item === 'triggers') void loadTriggers();
   if (item === 'settings') void loadDevices();
   if (item === 'notifications') void loadNotifications();

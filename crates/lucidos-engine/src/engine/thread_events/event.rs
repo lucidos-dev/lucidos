@@ -342,6 +342,18 @@ pub enum ThreadEvent {
         #[serde(default = "default_coding_agent_claude_code", alias = "agent")]
         coding_agent: CodingAgent,
     },
+    /// Streamed reasoning/thinking from a coding agent — the coding-agent mirror
+    /// of the chat agent's `ThoughtStreamed`. Carries plaintext reasoning the
+    /// agent emitted before its visible output (CC's `thinking_delta`; Codex's
+    /// `item/reasoning/*Delta` / `reasoning` item). Per-token streamed, persisted,
+    /// rendered as the "Thinking" step's live content so a long reasoning pass
+    /// shows progress instead of a silent "Working" gap.
+    #[serde(alias = "ClaudeCodeThoughtStreamed")]
+    CodingAgentThoughtStreamed {
+        text: String,
+        #[serde(default = "default_coding_agent_claude_code", alias = "agent")]
+        coding_agent: CodingAgent,
+    },
     #[serde(alias = "ClaudeCodeToolCalled")]
     CodingAgentToolCalled {
         name: String,

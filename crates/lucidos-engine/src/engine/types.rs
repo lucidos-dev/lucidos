@@ -324,6 +324,20 @@ pub struct AgentSession {
     /// because the previous turn's Result triggers `agent_cancel.cancel()`
     /// while CC is still processing the new prompt.
     pub pending_followups: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Set by `answer_pending_question` when a user answers an `AskUserQuestion`
+    /// on a *live* subprocess (CC continues its turn in-place once the blocked
+    /// PreToolUse hook is woken). That resume path does NOT go through `msg_tx`,
+    /// so it never reaches the `msg_rx` arm's `reset_per_turn_flags` — the only
+    /// place the run loop's per-turn `emitted_terminal_event` flag clears. Without
+    /// this signal a turn whose flag was armed (every `Result` sets it, even when
+    /// the terminal emit is suppressed) would drop all of CC's continued output as
+    /// "post-terminal stragglers", stranding the thread on "thinking…". The run
+    /// loop reads-and-clears this on the per-event lock it already takes and, if
+    /// set while `emitted_terminal_event` is true, re-arms emission before
+    /// matching the event. Set under the `agent_sessions` lock *before* waking the
+    /// hook; default `false` so a genuine trailing straggler still drops. See
+    /// docs/plans/2026-06-27-cc-question-answer-resume-straggler-drop.md.
+    pub question_resume_pending: bool,
     /// Paired ToolCalled / ToolResult counter, mirrored from the local
     /// counter inside `run_session`. Read by the external watchdog
     /// (`external_watchdog::tick`) — which lives outside `run_session`'s

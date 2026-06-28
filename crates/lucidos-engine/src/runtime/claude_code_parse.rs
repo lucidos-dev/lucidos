@@ -256,15 +256,41 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
             }]
         }
         // CC 2.1.76+ sends streaming deltas as "type": "stream_event" wrappers.
-        // We persist nothing from them — tool calls are captured from complete
-        // "assistant" messages, and text from AgentEvent::Message — but each one
-        // is positive proof the subprocess is alive and actively producing
-        // output. Emit a content-free StreamActivity ping so the watchdog's
-        // inactivity clock stays fresh through a long single step (e.g. extended
-        // thinking on a hard problem). Without it the clock only ticks at step
-        // boundaries, and a step longer than WATCHDOG_INACTIVITY_LIMIT_MS is
-        // killed mid-work even while CC is streaming the whole time.
-        "stream_event" => vec![AgentEvent::StreamActivity],
+        // Every one is positive proof the subprocess is alive and actively
+        // producing output, so we always emit a content-free StreamActivity ping
+        // to keep the watchdog's inactivity clock fresh through a long single step
+        // (e.g. extended thinking on a hard problem) — without it the clock only
+        // ticks at step boundaries and a step longer than
+        // WATCHDOG_INACTIVITY_LIMIT_MS is killed mid-work even while CC streams.
+        //
+        // Beyond liveness we extract ONE thing: the plaintext reasoning carried by
+        // a `content_block_delta` whose `delta.type` is `thinking_delta`. CC's
+        // *complete* assistant message keeps thinking as a signature-only block
+        // (plaintext stripped from the persisted JSONL), so the live stream is the
+        // only place the reasoning text exists — capture it as `AgentEvent::Thought`
+        // or it is lost. Streamed text deltas are deliberately NOT taken here: the
+        // full assistant text arrives separately as `AgentEvent::Message`, so
+        // reading it from the delta too would duplicate it. The StreamActivity ping
+        // is always emitted regardless, so the watchdog contract is unchanged.
+        "stream_event" => {
+            let mut events = Vec::new();
+            if let Some(text) = val
+                .get("event")
+                .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("content_block_delta"))
+                .and_then(|e| e.get("delta"))
+                .filter(|d| d.get("type").and_then(|v| v.as_str()) == Some("thinking_delta"))
+                .and_then(|d| d.get("text"))
+                .and_then(|v| v.as_str())
+            {
+                if !text.is_empty() {
+                    events.push(AgentEvent::Thought {
+                        text: text.to_string(),
+                    });
+                }
+            }
+            events.push(AgentEvent::StreamActivity);
+            events
+        }
         // control_response is CC's reply to a control_request (e.g. interrupt).
         // We don't need to act on it — the interrupt itself triggers a Result event.
         "control_response" => Vec::new(),

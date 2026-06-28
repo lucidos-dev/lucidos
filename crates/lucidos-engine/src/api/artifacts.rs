@@ -82,22 +82,29 @@ pub(super) async fn upload_file(
     let dest = format!("imported/{}", filename);
     log!(@upload, "Starting import for {}", filename);
     match state.engine.import_file_from_path(&temp_path, &dest).await {
-        Ok((result, commit_sha)) => {
+        Ok((result, commit_sha, resolved_dest)) => {
             log!(@upload, "Import succeeded: {}", result);
             let _ = std::fs::remove_file(&temp_path);
+
+            // Reflect the ACTUAL final filename — a collision auto-suffix may
+            // have landed the file at e.g. "imported/Brev (1).pdf".
+            let final_filename = resolved_dest
+                .rsplit('/')
+                .next()
+                .map(str::to_string)
+                .unwrap_or(filename);
 
             // Spawn the post-import hook. Today it's a near no-op (memory
             // indexing for text artifacts runs via `memory_consumer`); kept
             // as the upload-side extension point.
             let engine = Arc::clone(&state.engine);
-            let dest_bg = dest.clone();
             tokio::spawn(async move {
-                engine.post_import_index(&dest_bg, &commit_sha).await;
+                engine.post_import_index(&resolved_dest, &commit_sha).await;
             });
 
             Json(UploadResponse {
                 success: true,
-                filename: Some(filename),
+                filename: Some(final_filename),
                 error: None,
             })
         }

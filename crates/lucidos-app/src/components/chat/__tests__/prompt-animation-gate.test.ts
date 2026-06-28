@@ -70,14 +70,17 @@ describe('promptAnimating gate', () => {
     expect(ungatedExchanges.length).toBeGreaterThan(0);
   });
 
-  it('emptyReason returns loading during animation regardless of event state', () => {
-    // The bug: during FLIP animation, events arrive via SSE (hasContent=true) and
-    // eventsLoaded=true, but exchanges are gated to []. Old boolean logic showed
-    // "Messages could not be displayed" error. Union type makes this impossible.
-    expect(emptyReason(true, false, false, false, 't1')).toEqual({ kind: 'loading', threadId: 't1' });
-    expect(emptyReason(true, true, false, false, 't1')).toEqual({ kind: 'loading', threadId: 't1' });
-    expect(emptyReason(true, true, false, true, 't1')).toEqual({ kind: 'loading', threadId: 't1' });
-    expect(emptyReason(true, false, true, false, 't1')).toEqual({ kind: 'loading', threadId: 't1' });
+  it('emptyReason returns animating during animation regardless of event state', () => {
+    // During the FLIP animation, events may arrive via SSE (hasContent=true) and
+    // eventsLoaded=true, but exchanges are gated to []. The 'animating' variant
+    // renders nothing — it suppresses the error/empty flash (the union makes the
+    // error state impossible here) AND keeps the loading skeleton from showing on
+    // a brand-new thread's first prompt send (the content is the just-sent
+    // message, not a DB fetch). Distinct from 'loading' (a real DB fetch).
+    expect(emptyReason(true, false, false, false, 't1')).toEqual({ kind: 'animating' });
+    expect(emptyReason(true, true, false, false, 't1')).toEqual({ kind: 'animating' });
+    expect(emptyReason(true, true, false, true, 't1')).toEqual({ kind: 'animating' });
+    expect(emptyReason(true, false, true, false, 't1')).toEqual({ kind: 'animating' });
   });
 
   it('emptyReason returns failed when load failed', () => {
@@ -113,9 +116,10 @@ describe('promptAnimating gate', () => {
     };
     threadMap.value = new Map([[id, state]]);
 
-    // During animation: emptyReason forces loading (never error)
+    // During animation: emptyReason forces 'animating' (never error), which
+    // renders nothing — no skeleton, no error flash.
     const reason = emptyReason(true, state.eventsLoaded, state.eventsLoadFailed, hasContentEvents(state.events), id);
-    expect(reason.kind).toBe('loading');
+    expect(reason.kind).toBe('animating');
 
     // After animation: events compute into exchanges normally — no empty state
     promptAnimating.value = false;

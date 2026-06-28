@@ -183,24 +183,25 @@ pub fn reclaim_stale_engine(resolved_dir: &Path) {
     let _ = resolved_dir;
 }
 
-/// Outcome of one health probe. Distinguishes a dead engine (the listener is
-/// gone — connection refused) from an alive-but-busy one (the probe timed out),
-/// so the supervisor can be PATIENT with the latter and PROMPT with the former.
-/// This split is what stops a heavy load spike (e.g. an e2e run) from being
-/// read as "engine died" and culled.
+/// Outcome of one health probe. Used to detect `Healthy` (which resets the
+/// stack) and to enrich the supervisor's log line. The cull decision keys on
+/// whether the engine PROCESS is alive, NOT on this outcome — an alive engine is
+/// never culled (see `respawn_decision`); only a process that has exited is
+/// respawned. The variants remain for the `Healthy` check and observability.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProbeOutcome {
     /// 2xx from `/api/v1/health`.
     Healthy,
     /// Connect error that is NOT a timeout (connection refused / reset) — the
-    /// engine isn't accepting connections. A strong "down" signal (crashed, or
-    /// mid-restart).
+    /// engine isn't accepting connections (crashed, or mid-restart). Acted on as
+    /// a respawn only when the process is also dead.
     Unreachable,
     /// The probe timed out (connect or read) — the process is (likely) alive
-    /// but too busy to answer within the budget. A WEAK signal: never cull on a
-    /// single one.
+    /// but too busy to answer within the budget. An alive engine is never culled,
+    /// so this never respawns on its own.
     Slow,
-    /// Any other error, or a non-2xx response. Treated like `Slow` (patient).
+    /// Any other error, or a non-2xx response. Like `Slow`, never culls an alive
+    /// engine.
     Other,
 }
 
@@ -232,10 +233,10 @@ pub async fn probe_health(client: &reqwest::Client, scheme: &str, port: u16) -> 
 /// its port, probed via `127.0.0.1` (harmless for the plain-http packaged engine).
 ///
 /// The 5s timeout gives a busy engine headroom to answer before the probe is
-/// classified `Slow` (a response that arrives in <5s is healthy). Culling never
-/// hinges on this timeout alone — it takes `SLOW_MISS_THRESHOLD` consecutive
-/// slow probes (see `server.rs`), so the budget can stay modest without
-/// false-culling working engines.
+/// classified `Slow` (a response that arrives in <5s is healthy). The budget can
+/// stay modest because a `Slow` outcome never culls a live engine at all — only a
+/// process that has actually EXITED is respawned (see `respawn_decision` in
+/// `server.rs`), so a slow probe against a working engine is harmless.
 pub fn build_health_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()

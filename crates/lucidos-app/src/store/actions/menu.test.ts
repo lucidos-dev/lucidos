@@ -42,6 +42,7 @@ vi.mock('../../api/client', () => ({
   listTriggers: vi.fn().mockResolvedValue({ triggers: [] }),
   listAppsApi: vi.fn().mockResolvedValue([]),
   fetchPluginCatalog: vi.fn().mockResolvedValue({ marketplaces: [], plugins: [], errors: [] }),
+  fetchInstalledPlugins: vi.fn().mockResolvedValue({ plugins: [] }),
   listDevices: vi.fn().mockResolvedValue({ devices: [] }),
 }));
 
@@ -128,6 +129,16 @@ describe('switchMenuItem', () => {
     expect(revealContentPane).toHaveBeenCalledTimes(1);
   });
 
+  it('navigates to the Plugins panel and reveals the content pane', () => {
+    // Mirror entry for the new top-level Plugins panel (frontend.md: new
+    // navigation entry points get pinned here). switchMenuItem('plugins') is
+    // the user-intent layer for the drawer's Plugins item + the `app-store`
+    // navigate target.
+    switchMenuItem('plugins');
+    expect(activeMenuItem.value).toBe('plugins');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
+  });
+
   it('reveals the content pane even when re-selecting the SAME menu item', () => {
     // Regression for the old setActiveMenu gate that skipped pane navigation
     // when `item === prev`. Re-tapping a link to a panel the user previously
@@ -195,6 +206,20 @@ describe('openSettingsSubview', () => {
     // subpanel reached via openSettingsSubview, not a top-level menu item.
     openSettingsSubview('thread-queue');
     expect(settingsSubview.value).toBe('thread-queue');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens the models subview (the triggering deep-link case)', () => {
+    // The agent could not deep-link Settings → Models before settings_view was
+    // widened; pin that it now lands (frontend.md: pin new navigation points).
+    openSettingsSubview('models');
+    expect(settingsSubview.value).toBe('models');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens the permissions subview', () => {
+    openSettingsSubview('permissions');
+    expect(settingsSubview.value).toBe('permissions');
     expect(revealContentPane).toHaveBeenCalledTimes(1);
   });
 });

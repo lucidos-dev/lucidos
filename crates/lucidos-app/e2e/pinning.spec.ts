@@ -1,8 +1,15 @@
 import { test, expect } from './fixtures';
 import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, ensureOnThreadPane, waitForVisibleInput } from './helpers';
 
-const SAVE_BTN = 'button[aria-label="Pin thread"]:visible';
-const UNSAVE_BTN = 'button[aria-label="Remove thread from Pinned section"]:visible';
+// Scope to the focused thread's header actions. The drawer rows now carry their
+// own pin button (extraClass="thread-row-action"), and on mobile the drawer pane
+// is always mounted (off-screen but CSS-:visible), so an unscoped selector's
+// .first()/count() would resolve to an off-screen drawer-row pin instead of the
+// focused thread's. `.thread-view-header-actions` is the focused thread's header
+// (ThreadView on desktop, MobileThreadTitleBar on mobile — the inactive variant
+// is display:none), never a drawer row.
+const SAVE_BTN = '.thread-view-header-actions button[aria-label="Pin thread"]:visible';
+const UNSAVE_BTN = '.thread-view-header-actions button[aria-label="Remove thread from Pinned section"]:visible';
 
 test.describe('Thread pin', () => {
   test.beforeEach(async ({ page }) => {

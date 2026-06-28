@@ -414,8 +414,10 @@ fn system_backup_completed_matches_server_event_shape() {
         seq: None,
         created: Utc::now(),
         typed: BusEvent::System(SystemEvent::BackupCompleted {
-            filename: "lucidos-backup-personal-20260504-090000.enc".into(),
+            filename: "lucidos-backup-myws-20260504-090000.enc".into(),
             size_bytes: 927_401_289,
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
         }),
         aggregate: None,
     };
@@ -424,17 +426,19 @@ fn system_backup_completed_matches_server_event_shape() {
     assert_eq!(json["type"], "BackupCompleted");
     assert_eq!(
         json["data"]["filename"],
-        "lucidos-backup-personal-20260504-090000.enc"
+        "lucidos-backup-myws-20260504-090000.enc"
     );
     assert_eq!(json["data"]["size_bytes"], 927_401_289u64);
 
     let event = SystemEvent::BackupCompleted {
         filename: "f".into(),
         size_bytes: 1,
+        started_at: Utc::now(),
+        finished_at: Utc::now(),
     };
     assert!(
-        !event.is_persisted(),
-        "BackupCompleted is ephemeral — audit lives in engine log"
+        event.is_persisted(),
+        "BackupCompleted is persisted — it is the durable backup run history"
     );
     assert_eq!(event.aggregate(), "ops");
 }
@@ -447,6 +451,8 @@ fn system_backup_failed_matches_server_event_shape() {
         created: Utc::now(),
         typed: BusEvent::System(SystemEvent::BackupFailed {
             error: "Token refresh failed (invalid_grant)".into(),
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
         }),
         aggregate: None,
     };
@@ -458,10 +464,14 @@ fn system_backup_failed_matches_server_event_shape() {
         "Token refresh failed (invalid_grant)"
     );
 
-    let event = SystemEvent::BackupFailed { error: "x".into() };
+    let event = SystemEvent::BackupFailed {
+        error: "x".into(),
+        started_at: Utc::now(),
+        finished_at: Utc::now(),
+    };
     assert!(
-        !event.is_persisted(),
-        "BackupFailed is ephemeral — failure notification persists separately"
+        event.is_persisted(),
+        "BackupFailed is persisted — it is part of the durable backup run history"
     );
     assert_eq!(event.aggregate(), "ops");
 }
@@ -557,9 +567,13 @@ fn reserved_type_names_match_event_type() {
         BackupCompleted {
             filename: "lucidos-backup-x-20260504-090000.enc".into(),
             size_bytes: 100,
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
         },
         BackupFailed {
             error: "boom".into(),
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
         },
         RecoveryProgress {
             completed: 0,
@@ -664,7 +678,7 @@ fn reserved_type_names_match_event_type() {
             change_id: "c".into(),
         },
         EmailSent {
-            account: "personal".into(),
+            account: "primary".into(),
             to: vec!["a@b.com".into()],
             cc: vec![],
             bcc: vec![],

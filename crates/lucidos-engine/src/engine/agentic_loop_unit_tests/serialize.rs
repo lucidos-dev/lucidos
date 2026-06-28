@@ -198,17 +198,17 @@ mod relation_tests {
         for relation in [Relation::Child, Relation::Top] {
             let text = relation.run_coding_agent_success_text(
                 child,
-                "personal",
+                "dev",
                 crate::runtime::CodingAgent::ClaudeCode,
             );
             assert!(
-                text.contains("workspace 'personal'"),
+                text.contains("workspace 'dev'"),
                 "{:?} CC ack must name the workspace in the body: {}",
                 relation,
                 text
             );
             assert!(
-                text.contains(&format!("thread:personal/{}", child)),
+                text.contains(&format!("thread:dev/{}", child)),
                 "{:?} CC ack link must be workspace-prefixed: {}",
                 relation,
                 text
@@ -220,15 +220,15 @@ mod relation_tests {
     fn run_thread_text_stamps_workspace_into_body_and_link() {
         let child = Uuid::new_v4();
         for relation in [Relation::Child, Relation::Top] {
-            let text = relation.run_thread_success_text(child, "work");
+            let text = relation.run_thread_success_text(child, "myws");
             assert!(
-                text.contains("workspace 'work'"),
+                text.contains("workspace 'myws'"),
                 "{:?} thread ack must name the workspace in the body: {}",
                 relation,
                 text
             );
             assert!(
-                text.contains(&format!("thread:work/{}", child)),
+                text.contains(&format!("thread:myws/{}", child)),
                 "{:?} thread ack link must be workspace-prefixed: {}",
                 relation,
                 text

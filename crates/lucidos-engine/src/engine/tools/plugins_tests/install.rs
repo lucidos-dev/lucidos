@@ -817,3 +817,101 @@ async fn e2e_update_plugin_re_fetches_when_version_bumps() {
 
 // ---- e2e test 5 -------------------------------------------------------
 
+const GIT_TRACK_MANIFEST: &str = r#"
+id = "git-track-plugin"
+version = "0.3.1"
+name = "Git Track Plugin"
+description = "test"
+source = "https://github.com/x/git-track"
+"#;
+
+/// Regression test for the plugin-install git-tracking bug: installing a
+/// plugin wrote its files into `data/` but never staged/committed them, so
+/// every plugin file sat untracked forever (no version history, lost on a
+/// hard reset, invisible to git-based backups). Every other data-writing
+/// path (write_file/edit_file/data writes/marketplace registration) commits
+/// the files it writes; install was the lone exception.
+///
+/// Asserts the post-install working tree is clean for the plugin's files
+/// (none untracked) AND that exactly one commit, touching those files,
+/// records the install. Spans two content dirs (`apps/` + `knowhow/`) to
+/// prove the whole install lands in a SINGLE commit.
+#[tokio::test]
+async fn install_commits_written_files_so_working_tree_is_clean() {
+    let scratch = fresh_workspace();
+    let archive_dir = scratch.join("archive");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    let archive = build_archive(
+        &archive_dir,
+        "git-track.lucidos-plugin",
+        GIT_TRACK_MANIFEST,
+        &[
+            ("apps/git-track-plugin/index.html", b"<h1>hi</h1>"),
+            ("apps/git-track-plugin/manifest.json", b"{\"name\":\"Git Track\"}"),
+            ("knowhow/git-track.md", b"# how"),
+        ],
+    );
+    let unpacked = extract_to(&archive_dir, &archive);
+
+    let bus = MockEventBus::new();
+    let (_msg, files) = install_from_unpacked_with_bus(
+        &scratch,
+        &bus,
+        &unpacked,
+        SourceType::Archive,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("install must succeed");
+
+    let repo = git2::Repository::open(&scratch).expect("workspace must be a git repo");
+
+    // 1. None of the installed files may be left untracked/dirty. Before the
+    //    fix, every one of these reported `WT_NEW` (the `?? data/apps/...`
+    //    lines from the bug report).
+    for rel in &files {
+        let repo_path = format!("data/{}", rel);
+        let status = repo
+            .status_file(std::path::Path::new(&repo_path))
+            .unwrap_or_else(|e| panic!("status for {}: {}", repo_path, e));
+        assert!(
+            status.is_empty(),
+            "installed file {} must be tracked & clean after install, got status {:?}",
+            repo_path,
+            status
+        );
+    }
+
+    // 2. HEAD records the install with a descriptive, version-stamped message.
+    let head_commit = repo
+        .head()
+        .and_then(|h| h.peel_to_commit())
+        .expect("install must have created a commit (HEAD)");
+    assert_eq!(
+        head_commit.message().unwrap_or(""),
+        "Install plugin: git-track-plugin v0.3.1",
+        "install commit must name the plugin and version"
+    );
+
+    // 3. The commit's tree actually contains every installed file (one commit
+    //    across both `apps/` and `knowhow/`).
+    let tree = head_commit.tree().expect("commit tree");
+    for rel in &files {
+        let repo_path = format!("data/{}", rel);
+        assert!(
+            tree.get_path(std::path::Path::new(&repo_path)).is_ok(),
+            "install commit tree must contain {}",
+            repo_path
+        );
+    }
+    assert!(
+        files.contains(&"apps/git-track-plugin/index.html".to_string())
+            && files.contains(&"knowhow/git-track.md".to_string()),
+        "fixture must span apps/ and knowhow/ to prove a single multi-dir commit"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+

@@ -25,8 +25,11 @@ import { getDeviceId } from './devices';
 import { handleEvent, makeOptimisticThreadState, type StoredEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { pushThreadNavState, removeThreadNavEntries } from './thread-navigation';
+import { revealThreadPane } from './pane';
 import { scrollToBottom } from '../../components/chat/scrollState';
 import { refreshThreadEvents } from './thread-loading';
+import { markThreadRerenderStart } from '../../utils/threadOpenMarks';
+import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { isTauri } from '../../utils/platform';
 import { getWebviewContent } from '../../utils/tauri';
 import { errorDetail } from '../../utils/errorDetail';
@@ -129,13 +132,35 @@ export const STALE_EXCHANGE_FOLLOWUP_MS = 60_000;
  *  If the pending message is still present (SSE missed the MessageReceived),
  *  force-refresh thread events and clear any stale pending messages.
  *  A second refresh fires later to catch backend-emitted terminal events
- *  (e.g. ResponseAborted for lost follow-ups) that weren't ready at 30s. */
-function schedulePendingCleanup(threadId: string, eventId: string): void {
+ *  (e.g. ResponseAborted for lost follow-ups) that weren't ready at 30s.
+ *
+ *  The refetch IS the recovery. `schedulePendingCleanup` is only reached after
+ *  `submitChat()` resolved, so the MessageReceived is already persisted in the
+ *  DB — a successful refresh surfaces it and `handleEvent` swaps the optimistic
+ *  row for it. The force-clear is the fallback for a GENUINE backend loss, but
+ *  ONLY a refetch that actually SUCCEEDED can prove the event is absent. A
+ *  refetch that FAILED (transient host contention / offline) proves nothing;
+ *  clearing then would force-drop a message that is safely persisted — the
+ *  user's just-sent message vanishes from the thread. That is the
+ *  `coding-agent-follow-ups` "follow-up lost entirely under rapid send-while-
+ *  working" flake: under load the MessageReceived SSE lags past 30s AND the
+ *  safety refetch times out, so the unconditional clear destroyed a persisted
+ *  follow-up. On a failed refetch we reschedule another attempt instead (the
+ *  guard at the top exits once the pending is gone, so the retry is bounded by
+ *  the pending's lifetime and self-clears when SSE catches up or any later
+ *  refetch succeeds). */
+export function schedulePendingCleanup(threadId: string, eventId: string): void {
   setTimeout(async () => {
     const thread = threadMap.value.get(threadId);
     if (!thread || !thread.pendingUserMessages.some(p => p.eventId === eventId)) return;
-    await refreshThreadEvents(threadId).catch(() => {});
-    clearStalePendingMessages(threadId);
+    let refetchOk = true;
+    await refreshThreadEvents(threadId).catch(() => { refetchOk = false; });
+    if (refetchOk) {
+      clearStalePendingMessages(threadId);
+    } else {
+      // Transient failure — don't drop a persisted message; try again later.
+      schedulePendingCleanup(threadId, eventId);
+    }
   }, PENDING_MESSAGE_SAFETY_MS);
 
   // CC threads only: pick up terminal events (ResponseAborted) emitted during
@@ -166,7 +191,15 @@ function addPendingMessage(
       created: new Date().toISOString(),
       image_hashes: imageHashes,
     });
-    if (focusedThreadId.value === threadId) scrollToBottom();
+    if (focusedThreadId.value === threadId) {
+      scrollToBottom();
+      // Perf: stamp the open→paint re-render span for the `thread-rerender` mark
+      // (a follow-up send on the focused thread re-renders the whole exchange
+      // list). ThreadView fires once on the next render. Focused-only — a
+      // background thread's optimistic insert doesn't render. Fire-and-forget
+      // telemetry; see utils/threadOpenMarks.ts + utils/renderPhaseTimers.ts.
+      markThreadRerenderStart(threadId, { ...currentPerfBaseline(), cause: 'send' });
+    }
     threadMap.value = new Map(map);
     // `computeExchanges` reads `thread.pendingUserMessages` to synthesize the
     // optimistic user-message row, but `activeExchanges` no longer subscribes
@@ -203,7 +236,15 @@ export async function sendMessage(
 
   if (shouldFocus) {
     setFocusedThread(threadId);
-    if (isNewThread) pushThreadNavState({ type: 'thread', id: threadId });
+    if (isNewThread) {
+      pushThreadNavState({ type: 'thread', id: threadId });
+      // A brand-new thread spawned from another pane (e.g. the new-app form in
+      // the content pane) must surface on the thread pane, mirroring focusThread.
+      // Compose/follow-up sends pass an explicit threadId so isNewThread is
+      // false — they're already on the thread pane, so this only fires for raw
+      // new sends, where it's the correct landing.
+      revealThreadPane();
+    }
   }
 
   // Snapshot the thread BEFORE the optimistic insert below — the insert

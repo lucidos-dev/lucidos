@@ -1,13 +1,13 @@
-import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, focusedPane, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, drawerView, threadSearchQuery, threadSearchResults } from '../store';
-import { navigateToPane } from './pane';
-import { isMobile } from '../../utils/viewport';
+import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, drawerView, threadSearchQuery, threadSearchResults } from '../store';
+import { revealThreadPane } from './pane';
 import type { ThreadSection, ThreadState } from '../thread-events';
 import { threadPassesChannelFilter } from '../threadFilter';
 import { computeFamilyGraph, filterByTopThread, orderedCurrentForReview, attentionThreads, reviewThreads, runningThreads, draftThreads } from '../../components/drawer/family-graph';
 import type { FamilyGraph } from '../../components/drawer/family-graph';
 import { saveThread, unsaveThread, archiveThread } from '../../api/threads';
-import { ApiError } from '../../api/client';
+import { ApiError, putComposeOnThread } from '../../api/client';
 import { loadThreadEvents, ensureThreadByIdInMap, sectionMutatedAt } from './thread-loading';
+import { clearDraft, draftPresentThreadIds, getDraft, setDraft, type ComposeDraft } from '../composeDrafts';
 import { scrollToBottom, scrollToEventAndPulse, scrollToChangeAndPulse, clearPendingEventScroll } from '../../components/chat/scrollState';
 import { pushThreadNavState } from './thread-navigation';
 import { hasSavedScroll, threadScrollKey } from '../../hooks/useScrollMemory';
@@ -61,20 +61,12 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
 
   pushThreadNavState({ type: 'thread', id: threadId });
 
-  // Surface the focused thread on the pane the user is actually working in.
-  // Mobile: navigate to the thread pane so the thread is visible — without this,
-  // callers like toast onClick and search would set the focused thread but leave
-  // the user on whichever pane they were on. Desktop: when arriving from the
-  // Content pane group (e.g. Search Everywhere → a thread while viewing an
-  // app/Settings), re-activate the Threads pane group so keyboard tabbing lands
-  // on the conversation. Signal-only — handlePaneTab pulls DOM focus in on the
-  // first Tab. Only the cross-group case switches: an existing 'drawer'/'thread'
-  // focus is left alone so drawer ↑/↓ browsing (and its accent) isn't disturbed.
-  if (isMobile()) {
-    navigateToPane('thread');
-  } else if (focusedPane.value === 'content') {
-    focusedPane.value = 'thread';
-  }
+  // Surface the focused thread on the pane the user is actually working in —
+  // mobile swipes to the thread pane, desktop re-activates the Threads pane
+  // group from the cross-group case. Without this, callers like toast onClick
+  // and search would set the focused thread but leave the user on whichever
+  // pane they were on. See `revealThreadPane` (the mirror of revealContentPane).
+  revealThreadPane();
 
   if (targetEventId) {
     scrollToEventAndPulse(targetEventId);
@@ -101,10 +93,25 @@ export function focusThreadOrBootstrap(threadId: string, options?: FocusThreadOp
   });
 }
 
-export function unfocusThread(): void {
+/** Drop the focused thread → the thread pane shows the compose view.
+ *
+ *  `revealPane` (default true): also surface the thread pane, so the user-intent
+ *  callers (the New-thread buttons, the new-chat shortcut, archiving the last
+ *  review, a new-chat NavigationRequested) land the compose view on the pane the
+ *  user is looking at — mobile swipes to it, desktop re-activates the Threads
+ *  pane group from the content group. Mirrors focusThread; the callers that used
+ *  to hand-pair `navigateToPane('thread')` no longer need to.
+ *
+ *  Pass `{ revealPane: false }` for stale-pointer CLEANUP — ThreadView clears a
+ *  focusedThreadId whose thread isn't in the map. ThreadView is mounted in the
+ *  background on mobile (MobileSwipeContainer mounts all three panes), so a
+ *  reveal there would yank a user on the content pane to the thread pane during
+ *  render. Cleanup isn't navigation — it must not move the visible pane. */
+export function unfocusThread(opts?: { revealPane?: boolean }): void {
   setFocusedThread(null);
   revealOnFocus.value = false;
   resetCodingAgentPendingPreferences();
+  if (opts?.revealPane !== false) revealThreadPane();
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +291,22 @@ function collectArchiveCascade(rootId: string): Set<string> {
   return seen;
 }
 
+/** Clear a thread's unsent reply draft — local signal plus the server compose
+ *  row. Snapshots the draft so a failed PUT restores it: local and server must
+ *  not diverge, or the discarded draft silently reappears on the next load.
+ *  Deliberately uses the leaf `composeDrafts` helpers + `putComposeOnThread`
+ *  rather than compose.ts's `updateCompose`, so core thread CRUD doesn't pull
+ *  the chat-send graph (compose.ts → chat.ts) into its imports. */
+function discardThreadDraft(threadId: string): void {
+  const prior = getDraft(threadId);
+  const restore: ComposeDraft = { ...prior, image_hashes: [...prior.image_hashes] };
+  clearDraft(threadId);
+  void putComposeOnThread(threadId, '', [], null).catch((e) => {
+    setDraft(threadId, restore);
+    showToast(`Couldn't discard draft: ${errorDetail(e)}`, 'error');
+  });
+}
+
 export async function handleArchiveThread(threadId: string): Promise<void> {
   if (archivingThreadIds.value.has(threadId)) return;
   if (discardingCCThreadIds.value.has(threadId)) return; // Can't archive while discarding
@@ -298,6 +321,44 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
     )) {
       return;
     }
+  }
+
+  // The archive cascades to the target + every transitive descendant; collect
+  // the family up front so we can both check it for unsent drafts here and (just
+  // below) flip the whole family out of review in one stroke.
+  const cascade = collectArchiveCascade(threadId);
+
+  // If any family member carries an unsent reply draft, ask whether to discard
+  // it too. Archiving doesn't clear the draft server-side, so the focused OK
+  // button ("Keep draft") is the conservative default — it leaves the draft to
+  // resume after un-archiving. "Discard draft" (the left extraAction) clears it
+  // on every drafted member once the archive succeeds; Cancel/Escape aborts the
+  // archive entirely. Mirrors the Apply/Discard/Cancel shape in threadActions.ts
+  // (destructive = extraAction, safe = the focused OK button).
+  const draftedIds = [...cascade].filter((id) => draftPresentThreadIds.value.has(id));
+  let discardDrafts = false;
+  if (draftedIds.length > 0) {
+    const many = draftedIds.length > 1;
+    let discardChosen = false;
+    const keep = await showConfirm(
+      many
+        ? 'These threads have unsent drafts. Discard them too?'
+        : 'This thread has an unsent draft. Discard it too?',
+      many ? 'Keep drafts' : 'Keep draft',
+      {
+        variant: 'default',
+        cancelLabel: 'Cancel',
+        extraAction: {
+          label: many ? 'Discard drafts' : 'Discard draft',
+          onClick: () => { discardChosen = true; },
+        },
+      },
+    );
+    // keep === true → OK ("Keep draft(s)"): archive, leave the draft.
+    // discardChosen → extraAction ("Discard draft(s)"): archive + clear below.
+    // neither → Cancel/Escape/outside-click: abort the archive.
+    if (!keep && !discardChosen) return;
+    discardDrafts = discardChosen;
   }
 
   // Pin to bottom and show header before banner re-renders
@@ -318,8 +379,8 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
   // Snapshot section + codingAgentProposed on every family member so we can
   // roll back if the API rejects (409 blocking, 500 mid-cascade). Both fields
   // are required to leave Current: `displaySection` keeps any thread with
-  // pending changes in Current regardless of `section`.
-  const cascade = collectArchiveCascade(threadId);
+  // pending changes in Current regardless of `section`. `cascade` was collected
+  // up front (above the draft confirm).
   type Snap = { section: ThreadSection; codingAgentProposed: boolean };
   const snapshot = new Map<string, Snap>();
   const optimistic = new Map(threadMap.value);
@@ -355,12 +416,18 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
     revealOnFocus.value = true;
     focusThread(nextId);
   } else {
+    // Last review dismissed → land on the compose view. unfocusThread reveals
+    // the thread pane itself (keeps the drawer open), so no manual navigate.
     unfocusThread();
-    navigateToPane('thread');
   }
 
   try {
     await archiveThread(threadId);
+    // Archive landed — now honor a "Discard draft(s)" choice. Deferred until
+    // here so a rejected archive (rolled back below) leaves the draft intact.
+    if (discardDrafts) {
+      for (const id of draftedIds) discardThreadDraft(id);
+    }
   } catch (e) {
     const restored = new Map(threadMap.value);
     for (const [tid, snap] of snapshot) {

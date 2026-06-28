@@ -6,7 +6,7 @@ import { formatChannel } from '../../utils/formatChannel';
 import { PENDING_TITLE_PLACEHOLDER } from '../../store/thread-events';
 
 const menuLabels: Record<string, string> = {
-  files: 'Files', apps: 'Apps', triggers: 'Triggers',
+  files: 'Files', apps: 'Apps', plugins: 'Plugins', triggers: 'Triggers',
   changes: 'Changes', notifications: 'Notifications',
   settings: 'Settings',
 };
@@ -66,7 +66,9 @@ export function getContentTitle(): string {
     return fileName;
   }
   if (overlay?.type === 'url-preview') return pageTitle || getHostname(url!);
-  if (overlay?.type === 'notification-detail') return overlay.notification.title || 'Notification';
+  if (overlay?.type === 'notification-detail') {
+    return overlay.notification.title ? `Notification - ${overlay.notification.title}` : 'Notification';
+  }
   if (!overlay && active === 'settings' && settingsSubview.value !== 'main') {
     return settingsSubviewLabel(settingsSubview.value) || '';
   }

@@ -524,13 +524,16 @@ pub(super) async fn create_model(
     Json(request): Json<CreateModelRequest>,
 ) -> Json<ApiResult> {
     let id = request.id.trim();
-    let label = request.label.trim();
     if id.is_empty() {
         return ApiResult::err("Model id cannot be empty");
     }
-    if label.is_empty() {
-        return ApiResult::err("Model label cannot be empty");
-    }
+    // Label is optional — an absent/empty label defaults to the id (mirrors the
+    // `manage_models` LLM handler and the `lucidos models add` CLI, whose --label
+    // is optional). The Settings UI always supplies one.
+    let label = match request.label.trim() {
+        l if !l.is_empty() => l,
+        _ => id,
+    };
     if !valid_provider(&request.provider) {
         return ApiResult::err(PROVIDER_ERR);
     }
@@ -773,36 +776,27 @@ pub(super) async fn set_preference(
     headers: HeaderMap,
     Json(request): Json<SetPreferenceRequest>,
 ) -> Json<ApiResult> {
-    let key = query.key;
-    let result = if let Some(ref device_id) = request.device_id {
-        PreferenceStore::set_for_device(&state.pool, &key, &request.value, device_id).await
-    } else {
-        PreferenceStore::set(&state.pool, &key, &request.value).await
-    };
-    match result {
-        Ok(()) => {
-            let actor = super::actor::user_actor_resolved(
-                &headers,
-                &state.pool,
-                request.device_id.as_deref(),
-            )
+    // Route through the single write chokepoint (engine/preferences.rs) so the
+    // Settings UI gets the same side-effects the set_preference tool does:
+    // language/timezone refresh the engine's in-memory locale + emit
+    // LanguageSet/TimezoneSet, push syncs devices.push_enabled, everything else
+    // emits PreferencesChanged. The HTTP path is intentionally permissive about
+    // the key (the human edits internal keys here) — the catalog gate lives in
+    // the tool handler only.
+    let actor =
+        super::actor::user_actor_resolved(&headers, &state.pool, request.device_id.as_deref())
             .await;
-            state
-                .engine
-                .event_bus
-                .emit_or_log(
-                    crate::engine::event_bus::BusEvent::System(
-                        crate::engine::event_bus::SystemEvent::PreferencesChanged {
-                            key: key.clone(),
-                            value: Some(request.value.clone()),
-                            actor,
-                        },
-                    ),
-                    "[Settings] PreferencesChanged",
-                )
-                .await;
-            ApiResult::ok()
-        }
+    match state
+        .engine
+        .apply_preference_write(
+            &query.key,
+            &request.value,
+            request.device_id.as_deref(),
+            actor,
+        )
+        .await
+    {
+        Ok(_) => ApiResult::ok(),
         Err(e) => ApiResult::err(format!("Failed to set preference: {}", e)),
     }
 }

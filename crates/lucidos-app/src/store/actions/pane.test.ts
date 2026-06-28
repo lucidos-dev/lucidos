@@ -9,7 +9,7 @@ import {
   DEFAULT_SPLIT_RATIO, KEYBOARD_RESIZE_STEP_PX, MIN_THREAD_PANE_PX, MIN_CONTENT_PANE_PX,
 } from '../../components/layout/splitHelpers';
 import {
-  navigateToPane, checkPaneConsistency, toggleThreads, focusPane, revealContentPane,
+  navigateToPane, checkPaneConsistency, toggleThreads, focusPane, revealContentPane, revealThreadPane,
   toggleThreadPane, toggleContentPane, stepThreadPaneWidth, stepThreadDrawerWidth, resetPaneLayout,
 } from './pane';
 
@@ -349,6 +349,69 @@ describe('revealContentPane', () => {
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// revealThreadPane — the mirror of revealContentPane for thread navigation
+// (focusThread / unfocusThread / sendMessage's raw-new-thread path). Desktop:
+// re-activate the Threads pane group ONLY from the cross-group case so drawer/
+// thread focus is left alone. Mobile: swipe to the thread pane.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('revealThreadPane', () => {
+  beforeEach(() => {
+    resetState(); // focusedPane = 'thread', mobileView = 'thread'
+    splitRatio.value = 0.5;
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('desktop: re-activates the Threads pane group from the content group', () => {
+    (globalThis as any).innerWidth = 1024;
+    focusedPane.value = 'content'; // arriving from the Content pane group
+    revealThreadPane();
+    expect(focusedPane.value).toBe('thread');
+  });
+
+  it('desktop: leaves an existing drawer focus alone (no cross-group switch)', () => {
+    (globalThis as any).innerWidth = 1024;
+    focusedPane.value = 'drawer'; // browsing the thread list via keyboard
+    revealThreadPane();
+    expect(focusedPane.value).toBe('drawer');
+  });
+
+  it('desktop: idempotent when already focused on the thread pane', () => {
+    (globalThis as any).innerWidth = 1024;
+    focusedPane.value = 'thread';
+    revealThreadPane();
+    expect(focusedPane.value).toBe('thread');
+  });
+
+  it('desktop: does not move the split ratio (focus-only)', () => {
+    (globalThis as any).innerWidth = 1024;
+    focusedPane.value = 'content';
+    splitRatio.value = 0.5;
+    revealThreadPane();
+    expect(splitRatio.value).toBe(0.5);
+  });
+
+  it('mobile: navigates to the thread pane and never touches focusedPane', () => {
+    (globalThis as any).innerWidth = 375;
+    mobileView.value = 'content';
+    revealThreadPane();
+    expect(mobileView.value).toBe('thread');
+    expect(focusedPane.value).toBe('thread'); // mobile navigates, never focuses
+  });
+
+  it('mobile: keeps the thread drawer open when navigating to the thread pane', () => {
+    (globalThis as any).innerWidth = 375;
+    mobileView.value = 'thread';
+    threadDrawerOpen.value = true;
+    revealThreadPane();
+    // navigateToPane('thread') keeps the drawer (the `view !== 'thread'` guard) —
+    // this is what lets the archive "last review → compose, drawer stays open"
+    // behavior survive the move from a manual navigateToPane to revealThreadPane.
+    expect(mobileView.value).toBe('thread');
+    expect(threadDrawerOpen.value).toBe(true);
+  });
+});
+
 describe('stepThreadPaneWidth', () => {
   const TOTAL = 1000;
 
@@ -453,43 +516,44 @@ describe('resetPaneLayout', () => {
   });
 });
 
-// iOS PWA cold-start: when iOS kills the PWA after the user opened an app and
-// never swiped back, the next launch must land on the thread pane — sessionStorage
-// dies with the process, and any pre-fix localStorage value must not leak in.
-describe('mobileView session-only persistence', () => {
+// iOS PWA cold-start: the last-viewed pane must survive the PWA being killed, so
+// reopening lands on the pane the user left (e.g. content), not a forced reset to
+// thread. The pane lives in localStorage (survives process death); the content
+// pane's actual content (open app/file) is independently restored from the
+// localStorage nav stack, so landing on `content` is never a stranded blank pane.
+describe('mobileView persistence (survives PWA close)', () => {
   beforeEach(() => {
     sessionStorage.removeItem('lucidos-mobile-view');
     localStorage.removeItem('lucidos-mobile-view');
     resetState();
   });
 
-  it('cold start with stale localStorage="content" still defaults to thread', () => {
-    // Simulate the bug scenario: an old build wrote `content` to localStorage,
-    // sessionStorage is empty (process was killed). The user must land on thread.
+  it('cold start restores the last pane from localStorage', () => {
+    // Simulate the reopen scenario: the user closed on the content pane, iOS
+    // killed the PWA (sessionStorage gone), localStorage survives → land on content.
     localStorage.setItem('lucidos-mobile-view', 'content');
+    expect(getInitialMobileView()).toBe('content');
+  });
+
+  it('defaults to thread when localStorage is empty', () => {
     expect(getInitialMobileView()).toBe('thread');
   });
 
-  it('defaults to thread when sessionStorage is empty', () => {
+  it('falls back to thread for an invalid localStorage value', () => {
+    localStorage.setItem('lucidos-mobile-view', 'bogus');
     expect(getInitialMobileView()).toBe('thread');
   });
 
-  it('falls back to thread for an invalid sessionStorage value', () => {
-    sessionStorage.setItem('lucidos-mobile-view', 'bogus');
-    expect(getInitialMobileView()).toBe('thread');
-  });
-
-  it('round-trips through sessionStorage', () => {
+  it('round-trips through localStorage', () => {
     for (const view of MOBILE_VIEWS) {
-      sessionStorage.setItem('lucidos-mobile-view', view);
+      localStorage.setItem('lucidos-mobile-view', view);
       expect(getInitialMobileView()).toBe(view);
     }
   });
 
-  it('setMobileView writes to sessionStorage, not localStorage', () => {
+  it('setMobileView writes to localStorage so it survives a PWA kill', () => {
     setMobileView('content');
-    expect(sessionStorage.getItem('lucidos-mobile-view')).toBe('content');
-    expect(localStorage.getItem('lucidos-mobile-view')).toBeNull();
+    expect(localStorage.getItem('lucidos-mobile-view')).toBe('content');
   });
 });
 

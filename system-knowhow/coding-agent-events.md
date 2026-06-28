@@ -30,7 +30,7 @@ For trigger config syntax (cron vs the `on` subscription list, per-entry `condit
 
 ## Triggerability: blocklist semantics
 
-The scheduler forwards persisted ThreadEvents to the trigger matcher unless they're in a small **per-token streaming blocklist** (`ThreadEvent::is_per_token_streaming` in `crates/lucidos-engine/src/engine/thread_events.rs`, gated at the `BusEvent::Thread` arm of the scheduler subscriber in `crates/lucidos-engine/src/scheduler/mod.rs`). The coding-agent streaming entry on the blocklist is `CodingAgentTextStreamed` — that's the only coding-agent variant a workspace cannot subscribe to today.
+The scheduler forwards persisted ThreadEvents to the trigger matcher unless they're in a small **per-token streaming blocklist** (`ThreadEvent::is_per_token_streaming` in `crates/lucidos-engine/src/engine/thread_events.rs`, gated at the `BusEvent::Thread` arm of the scheduler subscriber in `crates/lucidos-engine/src/scheduler/mod.rs`). The coding-agent streaming entries on the blocklist are `CodingAgentTextStreamed` and `CodingAgentThoughtStreamed` — the two coding-agent variants a workspace cannot subscribe to today.
 
 That means right now (each line is one entry inside a trigger's `on` list — see `system-knowhow/building-a-trigger.md` for the full subscription shape):
 
@@ -38,7 +38,7 @@ That means right now (each line is one entry inside a trigger's `on` list — se
 - `event_type: CodingAgentIdled` — **works**. Pair with the entry's `condition: { has_changes: true }` to scope to "the coding agent finished and left work to review."
 - `event_type: CodingAgentPermissionRequest` — **works**. Lets a workspace react to "the coding agent is asking permission for a tool call."
 - `event_type: CodingAgentToolCalled` / `CodingAgentToolResult` / `CodingAgentPromptSent` — **works**, but these are per-action and chatty. Always pair with the entry's `condition:` (e.g. `name: "Bash"`, `args.command: { $regex: "git push" }`) — without one the trigger fires many times per turn.
-- `event_type: CodingAgentTextStreamed` — does not fire; per-token streaming is the only thing the scheduler blocks. Subscribing to it is a no-op.
+- `event_type: CodingAgentTextStreamed` / `CodingAgentThoughtStreamed` — does not fire; per-token streaming is the only thing the scheduler blocks. Subscribing to either is a no-op.
 - `event_type: <any chat-side lifecycle event>` (`ResponseGenerated`, `ResponseFailed`, `ChangeApplied`, …) — works; same blocklist semantics. See `system-knowhow/thread-events.md` for the full set.
 
 ## The full enumerated list
@@ -59,11 +59,12 @@ All variants below are defined on `ThreadEvent` in `crates/lucidos-engine/src/en
 
 ### Persisted, high-volume — pair with `condition:` (or, for streaming, blocked entirely)
 
-These fire many times per turn. `CodingAgentTextStreamed` is per-token streaming and is **blocked** by the scheduler — subscribing is a no-op. `CodingAgentToolCalled` / `CodingAgentToolResult` are per-tool-call (a few to a few dozen per turn): they flow through the matcher, but a trigger without a `condition:` filter will fire on every tool call. Always scope (e.g. `name: "Bash"`, `args.command: { $regex: "rm -rf" }`).
+These fire many times per turn. `CodingAgentTextStreamed` and `CodingAgentThoughtStreamed` are per-token streaming and are **blocked** by the scheduler — subscribing is a no-op. `CodingAgentToolCalled` / `CodingAgentToolResult` are per-tool-call (a few to a few dozen per turn): they flow through the matcher, but a trigger without a `condition:` filter will fire on every tool call. Always scope (e.g. `name: "Bash"`, `args.command: { $regex: "rm -rf" }`).
 
 | Event | When it fires | Triggerable |
 |---|---|---|
 | `CodingAgentTextStreamed` | Each `text` chunk the coding agent streams to the user. One per assistant-message line / paragraph as the backend writes it. | **no (blocked — per-token streaming)** |
+| `CodingAgentThoughtStreamed` | Each chunk of streamed reasoning/thinking the coding agent produces before its visible output. CC sends it as a `stream_event` `thinking_delta` (the persisted CC JSONL keeps only an encrypted signature, so the live stream is the only source); Codex sends `item/reasoning/textDelta` / `summaryTextDelta` (app-server) or a `reasoning` item (exec). Coalesced into a few rows per turn and rendered as the live "Thinking" step's content so a long reasoning pass shows progress. | **no (blocked — per-token streaming)** |
 | `CodingAgentToolCalled` | Each tool invocation the coding agent makes. Carries `name`, `args` (full JSON), optional `description`, and `tool_use_id` so the matching `ToolResult` can be paired even when a permission prompt splits them across exchanges. | yes (use condition) |
 | `CodingAgentToolResult` | The result returned to the coding agent for a prior `ToolCalled`. Carries the same `tool_use_id`. | yes (use condition) |
 
@@ -206,6 +207,8 @@ Used by the MCP permission-prompt subprocess (the `mcp__permission-prompt` tool 
 `persist_scope` is `"narrow"` / `"broad"` / `"session"` when the user clicked "Always allow"-style; `null` for plain Allow-once / Deny / orphan-recovery / supersession. The frontend reads it to render the answered card with a check on the chosen button and strike-through on the rest.
 
 **Supersession.** If the user types a new message while a permission card is still pending, the engine resolves the card as `allowed: false` (`reason: "Superseded by a new message"`) before routing the typed text to the coding agent as a normal follow-up — so the buttons stop dangling instead of leaving the thread stuck on `waiting_for_user_answer` while the coding agent moves on. This mirrors the AskUserQuestion free-form path, where typing becomes a `FreeText` answer; permissions have no "answer", so the pending request is denied instead. Emitted from `resolve_pending_permissions_as_superseded` (`engine/cc_permission.rs`).
+
+**Resume after an engine restart is NOT a rejection.** When the engine restarts while a session is blocked on a permission card, the in-memory broadcast channel closes, so the still-awaiting `prompt_coding_agent_permission` call returns `allowed: false` with a **neutral** reason (`RESTART_INTERRUPT_REASON` — "Interrupted by an engine restart — not a user decision…"), NOT `DENIAL_REASON` ("User denied"), which is reserved for an explicit Deny click (incl. supersession). That neutral reason is only the MCP / app-server response the agent reads on resume; it is distinct from the persisted `CodingAgentPermissionResolved` reasons above (orphan-recovery / supersession), which are unchanged. On the next turn the session is relaunched with `--resume`, replaying its own transcript, so the recovery system prompts (`recovery_system_prompt` and siblings in `engine/agent_session/prompts.rs`) carry a **restart-not-rejection note** telling the agent that any denial or interrupted/incomplete tool call in its recent history is a restart artifact, not the user rejecting its approach — without it the resumed agent reads the interruption as a rejection and abandons its plan.
 
 **Unattended auto-resolution (no card, never hangs).** A permission card needs a human to click it. A coding-agent thread launched by a **trigger** has none — so before rendering a card the engine asks "is anyone here?": it walks the spawn tree from this thread up to its root via the persisted `MessageOrigin` chain (`cc_permission::resolve_attend_mode`). If the root is a **human device**, the session is *interactive* and behaves exactly as above (emit a card, wait indefinitely). If the root is a **trigger/scheduler** (the thread is *unattended* — directly trigger-fired, or an agent-spawned sub-thread of one), the engine resolves the request immediately from the originating trigger's *side-effect grant* (see `building-a-trigger.md` § "Side-effect grant") plus a static benign check, and emits **no** `CodingAgentPermissionRequest`/`Resolved` events at all (the same silent fast path session-allow uses):
 

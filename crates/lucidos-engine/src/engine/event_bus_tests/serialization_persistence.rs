@@ -292,7 +292,7 @@ fn change_discarded_serializes_and_persists() {
 #[test]
 fn email_sent_persists_envelope_metadata_without_body() {
     let event = SystemEvent::EmailSent {
-        account: "personal".to_string(),
+        account: "primary".to_string(),
         to: vec!["alice@example.com".to_string(), "bob@example.com".to_string()],
         cc: vec!["carol@example.com".to_string()],
         bcc: vec![],
@@ -302,7 +302,7 @@ fn email_sent_persists_envelope_metadata_without_body() {
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["type"], "EmailSent");
-    assert_eq!(json["data"]["account"], "personal");
+    assert_eq!(json["data"]["account"], "primary");
     assert_eq!(json["data"]["to"][0], "alice@example.com");
     assert_eq!(json["data"]["to"][1], "bob@example.com");
     assert_eq!(json["data"]["cc"][0], "carol@example.com");
@@ -320,13 +320,13 @@ fn email_sent_persists_envelope_metadata_without_body() {
     );
     assert!(event.is_persisted());
     assert_eq!(event.aggregate(), "email");
-    assert_eq!(event.aggregate_id(), "personal");
+    assert_eq!(event.aggregate_id(), "primary");
 }
 
 #[test]
 fn email_sent_omits_empty_cc_and_bcc() {
     let event = SystemEvent::EmailSent {
-        account: "work".to_string(),
+        account: "secondary".to_string(),
         to: vec!["bob@example.com".to_string()],
         cc: vec![],
         bcc: vec![],

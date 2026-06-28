@@ -11,6 +11,8 @@ import type { CapacityPolicy, ThreadQueueEntry } from '../../store/types';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { formatShortDate, formatShortTime } from '../../utils/formatTime';
 import { LoadableError } from '../shared/LoadableError';
+import { ListSkeleton } from '../shared/ListSkeleton';
+import { LoadingFade } from '../shared/LoadingFade';
 import { Dropdown } from '../shared/Dropdown';
 
 const KIND_LABELS: Record<ThreadQueueEntry['kind'], string> = {
@@ -186,55 +188,53 @@ export function ThreadQueueView() {
     );
   }
 
-  if (loadable.status !== 'loaded') {
-    if (!showLoading) return null;
-    return (
-      <div class="content-view active">
-        <div class="list-rows">
-          <div class="loading-spinner" />
-        </div>
-      </div>
-    );
-  }
-
-  const { entries, policy } = loadable.data;
-  const running = entries.filter((e) => e.status === 'admitted');
-  const queued = entries.filter((e) => e.status === 'queued');
-
   return (
     <div class="content-view active">
       <div class="list-rows">
-        <div class="thread-queue-section-header">
-          <span class="thread-queue-section-title">
-            Running ({running.length}/{policy.max_concurrent_total})
-          </span>
-          <button
-            class="action-btn"
-            data-role="toggle-capacity-policy"
-            onClick={() => setPolicyOpen(!policyOpen)}
-          >
-            {policyOpen ? 'Hide policy' : 'Capacity policy'}
-          </button>
-        </div>
-        {policyOpen && <CapacityPolicyEditor policy={policy} />}
-        {running.length === 0 && (
-          <div class="empty thread-queue-empty">Nothing running.</div>
-        )}
-        {running.map((entry) => (
-          <ThreadQueueItem key={entry.id} entry={entry} />
-        ))}
+        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+          {loadable.status === 'loaded'
+            ? (() => {
+                const { entries, policy } = loadable.data;
+                const running = entries.filter((e) => e.status === 'admitted');
+                const queued = entries.filter((e) => e.status === 'queued');
+                return (
+                  <>
+                    <div class="thread-queue-section-header">
+                      <span class="thread-queue-section-title">
+                        Running ({running.length}/{policy.max_concurrent_total})
+                      </span>
+                      <button
+                        class="action-btn"
+                        data-role="toggle-capacity-policy"
+                        onClick={() => setPolicyOpen(!policyOpen)}
+                      >
+                        {policyOpen ? 'Hide policy' : 'Capacity policy'}
+                      </button>
+                    </div>
+                    {policyOpen && <CapacityPolicyEditor policy={policy} />}
+                    {running.length === 0 && (
+                      <div class="empty thread-queue-empty">Nothing running.</div>
+                    )}
+                    {running.map((entry) => (
+                      <ThreadQueueItem key={entry.id} entry={entry} />
+                    ))}
 
-        <div class="thread-queue-section-header">
-          <span class="thread-queue-section-title">Queued ({queued.length})</span>
-        </div>
-        {queued.length === 0 && (
-          <div class="empty thread-queue-empty" data-role="thread-queue-empty">
-            Nothing waiting — threads run immediately while capacity is free.
-          </div>
-        )}
-        {queued.map((entry) => (
-          <ThreadQueueItem key={entry.id} entry={entry} />
-        ))}
+                    <div class="thread-queue-section-header">
+                      <span class="thread-queue-section-title">Queued ({queued.length})</span>
+                    </div>
+                    {queued.length === 0 && (
+                      <div class="empty thread-queue-empty" data-role="thread-queue-empty">
+                        Nothing waiting — threads run immediately while capacity is free.
+                      </div>
+                    )}
+                    {queued.map((entry) => (
+                      <ThreadQueueItem key={entry.id} entry={entry} />
+                    ))}
+                  </>
+                );
+              })()
+            : null}
+        </LoadingFade>
       </div>
     </div>
   );

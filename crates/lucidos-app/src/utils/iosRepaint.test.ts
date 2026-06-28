@@ -5,7 +5,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 let iosValue = true;
 vi.mock('./platform', () => ({ isIOS: () => iosValue }));
 
-import { forceIOSRepaint, createRepaintThrottle } from './iosRepaint';
+import { forceIOSRepaint, forceIOSRepaintBurst, createRepaintThrottle } from './iosRepaint';
 
 // Minimal rAF stub: queue callbacks, run them on demand so the two-frame
 // transform toggle is deterministic.
@@ -167,37 +167,192 @@ describe('forceIOSRepaint', () => {
   });
 });
 
+describe('forceIOSRepaintBurst', () => {
+  // The file-level beforeEach already installs the manual rAF stub + iosValue.
+  // Add ONLY setTimeout/clearTimeout fakes so the burst's spaced retries are
+  // driven deterministically while rAF stays the manual queue.
+  beforeEach(() => { vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] }); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('fires an immediate toggle then setTimeout-spaced retries', () => {
+    const el = fakeEl();
+    forceIOSRepaintBurst(el);
+
+    // Immediate attempt: deferred to rAF, nothing applied yet.
+    expect(el.style.transform).toBe('');
+    flushFrame(); // immediate frame 1: nudge
+    expect(el.style.transform).toBe('translateZ(0.1px)');
+    flushFrame(); // immediate frame 2: restore
+    expect(el.style.transform).toBe('');
+
+    // First retry at 100ms fires a fresh, independent toggle.
+    vi.advanceTimersByTime(100);
+    flushFrame();
+    expect(el.style.transform).toBe('translateZ(0.1px)');
+    flushFrame();
+    expect(el.style.transform).toBe('');
+
+    // Second retry at 300ms (200ms more) fires another.
+    vi.advanceTimersByTime(200);
+    flushFrame();
+    expect(el.style.transform).toBe('translateZ(0.1px)');
+    flushFrame();
+    expect(el.style.transform).toBe('');
+  });
+
+  it('recovers when the immediate toggle frames are dropped (iOS coalesces) via a later retry', () => {
+    // The blank-on-open repro: the open path fires ONE toggle and iOS drops its
+    // queued rAF callbacks (cold open / suspended frame queue). With no retry the
+    // thread stays black (up-chevron visible, content in the DOM) until a manual
+    // scroll. The burst's spaced setTimeout retry lands a fresh toggle that
+    // actually paints.
+    const el = fakeEl();
+    forceIOSRepaintBurst(el);
+    rafQueue = []; // OS drops the immediate toggle's frames without running them
+    expect(el.style.transform).toBe(''); // immediate attempt never painted
+
+    vi.advanceTimersByTime(100); // first retry
+    flushFrame();
+    expect(el.style.transform).toBe('translateZ(0.1px)'); // recovered
+    flushFrame();
+    expect(el.style.transform).toBe('');
+  });
+
+  it('preserves an existing inline transform across the burst', () => {
+    const el = fakeEl('rotate(2deg)');
+    forceIOSRepaintBurst(el);
+    flushFrame();
+    expect(el.style.transform).toBe('rotate(2deg) translateZ(0.1px)');
+    flushFrame();
+    expect(el.style.transform).toBe('rotate(2deg)');
+
+    vi.advanceTimersByTime(300); // run all remaining retries
+    flushFrame();
+    flushFrame();
+    expect(el.style.transform).toBe('rotate(2deg)'); // no cruft accumulates
+  });
+
+  it('is a no-op off iOS', () => {
+    iosValue = false;
+    const el = fakeEl();
+    const cleanup = forceIOSRepaintBurst(el);
+    expect(cleanup).toBeUndefined();
+    vi.advanceTimersByTime(1000);
+    flushFrame();
+    flushFrame();
+    expect(el.style.transform).toBe('');
+  });
+
+  it('is a no-op for a detached node', () => {
+    const el = fakeEl();
+    el.isConnected = false;
+    const cleanup = forceIOSRepaintBurst(el);
+    expect(cleanup).toBeUndefined();
+  });
+
+  it('cleanup cancels the immediate frames and all pending retries', () => {
+    const el = fakeEl();
+    const cleanup = forceIOSRepaintBurst(el)!;
+    cleanup();
+    // Immediate frames canceled — no nudge applied.
+    flushFrame();
+    flushFrame();
+    expect(el.style.transform).toBe('');
+    // Pending retries canceled — advancing past every delay fires nothing.
+    vi.advanceTimersByTime(1000);
+    flushFrame();
+    flushFrame();
+    expect(el.style.transform).toBe('');
+  });
+});
+
 describe('createRepaintThrottle', () => {
-  it('allows the first call immediately', () => {
+  // Fake only the timers the throttle uses — leaving the file-level rAF stubs
+  // (set by the root beforeEach for the forceIOSRepaint suite) untouched.
+  beforeEach(() => { vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] }); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('fires immediately on the leading edge', () => {
+    const fire = vi.fn();
     const gate = createRepaintThrottle(200);
-    expect(gate(0)).toBe(true);
+    gate.request(0, fire);
+    expect(fire).toHaveBeenCalledTimes(1);
   });
 
-  it('blocks repeat calls inside the interval, allows once it elapses', () => {
+  it('throttles a leading repaint but fires the request on the trailing edge', () => {
+    const fire = vi.fn();
     const gate = createRepaintThrottle(200);
-    expect(gate(1000)).toBe(true);  // first — fires
-    expect(gate(1100)).toBe(false); // +100ms — throttled
-    expect(gate(1199)).toBe(false); // +199ms — still throttled
-    expect(gate(1200)).toBe(true);  // +200ms — fires again
-    expect(gate(1250)).toBe(false); // throttle re-armed from 1200
+    gate.request(1000, fire); // leading
+    expect(fire).toHaveBeenCalledTimes(1);
+    gate.request(1100, fire); // +100ms — throttled, arms trailing for the window end
+    gate.request(1199, fire); // +199ms — re-arms trailing, still not fired inline
+    expect(fire).toHaveBeenCalledTimes(1);
+    // Trailing for the last request (at 1199, window ends 1ms later) fires.
+    vi.advanceTimersByTime(1);
+    expect(fire).toHaveBeenCalledTimes(2);
+    // After the trailing fired, the next request inside the new window throttles.
+    gate.request(1250, fire);
+    expect(fire).toHaveBeenCalledTimes(2);
   });
 
-  it('measures the window from the last ALLOWED call, not the last attempt', () => {
+  it('a single request throttled right after a leading repaint still paints once activity stops', () => {
+    // The stuck-blank repro: a streamed mutation (or a More/Less toggle's shrink)
+    // re-blanks the iOS layer a beat after a leading repaint, then the stream
+    // pauses (a CC tool call runs for many seconds) so no further request comes.
+    // Leading-only throttling dropped it and left the pane black; the trailing
+    // edge recovers it within one window.
+    const fire = vi.fn();
     const gate = createRepaintThrottle(200);
-    expect(gate(0)).toBe(true);
-    // A burst of blocked attempts must not slide the window forward — otherwise
-    // a steady stream of tokens (each <200ms apart) would never repaint.
-    expect(gate(150)).toBe(false);
-    expect(gate(199)).toBe(false);
-    expect(gate(200)).toBe(true); // 200ms since the allowed call at 0, not since 199
+    gate.request(0, fire);   // leading repaint
+    expect(fire).toHaveBeenCalledTimes(1);
+    gate.request(40, fire);  // re-blanking mutation — throttled
+    expect(fire).toHaveBeenCalledTimes(1);
+    // ...stream pauses; no more requests...
+    vi.advanceTimersByTime(200);
+    expect(fire).toHaveBeenCalledTimes(2); // trailing repaint clears the blank
   });
 
-  it('keeps firing at the cadence under a dense stream of attempts', () => {
+  it('coalesces a burst of throttled requests into one trailing fire', () => {
+    const fire = vi.fn();
+    const gate = createRepaintThrottle(200);
+    gate.request(0, fire);   // leading
+    gate.request(50, fire);  // throttled
+    gate.request(100, fire); // throttled — re-arms
+    gate.request(150, fire); // throttled — re-arms (window ends at 200)
+    expect(fire).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(50); // window end reached for the last request
+    expect(fire).toHaveBeenCalledTimes(2);
+    vi.advanceTimersByTime(1000); // no further fires
+    expect(fire).toHaveBeenCalledTimes(2);
+  });
+
+  it('measures the window from the last ALLOWED fire, not the last attempt', () => {
+    const fire = vi.fn();
+    const gate = createRepaintThrottle(200);
+    gate.request(0, fire);   // leading fire, window from 0
+    expect(fire).toHaveBeenCalledTimes(1);
+    gate.request(150, fire); // throttled (150 < 200), arms trailing
+    gate.request(199, fire); // throttled, re-arms
+    gate.request(200, fire); // 200ms since the allowed fire at 0 → leading fires
+    expect(fire).toHaveBeenCalledTimes(2);
+  });
+
+  it('fires the leading edge at the interval cadence under a dense stream', () => {
+    const fire = vi.fn();
     const gate = createRepaintThrottle(100);
-    const allowed: number[] = [];
-    for (let t = 0; t <= 350; t += 25) {
-      if (gate(t)) allowed.push(t);
-    }
-    expect(allowed).toEqual([0, 100, 200, 300]);
+    // Issue requests every 25ms without advancing timers — only leading fires
+    // are counted (trailing timers stay armed-and-superseded, never run).
+    for (let t = 0; t <= 350; t += 25) gate.request(t, fire);
+    expect(fire).toHaveBeenCalledTimes(4); // 0, 100, 200, 300
+  });
+
+  it('cancel() clears a pending trailing fire', () => {
+    const fire = vi.fn();
+    const gate = createRepaintThrottle(200);
+    gate.request(0, fire);  // leading
+    gate.request(40, fire); // throttled — arms trailing
+    gate.cancel();
+    vi.advanceTimersByTime(1000);
+    expect(fire).toHaveBeenCalledTimes(1); // trailing never ran
   });
 });

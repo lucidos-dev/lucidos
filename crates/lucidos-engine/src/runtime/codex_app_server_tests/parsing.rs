@@ -101,6 +101,33 @@ fn agent_message_deltas_stream_and_completed_emits_only_remainder() {
     );
 }
 
+// Reasoning deltas (raw `textDelta` and summary `summaryTextDelta`) surface as
+// Thoughts so the timeline can render a live "Thinking" step; an empty delta
+// emits nothing.
+#[test]
+fn reasoning_deltas_emit_thoughts() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn();
+    let evs = note(
+        &mut t,
+        "item/reasoning/textDelta",
+        serde_json::json!({"itemId": "r1", "delta": "Think", "threadId": "t", "turnId": "u", "contentIndex": 0}),
+    );
+    assert!(matches!(&evs[..], [AgentEvent::Thought { text }] if text == "Think"));
+    let evs = note(
+        &mut t,
+        "item/reasoning/summaryTextDelta",
+        serde_json::json!({"itemId": "r1", "delta": "ing", "threadId": "t", "turnId": "u", "summaryIndex": 0}),
+    );
+    assert!(matches!(&evs[..], [AgentEvent::Thought { text }] if text == "ing"));
+    let evs = note(
+        &mut t,
+        "item/reasoning/textDelta",
+        serde_json::json!({"itemId": "r1", "delta": "", "threadId": "t", "turnId": "u", "contentIndex": 1}),
+    );
+    assert!(evs.is_empty(), "empty reasoning delta emits nothing; got {evs:?}");
+}
+
 #[test]
 fn fully_streamed_agent_message_emits_nothing_at_completion() {
     let mut t = AppServerTracker::new(Some("t-1".into()));

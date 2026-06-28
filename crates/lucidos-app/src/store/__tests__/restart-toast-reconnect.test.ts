@@ -117,6 +117,13 @@ describe('restart toast survives network reconnect', () => {
     // Toast must be dismissed — engine restarted
     expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)).toBeFalsy();
     expect(localStorage.getItem(RESTART_LS_KEY)).toBeNull();
+
+    // The post-restart confirmation is a plain, action-LESS success toast — no
+    // Refresh nag, because an engine-only restart leaves the client in sync. The
+    // refresh prompt is owned solely by the build-id staleness check.
+    const restartedToast = toasts.value.find(t => t.message === 'Engine restarted');
+    expect(restartedToast).toBeTruthy();
+    expect(restartedToast!.action).toBeUndefined();
   });
 
   it('dismisses restart toast on reconnect when engine restarted during disconnect', async () => {

@@ -603,7 +603,7 @@ pub async fn get_thread_cc_diff(
 }
 
 /// Look up the in-app pathspec for an app coding-agent thread, e.g.
-/// `data/apps/momentum-autoresearch`. Returns None for Lucidos-source and
+/// `data/apps/habit-tracker`. Returns None for Lucidos-source and
 /// external-repo threads (and for legacy app rows with a NULL folder, in
 /// which case the unscoped diff is the best we can do).
 ///

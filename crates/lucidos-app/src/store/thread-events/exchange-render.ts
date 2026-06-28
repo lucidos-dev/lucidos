@@ -249,6 +249,25 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
       case 'CodingAgentIdled':
         isComplete = true;
         break;
+      case 'CodingAgentThoughtStreamed': {
+        // Mirror of exchangeResponseEvents: accumulate reasoning into the live
+        // "Thinking" step, opening one if none is pending.
+        const text = (event as { text?: string }).text ?? '';
+        let target: Step | undefined;
+        for (let i = steps.length - 1; i >= 0; i--) {
+          if (steps[i].success === null && steps[i].description === 'Thinking') {
+            target = steps[i];
+            break;
+          }
+        }
+        if (!target) {
+          target = { description: 'Thinking', success: null };
+          steps.push(target);
+        }
+        target.thinkingText = (target.thinkingText ?? '') + text;
+        isComplete = false; // CC actively reasoning — not finished
+        break;
+      }
       case 'CodingAgentTextStreamed':
         resolveLastPendingStep(steps, isThinking);
         isComplete = false; // CC resumed — not finished yet
@@ -467,6 +486,28 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
           const fallback = resolveLastPendingResponseStep(events, isNotThinking);
           if (fallback && ccResult !== undefined) fallback.result = ccResult;
         }
+        break;
+      }
+      case 'CodingAgentThoughtStreamed': {
+        // Streamed reasoning — accumulate into the live "Thinking" step. If none
+        // is pending (a resumed session's initial prompt fires no
+        // CodingAgentPromptSent), open one so reasoning is visible from the first
+        // token — the fix for a long think reading as a frozen "Working".
+        const text = (event as { text?: string }).text ?? '';
+        let target: Extract<ResponseEvent, { type: 'step' }> | undefined;
+        for (let i = events.length - 1; i >= 0; i--) {
+          const e = events[i];
+          if (e.type === 'step' && e.success === null && e.description === 'Thinking') {
+            target = e;
+            break;
+          }
+        }
+        if (!target) {
+          target = { type: 'step', description: 'Thinking', success: null, created };
+          pushStep(target);
+        }
+        target.thinkingText = (target.thinkingText ?? '') + text;
+        isComplete = false; // CC actively reasoning — not finished
         break;
       }
       case 'CodingAgentTextStreamed':

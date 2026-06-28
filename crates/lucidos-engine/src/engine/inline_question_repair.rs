@@ -1,7 +1,7 @@
 //! Defense against Opus 4.7's recurring habit of emitting the
 //! `ask_user_question` tool call as inline `<ask_user_question>...</ask_user_question>`
-//! XML text instead of as a structured tool call. See thread 8f257e88 in
-//! personal for the canonical leak: same thread, same engine instance, the
+//! XML text instead of as a structured tool call. The canonical leak was
+//! observed in a single thread / engine instance even after the
 //! sharpened `ASK_USER_QUESTION_RULE` instruction explicitly told the model
 //! "STOP if about to type `<ask_user_question`" — and the model still
 //! emitted it.
@@ -39,8 +39,8 @@ pub(crate) struct DetectedQuestion {
 ///
 /// Recognises only the JSON-array body form
 /// (`<ask_user_question>[{"question":..., "options":[...]}]</ask_user_question>`)
-/// — the variant Opus 4.7 has consistently emitted in personal's last four
-/// leaks. The earliest 5/24 leak used a markdown-bullet body inside the
+/// — the variant Opus 4.7 has consistently emitted across the observed
+/// leaks. The earliest leak used a markdown-bullet body inside the
 /// tag; that variant is left untouched here (the agentic loop logs the
 /// detection miss so monitoring still surfaces it).
 ///
@@ -167,9 +167,9 @@ mod tests {
     }
 
     #[test]
-    fn detect_real_personal_leak_fixture() {
-        // Verbatim from event 616102 in personal thread 8f257e88, edited
-        // only to shorten the descriptions to fit a Rust string literal.
+    fn detect_real_leak_fixture() {
+        // Verbatim from a real observed leak event, edited only to shorten
+        // the descriptions to fit a Rust string literal.
         let text = r#"#1 fixes today's instance. #2 fixes future drift. They're independent.
 
 <ask_user_question>

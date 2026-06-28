@@ -36,6 +36,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   ContinuationStarted: 'metadata',
   SessionEnded: 'terminal',
   CodingAgentTextStreamed: 'activity',
+  CodingAgentThoughtStreamed: 'activity',
   CodingAgentToolCalled: 'activity',
   CodingAgentToolResult: 'activity',
   CodingAgentUserMessageSent: 'start',
@@ -86,6 +87,7 @@ export const CC_ONLY_EVENTS: ReadonlySet<string> = new Set([
   'SessionStarted',
   'SessionEnded',
   'CodingAgentTextStreamed',
+  'CodingAgentThoughtStreamed',
   'CodingAgentToolCalled',
   'CodingAgentToolResult',
   'CodingAgentUserMessageSent',
@@ -124,6 +126,7 @@ export const LAST_ACTIVITY_EVENTS: ReadonlySet<string> = new Set([
   'ThoughtStreamed',
   'MemorySearched',
   'CodingAgentTextStreamed',
+  'CodingAgentThoughtStreamed',
   'CodingAgentToolCalled',
   'CodingAgentToolResult',
 ]);

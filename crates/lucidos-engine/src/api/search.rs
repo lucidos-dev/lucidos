@@ -173,7 +173,8 @@ async fn search_threads_internal(
             .get_recent_threads(limit as i64)
             .await
             .map_err(|e| format!("Thread search failed: {}", e))?;
-        // get_recent_threads returns `per_source` items per source type, so truncate to limit
+        // get_recent_threads returns the global newest threads (inbox + the newest
+        // archived slice), so truncate to limit.
         return Ok(threads
             .into_iter()
             .take(limit)

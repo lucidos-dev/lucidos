@@ -35,7 +35,15 @@ normative "Dev runtime topology" table — read it before touching ports/binds):
 interfaces on its own port so `https://localhost:5173/` reaches it directly; the
 gateway (`LUCIDOS_GATEWAY_ENGINE_LOOPBACK=0`) spawns it that way and proxies +
 health-probes it over **https** (self-signed cert accepted). Do not make the dev
-engine loopback-only — that breaks direct access and contradicts §4.
+engine loopback-only — that breaks direct access and contradicts §4. **The
+gateway ITSELF also binds all interfaces in dev** via `LUCIDOS_GATEWAY_BIND_ALL=1`
+(set by `start_gateway`, the sibling opt-in to `LUCIDOS_GATEWAY_ENGINE_LOOPBACK=0`):
+the gateway defaults to loopback-only as its packaged security posture, so dev —
+which fronts the picker + `/<slug>/` routing for other devices (e.g. an iOS PWA
+over Tailscale) — must opt in explicitly, or a gateway rebuild+reload comes back
+up on `127.0.0.1` only and is unreachable remotely. Packaged
+(`desktop.rs::spawn_gateway`, `LUCIDOS_PACKAGED=1`) does NOT run `start_gateway`,
+so it stays loopback-only.
 
 `web-dev.sh -w <ws>` (`scripts/lib/workspace.sh`): `swap_ports` sets
 `ENGINE_PORT=VITE_PORT` (per-workspace) + `GATEWAY_PORT=5251` (**fixed, shared** —
@@ -59,6 +67,7 @@ shell + terminal close, the way the packaged Rust `--service` survives under
 launchd `KeepAlive`. Its only legitimate stop is SIGUSR1 to the gateway child)
 (`LUCIDOS_ENGINE_BIN=<engine>`, `LUCIDOS_STATIC_DIR=<dist>`,
 `LUCIDOS_API_PORT=5251`, `LUCIDOS_GATEWAY_ENGINE_LOOPBACK=0`,
+`LUCIDOS_GATEWAY_BIND_ALL=1`,
 `LUCIDOS_GATEWAY_DATA=$HOME/.lucidos/gateway`,
 `LUCIDOS_GATEWAY_PG_BACKEND=docker`, `LUCIDOS_GATEWAY_PG_PORT=<shared-pg-port>`,
 `LUCIDOS_GATEWAY_PG_CONTAINER=lucidos-pg-shared`) — either way it then POSTs
@@ -185,7 +194,15 @@ that toast share a **single source of truth** — `syncClientUpdateFromBuild`, w
 compares the running bundle's `CLIENT_BUILD_ID` against the served `sw.js`
 `BUILD_ID` — an honest "is my loaded code stale?" signal that self-clears once a
 reload lands on the served build, rather than latching on the controlling worker's
-id. Both surface **together** once the rebuilt `sw.js` is genuinely served: the
+id. This check is the **sole owner of the refresh prompt**: the post-restart
+**"Engine restarted"** toast (`connection.ts`) is a plain action-LESS confirmation
+— a pure engine-only (Rust) Apply leaves the bundle byte-identical, so client and
+engine are already in sync and a Refresh button there would be a no-op nag. When a
+restart ALSO rebuilt the client, `syncClientUpdateFromBuild` (re-run after the
+restart + via the SW nudges) surfaces the **"New version available — refresh to
+sync"** toast — and because "Engine restarted" carries no action it does NOT
+suppress that toast via `hasRefreshToast`. Both surface **together** once the
+rebuilt `sw.js` is genuinely served: the
 badge no longer leads the toast, because the former *eager* `ChangeApplied`/resync
 badge-light was removed (it set the dot at apply time, before the rebuilt bundle was
 served, so the dot appeared seconds before — or sometimes without — the toast). The
@@ -332,6 +349,8 @@ make test-full                  # → ./scripts/test-engine.sh --full  (whole cr
 `test-engine.sh` provisions a **dedicated, disposable** `lucidos-pg-test` container (`pgvector/pgvector:pg18`, port `LUCIDOS_TEST_PG_PORT` / default `5510`), exports `TEST_DATABASE_URL`, then runs cargo test. It is isolated from every workspace's PG (separate name + port) so a test run can't mutate `~/workspaces/*` data, and it **never broad-kills** — it touches only its own container by exact name (the prior `test-engine.sh` was deleted for `pkill -f cognos-engine`). To run cargo directly instead, start the container once and `export TEST_DATABASE_URL` yourself.
 
 Always use `web-dev.sh -b` to restart. `scripts/lib/ports.sh` allocates per-workspace engine ports; the engine serves the built `dist/` directly (`LUCIDOS_STATIC_DIR`, ADR 0014 — no Vite proxy). The shared Postgres container stays running when one workspace stops; legacy `lucidos-pg-<cksum>` containers stay intact only as rollback sources until decommissioned.
+
+**e2e runs on a RELEASE engine by default.** `scripts/lib/e2e.sh` (sourced by `e2e.sh` / `e2e-browser.sh` / `e2e-api.sh`) sets `RELEASE=1` so `build_or_find_engine` builds + serves `target/release/lucidos-engine` — the debug engine's CPU cost drove the mobile-webkit contention wedge, and release matches the packaged/prod engine. `LUCIDOS_E2E_DEBUG=1` opts back to the fast debug build for local iteration; `CARGO_BUILD_JOBS` is capped at half the cores on the release path to avoid a codegen OOM. See `.claude/rules/testing.md` and `docs/plans/2026-06-28-e2e-always-release-build.md`.
 
 ### macOS code signing (stable TCC grants)
 

@@ -2,6 +2,7 @@ import type { SettingsSubview } from '../../store/store';
 import type { SearchResultItem } from '../../api/client';
 import { SHORTCUT_DEFS, bindingSearchText } from '../../utils/shortcuts';
 import { displayBinding, bindingFor } from '../../store/actions/keybindings';
+import { isMobile } from '../../utils/viewport';
 
 type Subview = Exclude<SettingsSubview, 'main'>;
 
@@ -19,6 +20,10 @@ interface SettingsSearchEntry {
   /** Extra free-text matched in addition to the label (e.g. key-combo aliases
    *  like "ctrl k" for a shortcut). Not shown in the UI. */
   keywords?: string;
+  /** Only surfaced in search results on a mobile-width viewport — the matching
+   *  settings row is itself hidden on desktop (e.g. the Mobile section), so a
+   *  desktop result would navigate to a row that doesn't render. */
+  mobileOnly?: boolean;
 }
 
 /**
@@ -43,11 +48,20 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'memory', label: 'Memory', subview: 'memory', path: 'Settings → System' },
   { id: 'disk-usage', label: 'Disk Usage', subview: 'disk-usage', path: 'Settings → System', keywords: 'storage space disk usage data' },
   { id: 'environment-variables', label: 'Environment Variables', subview: 'environment-variables', path: 'Settings → System', keywords: 'env var environment variable config' },
+  { id: 'debugging', label: 'Debugging', subview: 'debugging', path: 'Settings → System', keywords: 'debug developer diagnostics perf performance instrumentation telemetry lag latency profiling capture context' },
+
+  // System → Debugging rows
+  { id: 'debugging:capture-context', label: 'Capture context per step', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:capture-context', keywords: 'capture context step debug llm prompt' },
+  { id: 'debugging:perf', label: 'Perf instrumentation', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:perf', keywords: 'perf performance instrumentation telemetry lag latency profiling thread open render linkify' },
+  { id: 'debugging:animation-speed', label: 'Animation speed', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:animation-speed', keywords: 'animation speed transition duration slow motion multiplier' },
 
   // System overview
   { id: 'system:connection', label: 'Connection', subview: 'system', path: 'Settings → System', anchor: 'system:connection', keywords: 'status workspace path api url' },
   { id: 'system:versions', label: 'Versions', subview: 'system', path: 'Settings → System', anchor: 'system:versions', keywords: 'lucidos engine client build release uptime' },
   { id: 'system:maintenance', label: 'Maintenance', subview: 'system', path: 'Settings → System', anchor: 'system:maintenance', keywords: 'restart rebuild refresh update client engine' },
+  { id: 'system:locale', label: 'Locale', subview: 'system', path: 'Settings → System', anchor: 'system:locale', keywords: 'language timezone region locale' },
+  { id: 'system:language', label: 'Language', subview: 'system', path: 'Settings → System → Locale', anchor: 'system:language', keywords: 'language locale respond reply' },
+  { id: 'system:timezone', label: 'Timezone', subview: 'system', path: 'Settings → System → Locale', anchor: 'system:timezone', keywords: 'timezone time zone iana triggers schedule' },
 
   // Models subview
   { id: 'models:chat', label: 'Chat', subview: 'models', path: 'Settings → Models', anchor: 'models:chat' },
@@ -59,8 +73,6 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:title-generation', label: 'Title generation', subview: 'models', path: 'Settings → Models → Background Tasks', anchor: 'models:title-generation' },
   { id: 'models:image-description', label: 'Image description', subview: 'models', path: 'Settings → Models → Background Tasks', anchor: 'models:image-description' },
   { id: 'models:memory-context', label: 'Memory & context', subview: 'models', path: 'Settings → Models → Background Tasks', anchor: 'models:memory-context' },
-  { id: 'models:debugging', label: 'Debugging', subview: 'models', path: 'Settings → Models', anchor: 'models:debugging' },
-  { id: 'models:capture-context', label: 'Capture context per step', subview: 'models', path: 'Settings → Models → Debugging', anchor: 'models:capture-context' },
   { id: 'models:region', label: 'Region', subview: 'models', path: 'Settings → Models → Vertex AI', anchor: 'models:region' },
 
   // Appearance subview
@@ -69,9 +81,8 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'appearance:mode', label: 'Mode', subview: 'appearance', path: 'Settings → Appearance → Theme', anchor: 'appearance:mode' },
   { id: 'appearance:font', label: 'Font', subview: 'appearance', path: 'Settings → Appearance → Typography', anchor: 'appearance:font' },
   { id: 'appearance:ui-scale', label: 'UI scale', subview: 'appearance', path: 'Settings → Appearance → Typography', anchor: 'appearance:ui-scale' },
-  { id: 'appearance:animation-speed', label: 'Animation speed', subview: 'appearance', path: 'Settings → Appearance → Typography', anchor: 'appearance:animation-speed' },
-  { id: 'appearance:mobile', label: 'Mobile', subview: 'appearance', path: 'Settings → Appearance', anchor: 'appearance:mobile' },
-  { id: 'appearance:mobile-header-sticky', label: 'Keep header visible', subview: 'appearance', path: 'Settings → Appearance → Mobile', anchor: 'appearance:mobile-header-sticky' },
+  { id: 'appearance:mobile', label: 'Mobile', subview: 'appearance', path: 'Settings → Appearance', anchor: 'appearance:mobile', mobileOnly: true },
+  { id: 'appearance:mobile-header-sticky', label: 'Keep header visible', subview: 'appearance', path: 'Settings → Appearance → Mobile', anchor: 'appearance:mobile-header-sticky', mobileOnly: true },
 
   // Backup subview (restore moved to the workspace picker — no in-app entry)
   { id: 'backup:provider', label: 'Provider', subview: 'backup', path: 'Settings → System → Backup', anchor: 'backup:provider' },
@@ -112,9 +123,12 @@ function allSettingsEntries(): SettingsSearchEntry[] {
  *  index only (not every shortcut). */
 export function getSettingsSearchResults(query: string, limit: number): SearchResultItem[] {
   const q = query.trim().toLowerCase();
+  // Mobile-only rows are hidden in Settings on desktop, so don't surface them as
+  // search results there — selecting one would land on a row that doesn't render.
+  const visible = (e: SettingsSearchEntry) => !e.mobileOnly || isMobile();
   const matches = q
-    ? allSettingsEntries().filter(e => `${e.label} ${e.keywords ?? ''}`.toLowerCase().includes(q))
-    : SETTINGS_SEARCH_INDEX;
+    ? allSettingsEntries().filter(e => visible(e) && `${e.label} ${e.keywords ?? ''}`.toLowerCase().includes(q))
+    : SETTINGS_SEARCH_INDEX.filter(visible);
   return matches.slice(0, limit).map(e => ({
     id: e.id,
     title: e.label,

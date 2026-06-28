@@ -24,14 +24,14 @@ import { refreshChangesState, restoreRestartToast } from '../store/actions/chat-
 import { restoreRepoSelectionFromStorage } from '../store/actions/repositories';
 import { openThreadAcrossWorkspaces } from '../store/actions/cross-workspace';
 import { CHECK_ICON, COPY_ICON } from '../utils/markedConfig';
-import { activeMenuItem, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, showConfirm, FOCUSED_THREAD_KEY, setFocusedThread } from '../store/store';
+import { activeMenuItem, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, showConfirm, showPrompt, FOCUSED_THREAD_KEY, setFocusedThread } from '../store/store';
 import { requestServiceWorkerBuildId } from './sw-update';
 import { syncClientUpdateFromBuild } from '../store/actions/client-update';
 import {
   parseDeepLinkFromSwMessage,
   hasDeepLinkParams,
 } from '../store/actions/notification-deeplink';
-import { dispatchDeepLink, surfaceResumeNotificationAffordance } from '../store/actions/in-app-notification-toast';
+import { dispatchDeepLink } from '../store/actions/in-app-notification-toast';
 import { setupHashDeeplinkRouting } from '../store/actions/hash-deeplink-router';
 import { reportStartupKind, startLivenessTracking } from '../utils/liveness';
 import { isKnownAppFrame } from '../utils/appFrame';
@@ -65,11 +65,8 @@ export function useStartup(): void {
         connectThreadEvents();
       }
     }).catch(() => { /* checkConnection swallows internally; satisfy fail-fast rule */ });
-    // Cold-start: after the unread set loads, surface a best-effort in-app
-    // affordance for any recent unread navigate-notification (the iOS PWA push
-    // tap may have just opened the app and dropped its deep link — see
-    // surfaceResumeNotificationAffordance / plan 2026-06-19-ios-native-apns-app).
-    void loadUnreadNotifications().then(surfaceResumeNotificationAffordance);
+    // Cold-start: load the unread set so the bell badge is correct.
+    void loadUnreadNotifications();
     loadPreferences().then(() => {
       // Notifications must load after preferences so the persisted filter is applied
       if (activeMenuItem.value === 'notifications') loadNotifications();
@@ -346,23 +343,62 @@ export function useStartup(): void {
       const data = event.data as {
         type?: unknown;
         id?: unknown;
-        payload?: { title?: unknown; message?: unknown; okLabel?: unknown; cancelLabel?: unknown; danger?: unknown };
+        payload?: {
+          title?: unknown; message?: unknown; okLabel?: unknown; cancelLabel?: unknown; danger?: unknown;
+          type?: unknown; durationMs?: unknown; dismissable?: unknown;
+          defaultValue?: unknown; placeholder?: unknown; multiline?: unknown;
+        };
       } | null;
       if (!data || typeof data !== 'object') return;
-      if (data.type !== 'lucidos:ui:confirm') return;
-      if (typeof data.id !== 'string') return;
+      if (data.type !== 'lucidos:ui:confirm' && data.type !== 'lucidos:ui:toast' && data.type !== 'lucidos:ui:prompt') return;
       const payload = data.payload;
       if (!payload || typeof payload !== 'object') return;
       if (typeof payload.message !== 'string' || payload.message.length === 0) return;
 
       // Reject messages from any iframe that isn't a current app iframe,
-      // so nested iframes (embeds, ads) can't trigger host modals.
+      // so nested iframes (embeds, ads) can't trigger host modals / toasts.
       const source = event.source as Window | null;
       if (!source || !isKnownAppFrame(source)) return;
 
+      // Toast — fire-and-forget; no id, no result reply.
+      if (data.type === 'lucidos:ui:toast') {
+        const allowed = ['success', 'info', 'warning', 'error'] as const;
+        type ToastT = (typeof allowed)[number];
+        const toastType: ToastT = allowed.includes(payload.type as ToastT) ? payload.type as ToastT : 'info';
+        showToast(payload.message, toastType, {
+          autoDismissMs: typeof payload.durationMs === 'number' ? payload.durationMs : undefined,
+          dismissable: typeof payload.dismissable === 'boolean' ? payload.dismissable : undefined,
+        });
+        return;
+      }
+
+      // Both confirm and prompt carry an id and post a result back.
+      if (typeof data.id !== 'string') return;
       const title = typeof payload.title === 'string' ? payload.title : undefined;
-      const okLabel = typeof payload.okLabel === 'string' && payload.okLabel.length > 0 ? payload.okLabel : 'Confirm';
       const cancelLabel = typeof payload.cancelLabel === 'string' && payload.cancelLabel.length > 0 ? payload.cancelLabel : 'Cancel';
+
+      // Prompt — text input; resolves a string (OK) or null (cancel).
+      if (data.type === 'lucidos:ui:prompt') {
+        const okLabel = typeof payload.okLabel === 'string' && payload.okLabel.length > 0 ? payload.okLabel : 'OK';
+        showPrompt(payload.message, {
+          title,
+          cancelLabel,
+          okLabel,
+          defaultValue: typeof payload.defaultValue === 'string' ? payload.defaultValue : undefined,
+          placeholder: typeof payload.placeholder === 'string' ? payload.placeholder : undefined,
+          multiline: payload.multiline === true,
+        }).then((value) => {
+          try {
+            source.postMessage({ type: 'lucidos:ui:prompt:result', id: data.id, value }, '*');
+          } catch {
+            // Source iframe may have unloaded — drop the reply silently.
+          }
+        }).catch(() => { /* showPrompt rejection — drop, modal already closed */ });
+        return;
+      }
+
+      // Confirm — boolean result.
+      const okLabel = typeof payload.okLabel === 'string' && payload.okLabel.length > 0 ? payload.okLabel : 'Confirm';
       const variant: 'danger' | 'default' = payload.danger === true ? 'danger' : 'default';
 
       showConfirm(payload.message, okLabel, { title, cancelLabel, variant }).then((ok) => {
@@ -384,13 +420,11 @@ export function useStartup(): void {
       // the sync to the 5s health poll (which calls checkConnection, which
       // picks up the deferred resume once the engine is back).
       handleResume();
-      // Best-effort iOS PWA deep-link rescue: reload the unread set and surface a
-      // tappable in-app affordance for any recent unread navigate-notification.
-      // If the push tap actually deep-linked (worked), that notification is read
-      // and excluded; if the WebKit bug swallowed the tap, this is the one-tap
-      // in-app path to the target. Non-hijacking (never auto-navigates). See
-      // surfaceResumeNotificationAffordance / plan 2026-06-19-ios-native-apns-app.
-      void loadUnreadNotifications().then(surfaceResumeNotificationAffordance);
+      // Reload the unread set on resume so the bell badge reflects anything that
+      // arrived while backgrounded. The OS push tap delivers the deep link itself
+      // (absolute-navigate URL on iOS, notificationclick elsewhere), so there's
+      // no in-app rescue toast to surface here.
+      void loadUnreadNotifications();
       // Check for SW updates on resume — iOS PWA never reloads, so this is the
       // only chance to detect new versions after the initial page load.
       navigator.serviceWorker?.getRegistration().then(reg => reg?.update()).catch(() => {});

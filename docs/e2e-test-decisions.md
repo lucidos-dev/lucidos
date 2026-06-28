@@ -112,7 +112,7 @@ dominant cause outright.
 auto-discovery.* WebKit's network process runs system proxy discovery
 synchronously when it initialises a fresh network session — and Playwright
 creates a fresh context (= fresh network session) per test. On a **managed/MDM
-Mac** (this fleet is Jamf-enrolled, `m10s.jamfcloud.com`) the system network
+Mac** (an MDM-managed corporate fleet) the system network
 config can carry "Auto Proxy Discovery" or a PAC URL pushed by a config profile,
 active on the corp network. The discovery does a DNS lookup for `wpad`, a
 captive-portal probe, and/or a PAC fetch; under contention that round trip stalls

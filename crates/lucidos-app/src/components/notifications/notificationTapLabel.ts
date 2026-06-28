@@ -24,7 +24,9 @@ export function navigateTapLabel(to: NavigateUi): string {
     case 'apps':
       return 'View apps';
     case 'app-store':
-      return 'Open app store';
+      // `app-store` is the retained navigate target; it opens the Plugins panel
+      // (its marketplace catalog). The "App Store" / "Store tab" names are retired.
+      return 'Open Plugins';
     case 'triggers':
       return 'View triggers';
     case 'thread-queue':

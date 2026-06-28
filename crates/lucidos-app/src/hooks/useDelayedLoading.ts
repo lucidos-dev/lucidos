@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'preact/hooks';
 import type { Loadable } from '../store/types';
 
-/** Standard delay before a loading spinner becomes visible — fast loads
- *  finish inside this window and never flash a spinner. */
+/** Standard delay before a loading indicator becomes visible — fast loads
+ *  finish inside this window and never flash a loader. The smooth exit (so a
+ *  skeleton that DID appear doesn't hard-snap to content) is handled separately
+ *  by `<LoadingFade>`, not by withholding content with a minimum-visible floor. */
 export const SPINNER_DELAY_MS = 300;
 
 /** The effect body behind useDelayedFlag, extracted so tests can drive it
@@ -24,9 +26,11 @@ export function delayedFlagEffect(
 /**
  * Returns true only after `active` has been true for at least `delayMs`
  * milliseconds; resets to false immediately when `active` drops. Backs
- * `<DelayedSpinner />` (components/shared/DelayedSpinner.tsx) — prefer that
- * for spinner rendering — and longer-fuse flags like ThreadView's
- * "Taking too long? Tap to reload" timeout.
+ * `useDelayedLoading` and any hook-gated loader/skeleton, plus longer-fuse flags
+ * like ThreadView's 8s "Taking too long? Tap to reload" timeout. The loader's
+ * smooth EXIT (no hard snap from a shown skeleton to content) is handled by
+ * `<LoadingFade>`, not by a minimum-visible floor — withholding ready content to
+ * satisfy a minimum makes every slow load feel sluggish.
  */
 export function useDelayedFlag(active: boolean, delayMs = SPINNER_DELAY_MS): boolean {
   const [show, setShow] = useState(false);
@@ -37,13 +41,13 @@ export function useDelayedFlag(active: boolean, delayMs = SPINNER_DELAY_MS): boo
 }
 
 /**
- * Returns true only after the loadable has been in 'loading' state
- * for at least `delayMs` milliseconds. This avoids flashing a spinner
- * for fast loads.
+ * Returns true only after the loadable has been in 'loading' state for at least
+ * `delayMs` milliseconds. This avoids flashing a loader for fast loads. Pair the
+ * returned flag with `<LoadingFade>` to smooth the skeleton→content exit.
  */
 export function useDelayedLoading(
   loadable: Loadable<unknown>,
-  delayMs = SPINNER_DELAY_MS
+  delayMs = SPINNER_DELAY_MS,
 ): boolean {
   return useDelayedFlag(loadable.status === 'loading', delayMs);
 }

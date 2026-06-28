@@ -171,3 +171,51 @@ respawns in one night; it interrupted the nightly e2e thread `86ae9ec6`).
 The browser-orphan half of the loop (force-stopped CC e2e sessions leaking
 Playwright browsers across respawns) is tracked separately — see
 `docs/plans/2026-06-24-gateway-respawn-storm-fix.md`.
+
+## Addendum (2026-06-27): never respawn an alive engine — supersedes the cull-alive-`Slow` policy
+
+The 2026-06-24 patience fix above made the supervisor *slower* to cull an
+alive-but-`Slow` engine, but it still culled one after `SLOW_MISS_THRESHOLD`
+consecutive misses. Under **sustained** resource/memory contention (multiple
+concurrent `target/debug` engines + CC sessions + the shared Docker Postgres VM,
+with the box swapping) a healthy engine misses far more than 5 consecutive probes
+— not because it is wedged, but because swapping adds I/O latency so
+`/api/v1/health` blows the 5s budget for 30s+ stretches. The supervisor read that
+as "wedged", respawned the *live* engine, and each respawn cold-booted (replay
+~14k trigger events + a worktree rescan + embedding-model warmup) — spiking
+memory/CPU and starving the next engine's probe. Same self-sustaining cascade as
+2026-06-24, now leaking through the patient policy (56 engine starts in a day; 8
+in 15 min; it interrupted live chat / coding-agent threads —
+`Skipping cleanup for thread … — session will resume after restart`).
+
+**Root realisation:** a timed-out HTTP probe cannot distinguish "hung forever"
+from "busy right now". The 2026-06-24 fix tried to separate them by *how long*
+the engine stays unresponsive, but under sustained contention "busy" outlasts any
+fixed threshold, so the heuristic mis-fires on the common case (a contended-but-
+fine engine) and pays the worst price (an expensive respawn that feeds the
+cascade). Respawning an alive-but-`Slow` engine has negative expected value.
+
+**Decision:** the health supervisor **never respawns a process that is alive** —
+booting, busy, `Slow`, or even `Unreachable`-while-alive (apparently wedged). It
+respawns **only** a process that has actually exited (`alive == false`), keyed on
+`engine_process_alive` (`try_wait` the child / signal-0 the pidfile pid).
+`respawn_decision`: after the `Healthy` reset, an alive process returns `Booting`
+(inside `BOOT_GRACE`) or `Wait`; only a dead process proceeds to the backoff →
+`DEAD_MISS_THRESHOLD` → `RESTART_CAP` → `MarkUnhealthy` path. `SLOW_MISS_THRESHOLD`
+and the outcome-asymmetry are removed; `ProbeOutcome` is retained for the
+`Healthy` check + log observability.
+
+- **Preserved:** crash recovery + lazy-start (a genuinely dead engine still
+  auto-respawns), the boot grace, the restart cap, and explicit restart
+  (`restart_workspace` → `respawn_stack`, used by Apply & Restart / control API /
+  dev launcher) which is independent of the supervisor.
+- **Accepted tradeoff:** a genuinely *deadlocked-but-alive* engine (rare) no
+  longer auto-recovers — it waits for a manual restart. Deliberate: never
+  interrupting a healthy busy engine is worth more than auto-recovering a rare
+  true hang, and the cascade made auto-recovery net-negative anyway.
+- **Out of scope (noted):** the underlying memory/CPU contention is an ops
+  concern (fewer concurrent debug engines, release builds, Docker VM sizing); and
+  the engine's `/api/v1/health` doing two synchronous disk reads per probe
+  (`read_engine_version` / `read_app_version`) is a hot-path smell that is now
+  harmless (a slow health response no longer culls a live engine), left for a
+  follow-up. See `docs/plans/2026-06-27-gateway-never-respawn-alive-engine.md`.

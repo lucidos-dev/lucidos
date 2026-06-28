@@ -9,6 +9,7 @@ import type {
   CredentialInfo,
   OAuthAccountInfo,
   PinnedAppEntry,
+  InstalledPlugin,
   TriggerInfo,
   TriggerGroup,
   HistoricalTriggerInfo,
@@ -16,6 +17,7 @@ import type {
   MarketplaceCatalog,
   ConfirmState,
   ConfirmDetails,
+  PromptState,
   ResponseEvent,
   ToastAction, ToastItem, ToastType,
   CredentialRequest,
@@ -118,7 +120,7 @@ export function closeInlineForm(): void {
 }
 
 // --- Settings subview ---
-export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'marketplaces' | 'disk-usage' | 'permissions' | 'keyboard-shortcuts' | 'mobile-access' | 'environment-variables' | 'thread-queue';
+export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'marketplaces' | 'disk-usage' | 'permissions' | 'keyboard-shortcuts' | 'mobile-access' | 'environment-variables' | 'thread-queue' | 'debugging' | 'experimental';
 export type SettingsNavKey = Exclude<SettingsSubview, 'main'>;
 export interface SettingsNavItem {
   key: SettingsNavKey;
@@ -134,6 +136,7 @@ export const SETTINGS_SYSTEM_SUBPANEL_ITEMS: SettingsNavItem[] = [
   { key: 'memory', label: 'Memory' },
   { key: 'disk-usage', label: 'Disk Usage' },
   { key: 'environment-variables', label: 'Environment Variables' },
+  { key: 'debugging', label: 'Debugging' },
 ];
 
 export const SETTINGS_NAV_ITEMS: SettingsNavItem[] = [
@@ -147,6 +150,9 @@ export const SETTINGS_NAV_ITEMS: SettingsNavItem[] = [
   { key: 'mobile-access', label: 'Mobile Access' },
   { key: 'permissions', label: 'Permissions' },
   { key: 'keyboard-shortcuts', label: 'Keyboard Shortcuts' },
+  // Desktop only — gated to isTauri() in SettingsView (the experimental toggles
+  // here, e.g. the in-app browser, are only meaningful under Tauri).
+  { key: 'experimental', label: 'Experimental' },
   { key: 'system', label: 'System' },
 ];
 
@@ -155,11 +161,21 @@ export function settingsSubviewLabel(key: Exclude<SettingsSubview, 'main'>): str
 }
 
 // --- Active menu item ---
-// Migrate the retired 'app-store' menu item → the Apps section's Store tab.
-// Written before `appsTab` hydrates (further down) so it picks up the Store tab.
-if (localStorage.getItem('lucidos-active-menu-item') === 'app-store') {
-  localStorage.setItem('lucidos-active-menu-item', 'apps');
-  localStorage.setItem('lucidos-apps-tab', 'store');
+// The plugin Store moved out of the Apps section into its own top-level
+// **Plugins** panel. Migrate older persisted state to land on it:
+//  - the retired 'app-store' menu item → the Plugins panel;
+//  - someone last viewing Apps → Store (the prior fold-in) → the Plugins panel.
+// The former per-tab selection ('lucidos-plugins-tab') is retired — the panel
+// now uses a single "Installed only" filter instead of Installed | Store tabs,
+// so both that key and the older 'lucidos-apps-tab' are cleared.
+{
+  const savedMenu = localStorage.getItem('lucidos-active-menu-item');
+  const legacyAppsTab = localStorage.getItem('lucidos-apps-tab');
+  if (savedMenu === 'app-store' || (savedMenu === 'apps' && legacyAppsTab === 'store')) {
+    localStorage.setItem('lucidos-active-menu-item', 'plugins');
+  }
+  localStorage.removeItem('lucidos-apps-tab');
+  localStorage.removeItem('lucidos-plugins-tab');
 }
 const savedMenuItem = localStorage.getItem('lucidos-active-menu-item');
 export const activeMenuItem = signal<MenuItem>(
@@ -676,13 +692,17 @@ export const MOBILE_VIEWS: MobileView[] = [...PANE_DEFS];
 export const PANE_INDEX: Record<MobileView, number> =
   Object.fromEntries(PANE_DEFS.map((v, i) => [v, i])) as Record<MobileView, number>;
 export const PANE_COUNT = PANE_DEFS.length;
-// Session-scoped so iOS killing the PWA returns the user to the default 'thread'
-// pane instead of stranding them wherever they happened to be (e.g. 'content'
-// after opening an app).
+// Persisted in localStorage so the last-viewed pane survives the PWA being killed
+// — reopening lands on the pane the user left (e.g. 'content'), not a forced reset
+// to 'thread'. Session-scoping was the old behavior, chosen to avoid stranding the
+// user on a content pane whose content didn't survive; that rationale is now
+// obsolete because the content pane's actual content (open app/file/url) is
+// independently restored from the localStorage nav stack (see navigation.ts
+// `restoreState`), so a restored 'content' pane is never blank.
 export const MOBILE_VIEW_KEY = 'lucidos-mobile-view';
 
 export function getInitialMobileView(): MobileView {
-  const saved = sessionStorage.getItem(MOBILE_VIEW_KEY);
+  const saved = localStorage.getItem(MOBILE_VIEW_KEY);
   return saved && (MOBILE_VIEWS as string[]).includes(saved) ? (saved as MobileView) : 'thread';
 }
 
@@ -690,7 +710,7 @@ export const mobileView = signal<MobileView>(getInitialMobileView());
 
 export function setMobileView(view: MobileView) {
   mobileView.value = view;
-  sessionStorage.setItem(MOBILE_VIEW_KEY, view);
+  localStorage.setItem(MOBILE_VIEW_KEY, view);
 }
 
 // --- Input Mode ---
@@ -1218,6 +1238,10 @@ export function resetCodingAgentPendingPreferences(): void {
 // --- Apps ---
 export const appsList = signal<Loadable<App[]>>({ status: 'not-loaded' });
 export const marketplaceCatalog = signal<Loadable<MarketplaceCatalog>>({ status: 'not-loaded' });
+/** Installed plugins for the Plugins → Installed tab (from GET /plugins/installed
+ *  — the event projection, no marketplace scan, so it works offline and still
+ *  lists a plugin whose marketplace was later removed). */
+export const installedPlugins = signal<Loadable<InstalledPlugin[]>>({ status: 'not-loaded' });
 /** Incremented to force-refresh app UI iframes. Used as a cache-busting key in the
  *  iframe src so Preact naturally propagates the reload to ALL iframe instances
  *  (desktop + mobile). 0 = initial load (no cache-buster needed). */
@@ -1237,17 +1261,30 @@ export const pinnedApps = signal<Loadable<PinnedAppEntry[]>>(
   hydratePinnedAppsFromStorage(),
 );
 
-/** Which tab the Apps section shows: the user's **Installed** apps, or the
- *  **Store** (the former App Store — browse/install plugins from registered
- *  marketplaces). Persisted so a reload returns to the same tab. */
-export type AppsTab = 'installed' | 'store';
-function hydrateAppsTab(): AppsTab {
-  return localStorage.getItem('lucidos-apps-tab') === 'store' ? 'store' : 'installed';
+/** The **Plugins** panel's All | Installed filter. One unified catalog list
+ *  shows installed and available plugins the same way (status badge + Uninstall
+ *  on installed rows); this toggle just narrows it. `false` (default) → All (the
+ *  whole catalog, plus any installed plugin whose marketplace is gone); `true` →
+ *  only installed plugins. Persisted so a reload returns to the same view; absent
+ *  state defaults to All. */
+const PLUGINS_INSTALLED_ONLY_KEY = 'lucidos-plugins-installed-only';
+export const pluginsInstalledOnly = signal<boolean>(
+  localStorage.getItem(PLUGINS_INSTALLED_ONLY_KEY) === 'true',
+);
+export function setPluginsInstalledOnly(next: boolean): void {
+  pluginsInstalledOnly.value = next;
+  localStorage.setItem(PLUGINS_INSTALLED_ONLY_KEY, String(next));
 }
-export const appsTab = signal<AppsTab>(hydrateAppsTab());
-/** Inline search bar in the Apps panel header (the SearchIcon). Filters the
- *  active tab client-side — installed apps on Installed, plugins on Store —
- *  mirroring the thread search. */
+/** A plugin id the Plugins panel's list should scroll to and pulse-highlight
+ *  once it renders — set by the update-notification deep-link (`navigate_ui`
+ *  target `plugins`) so a tap lands the user on the exact plugin that has the
+ *  pending update. Mirrors `settingsScrollTarget`; the `StoreTab` scroll effect
+ *  consumes it once and clears it. */
+export const pluginScrollTarget = signal<string | null>(null);
+/** Inline content-pane search bar (the SearchIcon in the Apps / Plugins panel
+ *  header). Filters the active list client-side — installed apps on Apps,
+ *  installed plugins or the catalog on Plugins — mirroring the thread search.
+ *  Shared because only one panel is visible at a time. */
 export const appSearchOpen = signal(false);
 export const appSearchQuery = signal('');
 
@@ -1260,6 +1297,12 @@ export const confirmState = signal<ConfirmState>({
   visible: false,
   message: '',
   okLabel: 'Delete',
+});
+
+// --- Prompt dialog ---
+export const promptState = signal<PromptState>({
+  visible: false,
+  message: '',
 });
 
 // --- Toasts ---
@@ -1341,15 +1384,17 @@ export function dismissToast(idOrKey: number | string) {
   }
 }
 
-/** True when a toast already on screen offers the user a way to pick up a new
- *  build — i.e. it carries an action button. Every action-bearing toast in the
- *  app is a refresh/restart prompt ("Engine restarted" with a Refresh button,
- *  "Engine restart required" with a Restart button, or the "New version
- *  available" toast itself), so the presence of `action` is a sufficient signal.
- *  Used to suppress the redundant "New version available" toast when one of those
- *  is already visible. (The "Applied …" toast deliberately carries no Refresh
- *  button — the rebuilt frontend isn't ready at apply time — so it never trips
- *  this guard.) */
+/** True when a toast already on screen offers the user a way to act on a pending
+ *  build/restart — i.e. it carries an action button. The action-bearing
+ *  refresh/restart toasts are the pre-restart "Engine restart required" toast
+ *  (its Restart button) and the "New version available" toast itself, so the
+ *  presence of `action` is a sufficient signal. Used to suppress a redundant
+ *  "New version available" toast when one of those is already visible. Two
+ *  notable action-LESS toasts deliberately don't trip this guard: the post-restart
+ *  "Engine restarted" confirmation (so a restart that also rebuilt the client
+ *  still surfaces the refresh prompt) and the "Applied …" toast (the rebuilt
+ *  frontend isn't ready at apply time — the refresh affordance is deferred to the
+ *  build-id staleness check). */
 export function hasRefreshToast(): boolean {
   return toasts.value.some((t) => t.action !== undefined);
 }
@@ -1381,6 +1426,38 @@ export function showConfirm(
       resolve,
       extraAction: options?.extraAction,
       details: options?.details,
+    };
+  });
+}
+
+/** Show a text-input modal. Resolves the entered string on OK, or `null` on
+ *  Cancel / Esc / backdrop. Like {@link showConfirm}, a second call replaces a
+ *  visible prompt (the prior resolves `null`) — never queues. */
+export function showPrompt(
+  message: string,
+  options?: {
+    title?: string;
+    defaultValue?: string;
+    placeholder?: string;
+    okLabel?: string;
+    cancelLabel?: string;
+    multiline?: boolean;
+  }
+): Promise<string | null> {
+  const prior = promptState.peek();
+  if (prior.visible) prior.resolve?.(null);
+
+  return new Promise((resolve) => {
+    promptState.value = {
+      visible: true,
+      message,
+      title: options?.title,
+      defaultValue: options?.defaultValue,
+      placeholder: options?.placeholder,
+      okLabel: options?.okLabel,
+      cancelLabel: options?.cancelLabel,
+      multiline: options?.multiline,
+      resolve,
     };
   });
 }

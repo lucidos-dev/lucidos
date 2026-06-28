@@ -362,22 +362,22 @@ mod tests {
     #[test]
     fn match_app_id_accepts_exact_app_folder() {
         assert_eq!(
-            match_app_id(Path::new("apps/momentum")),
-            Some("momentum".to_string())
+            match_app_id(Path::new("apps/habit-tracker")),
+            Some("habit-tracker".to_string())
         );
         // Trailing slash gets normalized away by Path components.
         assert_eq!(
-            match_app_id(Path::new("apps/momentum/")),
-            Some("momentum".to_string())
+            match_app_id(Path::new("apps/habit-tracker/")),
+            Some("habit-tracker".to_string())
         );
     }
 
     #[test]
     fn match_app_id_refuses_subpaths() {
-        assert_eq!(match_app_id(Path::new("apps/momentum/ui")), None);
-        assert_eq!(match_app_id(Path::new("apps/momentum/index.html")), None);
+        assert_eq!(match_app_id(Path::new("apps/habit-tracker/ui")), None);
+        assert_eq!(match_app_id(Path::new("apps/habit-tracker/index.html")), None);
         assert_eq!(
-            match_app_id(Path::new("apps/momentum/knowhow/intent.md")),
+            match_app_id(Path::new("apps/habit-tracker/knowhow/intent.md")),
             None
         );
     }
@@ -404,7 +404,7 @@ mod tests {
         assert!(!is_valid_app_id("a/b"));
         assert!(!is_valid_app_id("a\\b"));
         assert!(!is_valid_app_id(".hidden"));
-        assert!(is_valid_app_id("momentum"));
+        assert!(is_valid_app_id("habit-tracker"));
         assert!(is_valid_app_id("habit-tracker"));
         assert!(is_valid_app_id("app_v2"));
     }
@@ -438,7 +438,7 @@ mod tests {
     #[test]
     fn classify_returns_app_for_canonical_app_folder() {
         let ws = std::env::temp_dir().join("classify_test_ws_app");
-        let target = ws.join("data/apps/momentum");
+        let target = ws.join("data/apps/habit-tracker");
         let _ = std::fs::create_dir_all(&target);
         let lucidos_root = ws.join("lucidos-source");
         let _ = std::fs::create_dir_all(&lucidos_root);
@@ -446,7 +446,7 @@ mod tests {
         match res {
             Ok(FolderClassification::App { workspace_root, app_id }) => {
                 assert_eq!(workspace_root, ws);
-                assert_eq!(app_id, "momentum");
+                assert_eq!(app_id, "habit-tracker");
             }
             other => panic!("expected App, got {:?}", other.as_ref().err().map(|e| e.to_string())),
         }
@@ -455,7 +455,7 @@ mod tests {
     #[test]
     fn classify_refuses_app_subpath() {
         let ws = std::env::temp_dir().join("classify_test_ws_appsub");
-        let target = ws.join("data/apps/momentum/ui");
+        let target = ws.join("data/apps/habit-tracker/ui");
         let _ = std::fs::create_dir_all(&target);
         let lucidos_root = ws.join("lucidos-source");
         let _ = std::fs::create_dir_all(&lucidos_root);
@@ -545,13 +545,13 @@ mod tests {
         // Packaged: no source checkout, yet an app folder must still classify so
         // app coding-agent spawns work (the regression this fix targets).
         let ws = std::env::temp_dir().join("classify_test_ws_app_no_src");
-        let target = ws.join("data/apps/momentum");
+        let target = ws.join("data/apps/habit-tracker");
         let _ = std::fs::create_dir_all(&target);
         let res = classify_resolved_folder(&target, &ws, None, |_| None);
         match res {
             Ok(FolderClassification::App { workspace_root, app_id }) => {
                 assert_eq!(workspace_root, ws);
-                assert_eq!(app_id, "momentum");
+                assert_eq!(app_id, "habit-tracker");
             }
             other => panic!("expected App, got {:?}", other.as_ref().err().map(|e| e.to_string())),
         }

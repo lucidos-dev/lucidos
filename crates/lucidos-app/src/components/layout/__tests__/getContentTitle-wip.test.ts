@@ -66,6 +66,36 @@ describe('getContentTitle — WIP preview', () => {
   });
 });
 
+describe('getContentTitle — notification detail', () => {
+  beforeEach(() => {
+    panelOverlay.value = null;
+    wipPreviewThreadId.value = null;
+    threadMap.value = new Map();
+    activeMenuItem.value = 'notifications';
+  });
+
+  const fakeNotification = {
+    id: 'n1',
+    title: 'Backup completed',
+    message: 'All good',
+    read: false,
+    created_at: new Date('2026-06-26T10:00:00Z').toISOString(),
+  };
+
+  it('prefixes the notification title with "Notification - "', () => {
+    panelOverlay.value = { type: 'notification-detail', notification: fakeNotification };
+    expect(getContentTitle()).toBe('Notification - Backup completed');
+  });
+
+  it('falls back to bare "Notification" when the title is empty', () => {
+    panelOverlay.value = {
+      type: 'notification-detail',
+      notification: { ...fakeNotification, title: '' },
+    };
+    expect(getContentTitle()).toBe('Notification');
+  });
+});
+
 describe('getContentTitle — menu labels', () => {
   beforeEach(() => {
     panelOverlay.value = null;
@@ -89,7 +119,7 @@ describe('getContentTitle — menu labels', () => {
     expect(getContentTitle()).toBe('Thread Queue');
   });
 
-  it('apps renders its canonical "Apps" title (the App Store is now its Store tab)', () => {
+  it('apps renders its canonical "Apps" title (the Store moved out to the Plugins panel)', () => {
     activeMenuItem.value = 'apps';
     expect(getContentTitle()).toBe('Apps');
   });

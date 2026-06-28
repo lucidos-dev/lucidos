@@ -1,6 +1,19 @@
 :root {
     --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
     --font-ui: var(--font-mono);
+    /* TEMPORARY MEASURE — model-tolerance (removable — see
+       docs/temporary-measures.md § Model-tolerance measures, governed by
+       .claude/rules/temporary-measures.md). `--font-ui` is the canonical token
+       for the user's UI font (set live by sdk-prefs.js / applyPreferences), but
+       app-building agents overwhelmingly reach for `--font-family` (it mirrors
+       the CSS property) or the `--font` shorthand. An undefined `var()` silently
+       falls back to the app's hardcoded stack, so the wrong guess shipped the
+       system font instead of the user's choice — with no error. Aliasing the two
+       most-guessed names to the one source of truth makes the intuitive guess
+       just work; drop it once agents reliably emit `--font-ui`. IFRAME-ONLY:
+       host code uses --font-ui directly, so these don't belong in base.css. */
+    --font-family: var(--font-ui);
+    --font: var(--font-ui);
     --space-xs: 0.25rem;
     --space-sm: 0.5rem;
     --space-md: 0.75rem;

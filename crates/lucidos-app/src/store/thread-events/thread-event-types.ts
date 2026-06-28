@@ -254,6 +254,7 @@ export type ThreadEvent =
   // historical row and should be treated as a harmless terminal end.
   | { type: 'SessionEnded'; reason?: SessionEndReason | string }
   | { type: 'CodingAgentTextStreamed'; text: string; coding_agent?: CodingAgent }
+  | { type: 'CodingAgentThoughtStreamed'; text: string; coding_agent?: CodingAgent }
   | { type: 'CodingAgentToolCalled'; name: string; args: unknown; description?: string; tool_use_id?: string; coding_agent?: CodingAgent }
   | { type: 'CodingAgentToolResult'; name: string; result: string; tool_use_id?: string; coding_agent?: CodingAgent }
   | { type: 'CodingAgentUserMessageSent'; text: string; coding_agent?: CodingAgent }
@@ -371,6 +372,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   ContinuationStarted: true,
   SessionEnded: true,
   CodingAgentTextStreamed: true,
+  CodingAgentThoughtStreamed: true,
   CodingAgentToolCalled: true,
   CodingAgentToolResult: true,
   CodingAgentUserMessageSent: true,
@@ -485,7 +487,11 @@ export type TransientEvent =
   | { type: 'FileRefreshRequested'; path: string }
   | { type: 'AppUiRefreshRequested'; app_id: string }
   | { type: 'AppUiCaptureRequested'; app_id: string; request_id: string }
-  | { type: 'NavigationRequested'; payload: string }
+  // `actor` carries the originating device for an agent (navigate_ui) navigate —
+  // the device that sent the prompt that triggered the turn. The SSE handler
+  // scopes the navigate to that device. Absent for trigger/background turns and
+  // for the SDK app-iframe (nil-thread) path.
+  | { type: 'NavigationRequested'; payload: string; actor?: MessageOrigin }
   | { type: 'CodingAgentThreadSpawned'; cc_thread_id: string; title: string; coding_agent?: CodingAgent }
   | { type: 'CodingAgentDiffChanged'; has_diff: boolean }
   | { type: 'ChildrenCountChanged'; active: number; total: number };

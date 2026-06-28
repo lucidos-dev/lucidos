@@ -3,12 +3,12 @@ import { appIdFromFolder } from './appIdFromFolder';
 
 describe('appIdFromFolder', () => {
   it('extracts id from absolute workspace path', () => {
-    expect(appIdFromFolder('/Users/me/workspaces/personal/data/apps/momentum-autoresearch'))
-      .toBe('momentum-autoresearch');
+    expect(appIdFromFolder('/Users/me/workspaces/myws/data/apps/habit-tracker'))
+      .toBe('habit-tracker');
   });
 
   it('handles trailing slash', () => {
-    expect(appIdFromFolder('/ws/data/apps/momentum/')).toBe('momentum');
+    expect(appIdFromFolder('/ws/data/apps/habit-tracker/')).toBe('habit-tracker');
   });
 
   it('handles workspace-relative path', () => {

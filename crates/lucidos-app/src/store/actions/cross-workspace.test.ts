@@ -47,8 +47,8 @@ const TID = '1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff';
 const gwEntry = (
   overrides: Partial<{ id: string; name: string; port: number; health: 'booting' | 'healthy' | 'unhealthy' }>,
 ) => ({
-  id: 'work',
-  name: 'work',
+  id: 'other-ws',
+  name: 'other-ws',
   port: 5175,
   health: 'healthy' as 'booting' | 'healthy' | 'unhealthy',
   autostart: true,
@@ -56,7 +56,7 @@ const gwEntry = (
 });
 
 const wsInfo = (overrides: Partial<{ name: string; port: number | null; engine_running: boolean }>) => ({
-  name: 'work',
+  name: 'other-ws',
   path: '/tmp/x',
   port: 5175 as number | null,
   engine_running: true,
@@ -77,7 +77,7 @@ beforeEach(() => {
 
 describe('openThreadInWorkspace — behind the gateway', () => {
   beforeEach(() => {
-    mocks.workspaceId = 'personal'; // served at https://<gateway>/personal/
+    mocks.workspaceId = 'myws'; // served at https://<gateway>/myws/
     stubLocation('https://localhost:5251');
   });
 
@@ -127,7 +127,7 @@ describe('openThreadInWorkspace — behind the gateway', () => {
   });
 
   it('toasts when the workspace is not registered with the gateway', async () => {
-    mocks.listWorkspaces.mockResolvedValue([gwEntry({ id: 'personal', name: 'personal' })]);
+    mocks.listWorkspaces.mockResolvedValue([gwEntry({ id: 'myws', name: 'myws' })]);
 
     await openThreadInWorkspace('ghost', TID);
 
@@ -147,12 +147,12 @@ describe('openThreadInWorkspace — served directly on an engine port', () => {
 
   it("opens the target engine's own port and never touches the gateway", async () => {
     mocks.fetchWorkspaces.mockResolvedValue({
-      workspaces: [wsInfo({ name: 'work', port: 5175 }), wsInfo({ name: 'personal', port: 5174 })],
+      workspaces: [wsInfo({ name: 'other-ws', port: 5175 }), wsInfo({ name: 'myws', port: 5174 })],
     });
 
-    await openThreadInWorkspace('work', TID);
+    await openThreadInWorkspace('other-ws', TID);
 
-    expect(mocks.windowOpen).toHaveBeenCalledWith(`https://localhost:5175/#thread=${TID}`, 'lucidos-ws-work');
+    expect(mocks.windowOpen).toHaveBeenCalledWith(`https://localhost:5175/#thread=${TID}`, 'lucidos-ws-other-ws');
     expect(mocks.listWorkspaces).not.toHaveBeenCalled();
     expect(mocks.openUrl).not.toHaveBeenCalled();
     expect(mocks.showToast).not.toHaveBeenCalled();
@@ -160,33 +160,33 @@ describe('openThreadInWorkspace — served directly on an engine port', () => {
 
   it('keeps the current host (Tailscale) for the dedicated port', async () => {
     stubLocation('https://tail.host:5173');
-    mocks.fetchWorkspaces.mockResolvedValue({ workspaces: [wsInfo({ name: 'work', port: 5175 })] });
+    mocks.fetchWorkspaces.mockResolvedValue({ workspaces: [wsInfo({ name: 'other-ws', port: 5175 })] });
 
-    await openThreadInWorkspace('work', TID);
+    await openThreadInWorkspace('other-ws', TID);
 
-    expect(mocks.windowOpen).toHaveBeenCalledWith(`https://tail.host:5175/#thread=${TID}`, 'lucidos-ws-work');
+    expect(mocks.windowOpen).toHaveBeenCalledWith(`https://tail.host:5175/#thread=${TID}`, 'lucidos-ws-other-ws');
   });
 
   it('toasts when the workspace is not in the list', async () => {
-    mocks.fetchWorkspaces.mockResolvedValue({ workspaces: [wsInfo({ name: 'personal' })] });
+    mocks.fetchWorkspaces.mockResolvedValue({ workspaces: [wsInfo({ name: 'myws' })] });
 
-    await openThreadInWorkspace('work', TID);
+    await openThreadInWorkspace('other-ws', TID);
 
     expect(mocks.windowOpen).not.toHaveBeenCalled();
     expect(mocks.showToast).toHaveBeenCalledWith(
-      expect.stringContaining("Workspace 'work' is not available"),
+      expect.stringContaining("Workspace 'other-ws' is not available"),
       'error',
     );
   });
 
   it('toasts when the workspace exists but the engine is not running', async () => {
-    mocks.fetchWorkspaces.mockResolvedValue({ workspaces: [wsInfo({ name: 'work', engine_running: false })] });
+    mocks.fetchWorkspaces.mockResolvedValue({ workspaces: [wsInfo({ name: 'other-ws', engine_running: false })] });
 
-    await openThreadInWorkspace('work', TID);
+    await openThreadInWorkspace('other-ws', TID);
 
     expect(mocks.windowOpen).not.toHaveBeenCalled();
     expect(mocks.showToast).toHaveBeenCalledWith(
-      expect.stringContaining("Workspace 'work' is not available"),
+      expect.stringContaining("Workspace 'other-ws' is not available"),
       'error',
     );
   });
@@ -194,7 +194,7 @@ describe('openThreadInWorkspace — served directly on an engine port', () => {
   it('toasts the cause when the workspace-list request fails', async () => {
     mocks.fetchWorkspaces.mockRejectedValue(new Error('boom'));
 
-    await openThreadInWorkspace('work', TID);
+    await openThreadInWorkspace('other-ws', TID);
 
     expect(mocks.windowOpen).not.toHaveBeenCalled();
     expect(mocks.showToast).toHaveBeenCalledWith(
@@ -228,8 +228,8 @@ describe('openThreadAcrossWorkspaces', () => {
   });
 
   it('hops to the source workspace for a cross-workspace link', () => {
-    mocks.listWorkspaces.mockResolvedValue([gwEntry({ id: 'work', name: 'work' })]);
-    openThreadAcrossWorkspaces('work', TID);
+    mocks.listWorkspaces.mockResolvedValue([gwEntry({ id: 'other-ws', name: 'other-ws' })]);
+    openThreadAcrossWorkspaces('other-ws', TID);
     // openThreadInWorkspace resolves the slug via listWorkspaces synchronously
     // before its first await, so we can assert the routing decision without flushing.
     expect(mocks.focusThreadOrBootstrap).not.toHaveBeenCalled();
@@ -241,14 +241,14 @@ describe('ensureCrossWorkspaceThreadTitle', () => {
   it('fetches same-origin through the gateway when behind it', async () => {
     mocks.workspaceId = 'dev';
     stubLocation('https://localhost:5251');
-    mocks.listWorkspaces.mockResolvedValue([gwEntry({ id: 'personal', name: 'personal' })]);
+    mocks.listWorkspaces.mockResolvedValue([gwEntry({ id: 'myws', name: 'myws' })]);
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ title: 'Gateway name' }) });
     vi.stubGlobal('fetch', fetchMock);
 
-    await ensureCrossWorkspaceThreadTitle('personal', TID);
+    await ensureCrossWorkspaceThreadTitle('myws', TID);
 
-    expect(fetchMock).toHaveBeenCalledWith(`https://localhost:5251/personal/api/v1/threads/${TID}`);
-    expect(crossWorkspaceThreadTitle('personal', TID)).toBe('Gateway name');
+    expect(fetchMock).toHaveBeenCalledWith(`https://localhost:5251/myws/api/v1/threads/${TID}`);
+    expect(crossWorkspaceThreadTitle('myws', TID)).toBe('Gateway name');
   });
 
   it('does NOT boot a stopped peer through the gateway just to read a title', async () => {

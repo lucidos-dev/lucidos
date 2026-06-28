@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'preact/hooks';
-import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, chatModels, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, animationSpeed, speedMultiplier, repositories, enginePackaged } from '../../store/store';
+import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, chatModels, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, repositories, enginePackaged } from '../../store/store';
 import { devices, getDeviceId, loadDevices, updateDeviceName, toggleDevicePush, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCaptureContext, setCaptureContext, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, type Theme, type FontFamily } from '../../store/actions/preferences';
+import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentInAppBrowser, setInAppBrowser, type Theme, type FontFamily } from '../../store/actions/preferences';
 import { openScaleModal } from '../shared/scaleModalState';
 import { formatDateTime } from '../../utils/formatTime';
 import { loadOAuthAccounts, disconnectOAuthAccount, grantOAuthScope } from '../../store/actions/oauth';
@@ -22,6 +22,7 @@ import { MarketplacesSection } from './MarketplacesSection';
 import { MobileAccessPage } from './MobileAccessPage';
 import { SystemPage } from './SystemPage';
 import { isTauri } from '../../utils/platform';
+import { viewportIsMobile } from '../../utils/viewport';
 import { ChevronRightIcon } from '../shared/icons';
 import { CredentialItem } from '../credentials/CredentialItem';
 import { openAddCredential, loadCredentials } from '../../store/actions/credentials';
@@ -29,7 +30,10 @@ import { loadRepositories } from '../../store/actions/chat';
 import { API, mutatingFetch, throwIfNotOk } from '../../api/client';
 import { DirectoryPicker } from './DirectoryPicker';
 import { LoadableError } from '../shared/LoadableError';
+import { ListSkeleton } from '../shared/ListSkeleton';
+import { LoadingFade } from '../shared/LoadingFade';
 import { openSettingsSubview } from '../../store/actions/menu';
+import { focusFirstFocusableWithin } from '../layout/paneFocus';
 import { formatTimeAgo } from '../../utils/formatTime';
 import type { DeviceInfo } from '../../api/types';
 import type { ImageModel } from '../../store/actions/preferences';
@@ -107,6 +111,7 @@ const FONT_OPTIONS: Array<{ value: FontFamily; label: string }> = [
   { value: 'inter', label: 'Inter' },
   { value: 'jetbrains-mono', label: 'JetBrains Mono' },
   { value: 'ibm-plex-mono', label: 'IBM Plex Mono' },
+  { value: 'fira-code', label: 'Fira Code' },
 ];
 
 const IMAGE_MODELS = [
@@ -425,6 +430,11 @@ export function SettingsView() {
       el.classList.remove('settings-search-highlight');
       void el.offsetWidth; // force reflow so the animation re-triggers on repeat clicks
       el.classList.add('settings-search-highlight');
+      // Land keyboard focus on the targeted row's control (e.g. the Language
+      // dropdown) so a Search Everywhere jump lands focus on the setting itself,
+      // not the panel's first control. No-op for a section-title anchor with no
+      // focusable child; desktop-only (see focusFirstFocusableWithin).
+      focusFirstFocusableWithin(el);
     }
     settingsScrollTarget.value = null;
   }, [settingsScrollTarget.value, settingsSubview.value]);
@@ -548,31 +558,33 @@ export function SettingsView() {
         </div>
       );
     }
-    if (loadable.status !== 'loaded') {
-      if (!showLoading) return null;
-      return (
-        <div class="list-rows">
-          <div class="loading-spinner" />
-        </div>
-      );
-    }
-    if (loadable.data.length === 0) {
-      return <div class="list-rows"><div class="empty-state">No devices registered</div></div>;
-    }
-    // Current device first; then push-enabled; within each group keep the
-    // backend's last_seen_at DESC ordering via Array.prototype.sort's ES2019
-    // stability guarantee.
-    const currentId = getDeviceId();
-    const sorted = [...loadable.data].sort((a, b) => {
-      if (a.id === currentId) return -1;
-      if (b.id === currentId) return 1;
-      return Number(b.push_enabled) - Number(a.push_enabled);
-    });
     return (
       <div class="list-rows">
-        {sorted.map((device) => (
-          <DeviceRow key={device.id} device={device} editingId={editingId} setEditingId={setEditingId} />
-        ))}
+        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+          {loadable.status === 'loaded'
+            ? (() => {
+                if (loadable.data.length === 0) {
+                  return <div class="empty-state">No devices registered</div>;
+                }
+                // Current device first; then push-enabled; within each group keep the
+                // backend's last_seen_at DESC ordering via Array.prototype.sort's ES2019
+                // stability guarantee.
+                const currentId = getDeviceId();
+                const sorted = [...loadable.data].sort((a, b) => {
+                  if (a.id === currentId) return -1;
+                  if (b.id === currentId) return 1;
+                  return Number(b.push_enabled) - Number(a.push_enabled);
+                });
+                return (
+                  <>
+                    {sorted.map((device) => (
+                      <DeviceRow key={device.id} device={device} editingId={editingId} setEditingId={setEditingId} />
+                    ))}
+                  </>
+                );
+              })()
+            : null}
+        </LoadingFade>
       </div>
     );
   }
@@ -762,20 +774,6 @@ export function SettingsView() {
             />
           </div>
         </div>
-        <div class="settings-section">
-          <div class="settings-section-title" data-search-anchor="models:debugging">Debugging</div>
-          <div class="settings-row" data-search-anchor="models:capture-context">
-            <span class="settings-row-label">Capture context per step</span>
-            <label class="toggle-switch">
-              <input
-                type="checkbox"
-                checked={currentCaptureContext()}
-                onChange={(e) => void setCaptureContext((e.currentTarget as HTMLInputElement).checked)}
-              />
-              <span class="toggle-slider" />
-            </label>
-          </div>
-        </div>
         <VertexRegionSetting />
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="models:providers">Providers</div>
@@ -828,39 +826,54 @@ export function SettingsView() {
               {uiScale}%
             </button>
           </div>
-          <div class="settings-row" data-search-anchor="appearance:animation-speed">
-            <span class="settings-row-label">Animation speed</span>
-            <div class="settings-row-options" style="gap: 0.5rem; align-items: center">
-              <input
-                type="range"
-                min="-10"
-                max="10"
-                step="1"
-                value={animationSpeed.value}
-                onInput={(e) => {
-                  animationSpeed.value = parseInt((e.target as HTMLInputElement).value);
-                }}
-                style="width: 7rem"
-              />
-              <span class="settings-row-label" style="min-width: 2.5rem; text-align: right">{speedMultiplier.value.toFixed(1)}x</span>
+        </div>
+        {/* The mobile header (and its hide-on-scroll behavior) only exists at the
+            ≤768px breakpoint, so this toggle does nothing observable on desktop.
+            Gate the whole section on the reactive viewport signal — it appears /
+            disappears live as the viewport crosses the breakpoint. The preference
+            is global, so it's set from a mobile-width viewport where its effect is
+            visible. */}
+        {viewportIsMobile.value && (
+          <div class="settings-section">
+            <div class="settings-section-title" data-search-anchor="appearance:mobile">Mobile</div>
+            <div class="settings-row" data-search-anchor="appearance:mobile-header-sticky">
+              <span class="settings-row-label">Keep header visible</span>
+              <label class="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={currentMobileHeaderSticky()}
+                  onChange={(e) => void setMobileHeaderSticky((e.currentTarget as HTMLInputElement).checked)}
+                />
+                <span class="toggle-slider" />
+              </label>
             </div>
           </div>
-        </div>
-        <div class="settings-section">
-          <div class="settings-section-title" data-search-anchor="appearance:mobile">Mobile</div>
-          <div class="settings-row" data-search-anchor="appearance:mobile-header-sticky">
-            <span class="settings-row-label">Keep header visible</span>
-            <label class="toggle-switch">
-              <input
-                type="checkbox"
-                checked={currentMobileHeaderSticky()}
-                onChange={(e) => void setMobileHeaderSticky((e.currentTarget as HTMLInputElement).checked)}
-              />
-              <span class="toggle-slider" />
-            </label>
-          </div>
-        </div>
+        )}
       </>
+    );
+  }
+
+  function experimentalSection() {
+    // Gate the toggle on the loaded status so it mounts in its persisted
+    // position rather than animating across on reload (see `LoadableToggle`).
+    const loaded = preferences.value.status === 'loaded';
+    return (
+      <div class="settings-section">
+        <div class="settings-section-title" data-search-anchor="experimental:in-app-browser">In-app browser</div>
+        <p class="settings-section-desc">
+          Open links inside the app in a built-in browser pane instead of your
+          system browser. Experimental — the in-app browser has rough edges, so
+          it's off by default.
+        </p>
+        <div class="settings-row" data-search-anchor="experimental:in-app-browser-toggle">
+          <span class="settings-row-label">Open links in the in-app browser</span>
+          <LoadableToggle
+            loaded={loaded}
+            checked={currentInAppBrowser()}
+            onChange={(c) => void setInAppBrowser(c)}
+          />
+        </div>
+      </div>
     );
   }
 
@@ -878,9 +891,11 @@ export function SettingsView() {
       case 'marketplaces': return <MarketplacesSection />;
       case 'mobile-access': return <MobileAccessPage />;
       case 'permissions': return permissionsSection();
+      case 'experimental': return experimentalSection();
       case 'keyboard-shortcuts': return <KeyboardShortcutsSection />;
       case 'disk-usage': return <SystemPage panel="disk-usage" />;
       case 'environment-variables': return <SystemPage panel="environment-variables" />;
+      case 'debugging': return <SystemPage panel="debugging" />;
       default: return null;
     }
   }
@@ -895,9 +910,13 @@ export function SettingsView() {
 
   // Mobile Access is meaningful only for the packaged desktop app's always-on
   // service (its Tauri commands surface the connect URLs + drive Tailscale).
-  const navItems = SETTINGS_NAV_ITEMS.filter(
-    ({ key }) => key !== 'mobile-access' || (isTauri() && enginePackaged.value),
-  );
+  // Experimental hosts desktop-only toggles (the in-app browser webview exists
+  // only under Tauri), so it's hidden in Chrome/PWA.
+  const navItems = SETTINGS_NAV_ITEMS.filter(({ key }) => {
+    if (key === 'mobile-access') return isTauri() && enginePackaged.value;
+    if (key === 'experimental') return isTauri();
+    return true;
+  });
 
   return (
     <div class="content-view active settings-panel">

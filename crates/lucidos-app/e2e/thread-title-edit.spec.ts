@@ -79,15 +79,22 @@ test.describe('Thread title editing — desktop', () => {
     await clickVisibleElement(page, '.thread-title-display');
     input = await waitForTitleInput(page);
 
-    // Sanity: the edit field is the active element and editable. It's an
+    // Sanity: the edit field becomes the active element and editable. It's an
     // <input> on desktop and a <textarea> on mobile, and this block runs at
     // both widths across the Playwright projects, so accept either tag.
-    const isFocused = await page.evaluate(() => {
+    //
+    // Poll, don't snapshot: startEditing() calls inputRef.focus() synchronously
+    // while the setEditing(true) re-render (which flips the field's tabIndex
+    // -1 → 0) is still pending, so DOM focus settles a frame or two after
+    // `.is-editing` appears. A single immediate read raced that settle under
+    // host contention (mobile-webkit retries:0 sweep, 2026-06-27). The poll
+    // still fails loudly if focus genuinely never lands — the real regression
+    // this guards (the still-focused overlay swallowing the re-open click).
+    await page.waitForFunction(() => {
       const el = document.activeElement;
       return (el?.tagName === 'INPUT' || el?.tagName === 'TEXTAREA')
         && el.classList.contains('thread-title-edit-input');
-    });
-    expect(isFocused).toBe(true);
+    }, undefined, { timeout: 5_000 });
   });
 
   test('press Escape cancels editing without saving', async ({ page }) => {

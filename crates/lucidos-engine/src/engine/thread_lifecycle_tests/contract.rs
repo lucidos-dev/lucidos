@@ -4,6 +4,7 @@ const CC_ONLY_EVENTS: &[&str] = &[
     "SessionStarted",
     "SessionEnded",
     "CodingAgentTextStreamed",
+    "CodingAgentThoughtStreamed",
     "CodingAgentToolCalled",
     "CodingAgentToolResult",
     "CodingAgentUserMessageSent",

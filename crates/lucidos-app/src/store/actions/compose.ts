@@ -102,8 +102,38 @@ export const pendingComposePuts = new Set<string>();
  *  capture a request time AFTER the last local edit. */
 export const composeEditedAt = new Map<string, number>();
 
+/** Per-thread timestamp of the last compose PUT *settling* (Date.now()),
+ *  stamped in pushNow's finally. Closes the inverse of the `composeEditedAt`
+ *  hole: when the edit happened BEFORE a stale GET started (so
+ *  `composeEditedAt` is older than the GET's request time) but the debounced
+ *  PUT only settled AFTER the GET started, the GET's server snapshot was read
+ *  before the PUT committed — yet by the time its response lands
+ *  `pendingComposePuts` is already cleared. upsertThread consults this map and
+ *  skips the overwrite when a PUT settled AT OR AFTER the GET went out. Without
+ *  it, the "thread draft persists when switching to compose and back" flow
+ *  intermittently blanks the restored draft (drafts.spec.ts:65). Stays set
+ *  forever (no expiry); cross-device sync still works because a legitimate
+ *  later refresh captures a request time AFTER the last local PUT settled. */
+export const composePutSettledAt = new Map<string, number>();
+
 function markLocallyEdited(threadId: string): void {
   composeEditedAt.set(threadId, Date.now());
+}
+
+/** True when this device holds a non-empty draft it locally authored for the
+ *  thread — the shared invariant guard for every INBOUND compose EMPTY-clear
+ *  path: the bulk `loadAllThreads` empty snapshot (`stageDraftFromApi`), an
+ *  empty SSE `ThreadComposeChanged` (`applyRemoteCompose`), and the SSE
+ *  `MessageReceived` echo's clear (`clearComposeIfUnfocused` in thread-sync).
+ *  Such a draft is the user's unsent intent and must never be blanked by an
+ *  inbound echo/snapshot — only a send/discard FROM THIS DEVICE clears it.
+ *  (`upsertThread` guards the distinct NON-empty stale overwrite with the
+ *  `composeEditedAt` / `composePutSettledAt` / `pendingComposePuts` timestamps,
+ *  not this helper.) `composeEditedAt` is stamped by `markLocallyEdited` and
+ *  never cleared, so a server-ORIGINATED draft (present but never edited here)
+ *  returns false and stays clearable by a genuine remote clear. */
+export function hasLocalDraftEdit(threadId: string): boolean {
+  return composeEditedAt.has(threadId) && !draftIsEmpty(getDraft(threadId));
 }
 
 /** Single entry point for compose mutations from the UI. Optimistic local
@@ -140,6 +170,17 @@ export function applyRemoteCompose(
 ): void {
   if (!threadMap.value.has(threadId)) return;
   if (fields.text === '' && fields.image_hashes.length === 0 && fields.mode === null) {
+    // A remote EMPTY snapshot must never clear a non-empty draft this device
+    // authored — the SSE mirror of stageDraftFromApi's guard (thread-loading.ts).
+    // The only emitter is the compose PUT handler; a PUT that fired before the
+    // device-id header was available broadcasts origin=None, which bypasses the
+    // SSE self-echo suppression (thread-sync.ts only suppresses a PRESENT origin)
+    // and lands here. Without this, that own/non-attributable empty echo blanks
+    // the just-typed draft — the value='' face of drafts.spec.ts:65 (see
+    // docs/plans/2026-06-28-drafts-sse-empty-clear-guard.md). Gate on
+    // hasLocalDraftEdit so a server-ORIGINATED draft (never edited here) is
+    // still clearable by a genuine peer clear; the kept draft is local-view only.
+    if (hasLocalDraftEdit(threadId)) return;
     clearDraft(threadId);
     return;
   }
@@ -221,6 +262,13 @@ async function pushNow(threadId: string): Promise<void> {
     }
   } finally {
     pendingComposePuts.delete(threadId);
+    // Stamp the settle moment AFTER clearing pendingComposePuts: from here a
+    // GET that started before this settle (its server snapshot read before our
+    // PUT committed) must not clobber local compose state. See
+    // `composePutSettledAt`. Set even on the awaitThreadStarted early-return /
+    // PUT-failure path — local is still the user's latest intent, and a failed
+    // sync already toasted.
+    composePutSettledAt.set(threadId, Date.now());
   }
 }
 

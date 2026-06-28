@@ -46,3 +46,38 @@ export function forgetLastWorkspace(): void {
     /* no-op */
   }
 }
+
+/** Largest skeleton row count we'll restore — guards against a corrupt stored
+ *  value rendering a wall of shimmer rows. Beyond this the list scrolls anyway,
+ *  so an exact height match matters less. */
+const MAX_SKELETON_ROWS = 20;
+
+/** Device-global key holding the count of workspaces from the last successful
+ *  picker load. Read by the picker to size its loading skeleton to the list the
+ *  user will actually see, so the skeleton→list handoff doesn't bounce. Like
+ *  `LAST_WORKSPACE_KEY` it must stay raw (it's only ever touched in the picker
+ *  context, where storage namespacing no-ops) — see `workspaceStorage.ts`. */
+export const LAST_WORKSPACE_COUNT_KEY = 'lucidos-last-workspace-count';
+
+/** Record how many workspaces the last load returned (best-effort). */
+export function rememberLastWorkspaceCount(n: number): void {
+  try {
+    localStorage.setItem(LAST_WORKSPACE_COUNT_KEY, String(n));
+  } catch {
+    /* storage off — the skeleton just falls back to a default row count */
+  }
+}
+
+/** The last-known workspace count, clamped to a sane skeleton range, or `null`
+ *  when nothing valid is recorded (the caller picks a default). */
+export function recallLastWorkspaceCount(): number | null {
+  try {
+    const raw = localStorage.getItem(LAST_WORKSPACE_COUNT_KEY);
+    if (raw === null) return null;
+    const n = Number.parseInt(raw, 10);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return Math.min(n, MAX_SKELETON_ROWS);
+  } catch {
+    return null;
+  }
+}

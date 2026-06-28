@@ -102,47 +102,6 @@ test.describe('Repo File Explorer', () => {
     }, undefined, { timeout: 10_000 });
   });
 
-  test('expand/collapse all folders', async ({ page }) => {
-    await navigateToApp(page);
-    await openFilesPanel(page);
-
-    // Switch to repo
-    await clickVisibleElement(page, '.files-source-switcher .dropdown-trigger');
-    await page.waitForSelector('.dropdown-option:visible', { timeout: 5_000 });
-    await clickVisibleElement(page, '.dropdown-option', repoName);
-
-    // Wait for tree
-    await page.waitForSelector('.folder-header:visible', { timeout: 15_000 });
-
-    // Click "Expand All"
-    await clickVisibleElement(page, '.files-toolbar-btn', 'Expand All');
-    await page.waitForTimeout(500);
-
-    // Count visible folders after expand
-    const expandedCount = await page.evaluate(() => {
-      const headers = document.querySelectorAll('.folder-header');
-      return Array.from(headers).filter(el => {
-        const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
-      }).length;
-    });
-    expect(expandedCount).toBeGreaterThan(2);
-
-    // Click "Collapse All"
-    await clickVisibleElement(page, '.files-toolbar-btn', 'Collapse All');
-    await page.waitForTimeout(500);
-
-    // After collapse, only top-level folders visible
-    const collapsedCount = await page.evaluate(() => {
-      const headers = document.querySelectorAll('.folder-header');
-      return Array.from(headers).filter(el => {
-        const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
-      }).length;
-    });
-    expect(collapsedCount).toBeLessThan(expandedCount);
-  });
-
   test('switching back to workspace restores workspace view', async ({ page }) => {
     await navigateToApp(page);
     await openFilesPanel(page);

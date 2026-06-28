@@ -5,6 +5,8 @@ import { showToast, memoryRebuildProgress } from '../../store/store';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { Dropdown } from '../shared/Dropdown';
 import { LoadableError } from '../shared/LoadableError';
+import { ListSkeleton } from '../shared/ListSkeleton';
+import { LoadingFade } from '../shared/LoadingFade';
 import { toFailed } from '../../store/types';
 import { formatTimeAgo, formatDateTime } from '../../utils/formatTime';
 import { errorDetail } from '../../utils/errorDetail';
@@ -297,30 +299,31 @@ export function MemoryInspector() {
     if (entries.status === 'failed') {
       return <LoadableError noun="entries" error={entries.error} />;
     }
-    if (entries.status !== 'loaded') {
-      if (!showEntriesLoading) return null;
-      return <div class="loading-spinner" />;
-    }
-    if (entries.data.entries.length === 0) {
-      return <div class="empty-state">No memory entries</div>;
-    }
     return (
-      <>
-        <div class="list-rows">
-          {entries.data.entries.map((entry) => (
-            <MemoryEntryRow key={entry.id} entry={entry} />
-          ))}
-        </div>
-        <div class="memory-pagination">
-          <span class="memory-pagination-info">
-            {offset + 1}–{Math.min(offset + PAGE_SIZE, entries.data.total)} of {entries.data.total.toLocaleString()}
-          </span>
-          <div class="memory-pagination-buttons">
-            <button class="action-btn" disabled={offset === 0} onClick={handlePrevPage}>Prev</button>
-            <button class="action-btn" disabled={!entries.data.has_more} onClick={handleNextPage}>Next</button>
-          </div>
-        </div>
-      </>
+      <LoadingFade showSkeleton={showEntriesLoading} skeleton={<ListSkeleton />}>
+        {entries.status === 'loaded' ? (
+          entries.data.entries.length === 0 ? (
+            <div class="empty-state">No memory entries</div>
+          ) : (
+            <>
+              <div class="list-rows">
+                {entries.data.entries.map((entry) => (
+                  <MemoryEntryRow key={entry.id} entry={entry} />
+                ))}
+              </div>
+              <div class="memory-pagination">
+                <span class="memory-pagination-info">
+                  {offset + 1}–{Math.min(offset + PAGE_SIZE, entries.data.total)} of {entries.data.total.toLocaleString()}
+                </span>
+                <div class="memory-pagination-buttons">
+                  <button class="action-btn" disabled={offset === 0} onClick={handlePrevPage}>Prev</button>
+                  <button class="action-btn" disabled={!entries.data.has_more} onClick={handleNextPage}>Next</button>
+                </div>
+              </div>
+            </>
+          )
+        ) : null}
+      </LoadingFade>
     );
   }
 

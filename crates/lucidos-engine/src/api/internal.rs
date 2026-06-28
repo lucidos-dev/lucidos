@@ -1,5 +1,5 @@
 use super::*;
-use crate::engine::cc_permission::prompt_coding_agent_permission;
+use crate::engine::cc_permission::{prompt_coding_agent_permission, CodingAgentPermissionInput};
 use crate::engine::event_bus::BusEvent;
 use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
 
@@ -65,10 +65,12 @@ pub(super) async fn permission_prompt(
         &state.engine.pending_cc_permission,
         &state.engine.trigger_configs,
         &state.workspace_path,
-        thread_id,
-        body.tool_use_id,
-        body.tool_name,
-        body.input,
+        CodingAgentPermissionInput {
+            thread_id,
+            tool_use_id: body.tool_use_id,
+            tool_name: body.tool_name,
+            input: body.input,
+        },
     )
     .await;
 
@@ -87,6 +89,35 @@ pub(super) struct ClientLogRequest {
     pub data: serde_json::Value,
 }
 
+const CLIENT_LOG_MAX_FIELD_LEN: usize = 256;
+const CLIENT_LOG_MAX_DATA_LEN: usize = 4096;
+/// Max entries one batched `/internal/client-logs` request may carry, so a
+/// misbehaving client can't flood the engine.log tail in a single POST. The
+/// frontend perf queue flushes well under this.
+const CLIENT_LOG_MAX_BATCH: usize = 100;
+
+/// Validate one breadcrumb's caps, returning its serialized `data` on success.
+/// `Err(reason)` on a cap violation (the caller maps it to a 400). Pure — does
+/// NOT log, so a batch can validate every entry before committing any line.
+fn validate_client_entry(entry: &ClientLogRequest) -> Result<String, &'static str> {
+    if entry.category.len() > CLIENT_LOG_MAX_FIELD_LEN || entry.message.len() > CLIENT_LOG_MAX_FIELD_LEN {
+        return Err("category/message too long");
+    }
+    // Value's Display is infallible — it serializes through a String buffer.
+    let data_str = entry.data.to_string();
+    if data_str.len() > CLIENT_LOG_MAX_DATA_LEN {
+        return Err("data too large");
+    }
+    Ok(data_str)
+}
+
+fn user_agent(headers: &HeaderMap) -> &str {
+    headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
 /// POST /api/v1/internal/client-log — fire-and-forget breadcrumb channel for
 /// browser-side telemetry that needs engine-log persistence. Body capped at
 /// 4KB so the engine.log tail isn't drowned by a misbehaving client.
@@ -94,27 +125,39 @@ pub(super) async fn client_log(
     headers: HeaderMap,
     Json(body): Json<ClientLogRequest>,
 ) -> impl IntoResponse {
-    const MAX_FIELD_LEN: usize = 256;
-    const MAX_DATA_LEN: usize = 4096;
-    if body.category.len() > MAX_FIELD_LEN || body.message.len() > MAX_FIELD_LEN {
-        return (StatusCode::BAD_REQUEST, "category/message too long").into_response();
+    match validate_client_entry(&body) {
+        Ok(data_str) => {
+            crate::log!("[Client/{}] {} {} ua={}", body.category, body.message, data_str, user_agent(&headers));
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(reason) => (StatusCode::BAD_REQUEST, reason).into_response(),
     }
-    // Value's Display is infallible — it serializes through a String buffer.
-    let data_str = body.data.to_string();
-    if data_str.len() > MAX_DATA_LEN {
-        return (StatusCode::BAD_REQUEST, "data too large").into_response();
+}
+
+/// POST /api/v1/internal/client-logs — batched variant of `client-log` so a
+/// client-side queue (e.g. the perf instrumentation) can flush many breadcrumbs
+/// in one request instead of one POST per sample. Each valid entry is logged as
+/// its own `[Client/<category>]` line; the array length and per-entry sizes are
+/// capped. Validation is atomic — if any entry is over-cap the whole batch is
+/// rejected (400) and nothing is logged.
+pub(super) async fn client_logs(
+    headers: HeaderMap,
+    Json(body): Json<Vec<ClientLogRequest>>,
+) -> impl IntoResponse {
+    if body.len() > CLIENT_LOG_MAX_BATCH {
+        return (StatusCode::BAD_REQUEST, "too many entries").into_response();
     }
-    let ua = headers
-        .get(axum::http::header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    crate::log!(
-        "[Client/{}] {} {} ua={}",
-        body.category,
-        body.message,
-        data_str,
-        ua
-    );
+    let mut serialized = Vec::with_capacity(body.len());
+    for entry in &body {
+        match validate_client_entry(entry) {
+            Ok(data_str) => serialized.push(data_str),
+            Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
+        }
+    }
+    let ua = user_agent(&headers);
+    for (entry, data_str) in body.iter().zip(serialized) {
+        crate::log!("[Client/{}] {} {} ua={}", entry.category, entry.message, data_str, ua);
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -425,9 +468,14 @@ pub(super) struct SeedChangeForTestRequest {
 /// without recreating the entire CC turn flow.
 ///
 /// Hardened so it can't be abused on a production instance:
-/// 1. Refuses outright in release builds (`cfg!(debug_assertions)` is false).
-///    The route is mounted unconditionally so `cargo build --release` doesn't
-///    silently miss it; the guard returns 404 instead.
+/// 1. Refuses unless the build is a dev build (`debug_assertions`) OR was compiled
+///    with the `e2e-test-hooks` cargo feature — the feature the e2e harness passes
+///    (`scripts/lib/e2e.sh` `ENGINE_BUILD_FEATURES`), so a RELEASE e2e engine can
+///    still seed. This mirrors the `#[cfg(feature = "e2e-test-hooks")]` gating on
+///    `api/notifications.rs`'s test endpoints. A prod/packaged build
+///    (`cargo tauri build`, no feature) sets neither flag, so the guard returns
+///    404. The route stays mounted unconditionally so a release build doesn't
+///    silently miss it.
 /// 2. Path-validates `repo_root`, `branch_name`, and every entry of `files`
 ///    against `..`, leading `/`, and leading `\` per the rust.md path-validation
 ///    rule, so even a dev-build instance reachable from the network can't be
@@ -436,7 +484,7 @@ pub(super) async fn seed_change_for_test(
     State(state): State<AppState>,
     Json(body): Json<SeedChangeForTestRequest>,
 ) -> impl IntoResponse {
-    if !cfg!(debug_assertions) {
+    if !cfg!(any(debug_assertions, feature = "e2e-test-hooks")) {
         return (StatusCode::NOT_FOUND, "test-only endpoint").into_response();
     }
 
@@ -665,6 +713,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/internal/planned-state", get(query_planned))
         .route("/internal/approve-plan", post(approve_plan))
         .route("/internal/client-log", post(client_log))
+        .route("/internal/client-logs", post(client_logs))
         .route(
             "/internal/seed-change-for-test",
             post(seed_change_for_test),
@@ -697,5 +746,27 @@ mod tests {
                 tool
             );
         }
+    }
+
+    fn entry(category: &str, message: &str, data: serde_json::Value) -> ClientLogRequest {
+        ClientLogRequest { category: category.into(), message: message.into(), data }
+    }
+
+    #[test]
+    fn validate_client_entry_accepts_normal_breadcrumb_and_returns_serialized_data() {
+        let e = entry("perf", "open", serde_json::json!({ "eventCount": 7847, "openMs": 1234 }));
+        let data = validate_client_entry(&e).expect("normal entry valid");
+        assert!(data.contains("7847") && data.contains("openMs"), "returns serialized data for logging");
+    }
+
+    #[test]
+    fn validate_client_entry_rejects_oversized_fields_and_data() {
+        let long = "x".repeat(CLIENT_LOG_MAX_FIELD_LEN + 1);
+        assert_eq!(
+            validate_client_entry(&entry(&long, "m", serde_json::Value::Null)),
+            Err("category/message too long")
+        );
+        let big = serde_json::json!({ "blob": "y".repeat(CLIENT_LOG_MAX_DATA_LEN) });
+        assert_eq!(validate_client_entry(&entry("perf", "m", big)), Err("data too large"));
     }
 }

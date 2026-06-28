@@ -35,7 +35,7 @@ const chatExchangeSource = readFileSync(resolve(here, '../ChatExchange.tsx'), 'u
 
 const APPS: App[] = [
   { id: 'work-tracker', name: 'Lucidos Work', description: 'x' },
-  { id: 'momentum-autoresearch', name: 'Momentum Autoresearch', description: 'y' },
+  { id: 'habit-tracker', name: 'Habit Tracker', description: 'y' },
 ];
 
 interface MockAnchor {
@@ -192,8 +192,8 @@ describe('chat link click — the bug-report scenario', () => {
     'apps/work-tracker/',
     'apps/work-tracker/index.html?v=2',
     'apps/work-tracker/index.html#section',
-    // `app:<id>` custom-scheme shorthand. The Momentum-app bug report:
-    // LLM wrote `[Momentum app](app:momentum)`, which fell through to the
+    // `app:<id>` custom-scheme shorthand. The Habit Tracker-app bug report:
+    // LLM wrote `[Habit Tracker app](app:habit-tracker)`, which fell through to the
     // browser and dead-ended on macOS Chrome.
     'app:work-tracker',
     'app:work-tracker/',
@@ -242,14 +242,14 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('END-TO-END: render → linkify pipeline rewrites app:<id> custom scheme', () => {
-    // Exact markdown from the Momentum-app bug-report thread:
-    //   Open the [Momentum app](app:momentum) and switch to the Backtest tab.
-    const md = 'Open the [Momentum Autoresearch](app:momentum-autoresearch) and switch to the Backtest tab.';
+    // Exact markdown from the Habit Tracker-app bug-report thread:
+    //   Open the [Habit Tracker app](app:habit-tracker) and switch to the Backtest tab.
+    const md = 'Open the [Habit Tracker](app:habit-tracker) and switch to the Backtest tab.';
     const html = linkifyPaths(renderMarkdown(md), [], APPS);
     expect(html).toContain('href="#"');
     expect(html).toContain('class="app-link"');
-    expect(html).toContain('data-app-id="momentum-autoresearch"');
-    expect(html).toContain('>Momentum Autoresearch</a>');
+    expect(html).toContain('data-app-id="habit-tracker"');
+    expect(html).toContain('>Habit Tracker</a>');
     expect(html).not.toContain('href="app:');
   });
 
@@ -312,7 +312,7 @@ describe('chat link click — the bug-report scenario', () => {
 
   it('END-TO-END: render → linkify yields the .nav-link the click expects (bug-report shape)', () => {
     // Exact markdown from the bug-report thread:
-    //   Open it: [Notifications](data/notifications) or [Momentum …](apps/momentum-autoresearch/index.html).
+    //   Open it: [Notifications](data/notifications) or [Habit Tracker …](apps/habit-tracker/index.html).
     const md = 'Open it: [Notifications](data/notifications).';
     const html = linkifyPaths(renderMarkdown(md), [], APPS);
     expect(html).toContain('href="#"');
@@ -330,7 +330,7 @@ describe('chat link click — the bug-report scenario', () => {
   // ---------------------------------------------------------------------------
 
   it('OS-OPEN: file:///abs/path.dmg → osOpen, not navigate / openApp / openArtifact', () => {
-    const href = 'file:///Users/ken/.lucidos/release-worktrees/0.12.3/Lucidos_0.12.3_aarch64.dmg';
+    const href = 'file:///Users/me/.lucidos/release-worktrees/0.12.3/Lucidos_0.12.3_aarch64.dmg';
     const e = mkEvent(mkAnchor(href));
     runHandleLinkClick(e, APPS, cb);
     expect(cb.osOpen).toHaveBeenCalledWith(href);
@@ -341,7 +341,7 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('OS-OPEN: bare absolute path /Users/.../x.dmg → osOpen, not navigate / openArtifact', () => {
-    const href = '/Users/ken/Downloads/Lucidos_0.12.3_aarch64.dmg';
+    const href = '/Users/me/Downloads/Lucidos_0.12.3_aarch64.dmg';
     const e = mkEvent(mkAnchor(href));
     runHandleLinkClick(e, APPS, cb);
     expect(cb.osOpen).toHaveBeenCalledWith(href);
@@ -352,7 +352,7 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('OS-OPEN: absolute folder path is revealed via the OS', () => {
-    const href = '/Users/ken/.lucidos/release-worktrees/0.12.3';
+    const href = '/Users/me/.lucidos/release-worktrees/0.12.3';
     const e = mkEvent(mkAnchor(href));
     runHandleLinkClick(e, APPS, cb);
     expect(cb.osOpen).toHaveBeenCalledWith(href);
@@ -391,7 +391,7 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it.each([
-    'https://example.com/Users/ken/foo.dmg',
+    'https://example.com/Users/me/foo.dmg',
     'http://example.com/foo.dmg',
   ])('OS-OPEN: external URL %s is NOT OS-opened (keeps browser behavior)', (href) => {
     const e = mkEvent(mkAnchor(href));

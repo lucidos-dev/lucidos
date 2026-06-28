@@ -290,6 +290,7 @@ fn make_test_session(
         current_reasoning_effort: None,
         last_event_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         pending_followups: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        question_resume_pending: false,
         tools_in_flight: Arc::new(std::sync::atomic::AtomicI32::new(0)),
         coding_agent: crate::runtime::CodingAgent::ClaudeCode,
     }
@@ -393,6 +394,45 @@ async fn is_in_flight_false_for_exited_session() {
     assert!(!session.is_in_flight());
 }
 
+/// Idle-termination follow-up race contract (the `:31` regression).
+///
+/// At idle the run loop's `ExitSubprocess` arm now sets `process_exited = true`
+/// (under the `agent_sessions` lock) BEFORE `agent_cancel.cancel()`, so a
+/// follow-up landing during the ~3s graceful-shutdown window is declined by the
+/// chat fast-path instead of being sent on `msg_tx` into a dying subprocess.
+/// This pins both halves of that fast-path gate (`chat/process/run.rs`): the
+/// `has_session` predicate (`map(|s| !s.process_exited)`) and the send-step
+/// guard (`if !session.process_exited`). When the gate declines, the follow-up
+/// falls through to the slow `--resume` path and is never dropped.
+#[tokio::test]
+async fn exited_mark_declines_fast_path_followup_route() {
+    let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut session = make_test_session(msg_tx, true);
+
+    // Before the idle-terminate mark: an idle session accepts the fast-path.
+    let has_session_before = !session.process_exited;
+    assert!(
+        has_session_before,
+        "an idle, alive session must be eligible for the msg_tx fast-path"
+    );
+
+    // The Terminate arm marks the session exited as it cancels the subprocess.
+    session.process_exited = true;
+
+    // Both fast-path gates now decline → caller falls through to the slow
+    // (`--resume`) path rather than routing into the terminating subprocess.
+    let has_session_after = !session.process_exited; // chat fast-path has_session
+    let send_step_allows = !session.process_exited; // chat fast-path send guard
+    assert!(
+        !has_session_after,
+        "a session marked process_exited at idle-terminate must NOT pass has_session"
+    );
+    assert!(
+        !send_step_allows,
+        "a session marked process_exited must NOT pass the msg_tx send guard"
+    );
+}
+
 // Regression coverage for the "ResponseCanceled is missing device" gap on a
 // LIVE Claude Code session: `POST /api/v1/claude-code/stop` (UserStop) resolves
 // the actor from the request headers and `interrupt_agent` stamps it on the
@@ -422,7 +462,7 @@ async fn cancel_actor_field_stores_and_drains() {
     // Stamp (mirrors interrupt_agent's live-session branch).
     let actor = MessageOrigin::Device {
         device_id: "ios-1".into(),
-        label: "Kenneth's iPhone".into(),
+        label: "My iPhone".into(),
     };
     session.cancel_actor = Some(actor.clone());
 
@@ -459,13 +499,13 @@ fn is_engine_injected_path_matches_excluded_paths_only() {
     // worktree root). Must match the same as the root-level path or the
     // skill folder shows up as a pending change every app spawn.
     assert!(super::is_engine_injected_path(
-        "data/apps/momentum-autoresearch/.claude/skills/lucidos-cli/SKILL.md"
+        "data/apps/habit-tracker/.claude/skills/lucidos-cli/SKILL.md"
     ));
     assert!(super::is_engine_injected_path(
-        "data/apps/momentum-autoresearch/.claude/skills/lucidos-cli/"
+        "data/apps/habit-tracker/.claude/skills/lucidos-cli/"
     ));
     assert!(super::is_engine_injected_path(
-        "data/apps/momentum-autoresearch/.claude/skills/lucidos-cli"
+        "data/apps/habit-tracker/.claude/skills/lucidos-cli"
     ));
 
     // Sibling paths must NOT match — false positives would hide unrelated
@@ -485,10 +525,10 @@ fn is_engine_injected_path_matches_excluded_paths_only() {
     assert!(!super::is_engine_injected_path("src/main.rs"));
     // Sibling under the deep app path must also stay visible.
     assert!(!super::is_engine_injected_path(
-        "data/apps/momentum-autoresearch/.claude/skills/lucidos-cli-helper/SKILL.md"
+        "data/apps/habit-tracker/.claude/skills/lucidos-cli-helper/SKILL.md"
     ));
     assert!(!super::is_engine_injected_path(
-        "data/apps/momentum-autoresearch/.claude/CLAUDE.md"
+        "data/apps/habit-tracker/.claude/CLAUDE.md"
     ));
 }
 

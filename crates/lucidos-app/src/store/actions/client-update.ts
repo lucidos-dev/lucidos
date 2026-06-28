@@ -26,9 +26,12 @@ import { CLIENT_BUILD_ID } from 'virtual:build-id';
  *     served build; a genuinely newer build re-surfaces it. The badge is left to
  *     the caller (it stays lit — the update IS available — even when the toast is
  *     suppressed).
- *   - `hasRefreshToast()` — a restart/refresh toast already on screen ("Engine
- *     restarted", "Engine restart required") is itself a way to pick up this
- *     build, so don't stack a redundant prompt.
+ *   - `hasRefreshToast()` — a refresh/restart toast already on screen is itself a
+ *     way to act, so don't stack a redundant prompt. Today that's the pre-restart
+ *     "Engine restart required" toast (its Restart button) or a live copy of this
+ *     toast. The post-restart "Engine restarted" confirmation deliberately
+ *     carries NO action, so it does NOT suppress this prompt — a restart that
+ *     also rebuilt the client must still surface the refresh.
  *
  *  (`showToast` additionally no-ops while the engine is restarting, so this can't
  *  stack on the "Restarting engine…" status either.) */
@@ -38,7 +41,7 @@ export function surfaceUpdateToast(servedBuildId: string): void {
   noteUpdateBuildId(servedBuildId);
   if (wasSwUpdateDismissed(servedBuildId)) return;
   if (hasRefreshToast()) return;
-  showToast('New version available', 'info', {
+  showToast('New version available — refresh to sync', 'info', {
     key: 'update-available',
     action: {
       label: 'Refresh',

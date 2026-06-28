@@ -19,52 +19,75 @@ impl EventStore {
     /// Get recent threads for the drawer.
     ///
     /// Returns every `archive_state='inbox'` thread (the REVIEW pile) and the
-    /// top `per_source` archived threads per source (the Archive pile). Inbox
+    /// newest `archive_limit` archived threads (the Archive pile). Inbox
     /// is unbounded by design: an inbox row is one the user hasn't dismissed,
     /// so capping it would silently hide work the user expects to see —
     /// crashed coding-agent sessions, idle chats they meant to come back to, and so on.
     /// Archive is capped because old archived threads aren't time-sensitive;
     /// the user can page back via `get_older_threads`.
     ///
-    /// The per-source archive window is ordered by `created_at DESC` (newest
-    /// created per source) — the SAME axis the drawer's Archive section sorts
-    /// and `get_older_threads` pages by, so the boundary between this initial
-    /// window and the first scroll-page is seamless. (The outer `ORDER BY` is
+    /// The archive window is a SINGLE GLOBAL `created_at DESC` slice over archived
+    /// rows — the newest `archive_limit` archived threads regardless of source — so
+    /// it is a contiguous prefix of the archived-by-`created_at` list. This is the
+    /// SAME axis AND granularity the drawer's Archive section sorts (`byCreated`)
+    /// and `get_older_threads` pages by (one global `created_at` cursor), so the
+    /// initial-window → first-scroll-page seam is gap-free. (The outer `ORDER BY` is
     /// irrelevant — the frontend re-sorts every section.)
     ///
-    /// Also unconditionally includes active-status threads (`running`,
-    /// `waiting_for_user_answer`) — a thread the user just started or that's
-    /// blocked on user input must appear immediately, before any response
-    /// arrives. And the actionable bypasses (`coding_agent_proposed=TRUE`,
-    /// `status='failed'`, `status='waiting_for_user_answer'`) are preserved
-    /// in case a future state lets one of those slip past `archive_state='inbox'`.
+    /// It is deliberately NOT per-source: a per-source window is a *union* of
+    /// per-source `created_at` prefixes, which a single global cursor cannot page
+    /// without gaps. When sources differ in density (many recent chats; sparse,
+    /// older coding-agent / trigger threads) the per-source union dragged the cursor
+    /// down to the sparse source's months-old boundary — surfacing coding-agent
+    /// threads far above their real date, skipping every chat in between, and
+    /// halting scroll early. Pure-chronological gives up the "newest-of-every-source
+    /// up top" guarantee in the unfiltered view (old coding-agent threads sit at
+    /// their true date, reachable by scroll or the coding-agent channel filter).
+    ///
+    /// The window ranks ONLY archived rows (`PARTITION BY (archive_state =
+    /// 'archived')` splits the exactly-two-valued `ArchiveState` cleanly), so inbox
+    /// rows never consume the archive budget.
+    ///
+    /// The outer `WHERE` has exactly two clauses — unbounded inbox + the contiguous
+    /// archived window — and NO out-of-window bypass. An archived thread is NEVER
+    /// injected ahead of its `created_at` position; archived `failed` /
+    /// `waiting_for_user_answer` threads reach the drawer purely via
+    /// `get_older_threads` pagination, at their true date (so the Archive pile stays
+    /// gap-free). There is no `coding_agent_proposed` bypass because an
+    /// archived-proposed thread is an impossible state: a thread with a pending
+    /// in-workspace change has no Archive action (`is_blocking` → `[Discard, Apply]`
+    /// only), and external-repo archiving emits `ChangeApplied` for each pending
+    /// change before `ThreadArchived`, so the row is no longer proposed once
+    /// archived. Active threads (`running` / `waiting_for_user_answer`) likewise
+    /// surface via the unbounded inbox clause — they can't be archived while active.
+    ///
+    /// The INNER candidate filter (`has_response OR status = ANY($1) OR
+    /// coding_agent_proposed`) is unrelated to the window: it scopes which rows are
+    /// candidates at all (so an inbox proposed/active row with no response still
+    /// surfaces) and mirrors the `has_response` gate in `get_older_threads`.
     pub async fn get_recent_threads(
         &self,
-        per_source: i64,
+        archive_limit: i64,
     ) -> Result<Vec<ThreadSummary>, Box<dyn std::error::Error + Send + Sync>> {
         let active_statuses = active_thread_statuses();
-        let actionable_statuses: &[&str] = &[
-            ThreadStatus::WaitingForUserAnswer.as_str(),
-            ThreadStatus::Failed.as_str(),
-        ];
         let sql = format!(
-            "SELECT {} FROM (\
-                SELECT *, ROW_NUMBER() OVER (PARTITION BY source ORDER BY created_at DESC) AS rn \
+            "SELECT {cols} FROM (\
+                SELECT *, ROW_NUMBER() OVER (\
+                    PARTITION BY (archive_state = '{archived}') ORDER BY created_at DESC\
+                ) AS rn \
                 FROM thread_summaries \
                 WHERE has_response = TRUE OR status = ANY($1) OR coding_agent_proposed = TRUE\
             ) t \
-            WHERE t.archive_state = '{}' \
-               OR t.rn <= $2 \
-               OR t.coding_agent_proposed = TRUE \
-               OR t.status = ANY($3) \
+            WHERE t.archive_state = '{inbox}' \
+               OR (t.archive_state = '{archived}' AND t.rn <= $2) \
             ORDER BY t.last_user_action DESC",
-            THREAD_COLS.as_str(),
-            ArchiveState::Inbox.as_str(),
+            cols = THREAD_COLS.as_str(),
+            archived = ArchiveState::Archived.as_str(),
+            inbox = ArchiveState::Inbox.as_str(),
         );
         let rows = sqlx::query_as::<_, ThreadRow>(&sql)
             .bind(&active_statuses[..])
-            .bind(per_source)
-            .bind(actionable_statuses)
+            .bind(archive_limit)
             .fetch_all(&self.pool)
             .await?;
 
@@ -400,8 +423,8 @@ impl EventStore {
     /// `archive_state='archived'` and not saved (a saved+archived thread routes
     /// to the Saved section, not Archive). Drives the collapsed Archive
     /// section's count badge, which would otherwise show only the loaded window
-    /// (`get_recent_threads`'s 15 per source + scroll-paginated rows) — a gross
-    /// undercount on workspaces with hundreds of archived threads.
+    /// (`get_recent_threads`'s `archive_limit` global slice + scroll-paginated
+    /// rows) — a gross undercount on workspaces with hundreds of archived threads.
     ///
     /// The filter is `channel_facet_filter_sql`, shared verbatim with
     /// [`Self::get_older_threads`] so the badge total stays in lockstep with what

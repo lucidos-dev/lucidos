@@ -146,7 +146,7 @@ fn user_question_answered_status_transition_resumes_running() {
 /// !isComplete` branch) briefly classifies the active turn as `'aborted'` in
 /// the window between MemorySearched landing over SSE and the next activity
 /// event (typically ThoughtStreamed) arriving milliseconds later. Reproduced on
-/// personal thread 3fedeee4 ("Training Duration for Proposed Candidates").
+/// a real chat thread.
 #[test]
 fn memory_searched_bumps_status_to_running() {
     let transitions: std::collections::HashMap<&str, StatusTransition> =

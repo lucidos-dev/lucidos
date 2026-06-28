@@ -1,6 +1,6 @@
 import { useEffect } from 'preact/hooks';
 import { artifacts, repositories, repoSource, repoPending, workspaceName } from '../../store/store';
-import { expandAllFolders, collapseAllFolders, uploadFiles } from '../../store/actions/artifacts';
+import { uploadFiles } from '../../store/actions/artifacts';
 import { loadRepositories } from '../../store/actions/chat';
 import { switchRepoSource } from '../../store/actions/repositories';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
@@ -9,6 +9,8 @@ import { RepoFilesView } from './RepoFilesView';
 import { ChangeSelector } from './ChangeSelector';
 import { Dropdown } from '../shared/Dropdown';
 import { HiddenFileInput } from '../shared/HiddenFileInput';
+import { ListSkeleton } from '../shared/ListSkeleton';
+import { LoadingFade } from '../shared/LoadingFade';
 import { loadedOr } from '../../store/types';
 
 export function FilesView() {
@@ -30,33 +32,54 @@ export function FilesView() {
     { value: '', label: `Current Workspace (${workspaceName.value || 'unknown'})` },
     ...repos.map(r => ({ value: r.id, label: r.name })),
   ] : [];
+  const hasSwitcher = sourceOptions.length > 0;
 
+  const sourceDropdown = hasSwitcher ? (
+    <Dropdown
+      options={sourceOptions}
+      value={repoSource.value ?? ''}
+      onChange={(v) => void switchRepoSource(v || null)}
+    />
+  ) : null;
+
+  if (showRepoView) {
+    return (
+      <div class="content-view active">
+        {hasSwitcher && (
+          <div class="files-source-switcher">
+            {/* Source switcher renders even in app-CC mode — selecting
+                "Current Workspace" routes back through the dropdown's
+                onChange, which clears repoPending and drops the user back
+                into WorkspaceFilesView. Without this, an app-CC diff has no
+                in-pane escape control. */}
+            {sourceDropdown}
+            {isRepo && <ChangeSelector />}
+          </div>
+        )}
+        <RepoFilesView />
+      </div>
+    );
+  }
+
+  // Workspace (artifacts) mode. The whole area stays an import drop target, and
+  // the import control is pinned to the top-right of the switcher row — the
+  // source-switcher selector (when present) owns the top-left, the import box
+  // the top-right. The switcher row renders even without registered repos so
+  // the import box always has a top row to anchor to.
   return (
     <div class="content-view active">
-      {sourceOptions.length > 0 && (
+      <div class="workspace-files-view" data-drop-zone="import">
         <div class="files-source-switcher">
-          {/* Source switcher renders even in app-CC mode — selecting
-              "Current Workspace" routes back through the dropdown's
-              onChange, which clears repoPending and drops the user back
-              into WorkspaceFilesView. Without this, an app-CC diff has no
-              in-pane escape control. */}
-          <Dropdown
-            options={sourceOptions}
-            value={repoSource.value ?? ''}
-            onChange={(v) => void switchRepoSource(v || null)}
-          />
-          {isRepo && <ChangeSelector />}
+          {sourceDropdown}
+          <ImportDropzone />
         </div>
-      )}
-      {showRepoView ? <RepoFilesView /> : <WorkspaceFilesView />}
+        <WorkspaceFilesView />
+      </div>
     </div>
   );
 }
 
-function WorkspaceFilesView() {
-  const loadable = artifacts.value;
-  const showLoading = useDelayedLoading(loadable);
-
+function ImportDropzone() {
   const handleFileSelected = (e: Event) => {
     const input = e.target as HTMLInputElement;
     if (input.files && input.files.length > 0) {
@@ -64,6 +87,18 @@ function WorkspaceFilesView() {
       input.value = '';
     }
   };
+
+  return (
+    <label class="files-import-dropzone">
+      <HiddenFileInput multiple onChange={handleFileSelected} />
+      Drop or click to import
+    </label>
+  );
+}
+
+function WorkspaceFilesView() {
+  const loadable = artifacts.value;
+  const showLoading = useDelayedLoading(loadable);
 
   if (loadable.status === 'failed') {
     return (
@@ -73,32 +108,16 @@ function WorkspaceFilesView() {
     );
   }
 
-  if (loadable.status !== 'loaded') {
-    if (!showLoading) return null;
-    return <div class="loading-spinner" />;
-  }
-
-  const hasArtifacts = loadable.data.length > 0;
-
+  // Crossfade the skeleton out as the artifacts area appears. The import
+  // dropzone + source switcher now live in the parent's `files-source-switcher`
+  // row (main refactor), so this only owns the artifacts list.
   return (
-    <div class="workspace-files-view" data-drop-zone="import">
-      <div class="files-toolbar">
-        <span class="files-toolbar-actions">
-          {hasArtifacts && (
-            <>
-              <button class="files-toolbar-btn" onClick={expandAllFolders} data-tooltip="Expand all folders">Expand All</button>
-              <button class="files-toolbar-btn" onClick={collapseAllFolders} data-tooltip="Collapse all folders">Collapse All</button>
-            </>
-          )}
-        </span>
-        <label class="files-import-dropzone">
-          <HiddenFileInput multiple onChange={handleFileSelected} />
-          Drop or click to import
-        </label>
-      </div>
-      <div class="artifacts-desktop">
-        {hasArtifacts && <FolderTree />}
-      </div>
-    </div>
+    <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+      {loadable.status === 'loaded' ? (
+        <div class="artifacts-desktop">
+          {loadable.data.length > 0 && <FolderTree />}
+        </div>
+      ) : null}
+    </LoadingFade>
   );
 }

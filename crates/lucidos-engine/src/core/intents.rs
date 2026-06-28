@@ -77,6 +77,16 @@ impl IntentStore {
 
         // App-scoped: id = "app-name/intent-name"
         if let Some((app_id, intent_name)) = id.split_once('/') {
+            // `intent_name` must also pass the path-traversal guard: an absolute
+            // or backslash-prefixed segment would let `Path::join` replace the
+            // data_dir prefix and escape to the filesystem root (e.g. `foo//bar`
+            // splits to ("foo", "/bar"), and `…join("/bar.md")` becomes
+            // `/bar.md`). Mirrors `knowhow.rs::app_scoped_knowhow_path`.
+            if app_id.is_empty() || intent_name.is_empty() || super::is_path_traversal(intent_name)
+            {
+                log!("[Intents] Rejected invalid intent id: {}", id);
+                return None;
+            }
             for subdir in APP_INTENT_SUBDIRS {
                 let path = data_dir
                     .join("apps")

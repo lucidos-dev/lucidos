@@ -27,7 +27,7 @@ describe('appFilterOptions — only apps with CC sessions', () => {
   });
 
   it('returns [] until appsList loads', () => {
-    threadMap.value = new Map([['t1', appThread('/ws/data/apps/momentum')]]);
+    threadMap.value = new Map([['t1', appThread('/ws/data/apps/habit-tracker')]]);
     expect(appFilterOptions.value).toEqual([]);
   });
 
@@ -35,22 +35,22 @@ describe('appFilterOptions — only apps with CC sessions', () => {
     appsList.value = {
       status: 'loaded',
       data: [
-        { id: 'momentum', name: 'Momentum', description: '' },
+        { id: 'habit-tracker', name: 'Habit Tracker', description: '' },
         { id: 'habit', name: 'Habit', description: '' },
       ],
     };
-    // Only momentum has a thread.
-    threadMap.value = new Map([['t1', appThread('/ws/data/apps/momentum')]]);
-    expect(appFilterOptions.value.map(o => o.id)).toEqual(['momentum']);
+    // Only habit-tracker has a thread.
+    threadMap.value = new Map([['t1', appThread('/ws/data/apps/habit-tracker')]]);
+    expect(appFilterOptions.value.map(o => o.id)).toEqual(['habit-tracker']);
   });
 
   it('labels a session app from the live appsList (not deleted)', () => {
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'momentum', name: 'Momentum', description: '' }],
+      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '' }],
     };
-    threadMap.value = new Map([['t1', appThread('/ws/data/apps/momentum')]]);
-    expect(appFilterOptions.value).toEqual([{ id: 'momentum', label: 'Momentum', deleted: false }]);
+    threadMap.value = new Map([['t1', appThread('/ws/data/apps/habit-tracker')]]);
+    expect(appFilterOptions.value).toEqual([{ id: 'habit-tracker', label: 'Habit Tracker', deleted: false }]);
   });
 
   it('marks a session app missing from appsList as deleted', () => {
@@ -64,20 +64,20 @@ describe('appFilterOptions — only apps with CC sessions', () => {
   it('keeps a selected app even with no session so it stays clearable', () => {
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'momentum', name: 'Momentum', description: '' }],
+      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '' }],
     };
     threadMap.value = new Map();
-    selectedAppIds.value = new Set(['momentum']);
-    expect(appFilterOptions.value.map(o => o.id)).toEqual(['momentum']);
+    selectedAppIds.value = new Set(['habit-tracker']);
+    expect(appFilterOptions.value.map(o => o.id)).toEqual(['habit-tracker']);
   });
 
   it('ignores non-app coding-agent threads', () => {
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'momentum', name: 'Momentum', description: '' }],
+      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '' }],
     };
     threadMap.value = new Map([
-      ['t1', { meta: { codingAgentKind: 'lucidos', codingAgentFolder: '/ws/data/apps/momentum' } } as unknown as ThreadState],
+      ['t1', { meta: { codingAgentKind: 'lucidos', codingAgentFolder: '/ws/data/apps/habit-tracker' } } as unknown as ThreadState],
     ]);
     expect(appFilterOptions.value).toEqual([]);
   });
@@ -85,14 +85,14 @@ describe('appFilterOptions — only apps with CC sessions', () => {
   it('lists an app from filterFacets even with no loaded thread (complete option list)', () => {
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'momentum', name: 'Momentum', description: '' }],
+      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '' }],
     };
     threadMap.value = new Map();
     filterFacets.value = {
       status: 'loaded',
-      data: { triggers: [], repos: [], apps: [{ id: 'momentum', name: null, last_activity: '2026-04-01T00:00:00Z' }] },
+      data: { triggers: [], repos: [], apps: [{ id: 'habit-tracker', name: null, last_activity: '2026-04-01T00:00:00Z' }] },
     };
-    expect(appFilterOptions.value).toEqual([{ id: 'momentum', label: 'Momentum', deleted: false }]);
+    expect(appFilterOptions.value).toEqual([{ id: 'habit-tracker', label: 'Habit Tracker', deleted: false }]);
   });
 
   it('marks a facet app missing from appsList as deleted', () => {
@@ -109,9 +109,9 @@ describe('appFilterOptions — only apps with CC sessions', () => {
 
 describe('appFilterOptions — include-deleted toggle', () => {
   beforeEach(() => {
-    appsList.value = { status: 'loaded', data: [{ id: 'momentum', name: 'Momentum', description: '' }] };
+    appsList.value = { status: 'loaded', data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '' }] };
     threadMap.value = new Map([
-      ['t1', appThread('/ws/data/apps/momentum')],
+      ['t1', appThread('/ws/data/apps/habit-tracker')],
       ['t2', appThread('/ws/data/apps/gone')],
     ]);
     selectedAppIds.value = new Set();
@@ -120,17 +120,17 @@ describe('appFilterOptions — include-deleted toggle', () => {
 
   it('excludes deleted apps when the toggle is off (default)', () => {
     includeDeletedFilterOptions.value = false;
-    expect(appFilterOptions.value.map(o => o.id)).toEqual(['momentum']);
+    expect(appFilterOptions.value.map(o => o.id)).toEqual(['habit-tracker']);
   });
 
   it('includes deleted apps when the toggle is on', () => {
     includeDeletedFilterOptions.value = true;
-    expect(appFilterOptions.value.map(o => o.id)).toEqual(['momentum', 'gone']);
+    expect(appFilterOptions.value.map(o => o.id)).toEqual(['habit-tracker', 'gone']);
   });
 
   it('keeps a selected deleted app visible even when the toggle is off (stays clearable)', () => {
     includeDeletedFilterOptions.value = false;
     selectedAppIds.value = new Set(['gone']);
-    expect(appFilterOptions.value.map(o => o.id)).toEqual(['momentum', 'gone']);
+    expect(appFilterOptions.value.map(o => o.id)).toEqual(['habit-tracker', 'gone']);
   });
 });

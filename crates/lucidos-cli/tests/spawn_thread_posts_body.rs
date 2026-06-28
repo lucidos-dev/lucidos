@@ -197,15 +197,15 @@ async fn spawn_thread_explicit_repo_flag_lands_in_body() {
     let (port, captured) = start_capture_server().await;
     let tmp = tempfile::tempdir().unwrap();
     let caller = tmp.path().join("caller");
-    let target = tmp.path().join("work");
+    let target = tmp.path().join("myws");
     write_ports_file(&caller, 1);
     write_ports_file(&target, port);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let status = std::process::Command::new(bin)
         .args([
-            "spawn-thread", "--to", "work", "--cc",
-            "--repo", "user-acquisition",
+            "spawn-thread", "--to", "myws", "--cc",
+            "--repo", "example-repo",
             "--message", "fix bug", "--title", "Fix", "--insecure-http",
         ])
         .env("LUCIDOS_WORKSPACE", &caller)
@@ -218,33 +218,33 @@ async fn spawn_thread_explicit_repo_flag_lands_in_body() {
     assert!(status.success());
 
     let body = captured.lock().unwrap().clone().expect("server received body");
-    assert_eq!(body["repo_id"], "user-acquisition", "explicit --repo wins over env var");
+    assert_eq!(body["repo_id"], "example-repo", "explicit --repo wins over env var");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_thread_defaults_repo_from_lucidos_repo_env() {
     let (port, captured) = start_capture_server().await;
     let tmp = tempfile::tempdir().unwrap();
-    let caller = tmp.path().join("work");
+    let caller = tmp.path().join("myws");
     write_ports_file(&caller, port);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let status = std::process::Command::new(bin)
         .args([
-            "spawn-thread", "--parent", "--to", "work", "--cc",
+            "spawn-thread", "--parent", "--to", "myws", "--cc",
             "--message", "sidequest", "--title", "Side", "--insecure-http",
         ])
         .env("LUCIDOS_WORKSPACE", &caller)
         .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
         // No --repo flag — must default from env.
-        .env("LUCIDOS_REPO", "user-acquisition")
+        .env("LUCIDOS_REPO", "example-repo")
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
         .status().expect("spawn cli");
     assert!(status.success());
 
     let body = captured.lock().unwrap().clone().expect("server received body");
-    assert_eq!(body["repo_id"], "user-acquisition", "$LUCIDOS_REPO is the default");
+    assert_eq!(body["repo_id"], "example-repo", "$LUCIDOS_REPO is the default");
 }
 
 /// `--relation top` on a same-workspace target must produce the
@@ -402,14 +402,14 @@ async fn parent_flag_still_works_with_deprecation_warning() {
 async fn spawn_thread_with_folder_posts_folder_and_omits_repo() {
     let (port, captured) = start_capture_server().await;
     let tmp = tempfile::tempdir().unwrap();
-    let caller = tmp.path().join("personal");
+    let caller = tmp.path().join("dev");
     write_ports_file(&caller, port);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let output = std::process::Command::new(bin)
         .args([
-            "spawn-thread", "--to", "personal", "--relation", "top", "--cc",
-            "--folder", "data/apps/momentum-autoresearch",
+            "spawn-thread", "--to", "dev", "--relation", "top", "--cc",
+            "--folder", "data/apps/habit-tracker",
             "--message", "run a research session", "--title", "Research", "--insecure-http",
         ])
         .env("LUCIDOS_WORKSPACE", &caller)
@@ -424,7 +424,7 @@ async fn spawn_thread_with_folder_posts_folder_and_omits_repo() {
     assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
 
     let body = captured.lock().unwrap().clone().expect("server received body");
-    assert_eq!(body["folder"], "data/apps/momentum-autoresearch");
+    assert_eq!(body["folder"], "data/apps/habit-tracker");
     assert_eq!(body["use_coding_agent"], true);
     assert!(
         body.get("repo_id").is_none(),
@@ -438,13 +438,13 @@ async fn spawn_thread_with_folder_posts_folder_and_omits_repo() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_thread_folder_and_repo_are_mutually_exclusive() {
     let tmp = tempfile::tempdir().unwrap();
-    let caller = tmp.path().join("personal");
+    let caller = tmp.path().join("dev");
     write_ports_file(&caller, 1);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let output = std::process::Command::new(bin)
         .args([
-            "spawn-thread", "--to", "personal", "--relation", "top", "--cc",
+            "spawn-thread", "--to", "dev", "--relation", "top", "--cc",
             "--folder", "data/apps/foo", "--repo", "Lucidos",
             "--message", "x", "--insecure-http",
         ])
@@ -469,13 +469,13 @@ async fn spawn_thread_folder_and_repo_are_mutually_exclusive() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_thread_folder_requires_cc() {
     let tmp = tempfile::tempdir().unwrap();
-    let caller = tmp.path().join("personal");
+    let caller = tmp.path().join("dev");
     write_ports_file(&caller, 1);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let output = std::process::Command::new(bin)
         .args([
-            "spawn-thread", "--to", "personal", "--relation", "top",
+            "spawn-thread", "--to", "dev", "--relation", "top",
             "--folder", "data/apps/foo",
             "--message", "x", "--insecure-http",
         ])
@@ -499,19 +499,19 @@ async fn spawn_thread_empty_repo_flag_overrides_env_to_workspace_default() {
     // escape hatch — it must drop the env-var default.
     let (port, captured) = start_capture_server().await;
     let tmp = tempfile::tempdir().unwrap();
-    let caller = tmp.path().join("work");
+    let caller = tmp.path().join("myws");
     write_ports_file(&caller, port);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let status = std::process::Command::new(bin)
         .args([
-            "spawn-thread", "--parent", "--to", "work", "--cc",
+            "spawn-thread", "--parent", "--to", "myws", "--cc",
             "--repo", "",
             "--message", "default repo", "--title", "Def", "--insecure-http",
         ])
         .env("LUCIDOS_WORKSPACE", &caller)
         .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
-        .env("LUCIDOS_REPO", "user-acquisition")
+        .env("LUCIDOS_REPO", "example-repo")
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
         .status().expect("spawn cli");

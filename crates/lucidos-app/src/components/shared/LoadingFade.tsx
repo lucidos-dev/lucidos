@@ -1,0 +1,51 @@
+import type { ComponentChildren, VNode } from 'preact';
+import { useLingeringFlag } from '../../hooks/useDelayedLoading';
+
+/** How long the skeleton lingers (fading out) after the load completes. Slightly
+ *  longer than the CSS opacity transition (var(--duration-normal) = 200ms) so the
+ *  element stays mounted until the fade finishes. */
+const SKELETON_FADE_MS = 250;
+
+/** Crossfades a skeleton OUT as content comes in — the smooth exit that a plain
+ *  delayed loader lacks (a slow load otherwise hard-snaps from skeleton to
+ *  content). No content is withheld: `children` (the loaded content) renders
+ *  immediately when ready; the skeleton just lingers briefly and fades out over
+ *  it. Pair with a delay-only gate (`useDelayedFlag`/`useDelayedLoading`) on
+ *  `showSkeleton` so fast loads never show the skeleton at all — EXCEPT on a
+ *  full-screen surface with no competing content behind the loader (e.g. the
+ *  workspace picker), which passes an ungated boolean so the skeleton shows
+ *  immediately. See `.claude/rules/frontend.md` § "full-screen surface".
+ *
+ *  Layout: the content wrapper and the skeleton share one grid cell (stacked).
+ *  While loading, the skeleton sizes the cell (children is typically null); once
+ *  loaded the content sizes it and the skeleton goes absolute + fades, so it
+ *  doesn't fight the content's height. Reduced-motion: the skeleton disappears
+ *  without animating (see styles/components.css).
+ *
+ *  `children` is wrapped in a single `.loading-fade-content` element so callers
+ *  may pass a fragment of multiple siblings. Without the wrapper those siblings
+ *  would each become a direct grid child and `.loading-fade > * { grid-area: 1/1
+ *  }` would stack them ALL into the one cell, overlapping (the Changes-panel
+ *  double-text bug). The wrapper keeps exactly two grid children — content and
+ *  skeleton — regardless of what the caller passes. */
+export function LoadingFade({
+  showSkeleton,
+  skeleton,
+  children,
+}: {
+  showSkeleton: boolean;
+  skeleton: VNode;
+  children: ComponentChildren;
+}) {
+  const skeletonMounted = useLingeringFlag(showSkeleton, SKELETON_FADE_MS);
+  return (
+    <div class="loading-fade">
+      <div class="loading-fade-content">{children}</div>
+      {skeletonMounted && (
+        <div class={`loading-fade-skeleton${showSkeleton ? '' : ' loading-fade-out'}`} aria-hidden="true">
+          {skeleton}
+        </div>
+      )}
+    </div>
+  );
+}

@@ -27,7 +27,18 @@ test.describe('Welcome surface', () => {
 
     const welcome = page.locator('.welcome-message:visible').first();
     await expect(welcome).toBeVisible({ timeout: 10_000 });
-    await expect(welcome.getByText('Welcome to Lucidos')).toBeVisible();
+    // The e2e mock model configures a provider, so WelcomeMessage renders the
+    // starter-suggestions hero variant ("Hi, there!"), not the no-provider
+    // ProviderSetupWelcome ("Welcome to Lucidos"). See WelcomeMessage.tsx.
+    await expect(welcome.getByText('Hi, there!')).toBeVisible();
+
+    // The entrance fades the welcome in (sequenced after the prompt move) from a
+    // base `opacity: 0`. Assert it ENDS fully visible — guards against the base
+    // rule ever permanently hiding the surface (the inverse of the clipping bug)
+    // if the `.welcome-revealing` reveal class fails to land.
+    await expect
+      .poll(async () => welcome.evaluate((el) => getComputedStyle(el).opacity), { timeout: 5_000 })
+      .toBe('1');
 
     // The clipping bug left this wrap at ~0 height. `toBeVisible` alone can't
     // catch it (the welcome's own box is non-zero even when an ancestor clips
@@ -36,6 +47,74 @@ test.describe('Welcome surface', () => {
     const box = await wrap.boundingBox();
     expect(box).not.toBeNull();
     expect(box!.height).toBeGreaterThan(100);
+  });
+
+  test('clicking a suggestion prefills it into the prompt (not sent)', async ({ page }) => {
+    await navigateToApp(page);
+
+    const welcome = page.locator('.welcome-message:visible').first();
+    await expect(welcome).toBeVisible({ timeout: 10_000 });
+
+    // The carousel suggestion is a button — clicking it prefills the prompt via
+    // prefillCompose so the user can edit/send, rather than read-only copy.
+    const suggestion = page.locator('.welcome-carousel-item:visible').first();
+    await expect(suggestion).toBeVisible();
+    const text = (await suggestion.innerText()).trim();
+    expect(text.length).toBeGreaterThan(0);
+
+    await suggestion.click();
+
+    // Lands in the prompt textarea, ready to edit/send — NOT sent, so the
+    // welcome stays (no exchange yet) and the text matches the suggestion.
+    const input = await waitForVisibleInput(page, 10_000);
+    await expect.poll(async () => (await input.inputValue()).trim(), { timeout: 5_000 }).toBe(text);
+    await expect(welcome).toBeVisible();
+  });
+
+  test('carousel viewport height is stable across all suggestions (chevrons do not bounce)', async ({ page }) => {
+    await navigateToApp(page);
+
+    const welcome = page.locator('.welcome-message:visible').first();
+    await expect(welcome).toBeVisible({ timeout: 10_000 });
+
+    // Let the entrance settle before measuring: it fades in AND slides up 0.5rem,
+    // so an early sample reads a transient vertical offset (the slide, not a real
+    // per-slide bounce). opacity reaches 1 exactly as the slide ends (same
+    // keyframe), so this is the settle signal — same wait the first test uses.
+    await expect
+      .poll(async () => welcome.evaluate((el) => getComputedStyle(el).opacity), { timeout: 5_000 })
+      .toBe('1');
+
+    // Suggestions vary in length, so a viewport sized to the *visible* card would
+    // change height per slide and the vertically-centered chevrons would bounce.
+    // The fix stacks every suggestion in one grid cell so the viewport sizes to
+    // the tallest card and stays constant. Walk every slide and assert the
+    // carousel height + a chevron's Y never move (this would fail on the old
+    // single-card layout, where the long e-bike suggestion wraps to more lines
+    // than the short ones).
+    const carousel = page.locator('.welcome-carousel:visible').first();
+    await expect(carousel).toBeVisible();
+    const next = carousel.getByRole('button', { name: 'Next suggestion' });
+    const prevChevron = carousel.getByRole('button', { name: 'Previous suggestion' });
+
+    const heights: number[] = [];
+    const chevronYs: number[] = [];
+    for (;;) {
+      const cbox = await carousel.boundingBox();
+      const pbox = await prevChevron.boundingBox();
+      expect(cbox).not.toBeNull();
+      expect(pbox).not.toBeNull();
+      heights.push(Math.round(cbox!.height));
+      chevronYs.push(Math.round(pbox!.y));
+      if (await next.isDisabled()) break;
+      await next.click();
+    }
+
+    // More than one slide, or the stability assertion below is vacuous.
+    expect(heights.length).toBeGreaterThan(1);
+    // ±1px tolerance for sub-pixel rounding across slides.
+    for (const h of heights) expect(Math.abs(h - heights[0])).toBeLessThanOrEqual(1);
+    for (const y of chevronYs) expect(Math.abs(y - chevronYs[0])).toBeLessThanOrEqual(1);
   });
 
   test('"Don\'t show this again" dismisses it and it stays dismissed after reload', async ({ page }) => {

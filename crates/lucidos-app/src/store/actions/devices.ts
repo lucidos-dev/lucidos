@@ -57,8 +57,31 @@ export async function updateDeviceName(deviceId: string, name: string | null): P
   }
 }
 
-/** Toggle push for a device — sets both the per-device preference and devices.push_enabled */
+/** Optimistically set one loaded device's `push_enabled`. Returns the previous
+ *  value (so the caller can revert on failure), or `undefined` when the list
+ *  isn't loaded or the device isn't present. */
+function patchDevicePush(deviceId: string, enabled: boolean): boolean | undefined {
+  const cur = devices.value;
+  if (cur.status !== 'loaded') return undefined;
+  let prev: boolean | undefined;
+  devices.value = {
+    status: 'loaded',
+    data: cur.data.map((d) => {
+      if (d.id !== deviceId) return d;
+      prev = d.push_enabled;
+      return { ...d, push_enabled: enabled };
+    }),
+  };
+  return prev;
+}
+
+/** Toggle push for a device — sets both the per-device preference and devices.push_enabled.
+ *  The toggle is a controlled checkbox bound to `device.push_enabled`, so it can't
+ *  move until that signal updates. Flip it optimistically first so the slider
+ *  responds instantly, then reconcile with the server (reverting on failure)
+ *  instead of leaving the user staring at an unmoved toggle for two round-trips. */
 export async function toggleDevicePush(deviceId: string, enabled: boolean): Promise<void> {
+  const prev = patchDevicePush(deviceId, enabled);
   try {
     await Promise.all([
       apiSetDevicePush(deviceId, enabled),
@@ -66,6 +89,7 @@ export async function toggleDevicePush(deviceId: string, enabled: boolean): Prom
     ]);
     await loadDevices();
   } catch (e) {
+    if (prev !== undefined) patchDevicePush(deviceId, prev);
     showToast('Failed to update push setting: ' + errorDetail(e), 'error');
   }
 }

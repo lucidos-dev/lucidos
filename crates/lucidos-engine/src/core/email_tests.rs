@@ -261,8 +261,8 @@ fn test_sanitize_ascii_only_unchanged() {
 #[test]
 fn test_sanitize_strips_non_ascii_in_quotes() {
     assert_eq!(
-        sanitize_search_query("FROM \"Kløfta eSport\""),
-        "FROM \"Klfta eSport\""
+        sanitize_search_query("FROM \"Café Latté\""),
+        "FROM \"Caf Latt\""
     );
 }
 
@@ -286,13 +286,13 @@ fn test_filter_from_match() {
     let email = EmailSummary {
         uid: 1,
         message_id: String::new(),
-        from: "Kløfta eSport <esport@kloftail.no>".to_string(),
+        from: "Café Latté <team@example.no>".to_string(),
         subject: "Meeting".to_string(),
         date: String::new(),
         preview: String::new(),
     };
-    assert!(matches_search_filter(&email, "FROM \"Kløfta eSport\""));
-    assert!(matches_search_filter(&email, "FROM \"esport@kloftail.no\""));
+    assert!(matches_search_filter(&email, "FROM \"Café Latté\""));
+    assert!(matches_search_filter(&email, "FROM \"team@example.no\""));
     assert!(!matches_search_filter(&email, "FROM \"other@example.com\""));
 }
 
@@ -343,14 +343,14 @@ fn test_filter_or_criteria() {
     let email = EmailSummary {
         uid: 1,
         message_id: String::new(),
-        from: "esport@kloftail.no".to_string(),
+        from: "team@example.no".to_string(),
         subject: "Meeting".to_string(),
         date: String::new(),
         preview: String::new(),
     };
     assert!(matches_search_filter(
         &email,
-        "OR SUBJECT \"Twitch\" FROM \"esport@kloftail.no\""
+        "OR SUBJECT \"Twitch\" FROM \"team@example.no\""
     ));
     assert!(!matches_search_filter(
         &email,
@@ -368,8 +368,8 @@ fn test_tokenize_simple() {
 
 #[test]
 fn test_tokenize_quoted_spaces() {
-    let tokens = tokenize_imap_query("FROM \"Kløfta eSport\"");
-    assert_eq!(tokens, vec!["FROM", "\"Kløfta eSport\""]);
+    let tokens = tokenize_imap_query("FROM \"Café Latté\"");
+    assert_eq!(tokens, vec!["FROM", "\"Café Latté\""]);
 }
 
 #[test]

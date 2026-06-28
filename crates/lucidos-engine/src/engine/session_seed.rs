@@ -45,7 +45,7 @@ use uuid::Uuid;
 /// point: the gate that decides whether to SHOW the button, the gate that
 /// re-proposes held-back changes, and the algorithm that COMPUTES the diff are
 /// the same, so the button can never enable on an empty diff (the
-/// `user-acquisition` migration bug) nor light on a branch the sweep already
+/// `example-repo` migration bug) nor light on a branch the sweep already
 /// declined. Two-dot commit existence (`has_branch_commits`) was the wrong gate
 /// — a branch can carry commits that produce zero net diff against its true fork
 /// point (commit+revert, a force-rewritten local default), or carry *only*

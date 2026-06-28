@@ -158,10 +158,7 @@ pub(crate) async fn run_plugin_marketplace_update_check(
             None,
             None,
             Tap::Navigate {
-                to: NavigateUi {
-                    target: NavigateTarget::Apps,
-                    ..Default::default()
-                },
+                to: build_update_navigation(&candidates),
             },
             None,
         )
@@ -190,13 +187,13 @@ pub(crate) async fn run_plugin_marketplace_update_check(
 
 /// Title + body for the "updates available" notification. Singular and plural
 /// phrasings; the body lists plugin names so the user knows what's waiting
-/// before opening the Apps section.
+/// before opening the Plugins panel.
 fn build_update_notification(candidates: &[MarketplacePlugin]) -> (String, String) {
     if let [only] = candidates {
         return (
             "Plugin update available".to_string(),
             format!(
-                "{} v{} is ready to update. Open Apps to review.",
+                "{} v{} is ready to update. Open Plugins to review.",
                 only.name, only.version
             ),
         );
@@ -206,11 +203,29 @@ fn build_update_notification(candidates: &[MarketplacePlugin]) -> (String, Strin
     (
         "Plugin updates available".to_string(),
         format!(
-            "{} plugins have updates: {}. Open Apps to review.",
+            "{} plugins have updates: {}. Open Plugins to review.",
             candidates.len(),
             names.join(", ")
         ),
     )
+}
+
+/// Where the update notification's tap lands: the Plugins panel's Installed tab,
+/// scrolled to (and pulsing) the row of a plugin that has a pending update. With
+/// a single candidate that's its row; with several we focus the
+/// alphabetically-first by name (deterministic — matches the name ordering in the
+/// plural body) while the rest stay visibly chipped in the list. The `id` is the
+/// plugin id, which the Installed tab matches against each row's `data-plugin-id`.
+fn build_update_navigation(candidates: &[MarketplacePlugin]) -> NavigateUi {
+    let focus = candidates
+        .iter()
+        .min_by(|a, b| a.name.cmp(&b.name))
+        .map(|p| p.id.clone());
+    NavigateUi {
+        target: NavigateTarget::Plugins,
+        id: focus,
+        ..Default::default()
+    }
 }
 
 fn marker_path(workspace: &Path) -> PathBuf {

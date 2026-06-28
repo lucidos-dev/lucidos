@@ -5,7 +5,7 @@ description: Complete API reference for the lucidos JS SDK — functions, types,
 
 # Lucidos JavaScript SDK
 
-The SDK is available as `lucidos` in app UIs. Import from `@anthropic/lucidos-sdk` in external projects.
+The SDK is available as the `lucidos` global in app UIs (loaded via `<script src="/api/v1/sdk.js">`). The host frontend imports it from the `@lucidos/sdk` package directly.
 
 > From a coding-agent subprocess, prefer the `lucidos` CLI for `data.*` and `events.*` operations — see [`lucidos-cli.md`](./lucidos-cli.md).
 
@@ -63,6 +63,15 @@ What each piece does — include only what you need:
 | Focus | `--focus-ring` — a ready-made `box-shadow` value (a soft accent band) for focus indicators; the `.action-btn`/`.icon-btn` classes use it, and your own controls match the host with `:focus-visible { box-shadow: var(--focus-ring); }` |
 | Shadows | `--shadow-sm`, `--shadow-md`, `--shadow-lg` |
 | Layout (theme-independent) | `--font-ui`, `--font-mono`, `--transition`, `--user-ui-scale` — plus the spacing / radius / motion scales below |
+
+The user's UI font is **`--font-ui`** — that's the canonical token, set live to the
+user's font choice. You rarely need to apply it yourself: `sdk-iframe.css` already
+sets `body { font-family: var(--font-ui) }` (and on inputs/buttons), so any element
+that inherits gets the right font for free. Only re-declare `font-family` when you
+deliberately override it, and then use `var(--font-ui)`. As a safety net,
+`--font-family` and `--font` are tolerated **aliases** of `--font-ui` (so the
+intuitive guess still resolves to the user's font instead of silently dropping to a
+hardcoded fallback) — but `--font-ui` is the name to write.
 
 The spacing, radius, motion, and icon scales are theme-independent and have
 fixed values — **use the token, not a magic number, and never a `px` fallback
@@ -135,11 +144,21 @@ gets a neutral default that does **not** match Lucidos's primary blue button.
 
 Apps using `lucidos._capture()` don't need to include `html2canvas` — the SDK loads it on demand from `/api/v1/static/html2canvas.min.js`. `html2canvas` can't rasterize CSS Color 4 functions (`color()`, `oklab()`, `oklch()`, `color-mix()`); when the screenshot fails for any reason the capture degrades to **DOM-only** — it returns an empty `screenshot` plus a `dom` layout snapshot (element positions + classes) prefixed with the failure reason, rather than throwing. The agent still sees the rendered layout instead of going blind.
 
-External-host apps point `baseUrl` at the Lucidos instance:
+External-host apps point `baseUrl` at the Lucidos instance with `lucidos.configure`:
+
+```ts
+lucidos.configure(opts: { baseUrl?: string; token?: string }): void
+```
 
 ```js
 lucidos.configure({ baseUrl: 'https://your-lucidos.example' });
 ```
+
+`baseUrl` overrides the auto-derived workspace base path (in-app iframes don't
+need it — the SDK reads the gateway prefix from `<base href>` / the `/app/` URL).
+`token`, when set, is sent as an `Authorization: Bearer <token>` header on every
+SDK request — for embedders calling a remote engine that requires auth. Both are
+optional and each call merges into the existing config.
 
 ## Error Handling
 
@@ -226,6 +245,8 @@ const src = lucidos.data.url('artifacts/screenshots/latest.png');
 ### `url` and app-bundled assets
 
 `lucidos.data.url(path)` normally returns a `/data/...` URL, which always serves from the live workspace. When the SDK is loaded inside an app iframe (`/app/<id>/...`) and `path` points at the app's own bundled folder (`apps/<id>/<rest>`), it instead returns a `/app/<id>/<rest>` URL and carries over `?thread_id=` from the iframe. This makes JS-set asset URLs (e.g. `img.src = lucidos.data.url('apps/my-app/icon.png')`) load correctly in WIP-preview — without it, the engine's HTML rewriter only covers markup `src` / `href` attributes and JS-set sources silently 404 against the live workspace. Cross-app references (`apps/<other>/...`) and non-app paths (`artifacts/...`, `knowhow/...`) keep the `/data/` route unchanged.
+
+One other special case: a `system-knowhow/...` path is routed through the engine's `/api/v1/data/...` endpoint (these files live in the engine repo, not the workspace, so the static `/data` mount can't serve them).
 
 ## lucidos.events — Event Store
 
@@ -515,14 +536,25 @@ lucidos.apps.get(id: string): Promise<App>
 
 ```ts
 interface App {
-  id: string;
+  id: string;             // folder name under data/apps/
   name: string;
   description: string;
-  instructions?: string;
-  has_ui: boolean;
-  created_at: string;
-  updated_at?: string;
+  /** Optional icon from the app's manifest.json (emoji or asset path).
+   *  Omitted when the manifest has none. */
+  icon?: string;
 }
+```
+
+The shape mirrors the app's `manifest.json` (`name` / `description` / `icon`) plus
+the `id` derived from its folder. `list()` hits `GET /api/v1/apps`; `get(id)`
+hits `GET /api/v1/app?id=<id>` and throws a `404` `SdkError` for an unknown id.
+
+### Example
+
+```js
+const apps = await lucidos.apps.list();
+const me = await lucidos.apps.get('habit-tracker');
+console.log(me.name, me.icon ?? '(no icon)');
 ```
 
 ## lucidos.preferences — User Settings
@@ -547,7 +579,7 @@ type Preferences = Record<string, string>;
 | Key | Values | Description |
 |-----|--------|-------------|
 | `theme` | `dark`, `light`, `system` | UI theme |
-| `font-family` | `monospace`, `system`, `inter`, `jetbrains-mono`, `ibm-plex-mono` | Font |
+| `font-family` | `monospace`, `system`, `inter`, `jetbrains-mono`, `ibm-plex-mono`, `fira-code` | Font (`fira-code` also enables programming ligatures) |
 | `ui-scale` | Number in 12.5% steps from 75 to 200 (`75`, `87.5`, `100`, `112.5`, `125`, `137.5`, `150`, `162.5`, `175`, `187.5`, `200`); or the legacy strings `small` / `medium` / `large` (= `100` / `112.5` / `125`). Off-grid numbers snap to the nearest valid step. | Scale |
 
 ## lucidos.notifications — Notification Center
@@ -565,15 +597,29 @@ lucidos.notifications.markAllRead(): Promise<void>
 
 ### Types
 
+`NavigateTarget` and `SettingsViewTarget` are **generated from the engine's
+`navigate_ui` tool** (the `NAVIGATE_TARGETS` / `NAVIGABLE_SETTINGS_VIEWS` consts in
+`crates/lucidos-engine/src/llm/tools/misc.rs`) into
+`packages/lucidos-sdk/src/generated/navigate-targets.ts`, so the SDK and the LLM
+tool schema cannot drift. To change the set, edit those Rust consts and run
+`cargo test -p lucidos-engine --lib generate_navigate_targets_file -- --ignored`.
+
 ```ts
 type NavigateTarget =
-  | 'files' | 'apps' | 'app-store' | 'triggers' | 'thread-queue' | 'changes' | 'notifications'
+  | 'files' | 'apps' | 'app-store' | 'plugins' | 'triggers' | 'thread-queue' | 'changes' | 'notifications'
   | 'settings' | 'app' | 'file' | 'trigger' | 'thread'
   | 'new-app' | 'new-trigger' | 'new-chat' | 'url';
 
+// Settings sub-section for `target: 'settings'` (platform-gated 'mobile-access' /
+// 'experimental' are intentionally excluded).
+type SettingsViewTarget =
+  | 'models' | 'appearance' | 'devices' | 'accounts' | 'repositories' | 'marketplaces'
+  | 'permissions' | 'keyboard-shortcuts' | 'system'
+  | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables';
+
 interface NavigateUi {
   target: NavigateTarget;
-  settings_view?: 'devices' | 'accounts' | 'backup' | 'memory' | 'repositories' | 'environment-variables';
+  settings_view?: SettingsViewTarget;
   app_id?: string;
   file_path?: string;
   id?: string;
@@ -734,6 +780,14 @@ interface ThreadSummary {
   section: string;
   active_children_count: number;
   total_children_count: number;
+  /** Transitive descendants currently in a state that blocks this thread from
+   *  being archived (Running / WaitingForUserAnswer / pending in-workspace
+   *  coding-agent changes). `> 0` ⇒ "N sub-threads still busy". */
+  blocking_descendant_count: number;
+  /** Strict subset of `blocking_descendant_count` that drops the Running case —
+   *  descendants needing *user attention* (WaitingForUserAnswer, or pending
+   *  changes). Drives REVIEW bubbling up the ancestor chain. */
+  attention_descendant_count: number;
   /** 'idle' | 'running' | 'waiting' | 'failed' | 'waiting_for_user_answer'. */
   status: string;
   coding_agent_has_diff: boolean;
@@ -748,6 +802,16 @@ interface ThreadSummary {
   trigger_name?: string | null;
   cc_repo_id?: string | null;
   cc_repo_name?: string | null;
+  /** Coding-agent thread flavor — `'lucidos' | 'app' | 'external'`. Omitted for
+   *  non-coding-agent threads (and legacy rows, which consumers default to
+   *  `'lucidos'`). */
+  coding_agent_kind?: string;
+  /** Canonical folder the coding agent operates on — `<ws>/data/apps/<id>/` for
+   *  an app thread, the repo root otherwise. Omitted for non-coding-agent threads. */
+  coding_agent_folder?: string;
+  /** Which backend drives the thread — `'claude-code' | 'codex'`. Omitted for
+   *  non-coding-agent threads (legacy rows default to `'claude-code'`). */
+  coding_agent?: string;
   /** Compose state machine — `composing` | `active` | `discarded`. The
    *  archive flag is on the separate `section` field; an archived thread
    *  carries `state: 'active'` and `section: 'archived'`. */
@@ -772,9 +836,11 @@ interface ThreadSummary {
 ```ts
 lucidos.ui.applyPreferences(): Promise<void>
 lucidos.ui.watchPreferences(): void
-lucidos.ui.navigate(target: string, params?: Record<string, string>): Promise<void>
+lucidos.ui.navigate(target: NavigateTarget, params?: NavigateParams): Promise<void>
 lucidos.ui.startThread(opts?: { prompt?: string }): Promise<void>
 lucidos.ui.confirm(options: ConfirmOptions): Promise<boolean>
+lucidos.ui.toast(message: string, type?: ToastType, opts?: ToastOptions): void
+lucidos.ui.prompt(options: PromptOptions): Promise<string | null>
 lucidos.ui.Select.create(opts: SelectCreateOptions): SelectInstance
 lucidos.ui.enhanceSelects(root?: ParentNode): SelectInstance[]
 ```
@@ -783,15 +849,22 @@ lucidos.ui.enhanceSelects(root?: ParentNode): SelectInstance[]
 
 `watchPreferences()` subscribes to live preference changes (SSE `PreferencesChanged`) and re-applies them automatically. Call it once alongside `applyPreferences()` so the app reacts when the user toggles light/dark — or when the OS appearance changes under a `system` preference — without a reload.
 
-`navigate()` sends a navigation request to the Lucidos frontend via SSE.
+`navigate()` sends a navigation request to the Lucidos frontend via SSE. `target`
+and `params` (`NavigateParams` = `NavigateUi` minus `target`) are typed against the
+generated navigation contract, so valid `target`s and `settings_view`s are
+discoverable and type-checked (§ Types, under lucidos.notifications).
 
 ### Navigation targets
 
 | Target | Params | Description |
 |--------|--------|-------------|
 | `thread` | `id` | Focus a specific thread |
-| `app` | `id` | Open an app UI |
+| `app` | `id` (or `app_id`) | Open an app UI |
+| `settings` | `settings_view` (optional) | Open Settings, optionally a sub-section — `models`, `appearance`, `permissions`, `keyboard-shortcuts`, `devices`, `accounts`, `repositories`, `marketplaces`, or a System subpanel (`system`, `backup`, `memory`, `disk-usage`, `environment-variables`, `thread-queue`). Omit `settings_view` for the Settings home list. |
 | `new-chat` | `prompt` (optional) | Open a fresh chat thread, optionally prefilling the compose textarea. Prefer `lucidos.ui.startThread()` — it's the typed wrapper around this target. |
+| `plugins` | `id` (optional) | Open the Plugins panel's Installed tab. With `id` (a plugin id), scroll to and pulse-highlight that plugin's row — used by the plugin-update notification so a tap lands on the plugin that has the pending update. |
+| `app-store` | — | Open the Plugins panel's Store (marketplace) tab. |
+| _other panels_ | — | `files`, `apps`, `triggers`, `thread-queue`, `changes`, `notifications`; plus `file` (`file_path`), `trigger` (`id`), `url` (`url`), `new-app`, `new-trigger`. |
 
 ### Starting a fresh chat with a prefilled prompt
 
@@ -842,6 +915,80 @@ const ok = await lucidos.ui.confirm({
 });
 if (!ok) return;
 // proceed with deletion
+```
+
+### Toasts
+
+`lucidos.ui.toast` shows a transient status banner rendered by the Lucidos shell
+(above all app content, themed by the user's preferences). It's **fire-and-forget**
+— no return value, no result to await. Use it for success/error feedback instead
+of hand-rolling your own banner.
+
+```ts
+type ToastType = 'success' | 'info' | 'warning' | 'error';
+
+interface ToastOptions {
+  /** Auto-dismiss after this many ms. Omit for the host default: errors and
+   *  warnings stay until dismissed; success/info auto-close. */
+  durationMs?: number;
+  /** false = hide the close (X) button. Default true. */
+  dismissable?: boolean;
+}
+```
+
+`type` defaults to `'info'`; an unknown value degrades to `'info'`. Only this
+serializable subset is exposed — the host's toast action buttons take `onClick`
+callbacks, which can't cross the app-iframe boundary, so they aren't available
+from an app.
+
+**Example:**
+
+```js
+lucidos.ui.toast('Saved', 'success');
+lucidos.ui.toast('Could not reach the server', 'error');
+lucidos.ui.toast('Working on it…', 'info', { durationMs: 2000 });
+```
+
+### Prompts
+
+`lucidos.ui.prompt` shows a single-field text-input modal rendered by the Lucidos
+shell (themed, above all app content) — the text-input sibling of `confirm`. Use
+it instead of `window.prompt()`.
+
+```ts
+interface PromptOptions {
+  /** Required. The question/instruction shown above the input. Plain text. */
+  message: string;
+  /** Optional heading rendered above the message. */
+  title?: string;
+  /** Prefilled input value. */
+  defaultValue?: string;
+  /** Placeholder shown when the input is empty. */
+  placeholder?: string;
+  /** OK button label. Default "OK". */
+  okLabel?: string;
+  /** Cancel button label. Default "Cancel". */
+  cancelLabel?: string;
+  /** Render a multi-line textarea instead of a single-line input. Default false. */
+  multiline?: boolean;
+}
+```
+
+Resolves the entered string on OK click or Enter; `null` on Cancel, Esc, or
+backdrop click. (A `multiline` prompt uses Enter for newlines — submit with the
+OK button.) If a second `prompt` is called while one is visible, the previous one
+resolves `null` and the new one replaces it.
+
+**Example:**
+
+```js
+const name = await lucidos.ui.prompt({
+  title: 'Rename board',
+  message: 'New name for this board:',
+  defaultValue: 'Untitled',
+});
+if (name === null) return; // user cancelled
+// proceed with `name`
 ```
 
 ### lucidos.ui.Select — themed dropdown
@@ -1004,7 +1151,9 @@ lucidos.utils.formatDate(iso: string): string    // Locale-formatted date string
 Standard app initialization:
 
 ```js
-import { lucidos } from '@anthropic/lucidos-sdk';
+// In an app iframe the `lucidos` global is already present (sdk.js).
+// The host frontend / external embedders import it from the package:
+import { lucidos } from '@lucidos/sdk';
 
 // Apply user theme/font/scale
 await lucidos.ui.applyPreferences();

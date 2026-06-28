@@ -74,42 +74,41 @@ fn load_knowhow_schema_example_resolves_to_shipped_knowhow() {
     );
 }
 
+/// Plugin management is the grouped `plugins` manifest tool (it consolidated the
+/// five flat plugin tools). It's spliced from `capability_manifest::llm_tools()`,
+/// not `get_default_tools()` — assert the grouped tool exposes the
+/// register_marketplace action and its `source` property.
 #[test]
-fn register_plugin_marketplace_is_in_chat_agent_default_tools() {
-    let tools = get_default_tools();
+fn plugins_grouped_tool_exposes_register_marketplace() {
+    let tools = crate::capability_manifest::llm_tools();
     let tool = tools
         .iter()
-        .find(|t| t.name == tn::REGISTER_PLUGIN_MARKETPLACE)
-        .expect("register_plugin_marketplace must be in the default chat tool set");
+        .find(|t| t.name == tn::PLUGINS)
+        .expect("grouped `plugins` tool must be contributed by the manifest");
 
     let props = tool
         .parameters
         .get("properties")
-        .expect("register_plugin_marketplace must declare properties");
-    let source = props
-        .get("source")
-        .expect("register_plugin_marketplace must accept source");
-    assert_eq!(
-        source.get("type").and_then(|v| v.as_str()),
-        Some("string"),
-        "source must be a string"
+        .expect("plugins tool must declare properties");
+    let actions = props
+        .get("action")
+        .and_then(|a| a.get("enum"))
+        .and_then(|v| v.as_array())
+        .expect("plugins tool must declare an action enum");
+    let action_names: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
+    assert!(
+        action_names.contains(&"register_marketplace"),
+        "plugins tool must expose register_marketplace action, got: {action_names:?}"
     );
     assert!(
-        props.get("name").is_some(),
-        "register_plugin_marketplace must accept optional display name"
+        props.get("source").is_some(),
+        "plugins tool must accept a `source` property"
     );
 
-    let required = tool
-        .parameters
-        .get("required")
-        .and_then(|v| v.as_array())
-        .expect("register_plugin_marketplace schema must declare required fields");
-    let required_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
-    assert!(
-        required_names.contains(&"source"),
-        "`source` must be required, got: {:?}",
-        required_names,
-    );
+    // The retired flat name still resolves to the plugins domain (back-compat).
+    let domain = crate::capability_manifest::domain_for_tool("register_plugin_marketplace")
+        .expect("register_plugin_marketplace alias must resolve");
+    assert_eq!(domain.name, "plugins");
 }
 
 /// The chat agent's `ask_user_question` MUST expose the same schema CC's
@@ -417,6 +416,30 @@ fn send_notification_schema_tap_documents_object_shape() {
     }
 }
 
+/// The delivery semantics (notifications.md §2/§4) must be in the tool
+/// description so the agent communicates accurately: an active device gets
+/// an in-app TOAST and the OS push is suppressed everywhere; the push fires
+/// only when no device is active. Without this steer the agent tells a user
+/// who is clearly using the app to "check your device for the push" — the
+/// exact mistake that motivated this (the user was active, so no push was
+/// ever sent, only a toast).
+#[test]
+fn send_notification_description_explains_active_device_gets_toast_not_push() {
+    let desc = get_notification_tool().description;
+    assert!(
+        desc.contains("toast"),
+        "description must mention the in-app toast surface: {desc:?}"
+    );
+    assert!(
+        desc.contains("suppressed"),
+        "description must say the OS push is suppressed when a device is active: {desc:?}"
+    );
+    assert!(
+        desc.contains("check your device for the push"),
+        "description must warn against telling an active user to check for a push: {desc:?}"
+    );
+}
+
 #[test]
 fn tap_modal_round_trips_as_kind_object() {
     use crate::scheduler::notifications::Tap;
@@ -439,102 +462,174 @@ fn tap_none_round_trips_as_kind_object() {
     assert_eq!(parsed, Tap::None);
 }
 
-/// `list_changes` and `apply_change` are the in-thread mirror of the
-/// `lucidos changes list` / `lucidos changes apply` CLI subcommands —
-/// closing the one CLI⇄LLM-tool parity gap. Pin their registration so a
-/// refactor that drops either tool from the chat surface trips here.
+/// `list_changes` / `apply_change` consolidated into the grouped `changes`
+/// manifest tool (action enum list/apply, exposing `change_id` for apply). It's
+/// spliced from `capability_manifest::llm_tools()`. Pin the grouped tool's shape
+/// and that the flat names still resolve as back-compat aliases.
 #[test]
-fn change_tools_are_in_chat_agent_default_tools() {
-    let tools = get_default_tools();
-    for name in [tn::LIST_CHANGES, tn::APPLY_CHANGE] {
-        assert!(
-            tools.iter().any(|t| t.name == name),
-            "{name} must be registered in get_default_tools()",
-        );
-    }
-}
-
-/// `apply_change` MUST require `change_id` (there's nothing to merge without
-/// it) and `list_changes` MUST require nothing (it returns the whole
-/// pending+applied set). Drift here would let the LLM call apply with no
-/// target or force a needless arg on the read tool.
-#[test]
-fn apply_change_requires_change_id_and_list_changes_requires_nothing() {
-    let tools = get_default_tools();
-
-    let apply = tools
+fn changes_grouped_tool_exposes_list_and_apply() {
+    let tools = crate::capability_manifest::llm_tools();
+    let tool = tools
         .iter()
-        .find(|t| t.name == tn::APPLY_CHANGE)
-        .expect("apply_change must be in the default chat tool set");
-    let change_id = apply
+        .find(|t| t.name == tn::CHANGES)
+        .expect("grouped `changes` tool must be contributed by the manifest");
+
+    let props = tool
         .parameters
         .get("properties")
-        .and_then(|p| p.get("change_id"))
-        .expect("apply_change must expose a `change_id` property");
+        .expect("changes tool must declare properties");
+    let action_names: Vec<&str> = props
+        .get("action")
+        .and_then(|a| a.get("enum"))
+        .and_then(|v| v.as_array())
+        .expect("changes tool must declare an action enum")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(action_names, vec!["list", "apply"]);
+    let change_id = props
+        .get("change_id")
+        .expect("changes tool must expose a `change_id` property for apply");
     assert_eq!(
         change_id.get("type").and_then(|v| v.as_str()),
         Some("string"),
         "change_id must be a string"
     );
-    let apply_required: Vec<&str> = apply
-        .parameters
-        .get("required")
-        .and_then(|v| v.as_array())
-        .expect("apply_change must declare required")
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect();
-    assert!(
-        apply_required.contains(&"change_id"),
-        "`change_id` must be required, got: {apply_required:?}"
-    );
 
-    let list = tools
-        .iter()
-        .find(|t| t.name == tn::LIST_CHANGES)
-        .expect("list_changes must be in the default chat tool set");
-    let list_required = list
-        .parameters
-        .get("required")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-        .unwrap_or_default();
-    assert!(
-        list_required.is_empty(),
-        "list_changes must require no args, got: {list_required:?}"
-    );
+    // Flat aliases still resolve to the changes domain (back-compat).
+    for alias in [tn::LIST_CHANGES, tn::APPLY_CHANGE] {
+        let domain = crate::capability_manifest::domain_for_tool(alias)
+            .unwrap_or_else(|| panic!("alias {alias} must resolve"));
+        assert_eq!(domain.name, "changes");
+    }
 }
 
-/// Thread Queue policy changes need a typed in-process tool. Without this
-/// surface, the LLM falls back to `curl` / `http_request` against local engine
-/// ports and then tries to read temp files, which is brittle and poorly
-/// attributed.
+/// Active-consolidation guard: the flat per-verb tools that were folded into
+/// grouped manifest tools must NOT reappear in `get_default_tools()` — otherwise
+/// the model would see both the flat tool AND the grouped tool, growing the
+/// selection surface the consolidation exists to shrink. The flat names stay
+/// wired as dispatch aliases (resolved via the manifest), but are no longer
+/// advertised. Each consolidated capability is instead offered as exactly one
+/// grouped tool from `capability_manifest::llm_tools()`.
 #[test]
-fn thread_queue_tools_are_registered_and_policy_patch_is_partial() {
-    let tools = get_default_tools();
-    for name in [tn::LIST_THREAD_QUEUE, tn::UPDATE_THREAD_QUEUE_POLICY] {
+fn consolidated_flat_tools_are_not_advertised() {
+    let default_tools = get_default_tools();
+    let default_names: Vec<&str> = default_tools.iter().map(|t| t.name.as_str()).collect();
+    let grouped_names: Vec<String> = crate::capability_manifest::llm_tools()
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+
+    // Folded flat tools must be absent from the advertised default set.
+    for flat in [
+        tn::EMIT_EVENT,
+        tn::QUERY_EVENTS,
+        tn::COUNT_EVENTS,
+        tn::LIST_CHANGES,
+        tn::APPLY_CHANGE,
+        tn::LIST_THREAD_QUEUE,
+        tn::UPDATE_THREAD_QUEUE_POLICY,
+        tn::CORRECT_MEMORY,
+        tn::CORRECT_MEMORY_BY_ID,
+        tn::LIST_THREADS,
+        tn::COUNT_THREADS,
+        tn::SET_ENVIRONMENT_VARIABLE,
+    ] {
         assert!(
-            tools.iter().any(|t| t.name == name),
-            "{name} must be registered in get_default_tools()",
+            !default_names.contains(&flat),
+            "{flat} was consolidated into a grouped tool but is still advertised in get_default_tools()"
         );
     }
 
-    let update = tools
+    // Each grouped tool is contributed exactly once by the manifest.
+    for grouped in [
+        tn::EVENTS,
+        tn::CHANGES,
+        tn::THREAD_QUEUE,
+        tn::MEMORY,
+        tn::THREADS,
+        tn::ENV_VARS,
+        tn::MCP,
+        tn::PLUGINS,
+    ] {
+        let n = grouped_names.iter().filter(|g| g.as_str() == grouped).count();
+        assert_eq!(n, 1, "grouped tool {grouped} must be contributed exactly once, got {n}");
+    }
+
+    // The hot single-purpose tools the guardrail protects stay standalone.
+    for standalone in [
+        tn::READ_FILE,
+        tn::WRITE_FILE,
+        tn::EDIT_FILE,
+        tn::RUN_BASH,
+        tn::RUN_PYTHON,
+        tn::GREP_FILES,
+        tn::RUN_THREAD,
+        tn::RUN_CODING_AGENT,
+    ] {
+        assert!(
+            default_names.contains(&standalone),
+            "hot single-purpose tool {standalone} must remain standalone in get_default_tools()"
+        );
+    }
+}
+
+/// The grouped `events` tool consolidated emit/query/count. Pin its action enum
+/// and that the flat names still resolve as aliases.
+#[test]
+fn events_grouped_tool_exposes_emit_query_count() {
+    let tools = crate::capability_manifest::llm_tools();
+    let tool = tools
         .iter()
-        .find(|t| t.name == tn::UPDATE_THREAD_QUEUE_POLICY)
-        .expect("update_thread_queue_policy must be in the default chat tool set");
-    assert_eq!(
-        update
-            .parameters
-            .get("minProperties")
-            .and_then(|v| v.as_u64()),
-        Some(1),
-        "update_thread_queue_policy must require at least one patched field"
-    );
-    let props = update
+        .find(|t| t.name == tn::EVENTS)
+        .expect("grouped `events` tool must be contributed by the manifest");
+    let action_names: Vec<&str> = tool
         .parameters
         .get("properties")
-        .expect("update_thread_queue_policy must declare properties");
+        .and_then(|p| p.get("action"))
+        .and_then(|a| a.get("enum"))
+        .and_then(|v| v.as_array())
+        .expect("events tool must declare an action enum")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(action_names, vec!["emit", "query", "count"]);
+    for alias in [tn::EMIT_EVENT, tn::QUERY_EVENTS, tn::COUNT_EVENTS] {
+        let domain = crate::capability_manifest::domain_for_tool(alias)
+            .unwrap_or_else(|| panic!("alias {alias} must resolve"));
+        assert_eq!(domain.name, "events");
+    }
+}
+
+/// Thread Queue read/tune is the grouped `thread_queue` manifest tool (list +
+/// update_policy; run-now/drop are CLI-only). Without this surface, the LLM
+/// falls back to `curl` against local engine ports. Pin the grouped tool's
+/// action enum, every policy field on the update_policy union, and that the flat
+/// names still resolve as aliases.
+#[test]
+fn thread_queue_grouped_tool_exposes_list_and_update_policy() {
+    let tools = crate::capability_manifest::llm_tools();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == tn::THREAD_QUEUE)
+        .expect("grouped `thread_queue` tool must be contributed by the manifest");
+
+    let props = tool
+        .parameters
+        .get("properties")
+        .expect("thread_queue tool must declare properties");
+    let action_names: Vec<&str> = props
+        .get("action")
+        .and_then(|a| a.get("enum"))
+        .and_then(|v| v.as_array())
+        .expect("thread_queue tool must declare an action enum")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    // run-now/drop are CLI-only, so the LLM action enum is list + update_policy.
+    assert_eq!(action_names, vec!["list", "update_policy"]);
+
+    // The update_policy union contributes every capacity-policy field.
     for field in [
         "max_concurrent_total",
         "max_concurrent_event_trigger",
@@ -548,16 +643,55 @@ fn thread_queue_tools_are_registered_and_policy_patch_is_partial() {
     ] {
         assert!(
             props.get(field).is_some(),
-            "update_thread_queue_policy schema missing `{field}`"
+            "thread_queue tool schema missing policy field `{field}`"
         );
     }
-    assert!(
-        update
-            .description
-            .contains("Only fields you provide are changed"),
-        "description must steer the LLM away from full-policy resets: {:?}",
-        update.description
-    );
+
+    for alias in [tn::LIST_THREAD_QUEUE, tn::UPDATE_THREAD_QUEUE_POLICY] {
+        let domain = crate::capability_manifest::domain_for_tool(alias)
+            .unwrap_or_else(|| panic!("alias {alias} must resolve"));
+        assert_eq!(domain.name, "thread_queue");
+    }
+}
+
+/// env-var management consolidated into the grouped `env_vars` manifest tool
+/// (action enum list/set/delete, exposing name+value for set). It's spliced from
+/// `capability_manifest::llm_tools()`. Pin the grouped tool's shape and that the
+/// retired `set_environment_variable` name still resolves as a back-compat alias.
+#[test]
+fn env_vars_grouped_tool_exposes_list_set_delete() {
+    let tools = crate::capability_manifest::llm_tools();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == tn::ENV_VARS)
+        .expect("grouped `env_vars` tool must be contributed by the manifest");
+
+    let props = tool
+        .parameters
+        .get("properties")
+        .expect("env_vars tool must declare properties");
+    let action_names: Vec<&str> = props
+        .get("action")
+        .and_then(|a| a.get("enum"))
+        .and_then(|v| v.as_array())
+        .expect("env_vars tool must declare an action enum")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(action_names, vec!["list", "set", "delete"]);
+
+    // `set` contributes name + value; `delete` contributes name.
+    for field in ["name", "value"] {
+        assert!(
+            props.get(field).is_some(),
+            "env_vars tool schema missing property `{field}`"
+        );
+    }
+
+    // The retired flat tool still resolves to this domain.
+    let domain = crate::capability_manifest::domain_for_tool(tn::SET_ENVIRONMENT_VARIABLE)
+        .expect("set_environment_variable alias must resolve");
+    assert_eq!(domain.name, "env_vars");
 }
 
 #[test]

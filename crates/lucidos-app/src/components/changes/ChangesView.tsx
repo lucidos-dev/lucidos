@@ -9,6 +9,8 @@ import type { Change } from '../../api/client';
 import { formatTimeAgo } from '../../utils/formatTime';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
+import { ListSkeleton } from '../shared/ListSkeleton';
+import { LoadingFade } from '../shared/LoadingFade';
 
 /** Render a change description, preserving line breaks. */
 function ChangeDescription({ description }: { description: string }) {
@@ -89,27 +91,19 @@ export function ChangesView() {
       </div>
     );
   }
-  if (pendingLoadable.status !== 'loaded' || appliedLoadable.status !== 'loaded') {
-    if (!showLoading) {
-      return <div class="panel-content" />;
-    }
-    return (
-      <div class="panel-content">
-        <div class="empty-state">Loading...</div>
-      </div>
-    );
-  }
-
-  const pending = pendingLoadable.data;
-  const applied = appliedLoadable.data;
+  const bothLoaded = pendingLoadable.status === 'loaded' && appliedLoadable.status === 'loaded';
 
   return (
     <div class="panel-content">
-      {pending.length === 0 && applied.length === 0 ? (
-        <div class="empty-state">No changes</div>
-      ) : (
-        <>
-          {pending.length > 1 && (
+      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+        {bothLoaded ? (() => {
+          const pending = pendingLoadable.data;
+          const applied = appliedLoadable.data;
+          return pending.length === 0 && applied.length === 0 ? (
+            <div class="empty-state">No changes</div>
+          ) : (
+            <>
+              {pending.length > 1 && (
             <div class="changes-bulk-actions">
               {/* Apply/Discard All skip changes whose thread is still working
                   (server-side too); disable the buttons when none are eligible. */}
@@ -198,8 +192,10 @@ export function ChangesView() {
               )}
             </>
           )}
-        </>
-      )}
+            </>
+          );
+        })() : null}
+      </LoadingFade>
     </div>
   );
 }

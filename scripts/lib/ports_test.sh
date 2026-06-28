@@ -135,9 +135,9 @@ test_protects_pid_from_other_workspace_pidfile() {
 test_protects_pid_from_other_workspace_frontend_pidfile() {
     echo "test: another workspace's frontend.pid protects that PID"
     reset_env
-    write_pidfile "personal" "frontend" "$LIVE_PID"
+    write_pidfile "myws" "frontend" "$LIVE_PID"
     if is_protected_host_pid "$LIVE_PID"; then
-        pass "scanned ~/workspaces/personal/.lucidos/frontend.pid"
+        pass "scanned ~/workspaces/myws/.lucidos/frontend.pid"
     else
         fail "expected 0 for frontend pidfile-scan match, got $?"
     fi
@@ -324,7 +324,7 @@ test_collision_walks_forward() {
     local ws
     ws="$(make_workspace "$SANDBOX/ws-h")"
 
-    # Simulate a foreign process holding 5173 (Akram's ua-backoffice case)
+    # Simulate a foreign process holding 5173 (a foreign-process-on-5173 case)
     OCCUPIED_PORTS="5173"
 
     allocate_ports "$ws" > /dev/null 2>&1

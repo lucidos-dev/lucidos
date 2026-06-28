@@ -14,6 +14,7 @@ import { WORKSPACE_ID, gatewayPickerHref } from '../../utils/basePath';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { Overlay } from '../shared/Overlay';
+import { LoadingFade } from '../shared/LoadingFade';
 import { viewportIsMobile } from '../../utils/viewport';
 
 export const controlPanelOpen = signal(false);
@@ -251,8 +252,23 @@ function CurrentWorkspaceControls() {
   );
 }
 
-function LoadingItem() {
-  return <div class="control-panel-empty">Loading...</div>;
+/** Shimmer placeholder rows shown while the workspace switcher loads its list.
+ *  Reuses `.control-panel-workspace-row` so each row's height (min-height 2rem)
+ *  matches a real switcher row exactly — no reflow on the skeleton→list handoff.
+ *  Decorative → aria-hidden. Shown immediately (the panel is a popover with no
+ *  competing content behind the list — see `.claude/rules/frontend.md`
+ *  § "full-screen surface"). */
+function WorkspaceSwitcherSkeleton({ rows = 3 }: { rows?: number }) {
+  return (
+    <div class="control-panel-workspace-skel" aria-hidden="true">
+      {Array.from({ length: rows }, (_, i) => (
+        <div class="control-panel-workspace-row" key={i}>
+          <span class="control-panel-skel-dot" />
+          <span class="control-panel-skel-name" />
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function EmptyItem({ children }: { children: string }) {
@@ -311,6 +327,18 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
       ? wsLoadable.data.filter(w => w.engine_running)
       : [];
 
+  // Skeleton is shown while the switcher list is still resolving: gateway not yet
+  // tried/loading, or (no-gateway fallback) the legacy list still resolving. Once
+  // either path lands (loaded/failed) the real content renders and the skeleton
+  // crossfades out via <LoadingFade>. Driving the content branches off the same
+  // "resolved" condition keeps the loading frame skeleton-only (nothing peeks
+  // through the crossfade).
+  const switcherLoading =
+    gatewayWs.status === 'not-loaded' ||
+    gatewayWs.status === 'loading' ||
+    (gatewayWs.status === 'failed' &&
+      (wsLoadable.status === 'not-loaded' || wsLoadable.status === 'loading'));
+
   if (!effectiveOpen) return null;
 
   return (
@@ -333,8 +361,7 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
           : { position: 'fixed', visibility: 'hidden' }}
       >
         <div class="control-panel-workspace-list">
-          {gatewayWs.status === 'loading' && <LoadingItem />}
-
+          <LoadingFade showSkeleton={switcherLoading} skeleton={<WorkspaceSwitcherSkeleton />}>
           {gatewayWs.status === 'loaded' && (
             <>
               {gatewayPeers.length === 0 && <EmptyItem>No workspaces running</EmptyItem>}
@@ -371,9 +398,8 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
             </>
           )}
 
-          {gatewayWs.status === 'failed' && (
+          {gatewayWs.status === 'failed' && (wsLoadable.status === 'loaded' || wsLoadable.status === 'failed') && (
             <>
-              {wsLoadable.status === 'loading' && <LoadingItem />}
               {wsLoadable.status === 'failed' && (
                 <div class="control-panel-empty error-text">
                   {connected ? 'Failed to load workspaces' : 'Workspaces unavailable while disconnected'}
@@ -420,6 +446,7 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
               <ManageWorkspacesItem />
             </>
           )}
+          </LoadingFade>
         </div>
       </Overlay>
     </>

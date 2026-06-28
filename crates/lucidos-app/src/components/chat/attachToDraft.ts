@@ -1,7 +1,8 @@
 import { batch } from '@preact/signals';
 
 import { uploadThreadBlob, uploadPluginArchive, ApiError } from '../../api/client';
-import { showToast } from '../../store/store';
+import { showToast, showConfirm } from '../../store/store';
+import { uploadFiles } from '../../store/actions/artifacts';
 import { awaitThreadStarted, ensureFocusedComposeThread } from '../../store/actions/compose';
 import { sendMessage } from '../../store/actions/chat';
 import {
@@ -73,13 +74,13 @@ export async function attachImageToActiveDraft(file: File): Promise<void> {
 export interface DroppedFileSplit {
   images: File[];
   plugins: File[];
-  skipped: string[];
+  skipped: File[];
 }
 
 export function splitDroppedFiles(files: FileList): DroppedFileSplit {
   const images: File[] = [];
   const plugins: File[] = [];
-  const skipped: string[] = [];
+  const skipped: File[] = [];
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
     if (file.type.startsWith('image/')) {
@@ -87,7 +88,7 @@ export function splitDroppedFiles(files: FileList): DroppedFileSplit {
     } else if (file.name.toLowerCase().endsWith(PLUGIN_EXT)) {
       plugins.push(file);
     } else {
-      skipped.push(file.name);
+      skipped.push(file);
     }
   }
   return { images, plugins, skipped };
@@ -112,12 +113,15 @@ export async function uploadAndInstallPluginArchive(file: File): Promise<void> {
   await sendMessage(`Install the plugin at ${path}`);
 }
 
-/** The image attacher and plugin installer are injected so tests can run
- *  without real network or thread state. */
+/** The image attacher, plugin installer, file importer, and confirm prompt are
+ *  injected so tests can run without real network, thread state, or a rendered
+ *  dialog. */
 export async function attachDroppedFilesToDraft(
   files: FileList,
   attachImage: (file: File) => Promise<void> = attachImageToActiveDraft,
   installPlugin: (file: File) => Promise<void> = uploadAndInstallPluginArchive,
+  importFiles: (files: File[]) => Promise<void> | void = uploadFiles,
+  confirm: typeof showConfirm = showConfirm,
 ): Promise<void> {
   const { images, plugins, skipped } = splitDroppedFiles(files);
   await Promise.all(images.map((img) => attachImage(img)));
@@ -127,9 +131,15 @@ export async function attachDroppedFilesToDraft(
     await installPlugin(plugin);
   }
   if (skipped.length > 0) {
-    const msg = skipped.length === 1
-      ? `Cannot attach "${skipped[0]}" to a message — only images can be attached. Drop on the Files panel to import.`
-      : `Cannot attach ${skipped.length} non-image files to a message — only images can be attached. Drop on the Files panel to import.`;
-    showToast(msg, 'warning');
+    // Non-image, non-plugin files can't ride along on a message — but the user
+    // clearly wanted to do *something* with them. Instead of dead-ending with a
+    // warning, offer the one action that works: import them into the Files panel
+    // (the same thing a drop on that panel would do).
+    const message = skipped.length === 1
+      ? `Only images can be attached to a message. Import "${skipped[0].name}" to the Files panel instead?`
+      : `Only images can be attached to a message. Import these ${skipped.length} files to the Files panel instead?`;
+    if (await confirm(message, 'Import', { variant: 'default' })) {
+      await importFiles(skipped);
+    }
   }
 }

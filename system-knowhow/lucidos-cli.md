@@ -52,14 +52,14 @@ Print the absolute filesystem path that `<relative>` resolves to inside the pare
 Path normalization matches `normalizeDataPath()` in the artifacts UI: paths starting with `artifacts/`, `knowhow/`, `apps/`, or `triggers/` are kept; anything else is prefixed with `artifacts/`.
 
 ```bash
-$ lucidos data path artifacts/ua-analysis/foo/report.html
-/Users/.../workspaces/work/data/artifacts/ua-analysis/foo/report.html
+$ lucidos data path artifacts/data-analysis/foo/report.html
+/Users/.../workspaces/myws/data/artifacts/data-analysis/foo/report.html
 
 $ lucidos data path report.html
-/Users/.../workspaces/work/data/artifacts/report.html
+/Users/.../workspaces/myws/data/artifacts/report.html
 
 $ lucidos data path knowhow/myapp/notes.md --mkdir
-/Users/.../workspaces/work/data/knowhow/myapp/notes.md
+/Users/.../workspaces/myws/data/knowhow/myapp/notes.md
 # (parent dir created)
 ```
 
@@ -71,7 +71,7 @@ Write content to the resolved absolute path. Creates parent dirs automatically.
 
 ```bash
 # from a local file you generated elsewhere
-$ lucidos data write artifacts/ua-analysis/2026-04-20/report.html --from /tmp/report.html
+$ lucidos data write artifacts/data-analysis/2026-04-20/report.html --from /tmp/report.html
 
 # from stdin (default; also `--from -`)
 $ echo '{"hello": "world"}' | lucidos data write artifacts/foo.json
@@ -83,12 +83,12 @@ Two outputs:
 - **stdout** — a ready-to-paste clickable Lucidos chat link, mirroring `lucidos spawn-thread`:
 
 ```bash
-$ echo '# notes' | lucidos data write artifacts/ost-jira-workflow/node-types-and-attributes.md
-[node-types-and-attributes.md](artifacts/ost-jira-workflow/node-types-and-attributes.md)   # stdout
-/Users/.../workspaces/work/data/artifacts/ost-jira-workflow/node-types-and-attributes.md   # stderr
+$ echo '# notes' | lucidos data write artifacts/ticket-workflow/node-types-and-attributes.md
+[node-types-and-attributes.md](artifacts/ticket-workflow/node-types-and-attributes.md)   # stdout
+/Users/.../workspaces/myws/data/artifacts/ticket-workflow/node-types-and-attributes.md   # stderr
 ```
 
-**Linking an artifact in chat — use the bare store path, never a scheme.** The clickable form is the `data/`-rooted path with no URL scheme (e.g. `artifacts/ost-jira-workflow/node-types-and-attributes.md`, or with the leading `data/`); the frontend's path linkifier rewrites it into a file-preview link. There is **no `artifact:` or `file:` scheme** — inventing one (by analogy to `thread:`/`app:`) produces a dead link the browser can't resolve. Paste the stdout link verbatim, or keep its target and swap the label for something friendlier: `[OST node types & attributes](artifacts/ost-jira-workflow/node-types-and-attributes.md)`.
+**Linking an artifact in chat — use the bare store path, never a scheme.** The clickable form is the `data/`-rooted path with no URL scheme (e.g. `artifacts/ticket-workflow/node-types-and-attributes.md`, or with the leading `data/`); the frontend's path linkifier rewrites it into a file-preview link. There is **no `artifact:` or `file:` scheme** — inventing one (by analogy to `thread:`/`app:`) produces a dead link the browser can't resolve. Paste the stdout link verbatim, or keep its target and swap the label for something friendlier: `[OST node types & attributes](artifacts/ticket-workflow/node-types-and-attributes.md)`.
 
 ### `lucidos events emit <EventType> --payload <json> [--summary <str>]`
 
@@ -99,8 +99,8 @@ POST a domain event to the parent workspace's event store.
 
 ```bash
 $ lucidos events emit AnalysisCompleted \
-    --summary "UA analysis for 2026-04-20 complete" \
-    --payload '{"artifact": "artifacts/ua-analysis/2026-04-20/report.html", "rows": 1240}'
+    --summary "Data analysis for 2026-04-20 complete" \
+    --payload '{"artifact": "artifacts/data-analysis/2026-04-20/report.html", "rows": 1240}'
 ```
 
 The CLI prints the server's JSON response on stdout (`{"success": true, "event_id": "..."}`).
@@ -225,11 +225,11 @@ Start a new *thread* in another (or this same) workspace — a *chat thread* by 
 
 ```bash
 # Spawn an app coding-agent thread to work on an app in this workspace.
-$ lucidos spawn-thread --to personal --cc --relation top \
-    --folder data/apps/momentum-autoresearch \
-    --title "Autoresearch session" \
-    --message "Run one research session per data/apps/momentum-autoresearch/knowhow."
-[Autoresearch session](thread:personal/2f1c…)
+$ lucidos spawn-thread --to myws --cc --relation top \
+    --folder data/apps/habit-tracker \
+    --title "Research session" \
+    --message "Run one research session per data/apps/habit-tracker/knowhow."
+[Research session](thread:myws/2f1c…)
 
 # Spawn a Codex coding-agent thread in the dev workspace.
 $ lucidos spawn-thread --to dev --codex --relation top \
@@ -243,7 +243,7 @@ $ lucidos spawn-thread --to dev --codex --relation top \
 Send a push notification via the parent workspace. Persists to the inbox AND fans out as a web push to subscribed devices — identical to a `send_notification` LLM tool call, but callable directly from any subprocess (Python script, bash script, scheduled `script:`-typed trigger) without going through an LLM thread.
 
 ```bash
-$ lucidos notify --title "Nettbank pappa" --message "Sjekk nettbanken til pappa (Alf Tiller)"
+$ lucidos notify --title "Nightly backup done" --message "Backup completed: 1,240 rows archived"
 {"success":true,"notification_id":"5b1e..."}
 ```
 
@@ -285,6 +285,188 @@ The CLI prints the engine's JSON response on stdout (`{"success": true, "notific
 | One-off bash / Python script run as part of an app or trigger | `lucidos notify` |
 | LLM agent in a chat / trigger thread | `send_notification` tool (LLM picks `app_id` based on context) |
 | Background engine code (Rust) | `LucidosEngine::create_notification` (the shared helper both surfaces call) |
+
+### `lucidos notifications list | read --id <uuid> | read-all`
+
+Read and clear the notification *inbox* (the complement of `notify`, which only
+*sends*). Generated from the capability parity manifest, so it routes through the
+same gateway-safe HTTP client as every other subcommand — use it instead of
+hand-rolling `curl`, which has to reverse-engineer the engine port and the
+gateway `/<slug>/` path prefix.
+
+```bash
+# What's unread? (default filter is unread; pass --filter all for everything)
+$ lucidos notifications list
+[ { "id": "c3dac86b-…", "title": "Backup failed", "message": "…", "read": false, "created_at": "…" } ]
+
+# Clear one by id (from the list above)
+$ lucidos notifications read --id c3dac86b-bfd1-4f1e-a9d2-b47567957d25
+
+# Clear the whole unread inbox
+$ lucidos notifications read-all
+```
+
+`list` accepts `--filter unread|all` and `--limit N` (1–50, default 20). `read`
+requires `--id <uuid>`. Both `read`/`read-all` emit `NotificationRead` /
+`NotificationsAllRead` so other devices' unread state syncs over SSE. Exit
+non-zero on transport / HTTP error.
+
+> **In-thread agent:** the chat Lucidos Agent has the equivalent grouped
+> `notifications` tool (`action: list | mark_read | mark_all_read`), which runs
+> **in-process** (no HTTP round-trip). Use the tool from a chat / trigger thread;
+> use this CLI from a `script:`-typed trigger or a coding-agent / bash / Python
+> subprocess. Both surfaces are generated from / checked against the same
+> capability parity manifest, so they can't drift.
+
+### `lucidos preferences get | set --key <K> --value <V>`
+
+Read and change user *preferences* (Settings). Generated from the capability
+parity manifest (gateway-safe HTTP client). `get` lists every settable key with
+its current value, allowed values, default, and scope; `set` changes one.
+
+```bash
+$ lucidos preferences get
+$ lucidos preferences set --key timezone --value Europe/Oslo
+$ lucidos preferences set --key chat_model --value claude-opus-4-8@default
+```
+
+`get` accepts `--device-id <id>` (read device-scoped overrides; omit for the
+global view). `set` requires `--key` + `--value`; pass `--device-id` only for a
+per-device key. The chat agent's in-process equivalent is the grouped
+`preferences` tool (`action: get | set`).
+
+### `lucidos triggers list | create | update | delete`
+
+Manage *triggers* — scheduled (cron) and/or event-driven automations. Generated
+from the manifest. The rich fields (`run`, `on`, `cron_expressions`,
+`side_effect_grant`) are passed as JSON strings.
+
+```bash
+$ lucidos triggers list
+# Create a daily 8am intent trigger (cron in the user's local timezone)
+$ lucidos triggers create --name "Morning digest" \
+    --run '{"type":"intent","intent":"summarise overnight emails"}' \
+    --cron-expressions '["0 0 8 * * *"]'
+# Event-driven trigger with a payload filter
+$ lucidos triggers create --name "Bad sleep alert" \
+    --run '{"type":"intent","intent":"nudge me to rest"}' \
+    --on '[{"event_type":"OuraSleepImported","condition":{"sleep_score":{"$lt":70}}}]'
+# Update keeps run history (prefer over delete+create); pause/resume via --paused
+$ lucidos triggers update --id <uuid> --paused true
+$ lucidos triggers delete --id <uuid>
+```
+
+`create`/`update` accept `--name`, `--run`, `--cron-expressions`, `--on`,
+`--app-id`, `--go-to-review`, `--group-id`, `--side-effect-grant`, `--slug`;
+`update`/`delete` take `--id <uuid>`. The chat agent's in-process equivalent is
+the grouped `triggers` tool (`action: create | list | update | delete | pause |
+resume`) — pause/resume are tool-only (the CLI pauses via `update --paused`).
+
+### `lucidos trigger-groups list | create | rename | reorder | delete`
+
+Manage *trigger groups* — the user-visible folders that organize triggers in the
+panel (pure organizational label; no firing).
+
+```bash
+$ lucidos trigger-groups list
+$ lucidos trigger-groups create --name "Health" --order 10
+$ lucidos trigger-groups rename --id <uuid> --name "Wellbeing"
+$ lucidos trigger-groups reorder --ordering '[{"id":"<uuid>","order":0}]'
+$ lucidos trigger-groups delete --id <uuid>
+```
+
+Assign a trigger to a group with `lucidos triggers update --id <uuid>
+--group-id <group-uuid>`. The chat agent's in-process equivalent is the grouped
+`trigger_groups` tool.
+
+### `lucidos apps list | get --id <id> | update | delete`
+
+Manage *apps* — list, inspect, rename, or delete. (Creating an app and editing
+its source are not CLI ops: creation is the chat agent's `create_app` tool, and
+source editing happens in the app's coding-agent worktree.)
+
+```bash
+$ lucidos apps list
+$ lucidos apps get --id habit-tracker
+$ lucidos apps update --id habit-tracker --name "Habit Tracker" --description "Daily habits"
+$ lucidos apps delete --id habit-tracker
+```
+
+`get`/`update`/`delete` take `--id`; `update` takes `--name` (required) +
+`--description`. Plugin-installed apps refuse `delete` (remove the plugin
+instead). `list`/`get` are also in the JS SDK (`lucidos.apps`); `update`/`delete`
+are CLI-only.
+
+### `lucidos thread-queue list | run-now --entry-id <uuid> | drop --entry-id <uuid>`
+
+Inspect the *Thread Queue* (background admission control) — `list` prints the
+live queue + active *capacity policy* as JSON; `run-now` force-admits a queued
+entry ignoring caps; `drop` removes a queued entry without running it.
+
+```bash
+$ lucidos thread-queue list
+$ lucidos thread-queue run-now --entry-id 0b1e…  # force-admit
+$ lucidos thread-queue drop --entry-id 0b1e…     # cancel a queued entry
+```
+
+Get an entry id from `list` (`entries[].id`). Mirrors the chat agent's grouped
+`thread_queue` tool. Changing the capacity policy is the LLM tool's
+`update_policy` action — deliberately **not** a CLI command, because the raw
+`PUT /thread-queue/policy` replaces omitted caps with defaults (the LLM tool
+merges with the live policy instead).
+
+### `lucidos memory stats | entries [--limit N] [--offset N] [--source-type T] [--sort S] [--importance L] | source [--source-id UUID] [--source-type T] [--path P] [--commit C]`
+
+Read long-term memory — `stats` (index counts), `entries` (paginated entries
+with importance + source), `source` (the originating event/artifact for one
+memory plus the entries derived from it). All read-only.
+
+```bash
+$ lucidos memory stats
+$ lucidos memory entries --limit 20 --importance high,critical
+$ lucidos memory source --source-type event --source-id <uuid>
+```
+
+Correcting memory is the chat agent's grouped `memory` tool (`correct` /
+`correct_by_id`), not a CLI op — and the agent gets memory injected into its
+context, so these reads are for subprocess inspection.
+
+### `lucidos env-vars list | set --name <NAME> --value <V> | delete --name <NAME>`
+
+Manage **non-secret** environment variables injected into every subprocess
+Lucidos spawns (run_bash, run_python, scheduled scripts, coding agents).
+
+```bash
+$ lucidos env-vars list
+$ lucidos env-vars set --name GITHUB_TOKEN_NOTE --value "non-secret note"
+$ lucidos env-vars delete --name GITHUB_TOKEN_NOTE
+```
+
+Names must match `[A-Z_][A-Z0-9_]*` and not be engine-reserved (`CRED_*`,
+`OAUTH_*`, `PG*`, `PATH`, internal `LUCIDOS_*`). **For secrets (API keys,
+tokens, passwords) use a credential, never this** — env var values appear in
+logs/events. `set` is an upsert (create-or-replace).
+
+At parity, the chat agent has the grouped `env_vars` LLM tool (`list` / `set` /
+`delete`) — the retired `set_environment_variable` name still works as a
+back-compat alias for `set`.
+
+### `lucidos models list | add --id <id> --provider <p> [--label L] [--sort-order N] | update --id <id> [...] | delete --id <id>`
+
+Manage the chat-model registry (Settings → Models) — the models in the Lucidos
+Agent's picker.
+
+```bash
+$ lucidos models list
+$ lucidos models add --id z-ai/glm-5.2 --provider openrouter --label "GLM 5.2"
+$ lucidos models update --id z-ai/glm-5.2 --enabled false   # disable
+$ lucidos models delete --id z-ai/glm-5.2                   # user models only
+```
+
+`provider` is one of `vertex`, `anthropic`, `openai`, `openrouter`, `local`.
+Builtin models can be disabled (`update --enabled false`) but not deleted. To
+switch the **active** model, set the `chat_model` preference instead. Mirrors the
+chat agent's `manage_models` tool.
 
 ### `lucidos changes list`
 
@@ -502,10 +684,10 @@ You should never need to think about this — the env var is configured automati
 
 ### Write an artifact and emit a completion event
 
-The canonical end of an analysis or report-generation session. This is the pattern the UA analysis app's prompt should use instead of trying to write into the worktree:
+The canonical end of an analysis or report-generation session. This is the pattern an analysis app's prompt should use instead of trying to write into the worktree:
 
 ```bash
-ARTIFACT="artifacts/ua-analysis/$(date +%Y-%m-%d)/report.html"
+ARTIFACT="artifacts/data-analysis/$(date +%Y-%m-%d)/report.html"
 
 # 1. Write the artifact under data/.
 lucidos data write "$ARTIFACT" --from /tmp/report.html

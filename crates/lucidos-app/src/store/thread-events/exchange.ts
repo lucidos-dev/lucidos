@@ -477,7 +477,76 @@ export function describeEngineTool(name: string, args: unknown): string {
       if (target === 'url') return str('url') ? `Open ${str('url').split('/').slice(0, 3).join('/')}` : 'Open URL';
       return target ? `Open ${target}` : 'Navigate UI';
     }
-    case 'read_notifications': return 'Read notifications';
+    case 'notifications':
+    case 'read_notifications': {
+      const a = str('action');
+      if (a === 'mark_read') return 'Mark notification read';
+      if (a === 'mark_all_read') return 'Mark all notifications read';
+      return 'Read notifications';
+    }
+    // Grouped manifest tools (the flat per-verb cases above stay for aliases).
+    case 'triggers': {
+      const a = str('action');
+      if (a === 'create') return str('name') ? `Schedule: ${str('name')}` : 'Create trigger';
+      if (a === 'update') return str('name') ? `Update trigger: ${str('name')}` : 'Update trigger';
+      if (a === 'delete') return 'Delete trigger';
+      if (a === 'pause') return 'Pause trigger';
+      if (a === 'resume') return 'Resume trigger';
+      return 'List triggers';
+    }
+    case 'trigger_groups': {
+      const a = str('action');
+      if (a === 'create') return str('name') ? `Create group: ${str('name')}` : 'Create trigger group';
+      if (a === 'rename') return str('name') ? `Rename group: ${str('name')}` : 'Rename trigger group';
+      if (a === 'reorder') return 'Reorder trigger groups';
+      if (a === 'delete') return 'Delete trigger group';
+      return 'List trigger groups';
+    }
+    case 'preferences': {
+      const a = str('action');
+      if (a === 'set') return str('key') ? `Set ${str('key')}` : 'Set preference';
+      return 'Read preferences';
+    }
+    case 'mcp': {
+      const a = str('action');
+      if (a === 'setup') return str('name') ? `Setup MCP: ${str('name')}` : 'Setup MCP server';
+      if (a === 'start') return 'Start MCP server';
+      if (a === 'stop') return 'Stop MCP server';
+      if (a === 'remove') return 'Remove MCP server';
+      return 'List MCP servers';
+    }
+    case 'plugins': {
+      const a = str('action');
+      if (a === 'install') return str('source') ? `Install plugin: ${basename(str('source'))}` : 'Install plugin';
+      if (a === 'register_marketplace') return 'Register marketplace';
+      if (a === 'update') return str('id') ? `Update plugin: ${str('id')}` : 'Update plugin';
+      if (a === 'uninstall') return str('id') ? `Uninstall plugin: ${str('id')}` : 'Uninstall plugin';
+      return 'Check plugin updates';
+    }
+    case 'events': {
+      const a = str('action');
+      if (a === 'emit') return str('event_type') ? `Emit ${str('event_type')}` : 'Emit event';
+      if (a === 'count') return 'Count events';
+      return str('event_type') ? `Query ${str('event_type')}` : 'Query events';
+    }
+    case 'changes': {
+      const a = str('action');
+      if (a === 'apply') return 'Apply change';
+      return 'List changes';
+    }
+    case 'thread_queue': {
+      const a = str('action');
+      if (a === 'update_policy') return 'Update Thread Queue policy';
+      if (a === 'run_now') return 'Run queued entry now';
+      if (a === 'drop') return 'Drop queued entry';
+      return 'List Thread Queue';
+    }
+    case 'memory': return 'Correct memory';
+    case 'threads': {
+      const a = str('action');
+      if (a === 'count') return 'Count threads';
+      return 'List threads';
+    }
     case 'enable_push_notifications': return 'Enable push notifications';
     case 'setup_mcp_server': return str('name') ? `Setup MCP: ${str('name')}` : 'Setup MCP server';
     case 'list_mcp_servers': return 'List MCP servers';

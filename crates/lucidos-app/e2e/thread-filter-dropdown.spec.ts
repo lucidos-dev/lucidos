@@ -60,10 +60,10 @@ test.describe('Thread filter dropdown dismiss', () => {
     expect(stillFocused).toBe(initiallyFocused);
   });
 
-  test('clicking the copy button while filter is open closes the panel and does NOT copy', async ({ page }) => {
+  test('clicking a row action button while filter is open closes the panel and does NOT activate it', async ({ page }) => {
     await navigateToApp(page);
 
-    const msg = uniqueMessage('filter-dismiss-copy');
+    const msg = uniqueMessage('filter-dismiss-overflow');
     await sendMessage(page, `say "${msg}"`);
     await waitForResponse(page);
 
@@ -74,9 +74,14 @@ test.describe('Thread filter dropdown dismiss', () => {
     await clickVisibleElement(page, 'button[aria-label="Filter threads"]');
     await expect(page.locator('.thread-filter-dropdown:visible').first()).toBeVisible();
 
-    // Click on a copy button — this normally copies a thread reference and shows a toast.
+    // Click a drawer-row action button behind the open dropdown — the row's
+    // "More thread actions" (⋯) button, which normally opens the overflow menu.
+    // (Copy thread reference moved INTO that overflow menu, so it is no longer a
+    // directly-clickable row button.) Per the overlay dismiss-and-swallow
+    // contract, this click must dismiss the filter dropdown and NOT fire the
+    // button's own action (opening the overflow menu).
     const clicked = await page.evaluate(() => {
-      const buttons = document.querySelectorAll('button[aria-label="Copy thread reference"]');
+      const buttons = document.querySelectorAll('button[aria-label="More thread actions"]');
       for (const btn of buttons) {
         const rect = btn.getBoundingClientRect();
         if (rect.width > 0 && rect.height > 0) {
@@ -91,8 +96,9 @@ test.describe('Thread filter dropdown dismiss', () => {
     // The filter panel must close.
     await expect(page.locator('.thread-filter-dropdown')).toHaveCount(0);
 
-    // No toast should appear — the click was consumed. Polled assertion catches
-    // a toast that briefly appears even if it auto-dismisses.
-    await expect(page.locator('.toast')).toHaveCount(0, { timeout: 500 });
+    // The overflow menu must NOT have opened — the click was consumed by the
+    // dismiss. Polled assertion catches a menu that briefly appears even if it
+    // auto-dismisses.
+    await expect(page.locator('.thread-overflow-menu')).toHaveCount(0, { timeout: 500 });
   });
 });

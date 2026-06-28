@@ -24,6 +24,7 @@ pub(crate) mod inline_question_repair;
 mod memory;
 pub mod memory_consumer;
 mod pending_apply_actors;
+pub(crate) mod preferences;
 mod session_seed;
 pub mod supervisor_respawn_sidecar;
 pub mod thread_events;

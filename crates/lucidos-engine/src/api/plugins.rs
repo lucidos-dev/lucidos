@@ -21,7 +21,7 @@ use uuid::Uuid;
 use crate::api::AppState;
 use crate::core::plugin_marketplaces::{
     add_marketplace, load_registry, remove_marketplace, save_registry, scan_catalog,
-    MarketplaceCatalog, PluginMarketplace, MARKETPLACES_DATA_PATH,
+    InstalledPluginSummary, MarketplaceCatalog, PluginMarketplace, MARKETPLACES_DATA_PATH,
 };
 use crate::core::plugins::PLUGIN_ARCHIVE_EXT;
 use crate::core::ArtifactManager;
@@ -51,6 +51,11 @@ fn err(code: StatusCode, msg: &str) -> (StatusCode, Json<JsonValue>) {
 #[derive(Debug, Serialize)]
 pub(super) struct MarketplacesResponse {
     pub marketplaces: Vec<PluginMarketplace>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct InstalledPluginsResponse {
+    pub plugins: Vec<InstalledPluginSummary>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,6 +249,23 @@ pub(super) async fn catalog(
     Ok(Json(catalog))
 }
 
+/// `GET /api/v1/plugins/installed` — the Plugins → Installed list. Unlike
+/// `catalog`, this reads only the `PluginInstalled`/`PluginUninstalled` event
+/// projection (no marketplace scan), so it works offline and still lists a
+/// plugin whose marketplace was later removed. Each summary carries the
+/// shipped `content` kinds + `files` so the row can link to what was installed.
+pub(super) async fn installed(
+    State(state): State<AppState>,
+) -> Result<Json<InstalledPluginsResponse>, (StatusCode, Json<JsonValue>)> {
+    let plugins = installed_plugin_summaries(&state.pool).await.map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("read installed plugins: {e}"),
+        )
+    })?;
+    Ok(Json(InstalledPluginsResponse { plugins }))
+}
+
 /// Setup counts as "complete" once its thread is no longer actively working or
 /// waiting on the user — any `thread_summaries.status` other than `running` /
 /// `waiting_for_user_answer` (the two `ThreadStatus` values that mean the setup
@@ -253,7 +275,7 @@ fn setup_status_is_complete(status: &str) -> bool {
     !matches!(status, "running" | "waiting_for_user_answer")
 }
 
-/// Resolve a setup thread's completion for the App Store card from the two
+/// Resolve a setup thread's completion for the Plugins panel card from the two
 /// signals we can observe: `summary_status` is its `thread_summaries.status`
 /// (`Some` once the thread has a row), `in_queue` is whether a live
 /// `thread_queue` entry still exists for it.
@@ -560,6 +582,7 @@ pub(super) fn router() -> Router<AppState> {
             delete(remove_marketplace_handler),
         )
         .route("/plugins/catalog", get(catalog))
+        .route("/plugins/installed", get(installed))
         .route("/plugins/install-request", post(stage_install))
         .route("/plugins/uninstall-request", post(stage_uninstall))
         .route(
@@ -612,6 +635,7 @@ mod tests {
             source: "https://example.invalid/p".into(),
             manifest: serde_json::json!({}),
             content: vec![],
+            categories: vec![],
             files_count: 0,
             status: MarketplacePluginStatus::Installed,
             installed_version: Some("0.1.0".into()),

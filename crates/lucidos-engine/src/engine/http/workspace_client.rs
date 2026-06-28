@@ -3,7 +3,7 @@
 //! Merges `caller_workspace` / `caller_thread_id` / `caller_event_id` / `mode`
 //! into the JSON body of the outbound POST so the receiving engine can build
 //! a `MessageOrigin::Workspace` and the route panel can show "from workspace
-//! 'personal'" with traceable IDs back to the source thread / event.
+//! 'myws'" with traceable IDs back to the source thread / event.
 //!
 //! Note: the receiving engine treats these caller fields as a display hint
 //! only — they are user-controllable and MUST NOT be used for authorization.
@@ -58,7 +58,7 @@ pub fn cross_workspace_http_client() -> &'static Client {
 /// `MessageReceived` event.
 #[derive(Debug, Clone)]
 pub struct WorkspaceCallCtx {
-    /// Name of the calling workspace (e.g. "dev", "personal").
+    /// Name of the calling workspace (e.g. "dev", "myws").
     pub self_workspace: String,
     /// Thread in the calling workspace that initiated this call.
     pub source_thread_id: Option<Uuid>,
@@ -354,10 +354,10 @@ mod tests {
             "do the thing",
             None,
             None,
-            Some("data/apps/momentum"),
+            Some("data/apps/habit-tracker"),
             Some(crate::runtime::CodingAgent::Codex),
         );
-        assert_eq!(body["folder"], "data/apps/momentum");
+        assert_eq!(body["folder"], "data/apps/habit-tracker");
         assert_eq!(body["coding_agent"], "codex");
         assert!(
             body.get("repo_id").is_none(),
@@ -438,7 +438,7 @@ mod tests {
         });
 
         let target = CrossWorkspaceTarget {
-            workspace_path: std::path::PathBuf::from("/tmp/fake-personal"),
+            workspace_path: std::path::PathBuf::from("/tmp/fake-ws"),
             api_port: port,
             proto: "http".to_string(),
         };
@@ -456,7 +456,7 @@ mod tests {
                 prompt: "build the feature",
                 title: Some("Add feature X"),
                 repo: None,
-                folder: Some("data/apps/momentum"),
+                folder: Some("data/apps/habit-tracker"),
                 coding_agent: Some(crate::runtime::CodingAgent::Codex),
             },
             &ctx,
@@ -476,7 +476,7 @@ mod tests {
         assert_eq!(body["use_coding_agent"], true);
         assert_eq!(body["coding_agent"], "codex");
         assert_eq!(body["title"], "Add feature X");
-        assert_eq!(body["folder"], "data/apps/momentum");
+        assert_eq!(body["folder"], "data/apps/habit-tracker");
         assert!(body.get("repo_id").is_none());
         // Cross-workspace provenance: receiver MUST see caller_workspace +
         // mode=agent or it rejects the request as malformed.

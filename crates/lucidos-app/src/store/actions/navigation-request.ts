@@ -1,5 +1,5 @@
 import { switchMenuItem, openSettingsSubview, setActiveMenu } from './menu';
-import { openAppById, setAppsTab } from './apps';
+import { openAppById } from './apps';
 import { openFilePreview, openUrl, normalizeDataPath } from './artifacts';
 import { navigateToTrigger } from './triggers';
 import { focusThreadOrBootstrap, unfocusThread } from './threads';
@@ -7,8 +7,28 @@ import { pushNavState } from './navigation';
 import { revealContentPane } from './pane';
 import { ensureFocusedComposeThread, updateCompose } from './compose';
 import { focusPromptNow } from '../../components/chat/promptFocus';
-import { showToast, panelOverlay } from '../store';
+import { showToast, panelOverlay, pluginScrollTarget, setPluginsInstalledOnly, SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS, settingsSubviewLabel } from '../store';
+import type { SettingsNavKey } from '../store';
 import type { MenuItem } from '../types';
+
+/** Is `view` a renderable Settings sub-section (`SettingsView.renderSubview` has
+ *  a case for each)? The valid set is derived from the store's own nav lists —
+ *  the single source of truth for what Settings shows — so a new subview added
+ *  there is accepted here automatically (no second list to keep in sync). It is a
+ *  superset of the engine's advertised `settings_view` set; a Vitest pins
+ *  advertised ⊆ this set. Computed lazily (memoized) so importing this module
+ *  never touches those store exports at load time — that would force every
+ *  `../store`-mocking test transitively importing this file to stub them. */
+let settingsViewKeys: ReadonlySet<string> | null = null;
+function isRenderableSettingsView(view: string): boolean {
+  if (settingsViewKeys === null) {
+    settingsViewKeys = new Set<string>([
+      ...SETTINGS_NAV_ITEMS.map((i) => i.key),
+      ...SETTINGS_SYSTEM_SUBPANEL_ITEMS.map((i) => i.key),
+    ]);
+  }
+  return settingsViewKeys.has(view);
+}
 
 /** Handle a NavigationRequested event — dispatches to the correct UI action based on target.
  *
@@ -47,10 +67,15 @@ export function describeNavTarget(nav: {
       return 'the new-trigger form';
     case 'new-chat':
       return 'a new chat';
-    case 'settings':
-      return nav.settings_view ? `${nav.settings_view} settings` : 'settings';
+    case 'settings': {
+      if (!nav.settings_view) return 'settings';
+      const label = settingsSubviewLabel(nav.settings_view as SettingsNavKey);
+      return `${label ?? nav.settings_view} settings`;
+    }
     case 'app-store':
-      return 'the App Store';
+      return 'the Plugins panel';
+    case 'plugins':
+      return 'your installed plugins';
     case 'thread-queue':
       return 'the Thread Queue';
     case 'files':
@@ -92,16 +117,35 @@ export function handleNavigationRequest(nav: {
       openSettingsSubview('thread-queue');
       break;
     case 'app-store':
-      // The App Store is now the Store tab of the Apps section. Older
-      // notifications (and the still-valid `app-store` NavigateTarget) deep-link
-      // here — land on Apps with the Store tab selected.
-      setAppsTab('store');
-      switchMenuItem('apps');
+      // Plugins (and the apps they ship) are downloaded from the Plugins panel.
+      // Older notifications (and the still-valid `app-store` NavigateTarget)
+      // deep-link here — land on Plugins with the whole catalog showing (the
+      // All | Installed toggle on All).
+      setPluginsInstalledOnly(false);
+      switchMenuItem('plugins');
+      break;
+    case 'plugins':
+      // Land on the Plugins panel narrowed to Installed (the All | Installed
+      // toggle on Installed) — where every installed plugin (app or not) shows
+      // its update status + an Update button. The update-available notification
+      // deep-links here and carries the plugin id in `nav.id`; the list scrolls
+      // to and pulses that row once it renders (see StoreTab's pluginScrollTarget
+      // effect).
+      setPluginsInstalledOnly(true);
+      switchMenuItem('plugins');
+      if (nav.id) pluginScrollTarget.value = nav.id;
       break;
     case 'settings':
       switchMenuItem('settings');
       if (nav.settings_view) {
-        openSettingsSubview(nav.settings_view as 'system' | 'devices' | 'accounts' | 'backup' | 'memory' | 'repositories' | 'marketplaces' | 'disk-usage' | 'environment-variables');
+        // Validate against the renderable set, don't trust the input — an
+        // unknown subview would otherwise land on a blank settings panel
+        // (a silent error). Fail loud instead; we still showed Settings home.
+        if (isRenderableSettingsView(nav.settings_view)) {
+          openSettingsSubview(nav.settings_view as SettingsNavKey);
+        } else {
+          showToast(`Unknown settings section: "${nav.settings_view}"`, 'error');
+        }
       }
       break;
     case 'app':

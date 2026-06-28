@@ -55,7 +55,7 @@ describe('normalizeDataPath', () => {
   });
 });
 
-const PDF = 'artifacts/projects/pappa/folgebrev-fullmakt-nav-skatt.pdf';
+const PDF = 'artifacts/projects/reports/cover-letter.pdf';
 
 describe('loadArtifacts — previously-open file preview restore', () => {
   beforeEach(() => {

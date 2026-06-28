@@ -1,5 +1,7 @@
-//! LLM-facing schemas for thread-spawning and thread-listing tools
-//! (run_thread, run_coding_agent, list_threads, count_threads).
+//! LLM-facing schemas for the thread-spawning tools (run_thread,
+//! run_coding_agent). Thread INTROSPECTION (list_threads / count_threads) is the
+//! grouped `threads` manifest tool (built from `crate::capability_manifest`); the
+//! flat names stay wired as back-compat aliases in `execute_tool`.
 
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
@@ -47,7 +49,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     },
                     "folder": {
                         "type": "string",
-                        "description": "What the coding-agent thread should edit. Accepts: (a) an absolute path to an app folder like `/Users/.../workspaces/personal/data/apps/momentum`, (b) a workspace-relative path like `data/apps/momentum` (resolved against the target workspace's root), or (c) a registered external repository name or UUID from `manage_repositories` (resolved to the repo's path). Omit to edit Lucidos source. The engine selects the spawn kind automatically: Lucidos source ⇒ Lucidos-internal coding-agent thread (full /harden, Apply may restart the engine); `data/apps/<id>/` ⇒ app coding-agent thread (sparse-checkout worktree, Apply ff-merges to workspace git main, no engine restart, no /harden); registered external repo ⇒ external-repo coding-agent thread (no Apply gate). REFUSED: any `data/` path outside `data/apps/<id>/` (use chat tools + `lucidos` CLI for non-app data), subpaths inside an app (`data/apps/<id>/ui/`), file paths, the whole `data/`, unregistered git folders, non-git folders, `<workspace>/.lucidos/`, system paths."
+                        "description": "What the coding-agent thread should edit. Accepts: (a) an absolute path to an app folder like `/Users/.../workspaces/myws/data/apps/habit-tracker`, (b) a workspace-relative path like `data/apps/habit-tracker` (resolved against the target workspace's root), or (c) a registered external repository name or UUID from `manage_repositories` (resolved to the repo's path). Omit to edit Lucidos source. The engine selects the spawn kind automatically: Lucidos source ⇒ Lucidos-internal coding-agent thread (full /harden, Apply may restart the engine); `data/apps/<id>/` ⇒ app coding-agent thread (sparse-checkout worktree, Apply ff-merges to workspace git main, no engine restart, no /harden); registered external repo ⇒ external-repo coding-agent thread (no Apply gate). REFUSED: any `data/` path outside `data/apps/<id>/` (use chat tools + `lucidos` CLI for non-app data), subpaths inside an app (`data/apps/<id>/ui/`), file paths, the whole `data/`, unregistered git folders, non-git folders, `<workspace>/.lucidos/`, system paths."
                     },
                     "repo": {
                         "type": "string",
@@ -85,49 +87,6 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["prompt"]
-            }),
-        },
-    ]
-}
-
-pub(super) fn list_tools() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: tn::LIST_THREADS.to_string(),
-            description: "List thread summaries from the workspace's projection. Returns a newest-first JSON array of `ThreadSummary` rows (one per thread) — the same shape returned by `GET /api/v1/threads/list` and the `lucidos threads list` CLI. Use this instead of `query_events` when you want to know what threads exist (and their status / source / age) — `query_events` over `MessageReceived`/`ResponseGenerated` pairs would be much more expensive. Each ThreadSummary includes thread_id, title, channel ('chat'|'claude_code'|'trigger'; coding-agent threads currently retain the legacy 'claude_code' channel value), status ('idle'|'running'|'waiting'|'failed'|'waiting_for_user_answer'), last_activity, parent_thread_id, trigger_id, and the full projection field set.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "active": {
-                        "type": "boolean",
-                        "description": "When true, restricts to threads where the agentic loop is mid-flow (status running or waiting_for_user_answer). When false, inverts. Omit for no filter. Note: 'waiting' is NOT active — it means the coding agent has stopped and proposed changes the user must act on; the loop has paused."
-                    },
-                    "source": {
-                        "type": "string",
-                        "description": "Filter by source. Comma-separated list of 'chat', 'trigger', 'coding-agent'. Legacy 'claude_code' is also accepted. Omit for all."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of threads to return (1-1000, default 100)"
-                    }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: tn::COUNT_THREADS.to_string(),
-            description: "Count thread summaries matching the same filters as `list_threads`. Returns `{ \"count\": N }`. Use this for the 'is anything still running?' / 'how many active threads?' question — cheaper than materialising the whole list just to read its length.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "active": {
-                        "type": "boolean",
-                        "description": "When true, count only threads where the agentic loop is mid-flow (running or waiting_for_user_answer). When false, count the inverse. Omit for total count."
-                    },
-                    "source": {
-                        "type": "string",
-                        "description": "Filter by source. Comma-separated list of 'chat', 'trigger', 'coding-agent'. Legacy 'claude_code' is also accepted. Omit for all."
-                    }
-                }
             }),
         },
     ]

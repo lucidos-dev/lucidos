@@ -1,8 +1,8 @@
 /**
- * Tests for the spinner-delay logic shared by useDelayedLoading,
- * useDelayedFlag, and DelayedSpinner. Drives the extracted pure effect
- * (delayedFlagEffect) directly with fake timers — no DOM needed (same style
- * as useAnchoredPopover.test.ts).
+ * Tests for the loader-delay logic shared by useDelayedLoading, useDelayedFlag,
+ * and DelayedSpinner-style loaders. Drives the extracted pure effect
+ * (delayedFlagEffect) directly with fake timers — no DOM needed (same style as
+ * useAnchoredPopover.test.ts).
  *
  * Regression: opening a thread flashed the loading spinner for the few ms
  * until loadThreadEvents resolved — the spinner rendered immediately instead

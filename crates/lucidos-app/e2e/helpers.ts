@@ -517,18 +517,26 @@ export async function waitForActiveSession(page: Page, threadId: string, timeout
 }
 
 /** Assert that all given markers appear in visible user-message body elements.
- *  Single page.evaluate scans the DOM once and returns the missing markers,
- *  giving an informative failure message instead of "expected false to be true". */
-export async function assertUserMessagesVisible(page: Page, markers: string[]): Promise<void> {
-  const missing = await page.evaluate(({ sel, ms }) => {
-    const visibleTexts: string[] = [];
-    document.querySelectorAll(sel).forEach(el => {
-      const rect = el.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0) visibleTexts.push(el.textContent ?? '');
-    });
-    return ms.filter(m => !visibleTexts.some(t => t.includes(m)));
-  }, { sel: USER_MSG_SELECTOR, ms: markers });
-  expect(missing, `User messages not visible: ${missing.join(', ')}`).toEqual([]);
+ *  POLLS until every marker is visible (or the timeout elapses) rather than
+ *  snapshotting once: a just-confirmed follow-up swaps its optimistic pending
+ *  row for the persisted exchange on the next Preact flush, so a single
+ *  evaluate() can read the one-frame gap where the last follow-up's body hasn't
+ *  repainted yet (the `coding-agent-follow-ups` "user body not settled" race).
+ *  A genuinely missing message (never persisted / dropped) still fails loudly
+ *  when the poll times out — the recomputed `missing` set names which markers,
+ *  so this does NOT mask a real loss, it only tolerates the render frame. */
+export async function assertUserMessagesVisible(page: Page, markers: string[], timeout = 15_000): Promise<void> {
+  await expect(async () => {
+    const missing = await page.evaluate(({ sel, ms }) => {
+      const visibleTexts: string[] = [];
+      document.querySelectorAll(sel).forEach(el => {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) visibleTexts.push(el.textContent ?? '');
+      });
+      return ms.filter(m => !visibleTexts.some(t => t.includes(m)));
+    }, { sel: USER_MSG_SELECTOR, ms: markers });
+    expect(missing, `User messages not visible: ${missing.join(', ')}`).toEqual([]);
+  }).toPass({ timeout });
 }
 
 /** Count visible response-content elements with non-empty text */
@@ -585,8 +593,9 @@ export async function countVisibleThreadRows(page: Page): Promise<number> {
   });
 }
 
-/** Wait for the prompt-area Cancel button, click it, confirm the guard dialog,
- *  then wait for Canceled status.
+/** Wait for the prompt-area Cancel button, click it, then wait for Canceled
+ *  status. The cancel is no longer guarded by a confirm dialog (removed in
+ *  7fe30c930) — clicking the stop button cancels immediately.
  *  Works for both chat and Claude Code threads (single hard-cancel path).
  *  Identify the Send→Cancel morph by its `aria-label="Cancel"` — the stop
  *  button no longer carries `action-btn-danger` (it stays blue now), and the
@@ -594,10 +603,6 @@ export async function countVisibleThreadRows(page: Page): Promise<number> {
  *  :not(:disabled) is load-bearing to hit the actionable stop state. */
 export async function cancelStreamingResponse(page: Page): Promise<void> {
   await waitAndClick(page, 'button.send-cancel-morph[aria-label="Cancel"]:not(:disabled)', undefined, 30_000);
-
-  // Cancel is guarded by a confirm dialog — accept it to actually cancel.
-  await page.locator('.confirm-dialog').waitFor({ state: 'visible', timeout: 10_000 });
-  await page.locator('.confirm-dialog .confirm-btn-ok:visible').first().click();
 
   await page.waitForFunction(() => {
     const labels = document.querySelectorAll('.exchange-status-label');

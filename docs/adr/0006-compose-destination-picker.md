@@ -7,8 +7,8 @@
 
 The compose view's picker row was a `[Lucidos | Claude]` segmented control
 that, on "Claude", revealed a breadcrumb of two more dropdowns:
-`› [scope] › [Claude Code | Codex]`. Two structural problems (work-tracker
-item `akram-custom-1777262805564`, plus direct user feedback "Selecting
+`› [scope] › [Claude Code | Codex]`. Two structural problems (an internal
+work-tracker item, plus direct user feedback "Selecting
 claude then repo then claude or codex — that was NOT great"):
 
 - **Wrong names.** "Claude" labeled the coding-agent *channel* (which can run

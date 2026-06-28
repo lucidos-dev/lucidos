@@ -89,8 +89,6 @@ describe('repo store actions', () => {
   let repoExpandedFolders: typeof import('../../../store/store').repoExpandedFolders;
   let selectedLines: typeof import('../../../store/store').selectedLines;
   let toggleRepoFolder: typeof import('../../../store/actions/repositories').toggleRepoFolder;
-  let expandAllRepoFolders: typeof import('../../../store/actions/repositories').expandAllRepoFolders;
-  let collapseAllRepoFolders: typeof import('../../../store/actions/repositories').collapseAllRepoFolders;
 
   beforeEach(async () => {
     vi.resetModules();
@@ -104,8 +102,6 @@ describe('repo store actions', () => {
     repoExpandedFolders = store.repoExpandedFolders;
     selectedLines = store.selectedLines;
     toggleRepoFolder = actions.toggleRepoFolder;
-    expandAllRepoFolders = actions.expandAllRepoFolders;
-    collapseAllRepoFolders = actions.collapseAllRepoFolders;
 
     // Reset to defaults
     repoSource.value = null;
@@ -134,40 +130,6 @@ describe('repo store actions', () => {
       toggleRepoFolder('src');
       expect(repoExpandedFolders.value.has('src')).toBe(false);
       expect(repoExpandedFolders.value.has('tests')).toBe(true);
-    });
-  });
-
-  describe('expandAllRepoFolders', () => {
-    it('does nothing when files not loaded', () => {
-      repoFiles.value = { status: 'loading' };
-      expandAllRepoFolders();
-      expect(repoExpandedFolders.value.size).toBe(0);
-    });
-
-    it('expands all folder paths from loaded files', () => {
-      repoFiles.value = {
-        status: 'loaded',
-        data: ['src/api/client.ts', 'src/utils/format.ts', 'tests/e2e.ts'],
-      };
-      expandAllRepoFolders();
-      expect(repoExpandedFolders.value.has('src')).toBe(true);
-      expect(repoExpandedFolders.value.has('src/api')).toBe(true);
-      expect(repoExpandedFolders.value.has('src/utils')).toBe(true);
-      expect(repoExpandedFolders.value.has('tests')).toBe(true);
-    });
-
-    it('does not include root-level files as folders', () => {
-      repoFiles.value = { status: 'loaded', data: ['README.md'] };
-      expandAllRepoFolders();
-      expect(repoExpandedFolders.value.size).toBe(0);
-    });
-  });
-
-  describe('collapseAllRepoFolders', () => {
-    it('clears all expanded folders', () => {
-      repoExpandedFolders.value = new Set(['src', 'src/api', 'tests']);
-      collapseAllRepoFolders();
-      expect(repoExpandedFolders.value.size).toBe(0);
     });
   });
 });

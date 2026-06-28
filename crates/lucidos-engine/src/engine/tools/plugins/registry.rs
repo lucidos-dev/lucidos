@@ -85,7 +85,10 @@ pub(crate) async fn installed_plugin_summaries(
         .into_iter()
         .map(|(id, payload)| {
             let rec = InstalledRecord { payload };
-            let app_id = primary_app_id(&rec.files(), &id);
+            let files = rec.files();
+            let app_id = primary_app_id(&files, &id);
+            let content =
+                crate::core::plugin_marketplaces::content_dirs_from_files(files.iter().map(String::as_str));
             InstalledPluginSummary {
                 id: id.clone(),
                 name: rec.name().unwrap_or(&id).to_string(),
@@ -93,6 +96,8 @@ pub(crate) async fn installed_plugin_summaries(
                 source: rec.source().map(ToOwned::to_owned),
                 setup_thread_id: rec.setup_thread_id().map(ToOwned::to_owned),
                 app_id,
+                content,
+                files,
             }
         })
         .collect())
@@ -519,4 +524,84 @@ pub(crate) async fn fetch_remote_manifest(
     let text = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("read manifest: {}", e))?;
     plugins::parse_manifest(&text).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::installed_plugin_summaries;
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    use uuid::Uuid;
+
+    /// A `PluginInstalled` projection must carry the plugin's `files` and the
+    /// derived `content` kinds so the Plugins → Installed row can list what was
+    /// shipped and link to it — even for a plugin with no app.
+    #[tokio::test]
+    async fn installed_summary_carries_content_and_files() {
+        let (pool, db_name) = setup_test_db().await;
+        let payload = serde_json::json!({
+            "data": {
+                "manifest": { "manifest": { "id": "demo", "name": "Demo", "version": "1.2.0" } },
+                "files": [
+                    "apps/demo/index.html",
+                    "knowhow/demo-notes.md",
+                    "triggers/demo-watch/trigger.toml",
+                ],
+            }
+        });
+        sqlx::query(
+            "INSERT INTO events (id, event_type, aggregate, aggregate_id, payload) \
+             VALUES ($1, 'PluginInstalled', 'plugin', 'demo', $2)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(&payload)
+        .execute(&pool)
+        .await
+        .expect("seed PluginInstalled");
+
+        let summaries = installed_plugin_summaries(&pool).await.expect("summaries");
+        let demo = summaries
+            .iter()
+            .find(|s| s.id == "demo")
+            .expect("demo plugin present");
+        // content_dirs_from_files dedups + sorts (BTreeSet) → alphabetical.
+        assert_eq!(demo.content, vec!["apps", "knowhow", "triggers"]);
+        assert_eq!(demo.files.len(), 3);
+        assert_eq!(demo.app_id.as_deref(), Some("demo"));
+
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A non-app plugin (knowhow/triggers only) still projects with its content
+    /// and files, and `app_id` is `None` — it must be manageable from the
+    /// Plugins → Installed tab without an app.
+    #[tokio::test]
+    async fn installed_summary_non_app_plugin_has_no_app_id() {
+        let (pool, db_name) = setup_test_db().await;
+        let payload = serde_json::json!({
+            "data": {
+                "manifest": { "manifest": { "id": "notes-only", "name": "Notes", "version": "0.1.0" } },
+                "files": ["knowhow/a.md", "knowhow/b.md"],
+            }
+        });
+        sqlx::query(
+            "INSERT INTO events (id, event_type, aggregate, aggregate_id, payload) \
+             VALUES ($1, 'PluginInstalled', 'plugin', 'notes-only', $2)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(&payload)
+        .execute(&pool)
+        .await
+        .expect("seed PluginInstalled");
+
+        let summaries = installed_plugin_summaries(&pool).await.expect("summaries");
+        let notes = summaries
+            .iter()
+            .find(|s| s.id == "notes-only")
+            .expect("notes-only plugin present");
+        assert_eq!(notes.content, vec!["knowhow"]);
+        assert_eq!(notes.files.len(), 2);
+        assert!(notes.app_id.is_none());
+
+        teardown_test_db(&db_name).await;
+    }
 }

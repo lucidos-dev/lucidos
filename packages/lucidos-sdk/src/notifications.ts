@@ -1,35 +1,25 @@
 import { request, requestVoid } from './_fetch';
 import { assertPlainObject } from './_validate';
+import type { NavigateTarget, SettingsViewTarget } from './generated/navigate-targets';
 
-/** Targets a notification tap can navigate to. Mirrors the engine's
- *  `navigate_ui` LLM tool — see system-knowhow/js-sdk.md § lucidos.notifications. */
-export type NavigateTarget =
-  | 'files'
-  | 'apps'
-  | 'app-store'
-  | 'triggers'
-  | 'thread-queue'
-  | 'changes'
-  | 'notifications'
-  | 'settings'
-  | 'app'
-  | 'file'
-  | 'trigger'
-  | 'thread'
-  | 'new-app'
-  | 'new-trigger'
-  | 'new-chat'
-  | 'url';
+/** The navigation contract is GENERATED from the engine's `navigate_ui` tool
+ *  (the `NAVIGATE_TARGETS` / `NAVIGABLE_SETTINGS_VIEWS` consts in
+ *  `crates/lucidos-engine/src/llm/tools/misc.rs`) into
+ *  `./generated/navigate-targets.ts`, so the SDK and the LLM tool schema cannot
+ *  drift. Re-exported here so consumers keep importing these from `@lucidos/sdk`.
+ *  See system-knowhow/js-sdk.md § lucidos.notifications. */
+export type { NavigateTarget, SettingsViewTarget };
 
 /** Navigation payload — the same shape the `navigate_ui` LLM tool accepts.
  *  When `tap.kind === 'navigate'`, `tap.to` is this. Required sub-fields
  *  depend on `target`: `app` requires `app_id`, `file` requires `file_path`,
  *  `thread` requires `id` (and accepts optional `event_id` to scroll-and-pulse
  *  a specific event row on land), `trigger` requires `id`, `url` requires
- *  `url`. The page-side router enforces these. */
+ *  `url`. `settings_view` applies only when `target === 'settings'`. The
+ *  page-side router enforces these. */
 export interface NavigateUi {
   target: NavigateTarget;
-  settings_view?: 'devices' | 'accounts' | 'backup' | 'memory' | 'repositories';
+  settings_view?: SettingsViewTarget;
   app_id?: string;
   file_path?: string;
   id?: string;

@@ -181,8 +181,8 @@ mod tests {
         // No scheme on the target — a bare store path is what the frontend
         // linkifier rewrites to a file preview; `artifact:`/`file:` dead-ends.
         assert_eq!(
-            chat_link("artifacts/ost-jira-workflow/node-types-and-attributes.md"),
-            "[node-types-and-attributes.md](artifacts/ost-jira-workflow/node-types-and-attributes.md)"
+            chat_link("artifacts/ticket-workflow/node-types-and-attributes.md"),
+            "[node-types-and-attributes.md](artifacts/ticket-workflow/node-types-and-attributes.md)"
         );
     }
 

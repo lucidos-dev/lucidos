@@ -5,6 +5,7 @@ import { lazyComponent } from '../../utils/lazyComponent';
 
 const FilesView = lazyComponent(() => import('../files/FilesView').then(m => m.FilesView));
 const AppsView = lazyComponent(() => import('../apps/AppsView').then(m => m.AppsView));
+const PluginsView = lazyComponent(() => import('../plugins/PluginsView').then(m => m.PluginsView));
 const TriggersView = lazyComponent(() => import('../triggers/TriggersView').then(m => m.TriggersView));
 const SettingsView = lazyComponent(() => import('../settings/SettingsView').then(m => m.SettingsView));
 const ChangesView = lazyComponent(() => import('../changes/ChangesView').then(m => m.ChangesView));
@@ -61,6 +62,7 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
           <>
             {active === 'files' && <FilesView />}
             {active === 'apps' && <AppsView />}
+            {active === 'plugins' && <PluginsView />}
             {active === 'triggers' && <TriggersView />}
             {active === 'settings' && <SettingsView />}
             {active === 'changes' && <ChangesView />}

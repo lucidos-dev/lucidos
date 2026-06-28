@@ -1,6 +1,6 @@
 import { signal } from '@preact/signals';
 import { useRef } from 'preact/hooks';
-import { activeMenuItem, panelOverlay, pinnedApps, appsList, changes } from '../../store/store';
+import { activeMenuItem, panelOverlay, pinnedApps, appsList, changes, appliedChanges } from '../../store/store';
 import { switchMenuItem } from '../../store/actions/menu';
 import { openUrl } from '../../store/actions/artifacts';
 import { openAppById } from '../../store/actions/apps';
@@ -14,6 +14,7 @@ import type { MenuItem } from '../../store/types';
 const menuItems: Array<{ id: MenuItem; label: string }> = [
   { id: 'files', label: 'Files' },
   { id: 'apps', label: 'Apps' },
+  { id: 'plugins', label: 'Plugins' },
   { id: 'triggers', label: 'Triggers' },
 ];
 
@@ -87,6 +88,18 @@ export function Drawer() {
   const changeCount: number | null =
     changesLoadable.status === 'loaded' ? changesLoadable.data.length : null;
 
+  // Only surface the Changes entry when the user actually has changes to see —
+  // pending OR applied/reverted history. Most users never make changes to
+  // Lucidos, so this keeps the drawer uncluttered for them. Keep it visible
+  // while the Changes view is the active menu item so a user viewing it isn't
+  // stranded when the last change clears.
+  const appliedLoadable = appliedChanges.value;
+  const hasPendingChanges = changeCount !== null && changeCount > 0;
+  const hasAppliedChanges =
+    appliedLoadable.status === 'loaded' && appliedLoadable.data.length > 0;
+  const showChanges =
+    hasPendingChanges || hasAppliedChanges || activeMenuItem.value === 'changes';
+
   return (
     // The `.drawer-backdrop` wrapper stays the caller's own (it dims the chat
     // pane and carries the slide-out `closing` class); <Overlay backdrop={false}>
@@ -155,18 +168,20 @@ export function Drawer() {
           </div>
         )}
 
-        <div
-          class={`drawer-item ${activeMenuItem.value === 'changes' ? 'active' : ''}`}
-          onClick={() => {
-            switchMenuItem('changes');
-            closeDrawer();
-          }}
-        >
-          Changes
-          {changeCount !== null && changeCount > 0 && (
-            <span class="drawer-badge">{changeCount > 99 ? '99+' : changeCount}</span>
-          )}
-        </div>
+        {showChanges && (
+          <div
+            class={`drawer-item ${activeMenuItem.value === 'changes' ? 'active' : ''}`}
+            onClick={() => {
+              switchMenuItem('changes');
+              closeDrawer();
+            }}
+          >
+            Changes
+            {changeCount !== null && changeCount > 0 && (
+              <span class="drawer-badge">{changeCount > 99 ? '99+' : changeCount}</span>
+            )}
+          </div>
+        )}
 
         <div
           class={`drawer-item ${activeMenuItem.value === 'settings' ? 'active' : ''}`}

@@ -238,6 +238,83 @@ async fn ensure_resume_skips_emit_for_canceled_answer() {
     teardown_test_db(&db_name).await;
 }
 
+/// Live subprocess answer: arm the run-loop resume signal so the turn CC
+/// continues (via the PreToolUse hook, off the `msg_tx` path) re-arms emission
+/// instead of dropping its output as post-terminal stragglers.
+#[tokio::test]
+async fn arm_question_resume_sets_flag_on_live_session() {
+    let thread_id = Uuid::new_v4();
+    let mut map = HashMap::new();
+    map.insert(thread_id, make_session(false)); // process_exited=false → live
+    let sessions = Arc::new(tokio::sync::Mutex::new(map));
+
+    let armed = arm_question_resume_if_live(
+        &sessions,
+        thread_id,
+        &AnswerKind::FreeText { text: "Y".into() },
+    )
+    .await;
+    assert!(armed, "must report a live subprocess was armed");
+    assert!(
+        sessions.lock().await.get(&thread_id).unwrap().question_resume_pending,
+        "live session must have question_resume_pending set so the run loop self-heals"
+    );
+}
+
+/// Exited subprocess: nothing to re-arm in-place — the no-live path spawns a
+/// fresh `--resume` turn (new run loop, clean flags), so leave the signal off.
+#[tokio::test]
+async fn arm_question_resume_skips_exited_session() {
+    let thread_id = Uuid::new_v4();
+    let mut map = HashMap::new();
+    map.insert(thread_id, make_session(true)); // process_exited=true
+    let sessions = Arc::new(tokio::sync::Mutex::new(map));
+
+    let armed = arm_question_resume_if_live(
+        &sessions,
+        thread_id,
+        &AnswerKind::FreeText { text: "Y".into() },
+    )
+    .await;
+    assert!(!armed, "an exited subprocess must not be armed");
+    assert!(
+        !sessions.lock().await.get(&thread_id).unwrap().question_resume_pending,
+        "exited session must leave question_resume_pending false"
+    );
+}
+
+/// Absent session: nothing to arm.
+#[tokio::test]
+async fn arm_question_resume_skips_absent_session() {
+    let thread_id = Uuid::new_v4();
+    let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    let armed = arm_question_resume_if_live(
+        &sessions,
+        thread_id,
+        &AnswerKind::FreeText { text: "Y".into() },
+    )
+    .await;
+    assert!(!armed, "an absent session must not be armed");
+}
+
+/// Canceled is the archive/teardown sentinel — never arm a resume, mirroring
+/// `ensure_resume_after_answer` / `emit_resume_marker_for_cc_answer`.
+#[tokio::test]
+async fn arm_question_resume_skips_canceled_even_when_live() {
+    let thread_id = Uuid::new_v4();
+    let mut map = HashMap::new();
+    map.insert(thread_id, make_session(false)); // live
+    let sessions = Arc::new(tokio::sync::Mutex::new(map));
+
+    let armed = arm_question_resume_if_live(&sessions, thread_id, &AnswerKind::Canceled).await;
+    assert!(!armed, "Canceled must never arm a resume");
+    assert!(
+        !sessions.lock().await.get(&thread_id).unwrap().question_resume_pending,
+        "Canceled must leave question_resume_pending false even on a live session"
+    );
+}
+
 
 /// Cancel-stamp path (HTTP `claude_code_stop`, `archive_thread`) always
 /// follows the Canceled answer with `stop_agent`, so the marker would

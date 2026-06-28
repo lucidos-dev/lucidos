@@ -50,6 +50,7 @@ pub(crate) fn make_session(process_exited: bool) -> AgentSession {
         current_reasoning_effort: None,
         last_event_at: Arc::new(AtomicI64::new(0)),
         pending_followups: Arc::new(AtomicU32::new(0)),
+        question_resume_pending: false,
         tools_in_flight: Arc::new(AtomicI32::new(0)),
         coding_agent: crate::runtime::CodingAgent::ClaudeCode,
     }

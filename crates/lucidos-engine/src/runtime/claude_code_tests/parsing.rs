@@ -283,6 +283,35 @@ fn parse_stream_event_emits_liveness() {
     );
 }
 
+// A `thinking_delta` carries plaintext reasoning that exists ONLY on the live
+// stream (the persisted JSONL keeps just an encrypted signature). The parser must
+// extract it as a `Thought` AND still emit the `StreamActivity` ping so the
+// watchdog contract is unchanged.
+#[test]
+fn parse_stream_event_extracts_thinking_delta_and_keeps_liveness() {
+    let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","text":"Let me reason"}}}"#;
+    let events = parse_line(line);
+    match &events[..] {
+        [AgentEvent::Thought { text }, AgentEvent::StreamActivity] => {
+            assert_eq!(text, "Let me reason");
+        }
+        other => panic!("expected [Thought, StreamActivity], got {:?}", other),
+    }
+}
+
+// An empty thinking delta must not emit a Thought (no empty "Thinking" steps),
+// but the liveness ping is still emitted.
+#[test]
+fn parse_stream_event_empty_thinking_delta_is_liveness_only() {
+    let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","text":""}}}"#;
+    let events = parse_line(line);
+    assert!(
+        matches!(&events[..], [AgentEvent::StreamActivity]),
+        "empty thinking_delta must yield only StreamActivity, got {:?}",
+        events
+    );
+}
+
 #[test]
 fn parse_result() {
     let line = r#"{"type":"result","result":"Done.","duration_ms":1234}"#;

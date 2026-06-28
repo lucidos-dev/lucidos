@@ -237,7 +237,10 @@ impl OpenAiProvider {
                     )?;
                     if content.len() > prev_len {
                         if let Some(cb) = on_token {
-                            cb(&content[prev_len..]);
+                            // Floor defensively — `prev_len` is a byte length
+                            // captured before the chunk appended, so a future
+                            // accumulator change could leave it mid-codepoint.
+                            cb(&content[content.floor_char_boundary(prev_len)..]);
                         }
                     }
                     if done {

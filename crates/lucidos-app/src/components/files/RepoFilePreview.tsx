@@ -83,6 +83,8 @@ export function sidebarStateFromDiff(diff: Loadable<RepoDiff>): SidebarState {
  *  mobile and a heavily-collapsed content pane fall back to today's behavior. */
 export function RepoFilePreviewWithSidebar(props: Props) {
   const isActiveLayout = props.layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
+  // Delay the sidebar skeleton (300ms) so a fast diff load never flashes it.
+  const showSidebarLoading = useDelayedLoading(repoDiff.value);
   if (!isActiveLayout) return null;
 
   const sidebar = sidebarStateFromDiff(repoDiff.value);
@@ -94,7 +96,7 @@ export function RepoFilePreviewWithSidebar(props: Props) {
   return (
     <div class="repo-preview-split">
       <aside class="repo-preview-split-sidebar">
-        {sidebar.kind === 'loading' && (
+        {sidebar.kind === 'loading' && showSidebarLoading && (
           <div class="repo-preview-sidebar-state loading-skeleton" data-state="loading">
             Loading changed files…
           </div>

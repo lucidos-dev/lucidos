@@ -30,10 +30,11 @@ vi.hoisted(() => {
 import { makeThreadState } from './threads-test-helpers';
 import { type ThreadState } from '../thread-events';
 import { archiveThread } from '../../api/threads';
+import { putComposeOnThread } from '../../api/client';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { drawerOpen } from '../../components/layout/Drawer';
-import { _resetComposeDraftsForTesting } from '../composeDrafts';
-import { ALL_CHANNELS, archivingThreadIds, drawerView, focusedThreadId, generatedTitleIds, getCurrentThreads, mobileView, resetCodingAgentPendingPreferences, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, threadSearchQuery, threadSearchResults, toasts } from '../store';
+import { _resetComposeDraftsForTesting, draftPresentThreadIds, getDraft } from '../composeDrafts';
+import { ALL_CHANNELS, archivingThreadIds, confirmState, drawerView, focusedThreadId, generatedTitleIds, getCurrentThreads, mobileView, resetCodingAgentPendingPreferences, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, threadSearchQuery, threadSearchResults, toasts } from '../store';
 import { upsertThread } from './thread-loading';
 import { handleThreadEvent } from './thread-sync';
 import { focusThread, handleArchiveThread } from './threads';
@@ -76,6 +77,10 @@ beforeEach(() => {
   threadMap.value = new Map();
   _resetComposeDraftsForTesting();
   focusedThreadId.value = null;
+  // Desktop viewport by default (mobileView is a mobile-only concept); the
+  // mobile-specific test below opts into 375. Reset here so a prior mobile test
+  // can't leak its viewport into the next.
+  (globalThis as any).innerWidth = 1024;
   mobileView.value = 'thread';
   threadDrawerOpen.value = false;
   drawerOpen.value = false;
@@ -115,7 +120,10 @@ describe('handleArchiveThread', () => {
     expect(focusedThreadId.value).toBe('t2');
   });
 
-  it('unfocuses and resets mobileView when no more review threads remain', async () => {
+  it('mobile: unfocuses and swipes to the thread pane when no more review threads remain', async () => {
+    // mobileView is a mobile-only concept, so this lands-on-compose behavior is
+    // a mobile scenario. unfocusThread → revealThreadPane navigates to 'thread'.
+    (globalThis as any).innerWidth = 375;
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
       meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
@@ -1078,5 +1086,175 @@ describe('handleArchiveThread — 409 error toasts', () => {
     seedReviewThread();
     const message = await archiveAndGetToast(new ApiError(500, 'Internal Server Error'));
     expect(message).toBe('Failed to archive thread: 500 Internal Server Error');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handleArchiveThread — unsent draft confirm
+// ---------------------------------------------------------------------------
+// Archiving a thread that carries an unsent reply draft asks whether to discard
+// the draft too. "Keep draft" (OK) archives and leaves the draft; "Discard
+// draft" (extraAction) archives and clears it once the API succeeds;
+// Cancel/Escape aborts the archive. A thread with no draft skips the confirm.
+// ---------------------------------------------------------------------------
+
+describe('handleArchiveThread — unsent draft confirm', () => {
+  beforeEach(() => {
+    toasts.value = [];
+    confirmState.value = { visible: false, message: '', okLabel: 'Delete' };
+    (putComposeOnThread as ReturnType<typeof vi.fn>).mockClear().mockResolvedValue(undefined);
+  });
+
+  function seedDraftThread(): void {
+    const map = new Map<string, ThreadState>();
+    map.set('t', makeThreadState('t', {
+      meta: { id: 't', title: 'Drafted', channel: 'chat', status: 'idle', messageCount: 1, section: 'inbox', composeText: 'half-written reply' },
+    }));
+    threadMap.value = map;
+    focusThread('t');
+  }
+
+  /** Mimic ConfirmDialog's extraAction button: run onClick, then resolve(false). */
+  function clickDiscard(): void {
+    confirmState.value.extraAction?.onClick();
+    confirmState.value.resolve?.(false);
+  }
+
+  it('archives directly, with no confirm, when the thread has no draft', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t', makeThreadState('t', {
+      meta: { id: 't', title: 'No draft', channel: 'chat', status: 'idle', messageCount: 1, section: 'inbox' },
+    }));
+    threadMap.value = map;
+    focusThread('t');
+    (archiveThread as ReturnType<typeof vi.fn>).mockClear();
+
+    await handleArchiveThread('t');
+
+    expect(confirmState.value.visible).toBe(false);
+    expect(archiveThread).toHaveBeenCalledWith('t');
+  });
+
+  it('shows the discard-draft confirm with the right labels when the thread has a draft', async () => {
+    seedDraftThread();
+    (archiveThread as ReturnType<typeof vi.fn>).mockClear();
+
+    const pending = handleArchiveThread('t');
+    expect(confirmState.value.visible).toBe(true);
+    expect(confirmState.value.message).toBe('This thread has an unsent draft. Discard it too?');
+    expect(confirmState.value.okLabel).toBe('Keep draft');
+    expect(confirmState.value.extraAction?.label).toBe('Discard draft');
+
+    confirmState.value.resolve?.(false); // Cancel — tidy the pending promise
+    await pending;
+    expect(archiveThread).not.toHaveBeenCalled();
+  });
+
+  it('keeps the draft and archives when the user picks "Keep draft"', async () => {
+    seedDraftThread();
+    (archiveThread as ReturnType<typeof vi.fn>).mockClear();
+
+    const pending = handleArchiveThread('t');
+    expect(confirmState.value.visible).toBe(true);
+    confirmState.value.resolve?.(true); // OK = "Keep draft"
+    await pending;
+
+    expect(archiveThread).toHaveBeenCalledWith('t');
+    expect(getDraft('t').text).toBe('half-written reply');
+    expect(draftPresentThreadIds.value.has('t')).toBe(true);
+    expect(putComposeOnThread).not.toHaveBeenCalled(); // draft left untouched
+  });
+
+  it('discards the draft and archives when the user picks "Discard draft"', async () => {
+    seedDraftThread();
+    (archiveThread as ReturnType<typeof vi.fn>).mockClear();
+
+    const pending = handleArchiveThread('t');
+    expect(confirmState.value.visible).toBe(true);
+    clickDiscard();
+    await pending;
+
+    expect(archiveThread).toHaveBeenCalledWith('t');
+    expect(getDraft('t').text).toBe('');
+    expect(draftPresentThreadIds.value.has('t')).toBe(false);
+    expect(putComposeOnThread).toHaveBeenCalledWith('t', '', [], null); // server row cleared
+  });
+
+  it('aborts the archive entirely on Cancel, leaving the draft intact', async () => {
+    seedDraftThread();
+    (archiveThread as ReturnType<typeof vi.fn>).mockClear();
+
+    const pending = handleArchiveThread('t');
+    expect(confirmState.value.visible).toBe(true);
+    confirmState.value.resolve?.(false); // Cancel / Escape — no extraAction click
+    await pending;
+
+    expect(archiveThread).not.toHaveBeenCalled();
+    expect(threadMap.value.get('t')?.meta.section).toBe('inbox');
+    expect(getDraft('t').text).toBe('half-written reply');
+    expect(putComposeOnThread).not.toHaveBeenCalled();
+  });
+
+  it('pluralizes the prompt and clears every family draft on discard', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('parent', makeThreadState('parent', {
+      meta: { id: 'parent', title: 'Parent', channel: 'chat', status: 'idle', messageCount: 1, section: 'inbox', composeText: 'parent draft' },
+    }));
+    map.set('child', makeThreadState('child', {
+      meta: { id: 'child', title: 'Child', channel: 'chat', status: 'idle', messageCount: 1, section: 'inbox', parentThreadId: 'parent', composeText: 'child draft' },
+    }));
+    threadMap.value = map;
+    focusThread('parent');
+    (archiveThread as ReturnType<typeof vi.fn>).mockClear();
+
+    const pending = handleArchiveThread('parent');
+    expect(confirmState.value.visible).toBe(true);
+    expect(confirmState.value.message).toBe('These threads have unsent drafts. Discard them too?');
+    expect(confirmState.value.okLabel).toBe('Keep drafts');
+    expect(confirmState.value.extraAction?.label).toBe('Discard drafts');
+    clickDiscard();
+    await pending;
+
+    expect(getDraft('parent').text).toBe('');
+    expect(getDraft('child').text).toBe('');
+    expect(draftPresentThreadIds.value.has('parent')).toBe(false);
+    expect(draftPresentThreadIds.value.has('child')).toBe(false);
+    expect(putComposeOnThread).toHaveBeenCalledWith('parent', '', [], null);
+    expect(putComposeOnThread).toHaveBeenCalledWith('child', '', [], null);
+  });
+
+  it('preserves the draft when the archive fails after "Discard draft" was chosen', async () => {
+    seedDraftThread();
+    (archiveThread as ReturnType<typeof vi.fn>).mockClear().mockRejectedValueOnce(new Error('boom'));
+
+    const pending = handleArchiveThread('t');
+    clickDiscard();
+    await pending;
+
+    // Archive rejected → rollback; the draft survives (cleared only on success).
+    expect(threadMap.value.get('t')?.meta.section).toBe('inbox');
+    expect(getDraft('t').text).toBe('half-written reply');
+    expect(draftPresentThreadIds.value.has('t')).toBe(true);
+    expect(putComposeOnThread).not.toHaveBeenCalled();
+  });
+
+  it('restores the draft locally when the compose PUT fails after discard', async () => {
+    seedDraftThread();
+    (archiveThread as ReturnType<typeof vi.fn>).mockClear();
+    (putComposeOnThread as ReturnType<typeof vi.fn>).mockClear().mockRejectedValueOnce(new Error('net'));
+
+    const pending = handleArchiveThread('t');
+    clickDiscard();
+    await pending;
+    // Let the fire-and-forget PUT rejection settle so the rollback runs.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Archive succeeded but the server clear failed → local draft is restored
+    // so it can't silently diverge from the server, and the user is told.
+    expect(archiveThread).toHaveBeenCalledWith('t');
+    expect(getDraft('t').text).toBe('half-written reply');
+    expect(draftPresentThreadIds.value.has('t')).toBe(true);
+    expect(toasts.value.some(t => t.type === 'error')).toBe(true);
   });
 });

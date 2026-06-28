@@ -21,7 +21,7 @@ import { pushNavState } from '../../store/actions/navigation';
 import { getDraft } from '../../store/composeDrafts';
 import { ComposeDestinationRow } from './ComposeDestinationRow';
 import { scrollToBottom, preserveAtBottom } from './scrollState';
-import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon, PinIcon } from '../shared/icons';
+import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon } from '../shared/icons';
 import { BlobImage } from '../shared/BlobImage';
 import { CodingAgentControlMenu, codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
 import { LucidosControlMenu } from './LucidosControlMenu';
@@ -29,7 +29,6 @@ import { TodoListIndicator } from './TodoListPanel';
 import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton, type BannerState } from './WaitingBanner';
 import { composeHasContent, computeMorphMode, computeAnswerActionMode, dispatchSend, computeSubmitMultiCount, findPendingMultiSelectQuestion, findLatestPendingQuestion, shouldClearCanceling, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
 import { SplitButton } from '../shared/SplitButton';
-import { resolveThreadActions } from '../../store/actions/threadActions';
 export * from './prompt-input-helpers';
 import { useFitsInOneRow } from '../../hooks/useFitsInOneRow';
 import { focusIfNeeded, composeHandlers } from './promptFocus';
@@ -124,28 +123,6 @@ function CameraCapture() {
 // yields to the Send button (computeMorphMode reads composeHasContent, which
 // includes pending uploads). Without this, the banner's actions briefly show in
 // place of Send during the upload window for any thread in the review section.
-
-// Pin toggle — pins/unpins the focused thread (internally still the save
-// category: `is_saved` + the `ThreadSaved`/`ThreadUnsaved` events). Lives among
-// the left header icons (not the right action cluster) and reads as a pin: a
-// filled pin means pinned, an outline pin means not pinned. `saved` and
-// `onToggle` come from the save-category TaggedAction so this can never drift
-// from resolveThreadActions (the same selector the close cascade and
-// server-side guards consult). The unpin path confirms internally.
-function PinThreadButton({ saved, onToggle }: { saved: boolean; onToggle: () => void }) {
-  return (
-    <button
-      class={`icon-btn header-icon pin-thread-btn${saved ? ' active' : ''}`}
-      onClick={onToggle}
-      aria-pressed={saved}
-      aria-label={saved ? 'Remove thread from Pinned section' : 'Pin thread'}
-      data-tooltip={saved ? 'Pinned — click to unpin' : 'Pin thread'}
-      data-row-item
-    >
-      <PinIcon filled={saved} />
-    </button>
-  );
-}
 
 export function PromptInput() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -520,19 +497,6 @@ export function PromptInput() {
     !hasContent && waitingState && waitingState.type !== 'canceling'
       ? waitingState
       : null;
-
-  // The pin toggle carries ONLY the save/unsave action — Archive and the
-  // change actions are rendered by WaitingBanner from the same selector. The
-  // save-category action (save vs unsave) is derived from resolveThreadActions
-  // so the pin can never drift from the selector that the close cascade and the
-  // server-side guards also consult. It renders among the left header icons
-  // rather than the right action cluster.
-  const saveAction = tid && focusedThread
-    ? resolveThreadActions(tid).find((a) => a.category === 'save')
-    : undefined;
-  const pinButtonNode = saveAction
-    ? <PinThreadButton saved={saveAction.kind === 'unsave'} onToggle={saveAction.invoke} />
-    : null;
 
   const morphMode = computeMorphMode({
     hasContent: morphHasContent,
@@ -1030,7 +994,6 @@ export function PromptInput() {
               </Overlay>
             </div>
           )}
-          {pinButtonNode}
           <div class={rightClass}>
             {isStacked ? (
               <>

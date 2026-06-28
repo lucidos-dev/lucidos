@@ -61,22 +61,6 @@ export function toggleRepoFolder(path: string): void {
   repoExpandedFolders.value = next;
 }
 
-export function expandAllRepoFolders(): void {
-  if (repoFiles.value.status !== 'loaded') return;
-  const folders = new Set<string>();
-  for (const path of repoFiles.value.data) {
-    const parts = path.split('/');
-    for (let i = 1; i < parts.length; i++) {
-      folders.add(parts.slice(0, i).join('/'));
-    }
-  }
-  repoExpandedFolders.value = folders;
-}
-
-export function collapseAllRepoFolders(): void {
-  repoExpandedFolders.value = new Set();
-}
-
 /** repoFiles is cached; reload it alongside repoChanges so a merge to main
  *  shows up in the Files tree without a manual refresh. */
 export async function refreshRepoView(repoId: string): Promise<void> {

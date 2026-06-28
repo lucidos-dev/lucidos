@@ -294,44 +294,44 @@ async fn get_older_threads_filters_by_app_ids() {
     let (pool, db) = setup_test_db().await;
     let store = EventStore::new(pool.clone());
 
-    let momentum_active = insert_app_thread(&pool, "momentum", 60, false).await;
-    let momentum_archived = insert_app_thread(&pool, "momentum", 90, true).await;
-    let _other = insert_app_thread(&pool, "momentum-autoresearch", 30, false).await;
+    let habit_active = insert_app_thread(&pool, "habit", 60, false).await;
+    let habit_archived = insert_app_thread(&pool, "habit", 90, true).await;
+    let _other = insert_app_thread(&pool, "habit-tracker", 30, false).await;
 
     let cutoff = chrono::Utc::now() + chrono::Duration::hours(1);
     let hits = store
-        .get_older_threads(cutoff, 10, None, None, None, Some(&["momentum".to_string()]))
+        .get_older_threads(cutoff, 10, None, None, None, Some(&["habit".to_string()]))
         .await
         .expect("get_older_threads app filtered");
 
     let returned: std::collections::HashSet<&str> =
         hits.iter().map(|t| t.thread_id.as_str()).collect();
-    assert_eq!(hits.len(), 2, "both momentum threads (active + archived) match");
-    assert!(returned.contains(momentum_active.to_string().as_str()));
+    assert_eq!(hits.len(), 2, "both habit threads (active + archived) match");
+    assert!(returned.contains(habit_active.to_string().as_str()));
     assert!(
-        returned.contains(momentum_archived.to_string().as_str()),
+        returned.contains(habit_archived.to_string().as_str()),
         "archived app thread must be fetched, not excluded"
     );
 
     teardown_test_db(&db).await;
 }
 
-/// The app-id predicate must not prefix-match: selecting "momentum" must NOT
-/// pull in "momentum-autoresearch".
+/// The app-id predicate must not prefix-match: selecting "habit" must NOT
+/// pull in "habit-tracker".
 #[tokio::test]
 async fn get_older_threads_app_ids_exact_segment_match() {
     let (pool, db) = setup_test_db().await;
     let store = EventStore::new(pool.clone());
 
-    insert_app_thread(&pool, "momentum-autoresearch", 30, false).await;
+    insert_app_thread(&pool, "habit-tracker", 30, false).await;
 
     let cutoff = chrono::Utc::now() + chrono::Duration::hours(1);
     let hits = store
-        .get_older_threads(cutoff, 10, None, None, None, Some(&["momentum".to_string()]))
+        .get_older_threads(cutoff, 10, None, None, None, Some(&["habit".to_string()]))
         .await
         .expect("get_older_threads app filtered");
 
-    assert_eq!(hits.len(), 0, "'momentum' must not match 'momentum-autoresearch'");
+    assert_eq!(hits.len(), 0, "'habit' must not match 'habit-tracker'");
 
     teardown_test_db(&db).await;
 }
@@ -349,8 +349,8 @@ async fn get_filter_facets_returns_distinct_sessions() {
     insert_cc_repo_thread(&pool, &repo_a.to_string(), 60).await;
     insert_cc_repo_thread(&pool, &repo_a.to_string(), 30).await; // same repo twice → one facet
     insert_trigger_thread(&pool, "trig-a", "Trig A", 60).await;
-    insert_app_thread(&pool, "momentum", 90, true).await; // archived-only → still a facet
-    insert_app_thread(&pool, "momentum-autoresearch", 30, false).await;
+    insert_app_thread(&pool, "habit", 90, true).await; // archived-only → still a facet
+    insert_app_thread(&pool, "habit-tracker", 30, false).await;
 
     let facets = store.get_filter_facets().await.expect("get_filter_facets");
 
@@ -369,10 +369,10 @@ async fn get_filter_facets_returns_distinct_sessions() {
     let app_ids: std::collections::HashSet<&str> =
         facets.apps.iter().filter_map(|f| f.id.as_deref()).collect();
     assert!(
-        app_ids.contains("momentum"),
+        app_ids.contains("habit"),
         "archived-only app must still be a facet"
     );
-    assert!(app_ids.contains("momentum-autoresearch"));
+    assert!(app_ids.contains("habit-tracker"));
 
     teardown_test_db(&db).await;
 }

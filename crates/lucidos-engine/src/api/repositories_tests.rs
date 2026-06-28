@@ -243,12 +243,12 @@ fn parse_range_basic() {
 #[test]
 fn extract_app_id_matches_frontend_validation() {
     assert_eq!(
-        super::extract_app_id("/Users/me/ws/data/apps/momentum-autoresearch"),
-        Some("momentum-autoresearch".to_string())
+        super::extract_app_id("/Users/me/ws/data/apps/habit-tracker"),
+        Some("habit-tracker".to_string())
     );
     assert_eq!(
-        super::extract_app_id("/ws/data/apps/momentum/"),
-        Some("momentum".to_string())
+        super::extract_app_id("/ws/data/apps/habit-tracker/"),
+        Some("habit-tracker".to_string())
     );
     assert_eq!(
         super::extract_app_id("data/apps/habit-tracker"),
@@ -573,7 +573,7 @@ async fn diff_base_is_local_main_when_origin_is_behind() {
 /// branch's true fork point. Otherwise the three-dot merge-base collapses to an
 /// ancient common ancestor and the diff balloons with unrelated churn.
 ///
-/// Regression for the `user-acquisition` migration report: the migration system
+/// Regression for the `example-repo` migration report: the migration system
 /// committed to the user's local `main` ("secrets transfer", "migration notice"
 /// commits) and rewrote its history so the PR branch's fork point was no longer
 /// an ancestor of local `main`. Lucidos diffed against local `main` and showed
@@ -716,18 +716,18 @@ async fn diff_base_falls_back_to_origin_when_local_main_diverged() {
     let wt_dir = tempfile::tempdir().unwrap();
     let wt_path = wt_dir.path().join("wt");
     run(
-        &["worktree", "add", "-b", "apps/momentum", wt_path.to_str().unwrap(), "main"],
+        &["worktree", "add", "-b", "apps/habit-tracker", wt_path.to_str().unwrap(), "main"],
         ws_path,
     )
     .await;
 
-    let app_dir = wt_path.join("data/apps/momentum");
+    let app_dir = wt_path.join("data/apps/habit-tracker");
     tokio::fs::create_dir_all(&app_dir).await.unwrap();
     tokio::fs::write(app_dir.join("manifest.json"), "{}\n")
         .await
         .unwrap();
 
-    let artifacts_dir = wt_path.join("data/artifacts/momentum");
+    let artifacts_dir = wt_path.join("data/artifacts/habit-tracker");
     tokio::fs::create_dir_all(&artifacts_dir).await.unwrap();
     tokio::fs::write(artifacts_dir.join("notes.md"), "out of scope\n")
         .await
@@ -736,14 +736,14 @@ async fn diff_base_falls_back_to_origin_when_local_main_diverged() {
     run(&["add", "."], &wt_path).await;
     run(&["commit", "-q", "-m", "app + stray artifacts"], &wt_path).await;
 
-    let diff = super::diff_via_worktree(&wt_path, Some("data/apps/momentum"))
+    let diff = super::diff_via_worktree(&wt_path, Some("data/apps/habit-tracker"))
         .await
         .expect("diff_via_worktree should succeed with app pathspec");
 
     let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
     assert_eq!(
         paths,
-        vec!["data/apps/momentum/manifest.json"],
+        vec!["data/apps/habit-tracker/manifest.json"],
         "expected only in-scope app file, got {:?} — out-of-scope edits \
          leaked into the response",
         paths
@@ -757,7 +757,7 @@ async fn diff_base_falls_back_to_origin_when_local_main_diverged() {
     let unscoped_paths: Vec<&str> =
         unscoped.files.iter().map(|f| f.path.as_str()).collect();
     assert!(
-        unscoped_paths.contains(&"data/artifacts/momentum/notes.md"),
+        unscoped_paths.contains(&"data/artifacts/habit-tracker/notes.md"),
         "control: unscoped diff should include the out-of-scope file, \
          got {:?}",
         unscoped_paths

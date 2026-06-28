@@ -81,7 +81,9 @@ pub(in crate::api) async fn list_threads(
     let store = state.engine.event_store();
     let (saved_result, recent_result, active_result, composing_result, archive_count_result) = tokio::join!(
         store.get_saved_threads(),
-        store.get_recent_threads(15),
+        // Global newest-`created_at` archive slice (no longer per-source); 30 fills
+        // the initial Archive view comfortably before scroll-pagination takes over.
+        store.get_recent_threads(30),
         store.get_threads_by_ids(&active_id_strings),
         store.get_composing_threads(),
         // Unfiltered total for the first-paint badge; the frontend re-fetches a

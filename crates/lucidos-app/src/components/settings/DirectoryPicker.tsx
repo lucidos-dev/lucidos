@@ -3,6 +3,7 @@ import type { ComponentChildren } from 'preact';
 import { browseDirectories, type BrowseResult } from '../../api/client';
 import { toFailed, type Loadable } from '../../store/types';
 import { Overlay } from '../shared/Overlay';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 
 interface DirectoryPickerProps {
   onSelect: (path: string) => void;
@@ -13,6 +14,7 @@ interface DirectoryPickerProps {
  *  states so loading / failed are visually distinct from loaded-empty. */
 export function directoryPickerBody({
   data,
+  showLoading,
   currentPath,
   selectedIndex,
   onGoUp,
@@ -20,25 +22,31 @@ export function directoryPickerBody({
   onHoverIndex,
 }: {
   data: Loadable<BrowseResult>;
+  showLoading: boolean;
   currentPath: string;
   selectedIndex: number;
   onGoUp: () => void;
   onSelectDir: (dir: string) => void;
   onHoverIndex: (idx: number) => void;
 }): ComponentChildren {
-  if (data.status === 'not-loaded' || data.status === 'loading') {
-    return (
-      <div class="dir-picker-empty loading-skeleton" data-state="loading">
-        Loading...
-      </div>
-    );
-  }
   if (data.status === 'failed') {
     return (
       <div class="dir-picker-empty dir-picker-error" data-state="failed">
         {data.error}
       </div>
     );
+  }
+  // Delay (300ms) — only show the skeleton once the browse has been pending past
+  // the delay, so a fast browse doesn't flash "Loading…".
+  if (showLoading) {
+    return (
+      <div class="dir-picker-empty loading-skeleton" data-state="loading">
+        Loading...
+      </div>
+    );
+  }
+  if (data.status !== 'loaded') {
+    return null; // pre-delay window — show nothing yet
   }
   const dirs = data.data.directories;
   const showParent = currentPath !== '/';
@@ -86,6 +94,7 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
   const [editingPath, setEditingPath] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const showLoading = useDelayedLoading(data);
 
   useEffect(() => {
     setData({ status: 'loading' });
@@ -180,6 +189,7 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
         }} tabIndex={0}>
           {directoryPickerBody({
             data,
+            showLoading,
             currentPath,
             selectedIndex,
             onGoUp: goUp,

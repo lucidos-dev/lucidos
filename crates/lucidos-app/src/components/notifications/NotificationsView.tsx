@@ -17,6 +17,8 @@ import { loadedOr } from '../../store/types';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
+import { ListSkeleton } from '../shared/ListSkeleton';
+import { LoadingFade } from '../shared/LoadingFade';
 
 export function NotificationsView() {
   const sentinelRef = useRef<HTMLDivElement>(null);
@@ -79,45 +81,49 @@ export function NotificationsView() {
       </div>
       {loadable.status === 'failed' ? (
         <LoadableError noun="notifications" error={loadable.error} />
-      ) : loadable.status !== 'loaded' ? (
-        showLoading ? <div class="loading-spinner" /> : null
-      ) : items.length === 0 ? (
-        <div class="empty-state">{emptyMessage}</div>
       ) : (
-        <>
-          {items.map((n) => {
-            const date = new Date(n.created_at);
-            const timeAgo = formatTimeAgo(date);
-            const dateStr = formatNotificationDate(date);
-            return (
-              <button
-                key={n.id}
-                class={`notification-item ${n.read ? '' : 'unread'}`}
-                onClick={() => void viewNotification(n.id)}
-              >
-                <div class="title notification-title">
-                  <span class="trigger-icon">📋</span>
-                  {n.title}
-                </div>
-                <div class="notification-summary">
-                  {stripHtml(renderMarkdown(n.message))}
-                </div>
-                <div class="notification-time">
-                  {timeAgo} · {dateStr}
-                </div>
-              </button>
-            );
-          })}
-          {hasMore && (
-            <div
-              ref={sentinelRef}
-              class="dropdown-panel-loading-more"
-              style={loadingMore ? undefined : 'opacity: 0.4'}
-            >
-              {loadingMore ? 'Loading more...' : 'Scroll for more'}
-            </div>
-          )}
-        </>
+        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+          {loadable.status === 'loaded' ? (
+            items.length === 0 ? (
+              <div class="empty-state">{emptyMessage}</div>
+            ) : (
+              <>
+                {items.map((n) => {
+                  const date = new Date(n.created_at);
+                  const timeAgo = formatTimeAgo(date);
+                  const dateStr = formatNotificationDate(date);
+                  return (
+                    <button
+                      key={n.id}
+                      class={`notification-item ${n.read ? '' : 'unread'}`}
+                      onClick={() => void viewNotification(n.id)}
+                    >
+                      <div class="title notification-title">
+                        <span class="trigger-icon">📋</span>
+                        {n.title}
+                      </div>
+                      <div class="notification-summary">
+                        {stripHtml(renderMarkdown(n.message))}
+                      </div>
+                      <div class="notification-time">
+                        {timeAgo} · {dateStr}
+                      </div>
+                    </button>
+                  );
+                })}
+                {hasMore && (
+                  <div
+                    ref={sentinelRef}
+                    class="dropdown-panel-loading-more"
+                    style={loadingMore ? undefined : 'opacity: 0.4'}
+                  >
+                    {loadingMore ? 'Loading more...' : 'Scroll for more'}
+                  </div>
+                )}
+              </>
+            )
+          ) : null}
+        </LoadingFade>
       )}
     </div>
   );

@@ -26,7 +26,7 @@ describe('MessageOrigin type', () => {
 
   it('workspace carries optional mode field', () => {
     const o: MessageOrigin = {
-      kind: 'workspace', workspace: 'personal', mode: 'agent',
+      kind: 'workspace', workspace: 'myws', mode: 'agent',
     };
     if (o.kind === 'workspace') expect(o.mode).toBe('agent');
   });

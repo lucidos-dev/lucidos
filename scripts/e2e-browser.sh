@@ -108,21 +108,59 @@ done
 # for spawning a coding-agent thread) so newly added specs classify themselves;
 # if the set can't be split we fall back to a single run. Other projects always
 # run in one pass.
+# Run a list of spec files through CMD in fresh-process chunks of CHUNK_SIZE files
+# each. Each `npx playwright test` invocation launches a fresh browser, so
+# WebKit's per-context WebContent memory accumulation RESETS between chunks —
+# keeping host pressure below the threshold that makes the first navigation of a
+# fresh page cold-start-stall (the mobile-webkit nav-wedge, reproduced at
+# retries:0; root cause + rationale in
+# docs/plans/2026-06-27-mobile-webkit-shard-contention.md). Coverage is identical
+# to one big pass — only the process boundaries change. Exit codes aggregate, so
+# any failed chunk fails the whole. Chunk size is overridable via
+# LUCIDOS_E2E_WEBKIT_CHUNK for tuning without a code change.
+run_specs_chunked() {
+    local project="$1"; shift
+    local label="$1"; shift
+    local specs=("$@")
+    local total="${#specs[@]}"
+    local size="${LUCIDOS_E2E_WEBKIT_CHUNK:-8}"
+    local rc=0 start=0 chunk_no=0 nchunks
+    nchunks=$(( (total + size - 1) / size ))
+    while [ "$start" -lt "$total" ]; do
+        chunk_no=$(( chunk_no + 1 ))
+        local chunk=("${specs[@]:start:size}")
+        echo "── mobile-webkit $label chunk $chunk_no/$nchunks: ${#chunk[@]} specs (fresh browser) ──"
+        # Per-chunk --output dir: Playwright wipes its outputDir at the start of
+        # every invocation, so without this each chunk would erase the previous
+        # chunk's failure traces/screenshots (only the LAST chunk's would survive).
+        # Isolating them keeps every chunk's artifacts for triage.
+        "${CMD[@]}" --project="$project" --output="test-results/webkit-$label-$chunk_no" "${chunk[@]}" || rc=$?
+        start=$(( start + size ))
+    done
+    return "$rc"
+}
+
 run_browser_project() {
     local project="$1"
     local rc=0
     local f base
     local cc_specs=()
     local nav_specs=()
-    # Only phase-split the FULL mobile-webkit run. When the caller pinned a
-    # spec/file filter (-f <file>, a positional, or -- args), honor it verbatim:
-    # appending the whole spec list would OR the filter away (Playwright unions
-    # positional filters), running the entire suite instead of the requested
-    # subset. Targeted runs fall through to the single-pass call below.
+    # Only shard the FULL mobile-webkit run. When the caller pinned a spec/file
+    # filter (-f <file>, a positional, or -- args), honor it verbatim: appending
+    # the whole spec list would OR the filter away (Playwright unions positional
+    # filters), running the entire suite instead of the requested subset. Targeted
+    # runs fall through to the single-pass call below.
     if [ "$project" = "mobile-webkit" ] && [ -z "$TEST_FILE" ] && [ "${#PW_ARGS[@]}" -eq 0 ]; then
         for f in e2e/*.spec.ts; do
             [ -e "$f" ] || continue
             base="$(basename "$f")"
+            # Skip *-desktop.spec.ts: the mobile-webkit project testIgnores them
+            # (playwright.config.ts), so they run zero tests here. Including them
+            # was harmless in the single-pass run, but a SHARD landing entirely on
+            # ignored files would make `playwright test` exit "no tests found" (rc 1)
+            # and fail the chunk spuriously. Excluding them keeps every chunk real.
+            case "$base" in *-desktop.spec.ts) continue ;; esac
             if grep -q "pickComposeDestination" "$f" 2>/dev/null; then
                 cc_specs+=("$base")
             else
@@ -130,10 +168,16 @@ run_browser_project() {
             fi
         done
         if [ "${#nav_specs[@]}" -gt 0 ] && [ "${#cc_specs[@]}" -gt 0 ]; then
-            echo "── mobile-webkit phase 1/2: ${#nav_specs[@]} navigation specs (quiet engine) ──"
-            "${CMD[@]}" --project="$project" "${nav_specs[@]}" || rc=$?
-            echo "── mobile-webkit phase 2/2: ${#cc_specs[@]} CC-subprocess specs ──"
-            "${CMD[@]}" --project="$project" "${cc_specs[@]}" || rc=$?
+            # Nav specs first (quiet engine), then CC-subprocess specs — each phase
+            # sharded into fresh-process chunks so WebKit memory can't accumulate
+            # across the whole suite into the cold-start-stall zone.
+            local nav_rc=0 cc_rc=0
+            echo "── mobile-webkit phase 1/2: ${#nav_specs[@]} navigation specs (sharded) ──"
+            run_specs_chunked "$project" "nav" "${nav_specs[@]}" || nav_rc=$?
+            echo "── mobile-webkit phase 2/2: ${#cc_specs[@]} CC-subprocess specs (sharded) ──"
+            run_specs_chunked "$project" "CC" "${cc_specs[@]}" || cc_rc=$?
+            [ "$nav_rc" -ne 0 ] && rc="$nav_rc"
+            [ "$cc_rc" -ne 0 ] && rc="$cc_rc"
             return "$rc"
         fi
     fi
@@ -141,7 +185,16 @@ run_browser_project() {
     return "$rc"
 }
 
-if [ -n "$USER_PINNED_PROJECT" ]; then
+if [ -n "$USE_WEBKIT" ] && [ -z "$TEST_FILE" ] && [ "${#PW_ARGS[@]}" -eq 0 ]; then
+    # `--webkit` with no filter: route through run_browser_project so a manual
+    # webkit run gets the SAME sharding/phase-split as the nightly full run (and so
+    # the sharding is validatable in isolation). A filtered `--webkit -f X` (or any
+    # `--`/positional arg) still falls through to the single-pass branch below —
+    # run_browser_project's own guard would single-pass it anyway, but keeping it
+    # here avoids appending --project twice.
+    run_browser_project mobile-webkit
+    exit $?
+elif [ -n "$USER_PINNED_PROJECT" ]; then
     [ -n "$USE_WEBKIT" ] && CMD+=(--project=mobile-webkit)
     "${CMD[@]}"
 else

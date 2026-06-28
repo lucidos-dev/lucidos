@@ -43,6 +43,11 @@ pub struct TriggerInfo {
     /// side-effect categories it may perform unattended. Empty = none granted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub side_effect_grant: Vec<SideEffectCategory>,
+    /// Plugin provenance (ADR 0019) — the id of the *plugin* that auto-registered
+    /// this trigger, or absent for a user-created one. Drives the Triggers
+    /// panel's "from \<plugin\>" chip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
 }
 
 impl TriggerInfo {
@@ -72,6 +77,7 @@ impl TriggerInfo {
             go_to_review: config.go_to_review,
             group_id: config.group_id.clone(),
             side_effect_grant: config.side_effect_grant.clone(),
+            plugin_id: config.plugin_id.clone(),
         }
     }
 }

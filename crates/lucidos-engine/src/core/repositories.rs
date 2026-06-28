@@ -58,6 +58,7 @@ impl RepositoryStore {
     ///     deleted first so the unique `path` is free for the deterministic row;
     ///  2. the same git history already registered at a *different* path (same
     ///     deterministic id) — the id-keyed `ON CONFLICT` moves it to `path`.
+    ///
     /// Result: exactly one row, keyed by the deterministic id, at the current path.
     pub async fn add(
         pool: &PgPool,

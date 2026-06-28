@@ -71,6 +71,14 @@ function removeFromUnread(id: string): void {
   unreadNotifications.value = { status: 'loaded', data: set.data.filter((n) => n.id !== id) };
 }
 
+/** True when the inbox browse list is loaded AND already holds this row — i.e.
+ *  the detail's prev/next chevrons (which walk `notifications`) have a list with
+ *  this notification in it to step from. */
+function browseListHas(id: string): boolean {
+  const list = notifications.value;
+  return list.status === 'loaded' && list.data.some((n) => n.id === id);
+}
+
 /** Flip a single row to read in the inbox browse list (display only — the badge
  *  is driven by the unread set, not this list). No-op if absent / already read. */
 function markBrowseRowRead(id: string): void {
@@ -231,6 +239,17 @@ export async function viewNotification(id: string): Promise<void> {
       panelOverlay.value = { type: 'notification-detail', notification };
       revealContentPane();
       pushNavState();
+      // Deep-link / push-tap opens land here without the inbox browse list ever
+      // having been loaded (the user never opened the Notifications panel), so
+      // the detail's prev/next chevrons would sit permanently disabled — they
+      // walk `notifications` and resolve currentIndex === -1. Load it now when it
+      // doesn't already hold this row. Load BEFORE marking read: the just-pushed
+      // row is still unread server-side, so it's returned under either filter
+      // ('all' or 'unread'); the subsequent mark-read only flips the loaded row
+      // in place (markBrowseRowRead never removes it), so currentIndex stays
+      // valid and the chevrons can walk the inbox. In-app opens from the panel
+      // already have the list loaded with this row, so they skip the fetch.
+      if (!browseListHas(id)) await loadNotifications();
       markReadOptimistic(id);
     }
   } catch (error) {
@@ -243,36 +262,67 @@ export async function viewNotification(id: string): Promise<void> {
  *  overlay write the detail component must not do inline. Replaces the current
  *  nav entry in place (`replaceNavState`) so the whole detail-viewing session
  *  is a single history slot and panel Back returns to the inbox list, not
- *  through each notification stepped over. Returns the loaded id, or null on
- *  failure / unknown target. */
-export async function navigateToNotification(targetId: string): Promise<string | null> {
+ *  through each notification stepped over. Returns the stepped-to id, or null
+ *  when the target isn't in the loaded list.
+ *
+ *  Renders straight from the in-memory list row — no detail GET. The inbox list
+ *  query selects the IDENTICAL columns the single-notification GET does (id,
+ *  title, message, tap, event_id, thread_id, app_id, read, created_at), so the
+ *  loaded row IS the full notification; re-fetching it added a network
+ *  round-trip of lag to every chevron tap (badly felt on an iOS PWA over a slow
+ *  link). Mark-read is fire-and-forget via `markReadOptimistic` (optimistic
+ *  local cache update + best-effort POST) — it never gated rendering and is a
+ *  no-op on already-read rows, so the "don't POST for already-read" optimization
+ *  is preserved by the `!target.read` guard. */
+export function navigateToNotification(targetId: string): string | null {
   const list = notifications.value;
   const target = list.status === 'loaded'
     ? list.data.find((n) => n.id === targetId)
     : undefined;
   if (!target) return null;
 
-  try {
-    // Only POST the read flip when it would change something — clicking
-    // through already-read entries is the common case and used to round-trip
-    // for nothing.
-    const reads = target.read
-      ? [Promise.resolve(null), getNotification(target.id)] as const
-      : [markNotificationRead(target.id), getNotification(target.id)] as const;
-    const [, full] = await Promise.all(reads);
-    if (!full) return null;
+  panelOverlay.value = { type: 'notification-detail', notification: target };
+  replaceNavState();
+  if (!target.read) markReadOptimistic(target.id);
+  return target.id;
+}
 
-    panelOverlay.value = { type: 'notification-detail', notification: full };
-    replaceNavState();
-    if (!target.read) {
-      markBrowseRowRead(target.id);
-      removeFromUnread(target.id);
-    }
-    return full.id;
-  } catch (error) {
-    showToast('Failed to load notification: ' + errorDetail(error), 'error');
-    return null;
+/** Walk the panel detail to the adjacent notification (prev = -1 / next = +1).
+ *  Resolves the target by offset within the loaded inbox list, but in the
+ *  "older" (next) direction it transparently pulls the next page first when the
+ *  current item is the last loaded one and the server has more — so chevron
+ *  navigation walks the ENTIRE inbox, not just the first loaded page. The "newer"
+ *  (prev) direction needs no load-more: the list is always loaded newest-first,
+ *  so index 0 is the newest notification and there is nothing newer to fetch.
+ *  Returns the loaded id, or null when there is no adjacent notification. */
+export async function navigateAdjacentNotification(
+  currentId: string,
+  direction: -1 | 1,
+): Promise<string | null> {
+  let list = notifications.value;
+  if (list.status !== 'loaded') return null;
+  let index = list.data.findIndex((n) => n.id === currentId);
+  if (index < 0) return null;
+  let targetIndex = index + direction;
+
+  // Stepping older past the loaded boundary: fetch the next page, then re-resolve
+  // (loadMoreNotifications appends, so the current item's index is unchanged, but
+  // re-find defensively in case a concurrent reload reshaped the list).
+  if (direction === 1 && targetIndex >= list.data.length && notificationsHasMore.value) {
+    await loadMoreNotifications();
+    list = notifications.value;
+    if (list.status !== 'loaded') return null;
+    index = list.data.findIndex((n) => n.id === currentId);
+    if (index < 0) return null;
+    targetIndex = index + direction;
   }
+
+  const target = list.data[targetIndex];
+  if (!target) return null;
+  // Synchronous after this point — `navigateToNotification` renders from memory.
+  // The function stays async only for the page-boundary `loadMoreNotifications`
+  // await above (one fetch every PAGE_SIZE items, not per tap).
+  return navigateToNotification(target.id);
 }
 
 /** Run when the notification detail panel closes — the overlay is cleared by

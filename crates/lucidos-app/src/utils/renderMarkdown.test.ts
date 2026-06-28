@@ -144,6 +144,46 @@ describe('renderMarkdown', () => {
       const html = renderMarkdown('use `<iframe>` element');
       expect(html).toContain('<code>&lt;iframe&gt;</code>');
     });
+
+    it('strips event-handler attributes from raw HTML that marked preserves', () => {
+      const html = renderMarkdown('<img src="x" onerror="alert(1)"> <span onClick=alert(2)>ok</span>');
+      expect(html).toContain('<img src="x">');
+      expect(html).toContain('<span>ok</span>');
+      expect(html).not.toContain('onerror');
+      expect(html).not.toContain('onClick');
+      expect(html).not.toContain('alert(1)');
+    });
+
+    it('strips javascript and data URL attributes from raw HTML', () => {
+      const html = renderMarkdown('<a href="javascript:alert(1)">x</a><img src=data:text/html,evil>');
+      expect(html).toContain('<a>x</a>');
+      expect(html).toContain('<img>');
+      expect(html).not.toContain('javascript:');
+      expect(html).not.toContain('data:text/html');
+    });
+
+    it('strips entity-obfuscated javascript and data URL attributes from raw HTML', () => {
+      const html = renderMarkdown(
+        '<a href="jav&#x61;script&colon;alert(1)">x</a><img src="da&#116;a:text/html,evil">',
+      );
+      expect(html).toContain('<a>x</a>');
+      expect(html).toContain('<img>');
+      expect(html).not.toContain('jav&#x61;script');
+      expect(html).not.toContain('data:text/html');
+      expect(html).not.toContain('alert(1)');
+    });
+
+    it('strips URL attributes with embedded control whitespace in dangerous schemes', () => {
+      const html = renderMarkdown('<a href="java&#10;script:alert(1)">x</a><img src="da\tta:text/html,evil">');
+      expect(html).toContain('<a>x</a>');
+      expect(html).toContain('<img>');
+      expect(html).not.toContain('java&#10;script');
+      expect(html).not.toContain('data:text/html');
+    });
+
+    it('does not throw on out-of-range numeric character references in URL attributes', () => {
+      expect(() => renderMarkdown('<a href="&#99999999;">x</a>')).not.toThrow();
+    });
   });
 
   describe('copy blocks', () => {
@@ -384,6 +424,13 @@ Use this pattern for all prompts.`;
       expect(html).toContain('&lt;script&gt;');
     });
 
+    it('strips raw inline HTML event handlers', () => {
+      const html = renderMarkdownInline('<span onclick="alert(1)">tap</span>');
+      expect(html).toContain('<span>tap</span>');
+      expect(html).not.toContain('onclick');
+      expect(html).not.toContain('alert(1)');
+    });
+
     it('handles empty input', () => {
       expect(renderMarkdownInline('')).toBe('');
     });
@@ -392,12 +439,12 @@ Use this pattern for all prompts.`;
   describe('renderMarkdownInlineWithLinks (phrasing content + live links)', () => {
     it('linkifies a bare URL into a new-tab anchor', () => {
       const html = renderMarkdownInlineWithLinks(
-        'Draft PR #1488 is ready: https://github.com/m10s-green/user-acquisition/pull/1488 — mark it ready?',
+        'Draft PR #1488 is ready: https://github.com/example-org/example-repo/pull/1488 — mark it ready?',
       );
       expect(html).toContain(
-        '<a href="https://github.com/m10s-green/user-acquisition/pull/1488" target="_blank" rel="noopener">',
+        '<a href="https://github.com/example-org/example-repo/pull/1488" target="_blank" rel="noopener">',
       );
-      expect(html).toContain('https://github.com/m10s-green/user-acquisition/pull/1488</a>');
+      expect(html).toContain('https://github.com/example-org/example-repo/pull/1488</a>');
     });
 
     it('keeps [label](url) markdown links as anchors with the label text', () => {
@@ -447,6 +494,13 @@ Use this pattern for all prompts.`;
       expect(html).toContain('&lt;script&gt;');
     });
 
+    it('strips raw inline HTML javascript URLs', () => {
+      const html = renderMarkdownInlineWithLinks('<a href="javascript:alert(1)">tap</a>');
+      expect(html).toContain('<a>tap</a>');
+      expect(html).not.toContain('javascript:');
+      expect(html).not.toContain('alert(1)');
+    });
+
     it('handles empty input', () => {
       expect(renderMarkdownInlineWithLinks('')).toBe('');
     });
@@ -482,10 +536,10 @@ Use this pattern for all prompts.`;
   });
 
   describe('thread reference links — behind the gateway', () => {
-    // Served at https://<gateway>/personal/ → hover should show the real
+    // Served at https://<gateway>/myws/ → hover should show the real
     // destination, not the `#`-resolves-to-current-page URL.
     beforeEach(() => {
-      base.workspaceId = 'personal';
+      base.workspaceId = 'myws';
       vi.stubGlobal('location', { origin: 'https://localhost:5251' });
     });
     afterEach(() => {
@@ -495,7 +549,7 @@ Use this pattern for all prompts.`;
 
     it('points an untagged (same-workspace) link at the current workspace slug', () => {
       const html = renderMarkdown('See [the bug](thread:aa11aaaa-bbbb-cccc-dddd-eeeeffff0001)');
-      expect(html).toContain('href="https://localhost:5251/personal/#thread=aa11aaaa-bbbb-cccc-dddd-eeeeffff0001"');
+      expect(html).toContain('href="https://localhost:5251/myws/#thread=aa11aaaa-bbbb-cccc-dddd-eeeeffff0001"');
       expect(html).toContain('class="thread-link"');
     });
 

@@ -35,7 +35,7 @@ export function setLoadingIfFresh<T>(signal: { value: Loadable<T> }): void {
 }
 
 // Menu item names (drawer navigation)
-export const MENU_ITEMS = ['files', 'apps', 'triggers', 'settings', 'changes', 'notifications'] as const;
+export const MENU_ITEMS = ['files', 'apps', 'plugins', 'triggers', 'settings', 'changes', 'notifications'] as const;
 export type MenuItem = typeof MENU_ITEMS[number];
 
 // Connection status. 'connecting' is the initial state before the first
@@ -59,6 +59,11 @@ export interface Step {
   trimmed?: boolean;
   /** Absent for steps that aren't an LLM call (memory search, tool result). */
   contextCapture?: ContextCapture;
+  /** Accumulated reasoning/thinking text streamed for this "Thinking" step
+   *  (from `CodingAgentThoughtStreamed` / chat `ThoughtStreamed`). Rendered as
+   *  the step's expandable live content so a long reasoning pass shows progress
+   *  instead of a bare "Thinking" label. Absent on non-thinking steps. */
+  thinkingText?: string;
 }
 
 /** API role bucket a `ContextSection` belongs to. Mirrors the three buckets
@@ -162,6 +167,8 @@ export type ResponseEvent =
       /** @deprecated kept for legacy backend payloads. */
       context?: ContextAssembledData;
       contextCapture?: ContextCapture;
+      /** Accumulated reasoning text for a "Thinking" step — see Step.thinkingText. */
+      thinkingText?: string;
     }
   | { type: 'section_break'; channel: string }
   | { type: 'image'; base64: string; mime_type: string; index: number }
@@ -283,6 +290,10 @@ export interface TriggerInfo {
    *  side-effect categories it may perform unattended. Engine omits the field
    *  when empty, so readers must tolerate absence (= no grant). */
   side_effect_grant?: SideEffectCategory[];
+  /** Plugin provenance (ADR 0019) — the id of the *plugin* that auto-registered
+   *  this trigger. Absent for user-created triggers. Drives the "from <plugin>"
+   *  chip in the triggers panel. */
+  plugin_id?: string;
 }
 
 /** A user-visible folder that organizes triggers in the panel. Pure label —
@@ -421,6 +432,20 @@ export interface PinnedAppEntry {
   app_id: string;
 }
 
+// An installed plugin, from GET /plugins/installed (the PluginInstalled event
+// projection — no marketplace scan). The Plugins → Installed tab lists these
+// regardless of content; `content`/`files` drive the per-plugin navigation
+// (open the app, preview a shipped knowhow/script file).
+export interface InstalledPlugin {
+  id: string;
+  name: string;
+  version: string;
+  source?: string;
+  app_id?: string;
+  content: string[];
+  files: string[];
+}
+
 
 // Confirm dialog state
 export interface ConfirmState {
@@ -443,6 +468,20 @@ export interface ConfirmDetails {
 export interface ConfirmDetailGroup {
   header: string;
   items: string[];
+}
+
+// Prompt dialog state — a text-input sibling of ConfirmState. Resolves the
+// entered string on OK, or null on Cancel / Esc / backdrop.
+export interface PromptState {
+  visible: boolean;
+  message: string;
+  title?: string;
+  defaultValue?: string;
+  placeholder?: string;
+  okLabel?: string;
+  cancelLabel?: string;
+  multiline?: boolean;
+  resolve?: (value: string | null) => void;
 }
 
 // Toast notification
@@ -515,6 +554,10 @@ export interface MarketplacePlugin {
   source: string;
   manifest: Record<string, unknown>;
   content: string[];
+  /** Topical categories (controlled vocabulary) the plugin is tagged with.
+   *  Drives the Store tab's category filter/chips. Unknown author tags are
+   *  filtered out engine-side, so every value here is browsable. */
+  categories: string[];
   files_count: number;
   status: MarketplacePluginStatus;
   installed_version?: string;

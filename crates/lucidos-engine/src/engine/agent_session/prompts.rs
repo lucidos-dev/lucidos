@@ -108,6 +108,25 @@ const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST c
     blocked. Keep the plan's load-bearing invariants in view while you edit; do not defer their \
     first appearance to `/harden`.";
 
+/// Restart-is-not-rejection note shared by the three recovery system prompts
+/// (`recovery_system_prompt`, `external_repo_recovery_system_prompt`,
+/// `app_worktree_recovery_system_prompt`). A session resumed after an engine
+/// restart replays its own transcript, which may contain a permission denial
+/// ("User denied"), an interrupted/incomplete tool call, or a synthetic
+/// "[Request interrupted…]" result — all artifacts of the restart, NOT user
+/// decisions. Without this, the resumed agent reads them as the user rejecting
+/// its approach and changes course. Kept repo-generic (no Lucidos-only tokens)
+/// so it is safe in the external-repo recovery prompt. The companion half is the
+/// neutral `RESTART_INTERRUPT_REASON` returned on the permission teardown path
+/// (`engine::cc_permission`).
+const RESTART_NOT_REJECTION_RULE: &str = "RESTART CONTEXT — NOT A REJECTION: This session was \
+    resumed after the engine restarted mid-work. If your recent history shows a permission denial \
+    (e.g. \"User denied\"), a tool call that was interrupted or never completed, or a synthetic \
+    \"[Request interrupted]\" result, that was caused by the restart — NOT by the user rejecting \
+    your work, your plan, or your approach. Do not abandon or rework your approach on account of \
+    those signals. Re-confirm where you left off (the git log/diff steps above) and continue the \
+    same plan, unless the user has since told you otherwise in a new message.";
+
 /// Tell CC that "Task not found" / "task already completed" after a task ends
 /// is expected — the engine evicts the bg-bash registry record on completion,
 /// and CC's own task-list entries also get cleaned up. CC was treating these
@@ -354,7 +373,7 @@ pub(super) fn external_repo_system_prompt(
          STAY ON THIS WORKTREE'S BRANCH: Do ALL of your committed work on `{branch_name}` — the \
          branch this worktree is checked out on. Lucidos tracks THIS branch for the thread's Diff \
          view and for resuming you, and the branch you push must be the same one. If the repo's \
-         workflow wants a differently-named branch (e.g. a ticket branch like `UA-1234-...`), \
+         workflow wants a differently-named branch (e.g. a ticket branch like `JIRA-1234-...`), \
          RENAME this branch in place with `git branch -m {branch_name} <new-name>` and keep \
          working on it — do NOT `git checkout -b` a separate sibling branch, commit there, and \
          leave this worktree behind. Stranding later commits (e.g. a pre-PR cleanup pass) on a \
@@ -388,6 +407,7 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
          3. Understand what the previous session was working on\n\
          4. If the work looks complete or nearly complete, clean up and finish\n\
          5. If the work is incomplete or broken, either finish it or revert the problematic parts\n\n\
+         {restart_not_rejection}\n\n\
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check for \
          uncommitted changes. Commit or discard anything unintentional.\n\n\
          {commit_cadence}\n\n\
@@ -396,6 +416,7 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
          CRITICAL: Never run `exit` as a bash command.{process_safety}",
         branch = branch_name,
         repo = repo_name,
+        restart_not_rejection = RESTART_NOT_REJECTION_RULE,
         commit_cadence = COMMIT_CADENCE_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
@@ -418,6 +439,7 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
          2. Run `git diff` to check for uncommitted changes\n\
          3. If the work looks complete, clean up and finish\n\
          4. If incomplete, continue where you left off\n\n\
+         {restart_not_rejection}\n\n\
          {implementation_plan}\n\n\
          {apply_restart}\n\n\
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check for \
@@ -434,6 +456,7 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
          CRITICAL: Never run `exit` as a bash command.{process_safety}",
         preamble = workspace_preamble(workspace_name),
         branch = branch_name,
+        restart_not_rejection = RESTART_NOT_REJECTION_RULE,
         no_pull_requests = NO_PULL_REQUESTS_RULE,
         implementation_plan = IMPLEMENTATION_PLAN_RULE,
         apply_restart = APPLY_RESTART_RULE,
@@ -535,6 +558,7 @@ pub(super) fn app_worktree_recovery_system_prompt(
          2. Run `git diff` to check for uncommitted changes\n\
          3. If the work looks complete, clean up and finish\n\
          4. If incomplete, continue where you left off\n\n\
+         {restart_not_rejection}\n\n\
          When you finish, the user sees a pending *change* in the Apply panel. Apply \
          ff-merges your branch into the workspace git's `main`. No engine restart; no \
          `/harden` (apps own their hardening). Apply emits `AppUiRefreshRequested` if any \
@@ -547,6 +571,7 @@ pub(super) fn app_worktree_recovery_system_prompt(
          {ask_user_question}\n\n\
          {task_lifecycle}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}",
+        restart_not_rejection = RESTART_NOT_REJECTION_RULE,
         commit_cadence = COMMIT_CADENCE_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
@@ -639,27 +664,27 @@ mod tests {
 
     #[test]
     fn app_worktree_prompt_inlines_manifest_and_branch() {
-        let manifest = r#"{"name":"Momentum","icon":"target"}"#;
+        let manifest = r#"{"name":"Habit Tracker","icon":"target"}"#;
         let prompt = app_worktree_system_prompt(
-            "claude-code/app/momentum/20260527-100000-abc123",
-            "personal",
-            "momentum",
+            "claude-code/app/habit-tracker/20260527-100000-abc123",
+            "dev",
+            "habit-tracker",
             manifest,
         );
         assert!(
-            prompt.contains("`momentum`"),
+            prompt.contains("`habit-tracker`"),
             "must name the app id so CC knows which folder it owns",
         );
         assert!(
-            prompt.contains("personal"),
+            prompt.contains("dev"),
             "must name the workspace so cross-workspace context is clear",
         );
         assert!(
-            prompt.contains("claude-code/app/momentum/20260527-100000-abc123"),
+            prompt.contains("claude-code/app/habit-tracker/20260527-100000-abc123"),
             "must surface the branch name for the user-side Apply chip",
         );
         assert!(
-            prompt.contains("Momentum"),
+            prompt.contains("Habit Tracker"),
             "must inline the manifest so CC has the app's display name without an extra Read",
         );
         assert!(
@@ -697,12 +722,12 @@ mod tests {
     #[test]
     fn app_worktree_recovery_prompt_inlines_branch_and_app() {
         let prompt = app_worktree_recovery_system_prompt(
-            "claude-code/app/momentum/20260527-100000-abc123",
-            "personal",
-            "momentum",
+            "claude-code/app/habit-tracker/20260527-100000-abc123",
+            "dev",
+            "habit-tracker",
         );
-        assert!(prompt.contains("`momentum`"));
-        assert!(prompt.contains("claude-code/app/momentum/20260527-100000-abc123"));
+        assert!(prompt.contains("`habit-tracker`"));
+        assert!(prompt.contains("claude-code/app/habit-tracker/20260527-100000-abc123"));
         assert!(prompt.contains("RECOVERED"));
         // A resumed app session writes app code too — it needs the same
         // knowhow pointer as a fresh app spawn.
@@ -736,9 +761,9 @@ mod tests {
         // stranded on the pre-cleanup commit — so the Diff view (which follows
         // the worktree's branch) showed stale work that didn't match the PR.
         // The fix instructs CC to rename in place rather than fork.
-        let prompt = external_repo_system_prompt("Acme", "UA-1879-fix", "origin/main");
+        let prompt = external_repo_system_prompt("Acme", "JIRA-1879-fix", "origin/main");
         assert!(
-            prompt.contains("git branch -m UA-1879-fix"),
+            prompt.contains("git branch -m JIRA-1879-fix"),
             "external prompt must tell CC to RENAME its branch in place, not fork a sibling",
         );
         assert!(
@@ -751,6 +776,45 @@ mod tests {
     fn external_repo_recovery_prompt_omits_lucidos_only_tokens() {
         let prompt = external_repo_recovery_system_prompt("Acme", "feature/x");
         assert_no_lucidos_only_tokens(&prompt, "external_repo_recovery_system_prompt");
+    }
+
+    #[test]
+    fn recovery_prompts_carry_restart_not_rejection_note() {
+        // Every flavor of post-restart resume must tell the agent that a denial /
+        // interrupted tool call in its transcript is a restart artifact, not the
+        // user rejecting its approach — otherwise the resumed session changes
+        // course on a phantom rejection.
+        let cases: &[(&str, String)] = &[
+            (
+                "recovery_system_prompt",
+                recovery_system_prompt("feature/x", "dev"),
+            ),
+            (
+                "external_repo_recovery_system_prompt",
+                external_repo_recovery_system_prompt("Acme", "feature/x"),
+            ),
+            (
+                "app_worktree_recovery_system_prompt",
+                app_worktree_recovery_system_prompt("feature/x", "dev", "habit-tracker"),
+            ),
+        ];
+        for (label, prompt) in cases {
+            for needle in [
+                "RESTART CONTEXT — NOT A REJECTION",
+                "NOT by the user rejecting",
+                "Do not abandon or rework your approach",
+            ] {
+                assert!(
+                    prompt.contains(needle),
+                    "{label} must carry the restart-not-rejection note (missing: {needle:?})",
+                );
+            }
+        }
+        // The note must stay repo-generic so it is safe in the external-repo prompt.
+        assert_no_lucidos_only_tokens(
+            &external_repo_recovery_system_prompt("Acme", "feature/x"),
+            "external_repo_recovery_system_prompt (with restart note)",
+        );
     }
 
     #[test]
@@ -790,11 +854,11 @@ mod tests {
             ),
             (
                 "app_worktree_system_prompt",
-                app_worktree_system_prompt("feature/x", "dev", "momentum", "{}"),
+                app_worktree_system_prompt("feature/x", "dev", "habit-tracker", "{}"),
             ),
             (
                 "app_worktree_recovery_system_prompt",
-                app_worktree_recovery_system_prompt("feature/x", "dev", "momentum"),
+                app_worktree_recovery_system_prompt("feature/x", "dev", "habit-tracker"),
             ),
         ];
 
@@ -930,7 +994,7 @@ mod tests {
             ),
             (
                 "app_worktree_system_prompt",
-                app_worktree_system_prompt("feature/x", "dev", "momentum", "{}"),
+                app_worktree_system_prompt("feature/x", "dev", "habit-tracker", "{}"),
             ),
         ];
         for (label, prompt) in exempt {

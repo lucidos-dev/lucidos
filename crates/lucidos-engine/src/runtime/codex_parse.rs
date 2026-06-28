@@ -57,7 +57,9 @@ pub(super) enum ItemKind {
     AgentMessage {
         text: String,
     },
-    Reasoning,
+    Reasoning {
+        text: String,
+    },
     CommandExecution {
         command: String,
         aggregated_output: String,
@@ -151,7 +153,9 @@ pub(super) fn parse_codex_line(line: &str) -> CodexLine {
                 "agent_message" => ItemKind::AgentMessage {
                     text: str_field(item, "text"),
                 },
-                "reasoning" => ItemKind::Reasoning,
+                "reasoning" => ItemKind::Reasoning {
+                    text: str_field(item, "text"),
+                },
                 "command_execution" => ItemKind::CommandExecution {
                     command: str_field(item, "command"),
                     aggregated_output: str_field(item, "aggregated_output"),
@@ -371,9 +375,16 @@ impl TurnTracker {
                     text,
                 }]
             }
-            // Reasoning summaries have no slot in the coding-agent timeline
-            // today (CC's thinking isn't surfaced via stream-json either).
-            ItemKind::Reasoning => Vec::new(),
+            // Reasoning summary — surfaced as a Thought so the timeline can show a
+            // live "Thinking" step. Emitted only on completion (Codex exec sends
+            // the full summary text on the completed item, not as deltas) and only
+            // when non-empty, mirroring the AgentMessage guard above.
+            ItemKind::Reasoning { text } => {
+                if phase != ItemPhase::Completed || text.is_empty() {
+                    return Vec::new();
+                }
+                vec![AgentEvent::Thought { text }]
+            }
             ItemKind::CommandExecution {
                 command,
                 aggregated_output,

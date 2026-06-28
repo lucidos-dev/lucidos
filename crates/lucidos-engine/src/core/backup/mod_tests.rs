@@ -1,5 +1,57 @@
 use super::*;
 
+/// `PROVIDER_IDS` (the agent-settable `backup_provider` enum) must list exactly
+/// the ids in the `PROVIDERS` registry — otherwise the catalog enum drifts from
+/// the providers `get_provider` actually accepts.
+#[test]
+fn provider_ids_match_registry() {
+    let registry: Vec<&str> = PROVIDERS.iter().map(|(id, ..)| *id).collect();
+    assert_eq!(PROVIDER_IDS, registry.as_slice());
+}
+
+/// `backup_run_from_event` parses a persisted `BackupCompleted` event in the
+/// real `{ "type": .., "data": { .. } }` shape (the `#[serde(tag, content)]`
+/// wire format), recovering start/finish/size for the run history.
+#[test]
+fn backup_run_from_event_parses_completed_tagged_payload() {
+    let payload = serde_json::json!({
+        "type": "BackupCompleted",
+        "data": {
+            "filename": "lucidos-backup-myws-20260626-033846.enc",
+            "size_bytes": 8_187_790_566u64,
+            "started_at": "2026-06-26T03:00:00Z",
+            "finished_at": "2026-06-26T03:53:51Z",
+        }
+    });
+    let created = "2026-06-26T03:53:51Z".parse::<DateTime<Utc>>().unwrap();
+    let run = backup_run_from_event("BackupCompleted", &payload, created).expect("a run");
+    assert_eq!(run.status, BackupRunStatus::Success);
+    assert_eq!(run.size_bytes, Some(8_187_790_566));
+    assert_eq!(
+        run.filename.as_deref(),
+        Some("lucidos-backup-myws-20260626-033846.enc")
+    );
+    // Duration is finished - started = 53m 51s.
+    let dur = run.finished_at - run.started_at.expect("started_at parsed");
+    assert_eq!(dur.num_seconds(), 53 * 60 + 51);
+}
+
+/// A failure event carries the error; a bare (untagged) data object is tolerated;
+/// and a missing `finished_at` falls back to the row's `created` timestamp.
+#[test]
+fn backup_run_from_event_parses_failed_and_bare_payload() {
+    let bare = serde_json::json!({ "error": "pg_dump failed" });
+    let created = "2026-06-26T01:00:00Z".parse::<DateTime<Utc>>().unwrap();
+    let run = backup_run_from_event("BackupFailed", &bare, created).expect("a run");
+    assert_eq!(run.status, BackupRunStatus::Failure);
+    assert_eq!(run.error.as_deref(), Some("pg_dump failed"));
+    assert!(run.started_at.is_none(), "no started_at in this payload");
+    assert_eq!(run.finished_at, created, "finished_at falls back to created");
+
+    // An unrelated event type is not a backup run.
+    assert!(backup_run_from_event("SomethingElse", &bare, created).is_none());
+}
+
 #[test]
 fn apply_pg_env_errors_on_malformed_url() {
     // pg_env_vars returns empty Vec on parse failure; apply_pg_env must
@@ -34,8 +86,8 @@ fn is_cross_version_set_filters_correctly() {
 #[test]
 fn pg_dbname_extracts_target_db() {
     assert_eq!(
-        pg_dbname("postgres://lucidos:lucidos@localhost:5432/lucidos_personal").unwrap(),
-        "lucidos_personal"
+        pg_dbname("postgres://lucidos:lucidos@localhost:5432/lucidos_myws").unwrap(),
+        "lucidos_myws"
     );
     assert!(pg_dbname("mysql://x@y/z").is_err());
     assert!(pg_dbname("not a url").is_err());
@@ -81,7 +133,6 @@ fn test_tar_and_compress_excludes_lucidos_and_postgres() {
         ws,
         sql_dump.path(),
         output.path(),
-        None,
         &BackupIgnore::default(),
     )
     .unwrap();
@@ -154,7 +205,6 @@ fn test_tar_and_compress_includes_data_blobs() {
         ws,
         sql_dump.path(),
         output.path(),
-        None,
         &BackupIgnore::default(),
     )
     .unwrap();
@@ -209,7 +259,6 @@ fn test_tar_and_compress_excludes_postgres_migrated_archives() {
         ws,
         sql_dump.path(),
         output.path(),
-        None,
         &BackupIgnore::default(),
     )
     .unwrap();
@@ -262,7 +311,6 @@ fn test_full_pipeline_encrypt_decrypt() {
         ws,
         sql_dump.path(),
         compressed_path.path(),
-        None,
         &BackupIgnore::default(),
     )
     .unwrap();
@@ -426,40 +474,25 @@ fn test_move_contents() {
     );
 }
 
+/// Backups no longer include the user-level `~/.lucidos/` (`user_dir/`): restore
+/// always discards it, so it was multi-GB of dead weight. The workspace `.git/`
+/// IS kept (artifact version history). This pins the trimmed payload contract.
 #[test]
-fn test_tar_includes_user_dir() {
+fn test_tar_omits_user_dir_keeps_git() {
     let workspace = tempfile::tempdir().unwrap();
     let ws = workspace.path();
     std::fs::create_dir_all(ws.join("data")).unwrap();
     std::fs::write(ws.join("data/notes.txt"), "workspace content").unwrap();
-
-    // Create a mock user dir
-    let user_tmp = tempfile::tempdir().unwrap();
-    let user_dir = user_tmp.path();
-    std::fs::create_dir_all(user_dir.join("knowhow")).unwrap();
-    std::fs::write(
-        user_dir.join("knowhow/lucidos.md"),
-        "---\nname: Lucidos\n---\nLucidos knowhow.",
-    )
-    .unwrap();
-    // Create .git/ which should be excluded
-    std::fs::create_dir_all(user_dir.join(".git/objects")).unwrap();
-    std::fs::write(user_dir.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+    // Workspace .git/ MUST be kept.
+    std::fs::create_dir_all(ws.join(".git/objects")).unwrap();
+    std::fs::write(ws.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
 
     let sql_dump = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(sql_dump.path(), "CREATE TABLE test;").unwrap();
 
     let output = tempfile::NamedTempFile::new().unwrap();
-    tar_and_compress(
-        ws,
-        sql_dump.path(),
-        output.path(),
-        Some(user_dir),
-        &BackupIgnore::default(),
-    )
-    .unwrap();
+    tar_and_compress(ws, sql_dump.path(), output.path(), &BackupIgnore::default()).unwrap();
 
-    // Verify archive contents
     let file = std::fs::File::open(output.path()).unwrap();
     let decoder = zstd::Decoder::new(file).unwrap();
     let mut archive = tar::Archive::new(decoder);
@@ -469,19 +502,17 @@ fn test_tar_includes_user_dir() {
         found_paths.push(entry.path().unwrap().to_string_lossy().to_string());
     }
 
-    // Should include user_dir/knowhow/lucidos.md
+    // No user_dir/ at all.
     assert!(
-        found_paths
-            .iter()
-            .any(|p| p == "user_dir/knowhow/lucidos.md"),
-        "archive should contain user_dir/knowhow/lucidos.md: {found_paths:?}"
+        !found_paths.iter().any(|p| p.starts_with("user_dir")),
+        "archive must not contain user_dir/: {found_paths:?}"
     );
-    // Should NOT include user_dir/.git/
+    // Workspace .git/ kept.
     assert!(
-        !found_paths.iter().any(|p| p.starts_with("user_dir/.git")),
-        "archive should not contain user_dir/.git/: {found_paths:?}"
+        found_paths.iter().any(|p| p.starts_with(".git")),
+        "archive must contain the workspace .git/: {found_paths:?}"
     );
-    // Should still include workspace content
+    // Workspace content kept.
     assert!(
         found_paths.iter().any(|p| p == "data/notes.txt"),
         "archive should contain data/notes.txt: {found_paths:?}"
@@ -579,11 +610,11 @@ async fn last_run_success_round_trips() {
 
     let entry = BackupEntry {
         id: "drive-123".to_string(),
-        filename: "lucidos-backup-personal-20260530-031500.enc".to_string(),
+        filename: "lucidos-backup-myws-20260530-031500.enc".to_string(),
         size_bytes: 42_000_000,
         created_at: Utc::now(),
     };
-    persist_last_run(&pool, &BackupLastRun::success(&entry))
+    persist_last_run(&pool, &BackupLastRun::success(&entry, Utc::now()))
         .await
         .unwrap();
 
@@ -608,16 +639,17 @@ async fn last_run_failure_overwrites_success() {
         size_bytes: 1,
         created_at: Utc::now(),
     };
-    persist_last_run(&pool, &BackupLastRun::success(&entry))
+    persist_last_run(&pool, &BackupLastRun::success(&entry, Utc::now()))
         .await
         .unwrap();
-    persist_last_run(&pool, &BackupLastRun::failure("pg_dump failed"))
+    persist_last_run(&pool, &BackupLastRun::failure("pg_dump failed", Utc::now()))
         .await
         .unwrap();
 
     let loaded = load_last_run(&pool).await.expect("a persisted run");
     assert_eq!(loaded.status, BackupRunStatus::Failure);
     assert_eq!(loaded.error.as_deref(), Some("pg_dump failed"));
+    assert!(loaded.started_at.is_some(), "started_at must round-trip");
     assert!(loaded.filename.is_none());
 
     crate::test_support::teardown_test_db(&db_name).await;
@@ -631,15 +663,15 @@ async fn last_run_failure_overwrites_success() {
 /// string prefix is NOT excluded.
 #[test]
 fn backupignore_prefix_excludes_dir_and_descendants() {
-    let ignore = BackupIgnore::parse("data/artifacts/momentum/klines\n");
+    let ignore = BackupIgnore::parse("data/artifacts/habit-tracker/klines\n");
 
-    assert!(ignore.matches(Path::new("data/artifacts/momentum/klines")));
-    assert!(ignore.matches(Path::new("data/artifacts/momentum/klines/2024/jan.parquet")));
+    assert!(ignore.matches(Path::new("data/artifacts/habit-tracker/klines")));
+    assert!(ignore.matches(Path::new("data/artifacts/habit-tracker/klines/2024/jan.parquet")));
 
     // Component prefix, not string prefix: `klines-backup` is a different
     // component and must be kept.
-    assert!(!ignore.matches(Path::new("data/artifacts/momentum/klines-backup/x.bin")));
-    assert!(!ignore.matches(Path::new("data/artifacts/momentum/strategy.md")));
+    assert!(!ignore.matches(Path::new("data/artifacts/habit-tracker/klines-backup/x.bin")));
+    assert!(!ignore.matches(Path::new("data/artifacts/habit-tracker/strategy.md")));
 }
 
 /// Blank lines and `#` comments are ignored. A blank line, if mis-parsed into
@@ -678,12 +710,12 @@ fn backupignore_tolerates_trailing_slash() {
 fn backupignore_supports_wildcard() {
     let ignore = BackupIgnore::parse("data/artifacts/*/klines\n");
 
-    assert!(ignore.matches(Path::new("data/artifacts/momentum/klines")));
-    assert!(ignore.matches(Path::new("data/artifacts/momentum/klines/2024.parquet")));
+    assert!(ignore.matches(Path::new("data/artifacts/habit-tracker/klines")));
+    assert!(ignore.matches(Path::new("data/artifacts/habit-tracker/klines/2024.parquet")));
     assert!(ignore.matches(Path::new("data/artifacts/reversal/klines/x.bin")));
 
     // A different leaf under the same wildcard parent is kept.
-    assert!(!ignore.matches(Path::new("data/artifacts/momentum/signals/x.bin")));
+    assert!(!ignore.matches(Path::new("data/artifacts/habit-tracker/signals/x.bin")));
 }
 
 /// A malformed glob (e.g. an unclosed character class) is logged and skipped,
@@ -769,26 +801,26 @@ fn tar_and_compress_honors_backupignore() {
     std::fs::create_dir_all(ws.join("data")).unwrap();
     std::fs::write(
         ws.join("data/.backupignore"),
-        "# big re-downloadable cache\ndata/artifacts/momentum/klines/\n",
+        "# big re-downloadable cache\ndata/artifacts/habit-tracker/klines/\n",
     )
     .unwrap();
 
     // Excluded subtree.
-    std::fs::create_dir_all(ws.join("data/artifacts/momentum/klines/2024")).unwrap();
+    std::fs::create_dir_all(ws.join("data/artifacts/habit-tracker/klines/2024")).unwrap();
     std::fs::write(
-        ws.join("data/artifacts/momentum/klines/2024/jan.parquet"),
+        ws.join("data/artifacts/habit-tracker/klines/2024/jan.parquet"),
         "big bytes",
     )
     .unwrap();
 
     // Kept content alongside it.
-    std::fs::write(ws.join("data/artifacts/momentum/strategy.md"), "# Strategy").unwrap();
+    std::fs::write(ws.join("data/artifacts/habit-tracker/strategy.md"), "# Strategy").unwrap();
 
     let ignore = BackupIgnore::load(ws);
     let sql_dump = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(sql_dump.path(), "CREATE TABLE test;").unwrap();
     let output = tempfile::NamedTempFile::new().unwrap();
-    tar_and_compress(ws, sql_dump.path(), output.path(), None, &ignore).unwrap();
+    tar_and_compress(ws, sql_dump.path(), output.path(), &ignore).unwrap();
 
     let file = std::fs::File::open(output.path()).unwrap();
     let decoder = zstd::Decoder::new(file).unwrap();
@@ -803,13 +835,13 @@ fn tar_and_compress_honors_backupignore() {
     assert!(
         !found
             .iter()
-            .any(|p| p.starts_with("data/artifacts/momentum/klines")),
+            .any(|p| p.starts_with("data/artifacts/habit-tracker/klines")),
         "the ignored klines subtree must be excluded: {found:?}"
     );
     assert!(
         found
             .iter()
-            .any(|p| p == "data/artifacts/momentum/strategy.md"),
+            .any(|p| p == "data/artifacts/habit-tracker/strategy.md"),
         "sibling content must be kept: {found:?}"
     );
     assert!(
@@ -824,7 +856,7 @@ fn tar_and_compress_honors_backupignore() {
 async fn last_run_persists_documented_json_shape() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
 
-    persist_last_run(&pool, &BackupLastRun::failure("boom"))
+    persist_last_run(&pool, &BackupLastRun::failure("boom", Utc::now()))
         .await
         .unwrap();
 
@@ -838,6 +870,10 @@ async fn last_run_persists_documented_json_shape() {
     assert!(
         json["at"].as_str().unwrap().contains('T'),
         "RFC-3339 timestamp"
+    );
+    assert!(
+        json["started_at"].as_str().unwrap().contains('T'),
+        "started_at RFC-3339 timestamp"
     );
 
     crate::test_support::teardown_test_db(&db_name).await;
@@ -944,21 +980,21 @@ fn archive(id: &str, name: &str, age_secs: i64) -> BackupEntry {
 
 /// Keep the newest `keep` of THIS workspace's archives and return the rest
 /// oldest-first. Foreign-workspace archives and unrelated files are invisible
-/// to the selection — the safety property: pruning `personal` must never pick
-/// `work`'s backups or a stray file in the shared folder. (This assertion
+/// to the selection — the safety property: pruning `myws` must never pick
+/// `otherws`'s backups or a stray file in the shared folder. (This assertion
 /// fails under the old global newest-N logic, which would delete `w1`/`x1`.)
 #[test]
 fn select_prunable_keeps_newest_n_of_own_workspace_only() {
     let entries = vec![
-        archive("p1", "lucidos-backup-personal-20260601-000001.enc", 100), // oldest own
-        archive("p2", "lucidos-backup-personal-20260601-000002.enc", 80),
-        archive("p3", "lucidos-backup-personal-20260601-000003.enc", 60),
-        archive("p4", "lucidos-backup-personal-20260601-000004.enc", 40), // newest own
-        archive("w1", "lucidos-backup-work-20260601-000004.enc", 5),      // foreign workspace
+        archive("p1", "lucidos-backup-myws-20260601-000001.enc", 100), // oldest own
+        archive("p2", "lucidos-backup-myws-20260601-000002.enc", 80),
+        archive("p3", "lucidos-backup-myws-20260601-000003.enc", 60),
+        archive("p4", "lucidos-backup-myws-20260601-000004.enc", 40), // newest own
+        archive("w1", "lucidos-backup-otherws-20260601-000004.enc", 5),      // foreign workspace
         archive("x1", "important-tax-document.pdf", 1),                   // unrelated file
     ];
 
-    let to_delete: Vec<String> = select_prunable(entries, "personal", 2)
+    let to_delete: Vec<String> = select_prunable(entries, "myws", 2)
         .iter()
         .map(|e| e.id.clone())
         .collect();
@@ -975,15 +1011,15 @@ fn select_prunable_keeps_newest_n_of_own_workspace_only() {
 #[test]
 fn select_prunable_keeps_all_when_own_count_within_limit() {
     let entries = vec![
-        archive("p1", "lucidos-backup-personal-20260601-000001.enc", 50),
-        archive("p2", "lucidos-backup-personal-20260601-000002.enc", 40),
-        archive("w1", "lucidos-backup-work-20260601-000001.enc", 30),
-        archive("w2", "lucidos-backup-work-20260601-000002.enc", 20),
-        archive("w3", "lucidos-backup-work-20260601-000003.enc", 10),
+        archive("p1", "lucidos-backup-myws-20260601-000001.enc", 50),
+        archive("p2", "lucidos-backup-myws-20260601-000002.enc", 40),
+        archive("w1", "lucidos-backup-otherws-20260601-000001.enc", 30),
+        archive("w2", "lucidos-backup-otherws-20260601-000002.enc", 20),
+        archive("w3", "lucidos-backup-otherws-20260601-000003.enc", 10),
     ];
 
     // 2 own, keep 5 → nothing to delete, despite 5 files in the folder.
-    assert!(select_prunable(entries, "personal", 5).is_empty());
+    assert!(select_prunable(entries, "myws", 5).is_empty());
 }
 
 /// A workspace whose name is a prefix of another's must not match the other's
@@ -991,17 +1027,17 @@ fn select_prunable_keeps_all_when_own_count_within_limit() {
 #[test]
 fn is_own_backup_archive_rejects_prefix_collisions() {
     assert!(is_own_backup_archive(
-        "lucidos-backup-personal-20260601-040254.enc",
-        "personal"
+        "lucidos-backup-myws-20260601-040254.enc",
+        "myws"
     ));
-    // Belongs to `personal-2`, not `personal`.
+    // Belongs to `myws-2`, not `myws`.
     assert!(!is_own_backup_archive(
-        "lucidos-backup-personal-2-20260601-040254.enc",
-        "personal"
+        "lucidos-backup-myws-2-20260601-040254.enc",
+        "myws"
     ));
     assert!(is_own_backup_archive(
-        "lucidos-backup-personal-2-20260601-040254.enc",
-        "personal-2"
+        "lucidos-backup-myws-2-20260601-040254.enc",
+        "myws-2"
     ));
     // A hyphenated workspace name round-trips...
     assert!(is_own_backup_archive(
@@ -1021,18 +1057,18 @@ fn is_own_backup_archive_rejects_prefix_collisions() {
 #[test]
 fn is_own_backup_archive_requires_timestamp_and_enc_suffix() {
     assert!(!is_own_backup_archive(
-        "lucidos-backup-personal-notes.enc",
-        "personal"
+        "lucidos-backup-myws-notes.enc",
+        "myws"
     ));
     assert!(!is_own_backup_archive(
-        "lucidos-backup-personal-20260601-040254.zip",
-        "personal"
+        "lucidos-backup-myws-20260601-040254.zip",
+        "myws"
     ));
     assert!(!is_own_backup_archive(
-        "lucidos-backup-personal-20260601.enc",
-        "personal"
+        "lucidos-backup-myws-20260601.enc",
+        "myws"
     ));
-    assert!(!is_own_backup_archive("random.txt", "personal"));
+    assert!(!is_own_backup_archive("random.txt", "myws"));
 }
 
 /// End-to-end through the provider double: prune deletes exactly this
@@ -1041,15 +1077,15 @@ fn is_own_backup_archive_requires_timestamp_and_enc_suffix() {
 #[tokio::test]
 async fn prune_old_backups_deletes_only_own_excess_oldest_first() {
     let entries = vec![
-        archive("p_old", "lucidos-backup-personal-20260601-000001.enc", 100),
-        archive("p_mid", "lucidos-backup-personal-20260601-000002.enc", 50),
-        archive("p_new", "lucidos-backup-personal-20260601-000003.enc", 10),
-        archive("work", "lucidos-backup-work-20260601-000003.enc", 1),
+        archive("p_old", "lucidos-backup-myws-20260601-000001.enc", 100),
+        archive("p_mid", "lucidos-backup-myws-20260601-000002.enc", 50),
+        archive("p_new", "lucidos-backup-myws-20260601-000003.enc", 10),
+        archive("otherws", "lucidos-backup-otherws-20260601-000003.enc", 1),
         archive("doc", "tax.pdf", 1),
     ];
     let provider = MockProvider::new(entries);
 
-    let deleted = prune_old_backups(&provider, "personal", 1).await.unwrap();
+    let deleted = prune_old_backups(&provider, "myws", 1).await.unwrap();
 
     assert_eq!(deleted, 2, "two own archives beyond keep=1");
     assert_eq!(
@@ -1066,14 +1102,14 @@ async fn prune_old_backups_deletes_only_own_excess_oldest_first() {
 #[tokio::test]
 async fn prune_old_backups_swallows_individual_delete_failures() {
     let entries = vec![
-        archive("p_old", "lucidos-backup-personal-20260601-000001.enc", 100),
-        archive("p_mid", "lucidos-backup-personal-20260601-000002.enc", 50),
-        archive("p_new", "lucidos-backup-personal-20260601-000003.enc", 10),
+        archive("p_old", "lucidos-backup-myws-20260601-000001.enc", 100),
+        archive("p_mid", "lucidos-backup-myws-20260601-000002.enc", 50),
+        archive("p_new", "lucidos-backup-myws-20260601-000003.enc", 10),
     ];
     let provider = MockProvider::new(entries).failing_delete_on(&["p_old"]);
 
     // keep=1 → attempt p_old (fails) then p_mid (ok).
-    let deleted = prune_old_backups(&provider, "personal", 1).await.unwrap();
+    let deleted = prune_old_backups(&provider, "myws", 1).await.unwrap();
 
     assert_eq!(deleted, 1, "only the successful delete is counted");
     assert_eq!(
@@ -1090,7 +1126,7 @@ async fn prune_old_backups_swallows_individual_delete_failures() {
 #[tokio::test]
 async fn prune_old_backups_propagates_list_failure() {
     let provider = MockProvider::new(vec![]).failing_list();
-    assert!(prune_old_backups(&provider, "personal", 5).await.is_err());
+    assert!(prune_old_backups(&provider, "myws", 5).await.is_err());
 }
 
 /// A retention of 0 is a guard, not "delete everything" — prune no-ops without
@@ -1098,13 +1134,13 @@ async fn prune_old_backups_propagates_list_failure() {
 #[tokio::test]
 async fn prune_old_backups_keep_zero_is_a_noop() {
     let entries = vec![
-        archive("p1", "lucidos-backup-personal-20260601-000001.enc", 100),
-        archive("p2", "lucidos-backup-personal-20260601-000002.enc", 10),
+        archive("p1", "lucidos-backup-myws-20260601-000001.enc", 100),
+        archive("p2", "lucidos-backup-myws-20260601-000002.enc", 10),
     ];
     let provider = MockProvider::new(entries);
 
     assert_eq!(
-        prune_old_backups(&provider, "personal", 0).await.unwrap(),
+        prune_old_backups(&provider, "myws", 0).await.unwrap(),
         0
     );
     assert!(provider.deleted_ids().is_empty());
@@ -1116,8 +1152,8 @@ async fn prune_old_backups_keep_zero_is_a_noop() {
 #[test]
 fn workspace_archive_name_uses_final_component() {
     assert_eq!(
-        workspace_archive_name(Path::new("/home/u/workspaces/personal")),
-        "personal"
+        workspace_archive_name(Path::new("/home/u/workspaces/myws")),
+        "myws"
     );
     assert_eq!(
         workspace_archive_name(Path::new("/home/u/workspaces/e2e-test")),
@@ -1168,9 +1204,9 @@ async fn get_retention_count_falls_back_to_default() {
 #[test]
 fn parse_workspace_name_from_archive_roundtrips_and_rejects_non_archives() {
     assert_eq!(
-        parse_workspace_name_from_archive("lucidos-backup-personal-20260601-040254.enc")
+        parse_workspace_name_from_archive("lucidos-backup-myws-20260601-040254.enc")
             .as_deref(),
-        Some("personal")
+        Some("myws")
     );
     // Hyphenated workspace name — the timestamp tail is stripped, not the name.
     assert_eq!(
@@ -1191,16 +1227,16 @@ fn parse_workspace_name_from_archive_roundtrips_and_rejects_non_archives() {
 
     // Not archive-shaped → None (the picker then requires a typed name).
     assert!(parse_workspace_name_from_archive("random.txt").is_none());
-    assert!(parse_workspace_name_from_archive("lucidos-backup-personal.enc").is_none());
+    assert!(parse_workspace_name_from_archive("lucidos-backup-myws.enc").is_none());
     assert!(
-        parse_workspace_name_from_archive("lucidos-backup-personal-20260601.enc").is_none(),
+        parse_workspace_name_from_archive("lucidos-backup-myws-20260601.enc").is_none(),
         "a missing HHMMSS half is not a valid timestamp tail"
     );
     assert!(
         parse_workspace_name_from_archive("lucidos-backup-20260601-040254.enc").is_none(),
         "no name segment before the timestamp"
     );
-    assert!(parse_workspace_name_from_archive("other-backup-personal-20260601-040254.enc").is_none());
+    assert!(parse_workspace_name_from_archive("other-backup-myws-20260601-040254.enc").is_none());
 }
 
 /// `restore_archive_into` must restore the workspace files but MUST NOT apply the

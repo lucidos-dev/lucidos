@@ -13,7 +13,6 @@ import { fetchEventTypes } from '../../api/client';
 import { resizeTextarea, useFontMetricsResize } from '../chat/promptResize';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
-import { DelayedSpinner } from '../shared/DelayedSpinner';
 
 const NEW_GROUP_SENTINEL = '__new_group__';
 
@@ -38,6 +37,8 @@ let inflightFetch: Promise<string[]> | null = null;
 
 export function TriggerDetails() {
   const form = activeInlineForm.value;
+  // Delay the spinner (300ms) so a fast load never flashes it.
+  const showLoading = useDelayedLoading(triggers.value);
   if (form?.type !== 'trigger') return null;
 
   const editingId = form.triggerId;
@@ -50,8 +51,12 @@ export function TriggerDetails() {
         </div>
       );
     }
+    if (showLoading) {
+      return <div class="inline-form"><div class="loading-spinner" /></div>;
+    }
     if (triggers.value.status !== 'loaded') {
-      return <div class="inline-form"><DelayedSpinner /></div>;
+      // Pre-delay window — keep the container mounted but show nothing yet.
+      return <div class="inline-form" />;
     }
     const trigger = triggers.value.data.find((t) => t.id === editingId);
     if (!trigger) {

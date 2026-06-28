@@ -47,6 +47,38 @@ pub(crate) fn decide_in_place_merge_claim(
     }
 }
 
+/// Decide whether the apply-now CC-inactivity timeout should fire, and if so
+/// how many whole minutes of silence to report.
+///
+/// The inactivity clock is anchored to the LATER of CC's last event
+/// (`last_event_at_ms`) and apply-start (`apply_started_ms`). `last_event_at`
+/// only advances when CC emits an event, so it can be many minutes stale if the
+/// thread sat idle before the user clicked Apply (CC alive but quiet). Measuring
+/// `now - last_event_at` directly therefore counts that *pre-apply* idle gap as
+/// if it were apply inactivity, firing an instant false "no CC activity for N
+/// minutes" on the very first poll for any thread idle longer than the limit —
+/// and machine load worsens it, letting the first 30s tick beat CC's first
+/// post-prompt event. Anchoring to apply-start makes the timer measure silence
+/// *since apply began*: a freshly-started apply always gets the full limit
+/// before it can trip, while genuine mid-apply silence (both timestamps stale)
+/// still fires correctly.
+///
+/// Returns `Some(minutes_of_silence)` when the timeout should fire, else `None`.
+pub(crate) fn apply_inactivity_timeout_minutes(
+    now_ms: i64,
+    last_event_at_ms: i64,
+    apply_started_ms: i64,
+    inactivity_limit_ms: i64,
+) -> Option<i64> {
+    let idle_since = last_event_at_ms.max(apply_started_ms);
+    let idle_ms = now_ms - idle_since;
+    if idle_ms > inactivity_limit_ms {
+        Some(idle_ms / 60_000)
+    } else {
+        None
+    }
+}
+
 impl LucidosEngine {
     /// Apply Now: keep the existing Claude Code session alive and use it for review/conflict resolution.
     /// Only kills CC after the merge succeeds. Falls back to stale session handling if no live session.
@@ -196,8 +228,12 @@ impl LucidosEngine {
             let panic_result = std::panic::AssertUnwindSafe(async {
                 // Liveness-based timeout: abort only if CC hasn't emitted any
                 // events for 10 minutes (not wall-clock — active sessions can
-                // run as long as they keep producing output).
+                // run as long as they keep producing output). The clock is
+                // anchored to apply-start (not just CC's last event) so a long
+                // pre-apply idle gap can't trip an instant false timeout — see
+                // `apply_inactivity_timeout_minutes`.
                 let inactivity_limit_ms: i64 = 600_000;
+                let apply_started_ms = now_epoch_millis();
                 let inner_fut = engine.apply_now_inner(
                     thread_id,
                     &worktree_path,
@@ -215,11 +251,15 @@ impl LucidosEngine {
                         Err(_) => {
                             // Check liveness: has CC emitted an event recently?
                             let last_ms = last_event_at.load(std::sync::atomic::Ordering::Relaxed);
-                            let idle_ms = now_epoch_millis() - last_ms;
-                            if idle_ms > inactivity_limit_ms {
+                            if let Some(minutes) = apply_inactivity_timeout_minutes(
+                                now_epoch_millis(),
+                                last_ms,
+                                apply_started_ms,
+                                inactivity_limit_ms,
+                            ) {
                                 break Err(format!(
                                     "Apply timed out — no CC activity for {} minutes",
-                                    idle_ms / 60_000,
+                                    minutes,
                                 )
                                 .into());
                             }
@@ -422,7 +462,73 @@ impl LucidosEngine {
         let has_commits = has_branch_commits(repo_root, branch_name).await;
 
         if !has_commits {
-            // No changes to apply — branch is already merged or empty
+            // The branch has nothing ahead of main. That's NOT automatically a
+            // failure: the work may already be on main out-of-band (a prior
+            // apply fast-forwarded main, then was abandoned — exactly what the
+            // old stale-baseline timeout caused, stranding the change as
+            // `pending` while main already had the commits). Distinguish
+            // already-merged from a genuinely-empty branch the same way
+            // `apply_change`'s `recover_no_commits_branch` does (empty files =>
+            // legit no-op; main's history touches the change's files => already
+            // merged), and mark such a pending change APPLIED (truthful success)
+            // instead of emitting a confusing red "Change failed". We use the
+            // READ-ONLY `main_history_touches_files` rather than
+            // `recover_no_commits_branch` because the latter auto-commits the
+            // worktree — and the failure fallthrough below resets the worktree
+            // (`reset --hard main`), which would destroy any such commit. Unlike
+            // `finalize_change_as_noop` we must NOT delete the branch (the live
+            // session's worktree is checked out on it); mirror
+            // `apply_now_success`: emit `ChangeApplied`, reset the worktree to
+            // main, keep the session alive.
+            let pending_change = self
+                .changes()
+                .pending_for_thread(thread_id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .next();
+            if let Some(change) = pending_change {
+                let already_on_main = change.files.is_empty()
+                    || crate::engine::git_ops::main_history_touches_files(
+                        repo_root,
+                        &change.files,
+                    )
+                    .await;
+                if already_on_main {
+                    log!(
+                        "[ApplyNow] Branch {} already present on main — marking pending change {} applied (no-op)",
+                        branch_name,
+                        change.id
+                    );
+                    self.emit_change_applied(
+                        thread_id,
+                        change.id,
+                        false, // no-op: the work is already on main, nothing to restart now
+                        false, // client_update
+                        Vec::new(),
+                        change.thread_title.clone(),
+                        actor.clone(),
+                        None,
+                        None,
+                    )
+                    .await;
+                    // The branch is reset for reuse below, so mirror
+                    // `apply_now_success`: clear the harden + plan markers (the
+                    // next round of work on this branch must re-trigger both
+                    // gates) and make sure the already-merged main reaches the
+                    // remote (the abandoned apply that merged it may never have
+                    // pushed).
+                    consume_harden_marker(&self.pool, repo_root, branch_name).await;
+                    consume_plan_marker(&self.pool, repo_root, branch_name).await;
+                    self.reset_worktree_and_idle(thread_id, worktree_path).await;
+                    push_main_in_background(repo_root);
+                    self.broadcast_changes_updated().await;
+                    return Ok(());
+                }
+            }
+
+            // Genuinely nothing to apply (empty branch, no pending change, or a
+            // declared-files-but-no-commits mismatch that recovery refused).
             log!(
                 "[ApplyNow] No commits on branch {} — nothing to apply",
                 branch_name
@@ -735,6 +841,10 @@ impl LucidosEngine {
             // conflict resolution can run as long as it keeps producing output).
             let panic_result = std::panic::AssertUnwindSafe(async {
                 let inactivity_limit_ms: i64 = 600_000;
+                // Anchored to recovery-start so a long pre-apply idle gap can't
+                // trip an instant false timeout — see `apply_now`'s spawn loop
+                // and `apply_inactivity_timeout_minutes`.
+                let recovery_started_ms = now_epoch_millis();
                 let inner_fut = engine.cc_assisted_merge_then_ff(
                     thread_id,
                     change_id,
@@ -750,11 +860,15 @@ impl LucidosEngine {
                         Ok(result) => break result,
                         Err(_) => {
                             let last_ms = last_event_at.load(Ordering::Relaxed);
-                            let idle_ms = now_epoch_millis() - last_ms;
-                            if idle_ms > inactivity_limit_ms {
+                            if let Some(minutes) = apply_inactivity_timeout_minutes(
+                                now_epoch_millis(),
+                                last_ms,
+                                recovery_started_ms,
+                                inactivity_limit_ms,
+                            ) {
                                 break Err(format!(
                                     "Conflict resolution timed out — no CC activity for {} minutes",
-                                    idle_ms / 60_000,
+                                    minutes,
                                 )
                                 .into());
                             }
@@ -1039,6 +1153,7 @@ mod tests {
             current_reasoning_effort: None,
             last_event_at: Arc::new(AtomicI64::new(0)),
             pending_followups: Arc::new(AtomicU32::new(0)),
+            question_resume_pending: false,
             tools_in_flight: Arc::new(AtomicI32::new(0)),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
         }
@@ -1088,6 +1203,67 @@ mod tests {
         assert_eq!(
             decide_in_place_merge_claim(Some(&s)),
             InPlaceMergeClaim::Claim
+        );
+    }
+
+    const TEN_MIN_MS: i64 = 600_000;
+
+    /// Regression: a thread that sat idle longer than the inactivity limit
+    /// BEFORE the user clicked Apply must NOT trip an instant false timeout on
+    /// the first poll. `last_event_at` is 11 minutes stale (CC alive but quiet),
+    /// but the apply only just started — so the clock anchored to apply-start
+    /// reports no timeout. Against the old `now - last_event_at` math this
+    /// returned `Some(11)`, which is exactly the "Apply timed out — no CC
+    /// activity for 10 minutes" the user saw without 10 minutes having elapsed.
+    #[test]
+    fn inactivity_timeout_ignores_pre_apply_idle_gap() {
+        let now = 100 * 60_000; // t = 100 min
+        let last_event = now - 11 * 60_000; // CC last spoke 11 min ago
+        let apply_started = now; // apply just kicked off
+        assert_eq!(
+            apply_inactivity_timeout_minutes(now, last_event, apply_started, TEN_MIN_MS),
+            None,
+            "a fresh apply must get the full limit regardless of how long the thread was idle first"
+        );
+    }
+
+    /// One poll-interval after a fresh apply on a long-idle thread is still well
+    /// under the limit — no timeout.
+    #[test]
+    fn inactivity_timeout_holds_through_early_polls() {
+        let apply_started = 100 * 60_000;
+        let last_event = apply_started - 30 * 60_000; // 30 min stale baseline
+        let now = apply_started + 30_000; // 30s into the apply
+        assert_eq!(
+            apply_inactivity_timeout_minutes(now, last_event, apply_started, TEN_MIN_MS),
+            None
+        );
+    }
+
+    /// Genuine mid-apply silence still fires: both CC's last event and
+    /// apply-start are now older than the limit, so the timeout reports the
+    /// real minutes of silence.
+    #[test]
+    fn inactivity_timeout_fires_on_genuine_silence() {
+        let apply_started = 100 * 60_000;
+        let last_event = apply_started + 60_000; // CC spoke 1 min into the apply
+        let now = last_event + 12 * 60_000; // then went silent for 12 min
+        assert_eq!(
+            apply_inactivity_timeout_minutes(now, last_event, apply_started, TEN_MIN_MS),
+            Some(12)
+        );
+    }
+
+    /// CC activity advances the clock past apply-start: a recent event keeps the
+    /// timeout from firing even when apply-start is ancient.
+    #[test]
+    fn inactivity_timeout_respects_recent_cc_event() {
+        let apply_started = 100 * 60_000;
+        let now = apply_started + 60 * 60_000; // an hour-long active apply
+        let last_event = now - 60_000; // but CC spoke 1 min ago
+        assert_eq!(
+            apply_inactivity_timeout_minutes(now, last_event, apply_started, TEN_MIN_MS),
+            None
         );
     }
 

@@ -7,14 +7,17 @@ import { composeDraftContextName } from '../../store/composeDestination';
 import { threadPassesChannelFilter } from '../../store/threadFilter';
 import { navigateToPane, focusPane } from '../../store/actions/pane';
 import { focusThread } from '../../store/actions/threads';
-import { loadOlderThreads, reloadAfterFilterChange, ensureThreadInMap } from '../../store/actions/thread-loading';
+import { loadOlderThreads, reloadAfterFilterChange, ensureThreadInMap, loadThreadEvents } from '../../store/actions/thread-loading';
 import { ThreadStatusIcon, resolveVisualStatus, type VisualStatus } from '../shared/ThreadStatusIcon';
-import { CopyThreadRefButton } from '../shared/CopyThreadRefButton';
+import { PinThreadButton } from '../shared/PinThreadButton';
+import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
+import { ListSkeleton } from '../shared/ListSkeleton';
+import { LoadingFade } from '../shared/LoadingFade';
 import type { ThreadState, ThreadStatus } from '../../store/thread-events';
 import { getDraft } from '../../store/composeDrafts';
 import type { DisplaySection } from '../../generated/thread-lifecycle';
 import { formatThreadChannelLabel } from '../../utils/formatChannel';
-import { threadRowTooltip, draftRowTooltip, threadContextName, type ThreadContextFields } from './threadRowInfo';
+import { draftRowTooltip, threadContextName, type ThreadContextFields } from './threadRowInfo';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { useFlipTransitions } from '../../hooks/useFlipAnimation';
@@ -72,15 +75,67 @@ export function handleDrawerPointerDown(target: EventTarget | null): void {
     focusPane('drawer');
 }
 
-/** Currently keyboard-highlighted thread ID in the drawer. */
-const highlightedThreadId = signal<string | null>(null);
+/** A keyboard-navigable node in the drawer's list: either a collapsible section
+ *  header or a (possibly nested) thread row. The ↑/↓ highlight walks these in
+ *  render order; ←/→ collapse/expand them tree-style (see `leftAction` /
+ *  `rightAction`). */
+export type DrawerNavNode =
+    | { kind: 'section'; sectionKey: DisplaySection }
+    | {
+          kind: 'thread';
+          id: string;
+          /** Nesting depth — 0 for top-level rows, ≥1 for sub-threads. */
+          depth: number;
+          /** The visible parent thread id, set only when this row is nested
+           *  under a parent that's also rendered (depth > 0); null for top-level
+           *  rows and orphans whose parent is paginated/filtered out. */
+          parentId: string | null;
+          /** Whether the row renders a family disclosure (has sub-threads). */
+          hasChildren: boolean;
+          /** The lifecycle section this row lives in, or null in the flat
+           *  alternate views (drafts/attention/review/running/search), which have
+           *  no collapsible sections — ←/→ are inert there. */
+          sectionKey: DisplaySection | null;
+      };
 
-/** Ordered list of navigable thread IDs, set by ThreadList or SearchResults. */
-const navigableIds = signal<string[]>([]);
+const SECTION_KEY_PREFIX = '__section_';
+/** The stable nav + FLIP key for a section header (`__section_<name>`). */
+export function sectionNavKey(sectionKey: string): string {
+    return `${SECTION_KEY_PREFIX}${sectionKey}`;
+}
+function isSectionNavKey(key: string): boolean {
+    return key.startsWith(SECTION_KEY_PREFIX);
+}
+/** Highlight identity for a node: a section's nav key, or a thread's id. */
+export function nodeKey(node: DrawerNavNode): string {
+    return node.kind === 'section' ? sectionNavKey(node.sectionKey) : node.id;
+}
+
+/** Flat (depth-0, no-section, no-family) nodes for the alternate views — ←/→ are
+ *  inert on these; only ↑/↓/Enter apply. */
+function flatThreadNodes(ids: readonly string[]): DrawerNavNode[] {
+    return ids.map((id): DrawerNavNode => ({
+        kind: 'thread', id, depth: 0, parentId: null, hasChildren: false, sectionKey: null,
+    }));
+}
+
+/** Currently keyboard-highlighted node in the drawer — a thread id or a section
+ *  nav key (`__section_<name>`). */
+const highlightedKey = signal<string | null>(null);
+
+/** Ordered list of keyboard-navigable nodes, set by ThreadList (section headers +
+ *  threads) or the flat alternate views (threads only). */
+const navNodes = signal<DrawerNavNode[]>([]);
 
 export function selectHighlighted() {
-    const id = highlightedThreadId.value;
-    if (!id) return;
+    const key = highlightedKey.value;
+    if (!key) return;
+    // Enter on a section header toggles its collapse; on a thread, focuses it.
+    if (isSectionNavKey(key)) {
+        toggleSectionCollapse(key.slice(SECTION_KEY_PREFIX.length));
+        return;
+    }
+    const id = key;
     const searchResult = threadSearchResults.value;
     if (threadSearchQuery.value.trim().length > 0 && searchResult.status === 'loaded') {
         const match = searchResult.data.find((r: ThreadSearchResult) => r.thread_id === id);
@@ -89,60 +144,183 @@ export function selectHighlighted() {
     focusThread(id);
 }
 
-/** Collapse (`collapse: true`) or expand (`collapse: false`) the highlighted
- *  thread's family. No-op (returns false) when no thread is highlighted, the
- *  highlighted thread has no children (no chevron), or the family is already
- *  in the requested state. The caller uses the return value to decide whether
- *  to consume the keystroke. */
-function setHighlightedFamilyCollapse(collapse: boolean): boolean {
-    const id = highlightedThreadId.value;
-    if (!id) return false;
-    const thread = threadMap.value.get(id);
-    if (!thread || thread.meta.totalChildrenCount === 0) return false;
-    const isCollapsed = collapsedFamilies.value.has(id);
-    if (isCollapsed === collapse) return false;
-    toggleFamilyCollapse(id);
-    return true;
+/** Live collapse state for the pure ←/→ decision functions. */
+export interface NavCollapseState {
+    sectionCollapsed: (sectionKey: string) => boolean;
+    familyCollapsed: (threadId: string) => boolean;
+}
+
+/** What ←/→ should do to the highlighted node. Computed purely by `leftAction` /
+ *  `rightAction` and applied by `applyCollapseAction`, so the tree semantics are
+ *  unit-testable without signals or the DOM. */
+export type NavCollapseAction =
+    | { type: 'none' }
+    /** Collapse a section; highlight lands on (stays on) its header. */
+    | { type: 'collapseSection'; sectionKey: string }
+    /** Expand a section; highlight stays on its header. */
+    | { type: 'expandSection'; sectionKey: string }
+    /** Collapse a family; highlight moves to `focusKey` — the thread itself when
+     *  collapsing its own family, or the parent when collapsing from a child. */
+    | { type: 'collapseFamily'; threadId: string; focusKey: string }
+    /** Expand a family; highlight stays on the thread. */
+    | { type: 'expandFamily'; threadId: string }
+    /** Pure move (descend into a revealed child / first row); highlight → `key`. */
+    | { type: 'focusKey'; key: string };
+
+/** ← (collapse / ascend), tree-style. On a section header: collapse it (no-op if
+ *  already collapsed). On a thread with an expanded family: collapse that family,
+ *  staying put. On a sub-thread otherwise: collapse the PARENT's family (hiding
+ *  it and its siblings) and focus the parent. On a top-level thread with nothing
+ *  left to collapse: collapse the whole section and focus its header. Pure. */
+export function leftAction(node: DrawerNavNode, st: NavCollapseState): NavCollapseAction {
+    if (node.kind === 'section') {
+        return st.sectionCollapsed(node.sectionKey)
+            ? { type: 'none' }
+            : { type: 'collapseSection', sectionKey: node.sectionKey };
+    }
+    if (node.hasChildren && !st.familyCollapsed(node.id)) {
+        return { type: 'collapseFamily', threadId: node.id, focusKey: node.id };
+    }
+    if (node.depth > 0 && node.parentId) {
+        return { type: 'collapseFamily', threadId: node.parentId, focusKey: node.parentId };
+    }
+    if (node.sectionKey) {
+        return { type: 'collapseSection', sectionKey: node.sectionKey };
+    }
+    return { type: 'none' };
+}
+
+/** → (expand / descend), tree-style. On a collapsed section/family: expand it,
+ *  staying put. On an expanded section: descend to its first thread. On an
+ *  expanded parent thread: descend to its first child. On a leaf: nothing.
+ *  Pure — `nodes`/`idx` locate the node so descend can read the row that follows. */
+export function rightAction(
+    node: DrawerNavNode,
+    nodes: readonly DrawerNavNode[],
+    idx: number,
+    st: NavCollapseState,
+): NavCollapseAction {
+    if (node.kind === 'section') {
+        if (st.sectionCollapsed(node.sectionKey)) {
+            return { type: 'expandSection', sectionKey: node.sectionKey };
+        }
+        const next = nodes[idx + 1];
+        return next && next.kind === 'thread'
+            ? { type: 'focusKey', key: nodeKey(next) }
+            : { type: 'none' };
+    }
+    if (node.hasChildren && st.familyCollapsed(node.id)) {
+        return { type: 'expandFamily', threadId: node.id };
+    }
+    if (node.hasChildren && !st.familyCollapsed(node.id)) {
+        // The first child renders immediately after the parent, one level deeper.
+        const next = nodes[idx + 1];
+        return next && next.kind === 'thread' && next.depth > node.depth
+            ? { type: 'focusKey', key: nodeKey(next) }
+            : { type: 'none' };
+    }
+    return { type: 'none' };
+}
+
+function setHighlight(key: string): void {
+    highlightedKey.value = key;
+    scrollNavKeyIntoView(key);
+}
+
+function scrollNavKeyIntoView(key: string): void {
+    const sel = isSectionNavKey(key) ? `[data-flip-id="${key}"]` : `[data-thread-nav="${key}"]`;
+    document.querySelector(sel)?.scrollIntoView({ block: 'nearest' });
+}
+
+function liveCollapseState(): NavCollapseState {
+    return {
+        sectionCollapsed: (sectionKey) => collapsedSections.value.has(sectionKey),
+        familyCollapsed: (threadId) => collapsedFamilies.value.has(threadId),
+    };
+}
+
+function applyCollapseAction(action: NavCollapseAction): boolean {
+    switch (action.type) {
+        case 'none':
+            return false;
+        case 'collapseSection':
+            setSectionCollapsed(action.sectionKey, true);
+            setHighlight(sectionNavKey(action.sectionKey));
+            return true;
+        case 'expandSection':
+            setSectionCollapsed(action.sectionKey, false);
+            return true;
+        case 'collapseFamily':
+            setFamilyCollapsed(action.threadId, true);
+            setHighlight(action.focusKey);
+            return true;
+        case 'expandFamily':
+            setFamilyCollapsed(action.threadId, false);
+            return true;
+        case 'focusKey':
+            setHighlight(action.key);
+            return true;
+    }
+}
+
+function highlightedNodeIndex(): number {
+    const key = highlightedKey.value;
+    if (!key) return -1;
+    return navNodes.value.findIndex((n) => nodeKey(n) === key);
+}
+
+/** ←: collapse the highlighted node tree-style. Returns whether it acted, so the
+ *  caller only consumes the keystroke when something happened. */
+export function collapseHighlighted(): boolean {
+    const idx = highlightedNodeIndex();
+    if (idx < 0) return false;
+    return applyCollapseAction(leftAction(navNodes.value[idx], liveCollapseState()));
+}
+
+/** →: expand the highlighted node / descend into it. Returns whether it acted. */
+export function expandHighlighted(): boolean {
+    const nodes = navNodes.value;
+    const idx = highlightedNodeIndex();
+    if (idx < 0) return false;
+    return applyCollapseAction(rightAction(nodes[idx], nodes, idx, liveCollapseState()));
 }
 
 export function moveHighlight(delta: number) {
-    const ids = navigableIds.value;
-    if (ids.length === 0) return;
-    const current = highlightedThreadId.value;
-    const idx = current ? ids.indexOf(current) : -1;
+    const nodes = navNodes.value;
+    if (nodes.length === 0) return;
+    const idx = highlightedNodeIndex();
     let next: number;
     if (idx === -1) {
-        next = delta > 0 ? 0 : ids.length - 1;
+        next = delta > 0 ? 0 : nodes.length - 1;
     } else {
         next = idx + delta;
         if (next < 0) next = 0;
-        if (next >= ids.length) next = ids.length - 1;
+        if (next >= nodes.length) next = nodes.length - 1;
     }
-    highlightedThreadId.value = ids[next];
-    // Scroll highlighted row into view
-    const el = document.querySelector(`[data-thread-nav="${ids[next]}"]`);
-    el?.scrollIntoView({ block: 'nearest' });
+    setHighlight(nodeKey(nodes[next]));
 }
 
 /** Pure seed: where the keyboard highlight starts when the drawer gains focus —
- *  the open thread if it's navigable, else the first row, else null (empty list).
- *  Exported for unit testing. */
-export function pickInitialHighlight(openThreadId: string | null, ids: string[]): string | null {
-    if (openThreadId && ids.includes(openThreadId)) return openThreadId;
-    return ids[0] ?? null;
+ *  the open thread if it's navigable, else the first node (the top section header
+ *  when there's no focused thread), else null (empty list). Exported for unit
+ *  testing. */
+export function pickInitialHighlight(openThreadId: string | null, navKeys: string[]): string | null {
+    if (openThreadId && navKeys.includes(openThreadId)) return openThreadId;
+    return navKeys[0] ?? null;
 }
 
 /** Seed the keyboard highlight when the drawer is focused via ⌘⇧1, so Enter has
- *  an immediate target. `navigableIds` is set in a post-render effect, so on a
- *  fresh open it can still be empty for the first frame(s); retry a few frames
- *  while it's empty so the seed lands on a real row. A genuinely empty list just
- *  seeds null after the retries, which is harmless. */
+ *  an immediate target. `navNodes` is set in a post-render effect, so on a fresh
+ *  open it can still be empty for the first frame(s); retry a few frames while
+ *  it's empty so the seed lands on a real node. With a focused thread the seed is
+ *  that thread; without one it falls to the top section header. A genuinely empty
+ *  list just seeds null after the retries, which is harmless. */
 export function seedDrawerHighlight(): void {
     let tries = 0;
     const seed = () => {
-        const ids = navigableIds.value;
-        if (ids.length === 0 && tries++ < 3) { requestAnimationFrame(seed); return; }
-        highlightedThreadId.value = pickInitialHighlight(focusedThreadId.value, ids);
+        const keys = navNodes.value.map(nodeKey);
+        if (keys.length === 0 && tries++ < 3) { requestAnimationFrame(seed); return; }
+        highlightedKey.value = pickInitialHighlight(focusedThreadId.value, keys);
     };
     requestAnimationFrame(seed);
 }
@@ -180,18 +358,19 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
         } else if (e.key === 'Enter') {
             e.preventDefault();
             selectHighlighted();
-        } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
-            // Only intercept when the highlighted row is a parent — otherwise
-            // let the default keystroke through (no row has anything to do
-            // with horizontal arrow keys).
-            if (setHighlightedFamilyCollapse(e.key === 'ArrowLeft')) {
-                e.preventDefault();
-            }
+        } else if (e.key === 'ArrowLeft') {
+            // Tree collapse: own family → parent's family → section, focusing the
+            // node revealed by each step. Consume the key only when it acts; an
+            // unhandled ← falls through (nothing else binds the horizontal arrows).
+            if (collapseHighlighted()) e.preventDefault();
+        } else if (e.key === 'ArrowRight') {
+            // Tree expand / descend — the inverse of ←.
+            if (expandHighlighted()) e.preventDefault();
         }
     }, []);
 
     useEffect(() => {
-        highlightedThreadId.value = null;
+        highlightedKey.value = null;
     }, [activeView]);
 
     return (
@@ -302,20 +481,41 @@ function ThreadList() {
         .map(s => ({
             name: s.name,
             ids: [
-                `__section_${s.name}`,
+                sectionNavKey(s.name),
                 ...s.threads.map(n => n.thread.meta.id),
             ],
         }));
 
-    // Build flat navigable ID list from visible (non-collapsed) sections
+    // Build the keyboard-navigable node list: each rendered section header,
+    // followed by its visible (non-collapsed) thread rows — the exact order the
+    // drawer renders. ↑/↓ walk these; ←/→ collapse/expand them tree-style.
     const collapsed = collapsedSections.value;
-    const flatIds: string[] = [];
+    const navList: DrawerNavNode[] = [];
     for (const s of sections) {
+        if (s.threads.length === 0) continue; // empty sections render null
+        navList.push({ kind: 'section', sectionKey: s.name });
         if (collapsed.has(s.name)) continue;
-        flatIds.push(...s.threads.map(n => n.thread.meta.id));
+        for (const n of s.threads) {
+            navList.push({
+                kind: 'thread',
+                id: n.thread.meta.id,
+                depth: n.depth,
+                // depth > 0 guarantees the direct parent is rendered (nestByParent
+                // only nests under a present parent), so it's a valid focus target.
+                parentId: n.depth > 0 ? (n.thread.meta.parentThreadId ?? null) : null,
+                hasChildren: n.thread.meta.totalChildrenCount > 0,
+                sectionKey: s.name,
+            });
+        }
     }
-    const flatKey = flatIds.join(',');
-    useEffect(() => { navigableIds.value = flatIds; }, [flatKey]);
+    // Key the effect on structure AND the ←/→-relevant fields, so a thread
+    // gaining/losing children (or a re-nest) refreshes the cached nodes.
+    const navKey = navList
+        .map(n => n.kind === 'section'
+            ? sectionNavKey(n.sectionKey)
+            : `${n.id}:${n.depth}:${n.parentId ?? ''}:${n.hasChildren ? 1 : 0}`)
+        .join(',');
+    useEffect(() => { navNodes.value = navList; }, [navKey]);
 
     useFlipTransitions(containerRef, portalRef, sectionDefs, filter);
 
@@ -490,7 +690,7 @@ function saveStringSet(key: string, set: Set<string>) {
     localStorage.setItem(key, JSON.stringify([...set]));
 }
 
-/** Shared collapsed state so ThreadList can read it for navigableIds. */
+/** Shared collapsed state so ThreadList can read it when building navNodes. */
 const collapsedSections = signal(loadStringSet(COLLAPSED_KEY));
 
 /** Per-family collapse state keyed by parent thread id. Mirrors the
@@ -498,12 +698,34 @@ const collapsedSections = signal(loadStringSet(COLLAPSED_KEY));
  *  event-sourced. */
 const collapsedFamilies = signal(loadStringSet(COLLAPSED_FAMILIES_KEY));
 
-export function toggleFamilyCollapse(threadId: string) {
+/** Collapse/expand a lifecycle section. The single source of section-collapse
+ *  truth — the header click, Enter, and the ←/→ tree nav all route here. */
+export function setSectionCollapsed(sectionKey: string, collapse: boolean) {
+    if (collapsedSections.value.has(sectionKey) === collapse) return;
+    const next = new Set(collapsedSections.value);
+    if (collapse) next.add(sectionKey);
+    else next.delete(sectionKey);
+    collapsedSections.value = next;
+    saveStringSet(COLLAPSED_KEY, next);
+}
+
+export function toggleSectionCollapse(sectionKey: string) {
+    setSectionCollapsed(sectionKey, !collapsedSections.value.has(sectionKey));
+}
+
+/** Collapse/expand a thread's sub-thread family. The single source of
+ *  family-collapse truth — the disclosure chevron and the ←/→ tree nav route here. */
+export function setFamilyCollapsed(threadId: string, collapse: boolean) {
+    if (collapsedFamilies.value.has(threadId) === collapse) return;
     const next = new Set(collapsedFamilies.value);
-    if (next.has(threadId)) next.delete(threadId);
-    else next.add(threadId);
+    if (collapse) next.add(threadId);
+    else next.delete(threadId);
     collapsedFamilies.value = next;
     saveStringSet(COLLAPSED_FAMILIES_KEY, next);
+}
+
+export function toggleFamilyCollapse(threadId: string) {
+    setFamilyCollapsed(threadId, !collapsedFamilies.value.has(threadId));
 }
 
 // Skip pagination when Archive is collapsed: collapsing shrinks the list, pops
@@ -554,35 +776,40 @@ function DrawerSectionHeader({ Icon, title, hasRunning }: { Icon?: ComponentType
 
 function DrawerSection({ sectionKey, title, Icon, count, hasRunning, children }: { sectionKey: string; title: string; Icon?: ComponentType<{ size?: string }>; count: number; hasRunning?: boolean; children: ComponentChildren }) {
     const collapsed = collapsedSections.value.has(sectionKey);
-
-    const toggle = () => {
-        const next = new Set(collapsedSections.value);
-        if (collapsed) next.delete(sectionKey);
-        else next.add(sectionKey);
-        collapsedSections.value = next;
-        saveStringSet(COLLAPSED_KEY, next);
-    };
-
     return (
         <div class={`drawer-section${collapsed ? ' drawer-section-collapsed' : ''}`}>
-            <div class={`list-section-title list-section-title-collapsible${collapsed ? ' collapsed' : ''}`}
-                 data-flip-id={`__section_${sectionKey}`}
-                 onClick={toggle}
-                 role="button"
-                 aria-expanded={!collapsed}>
-                <DrawerSectionHeader Icon={Icon} title={title} hasRunning={hasRunning} />
-                {/* Thread count rides in a badge only while the section is
-                    collapsed — expanded sections show the rows themselves. */}
-                {collapsed && <span class="collapse-count-badge">{count}</span>}
-            </div>
+            <DrawerSectionTitle
+                sectionKey={sectionKey} title={title} Icon={Icon}
+                count={count} hasRunning={hasRunning} collapsed={collapsed}
+            />
             {!collapsed && children}
+        </div>
+    );
+}
+
+/** The clickable, keyboard-highlightable section header row. Split out from
+ *  DrawerSection so the highlight subscription (`highlightedKey`) lives here:
+ *  moving the ↑/↓ highlight among threads then re-renders only the (≤3) section
+ *  headers, not each section's whole subtree. */
+function DrawerSectionTitle({ sectionKey, title, Icon, count, hasRunning, collapsed }: { sectionKey: string; title: string; Icon?: ComponentType<{ size?: string }>; count: number; hasRunning?: boolean; collapsed: boolean }) {
+    const highlighted = highlightedKey.value === sectionNavKey(sectionKey);
+    return (
+        <div class={`list-section-title list-section-title-collapsible${collapsed ? ' collapsed' : ''}${highlighted ? ' list-section-title-highlighted' : ''}`}
+             data-flip-id={sectionNavKey(sectionKey)}
+             onClick={() => toggleSectionCollapse(sectionKey)}
+             role="button"
+             aria-expanded={!collapsed}>
+            <DrawerSectionHeader Icon={Icon} title={title} hasRunning={hasRunning} />
+            {/* Thread count rides in a badge only while the section is
+                collapsed — expanded sections show the rows themselves. */}
+            {collapsed && <span class="collapse-count-badge">{count}</span>}
         </div>
     );
 }
 
 export function ComposingThreadRow({ thread, depth = 0, onAfterClick }: { thread: ThreadState; depth?: number; onAfterClick?: () => void }) {
     const isFocused = focusedThreadId.value === thread.meta.id;
-    const isHighlighted = highlightedThreadId.value === thread.meta.id;
+    const isHighlighted = highlightedKey.value === thread.meta.id;
     const classes = ['list-row', 'thread-row', 'compose-draft-row'];
     if (isFocused) classes.push('thread-row-focused');
     if (isHighlighted) classes.push('thread-row-highlighted');
@@ -663,11 +890,6 @@ interface ThreadRowContentProps {
      *  header uses) — so every drawer row's dot is built in one pass and stays
      *  in lockstep with the list, instead of being re-read live per row. */
     visualStatus: VisualStatus;
-    /** Structured hover/long-press tooltip (Status / You / Agent / Context /
-     *  Exchanges / Started), pre-serialized to a JSON `TooltipRow[]` so the memo
-     *  equality check can compare it as a plain string. Empty string → no
-     *  tooltip (e.g. an unhydrated search hit). */
-    tooltip: string;
     /** Repo / app / trigger name chip shown next to the channel tag. Undefined
      *  for plain chat — a Lucidos thread carries no channel tag and no context
      *  name; the bare row (no chips) is itself the signal it's a regular chat. */
@@ -675,6 +897,9 @@ interface ThreadRowContentProps {
     totalChildren: number;
     needsReview: boolean;
     hasDraft: boolean;
+    /** Pinned (saved) state — drives the pin button's filled/outline glyph.
+     *  In the memo equality check so a pin toggle repaints just this row. */
+    isSaved: boolean;
     isFocused: boolean;
     isHighlighted: boolean;
     /** Set when this row is the root of a lifted family — its own natural
@@ -730,6 +955,15 @@ function ThreadRowContentImpl(props: ThreadRowContentProps) {
     // would be redundant (same reason the count badge is collapsed-only).
     const disclosureLabel = props.isCollapsed ? `Show ${a11yCount}` : 'Hide sub-threads';
 
+    // Shared by the disclosure button's click + keydown so the collapse logic
+    // lives in one place. stopPropagation keeps the row's onClick from also
+    // firing on click, and — for keydown — keeps the drawer container's
+    // Enter→selectHighlighted handler from stealing the keystroke (see below).
+    const toggleFamily = (e: Event) => {
+        e.stopPropagation();
+        props.onToggleFamily?.();
+    };
+
     // Every thread carries a channel tag now (chat reads "Lucidos Agent"); the
     // guard stays so a future empty label (or an unknown channel) doesn't paint
     // an empty bordered chip.
@@ -745,13 +979,37 @@ function ThreadRowContentImpl(props: ThreadRowContentProps) {
             <ThreadStatusIcon status={props.visualStatus} />
             <div class={classes.join(' ')}
                  data-thread-nav={props.id}
-                 {...(props.tooltip ? { 'data-tooltip-rows': props.tooltip, 'data-tooltip-title': props.title, 'data-tooltip-longpress': '' } : {})}
+                 // The thread's structured details (Status / You / Agent / Type /
+                 // Exchanges / Started) live behind the ⋯ menu's Info item now,
+                 // not a row tooltip — see ThreadOverflowMenu.
+                 // Prefetch on press-in: pointerdown fires before the tap's click
+                 // (touch-start / mouse-down), so the event load starts earlier and
+                 // content is often ready by the time focusThread switches the view.
+                 // loadThreadEvents is idempotent (no-op if already loading/loaded,
+                 // or if this row isn't in threadMap yet — e.g. a search hit), so a
+                 // canceled press just warms the cache and the tap never double-fetches.
+                 onPointerDown={() => void loadThreadEvents(props.id)}
                  onClick={props.onClick}>
                 {hasFamily && (
                     <button
                         type="button"
                         class="family-disclosure"
-                        onClick={(e) => { e.stopPropagation(); props.onToggleFamily?.(); }}
+                        onClick={toggleFamily}
+                        onKeyDown={(e) => {
+                            // The drawer container's keydown handler intercepts
+                            // Enter (selectHighlighted) at the bubble phase and
+                            // preventDefaults it, which cancels this native
+                            // button's Enter→click activation — so Enter would
+                            // otherwise never toggle the family. Handle Enter/Space
+                            // here: preventDefault blocks Space page-scroll and the
+                            // native synthetic click (so the toggle fires exactly
+                            // once), and toggleFamily's stopPropagation keeps the
+                            // drawer handler from also acting on the keystroke.
+                            if (e.key === 'Enter' || e.key === ' ') {
+                                e.preventDefault();
+                                toggleFamily(e);
+                            }
+                        }}
                         data-tooltip={disclosureLabel}
                         data-tooltip-longpress=""
                         aria-label={disclosureLabel}
@@ -783,7 +1041,8 @@ function ThreadRowContentImpl(props: ThreadRowContentProps) {
                     )}
                     {props.contextName && <span class="label thread-row-context">{props.contextName}</span>}
                     <span class="thread-row-actions">
-                        <CopyThreadRefButton threadId={props.id} title={props.title} stopPropagation extraClass="thread-row-action" />
+                        <PinThreadButton threadId={props.id} saved={props.isSaved} stopPropagation extraClass="thread-row-action" />
+                        <ThreadOverflowMenu threadId={props.id} title={props.title} stopPropagation extraClass="thread-row-action" />
                     </span>
                 </div>
             </div>
@@ -807,11 +1066,11 @@ const ThreadRowContent = memo(ThreadRowContentImpl, (prev, next) =>
     && prev.channel === next.channel
     && prev.codingAgent === next.codingAgent
     && prev.visualStatus === next.visualStatus
-    && prev.tooltip === next.tooltip
     && prev.contextName === next.contextName
     && prev.totalChildren === next.totalChildren
     && prev.needsReview === next.needsReview
     && prev.hasDraft === next.hasDraft
+    && prev.isSaved === next.isSaved
     && prev.isFocused === next.isFocused
     && prev.isHighlighted === next.isHighlighted
     && prev.isLiftedParent === next.isLiftedParent
@@ -836,7 +1095,7 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
     onAfterClick?: () => void;
 }) {
     // Signal reads stay here so each row's subscription set is narrow: the
-    // row re-renders on threadMap / focusedThreadId / highlightedThreadId /
+    // row re-renders on threadMap / focusedThreadId / highlightedKey /
     // draftPresentThreadIds, but the memo on ThreadRowContent below short-
     // circuits when none of the primitives it derives actually changed —
     // turning a per-flush N-row VDOM storm into one render per moved row.
@@ -857,7 +1116,7 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
         meta.codingAgentProposed,
     );
     const isFocused = focusedThreadId.value === meta.id;
-    const isHighlighted = highlightedThreadId.value === meta.id;
+    const isHighlighted = highlightedKey.value === meta.id;
     const hasDraft = threadHasUnsentDraft(thread);
     const hasFamily = !!enableFamilyToggle && meta.totalChildrenCount > 0;
     const isCollapsed = hasFamily && collapsedFamilies.value.has(meta.id);
@@ -872,11 +1131,11 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
             channel={meta.channel}
             codingAgent={meta.codingAgent}
             visualStatus={visualStatus}
-            tooltip={JSON.stringify(threadRowTooltip(meta, status))}
             contextName={threadContextName(meta)}
             totalChildren={meta.totalChildrenCount}
             needsReview={meta.section === 'inbox' && status !== 'running'}
             hasDraft={hasDraft}
+            isSaved={meta.saved}
             isFocused={isFocused}
             isHighlighted={isHighlighted}
             isLiftedParent={isLiftedParent}
@@ -922,7 +1181,7 @@ function DraftsList() {
 
     const ids = drafts.map(t => t.meta.id);
     const idsKey = ids.join(',');
-    useEffect(() => { navigableIds.value = ids; }, [idsKey]);
+    useEffect(() => { navNodes.value = flatThreadNodes(ids); }, [idsKey]);
 
     if (!hydrated) return null;
     if (drafts.length === 0) {
@@ -953,7 +1212,7 @@ function AttentionList() {
 
     const ids = threads.map(t => t.meta.id);
     const idsKey = ids.join(',');
-    useEffect(() => { navigableIds.value = ids; }, [idsKey]);
+    useEffect(() => { navNodes.value = flatThreadNodes(ids); }, [idsKey]);
 
     if (!hydrated) return null;
     if (threads.length === 0) {
@@ -980,7 +1239,7 @@ function ReviewList() {
 
     const ids = threads.map(t => t.meta.id);
     const idsKey = ids.join(',');
-    useEffect(() => { navigableIds.value = ids; }, [idsKey]);
+    useEffect(() => { navNodes.value = flatThreadNodes(ids); }, [idsKey]);
 
     if (!hydrated) return null;
     if (threads.length === 0) {
@@ -1008,7 +1267,7 @@ function RunningList() {
 
     const ids = threads.map(t => t.meta.id);
     const idsKey = ids.join(',');
-    useEffect(() => { navigableIds.value = ids; }, [idsKey]);
+    useEffect(() => { navNodes.value = flatThreadNodes(ids); }, [idsKey]);
 
     if (!hydrated) return null;
     if (threads.length === 0) {
@@ -1034,29 +1293,29 @@ function SearchResults() {
 
     const resultIds = loadable.status === 'loaded' ? loadable.data.map((r: ThreadSearchResult) => r.thread_id) : [];
     const resultKey = resultIds.join(',');
-    useEffect(() => { navigableIds.value = resultIds; }, [resultKey]);
+    useEffect(() => { navNodes.value = flatThreadNodes(resultIds); }, [resultKey]);
 
     if (loadable.status === 'failed') {
         return <div class="empty-state error-text">Search failed</div>;
     }
-    if (loadable.status !== 'loaded') {
-        if (!showLoading) return null;
-        return <div class="loading-spinner" />;
-    }
-
-    if (loadable.data.length === 0) {
-        return <div class="empty-state">No threads found</div>;
-    }
 
     return (
-        <div>
-            <div class="list-section-title">
-                <DrawerSectionHeader title="Results" />
-            </div>
-            {loadable.data.map((r: ThreadSearchResult) => (
-                <SearchResultRow key={r.thread_id} result={r} />
-            ))}
-        </div>
+        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+            {loadable.status === 'loaded' ? (
+                loadable.data.length === 0 ? (
+                    <div class="empty-state">No threads found</div>
+                ) : (
+                    <div>
+                        <div class="list-section-title">
+                            <DrawerSectionHeader title="Results" />
+                        </div>
+                        {loadable.data.map((r: ThreadSearchResult) => (
+                            <SearchResultRow key={r.thread_id} result={r} />
+                        ))}
+                    </div>
+                )
+            ) : null}
+        </LoadingFade>
     );
 }
 
@@ -1074,11 +1333,12 @@ function SearchResultRow({ result }: { result: ThreadSearchResult }) {
     );
     const section = liveThread?.meta.section ?? result.section;
     const isFocused = focusedThreadId.value === result.thread_id;
-    const isHighlighted = highlightedThreadId.value === result.thread_id;
+    const isHighlighted = highlightedKey.value === result.thread_id;
     // Context name works whether or not the hit is hydrated into threadMap —
     // ThreadMeta is structurally a ThreadContextFields; the result's snake-case
-    // fields map onto the same shape. The richer tooltip needs the full meta, so
-    // it's only built for hydrated rows (otherwise empty → no tooltip).
+    // fields map onto the same shape. (The richer details — Status / You / Agent
+    // / Exchanges / Started — live behind the ⋯ menu's Info item, which reads the
+    // live meta itself, so an unhydrated hit simply omits the Info item.)
     const ctxFields: ThreadContextFields = liveThread?.meta ?? {
         channel: result.channel,
         triggerName: result.trigger_name,
@@ -1095,11 +1355,11 @@ function SearchResultRow({ result }: { result: ThreadSearchResult }) {
             channel={result.channel}
             codingAgent={liveThread?.meta.codingAgent ?? result.coding_agent ?? undefined}
             visualStatus={visualStatus}
-            tooltip={liveThread ? JSON.stringify(threadRowTooltip(liveThread.meta, status)) : ''}
             contextName={threadContextName(ctxFields)}
             totalChildren={liveThread?.meta.totalChildrenCount ?? 0}
             needsReview={section === 'inbox' && status !== 'running'}
             hasDraft={threadHasUnsentDraft(liveThread)}
+            isSaved={liveThread?.meta.saved ?? false}
             isFocused={isFocused}
             isHighlighted={isHighlighted}
             onClick={() => { void ensureThreadInMap(result); focusThread(result.thread_id); }}

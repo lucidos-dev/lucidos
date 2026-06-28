@@ -843,9 +843,66 @@
     padding: 0.625rem 0.75rem;
 }
 
+/* Workspace switcher loading skeleton — shimmer placeholders that reuse the real
+   `.control-panel-workspace-row` wrapper, so each row's height (min-height 2rem)
+   matches a real switcher row exactly and the skeleton→list handoff doesn't
+   reflow. Reuses the global `shimmer` keyframes (drawer.css) + the app theme
+   tokens (same fill as ListSkeleton). */
+.control-panel-workspace-skel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+.control-panel-skel-dot,
+.control-panel-skel-name {
+    background: linear-gradient(
+        90deg,
+        var(--bg-tertiary) 25%,
+        color-mix(in srgb, var(--accent) 18%, var(--bg-tertiary)) 50%,
+        var(--bg-tertiary) 75%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+}
+
+/* Matches the 0.625rem `.ws-picker-dot` in a real switcher row. */
+.control-panel-skel-dot {
+    flex: 0 0 auto;
+    width: 0.625rem;
+    height: 0.625rem;
+    border-radius: 50%;
+}
+
+/* Partial name bar; margin-right:auto leaves trailing space like the flex-grow
+   `.control-panel-ws-name` (height matches its 0.8125rem text). */
+.control-panel-skel-name {
+    flex: 0 1 7rem;
+    height: 0.8125rem;
+    border-radius: 0.25rem;
+    margin-right: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .control-panel-skel-dot,
+    .control-panel-skel-name {
+        animation: none;
+    }
+}
+
 .control-panel-workspace-list {
     margin: 0;
     padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+/* The rows now live inside <LoadingFade>'s content wrapper (so the skeleton can
+   crossfade out over them), not as direct children of the flex list — re-apply
+   the row gap there so spacing is unchanged. The skeleton side carries its own
+   gap via `.control-panel-workspace-skel`. */
+.control-panel-workspace-list .loading-fade-content {
     display: flex;
     flex-direction: column;
     gap: 0.125rem;

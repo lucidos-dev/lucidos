@@ -18,6 +18,8 @@ export function CategoryIcon({ category }: { category: string }) {
       return <svg {...props}><path d="M9 2H5a1.5 1.5 0 0 0-1.5 1.5v9A1.5 1.5 0 0 0 5 14h6a1.5 1.5 0 0 0 1.5-1.5V6z" /><polyline points="9 2 9 6 12.5 6" /></svg>;
     case 'apps':
       return <svg {...props}><rect x="3" y="3" width="4" height="4" rx="0.5" /><rect x="9" y="3" width="4" height="4" rx="0.5" /><rect x="3" y="9" width="4" height="4" rx="0.5" /><rect x="9" y="9" width="4" height="4" rx="0.5" /></svg>;
+    case 'plugins':
+      return <svg {...props}><path d="M6 3.5a1.2 1.2 0 0 1 2.4 0c0 .5.4.8.9.8h1.7a.5.5 0 0 1 .5.5v1.7c0 .5.3.9.8.9a1.2 1.2 0 0 1 0 2.4c-.5 0-.8.4-.8.9v1.9a.5.5 0 0 1-.5.5H9.3c-.5 0-.9-.3-.9-.8a1.2 1.2 0 0 0-2.4 0c0 .5-.4.8-.9.8H3.5a.5.5 0 0 1-.5-.5V9.9c0-.5.3-.9.8-.9a1.2 1.2 0 0 0 0-2.4c-.5 0-.8-.4-.8-.9V4a.5.5 0 0 1 .5-.5h1.6c.5 0 .9-.3.9-.8z" /></svg>;
     case 'triggers':
       return <svg {...props}><circle cx="8" cy="8" r="5.5" /><path d="M8 4.5V8l2.5 1.5" /></svg>;
     case 'settings':

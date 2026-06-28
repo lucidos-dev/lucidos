@@ -33,8 +33,57 @@ pub struct PluginManifest {
     /// on the same turn as the install. Free-form markdown -- the author writes
     /// it; the engine does not interpret it.
     pub setup: Option<String>,
+    /// Topical categories the author tagged this plugin with (e.g. `finance`,
+    /// `health`). A *controlled vocabulary* (see [`PLUGIN_CATEGORIES`]): values
+    /// here are as authored — unknown ones are filtered + flagged at catalog
+    /// scan time (`scan_catalog`), not rejected at parse, so one bad tag never
+    /// blocks install. Lowercased + trimmed + de-duplicated on parse.
+    pub categories: Vec<String>,
     /// Full manifest as JSON, so future additive fields land in the event.
     pub raw: serde_json::Value,
+}
+
+/// The *controlled vocabulary* of plugin topical categories (kebab-case, the
+/// public-API value convention). Authors tag a plugin in `manifest.toml`
+/// (`categories = ["finance", ...]`); the Plugins → Store tab filters/browses by
+/// these. A value outside this set is dropped + flagged at scan time. Keep in
+/// sync with `system-knowhow/building-a-plugin.md` and the *plugin category*
+/// glossary entry.
+pub const PLUGIN_CATEGORIES: &[&str] = &[
+    "productivity",
+    "finance",
+    "health",
+    "developer-tools",
+    "data",
+    "communication",
+    "automation",
+    "lifestyle",
+    "research",
+    "fun",
+];
+
+/// True when `c` is a recognised plugin category (exact, case-sensitive — values
+/// are normalised to lowercase on parse).
+pub fn is_valid_category(c: &str) -> bool {
+    PLUGIN_CATEGORIES.contains(&c)
+}
+
+/// Split authored categories into `(known, unknown)`, preserving order and
+/// dropping duplicates. `known` is what the catalog surfaces (browsable);
+/// `unknown` is surfaced as a non-blocking scan warning.
+pub fn partition_categories(categories: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut known = Vec::new();
+    let mut unknown = Vec::new();
+    for c in categories {
+        if is_valid_category(c) {
+            if !known.contains(c) {
+                known.push(c.clone());
+            }
+        } else if !unknown.contains(c) {
+            unknown.push(c.clone());
+        }
+    }
+    (known, unknown)
 }
 
 /// Reasons a plugin archive is rejected at validation.
@@ -144,6 +193,21 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest, ValidationError
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // Categories are normalised (lowercase + trim) but NOT controlled-set
+    // checked here — an unknown tag is filtered + flagged at scan time so it
+    // can't block install. Non-array / non-string entries are ignored.
+    let mut categories: Vec<String> = Vec::new();
+    if let Some(arr) = table.get("categories").and_then(|v| v.as_array()) {
+        for entry in arr {
+            if let Some(s) = entry.as_str() {
+                let norm = s.trim().to_ascii_lowercase();
+                if !norm.is_empty() && !categories.contains(&norm) {
+                    categories.push(norm);
+                }
+            }
+        }
+    }
+
     let raw = serde_json::to_value(&value)
         .map_err(|e| ValidationError::ManifestParseError(e.to_string()))?;
 
@@ -155,6 +219,7 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest, ValidationError
         source,
         engine,
         setup,
+        categories,
         raw,
     })
 }

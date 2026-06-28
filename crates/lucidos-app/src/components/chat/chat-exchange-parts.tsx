@@ -72,8 +72,16 @@ export function UserMessageBody({ html, imageHashes }: { html: string; imageHash
 
 /** Body for change lifecycle initiator panels — surfaces the change description,
  *  file count, and (when failed) the error message. The resolved timestamp is
- *  the panel header timestamp (the change-lifecycle event time IS resolved_at). */
-export function ChangeBody({ changeId, error }: { changeId?: string; error?: string }) {
+ *  the panel header timestamp (the change-lifecycle event time IS resolved_at).
+ *
+ *  `seedDescription`/`seedFileCount` come from the in-thread `ChangeProposed`
+ *  event (already loaded with the thread). They render the body at its FINAL
+ *  height on first open — before the per-id `Change` lazy-fetch lands — so a
+ *  thread that ends with "Change applied" doesn't jump when the fetched row
+ *  pops the description + file count in (the open-path scroll-to-bottom would
+ *  re-pin to the grown bottom, shifting everything up). The authoritative live
+ *  row wins once loaded; it's normally identical to the seed. */
+export function ChangeBody({ changeId, error, seedDescription, seedFileCount }: { changeId?: string; error?: string; seedDescription?: string; seedFileCount?: number }) {
   const change: Change | undefined = changeId ? findChangeById(changeId) : undefined;
   const lazy: Loadable<Change> = (changeId ? lazyChanges.value.get(changeId) : undefined) ?? { status: 'not-loaded' };
   const showLoading = useDelayedLoading(lazy);
@@ -82,16 +90,23 @@ export function ChangeBody({ changeId, error }: { changeId?: string; error?: str
     if (changeId) void ensureChangeLoaded(changeId);
   }, [changeId]);
 
-  // Lifecycle error and live data both win over the lazy-fetch state — a 404
-  // for a row that arrives via SSE moments later shouldn't strand a stale
-  // "Failed to load" row beneath the now-resolved description.
-  const lazyFailedError = !error && !change && lazy.status === 'failed'
+  const desc = change ? change.description.split('\n')[0]
+    : seedDescription ? seedDescription.split('\n')[0]
+    : undefined;
+  const fileCount = change?.file_count ?? seedFileCount;
+
+  // Lifecycle error and any body content (live row OR in-thread seed) both win
+  // over the lazy-fetch state — a 404 for a row that arrives via SSE moments
+  // later shouldn't strand a stale "Failed to load" row, and a seeded body is
+  // already complete, so the fetch failure (which only gates the footer's
+  // Diff/Revert) must not surface a redundant error line beneath it.
+  const lazyFailedError = !error && !desc && fileCount == null && lazy.status === 'failed'
     ? `Failed to load change details: ${lazy.error}`
     : undefined;
-  const lazyLoading = !change && lazy.status === 'loading' && showLoading;
-
-  const desc = change ? change.description.split('\n')[0] : undefined;
-  const fileCount = change?.file_count;
+  // No "Loading..." line once the seed has already painted the body — the
+  // fetch is still running (the footer's Diff/Revert need the live row), but
+  // the body is complete, so a Loading line would just be a flicker + a shift.
+  const lazyLoading = !desc && fileCount == null && lazy.status === 'loading' && showLoading;
 
   if (!desc && fileCount == null && !error && !lazyFailedError && !lazyLoading) return null;
   return (
@@ -155,11 +170,21 @@ export function ResumeNoteBody({ exchange }: { exchange: Exchange }) {
 /** Diff/Revert action buttons rendered in the initiator panel's action slot
  *  for ChangeApplied/Discarded/Reverted exchanges. Returns null when the
  *  change has no relevant actions (e.g. ChangeApplyFailed leaves the change
- *  pending — user reads the error, doesn't diff/revert). */
-export function changeActions(changeId?: string, suppress?: boolean): ComponentChildren {
+ *  pending — user reads the error, doesn't diff/revert).
+ *
+ *  `reserveWhileLoading` (set for ChangeApplied panels, which always get at
+ *  least a Revert button) renders a hidden button placeholder while the per-id
+ *  `Change` row is still being fetched — so the real Diff/Revert buttons slot
+ *  into an already-reserved footer row without a vertical shift on first open.
+ *  Mirrors the body's `seed*` props in <ChangeBody>. */
+export function changeActions(changeId?: string, suppress?: boolean, reserveWhileLoading?: boolean): ComponentChildren {
   if (suppress || !changeId) return null;
   const change = findChangeById(changeId);
-  if (!change) return null;
+  if (!change) {
+    return reserveWhileLoading
+      ? <button class="action-btn change-actions-placeholder" aria-hidden="true" tabIndex={-1}>Revert</button>
+      : null;
+  }
   const showDiff = change.status === 'pending' || !!change.pre_merge_sha;
   const showRevert = change.status === 'applied';
   if (!showDiff && !showRevert) return null;
@@ -364,8 +389,13 @@ export function GeneratedImage({ event }: { event: Extract<ResponseEvent, { type
   );
 }
 
-/** Prefers `contextCapture` (new emissions + legacy synth); falls back
- *  to the legacy `context_tokens` projection so old DB rows still render. */
+/** Latest non-empty line of streamed reasoning, truncated — the inline "ticker"
+ *  preview for a live Thinking step. The full text lives in the detail modal. */
+function lastLinePreview(text: string, max = 120): string {
+  const line = text.split('\n').map(s => s.trim()).filter(Boolean).pop() ?? '';
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+}
+
 export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 'step' }> }) {
   const { className } = stepStatus(event.success);
   const snap = event.contextCapture;
@@ -373,6 +403,11 @@ export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 's
   const window = snap?.context_window;
   const trimmed = snap?.trimmed ?? event.trimmed;
   const hasContext = used != null;
+  // A "Thinking" step's reasoning streams into `thinkingText`. Show its tail
+  // (latest non-empty line, truncated) inline as a live ticker so a long
+  // reasoning pass visibly progresses; the full text is in the detail modal.
+  const thinkingTail = event.thinkingText ? lastLinePreview(event.thinkingText) : '';
+  const detailText = event.detail || thinkingTail;
 
   return (
     <button
@@ -387,7 +422,7 @@ export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 's
         {event.success === null ? null : event.success ? '✓' : '⚠'}
       </span>
       <span class={`step-description${event.success === null ? ' running-shimmer' : ''}`}>{highlightEllipsis(event.description)}</span>
-      {event.detail && <span class="step-detail">{highlightEllipsis(event.detail)}</span>}
+      {detailText && <span class="step-detail">{highlightEllipsis(detailText)}</span>}
       {hasContext && (
         <span class={`step-context${trimmed ? ' trimmed' : ''}`}>
           {window

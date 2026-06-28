@@ -273,6 +273,39 @@ fn test_describe_tool_trigger_groups_and_state() {
 }
 
 #[test]
+fn test_describe_grouped_tools_by_action() {
+    // The consolidated `triggers` / `trigger_groups` / `preferences` tools label
+    // by the `action` discriminator (the flat-name arms above stay for aliases).
+    assert_eq!(
+        describe_tool("triggers", &serde_json::json!({ "action": "create", "name": "Daily" })),
+        "Creating trigger 'Daily'..."
+    );
+    assert_eq!(
+        describe_tool("triggers", &serde_json::json!({ "action": "pause" })),
+        "Pausing trigger..."
+    );
+    assert_eq!(
+        describe_tool("triggers", &serde_json::json!({ "action": "list" })),
+        "Listing triggers..."
+    );
+    assert_eq!(
+        describe_tool(
+            "trigger_groups",
+            &serde_json::json!({ "action": "create", "name": "Morning" })
+        ),
+        "Creating trigger group 'Morning'..."
+    );
+    assert_eq!(
+        describe_tool("preferences", &serde_json::json!({ "action": "set", "key": "theme" })),
+        "Updating theme setting..."
+    );
+    assert_eq!(
+        describe_tool("preferences", &serde_json::json!({ "action": "get" })),
+        "Reading preferences..."
+    );
+}
+
+#[test]
 fn test_describe_tool_count_events() {
     assert_eq!(
         describe_tool(
@@ -606,7 +639,7 @@ fn test_describe_cc_tool_bash_middle_truncates() {
 fn test_describe_cc_tool_glob_middle_truncates() {
     // Long absolute glob patterns shouldn't show the full prefix at the
     // expense of the meaningful basename suffix.
-    let pat = "/Users/kenneth/workspaces/dev/.lucidos/worktrees/thread-1523def0/crates/lucidos-app/src/hooks/useTooltip*.ts";
+    let pat = "/Users/me/workspaces/dev/.lucidos/worktrees/thread-1523def0/crates/lucidos-app/src/hooks/useTooltip*.ts";
     let args = serde_json::json!({"pattern": pat});
     let result = describe_cc_tool("Glob", &args);
     assert!(result.starts_with("Find "), "got: {}", result);

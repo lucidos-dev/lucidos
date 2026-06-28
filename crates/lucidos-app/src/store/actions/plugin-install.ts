@@ -25,25 +25,33 @@ export function openPluginInstallRequest(request: PluginInstallRequest): void {
  *  touched. Closes the panel either way (the engine pops the pending
  *  entry up-front, so a failed confirm has no second chance — leaving
  *  the panel open just wedges the user with disabled buttons). */
-export async function confirmPluginInstallAction(installId: string, pluginName: string): Promise<void> {
+export async function confirmPluginInstallAction(
+  installId: string,
+  pluginName: string,
+  pluginVersion: string,
+): Promise<void> {
   try {
     const result = await confirmPluginInstall(installId);
-    showToast(
-      `${pluginName}: ${result.summary} (${result.installed_files.length} files)`,
-      'success',
-    );
     void refreshPluginCatalog();
     // When the plugin shipped NEW `setup` instructions the engine spawns a
     // Lucidos Agent thread to walk the user through them. Drop the user straight
-    // into it so setup happens in front of them. The engine spawns it as a
-    // SubThread, whose queue `prepare` step eager-emits MessageReceived — on the
-    // common immediate-admit path the thread_summaries row exists before this
-    // response returns, so the thread is real and already running when we focus.
-    // Use focusThread (not …OrBootstrap): if the spawn is briefly queued (no row
-    // yet) a bootstrap fetch would 404 → "Thread not found"; focusThread just
-    // sets focus and lets the row + events stream in over SSE.
+    // into it so setup happens in front of them — the thread IS the feedback, so
+    // we skip the success toast in that case (the panel already showed the setup
+    // instructions; dumping them into a toast as well was the noise we removed).
+    // The engine spawns it as a SubThread, whose queue `prepare` step eager-emits
+    // MessageReceived — on the common immediate-admit path the thread_summaries
+    // row exists before this response returns, so the thread is real and already
+    // running when we focus. Use focusThread (not …OrBootstrap): if the spawn is
+    // briefly queued (no row yet) a bootstrap fetch would 404 → "Thread not
+    // found"; focusThread just sets focus and lets the row + events stream in
+    // over SSE.
     if (result.setup_thread_id) {
       focusThread(result.setup_thread_id);
+    } else {
+      // No setup thread → a minimal one-line confirmation. The install panel
+      // closed and the catalog card flips to Installed/Open, so this just
+      // confirms what landed without restating files or setup steps.
+      showToast(`Installed ${pluginName} v${pluginVersion}`, 'success');
     }
   } catch (e) {
     showToast(`Install failed: ${errorDetail(e)}`, 'error');

@@ -1,6 +1,7 @@
 import { marked } from 'marked';
 import type { Tokens } from 'marked';
 import { COPY_ICON, escapeHtmlAttr } from './markedConfig';
+import { addMarkdownParseMs } from './renderPhaseTimers';
 import { WORKSPACE_ID } from './basePath';
 import { slugifyWorkspaceName } from './slug';
 
@@ -125,6 +126,55 @@ function postprocessCopyBlocks(html: string, encodedTexts: Map<number, string>):
 // Copy block elements (<span>, <button>, <svg>, <div>) and marked-generated
 // elements (<p>, <strong>, <code>, etc.) are NOT in this list and pass through.
 const DANGEROUS_TAG = /<(\/?)(iframe|script|style|object|embed|applet|base|meta|link)(\s[^>]*)?>/gi;
+const EVENT_HANDLER_ATTR = /\s+on[a-z0-9_-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+)/gi;
+const URL_ATTR = /\s+(href|src)\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+)/gi;
+
+function entityCodePoint(code: number): string | null {
+  if (!Number.isInteger(code) || code < 0 || code > 0x10ffff) return null;
+  return String.fromCodePoint(code);
+}
+
+function decodeHtmlEntitiesForScheme(value: string): string {
+  return value.replace(/&(#x[0-9a-f]+|#[0-9]+|[a-z][a-z0-9]+);?/gi, (match, entity: string) => {
+    const e = entity.toLowerCase();
+    if (e.startsWith('#x')) {
+      const code = Number.parseInt(e.slice(2), 16);
+      return entityCodePoint(code) ?? match;
+    }
+    if (e.startsWith('#')) {
+      const code = Number.parseInt(e.slice(1), 10);
+      return entityCodePoint(code) ?? match;
+    }
+    switch (e) {
+      case 'colon': return ':';
+      case 'tab': return '\t';
+      case 'newline': return '\n';
+      case 'amp': return '&';
+      default: return match;
+    }
+  });
+}
+
+function isDangerousUrlAttrValue(rawValue: string): boolean {
+  const unquoted = (rawValue.startsWith('"') && rawValue.endsWith('"'))
+    || (rawValue.startsWith("'") && rawValue.endsWith("'"))
+    ? rawValue.slice(1, -1)
+    : rawValue;
+  const normalized = decodeHtmlEntitiesForScheme(unquoted)
+    .trimStart()
+    .replace(/[\u0000-\u0020]+/g, '')
+    .toLowerCase();
+  return normalized.startsWith('javascript:') || normalized.startsWith('data:');
+}
+
+function sanitizeHtmlFragments(html: string): string {
+  return html
+    .replace(DANGEROUS_TAG, (match) => escapeHtmlAttr(match))
+    .replace(EVENT_HANDLER_ATTR, '')
+    .replace(URL_ATTR, (match, _name: string, value: string) =>
+      isDangerousUrlAttrValue(value) ? '' : match
+    );
+}
 
 // LRU cache for parsed markdown. `renderMarkdown` is pure (same input → same
 // HTML), but the chat timeline calls it INLINE on every render of every exchange
@@ -150,37 +200,46 @@ export function renderMarkdown(md: string, opts?: { cache?: boolean }): string {
       return hit;
     }
   }
-  // Preprocess copy blocks before marked parsing
-  const encodedTexts = new Map<number, string>();
-  const preprocessed = preprocessCopyBlocks(md, encodedTexts);
-  let html = marked.parse(preprocessed, { async: false }) as string;
-  // Wrap multiline copy blocks that used comment markers
-  html = postprocessCopyBlocks(html, encodedTexts);
-  // Escape dangerous HTML elements from raw markdown source
-  html = html.replace(DANGEROUS_TAG, (match) => escapeHtmlAttr(match));
-  // Wrap tables in a scrollable container so columns auto-size naturally
-  html = html.replace(/<table>/g, '<div class="table-scroll-wrapper"><table>');
-  html = html.replace(/<\/table>/g, '</table></div>');
-  // Convert thread: links to clickable thread navigation. Accepts both the
-  // bare-UUID form (`thread:UUID`, same workspace) and the workspace-qualified
-  // form emitted by the copy-ref button (`thread:workspace/UUID`).
-  html = html.replace(
-    /href="thread:(?:([a-zA-Z0-9_-]+)\/)?([0-9a-f-]+)"/g,
-    (_match, workspace: string | undefined, threadId: string) => {
-      const wsAttr = workspace ? ` data-thread-workspace="${escapeHtmlAttr(workspace)}"` : '';
-      const href = escapeHtmlAttr(threadLinkHref(workspace, threadId));
-      return `href="${href}" data-thread-id="${threadId}"${wsAttr} class="thread-link"`;
+  // Perf: time only the real parse path (cache MISS, or cache:false streaming) —
+  // cache hits returned above add nothing, so the parse share isn't inflated by
+  // O(1) lookups. try/finally records elapsed even if marked.parse throws, and
+  // re-throws unchanged. See utils/renderPhaseTimers.ts. Fire-and-forget.
+  const parseStart = performance.now();
+  try {
+    // Preprocess copy blocks before marked parsing
+    const encodedTexts = new Map<number, string>();
+    const preprocessed = preprocessCopyBlocks(md, encodedTexts);
+    let html = marked.parse(preprocessed, { async: false }) as string;
+    // Wrap multiline copy blocks that used comment markers
+    html = postprocessCopyBlocks(html, encodedTexts);
+    // Escape dangerous HTML elements from raw markdown source
+    html = sanitizeHtmlFragments(html);
+    // Wrap tables in a scrollable container so columns auto-size naturally
+    html = html.replace(/<table>/g, '<div class="table-scroll-wrapper"><table>');
+    html = html.replace(/<\/table>/g, '</table></div>');
+    // Convert thread: links to clickable thread navigation. Accepts both the
+    // bare-UUID form (`thread:UUID`, same workspace) and the workspace-qualified
+    // form emitted by the copy-ref button (`thread:workspace/UUID`).
+    html = html.replace(
+      /href="thread:(?:([a-zA-Z0-9_-]+)\/)?([0-9a-f-]+)"/g,
+      (_match, workspace: string | undefined, threadId: string) => {
+        const wsAttr = workspace ? ` data-thread-workspace="${escapeHtmlAttr(workspace)}"` : '';
+        const href = escapeHtmlAttr(threadLinkHref(workspace, threadId));
+        return `href="${href}" data-thread-id="${threadId}"${wsAttr} class="thread-link"`;
+      }
+    );
+    if (useCache) {
+      markdownCache.set(md, html);
+      if (markdownCache.size > MARKDOWN_CACHE_MAX) {
+        // Evict the least-recently-used (first key in insertion order).
+        const oldest = markdownCache.keys().next().value;
+        if (oldest !== undefined) markdownCache.delete(oldest);
+      }
     }
-  );
-  if (useCache) {
-    markdownCache.set(md, html);
-    if (markdownCache.size > MARKDOWN_CACHE_MAX) {
-      // Evict the least-recently-used (first key in insertion order).
-      const oldest = markdownCache.keys().next().value;
-      if (oldest !== undefined) markdownCache.delete(oldest);
-    }
+    return html;
+  } finally {
+    addMarkdownParseMs(performance.now() - parseStart);
   }
-  return html;
 }
 
 /** Phrasing-content-only variant of renderMarkdown — wraps `marked.parseInline`
@@ -195,11 +254,11 @@ export function renderMarkdown(md: string, opts?: { cache?: boolean }): string {
  *  `breaks: true` is passed locally so a future edit to markedConfig.ts's
  *  global options can't silently turn newlines back into spaces. */
 export function renderMarkdownInline(md: string): string {
-  return (marked.parseInline(md, {
+  return sanitizeHtmlFragments(marked.parseInline(md, {
     async: false,
     breaks: true,
     renderer: inlineLinkStripRenderer,
-  }) as string).replace(DANGEROUS_TAG, (match) => escapeHtmlAttr(match));
+  }) as string);
 }
 
 /** Like renderMarkdownInline (phrasing content only — no block wrappers) but
@@ -211,10 +270,10 @@ export function renderMarkdownInline(md: string): string {
  *  Safe ONLY in non-interactive containers: an `<a>` inside a `<button>` is
  *  invalid, so option buttons must keep `renderMarkdownInline`. */
 export function renderMarkdownInlineWithLinks(md: string): string {
-  return (marked.parseInline(md, {
+  return sanitizeHtmlFragments(marked.parseInline(md, {
     async: false,
     breaks: true,
     gfm: true,
     renderer: inlineLinkKeepRenderer,
-  }) as string).replace(DANGEROUS_TAG, (match) => escapeHtmlAttr(match));
+  }) as string);
 }

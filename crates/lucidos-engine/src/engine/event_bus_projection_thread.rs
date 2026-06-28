@@ -808,6 +808,7 @@ impl EventBus {
             | ThreadEvent::ThoughtStreamed { .. }
             | ThreadEvent::MemorySearched { .. }
             | ThreadEvent::CodingAgentTextStreamed { .. }
+            | ThreadEvent::CodingAgentThoughtStreamed { .. }
             | ThreadEvent::CodingAgentToolCalled { .. }
             | ThreadEvent::CodingAgentToolResult { .. } => {
                 // Update last_activity so the thread list timestamp stays current during

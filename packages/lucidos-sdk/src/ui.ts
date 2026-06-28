@@ -3,6 +3,13 @@ import { assertPlainObject } from './_validate';
 import { preferences as prefsModule } from './preferences';
 import { sse } from './sse';
 import { Select, enhanceSelects } from './select';
+import type { NavigateTarget, NavigateUi } from './notifications';
+
+/** Params for `lucidos.ui.navigate` — the `NavigateUi` payload minus `target`
+ *  (which is the first argument). Carries the generated `settings_view`
+ *  (`SettingsViewTarget`) so the full Settings sub-section set is type-checked
+ *  and discoverable from the SDK, in lockstep with the engine `navigate_ui` tool. */
+export type NavigateParams = Omit<NavigateUi, 'target'>;
 
 const FONT_FAMILIES: Record<string, string> = {
   monospace: "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
@@ -10,12 +17,22 @@ const FONT_FAMILIES: Record<string, string> = {
   inter: "'Inter', system-ui, sans-serif",
   'jetbrains-mono': "'JetBrains Mono', monospace",
   'ibm-plex-mono': "'IBM Plex Mono', monospace",
+  'fira-code': "'Fira Code', monospace",
 };
 
 const GOOGLE_FONT_URLS: Record<string, string> = {
   inter: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap',
   'jetbrains-mono': 'https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap',
   'ibm-plex-mono': 'https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap',
+  'fira-code': 'https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&display=swap',
+};
+
+// Programming ligatures, gated to fonts that ship them (Fira Code); every other
+// font resolves to `normal` (CSS initial → unchanged). Mirrors FONT_FEATURES in
+// the host shell (crates/lucidos-app/src/store/actions/preferences.ts) and the
+// FOUC scripts (index.html, crates/lucidos-engine/src/api/sdk_prefs.rs).
+const FONT_FEATURES: Record<string, string> = {
+  'fira-code': '"liga" 1, "calt" 1',
 };
 
 const loadedFonts = new Set<string>();
@@ -97,6 +114,55 @@ export interface ConfirmOptions {
   danger?: boolean;
 }
 
+/** Toast severity — matches the host shell's toast types. */
+export type ToastType = 'success' | 'info' | 'warning' | 'error';
+const TOAST_TYPES: readonly ToastType[] = ['success', 'info', 'warning', 'error'];
+
+export interface ToastOptions {
+  /** Auto-dismiss after this many ms. Omit for the host default (errors/warnings
+   *  stay until dismissed; success/info auto-close). */
+  durationMs?: number;
+  /** false = hide the close (X) button. Default true. */
+  dismissable?: boolean;
+}
+
+export interface PromptOptions {
+  /** Required. The question/instruction shown above the input. Plain text. */
+  message: string;
+  /** Optional heading rendered above the message. */
+  title?: string;
+  /** Prefilled input value. */
+  defaultValue?: string;
+  /** Placeholder shown when the input is empty. */
+  placeholder?: string;
+  /** OK button label. Default "OK". */
+  okLabel?: string;
+  /** Cancel button label. Default "Cancel". */
+  cancelLabel?: string;
+  /** Render a multi-line textarea instead of a single-line input. Default false. */
+  multiline?: boolean;
+}
+
+let promptCounter = 0;
+const pendingPrompts = new Map<string, (value: string | null) => void>();
+let promptListenerInstalled = false;
+
+function installPromptListener() {
+  if (promptListenerInstalled) return;
+  promptListenerInstalled = true;
+  window.addEventListener('message', (event: MessageEvent) => {
+    const data = event.data as { type?: unknown; id?: unknown; value?: unknown } | null;
+    if (!data || typeof data !== 'object') return;
+    if (data.type !== 'lucidos:ui:prompt:result') return;
+    if (typeof data.id !== 'string') return;
+    const resolver = pendingPrompts.get(data.id);
+    if (!resolver) return;
+    pendingPrompts.delete(data.id);
+    // A string is an OK with the entered text; anything else (cancel/esc) is null.
+    resolver(typeof data.value === 'string' ? data.value : null);
+  });
+}
+
 export const ui = {
   /** Fetch user preferences and apply theme, font, scale as CSS variables. */
   async applyPreferences(): Promise<void> {
@@ -135,6 +201,10 @@ export const ui = {
     }
     const fontValue = FONT_FAMILIES[fontKey] || FONT_FAMILIES['monospace'];
     document.documentElement.style.setProperty('--font-ui', fontValue);
+    document.documentElement.style.setProperty(
+      'font-feature-settings',
+      FONT_FEATURES[fontKey] || 'normal',
+    );
 
     // Mirrors clampUiScale in preferences.ts — keep (75, 200, 12.5) in sync.
     // Fall back to the `lucidos-ui-scale` localStorage value sdk-prefs.js read
@@ -155,9 +225,17 @@ export const ui = {
   watchPreferences(): void {
     if (watchingPrefs) return;
     watchingPrefs = true;
-    sse.on('PreferencesChanged', () => {
-      ui.applyPreferences();
-    });
+    // Best-effort live re-application: a transient prefs-fetch failure must not
+    // surface as an unhandled rejection — the next PreferencesChanged / OS-theme
+    // flip re-runs applyPreferences, and the app keeps its already-applied theme
+    // in the meantime. Swallow with a warn so a developer can still see a
+    // persistent failure.
+    const reapply = () => {
+      ui.applyPreferences().catch((err) => {
+        console.warn('[lucidos-sdk] live preference re-apply failed:', err);
+      });
+    };
+    sse.on('PreferencesChanged', reapply);
     sse.connect();
     // A live OS light/dark flip under a `system` theme preference does NOT emit
     // PreferencesChanged, so also re-apply on the media-query change — matching
@@ -167,9 +245,7 @@ export const ui = {
     // on iOS, whose WKWebView fires bogus
     // prefers-color-scheme events; there `system` resolves once per applyPreferences().
     if (typeof window !== 'undefined' && typeof window.matchMedia === 'function' && !isIOSAgent()) {
-      window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
-        ui.applyPreferences();
-      });
+      window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', reapply);
     }
   },
 
@@ -178,7 +254,7 @@ export const ui = {
    * Calls POST /api/v1/ui/navigate, which emits a NavigationRequested event
    * that the frontend subscribes to via SSE.
    */
-  navigate(target: string, params: Record<string, string> = {}): Promise<void> {
+  navigate(target: NavigateTarget, params: NavigateParams = {}): Promise<void> {
     assertPlainObject('params', params);
     return requestVoid('/ui/navigate', {
       method: 'POST',
@@ -194,7 +270,7 @@ export const ui = {
    * is focused it drops the focus so the compose lands on a new thread.
    */
   startThread(opts?: { prompt?: string }): Promise<void> {
-    const params: Record<string, string> = {};
+    const params: NavigateParams = {};
     if (opts && opts.prompt !== undefined) {
       if (typeof opts.prompt !== 'string') {
         return Promise.reject(new TypeError('opts.prompt must be a string'));
@@ -239,6 +315,80 @@ export const ui = {
         resolve(value);
       });
       window.parent.postMessage({ type: 'lucidos:ui:confirm', id, payload }, '*');
+    });
+  },
+
+  /**
+   * Show a transient toast rendered by the host shell (above all app content,
+   * themed by the user's preferences). Fire-and-forget — there is no result.
+   *
+   * Only the serializable subset of the host toast is exposed: `message`, the
+   * `type` severity, and `opts` (`durationMs`, `dismissable`). The host's
+   * action-button callbacks can't cross the postMessage boundary, so they're
+   * intentionally not available here. An unknown `type` degrades to `info`.
+   */
+  toast(message: string, type: ToastType = 'info', opts?: ToastOptions): void {
+    if (typeof message !== 'string' || message.length === 0) {
+      throw new TypeError('lucidos.ui.toast: message must be a non-empty string');
+    }
+    const safeType: ToastType = TOAST_TYPES.includes(type) ? type : 'info';
+    const payload = {
+      message,
+      type: safeType,
+      durationMs: opts && typeof opts.durationMs === 'number' ? opts.durationMs : undefined,
+      dismissable: opts && typeof opts.dismissable === 'boolean' ? opts.dismissable : undefined,
+    };
+    // No host parent (SDK loaded in a top-level window) — surface via console so
+    // a standalone testing context still sees the feedback instead of silence.
+    if (window.parent === window) {
+      const line = `[lucidos.ui.toast:${safeType}] ${message}`;
+      if (safeType === 'error') console.error(line);
+      else if (safeType === 'warning') console.warn(line);
+      else console.log(line);
+      return;
+    }
+    window.parent.postMessage({ type: 'lucidos:ui:toast', payload }, '*');
+  },
+
+  /**
+   * Prompt for a line of text via a modal rendered by the host shell (above all
+   * app content, themed by the user's preferences). Resolves to the entered
+   * string on OK/Enter, or `null` on Cancel / Esc / backdrop click. If another
+   * prompt is already showing, this one replaces it (the previous resolves
+   * `null`). Use it instead of `window.prompt()`.
+   */
+  prompt(options: PromptOptions): Promise<string | null> {
+    assertPlainObject('options', options);
+    if (typeof options.message !== 'string' || options.message.length === 0) {
+      return Promise.reject(new TypeError('options.message must be a non-empty string'));
+    }
+    // No parent (e.g. SDK loaded in a top-level window) — fall back to native
+    // window.prompt so the API still works in standalone testing contexts.
+    if (window.parent === window) {
+      const def = typeof options.defaultValue === 'string' ? options.defaultValue : '';
+      return Promise.resolve(window.prompt(options.message, def));
+    }
+    installPromptListener();
+    const id = `p${++promptCounter}-${Date.now()}`;
+    const payload = {
+      title: typeof options.title === 'string' ? options.title : undefined,
+      message: options.message,
+      defaultValue: typeof options.defaultValue === 'string' ? options.defaultValue : undefined,
+      placeholder: typeof options.placeholder === 'string' ? options.placeholder : undefined,
+      okLabel: typeof options.okLabel === 'string' && options.okLabel.length > 0 ? options.okLabel : 'OK',
+      cancelLabel: typeof options.cancelLabel === 'string' && options.cancelLabel.length > 0 ? options.cancelLabel : 'Cancel',
+      multiline: options.multiline === true,
+    };
+    return new Promise<string | null>((resolve) => {
+      // Bound the wait so a host crash or dropped reply can't leak the Map entry forever.
+      const timeout = setTimeout(() => {
+        if (pendingPrompts.delete(id)) resolve(null);
+      }, 60_000);
+      pendingPrompts.set(id, (value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      });
+      window.parent.postMessage({ type: 'lucidos:ui:prompt', id, payload }, '*');
     });
   },
 

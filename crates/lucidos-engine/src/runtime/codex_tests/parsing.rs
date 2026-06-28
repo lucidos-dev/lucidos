@@ -261,9 +261,23 @@ fn todo_list_dedupes_identical_snapshots() {
     assert!(matches!(&events[2], AgentEvent::ToolUse { name, .. } if name == "todo_list"));
 }
 
+// A completed reasoning item surfaces its summary text as a Thought so the
+// timeline can render a "Thinking" step.
 #[test]
-fn reasoning_items_are_skipped() {
+fn reasoning_item_completed_emits_thought() {
     let line = r#"{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"**Scanning**"}}"#;
+    let (events, _) = track(&[line]);
+    match &events[..] {
+        [AgentEvent::Thought { text }] => assert_eq!(text, "**Scanning**"),
+        other => panic!("expected [Thought], got {:?}", other),
+    }
+}
+
+// A reasoning item that is only started/updated (not completed) emits nothing —
+// Codex exec sends the full summary on completion, mirroring agent_message.
+#[test]
+fn reasoning_item_started_emits_nothing() {
+    let line = r#"{"type":"item.started","item":{"id":"item_0","type":"reasoning","text":"partial"}}"#;
     let (events, _) = track(&[line]);
     assert!(events.is_empty());
 }

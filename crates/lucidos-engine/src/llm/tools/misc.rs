@@ -1,12 +1,65 @@
 //! LLM-facing schemas for cross-cutting tools that do not belong to a
-//! single domain family: navigate_ui, manage_repositories, git_clone,
-//! set_language/set_timezone, request_credential, connect_oauth_account,
+//! single domain family: navigate_ui, git_clone, get_backup_status,
+//! set_environment_variable, request_credential, connect_oauth_account,
 //! execute_intent, ask_user_question, todo_write.
+//!
+//! (manage_repositories / manage_models moved to the capability parity manifest —
+//! domains `repositories` / `models` — and are built by `capability_manifest`.)
 
 
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
+
+/// Single source of truth for the `navigate_ui` `target` enum — the top-level
+/// navigation destinations. The SDK `NavigateTarget` type is GENERATED from this
+/// list (see `packages/lucidos-sdk/src/generated/navigate-targets.ts`), so the
+/// LLM tool schema and the SDK can never drift. To change the set, edit here and
+/// regenerate:
+///   cargo test -p lucidos-engine --lib generate_navigate_targets_file -- --ignored
+const NAVIGATE_TARGETS: &[&str] = &[
+    "files",
+    "apps",
+    "app-store",
+    "plugins",
+    "triggers",
+    "thread-queue",
+    "changes",
+    "notifications",
+    "settings",
+    "app",
+    "file",
+    "trigger",
+    "thread",
+    "new-app",
+    "new-trigger",
+    "new-chat",
+    "url",
+];
+
+/// Single source of truth for the `navigate_ui` `settings_view` enum — the
+/// Settings sub-sections the agent may deep-link to. The SDK `SettingsViewTarget`
+/// type is GENERATED from this list (same generated file as `NAVIGATE_TARGETS`).
+/// Deliberately excludes the platform-gated `mobile-access` / `experimental`
+/// subviews (hidden from the user's own nav off-platform; the LLM has no reliable
+/// platform signal). Every value here must be a renderable subview in
+/// `SettingsView.renderSubview` — a frontend Vitest cross-check pins that.
+const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
+    "models",
+    "appearance",
+    "devices",
+    "accounts",
+    "repositories",
+    "marketplaces",
+    "permissions",
+    "keyboard-shortcuts",
+    "system",
+    "thread-queue",
+    "backup",
+    "memory",
+    "disk-usage",
+    "environment-variables",
+];
 
 /// Tool for navigating the Lucidos UI to a specific panel, app, or file.
 pub fn get_navigate_ui_tool() -> ToolDefinition {
@@ -18,13 +71,13 @@ pub fn get_navigate_ui_tool() -> ToolDefinition {
             "properties": {
                 "target": {
                     "type": "string",
-                    "enum": ["files", "apps", "app-store", "triggers", "thread-queue", "changes", "notifications", "settings", "app", "file", "trigger", "thread", "new-app", "new-trigger", "new-chat", "url"],
-                    "description": "Navigation target. Use 'files', 'apps', 'app-store', 'triggers', 'thread-queue', 'changes', 'notifications', 'settings' for panels. Use 'app' to open an app by ID. Use 'file' to preview a file. Use 'trigger' to focus a trigger by ID. Use 'thread' to focus a thread by ID. Use 'new-app', 'new-trigger', or 'new-chat' to open the creation form. Use 'url' to open a URL in the internal browser panel."
+                    "enum": NAVIGATE_TARGETS,
+                    "description": "Navigation target. Use 'files', 'apps', 'app-store', 'triggers', 'thread-queue', 'changes', 'notifications', 'settings' for panels. 'app-store' opens the Plugins panel, where users browse and install apps and other plugins from marketplaces (they uncheck the panel's 'Installed only' filter to see installable ones; refer to it as the 'Plugins panel', never the retired 'App Store' or 'Store'). Use 'app' to open an app by ID. Use 'file' to preview a file. Use 'trigger' to focus a trigger by ID. Use 'thread' to focus a thread by ID. Use 'new-app', 'new-trigger', or 'new-chat' to open the creation form. Use 'url' to open a URL in the internal browser panel. For a Settings sub-section, use target 'settings' with the 'settings_view' arg."
                 },
                 "settings_view": {
                     "type": "string",
-                    "enum": ["devices", "accounts", "backup", "memory", "repositories", "environment-variables"],
-                    "description": "Settings subview to open. Only used when target is 'settings'. 'environment-variables' opens Settings → System → Environment variables."
+                    "enum": NAVIGABLE_SETTINGS_VIEWS,
+                    "description": "Which Settings sub-section to open. Only used when target is 'settings'. 'models' = chat/image/background model settings (use this for questions about the current model), 'appearance' = theme/font/scale, 'permissions' = command guard + allowlists, 'keyboard-shortcuts', 'devices', 'accounts' = credentials + OAuth, 'repositories', 'marketplaces'. Under Settings → System: 'system', 'backup', 'memory', 'disk-usage', 'environment-variables', 'thread-queue'. Omit to land on the Settings home list."
                 },
                 "app_id": {
                     "type": "string",
@@ -56,36 +109,10 @@ pub fn get_navigate_ui_tool() -> ToolDefinition {
     }
 }
 
-/// Tool for managing registered external git repositories for coding-agent sessions.
-pub fn get_manage_repositories_tool() -> ToolDefinition {
-    ToolDefinition {
-        name: tn::MANAGE_REPOSITORIES.to_string(),
-        description: "Manage registered external git repositories for coding-agent sessions. Users can register local repos so Claude Code or Codex can work on them.".to_string(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["add", "list", "remove"],
-                    "description": "Action to perform: 'add' registers a repo, 'list' shows all repos, 'remove' unregisters a repo."
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Repository display name (required for 'add', used to find repo for 'remove')."
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Absolute path to the git repository on disk (required for 'add'). Supports ~/."
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Optional description of the repository (for 'add')."
-                }
-            },
-            "required": ["action"]
-        }),
-    }
-}
+// `manage_repositories` and `manage_models` are now manifest-built grouped tools
+// (see `crate::capability_manifest`, domains `repositories` / `models`). Their
+// schemas come from the manifest (SSOT); `execute_tool` keeps routing the
+// unchanged tool names to `execute_manage_repositories` / `execute_manage_models`.
 
 pub(super) fn git_clone_tools() -> Vec<ToolDefinition> {
     vec![
@@ -124,55 +151,20 @@ pub(super) fn git_clone_tools() -> Vec<ToolDefinition> {
     ]
 }
 
-pub(super) fn locale_tools() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: tn::SET_LANGUAGE.to_string(),
-            description: "Set the user's preferred language for responses and summaries. Use this when the user tells you their language preference.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "language": {
-                        "type": "string",
-                        "description": "Language name (e.g., 'English', 'Spanish', 'French', 'German')"
-                    }
-                },
-                "required": ["language"]
-            }),
-        },
-        ToolDefinition {
-            name: tn::SET_TIMEZONE.to_string(),
-            description: "Set the user's timezone. Use this when the user tells you their timezone. Required before creating any triggers.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "timezone": {
-                        "type": "string",
-                        "description": "IANA timezone name (e.g., 'America/New_York', 'Europe/London', 'Asia/Tokyo')"
-                    }
-                },
-                "required": ["timezone"]
-            }),
-        },
-        ToolDefinition {
-            name: tn::SET_ENVIRONMENT_VARIABLE.to_string(),
-            description: "Set a user environment variable that gets injected into every subprocess Lucidos spawns (run_bash, run_python, scheduled scripts, coding agents). Use for NON-secret config the user wants available everywhere — build flags, default model names, CLI config dirs, things like CLAUDE_CODE_USE_VERTEX or LUCIDOS_REPO. These are NOT secret (they appear in logs/events); for API keys, tokens, or passwords use request_credential instead. Takes effect on the next subprocess — no restart.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Variable name: uppercase letters, digits, and underscores; must not start with a digit (e.g. 'CLAUDE_CODE_USE_VERTEX', 'LUCIDOS_REPO'). Engine-owned names (CRED_*, OAUTH_*, PG*, PATH, and internal LUCIDOS_* like LUCIDOS_WORKSPACE) are rejected."
-                    },
-                    "value": {
-                        "type": "string",
-                        "description": "Variable value (plaintext, non-secret)."
-                    }
-                },
-                "required": ["name", "value"]
-            }),
-        },
-    ]
+/// Standalone `get_backup_status` (read-only status, distinct surface — NOT part
+/// of the grouped `preferences` tool). Environment-variable management moved to
+/// the grouped `env_vars` manifest tool (list/set/delete); the former
+/// `set_environment_variable` name stays wired as a back-compat alias to its
+/// `set` action in `execute_tool`.
+pub(super) fn backup_status_tools() -> Vec<ToolDefinition> {
+    vec![ToolDefinition {
+        name: tn::GET_BACKUP_STATUS.to_string(),
+        description: "Read the workspace's backup status: the schedule (in the user's timezone) and next scheduled run, the provider and retention, the last run (with duration), recent run history (start/finish/size for each), and whether backups are stale. Read-only — makes no changes. Use it to answer 'when's my next/last backup?', 'how big/long are my backups?', or to check before changing the schedule. The schedule/provider/retention are CHANGED with set_preference (keys backup_schedule, backup_provider, backup_retention); restore is done from the workspace picker.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {}
+        }),
+    }]
 }
 
 pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
@@ -384,4 +376,117 @@ pub(super) fn todo_write_tools() -> Vec<ToolDefinition> {
             }),
         },
     ]
+}
+
+/// Contract codegen for the `navigate_ui` `target` + `settings_view` enums.
+///
+/// Rust is the single source of truth (`NAVIGATE_TARGETS` /
+/// `NAVIGABLE_SETTINGS_VIEWS`); the SDK `NavigateUi` TS types are GENERATED from
+/// it into `packages/lucidos-sdk/src/generated/navigate-targets.ts`. Mirrors the
+/// thread-lifecycle contract pattern in `thread_lifecycle_tests/contract.rs`:
+/// `generated_navigate_targets_is_up_to_date` fails `cargo test` if the on-disk
+/// file is stale, and the `#[ignore]` `generate_navigate_targets_file` rewrites
+/// it. Edit the consts above, then regenerate.
+#[cfg(test)]
+mod navigate_targets_codegen {
+    use super::*;
+
+    /// Path to the generated SDK file. CARGO_MANIFEST_DIR is
+    /// `<repo>/crates/lucidos-engine`, so two `.parent()`s reach the repo root
+    /// (the SDK lives under `packages/`, not `crates/`).
+    fn generated_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("packages/lucidos-sdk/src/generated/navigate-targets.ts")
+    }
+
+    fn push_const(out: &mut String, const_name: &str, type_name: &str, values: &[&str]) {
+        out.push_str(&format!("export const {} = [\n", const_name));
+        for v in values {
+            out.push_str(&format!("  '{}',\n", v));
+        }
+        out.push_str("] as const;\n");
+        out.push_str(&format!(
+            "export type {} = (typeof {})[number];\n",
+            type_name, const_name
+        ));
+    }
+
+    fn generate_navigate_targets_ts() -> String {
+        let mut out = String::new();
+        out.push_str(
+            "// AUTO-GENERATED by crates/lucidos-engine/src/llm/tools/misc.rs — do not edit by hand.\n",
+        );
+        out.push_str(
+            "// Regenerate: cargo test -p lucidos-engine --lib generate_navigate_targets_file -- --ignored\n",
+        );
+        out.push_str("//\n");
+        out.push_str(
+            "// Source of truth for the `navigate_ui` contract: the `NAVIGATE_TARGETS` and\n",
+        );
+        out.push_str(
+            "// `NAVIGABLE_SETTINGS_VIEWS` consts in that Rust file. The SDK `NavigateUi` type\n",
+        );
+        out.push_str(
+            "// derives from this file, so the LLM tool schema and the SDK can never drift.\n\n",
+        );
+        push_const(&mut out, "NAVIGATE_TARGETS", "NavigateTarget", NAVIGATE_TARGETS);
+        out.push('\n');
+        push_const(
+            &mut out,
+            "SETTINGS_VIEW_TARGETS",
+            "SettingsViewTarget",
+            NAVIGABLE_SETTINGS_VIEWS,
+        );
+        out
+    }
+
+    /// The tool schema's enums are built FROM the consts, so this guards only the
+    /// wiring (a refactor that hardcodes an enum again would trip it).
+    #[test]
+    fn tool_schema_enums_match_consts() {
+        let tool = get_navigate_ui_tool();
+        let props = &tool.parameters["properties"];
+        assert_eq!(
+            props["target"]["enum"],
+            serde_json::json!(NAVIGATE_TARGETS),
+            "navigate_ui target enum drifted from NAVIGATE_TARGETS"
+        );
+        assert_eq!(
+            props["settings_view"]["enum"],
+            serde_json::json!(NAVIGABLE_SETTINGS_VIEWS),
+            "navigate_ui settings_view enum drifted from NAVIGABLE_SETTINGS_VIEWS"
+        );
+    }
+
+    #[test]
+    fn generated_navigate_targets_is_up_to_date() {
+        let generated = generate_navigate_targets_ts();
+        let path = generated_path();
+        match std::fs::read_to_string(&path) {
+            Ok(existing) => assert_eq!(
+                existing, generated,
+                "Generated navigate-targets.ts is stale. Run: \
+                 cargo test -p lucidos-engine --lib generate_navigate_targets_file -- --ignored"
+            ),
+            Err(_) => panic!(
+                "Generated file missing at {}. Run: \
+                 cargo test -p lucidos-engine --lib generate_navigate_targets_file -- --ignored",
+                path.display()
+            ),
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn generate_navigate_targets_file() {
+        let generated = generate_navigate_targets_ts();
+        let path = generated_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &generated).unwrap();
+        crate::log!("[ContractTest] Generated: {}", path.display());
+    }
 }

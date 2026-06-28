@@ -8,6 +8,8 @@ import type { TriggerInfo } from '../../store/types';
 import { TriggerItem } from './TriggerItem';
 import { TriggerGroupHeader } from './TriggerGroupHeader';
 import { LoadableError } from '../shared/LoadableError';
+import { ListSkeleton } from '../shared/ListSkeleton';
+import { LoadingFade } from '../shared/LoadingFade';
 
 const UNGROUPED_KEY = '__ungrouped__';
 
@@ -51,17 +53,41 @@ export function TriggersView() {
     );
   }
 
-  if (triggersLoadable.status !== 'loaded') {
-    if (!showTriggersLoading) return null;
-    return (
-      <div class="content-view active">
-        <div class="list-rows">
-          <div class="loading-spinner" />
-        </div>
+  return (
+    <div class="content-view active">
+      <div class="list-rows">
+        <LoadingFade showSkeleton={showTriggersLoading} skeleton={<ListSkeleton />}>
+          {triggersLoadable.status === 'loaded' ? (
+            <TriggersLoaded
+              triggersData={triggersLoadable.data}
+              groupsLoadable={groupsLoadable}
+              newGroupName={newGroupName}
+              setNewGroupName={setNewGroupName}
+              commitNewGroup={commitNewGroup}
+              creatingGroupRef={creatingGroupRef}
+            />
+          ) : null}
+        </LoadingFade>
       </div>
-    );
-  }
+    </div>
+  );
+}
 
+function TriggersLoaded({
+  triggersData,
+  groupsLoadable,
+  newGroupName,
+  setNewGroupName,
+  commitNewGroup,
+  creatingGroupRef,
+}: {
+  triggersData: TriggerInfo[];
+  groupsLoadable: typeof triggerGroups.value;
+  newGroupName: string | null;
+  setNewGroupName: (v: string | null) => void;
+  commitNewGroup: () => void;
+  creatingGroupRef: { current: boolean };
+}) {
   // Group registry is small; if it failed, fall back to a flat panel under
   // "Ungrouped" so the user still sees their triggers. The failure surfaces
   // separately wherever the registry is needed (e.g. the picker in the trigger
@@ -74,7 +100,7 @@ export function TriggersView() {
   // the trigger's group_id update and the panel refetch) falls back to the
   // Ungrouped section so the row can never go invisible.
   const byGroup = new Map<string, TriggerInfo[]>();
-  for (const t of triggersLoadable.data) {
+  for (const t of triggersData) {
     const key = t.group_id && knownGroupIds.has(t.group_id) ? t.group_id : UNGROUPED_KEY;
     const bucket = byGroup.get(key);
     if (bucket) bucket.push(t);
@@ -86,61 +112,59 @@ export function TriggersView() {
   const ungroupedTriggers = byGroup.get(UNGROUPED_KEY) ?? [];
 
   return (
-    <div class="content-view active">
-      <div class="list-rows">
-        {groups.map(group => {
-          const members = byGroup.get(group.id) ?? [];
-          const isCollapsed = collapsed.has(group.id);
-          return (
-            <div class="trigger-group-section" key={group.id}>
-              <TriggerGroupHeader group={group} />
-              {!isCollapsed && members.map(trigger => (
-                <TriggerItem key={trigger.id} trigger={trigger} />
-              ))}
-            </div>
-          );
-        })}
-        {ungroupedTriggers.length > 0 && (
-          <div class="trigger-group-section trigger-group-section-ungrouped">
-            {groups.length > 0 && (
-              <div class="trigger-group-header trigger-group-header-ungrouped">
-                <span class="trigger-group-name">Ungrouped</span>
-                <span class="trigger-group-count">({ungroupedTriggers.length})</span>
-              </div>
-            )}
-            {ungroupedTriggers.map(trigger => (
+    <>
+      {groups.map(group => {
+        const members = byGroup.get(group.id) ?? [];
+        const isCollapsed = collapsed.has(group.id);
+        return (
+          <div class="trigger-group-section" key={group.id}>
+            <TriggerGroupHeader group={group} />
+            {!isCollapsed && members.map(trigger => (
               <TriggerItem key={trigger.id} trigger={trigger} />
             ))}
           </div>
-        )}
-        {newGroupName !== null && (
-          <div class="trigger-group-create-row">
-            <input
-              class="trigger-group-name-input"
-              type="text"
-              autoFocus
-              value={newGroupName}
-              placeholder="Group name"
-              onInput={e => setNewGroupName((e.target as HTMLInputElement).value)}
-              onBlur={commitNewGroup}
-              onKeyDown={e => {
-                if (e.key === 'Enter') void commitNewGroup();
-                else if (e.key === 'Escape') setNewGroupName(null);
-              }}
-            />
-          </div>
-        )}
-        <div class="trigger-add-row">
-          <div class="list-row-add-card" onClick={openAddTrigger}>
-            <div class="list-row-add-icon">+</div>
-            <div class="list-row-add-label">Add Trigger</div>
-          </div>
-          <div class="list-row-add-card" onClick={() => { creatingGroupRef.current = false; setNewGroupName(''); }}>
-            <div class="list-row-add-icon">+</div>
-            <div class="list-row-add-label">New Group</div>
-          </div>
+        );
+      })}
+      {ungroupedTriggers.length > 0 && (
+        <div class="trigger-group-section trigger-group-section-ungrouped">
+          {groups.length > 0 && (
+            <div class="trigger-group-header trigger-group-header-ungrouped">
+              <span class="trigger-group-name">Ungrouped</span>
+              <span class="trigger-group-count">({ungroupedTriggers.length})</span>
+            </div>
+          )}
+          {ungroupedTriggers.map(trigger => (
+            <TriggerItem key={trigger.id} trigger={trigger} />
+          ))}
+        </div>
+      )}
+      {newGroupName !== null && (
+        <div class="trigger-group-create-row">
+          <input
+            class="trigger-group-name-input"
+            type="text"
+            autoFocus
+            value={newGroupName}
+            placeholder="Group name"
+            onInput={e => setNewGroupName((e.target as HTMLInputElement).value)}
+            onBlur={commitNewGroup}
+            onKeyDown={e => {
+              if (e.key === 'Enter') void commitNewGroup();
+              else if (e.key === 'Escape') setNewGroupName(null);
+            }}
+          />
+        </div>
+      )}
+      <div class="trigger-add-row">
+        <div class="list-row-add-card" onClick={openAddTrigger}>
+          <div class="list-row-add-icon">+</div>
+          <div class="list-row-add-label">Add Trigger</div>
+        </div>
+        <div class="list-row-add-card" onClick={() => { creatingGroupRef.current = false; setNewGroupName(''); }}>
+          <div class="list-row-add-icon">+</div>
+          <div class="list-row-add-label">New Group</div>
         </div>
       </div>
-    </div>
+    </>
   );
 }

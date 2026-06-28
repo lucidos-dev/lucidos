@@ -372,3 +372,45 @@ fn compare_versions_treats_garbage_as_update() {
         UpdateDecision::Update
     );
 }
+
+// --- categories (controlled vocabulary) ---
+
+#[test]
+fn parses_categories_normalized_and_deduped() {
+    let toml = format!(
+        "{}categories = [\"Finance\", \"  health \", \"finance\", \"made-up\"]\n",
+        VALID_MANIFEST
+    );
+    let m = parse_manifest(&toml).unwrap();
+    // Lowercased + trimmed + de-duplicated; unknown values are NOT rejected at
+    // parse (they're filtered + flagged at scan time).
+    assert_eq!(m.categories, vec!["finance", "health", "made-up"]);
+}
+
+#[test]
+fn parse_manifest_without_categories_is_empty() {
+    let m = parse_manifest(VALID_MANIFEST).unwrap();
+    assert!(m.categories.is_empty());
+}
+
+#[test]
+fn partition_categories_splits_known_from_unknown() {
+    let input = vec![
+        "finance".to_string(),
+        "made-up".to_string(),
+        "health".to_string(),
+        "finance".to_string(), // dup known
+        "nonsense".to_string(),
+    ];
+    let (known, unknown) = partition_categories(&input);
+    assert_eq!(known, vec!["finance", "health"]);
+    assert_eq!(unknown, vec!["made-up", "nonsense"]);
+}
+
+#[test]
+fn every_known_category_passes_is_valid() {
+    for c in PLUGIN_CATEGORIES {
+        assert!(is_valid_category(c), "{c} should be a valid category");
+    }
+    assert!(!is_valid_category("not-a-category"));
+}

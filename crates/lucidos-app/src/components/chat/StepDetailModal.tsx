@@ -312,6 +312,12 @@ export function StepDetailModal() {
         <div class="step-detail-description">{highlightEllipsis(step.description)}</div>
         {step.detail && <div class="step-detail-detail">{highlightEllipsis(step.detail)}</div>}
         {showFull && <pre class="step-detail-full">{step.full}</pre>}
+        {step.thinkingText && (
+          <>
+            <div class="step-detail-section-label">Reasoning</div>
+            <pre class="step-detail-reasoning">{step.thinkingText}</pre>
+          </>
+        )}
         <ResultArea
           inlineResult={step.result}
           resultStripped={step.result_stripped}
@@ -319,7 +325,7 @@ export function StepDetailModal() {
         />
         {snap
           ? <ContextCapturePanel snap={snap} />
-          : <div class="step-detail-empty">No context snapshot captured for this step.</div>}
+          : !step.thinkingText && <div class="step-detail-empty">No context snapshot captured for this step.</div>}
         <button class="action-btn step-detail-close" onClick={close}>Close</button>
     </Overlay>
   );

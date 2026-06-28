@@ -145,12 +145,12 @@ describe('filterByTopThread', () => {
         const child = makeThread('c', {
             channel: CODING_AGENT_CHANNEL,
             codingAgentKind: 'app',
-            codingAgentFolder: '/ws/data/apps/momentum',
+            codingAgentFolder: '/ws/data/apps/habit-tracker',
             parentId: 'p',
         });
         const graph = computeFamilyGraph([parent, child]);
         const filter = new Set<ThreadChannel>([CODING_AGENT_CHANNEL]);
-        const apps = new Set(['momentum']);
+        const apps = new Set(['habit-tracker']);
         const result = filterByTopThread([parent, child], graph, t =>
             threadPassesChannelFilter(t, filter, NO_TRIGGERS, NO_REPOS, apps),
             true,
@@ -220,14 +220,14 @@ describe('threadPassesChannelFilter', () => {
         const matching = makeThread('m', {
             channel: CODING_AGENT_CHANNEL,
             codingAgentKind: 'app',
-            codingAgentFolder: '/ws/data/apps/momentum',
+            codingAgentFolder: '/ws/data/apps/habit-tracker',
         });
         const other = makeThread('o', {
             channel: CODING_AGENT_CHANNEL,
             codingAgentKind: 'app',
-            codingAgentFolder: '/ws/data/apps/habit-tracker',
+            codingAgentFolder: '/ws/data/apps/demo-director',
         });
-        const apps = new Set(['momentum']);
+        const apps = new Set(['habit-tracker']);
         expect(threadPassesChannelFilter(matching, ALL, NO_TRIGGERS, NO_REPOS, apps)).toBe(true);
         expect(threadPassesChannelFilter(other, ALL, NO_TRIGGERS, NO_REPOS, apps)).toBe(false);
     });
@@ -237,11 +237,11 @@ describe('threadPassesChannelFilter', () => {
         const appThread = makeThread('a', {
             channel: CODING_AGENT_CHANNEL,
             codingAgentKind: 'app',
-            codingAgentFolder: '/ws/data/apps/momentum',
+            codingAgentFolder: '/ws/data/apps/habit-tracker',
         });
         const unrelated = makeThread('u', { channel: CODING_AGENT_CHANNEL, repoId: 'Z' });
         const repos = new Set(['X']);
-        const apps = new Set(['momentum']);
+        const apps = new Set(['habit-tracker']);
         expect(threadPassesChannelFilter(repoThread, ALL, NO_TRIGGERS, repos, apps)).toBe(true);
         expect(threadPassesChannelFilter(appThread, ALL, NO_TRIGGERS, repos, apps)).toBe(true);
         expect(threadPassesChannelFilter(unrelated, ALL, NO_TRIGGERS, repos, apps)).toBe(false);
@@ -251,7 +251,7 @@ describe('threadPassesChannelFilter', () => {
         const appThread = makeThread('a', {
             channel: CODING_AGENT_CHANNEL,
             codingAgentKind: 'app',
-            codingAgentFolder: '/ws/data/apps/momentum',
+            codingAgentFolder: '/ws/data/apps/habit-tracker',
         });
         const repoThread = makeThread('r', { channel: CODING_AGENT_CHANNEL, repoId: 'X' });
         expect(threadPassesChannelFilter(appThread, ALL, NO_TRIGGERS, NO_REPOS, NO_APPS)).toBe(true);

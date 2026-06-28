@@ -1,5 +1,5 @@
 import type { VNode } from 'preact';
-import { useRef, useEffect, useLayoutEffect } from 'preact/hooks';
+import { useRef, useEffect, useLayoutEffect, useState } from 'preact/hooks';
 import {
   activeExchanges,
   activeStreamingBuffer,
@@ -11,6 +11,7 @@ import {
   cancelingThreadIds,
   removingQueuedMessageIds,
   queuedMessageRemovalKey,
+  promptAnimating,
 } from '../../store/store';
 import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
 import { scrolledUp, awayFromBottom, notAtTop, scrollToBottom, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, hasPendingEventScroll } from './scrollState';
@@ -18,9 +19,35 @@ import { ChatExchange } from './ChatExchange';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
 import type { Exchange } from '../../store/thread-events';
-import { exchangeStatus as getExchangeStatus, exchangeImageCount, exchangeResponseModel, exchangeReasoningEffort, exchangeKey, unresumedAbortIndex, queuedFollowupRun } from '../../store/thread-events';
+import { exchangeStatus as getExchangeStatus, exchangeImageCount, exchangeResponseModel, exchangeReasoningEffort, exchangeKey, unresumedAbortIndex, queuedFollowupRun, isChangeLifecycleEvent } from '../../store/thread-events';
 import { isActive as isStatusActive } from '../../store/exchange-status';
 import { forceIOSRepaint } from '../../utils/iosRepaint';
+
+/** First line of a change's description + its file count, keyed by change_id —
+ *  harvested from the `ChangeProposed` events that ride a thread's coding-agent
+ *  turns (as non-rendered steps). A later `ChangeApplied`/`Discarded`/`Reverted`
+ *  card for the same change_id is a SEPARATE exchange that carries no
+ *  description/file count of its own, so it would otherwise fetch the `Change`
+ *  row on open and pop the body in late (the open-path jump). Seeding the body
+ *  from this in-thread data paints it at full height immediately. */
+type ProposedChangeInfo = { description?: string; fileCount?: number };
+
+function buildProposedChangeInfo(exchanges: Exchange[]): Map<string, ProposedChangeInfo> {
+  const map = new Map<string, ProposedChangeInfo>();
+  for (const ex of exchanges) {
+    for (const { event } of ex.steps) {
+      // Per-commit ChangeProposed emits carry an empty change_id (see
+      // exchangeChangeId) — the truthiness check skips them; the aggregate
+      // proposal carries the real id + the full file list.
+      if (event.type === 'ChangeProposed' && event.change_id && !map.has(event.change_id)) {
+        map.set(event.change_id, { description: event.description, fileCount: event.files?.length });
+      }
+    }
+  }
+  return map;
+}
+
+const NO_PROPOSED_CHANGE_INFO = new Map<string, ProposedChangeInfo>();
 
 /** Threads imageOffset + last model/effort across exchanges so each child sees its predecessors' state. */
 export function renderExchanges(
@@ -82,6 +109,11 @@ export function renderExchanges(
   let lastModel: string | undefined;
   let lastEffort: string | undefined;
 
+  // Only scan for ChangeProposed seeds when the thread actually has a
+  // change-lifecycle card to seed — the common (chat) thread pays nothing.
+  const hasChangePanel = exchanges.some(ex => isChangeLifecycleEvent(ex.userEvent));
+  const proposedChangeInfo = hasChangePanel ? buildProposedChangeInfo(exchanges) : NO_PROPOSED_CHANGE_INFO;
+
   const renderOne = (ex: Exchange, i: number): VNode => {
     // The active exchange plays the 'last' role (gets the stream, reads
     // 'streaming'/'working'); queued follow-ups after it are explicitly flagged.
@@ -91,6 +123,12 @@ export function renderExchanges(
     // is driven by queuedRun so persisted follow-ups don't depend on
     // exchangeStatus' single-last queued branch.
     const priorActive = i > 0 && isStatusActive(getExchangeStatus(exchanges[i - 1], '', /* isLast */ false, /* hasPriorActive */ false, threadIsCC, threadIdle, threadAwaitingAnswer));
+    // Seed the change-lifecycle card's body from the in-thread ChangeProposed
+    // so it paints at final height on first open (see buildProposedChangeInfo).
+    const seedChangeId = isChangeLifecycleEvent(ex.userEvent)
+      ? (ex.userEvent as { change_id?: string }).change_id
+      : undefined;
+    const proposedSeed = seedChangeId ? proposedChangeInfo.get(seedChangeId) : undefined;
     return (
       <ChatExchange
         // Key by the stable event id (not userSeq) so an optimistic pending
@@ -118,6 +156,8 @@ export function renderExchanges(
         threadIdle={threadIdle}
         threadAwaitingAnswer={threadAwaitingAnswer}
         threadCanceling={threadCanceling}
+        proposedChangeDesc={proposedSeed?.description}
+        proposedChangeFileCount={proposedSeed?.fileCount}
       />
     );
   };
@@ -389,6 +429,10 @@ export function CreateThreadView() {
   const isUp = awayFromBottom.value;
   const isNotAtTop = notAtTop.value;
 
+  // Subscribe to the prompt's FLIP move (ThreadPane): the welcome's entrance is
+  // sequenced AFTER this move finishes — see the reveal effect below.
+  const animating = promptAnimating.value;
+
   const isEmpty = exchanges.length === 0;
   // Show the welcome until it's dismissed. `welcomeSuggestionsDismissed()` reads
   // the DB-backed preference and fails closed while preferences load (returns
@@ -399,6 +443,27 @@ export function CreateThreadView() {
     isEmpty,
     welcomeDismissed: welcomeSuggestionsDismissed(),
   });
+
+  // Sequenced welcome entrance: hold the surface hidden (CSS `opacity: 0` base)
+  // until the prompt textarea has finished sliding up to its resting position,
+  // then add `.welcome-revealing` to play the fade+slide enter animation.
+  // `promptAnimating` is the authoritative end-of-move signal — ThreadPane flips
+  // it true for the FLIP move and false on the transform `transitionend`. The
+  // rAF defer wins the race against a move that's about to START: when entering
+  // compose-empty this child's layout effect runs BEFORE ThreadPane's sets
+  // `promptAnimating`, so re-checking the live signal one frame later lets a
+  // just-started move re-gate the reveal. When there's no move (initial mount,
+  // mobile, reduced-motion) the welcome reveals on the next frame — no delay.
+  const [welcomeRevealed, setWelcomeRevealed] = useState(false);
+  useLayoutEffect(() => {
+    if (!showWelcome) { setWelcomeRevealed(false); return; }
+    if (welcomeRevealed || animating) return;
+    const raf = requestAnimationFrame(() => {
+      if (promptAnimating.value) return; // a move just started — wait for it
+      setWelcomeRevealed(true);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [animating, showWelcome, welcomeRevealed]);
 
   // hasContent: true exactly when the thread-content div will be in the DOM.
   // useAutoScroll depends on this — if we only pass `loaded`, the effect runs
@@ -414,7 +479,7 @@ export function CreateThreadView() {
     <div class="thread-content-wrap">
       {hasContent && (
         <>
-          <div class="thread-content visible" ref={areaRef}>
+          <div class={`thread-content visible${welcomeRevealed ? ' welcome-revealing' : ''}`} ref={areaRef}>
 
             {showWelcome ? (
               <WelcomeMessage />

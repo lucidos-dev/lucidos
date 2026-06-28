@@ -27,9 +27,11 @@ import { isTauri } from '../../utils/platform';
 import { invoke } from '../../utils/tauri';
 import { ENGINE_VERSION } from 'virtual:engine-version';
 import { BackupSection } from './BackupSection';
+import { LocaleSection } from './LocaleSection';
 import { DiskUsagePage } from './DiskUsagePage';
 import { MemoryInspector } from './MemoryInspector';
 import { EnvironmentVariablesPage } from './EnvironmentVariablesPage';
+import { DebuggingSection } from './DebuggingSection';
 import { ThreadQueueView } from '../thread-queue/ThreadQueueView';
 
 /** The SPA origin, read lazily so importing this module never touches the DOM. */
@@ -37,7 +39,7 @@ function getApiUrl(): string {
   return typeof window !== 'undefined' && window.location ? window.location.origin : '';
 }
 
-export type SystemPanel = 'overview' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables';
+export type SystemPanel = 'overview' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging';
 
 const SYSTEM_PANELS: Array<{ key: SystemPanel; label: string; subview: SettingsNavKey }> = [
   { key: 'overview', label: 'Overview', subview: 'system' },
@@ -137,6 +139,7 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
       case 'memory': return <MemoryInspector />;
       case 'disk-usage': return <DiskUsagePage />;
       case 'environment-variables': return <EnvironmentVariablesPage />;
+      case 'debugging': return <DebuggingSection />;
       default: return renderOverview();
     }
   }
@@ -169,6 +172,8 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
             </div>
           </div>
         </div>
+
+        <LocaleSection />
 
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="system:versions">Versions</div>

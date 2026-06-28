@@ -83,8 +83,10 @@ describe('WelcomeMessage — provider-aware variant selection', () => {
     const vnode = WelcomeMessage() as AnyVNode;
     // Configured branch is the inline DOM tree, not the setup component.
     expect(vnode.type).toBe('div');
-    // Suggestions render via the chevron carousel (its own component), with the
-    // lead-in label above it. No clickable chips, no provider-setup CTA.
+    // Suggestions render via the chevron carousel (its own component, which makes
+    // each suggestion a clickable button that prefills the prompt — covered by
+    // e2e/welcome.spec.ts), with the lead-in label above it. The old standalone
+    // `welcome-suggestion-chip` markup is gone, and there's no provider-setup CTA.
     expect(containsComponent(vnode, SuggestionCarousel)).toBe(true);
     expect(textOf(vnode)).toContain('A few suggestions');
     expect(findByClass(vnode, 'welcome-suggestion-chip').length).toBe(0);

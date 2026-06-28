@@ -193,7 +193,7 @@ async fn recover_no_commits_branch_already_applied_after_fast_forward() {
 #[test]
 fn repo_at_different_path_is_external() {
     let dev = std::path::PathBuf::from("/Users/me/IdeaProjects/lucidos");
-    let other = std::path::PathBuf::from("/Users/me/IdeaProjects/user-acquisition");
+    let other = std::path::PathBuf::from("/Users/me/IdeaProjects/example-repo");
     assert!(is_external_repo_path(&other, &dev));
 }
 
@@ -434,13 +434,13 @@ async fn worktree_exclude_paths_hide_deep_app_lucidos_cli_skill_from_git_status(
             "add",
             wt.to_str().unwrap(),
             "-b",
-            "claude-code/app/momentum-autoresearch/test-branch",
+            "claude-code/app/habit-tracker/test-branch",
         ],
         &repo,
     )
     .await;
 
-    let deep_skill_dir = wt.join("data/apps/momentum-autoresearch/.claude/skills/lucidos-cli");
+    let deep_skill_dir = wt.join("data/apps/habit-tracker/.claude/skills/lucidos-cli");
     tokio::fs::create_dir_all(&deep_skill_dir).await.unwrap();
     tokio::fs::write(deep_skill_dir.join("SKILL.md"), "skill content")
         .await
@@ -457,7 +457,7 @@ async fn worktree_exclude_paths_hide_deep_app_lucidos_cli_skill_from_git_status(
     .into_owned();
     assert!(
         status_before.contains(
-            "data/apps/momentum-autoresearch/.claude/skills/lucidos-cli/SKILL.md"
+            "data/apps/habit-tracker/.claude/skills/lucidos-cli/SKILL.md"
         ),
         "test setup: deep skill file should be untracked before exclude write: {status_before}"
     );
@@ -472,7 +472,7 @@ async fn worktree_exclude_paths_hide_deep_app_lucidos_cli_skill_from_git_status(
     )
     .into_owned();
     assert!(
-        !status_after.contains("data/apps/momentum-autoresearch/.claude"),
+        !status_after.contains("data/apps/habit-tracker/.claude"),
         "deep skill file still untracked — gitignore pattern in WORKTREE_EXCLUDE_PATHS \
          does not match at depth; app coding-agent threads will keep auto-committing \
          the engine-injected SKILL.md as a phantom user change: {status_after}"
@@ -754,7 +754,7 @@ async fn porcelain_for(wt: &std::path::Path, rel: &str) -> String {
     .into_owned()
 }
 
-/// The momentum-app bug: an engine-injected `SKILL.md` that was auto-committed
+/// The habit-tracker-app bug: an engine-injected `SKILL.md` that was auto-committed
 /// in an earlier session is now tracked-but-stale. The engine overwrites it on
 /// disk with its newer embedded copy → phantom `M`. `.git/info/exclude` can't
 /// hide a tracked path, so `hide_phantom_tracked_skill` must skip-worktree it so
@@ -826,7 +826,7 @@ async fn hide_phantom_tracked_skill_leaves_clean_tracked_skill_editable() {
     );
 }
 
-/// The real momentum scenario: an *app coding-agent thread* runs CC inside the
+/// The real habit-tracker scenario: an *app coding-agent thread* runs CC inside the
 /// deep app folder (`data/apps/<id>/`), so the guard's `cwd` is a subdirectory
 /// of the worktree and the skill path is resolved cwd-relative. The phantom must
 /// still be hidden — pins that `git update-index --skip-worktree` works from a
@@ -834,16 +834,16 @@ async fn hide_phantom_tracked_skill_leaves_clean_tracked_skill_editable() {
 #[tokio::test]
 async fn hide_phantom_tracked_skill_hides_deep_app_skill_from_subdir_cwd() {
     let (_tmp, repo) = make_test_repo().await;
-    let wt = add_worktree(&repo, "claude-code/app/momentum/x", "wt-deep").await;
+    let wt = add_worktree(&repo, "claude-code/app/habit-tracker/x", "wt-deep").await;
 
-    let app_cwd = wt.join("data/apps/momentum");
+    let app_cwd = wt.join("data/apps/habit-tracker");
     let skill = app_cwd.join(PHANTOM_SKILL_REL);
     tokio::fs::create_dir_all(skill.parent().unwrap())
         .await
         .unwrap();
     tokio::fs::write(&skill, "stale skill body\n").await.unwrap();
     // Commit from the worktree root with the full deep path.
-    let deep_rel = "data/apps/momentum/.claude/skills/lucidos-cli/SKILL.md";
+    let deep_rel = "data/apps/habit-tracker/.claude/skills/lucidos-cli/SKILL.md";
     let _ = git_cmd(&["add", "--", deep_rel], &wt).await.unwrap();
     let _ = git_cmd(&["commit", "-m", "auto-committed deep skill"], &wt)
         .await

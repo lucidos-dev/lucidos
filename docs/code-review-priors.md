@@ -234,6 +234,18 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   and `meta.updatedAt` are the SAME monotonic `thread_summaries.last_activity`
   column, so the lexicographic `<` is a valid causal-freshness test — not a
   cross-clock compare.
+- **`.boot-splash-status` uses `font-size: 15px` (px, not rem) on purpose — it
+  is NOT a violation of the "all sizes rem" rule.** The app's `<html>` font-size
+  is scaled by `var(--user-ui-scale)` (`base.css`), so a rem value would grow
+  with the user's UI scale (e.g. 22.5px at 150%). The boot splash must render the
+  status at the SAME size as the gateway "Starting engine…" splash
+  (`crates/lucidos-gateway/src/proxy.rs` `.mark-label`, `0.9375rem` × an
+  unscaled 16px root = 15px), which is an isolated document with no access to the
+  scale. Pinning a fixed 15px is the requirement — reverting it to rem
+  reintroduces the "status text jumps size across the cold-boot→workspace seam"
+  bug. The rem rule honors user scale; this is the deliberate case where scale
+  must NOT apply. Re-flag only if the gateway splash gains UI-scale awareness.
+  (`crates/lucidos-app/index.html` `.boot-splash-status`.)
 
 ## Scripts (bash)
 
@@ -258,6 +270,49 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   tty → it hangs" has conflated stdin with stdout. The only invocation that
   makes fd 1 a non-tty is an explicit redirect (`curl … | sh > file`), which is
   not the documented path. (`install.sh`, `scripts/web-dev.sh` tail.)
+
+## Plugins & triggers (ADR 0019)
+
+- **The `trigger.toml` projection is gitignored-by-`.git/info/exclude`, and that
+  degrades gracefully (to untracked files) when `.git` is a worktree *file*
+  rather than a dir.** `ensure_trigger_toml_gitignored` (`triggers/definition.rs`)
+  writes `<ws>/.git/info/exclude`; in a git worktree `.git` is a file, so the
+  write silently no-ops and the projected `trigger.toml` files show as untracked.
+  This is INTENDED and acceptable: real Lucidos *workspaces* are normal repos
+  (`.git` is a dir), and the files are a derived read-model regenerated from
+  events anyway — untracked is harmless. Re-flag only if workspaces start being
+  provisioned as worktrees. (`triggers/definition.rs`.)
+
+- **The boot rebuild rewrites every `trigger.toml` unconditionally (no
+  content/mtime compare).** `rebuild_trigger_definitions` runs once at boot in
+  `spawn_blocking` over a handful of triggers; the writes are deterministic
+  (identical bytes when unchanged) and the files are gitignored, so there's no
+  git churn and the cost is negligible. Not worth a content-equality
+  short-circuit. (`triggers/definition.rs`, `scheduler/mod.rs` boot path.)
+
+- **`appSearchOpen` / `appSearchQuery` are deliberately shared by the Apps and
+  Plugins panels.** Only one of the two panels is visible at a time, so one
+  search-state pair serves both (the store comment says so). A leftover query
+  can carry across a panel switch — this is the same accepted behavior the old
+  Installed/Store tabs had, not a new correctness break. Re-flag only if the
+  panels become simultaneously visible. (`store/store.ts`, `store/actions/apps.ts`.)
+
+- **`get_recent_threads` dropping the `coding_agent_proposed` out-of-window
+  bypass does NOT lose work behind the archive curtain.** The outer `WHERE` only
+  returns inbox rows + the contiguous archived window — it no longer force-loads
+  an archived `coding_agent_proposed` row. This looks like it violates the
+  "archived-with-pending-changes routes to Current" invariant
+  (`display_section`, test `archived_with_pending_changes_routes_to_current`), but
+  archived + `coding_agent_proposed=TRUE` is an UNREACHABLE state: `ChangeProposed`
+  (the event that sets `coding_agent_proposed`) and `CodingAgentIdled` both
+  transition the thread `to_inbox` (`thread_lifecycle.rs` transition table), so a
+  proposed CC thread is always inbox; `is_blocking` removes the Archive action
+  while an in-workspace change is pending; and the external-repo archive cascade
+  emits `ChangeApplied` (clearing proposed) before `ThreadArchived`. The
+  `display_section` arm is a defensive property, not proof of reachability.
+  Re-flag only if a path is added that sets `coding_agent_proposed` WITHOUT a
+  `ChangeProposed`/`to_inbox` transition. (`core/store/threads/summaries.rs`,
+  `engine/thread_lifecycle.rs`.)
 
 ## Settled architecture questions
 

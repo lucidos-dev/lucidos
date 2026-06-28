@@ -115,6 +115,15 @@ fragile bandaid. Special cases layered on shared infrastructure are a sign the
 fix isn't deep enough — prefer generalizing the underlying mechanism over
 adding special cases.
 
+**Private-data leak.** Flag any private/personal/company-internal data the diff
+introduces into a **shipping** file (everything except `docs/plans/**` and
+`WORKSPACES.md` ships verbatim to the public mirror — test fixtures and comments
+included): real names used as fixtures, personal/family data, internal
+repo/app/org names, real home paths, named live workspaces (`personal`/`work`).
+The definition, carve-out (legitimate attribution), and approved placeholders
+live in `.claude/rules/no-private-data.md` — flag against that rule and name the
+placeholder to use.
+
 Cleanup and altitude candidates use the same `file`/`line`/`summary` shape; in
 `failure_scenario`, state the concrete cost (what is duplicated, wasted, or
 harder to maintain) instead of a crash. **Correctness bugs always outrank

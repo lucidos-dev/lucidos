@@ -12,6 +12,7 @@ import { MENU_ITEMS } from '../types';
 import { normalizeUrl } from './artifacts';
 import { NAV_KEY } from './entityReferences';
 import { isTauri } from '../../utils/platform';
+import { currentInAppBrowser } from './preferences';
 import { revealContentPane } from './pane';
 
 /** A snapshot of panel navigation state. */
@@ -157,8 +158,12 @@ function restoreState(entry: NavEntry): void {
     activeMenuItem.value = menuItem;
     localStorage.setItem('lucidos-active-menu-item', menuItem);
     settingsSubview.value = migrated.settingsSubview;
-    // In Chrome/PWA, url-preview uses a broken iframe — don't restore it.
-    const overlay = !isTauri() && migrated.overlay?.type === 'url-preview'
+    // Don't restore a url-preview overlay when the in-app browser isn't the
+    // active path: in Chrome/PWA it uses a broken iframe, and under Tauri the
+    // experimental in-app webview is off by default (URLs open in the system
+    // browser, so there's no panel to resurrect on reload).
+    const overlay = migrated.overlay?.type === 'url-preview'
+      && (!isTauri() || !currentInAppBrowser())
       ? null : migrated.overlay;
     panelOverlay.value = overlay;
     if (overlay?.type === 'file-preview') {

@@ -413,7 +413,7 @@ pub struct ChatRequest {
     #[serde(default)]
     pub spawning_event_id: Option<String>,
     /// Cross-workspace origin: name of the calling workspace (e.g. `"dev"`,
-    /// `"personal"`). When set, the receiver constructs
+    /// `"myws"`). When set, the receiver constructs
     /// `MessageOrigin::Workspace` from the three `caller_*` fields. Mutually
     /// exclusive with `parent_thread_id` / `spawning_event_id` — those are
     /// for *same-workspace* parent-child spawns (with callback). Cross-workspace
@@ -539,6 +539,10 @@ pub struct ModelsListResponse {
 #[derive(Deserialize)]
 pub struct CreateModelRequest {
     pub id: String,
+    /// Display name. Optional — an absent/empty label defaults to the id, matching
+    /// the `manage_models` LLM handler and the `lucidos models add` CLI (whose
+    /// `--label` is optional). The Settings UI always sends one.
+    #[serde(default)]
     pub label: String,
     /// Backend that serves the model: "vertex" | "anthropic" | "openai" |
     /// "openrouter" | "local". Validated by `settings::valid_provider`.

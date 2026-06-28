@@ -4,28 +4,52 @@ import {
 } from '../../store/store';
 import type { DiffFile } from '../../store/store';
 import {
-  toggleRepoFolder, expandAllRepoFolders, collapseAllRepoFolders,
-  openRepoFilePreview,
+  toggleRepoFolder, openRepoFilePreview,
 } from '../../store/actions/repositories';
 import { buildFolderTree } from '../../store/actions/artifacts';
 import type { FolderNode } from '../../store/actions/artifacts';
-import { useDelayedLoading } from '../../hooks/useDelayedLoading';
-import { loadedOr } from '../../store/types';
+import { useDelayedLoading, useDelayedFlag } from '../../hooks/useDelayedLoading';
+import { loadedOr, type Loadable } from '../../store/types';
+import { ListSkeleton } from '../shared/ListSkeleton';
+import { LoadingFade } from '../shared/LoadingFade';
 import { FileTypeIcon } from '../../utils/fileIcons';
 import { TreeNode } from './FolderTree';
 import { changeBadgeLabel } from './changeBadge';
 import { diffStats } from './diffStats';
 import { DiffStatsInline, DiffView } from './DiffView';
 
+/** Whether the registered-repo Files view has the data its CURRENT mode renders.
+ *  All-files mode shows the file tree (repoFiles); Changes mode shows the diff
+ *  (repoDiff), not the tree. The skeleton vs content both gate on this so neither
+ *  flashes before its data is in. The Changes-mode diff gate is load-bearing:
+ *  repoFiles usually resolves first, so without folding repoDiff in here
+ *  ChangesFileList would render an empty [] → a spurious "No changes" while the
+ *  diff is still loading (and before the single-file overlay opens over it).
+ *  Exported for the unit test. */
+export function repoFilesContentReady(opts: {
+  filesStatus: Loadable<unknown>['status'];
+  diffStatus: Loadable<unknown>['status'];
+  mode: 'all' | 'changes';
+}): boolean {
+  if (opts.filesStatus !== 'loaded') return false;
+  return opts.mode !== 'changes' || opts.diffStatus === 'loaded';
+}
+
 export function RepoFilesView() {
   const loadable = repoFiles.value;
-  const showLoading = useDelayedLoading(loadable);
   const diffLoadable = repoDiff.value;
   // App-CC branch shows the diff directly (no repoFiles tree), so its spinner
   // must key off the diff's own load state, not repoFiles'.
   const diffShowLoading = useDelayedLoading(diffLoadable);
   const pending = repoPending.value;
   const mode = repoViewMode.value;
+  const diffLoaded = diffLoadable.status === 'loaded';
+  const contentReady = repoFilesContentReady({
+    filesStatus: loadable.status,
+    diffStatus: diffLoadable.status,
+    mode,
+  });
+  const showLoading = useDelayedFlag(!contentReady);
   // Without a registered repo (app coding-agent threads use the workspace
   // as their git root, which isn't a Repository row), the "All Files" tab
   // would render an empty tree — hide the toggle and pin Changes view.
@@ -33,18 +57,12 @@ export function RepoFilesView() {
   // so don't gate the render on its load state.
   const hasRepo = repoSource.value != null;
 
-  if (hasRepo) {
-    if (loadable.status === 'failed') {
-      return (
-        <div class="files-toolbar">
-          <span class="files-hint error-text">Failed to load: {loadable.error}</span>
-        </div>
-      );
-    }
-    if (loadable.status !== 'loaded') {
-      if (!showLoading) return null;
-      return <div class="loading-spinner" />;
-    }
+  if (hasRepo && loadable.status === 'failed') {
+    return (
+      <div class="files-toolbar">
+        <span class="files-hint error-text">Failed to load: {loadable.error}</span>
+      </div>
+    );
   }
 
   if (diffLoadable.status === 'failed') {
@@ -55,7 +73,6 @@ export function RepoFilesView() {
     );
   }
 
-  const diffLoaded = diffLoadable.status === 'loaded';
   const changedFiles = diffLoaded ? diffLoadable.data.files : [];
   const changedMap = new Map(changedFiles.map(f => [f.path, f]));
 
@@ -77,41 +94,42 @@ export function RepoFilesView() {
   }
 
   return (
-    <>
-      <div class="files-toolbar files-toolbar-bordered">
-        <span class="files-toolbar-actions">
+    <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+      {contentReady ? (
+        <>
+          {/* Toolbar holds only the All Files / Changes toggle now (Expand/Collapse
+              all were removed). Skip rendering it entirely when there's no change to
+              toggle against, so we don't leave an empty padded bar. */}
           {(pending || repoSelectedChangeId.value) && (
-            <span class="repo-view-toggle">
-              <button
-                class={`files-toolbar-btn ${mode === 'all' ? 'active' : ''}`}
-                onClick={() => { repoViewMode.value = 'all'; }}
-              >
-                All Files
-              </button>
-              <button
-                class={`files-toolbar-btn ${mode === 'changes' ? 'active' : ''}`}
-                onClick={() => { repoViewMode.value = 'changes'; }}
-              >
-                Changes {diffLoaded ? `(${changedFiles.length})` : '…'}
-              </button>
-            </span>
+            <div class="files-toolbar files-toolbar-bordered">
+              <span class="files-toolbar-actions">
+                <span class="repo-view-toggle">
+                  <button
+                    class={`files-toolbar-btn ${mode === 'all' ? 'active' : ''}`}
+                    onClick={() => { repoViewMode.value = 'all'; }}
+                  >
+                    All Files
+                  </button>
+                  <button
+                    class={`files-toolbar-btn ${mode === 'changes' ? 'active' : ''}`}
+                    onClick={() => { repoViewMode.value = 'changes'; }}
+                  >
+                    Changes {diffLoaded ? `(${changedFiles.length})` : '…'}
+                  </button>
+                </span>
+              </span>
+            </div>
           )}
-          {mode === 'all' && (
-            <>
-              <button class="files-toolbar-btn" onClick={expandAllRepoFolders} data-tooltip="Expand all folders">Expand All</button>
-              <button class="files-toolbar-btn" onClick={collapseAllRepoFolders} data-tooltip="Collapse all folders">Collapse All</button>
-            </>
-          )}
-        </span>
-      </div>
-      <div class="artifacts-desktop">
-        {mode === 'changes' ? (
-          <ChangesFileList files={changedFiles} />
-        ) : (
-          <RepoFolderTree changedMap={changedMap} />
-        )}
-      </div>
-    </>
+          <div class="artifacts-desktop">
+            {mode === 'changes' ? (
+              <ChangesFileList files={changedFiles} />
+            ) : (
+              <RepoFolderTree changedMap={changedMap} />
+            )}
+          </div>
+        </>
+      ) : null}
+    </LoadingFade>
   );
 }
 

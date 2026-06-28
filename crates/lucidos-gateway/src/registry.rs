@@ -278,9 +278,9 @@ mod tests {
     #[test]
     fn parse_workspace_name_from_archive_roundtrips_and_rejects_non_archives() {
         assert_eq!(
-            parse_workspace_name_from_archive("lucidos-backup-personal-20260601-040254.enc")
+            parse_workspace_name_from_archive("lucidos-backup-myws-20260601-040254.enc")
                 .as_deref(),
-            Some("personal")
+            Some("myws")
         );
         // Hyphenated name — only the timestamp tail is stripped.
         assert_eq!(
@@ -290,9 +290,9 @@ mod tests {
         );
         // Not archive-shaped → None (picker then requires a typed name).
         assert!(parse_workspace_name_from_archive("random.enc").is_none());
-        assert!(parse_workspace_name_from_archive("lucidos-backup-personal.enc").is_none());
+        assert!(parse_workspace_name_from_archive("lucidos-backup-myws.enc").is_none());
         assert!(
-            parse_workspace_name_from_archive("lucidos-backup-personal-20260601.enc").is_none()
+            parse_workspace_name_from_archive("lucidos-backup-myws-20260601.enc").is_none()
         );
         assert!(parse_workspace_name_from_archive("lucidos-backup-20260601-040254.enc").is_none());
         assert!(parse_workspace_name_from_archive("backup.tar.gz").is_none());
@@ -389,9 +389,9 @@ mod tests {
         })
         .unwrap();
         reg.add(Workspace {
-            id: "work".into(),
-            name: "Work 💼".into(),
-            dir: "workspaces/work".into(),
+            id: "myws".into(),
+            name: "My Workspace 💼".into(),
+            dir: "workspaces/myws".into(),
             port: 51812,
             database_url: Some("postgres://lucidos:lucidos@127.0.0.1:5599/lucidos".into()),
             autostart: true,
@@ -401,10 +401,10 @@ mod tests {
 
         let loaded = Registry::load(&path).unwrap();
         assert_eq!(loaded.workspaces, reg.workspaces);
-        assert_eq!(loaded.get("work").unwrap().name, "Work 💼");
+        assert_eq!(loaded.get("myws").unwrap().name, "My Workspace 💼");
         assert!(loaded.get("default").unwrap().database_url.is_none());
         // The autostart flag round-trips per entry.
-        assert!(loaded.get("work").unwrap().autostart);
+        assert!(loaded.get("myws").unwrap().autostart);
         assert!(!loaded.get("default").unwrap().autostart);
 
         let _ = std::fs::remove_dir_all(&dir);

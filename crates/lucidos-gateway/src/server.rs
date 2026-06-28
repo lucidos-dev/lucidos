@@ -97,17 +97,11 @@ const BOOT_GRACE: Duration = Duration::from_secs(120);
 const RESPAWN_BACKOFF: Duration = Duration::from_secs(5);
 /// Auto-respawn attempts (since last healthy) before a stack is marked unhealthy.
 const RESTART_CAP: u32 = 5;
-/// Consecutive missed probes before culling an engine that is UNREACHABLE
-/// (connection refused — listener gone) or whose process has exited. Small: a
-/// real death should recover promptly.
+/// Consecutive missed probes before respawning an engine whose process has
+/// EXITED (crash recovery). Small: a real death should recover promptly. An
+/// engine that is still ALIVE is never culled — whatever the probe says (see
+/// [`respawn_decision`]) — so there is no separate "slow" threshold.
 const DEAD_MISS_THRESHOLD: u32 = 2;
-/// Consecutive missed probes before culling an alive-but-SLOW engine (probe
-/// timed out but the process is alive — busy, not dead). High so a load spike
-/// (a heavy e2e run, memory pressure) never culls a working engine: with
-/// `SUPERVISE_INTERVAL` = 2s and a 5s probe timeout, 5 misses is ~25–35s of
-/// sustained unresponsiveness before a respawn. This is the core fix for the
-/// 2026-06-24 respawn storm, where a single missed 3s probe culled busy engines.
-const SLOW_MISS_THRESHOLD: u32 = 5;
 
 /// Shared, cheaply-cloneable gateway handle.
 #[derive(Clone)]
@@ -1146,10 +1140,10 @@ impl GatewayState {
 
             let since_spawn = s.last_spawn.map(|t| t.elapsed()).unwrap_or(Duration::MAX);
             let alive = engine_process_alive(&mut s);
-            // Count this miss; a healthy probe (above) resets it. The decision
-            // requires several consecutive misses before culling an
-            // alive-but-busy engine, so a transient load spike never respawns a
-            // working engine — the root cause of the 2026-06-24 respawn storm.
+            // Count this miss; a healthy probe (above) resets it. Only a DEAD
+            // process is ever culled (after DEAD_MISS_THRESHOLD misses); an
+            // alive engine is never respawned no matter how many it misses, so a
+            // load spike can't cull a working engine (ADR 0014, 2026-06-27).
             s.health_misses = s.health_misses.saturating_add(1);
 
             match respawn_decision(
@@ -1217,14 +1211,20 @@ enum SuperviseAction {
 
 /// Pure cull/keep decision for one stack, given a probe outcome and the stack's
 /// current state. Extracted from [`GatewayState::supervise_once`] so the policy
-/// — the fix for the 2026-06-24 respawn storm — is exhaustively unit-tested.
+/// is exhaustively unit-tested.
 ///
-/// Patience is asymmetric by outcome: an `Unreachable` engine (or one whose
-/// process has exited) is culled after `DEAD_MISS_THRESHOLD` misses (a real
-/// death recovers promptly), while an alive-but-`Slow` engine needs
-/// `SLOW_MISS_THRESHOLD` consecutive misses (a busy engine is never culled on a
-/// transient spike). `misses` is the consecutive-miss count INCLUDING the
-/// current probe.
+/// **An ALIVE engine is never culled** — booting, busy, `Slow`, or even
+/// `Unreachable`-while-alive (apparently wedged). Respawning a live engine
+/// interrupts its in-flight threads and, under sustained contention, feeds a
+/// cross-workspace respawn cascade: each respawn cold-boots (replaying ~14k
+/// trigger events + a worktree rescan), which spikes load and starves the next
+/// engine's probe. A timed-out HTTP probe cannot distinguish "hung forever" from
+/// "busy right now", so the supervisor stops guessing and respawns ONLY a
+/// process that has actually exited (`alive == false`) — preserving crash
+/// recovery + lazy-start. A genuinely deadlocked-but-alive engine is the rare,
+/// accepted cost: it waits for a manual restart. See ADR 0014 (2026-06-27
+/// sub-addendum). `misses` is the consecutive-miss count INCLUDING the current
+/// probe.
 fn respawn_decision(
     outcome: ProbeOutcome,
     alive: bool,
@@ -1235,24 +1235,21 @@ fn respawn_decision(
     if outcome == ProbeOutcome::Healthy {
         return SuperviseAction::Healthy;
     }
-    // A live process still inside its cold-boot window is BOOTING (pgvector
-    // init / migrations / embedding warmup take tens of seconds) — never cull.
-    if alive && since_spawn < BOOT_GRACE {
-        return SuperviseAction::Booting;
+    // Never cull an alive process. Inside the cold-boot window it's BOOTING
+    // (pgvector init / migrations / embedding warmup take tens of seconds, shown
+    // as the boot splash); past it, it's busy/slow/wedged — leave it be.
+    if alive {
+        return if since_spawn < BOOT_GRACE {
+            SuperviseAction::Booting
+        } else {
+            SuperviseAction::Wait
+        };
     }
-    // Crash backoff: don't respawn more often than RESPAWN_BACKOFF.
+    // The process has EXITED — crash recovery. Respawn with backoff + cap.
     if since_spawn < RESPAWN_BACKOFF {
         return SuperviseAction::Wait;
     }
-    // How dead does it look? A refused connection, or a process that has
-    // actually exited, is a strong "down" signal → prompt. An alive process
-    // that merely times out is "busy" → patient.
-    let required = if outcome == ProbeOutcome::Unreachable || !alive {
-        DEAD_MISS_THRESHOLD
-    } else {
-        SLOW_MISS_THRESHOLD
-    };
-    if misses < required {
+    if misses < DEAD_MISS_THRESHOLD {
         return SuperviseAction::Wait;
     }
     if restart_attempts >= RESTART_CAP {
@@ -1416,8 +1413,7 @@ pub async fn run() -> Result<(), BoxError> {
     // Re-adopt running engines and spawn the auto-start workspaces (ADR 0014).
     // A first-run empty registry is a no-op here: nothing is auto-created, so the
     // smart root serves the picker and the user names their first workspace
-    // ("personal" / "work" suggestions) instead of being dropped into a
-    // pre-made `default`.
+    // instead of being dropped into a pre-made `default`.
     state.boot_all().await;
 
     // Supervisor.
@@ -2053,10 +2049,11 @@ mod tests {
     }
 
     // ── Gateway health-supervisor cull policy (respawn_decision) ───────────
-    // The 2026-06-24 respawn storm: a single missed 3s probe culled busy-but-
-    // alive engines, cascading across every workspace. These pin the
-    // asymmetric-patience fix (patient with Slow-while-alive, prompt with a
-    // refused connection or a dead process).
+    // The 2026-06-24 respawn storm recurred under sustained contention
+    // (2026-06-27): the patient-but-still-culling policy kept respawning
+    // alive-but-Slow engines, interrupting threads and feeding the cascade. The
+    // policy is now: NEVER cull an alive engine — respawn ONLY a process that has
+    // actually exited. These tests pin that contract.
 
     /// `since_spawn` comfortably past the boot grace → an "established" engine
     /// (also past the respawn backoff, since BOOT_GRACE > RESPAWN_BACKOFF).
@@ -2104,36 +2101,40 @@ mod tests {
     }
 
     #[test]
-    fn alive_but_slow_is_not_culled_on_a_single_miss() {
-        // The core fix: one slow probe on a busy engine must NOT respawn it...
-        assert_eq!(
-            respawn_decision(ProbeOutcome::Slow, true, established(), 1, 0),
-            SuperviseAction::Wait
-        );
-        // ...nor anywhere below the slow threshold.
-        assert_eq!(
-            respawn_decision(
-                ProbeOutcome::Slow,
-                true,
-                established(),
-                SLOW_MISS_THRESHOLD - 1,
-                0
-            ),
-            SuperviseAction::Wait
-        );
+    fn alive_engine_is_never_culled_regardless_of_outcome_or_misses() {
+        // The core contract: an established, alive engine is never respawned —
+        // not on one slow probe, not on a long run of misses, whatever the probe
+        // outcome (Slow, Unreachable-while-alive, or Other). Respawning a live
+        // engine interrupts its threads and feeds the cross-workspace respawn
+        // cascade (ADR 0014, 2026-06-27).
+        for outcome in [
+            ProbeOutcome::Slow,
+            ProbeOutcome::Unreachable,
+            ProbeOutcome::Other,
+        ] {
+            for misses in [1, 5, 50, 9999] {
+                assert_eq!(
+                    respawn_decision(outcome, true, established(), misses, 0),
+                    SuperviseAction::Wait,
+                    "outcome={outcome:?} misses={misses}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn alive_but_slow_culled_after_sustained_misses() {
+    fn alive_engine_at_restart_cap_still_waits_never_unhealthy() {
+        // Liveness gates everything: an alive engine is left alone even with the
+        // restart cap's worth of attempts accumulated — never marked Unhealthy.
         assert_eq!(
             respawn_decision(
-                ProbeOutcome::Slow,
+                ProbeOutcome::Unreachable,
                 true,
                 established(),
-                SLOW_MISS_THRESHOLD,
-                0
+                9999,
+                RESTART_CAP
             ),
-            SuperviseAction::Respawn
+            SuperviseAction::Wait
         );
     }
 

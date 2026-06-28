@@ -2,6 +2,9 @@ import { threadMap, focusedThreadId, setFocusedThread, showToast, threadsLoaded,
 import { threadPassesChannelFilter } from '../threadFilter';
 import { handleEvent, isChannelDefiningEvent, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, createdKey, type ThreadAggregate, type ThreadState, type ThreadEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
+import { recordPerfSample } from '../../utils/perfQueue';
+import { markThreadOpenStart } from '../../utils/threadOpenMarks';
+import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { applyDraftBatch, setDraft, clearDraft, type ComposeDraft } from '../composeDrafts';
 import { fetchThreads, fetchThreadEvents, fetchOlderThreads, fetchFilterFacets, fetchArchivedCount } from '../../api/threads';
 import type { ThreadSummary, ThreadEventRow } from '../../api/threads';
@@ -10,7 +13,7 @@ import { toFailed } from '../types';
 import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { postClientLog } from '../../utils/liveness';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
-import { pendingComposePuts, composeEditedAt } from './compose';
+import { pendingComposePuts, composeEditedAt, composePutSettledAt, hasLocalDraftEdit } from './compose';
 
 /** Buffer for batched compose draft writes during loadAllThreads — hundreds
  *  of threads through the upsertThread loop should land in one signal write,
@@ -91,6 +94,24 @@ function stageDraftFromApi(info: ThreadSummary, batch?: DraftBatch): void {
   const image_hashes = info.compose_images || [];
   const mode = info.compose_mode ?? null;
   const isEmpty = text === '' && image_hashes.length === 0 && mode === null;
+  // A bulk loadAllThreads/upsert snapshot must NEVER clear a non-empty draft
+  // the user typed ON THIS DEVICE. The compose PUT is debounced and can fail or
+  // time out under host contention; `composePutSettledAt` is then stamped (even
+  // on failure) and a later resync's GET — fired AFTER that stamp, reading the
+  // server before our text ever committed — returns an empty compose. None of
+  // the timing guards in `upsertThread` (typing-here / pendingComposePuts /
+  // composeEditedAt / composePutSettledAt) catch that post-settle stale-empty
+  // read, so without this it blanks the just-typed draft (the value='' face of
+  // mobile-webkit drafts.spec.ts:65 — and a real way a transient sync failure
+  // silently drops an unsent draft). Gate on `composeEditedAt.has` so this only
+  // protects locally-authored drafts: a server-ORIGINATED draft (cross-device,
+  // never edited here) can still be cleared by a snapshot, and a peer's clear
+  // still flows through the SSE `ThreadComposeChanged` path. The kept draft is
+  // local-view only — it schedules no PUT, so it never resurrects server-side
+  // unless the user resumes editing it.
+  if (isEmpty && hasLocalDraftEdit(info.thread_id)) {
+    return;
+  }
   if (batch) {
     batch.set(info.thread_id, isEmpty ? null : { text, image_hashes, mode });
     return;
@@ -199,7 +220,14 @@ export function upsertThread(
     // request fired in the same millisecond as the edit can race ahead of the
     // edit's PUT and would otherwise pass the guard.
     const editedSinceRequest = (composeEditedAt.get(info.thread_id) ?? 0) >= requestStartedAt;
-    if (!userIsTypingHere && !pendingComposePuts.has(info.thread_id) && !editedSinceRequest) {
+    // Inverse-order hole: the edit predates this GET (so editedSinceRequest is
+    // false) but the debounced PUT settled AT OR AFTER the GET went out, so the
+    // server snapshot in this response was read before the PUT committed and is
+    // stale. pendingComposePuts no longer covers it — it cleared when the PUT
+    // settled, which is exactly the moment composePutSettledAt records. Skip the
+    // overwrite. See `composePutSettledAt` (fixes drafts.spec.ts:65 blank-draft).
+    const putSettledSinceRequest = (composePutSettledAt.get(info.thread_id) ?? 0) >= requestStartedAt;
+    if (!userIsTypingHere && !pendingComposePuts.has(info.thread_id) && !editedSinceRequest && !putSettledSinceRequest) {
       stageDraftFromApi(info, draftBatch);
     }
   }
@@ -438,6 +466,17 @@ export async function loadThreadEvents(threadId: string): Promise<void> {
   if (loadingThreads.has(threadId)) return;
   loadingThreads.add(threadId);
 
+  // Perf: stamp the open-start for the `thread-render` mark — the moment the
+  // focused thread's real event load begins (we're past the eventsLoaded
+  // early-return). ThreadView reads + clears it on first content render to
+  // measure open→paint. Gated to the focused thread so loadAllThreads' eager
+  // loads of non-focused active/saved threads (which never render) don't leave
+  // stale marks that would later fire a multi-minute renderMs. Covers both the
+  // click case (focusThread sets focusedThreadId before calling this) and
+  // cold-start (loadAllThreads loads the already-focused thread). See
+  // utils/threadOpenMarks.ts + utils/perfQueue.ts. Fire-and-forget telemetry.
+  if (threadId === focusedThreadId.value) markThreadOpenStart(threadId, currentPerfBaseline());
+
   // Clear any prior failure so the UI shows the loading state again
   if (thread.eventsLoadFailed) {
     thread.eventsLoadFailed = false;
@@ -450,14 +489,29 @@ export async function loadThreadEvents(threadId: string): Promise<void> {
   try {
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
+        // Perf instrumentation: split the open cost into transfer (fetchMs) vs
+        // store (applyMs), correlated with event count, so we can see which half
+        // dominates on a big coding-agent thread. Fire-and-forget; the grouping
+        // half is measured separately in ThreadView. See utils/perfQueue.ts.
+        const fetchStart = performance.now();
         const snapshot = await fetchThreadEvents(threadId);
+        const fetchMs = performance.now() - fetchStart;
         // Re-read from current map — the map reference may have changed
         // during the async fetch (other threads loaded/updated).
         const current = threadMap.value.get(threadId);
         if (!current) return;
+        const applyStart = performance.now();
         applyEventRows(threadMap.value, threadId, current, snapshot.events, snapshot.currentAggregate);
+        const applyMs = performance.now() - applyStart;
         current.eventsLoaded = true;
         threadMap.value = new Map(threadMap.value);
+        recordPerfSample('thread-load', {
+          threadId,
+          eventCount: snapshot.events.length,
+          channel: current.meta.channel,
+          fetchMs: Math.round(fetchMs),
+          applyMs: Math.round(applyMs),
+        });
         return;
       } catch (err) {
         if (attempt < MAX_RETRIES) {
@@ -630,15 +684,11 @@ export async function loadOlderThreads(): Promise<void> {
     let oldestTime: string | null = null;
     for (const t of map.values()) {
       if (t.meta.saved) continue;
-      // Only the Archive pile paginates — inbox/REVIEW is loaded in full by
-      // `get_recent_threads`. The cursor pages by `created_at`, and an inbox
-      // thread can be old-CREATED yet recently-active (a long-lived chat); if
-      // it drove the cursor it would collapse it far into the past, and
-      // `get_older_threads(before=that)` would skip every archived thread
-      // created after it — Archive would stop paging. Restrict to archived rows
-      // so the cursor is the oldest loaded ARCHIVE thread. (With the old
-      // last_user_action axis this didn't bite because active rows have a recent
-      // last_user_action; created_at does not move with activity.)
+      // `t.meta.section` is the raw `archive_state` ('archived'/'inbox'). The
+      // cursor tracks the Archive pile, which `get_recent_threads` returns as a
+      // single contiguous `created_at DESC` window — no out-of-window injection
+      // (the actionable/proposed bypasses were removed), so every loaded archived
+      // row is a contiguous member and there are no outliers to special-case.
       if (t.meta.section !== 'archived') continue;
       // Family-extension threads are loaded eagerly so the drawer can nest
       // them under their parent, but their own `last_activity` can be

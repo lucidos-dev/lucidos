@@ -206,7 +206,7 @@ pub(crate) async fn has_branch_commits(repo_root: &Path, branch_name: &str) -> b
 /// branch has diverged, otherwise the local default) — so the
 /// `coding_agent_has_diff` gate this feeds and the diff the button renders can
 /// never disagree. Using the local default directly here was the
-/// `user-acquisition` migration bug: a branch whose commits already live on
+/// `example-repo` migration bug: a branch whose commits already live on
 /// `origin/main` but not on a force-rewritten local `main` showed 53 changed
 /// files against local `main` yet 0 against `origin/main`, lighting the Diff
 /// button on an empty diff.
@@ -435,7 +435,11 @@ pub(crate) enum NoCommitsRecovery {
 /// "branch never produced any commits for the referenced files" (corruption).
 /// Files referenced by an applied change should always have a corresponding commit
 /// somewhere on main, even if the file was later deleted.
-async fn main_history_touches_files(repo_root: &Path, change_files: &[String]) -> bool {
+///
+/// Read-only — unlike [`recover_no_commits_branch`] it never auto-commits the
+/// worktree, so `apply_now`'s already-merged check can call it without risking a
+/// commit that a subsequent failure-path `reset --hard` would destroy.
+pub(crate) async fn main_history_touches_files(repo_root: &Path, change_files: &[String]) -> bool {
     if change_files.is_empty() {
         return false;
     }

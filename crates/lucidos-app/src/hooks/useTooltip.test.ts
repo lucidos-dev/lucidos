@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isRedundantTooltip, isTouchSwipe, reanchorToTarget, computeTooltipAnchor, parseTooltipRows } from './useTooltip';
+import { isRedundantTooltip, isTouchSwipe, reanchorToTarget, computeTooltipAnchor, computeTooltipVerticalPlacement, parseTooltipRows } from './useTooltip';
 
 describe('isRedundantTooltip', () => {
   it('flags exact matches as redundant', () => {
@@ -124,5 +124,36 @@ describe('computeTooltipAnchor', () => {
     expect(anchor.anchorX).toBe(604);     // pointer X
     expect(anchor.anchorTop).toBe(420);   // pointer Y
     expect(anchor.anchorBottom).toBe(420);
+  });
+});
+
+describe('computeTooltipVerticalPlacement', () => {
+  it('places above when there is room above the safe inset', () => {
+    // anchorTop 300, height 80 → aboveTop = 300 - 80 - 8 = 212, clear of safeTop
+    const { top, above } = computeTooltipVerticalPlacement(300, 330, 80, 0, false);
+    expect(above).toBe(true);
+    expect(top).toBe(212);
+  });
+
+  it('flips below when placing above would hide it behind the notch', () => {
+    // iOS Dynamic Island: safeTop ~59. A header title at anchorTop 73 with a 55px
+    // tooltip lands at top=10 — technically positive, so the OLD `top < 8` guard
+    // kept it above, behind the camera strip. The safe-top clamp flips it below.
+    const { top, above } = computeTooltipVerticalPlacement(73, 110, 55, 59, false);
+    expect(above).toBe(false);
+    expect(top).toBe(118); // anchorBottom 110 + gap 8
+  });
+
+  it('keeps a near-top tooltip above on a notchless device (safeTop 0)', () => {
+    // Desktop: same anchors, no inset → aboveTop = 73 - 55 - 8 = 10 ≥ 8 → above.
+    const { top, above } = computeTooltipVerticalPlacement(73, 110, 55, 0, false);
+    expect(above).toBe(true);
+    expect(top).toBe(10);
+  });
+
+  it('forces below regardless of available room when forceBelow is set', () => {
+    const { top, above } = computeTooltipVerticalPlacement(300, 330, 80, 0, true);
+    expect(above).toBe(false);
+    expect(top).toBe(338); // anchorBottom 330 + gap 8
   });
 });

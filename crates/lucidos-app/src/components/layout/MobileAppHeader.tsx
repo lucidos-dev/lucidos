@@ -4,8 +4,8 @@ import { unfocusThread } from '../../store/actions/threads';
 import { composeHandlers } from '../chat/promptFocus';
 import { scrolledFromTop } from '../chat/scrollState';
 import { ComposeIcon, SearchIcon } from '../shared/icons';
-import { CopyThreadRefButton } from '../shared/CopyThreadRefButton';
-import { ExportThreadButton } from '../shared/ExportThreadButton';
+import { PinThreadButton } from '../shared/PinThreadButton';
+import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
 import { ThreadNav } from '../shared/ThreadNav';
 import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './PanelNav';
@@ -93,7 +93,7 @@ function MobileThreadsHeader() {
         <div class="pane-header-spacer" />
         <button
           class="icon-btn header-icon brand-compose-btn"
-          {...composeHandlers(() => { unfocusThread(); navigateToPane('thread'); })}
+          {...composeHandlers(() => unfocusThread())}
           aria-label="New thread"
         >
           <ComposeIcon />
@@ -205,8 +205,10 @@ export function MobileThreadTitleBar() {
       <ThreadStatusIcon status={visualStatus} />
       <ThreadTitleEditor threadId={threadId} title={threadTitle} />
       <span class="thread-view-header-actions">
-        <CopyThreadRefButton threadId={threadId} title={threadTitle} />
-        <ExportThreadButton threadId={threadId} title={threadTitle} />
+        {eventThread.meta.state !== 'composing' && (
+          <PinThreadButton threadId={threadId} saved={eventThread.meta.saved} />
+        )}
+        <ThreadOverflowMenu threadId={threadId} title={threadTitle} />
       </span>
     </div>
   );

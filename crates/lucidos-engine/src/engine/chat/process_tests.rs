@@ -322,8 +322,10 @@ fn engine_restart_rule_still_blocks_post_restart_promises() {
 fn apply_verify_rule_tells_agent_to_act_and_verify_not_ask() {
     let lowered = APPLY_VERIFY_RULE.to_lowercase();
     assert!(
-        APPLY_VERIFY_RULE.contains("list_changes") && APPLY_VERIFY_RULE.contains("apply_change"),
-        "rule must name both self-service change tools:\n{APPLY_VERIFY_RULE}"
+        APPLY_VERIFY_RULE.contains("`changes` tool")
+            && APPLY_VERIFY_RULE.contains("action 'list'")
+            && APPLY_VERIFY_RULE.contains("action 'apply'"),
+        "rule must name the grouped `changes` tool and its list/apply actions:\n{APPLY_VERIFY_RULE}"
     );
     assert!(
         lowered.contains("have you applied it") && lowered.contains("did you restart"),
@@ -741,8 +743,8 @@ fn chat_prompt_nudges_use_of_ask_user_question() {
     assert!(
         rule.contains("what next"),
         "chat ASK_USER_QUESTION_RULE must include the concrete \"what next?\" \
-         follow-up-menu example — that's the exact failure pattern in personal \
-         workspace threads where the agent emits markdown bullets instead of \
+         follow-up-menu example — that's the exact failure pattern in \
+         observed threads where the agent emits markdown bullets instead of \
          buttons",
     );
     assert!(
@@ -757,8 +759,8 @@ fn chat_prompt_nudges_use_of_ask_user_question() {
          `ask_user_question` alongside other tools (see the parallel CC rule \
          in `agent_session::prompts::ASK_USER_QUESTION_RULE`)",
     );
-    // Three observed Opus 4.7 leaks in personal (4bc99ec8, ba1b4ef1,
-    // 66638f55) emitted `<ask_user_question>…</ask_user_question>` as
+    // Three observed Opus 4.7 leaks emitted
+    // `<ask_user_question>…</ask_user_question>` as
     // literal assistant text instead of a tool call. The rule must name
     // that exact failure mode so the next prompt edit can't silently drop
     // the anti-pattern callout.
