@@ -4090,6 +4090,7 @@ dependencies = [
  "block2",
  "libc",
  "objc2",
+ "objc2-app-kit",
  "objc2-foundation",
  "objc2-user-notifications",
  "serde",
@@ -4214,6 +4215,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml 0.8.23",
  "tower",
  "tower-http",
 ]

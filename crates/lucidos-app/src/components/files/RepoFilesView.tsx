@@ -94,7 +94,7 @@ export function RepoFilesView() {
   }
 
   return (
-    <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+    <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton fill />}>
       {contentReady ? (
         <>
           {/* Toolbar holds only the All Files / Changes toggle now (Expand/Collapse

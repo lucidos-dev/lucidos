@@ -77,26 +77,42 @@ describe('promptAnimating gate', () => {
     // error state impossible here) AND keeps the loading skeleton from showing on
     // a brand-new thread's first prompt send (the content is the just-sent
     // message, not a DB fetch). Distinct from 'loading' (a real DB fetch).
-    expect(emptyReason(true, false, false, false, 't1')).toEqual({ kind: 'animating' });
-    expect(emptyReason(true, true, false, false, 't1')).toEqual({ kind: 'animating' });
-    expect(emptyReason(true, true, false, true, 't1')).toEqual({ kind: 'animating' });
-    expect(emptyReason(true, false, true, false, 't1')).toEqual({ kind: 'animating' });
+    expect(emptyReason(true, false, false, false, 't1', false)).toEqual({ kind: 'animating' });
+    expect(emptyReason(true, true, false, false, 't1', false)).toEqual({ kind: 'animating' });
+    expect(emptyReason(true, true, false, true, 't1', false)).toEqual({ kind: 'animating' });
+    expect(emptyReason(true, false, true, false, 't1', false)).toEqual({ kind: 'animating' });
   });
 
   it('emptyReason returns failed when load failed', () => {
-    expect(emptyReason(false, false, true, false, 't1')).toEqual({ kind: 'failed', threadId: 't1' });
+    expect(emptyReason(false, false, true, false, 't1', false)).toEqual({ kind: 'failed', threadId: 't1' });
   });
 
   it('emptyReason returns corrupt only when CONTENT events exist but exchanges are empty', () => {
-    expect(emptyReason(false, true, false, true, 't1')).toEqual({ kind: 'corrupt', threadId: 't1' });
+    expect(emptyReason(false, true, false, true, 't1', false)).toEqual({ kind: 'corrupt', threadId: 't1' });
   });
 
   it('emptyReason returns empty for genuinely empty thread', () => {
-    expect(emptyReason(false, true, false, false, 't1')).toEqual({ kind: 'empty' });
+    expect(emptyReason(false, true, false, false, 't1', false)).toEqual({ kind: 'empty' });
   });
 
   it('emptyReason returns loading when events not yet loaded', () => {
-    expect(emptyReason(false, false, false, false, 't1')).toEqual({ kind: 'loading', threadId: 't1' });
+    expect(emptyReason(false, false, false, false, 't1', false)).toEqual({ kind: 'loading', threadId: 't1' });
+  });
+
+  it('emptyReason returns disconnected when unloaded AND the engine is unreachable', () => {
+    // The reported bug: a cold boot into an unreachable engine left the thread in
+    // 'loading' forever (→ "Tap to reload"). When disconnected, an unloaded thread
+    // is now honestly 'disconnected'.
+    expect(emptyReason(false, false, false, false, 't1', true)).toEqual({ kind: 'disconnected', threadId: 't1' });
+  });
+
+  it('emptyReason: disconnected ONLY overrides loading — failed/corrupt/empty/animating keep precedence', () => {
+    // A load that actually failed/completed is already honest; disconnection must
+    // not mask it. Animation still wins outright (suppresses any flash).
+    expect(emptyReason(true, false, false, false, 't1', true)).toEqual({ kind: 'animating' });
+    expect(emptyReason(false, false, true, false, 't1', true)).toEqual({ kind: 'failed', threadId: 't1' });
+    expect(emptyReason(false, true, false, true, 't1', true)).toEqual({ kind: 'corrupt', threadId: 't1' });
+    expect(emptyReason(false, true, false, false, 't1', true)).toEqual({ kind: 'empty' });
   });
 
   it('error state must NOT flash during animation even when events exist (thread creation bug)', () => {
@@ -118,7 +134,7 @@ describe('promptAnimating gate', () => {
 
     // During animation: emptyReason forces 'animating' (never error), which
     // renders nothing — no skeleton, no error flash.
-    const reason = emptyReason(true, state.eventsLoaded, state.eventsLoadFailed, hasContentEvents(state.events), id);
+    const reason = emptyReason(true, state.eventsLoaded, state.eventsLoadFailed, hasContentEvents(state.events), id, false);
     expect(reason.kind).toBe('animating');
 
     // After animation: events compute into exchanges normally — no empty state

@@ -459,6 +459,11 @@ pub async fn send_push_to_all_with_app(
         return;
     }
 
+    // Current workspace unread count → declarative `app_badge` (see
+    // `build_push_payload`). Queried once for the whole fan-out (same value for
+    // every subscription). Best-effort: a failure just omits the badge field.
+    let unread_count = read_unread_count(pool).await;
+
     let deliveries: Vec<(PushSubscription, String)> = subscriptions
         .into_iter()
         .map(|sub| {
@@ -471,6 +476,7 @@ pub async fn send_push_to_all_with_app(
                 link_event_id,
                 &tap,
                 sub.scope_url.as_deref(),
+                unread_count,
             )
             .to_string();
             (sub, payload_bytes)
@@ -694,6 +700,40 @@ async fn emit_native_push_requested(
     }
 }
 
+/// Broadcast a [`SystemEvent::NativePushDismissRequested`] so a connected Tauri
+/// desktop app REMOVES the already-delivered native macOS banner(s) for a
+/// notification that was just read (on this or another device). `notification_id
+/// = Some(id)` removes one banner; `None` removes all (the mark-all-read path).
+/// Broadcast SSE — browser / PWA pages ignore it (the open web can't silently
+/// remove a Web Push banner; Safari revokes a subscription after 3 silent
+/// pushes), so this is the macOS-desktop-only half of cross-device dismiss. The
+/// desktop app stays SSE-connected, so it acts on this deterministically.
+/// Non-fatal: a failed emit is logged; the worst case is a stale OS banner the
+/// user swipes away manually (the prior, pre-dismiss behaviour). See
+/// `system-knowhow/notifications.md` §4 and
+/// `docs/plans/2026-05-18-cross-device-notification-dismiss-design.md`.
+pub(crate) async fn emit_native_push_dismiss_requested(
+    event_bus: &crate::engine::event_bus::EventBus,
+    notification_id: Option<uuid::Uuid>,
+) {
+    let sent_at_ms = crate::engine::now_epoch_millis();
+    if let Err(e) = event_bus
+        .emit(crate::engine::event_bus::BusEvent::System(
+            crate::engine::event_bus::SystemEvent::NativePushDismissRequested {
+                notification_id,
+                sent_at_ms,
+            },
+        ))
+        .await
+    {
+        log!(
+            "[Push] Failed to broadcast NativePushDismissRequested for {:?}: {}",
+            notification_id,
+            e
+        );
+    }
+}
+
 /// Decides whether a device with the given `user_agent` is affected by
 /// Chromium #370536109 — the macOS-Chromium dispatcher bug where
 /// `notificationclick` is silently queued until a new push event drains
@@ -810,11 +850,13 @@ pub(crate) async fn send_wake_push_to_device(
         return Ok(0);
     }
 
+    let unread_count = read_unread_count(pool).await;
     let deliveries: Vec<(PushSubscription, String)> = subscriptions
         .into_iter()
         .map(|sub| {
             let payload_bytes =
-                build_wake_payload(&notification, sub.scope_url.as_deref()).to_string();
+                build_wake_payload(&notification, sub.scope_url.as_deref(), unread_count)
+                    .to_string();
             (sub, payload_bytes)
         })
         .collect();
@@ -942,6 +984,19 @@ fn navigate_url_sw(params: &str) -> String {
     }
 }
 
+/// Read the workspace's current unread-notification count for the declarative
+/// `app_badge` field. Best-effort: a query failure logs and returns `None`, so
+/// the push still goes out (just without touching the badge that one time).
+async fn read_unread_count(pool: &sqlx::PgPool) -> Option<i64> {
+    match crate::scheduler::NotificationStore::count_unread(pool).await {
+        Ok(count) => Some(count),
+        Err(e) => {
+            log!("[Push] Failed to count unread (omitting app_badge): {}", e);
+            None
+        }
+    }
+}
+
 /// Build a `wake: true` push payload from a stored notification. Mirrors
 /// `build_push_payload` field-for-field so the SW path is symmetric — the
 /// only wire difference is the added top-level `wake: true` flag (sibling to
@@ -952,6 +1007,7 @@ fn navigate_url_sw(params: &str) -> String {
 fn build_wake_payload(
     notification: &crate::scheduler::notifications::Notification,
     ios_scope_url: Option<&str>,
+    unread_count: Option<i64>,
 ) -> serde_json::Value {
     let mut payload = build_push_payload(
         &notification.title,
@@ -962,6 +1018,7 @@ fn build_wake_payload(
         notification.event_id,
         &notification.tap,
         ios_scope_url,
+        unread_count,
     );
     payload["wake"] = serde_json::Value::Bool(true);
     payload
@@ -1040,6 +1097,7 @@ fn build_push_payload(
     link_event_id: Option<uuid::Uuid>,
     tap: &crate::scheduler::notifications::Tap,
     ios_scope_url: Option<&str>,
+    unread_count: Option<i64>,
 ) -> serde_json::Value {
     let params = build_navigate_params(notification_id, link_thread_id, link_event_id, tap);
     let navigate_ios = navigate_url_ios(&params, ios_scope_url);
@@ -1080,7 +1138,7 @@ fn build_push_payload(
     // Warm taps route via postMessage, not this URL — see `navigate_url_sw`.
     data.insert("navigate".into(), serde_json::Value::String(navigate_sw));
 
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "web_push": DECLARATIVE_WEB_PUSH_MAGIC,
         "notification": {
             "title": title,
@@ -1091,7 +1149,19 @@ fn build_push_payload(
             "tag": tag,
             "data": serde_json::Value::Object(data),
         },
-    })
+    });
+    // Declarative Web Push top-level `app_badge` (sibling of `web_push` /
+    // `notification`, NOT inside the notification object): iOS Safari reads it
+    // in its parent process and sets the installed PWA's home-screen badge
+    // WITHOUT running the service worker — the ONLY badge path for a CLOSED iOS
+    // PWA, since iOS may bypass the SW for declarative pushes (see the §1002
+    // note above). `0` clears the badge. The workspace engine's own unread
+    // count, so a per-workspace PWA badges its own workspace. Omitted only when
+    // the count couldn't be read (the badge then simply isn't touched).
+    if let Some(count) = unread_count {
+        payload["app_badge"] = serde_json::json!(count.max(0));
+    }
+    payload
 }
 
 /// Dispatch the per-subscription send loop. `kind` appears in log lines for

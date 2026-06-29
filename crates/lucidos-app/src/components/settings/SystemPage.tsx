@@ -31,6 +31,7 @@ import { LocaleSection } from './LocaleSection';
 import { DiskUsagePage } from './DiskUsagePage';
 import { MemoryInspector } from './MemoryInspector';
 import { EnvironmentVariablesPage } from './EnvironmentVariablesPage';
+import { NetworkAccessPage } from './NetworkAccessPage';
 import { DebuggingSection } from './DebuggingSection';
 import { ThreadQueueView } from '../thread-queue/ThreadQueueView';
 
@@ -39,7 +40,7 @@ function getApiUrl(): string {
   return typeof window !== 'undefined' && window.location ? window.location.origin : '';
 }
 
-export type SystemPanel = 'overview' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging';
+export type SystemPanel = 'overview' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'network-access' | 'debugging';
 
 const SYSTEM_PANELS: Array<{ key: SystemPanel; label: string; subview: SettingsNavKey }> = [
   { key: 'overview', label: 'Overview', subview: 'system' },
@@ -139,6 +140,7 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
       case 'memory': return <MemoryInspector />;
       case 'disk-usage': return <DiskUsagePage />;
       case 'environment-variables': return <EnvironmentVariablesPage />;
+      case 'network-access': return <NetworkAccessPage />;
       case 'debugging': return <DebuggingSection />;
       default: return renderOverview();
     }

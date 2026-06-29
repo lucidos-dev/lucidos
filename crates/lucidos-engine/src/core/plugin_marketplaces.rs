@@ -49,6 +49,20 @@ pub struct InstalledPluginSummary {
     /// records that didn't list files.
     #[serde(default)]
     pub files: Vec<String>,
+    /// True when the plugin's shipped content currently differs from what it
+    /// installed — i.e. the user (or the Lucidos Agent / a coding-agent thread)
+    /// has locally edited an app/knowhow/script/trigger the plugin owns. Derived
+    /// on read by diffing the current content against the install commit (see
+    /// `engine::tools::plugins::registry::plugin_modification_status`), never
+    /// stored — so it self-heals when an edit is reverted and resets when the
+    /// plugin is updated. Drives the Plugins-list "Modified" badge.
+    #[serde(default)]
+    pub modified: bool,
+    /// The `data/`-relative paths that currently differ from the install commit
+    /// (the badge tooltip; also the breadcrumb for a future "keep your patch" /
+    /// "propose upstream" flow). Empty when `modified` is false.
+    #[serde(default)]
+    pub modified_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -93,6 +107,16 @@ pub struct MarketplacePlugin {
     /// "Open" button launches it; `None` → nothing to open.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
+    /// True when the user has locally modified the plugin's shipped content since
+    /// install — overlaid from the matching installed summary. Always false for an
+    /// available (not-installed) catalog row. Drives the Plugins-list "Modified"
+    /// badge and the "your changes will be overwritten" update warning.
+    #[serde(default)]
+    pub modified: bool,
+    /// The `data/`-relative paths that currently differ from the install commit
+    /// (the badge tooltip). Empty unless `modified`.
+    #[serde(default)]
+    pub modified_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -346,6 +370,8 @@ fn scan_one_marketplace(
             // catalog handler fills it in after the scan returns.
             setup_complete: false,
             app_id: installed.and_then(|p| p.app_id.clone()),
+            modified: installed.map(|p| p.modified).unwrap_or(false),
+            modified_paths: installed.map(|p| p.modified_paths.clone()).unwrap_or_default(),
         });
     }
 

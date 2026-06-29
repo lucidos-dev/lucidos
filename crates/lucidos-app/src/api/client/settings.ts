@@ -1,7 +1,7 @@
 import { API, json, text } from './_core';
 import { lucidos } from '@lucidos/sdk';
 import type { AuthType, EmailAccountInfo, Notification, OAuthAccountInfo } from '../../store/types';
-import type { ApiResult, CredentialsListResponse, DeviceInfo, EnvVarsListResponse, MemoryEntriesResponse, MemorySourceResponse, MemoryStatsResponse, NotificationsResponse } from '../types';
+import type { ApiResult, CredentialsListResponse, DeviceInfo, EnvVarsListResponse, MemoryEntriesResponse, MemorySourceResponse, MemoryStatsResponse, NetworkConfigResponse, NotificationsResponse } from '../types';
 
 // --- Notifications (SDK delegation) ---
 export function getNotifications(params?: {
@@ -68,6 +68,19 @@ export function updateEnvVar(name: string, body: { value: string }): Promise<Api
 export function deleteEnvVarApi(name: string): Promise<ApiResult> {
   return json(`${API}/env-vars?name=${encodeURIComponent(name)}`, {
     method: 'DELETE',
+  });
+}
+
+// --- Network access (per-workspace engine bind; Settings → System) ---
+export function getNetworkConfig(): Promise<NetworkConfigResponse> {
+  return json(`${API}/network-config`);
+}
+
+export function setNetworkConfig(body: { engine_bind: string }): Promise<ApiResult> {
+  return json(`${API}/network-config`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
 }
 

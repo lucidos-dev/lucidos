@@ -5,7 +5,25 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 let iosValue = true;
 vi.mock('./platform', () => ({ isIOS: () => iosValue }));
 
-import { forceIOSRepaint, forceIOSRepaintBurst, createRepaintThrottle } from './iosRepaint';
+import { forceIOSRepaint, forceIOSRepaintBurst, createRepaintThrottle, OPEN_REPAINT_BURST_DELAYS_MS } from './iosRepaint';
+
+describe('OPEN_REPAINT_BURST_DELAYS_MS', () => {
+  it('starts with an immediate (0ms) attempt', () => {
+    expect(OPEN_REPAINT_BURST_DELAYS_MS[0]).toBe(0);
+  });
+
+  it('is strictly ascending (no duplicate / out-of-order setTimeout slots)', () => {
+    for (let i = 1; i < OPEN_REPAINT_BURST_DELAYS_MS.length; i++) {
+      expect(OPEN_REPAINT_BURST_DELAYS_MS[i]).toBeGreaterThan(OPEN_REPAINT_BURST_DELAYS_MS[i - 1]);
+    }
+  });
+
+  it('extends past 300ms to cover a layer that blanks later under prolonged use', () => {
+    // Regression: the old [0,100,300] tail fired its last attempt before a
+    // late blank landed on a degraded WKWebView, leaving the body black.
+    expect(Math.max(...OPEN_REPAINT_BURST_DELAYS_MS)).toBeGreaterThanOrEqual(1000);
+  });
+});
 
 // Minimal rAF stub: queue callbacks, run them on demand so the two-frame
 // transform toggle is deterministic.
@@ -43,8 +61,22 @@ afterEach(() => {
   (globalThis as any).cancelAnimationFrame = origCancelRaf;
 });
 
-function fakeEl(transform = ''): any {
-  return { isConnected: true, style: { transform } };
+/** A fake element. Pass `scroll` to make it scrollable (the scroll-nudge path);
+ *  omit it for the transform-only cases (a non-scrollable element). `offsetHeight`
+ *  is a counting getter so a test can assert the forced synchronous layout read
+ *  actually happens. */
+function fakeEl(transform = '', scroll?: { scrollTop: number; scrollHeight: number; clientHeight: number }): any {
+  const el: any = { isConnected: true, style: { transform }, offsetReads: 0 };
+  if (scroll) {
+    el.scrollTop = scroll.scrollTop;
+    el.scrollHeight = scroll.scrollHeight;
+    el.clientHeight = scroll.clientHeight;
+  }
+  Object.defineProperty(el, 'offsetHeight', {
+    get() { el.offsetReads++; return 0; },
+    configurable: true,
+  });
+  return el;
 }
 
 describe('forceIOSRepaint', () => {
@@ -164,6 +196,94 @@ describe('forceIOSRepaint', () => {
     flushFrame();
     flushFrame();
     expect(el.style.transform).toBe('');
+  });
+
+  // --- scroll-nudge escalation (the WKCompositingView-removal recovery) -----
+
+  it('nudges scrollTop by 1px then restores it across two frames (scrollable)', () => {
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+    expect(el.scrollTop).toBe(500); // deferred to rAF — nothing yet
+
+    flushFrame(); // frame 1: nudge up by 1 (re-tiles the frozen layer)
+    expect(el.scrollTop).toBe(499);
+
+    flushFrame(); // frame 2: restore (not at bottom → exact prior position)
+    expect(el.scrollTop).toBe(500);
+  });
+
+  it('forces a synchronous layout read (offsetHeight) on the nudge frame', () => {
+    // The documented reliable repaint trigger — a layout read flushes the nudged
+    // state so it actually paints instead of being coalesced with the restore.
+    const el = fakeEl('', { scrollTop: 100, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+    expect(el.offsetReads).toBe(0); // deferred to rAF
+    flushFrame(); // frame 1 applies the nudge AND reads offsetHeight
+    expect(el.offsetReads).toBeGreaterThanOrEqual(1);
+  });
+
+  it('yields the restore to a concurrent scroll write (never clobbers useScrollMemory / autoscroll)', () => {
+    // The open-path race: useScrollMemory restores a scrolled-up thread to its
+    // saved position (or useAutoScroll pins to a new bottom during streaming)
+    // BETWEEN the nudge and its restore. The restore must yield — only undo OUR
+    // nudge if scrollTop is still the value we left — so it can't snap the user
+    // back to a stale position.
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+    flushFrame(); // frame 1: nudge to 499
+    expect(el.scrollTop).toBe(499);
+    el.scrollTop = 2000; // a concurrent writer (useScrollMemory restore) moves it
+    flushFrame(); // frame 2: 2000 !== 499 → yield, leave it alone
+    expect(el.scrollTop).toBe(2000);
+  });
+
+  it('nudges DOWN then restores when at the very top (direction-safe, scrollTop 0)', () => {
+    const el = fakeEl('', { scrollTop: 0, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+    flushFrame(); // frame 1: can't go below 0, so nudge +1
+    expect(el.scrollTop).toBe(1);
+    flushFrame(); // frame 2: restore to 0 (not at bottom)
+    expect(el.scrollTop).toBe(0);
+  });
+
+  it('does not touch scrollTop on a non-scrollable element (transform-only fallback)', () => {
+    const el = fakeEl('', { scrollTop: 0, scrollHeight: 800, clientHeight: 800 });
+    forceIOSRepaint(el);
+    flushFrame();
+    expect(el.style.transform).toBe('translateZ(0.1px)'); // transform still fires
+    expect(el.scrollTop).toBe(0); // scroll untouched
+    flushFrame();
+    expect(el.style.transform).toBe('');
+    expect(el.scrollTop).toBe(0);
+  });
+
+  it('supersedes a dropped scroll restore without drifting the position', () => {
+    // iOS dropped the restore frame; a superseding call must undo the partial
+    // nudge to the TRUE baseline (not read the nudged 499 as the new baseline)
+    // and round-trip again — no 1px-per-burst drift.
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+    flushFrame(); // nudge to 499
+    expect(el.scrollTop).toBe(499);
+    rafQueue = []; // page freezes — the restore frame is dropped
+
+    forceIOSRepaint(el); // supersede — immediately restores the true baseline
+    expect(el.scrollTop).toBe(500);
+    flushFrame(); // fresh nudge
+    expect(el.scrollTop).toBe(499);
+    flushFrame(); // fresh restore
+    expect(el.scrollTop).toBe(500);
+  });
+
+  it('is a no-op off iOS for a scrollable element (no scrollTop write, no layout read)', () => {
+    iosValue = false;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    const cleanup = forceIOSRepaint(el);
+    expect(cleanup).toBeUndefined();
+    flushFrame();
+    flushFrame();
+    expect(el.scrollTop).toBe(500);
+    expect(el.offsetReads).toBe(0);
   });
 });
 

@@ -281,6 +281,205 @@ fn debug_shows_refresh_token_none_when_absent() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// DB-backed store tests (resolver ordering + upsert semantics).
+// These need a real Postgres — run via `./scripts/test-engine.sh`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_by_provider_returns_most_recently_connected() {
+    // The reported bug: an old narrow-scope `drive.file` account (no email →
+    // NULL) shadowed a newer full-`drive` account because the resolver ordered
+    // by `created_at ASC`. Resolution must prefer the most-recently-CONNECTED
+    // (newest `created_at`) account so a fresh connect wins.
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+
+    let old_id = OAuthStore::insert(
+        &pool,
+        "google",
+        None,
+        None,
+        "old-narrow-access",
+        Some("old-refresh"),
+        None,
+        "https://www.googleapis.com/auth/drive.file",
+    )
+    .await
+    .unwrap();
+
+    let new_id = OAuthStore::insert(
+        &pool,
+        "google",
+        Some("user@example.com"),
+        Some("User"),
+        "new-broad-access",
+        Some("new-refresh"),
+        None,
+        "openid email https://www.googleapis.com/auth/drive",
+    )
+    .await
+    .unwrap();
+
+    // Pin the creation order deterministically — two back-to-back inserts can
+    // land in the same clock tick, which would make the assertion flaky.
+    sqlx::query("UPDATE oauth_accounts SET created_at = NOW() - INTERVAL '1 day' WHERE id = $1")
+        .bind(old_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE oauth_accounts SET created_at = NOW() WHERE id = $1")
+        .bind(new_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let resolved = OAuthStore::get_by_provider(&pool, "google")
+        .await
+        .unwrap()
+        .expect("an account should resolve for google");
+    assert_eq!(
+        resolved.id, new_id,
+        "resolver must return the newest connection, not the stale narrow-scope shadow"
+    );
+    assert_eq!(resolved.access_token, "new-broad-access");
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn insert_upserts_same_provider_email_in_place() {
+    // Re-connecting the SAME account (same provider+email) must broaden/refresh
+    // the existing row, never create a shadow. `refresh_token` survives a
+    // None-passing upsert via COALESCE.
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+
+    let first = OAuthStore::insert(
+        &pool,
+        "google",
+        Some("user@example.com"),
+        None,
+        "access-1",
+        Some("refresh-1"),
+        None,
+        "openid email",
+    )
+    .await
+    .unwrap();
+
+    let second = OAuthStore::insert(
+        &pool,
+        "google",
+        Some("user@example.com"),
+        None,
+        "access-2",
+        None,
+        None,
+        "openid email https://www.googleapis.com/auth/drive",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        first, second,
+        "re-connecting the same provider+email must update in place, not insert a shadow row"
+    );
+    let all = OAuthStore::list(&pool).await.unwrap();
+    assert_eq!(all.len(), 1, "same provider+email must collapse to one row");
+
+    let acct = OAuthStore::get_by_id(&pool, first).await.unwrap().unwrap();
+    assert_eq!(acct.access_token, "access-2");
+    assert_eq!(
+        acct.refresh_token.as_deref(),
+        Some("refresh-1"),
+        "a None refresh token on re-connect must preserve the stored one"
+    );
+    assert!(acct.scopes.contains("drive"), "scopes should be broadened");
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn insert_upserts_no_email_account_in_place() {
+    // The no-email path (provider yields no userinfo) collapses to a single
+    // (provider, NULL) row via the partial unique index.
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+
+    let first = OAuthStore::insert(
+        &pool,
+        "google",
+        None,
+        None,
+        "access-1",
+        Some("refresh-1"),
+        None,
+        "https://www.googleapis.com/auth/drive.file",
+    )
+    .await
+    .unwrap();
+
+    let second = OAuthStore::insert(
+        &pool,
+        "google",
+        None,
+        None,
+        "access-2",
+        None,
+        None,
+        "https://www.googleapis.com/auth/drive.file",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        first, second,
+        "re-connecting a no-email provider must update the single (provider, NULL) row"
+    );
+    let all = OAuthStore::list(&pool).await.unwrap();
+    assert_eq!(all.len(), 1, "no-email provider must collapse to one row");
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn insert_keeps_distinct_emails_as_separate_rows() {
+    // Genuinely distinct accounts (different non-null emails) stay separate.
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+
+    OAuthStore::insert(
+        &pool,
+        "google",
+        Some("a@example.com"),
+        None,
+        "access-a",
+        None,
+        None,
+        "openid email",
+    )
+    .await
+    .unwrap();
+    OAuthStore::insert(
+        &pool,
+        "google",
+        Some("b@example.com"),
+        None,
+        "access-b",
+        None,
+        None,
+        "openid email",
+    )
+    .await
+    .unwrap();
+
+    let all = OAuthStore::list(&pool).await.unwrap();
+    assert_eq!(
+        all.len(),
+        2,
+        "distinct emails for one provider must remain separate rows"
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
 #[test]
 fn debug_redacts_token_response() {
     let resp = TokenResponse {

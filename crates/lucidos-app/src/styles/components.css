@@ -69,6 +69,17 @@
     padding: 0.5rem 0;
 }
 
+/* Full-pane variant (ListSkeleton fill). The component pins an inline pixel
+   height to the available content-pane height and renders one extra row; this
+   clips the trailing partial row so the run fills the pane exactly instead of
+   leaving a void below. The 1rem horizontal padding matches `.list-row`'s inset
+   so the shimmer bars don't run edge-to-edge in views whose pane has no padding
+   of its own. */
+.list-skeleton--fill {
+    padding: 0.5rem 1rem;
+    overflow: hidden;
+}
+
 .list-skeleton-row {
     height: 2.75rem;
     border-radius: 0.5rem;
@@ -439,8 +450,8 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
 /* Light-mode warning override: the default mix muddies to brown in light mode
    because --text-secondary is dark there (#656d76) and --accent-yellow is already
    a dark gold (#9a6700), so mixing them yields a muddy brown. Light mode uses a
-   clean vivid gold directly, which stays clearly amber on the near-white toast. */
-html[data-theme="light"] .toast-warning { --toast-accent: #bf8700; }
+   muted gold directly, which stays clearly gold on the near-white toast. */
+html[data-theme="light"] .toast-warning { --toast-accent: #caa53d; }
 
 .toast-success,
 .toast-info,

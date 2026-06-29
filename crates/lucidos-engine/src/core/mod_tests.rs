@@ -134,6 +134,42 @@ fn redact_postgres_secrets_does_not_match_passwordless_url() {
 }
 
 #[test]
+fn redact_secret_values_masks_each_secret_occurrence() {
+    let secrets = vec!["ya29.super-secret-token".to_string(), "hunter2pw".to_string()];
+    let text = "Authorization: Bearer ya29.super-secret-token (pw=hunter2pw, again hunter2pw)";
+    assert_eq!(
+        redact_secret_values(text, &secrets),
+        "Authorization: Bearer [REDACTED] (pw=[REDACTED], again [REDACTED])"
+    );
+}
+
+#[test]
+fn redact_secret_values_skips_trivially_short_secrets() {
+    // A 1–3 char "secret" is too generic to scrub without nuking real text.
+    let secrets = vec!["ab".to_string(), "x".to_string()];
+    let text = "abc x ab xy";
+    assert_eq!(redact_secret_values(text, &secrets), text);
+}
+
+#[test]
+fn redact_secret_values_redacts_longest_first_no_partial_leftover() {
+    // "secretvalue" contains "secret" — scrubbing the longer one first means no
+    // dangling partial match is left behind.
+    let secrets = vec!["secret".to_string(), "secretvalue".to_string()];
+    assert_eq!(
+        redact_secret_values("token=secretvalue", &secrets),
+        "token=[REDACTED]"
+    );
+}
+
+#[test]
+fn redact_secret_values_leaves_text_without_secrets_alone() {
+    let secrets = vec!["never-present-token".to_string()];
+    let text = "nothing sensitive here";
+    assert_eq!(redact_secret_values(text, &secrets), text);
+}
+
+#[test]
 fn redact_postgres_secrets_in_json_walks_nested_strings() {
     let mut v = serde_json::json!({
         "command": "psql postgres://lucidos:lucidos@localhost:5432/lucidos -c 'select 1'",

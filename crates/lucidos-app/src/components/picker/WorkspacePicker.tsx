@@ -21,7 +21,10 @@ import { useEffect, useRef } from 'preact/hooks';
 import type { Loadable } from '../../store/types';
 import { Overlay } from '../shared/Overlay';
 import { LoadingFade } from '../shared/LoadingFade';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { dismissBootSplash } from '../../utils/bootSplash';
+import { isTauri } from '../../utils/platform';
+import { applyAppBadge } from '../../store/actions/app-badge';
 import {
   recallLastWorkspace,
   forgetLastWorkspace,
@@ -44,10 +47,20 @@ import {
   parseWorkspaceNameFromArchive,
   getGatewayStatus,
   reloadGateway,
+  getGatewayNetworkConfig,
+  setGatewayNetworkConfig,
   type WorkspaceStatus,
   type GwRestoreStatus,
   type GatewayStatus,
+  type GatewayNetworkConfig,
 } from '../../api/client/control';
+import {
+  parseBindValue,
+  toBindValue,
+  isValidIp,
+  isValidBindSelection,
+  type BindMode,
+} from '../../utils/bindMode';
 
 /** Derived display state — collapses health + last_error into one status the row
  *  renders as a dot. A stopped workspace reports `unhealthy` + "not started"; we
@@ -160,6 +173,15 @@ function ReloadIcon() {
   );
 }
 
+function GearIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+    </svg>
+  );
+}
+
 function PencilIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -238,6 +260,16 @@ export function WorkspacePicker() {
   // process). Anchored to the header reload icon.
   const reloadConfirmOpen = useSignal(false);
   const reloadAnchor = useSignal<HTMLElement | null>(null);
+  // Machine-global Network access control (writes ~/.lucidos/network.toml): the
+  // gateway bind + the "engines inherit gateway bind" toggle. Anchored to the
+  // header gear. Lazy-loaded on open.
+  const networkOpen = useSignal(false);
+  const networkAnchor = useSignal<HTMLElement | null>(null);
+  const networkConfig = useSignal<GatewayNetworkConfig | null>(null);
+  const gwMode = useSignal<BindMode>('loopback');
+  const gwAddress = useSignal('');
+  const gwInherit = useSignal(true);
+  const networkSaving = useSignal(false);
   // Per-row overflow menu (autostart / rename / delete). Only one open at a time;
   // anchor is the ⋯ button that opened it.
   const menuOpenId = useSignal<string | null>(null);
@@ -266,6 +298,15 @@ export function WorkspacePicker() {
     // Remember the count so a future load can size its skeleton to this list
     // (no skeleton→list bounce on the next visit).
     rememberLastWorkspaceCount(list.length);
+    // Gateway-root PWA app-icon badge: the AGGREGATE unread total across running
+    // workspaces (a stopped one reports no count, so it contributes 0). Refreshed
+    // every poll while the picker is open. Not under Tauri — the desktop process
+    // drives a native dock badge from the same total (the WKWebView has no
+    // installable app icon of its own).
+    if (!isTauri()) {
+      const total = list.reduce((sum, w) => sum + (w.unread_count ?? 0), 0);
+      applyAppBadge(total);
+    }
   }
 
   async function fetchRestoreStatus(): Promise<void> {
@@ -324,6 +365,51 @@ export function WorkspacePicker() {
       await reloadGateway();
       // The gateway re-execs (~300ms delay server-side) and briefly drops; the
       // 2s poll reconnects and clears `reloading` once the new image answers.
+    });
+  }
+
+  function openNetwork(btn: HTMLElement) {
+    networkAnchor.value = btn;
+    networkOpen.value = true;
+    void getGatewayNetworkConfig()
+      .then((cfg) => {
+        networkConfig.value = cfg;
+        const parsed = parseBindValue(cfg.gateway_bind);
+        gwMode.value = parsed.mode;
+        gwAddress.value = parsed.address;
+        gwInherit.value = cfg.inherit;
+      })
+      .catch((e) => {
+        error.value = String(e);
+      });
+  }
+
+  // Click-to-fill the detected Tailscale address: drop it into the IP field and
+  // switch to the Tailnet / IP mode (idempotent — already in that mode when the
+  // detected line is visible, but set both so the affordance is self-contained).
+  function fillDetectedTailscaleIp() {
+    const ip = networkConfig.value?.detected_tailscale_ip;
+    if (!ip) return;
+    gwMode.value = 'address';
+    gwAddress.value = ip;
+  }
+
+  function onSaveNetwork() {
+    if (!isValidBindSelection(gwMode.value, gwAddress.value)) {
+      error.value = 'Enter a valid IP address';
+      return;
+    }
+    void withBusy(async () => {
+      networkSaving.value = true;
+      try {
+        await setGatewayNetworkConfig({
+          gateway_bind: toBindValue(gwMode.value, gwAddress.value),
+          inherit: gwInherit.value,
+        });
+        networkOpen.value = false;
+      } finally {
+        networkSaving.value = false;
+      }
     });
   }
 
@@ -480,15 +566,35 @@ export function WorkspacePicker() {
     });
   }
 
+  // Tapping a row opens the workspace — EXCEPT an `unhealthy` one, where opening
+  // would drop the user into a dead app shell (the reported "navigated into a
+  // workspace I couldn't connect to" bug). For unhealthy, Retry (restart +
+  // refresh) instead — matching the row's play/Retry button — so the user opens
+  // it once it goes healthy. `healthy`/`booting`/`stopped` open normally; a
+  // stopped workspace lazy-starts behind the gateway's own auto-refreshing boot
+  // splash, which is the good path, not the dead-skeleton case. This mirrors the
+  // auto-open guard above, which already skips an unhealthy remembered workspace.
+  function openOrRetry(w: WorkspaceStatus, state: PickerState) {
+    if (state === 'unhealthy') {
+      void withBusy(() => restartWorkspace(w.id).then(refresh));
+      return;
+    }
+    openWorkspace(w.id);
+  }
+
   const v = workspaces.value;
-  // Show the skeleton immediately while the list loads — no delay gate. The
-  // picker is a full-screen surface whose only alternative is a blank blue panel,
-  // and <LoadingFade> crossfades the skeleton into the list, so showing it on
-  // every open reads as intentional rather than as a flash. (The usual
-  // SPINNER_DELAY_MS gate exists to avoid flashing a loader over already-visible
-  // content; there is none here, and a fast local gateway otherwise suppressed
-  // the skeleton entirely.)
-  const showListSkeleton = v.status === 'loading' || v.status === 'not-loaded';
+  // Gate the skeleton behind the standard SPINNER_DELAY_MS (300ms), like every
+  // other view — a fast local gateway resolves well inside that window, so the
+  // skeleton never appears and can't flash. There IS competing content behind it
+  // (the brand header + footer render immediately) and the inline boot splash
+  // fades over the picker for ~0.45s on every open, masking the brief empty→list
+  // transition on a fast load — so the earlier "show it immediately" approach
+  // (the picker as a no-competing-content exception) just produced a skeleton
+  // blink under the clearing splash. Only a genuinely slow load (>300ms) now
+  // shows the skeleton, which is exactly when it helps; <LoadingFade> still
+  // crossfades it out so a shown skeleton doesn't hard-snap to the list.
+  const listLoading = v.status === 'loading' || v.status === 'not-loaded';
+  const showListSkeleton = useDelayedFlag(listLoading);
   // Size the skeleton to the last-known workspace count so the skeleton→list
   // handoff doesn't bounce (each skeleton row matches a real row's height).
   // Captured once at mount so it stays stable while the skeleton fades out
@@ -517,6 +623,120 @@ export function WorkspacePicker() {
     <div class="ws-picker">
       <div class="ws-picker-shell">
         <header class="ws-picker-header">
+          <button
+            class="ws-picker-net-btn"
+            disabled={busy.value}
+            title="Network access"
+            aria-label="Network access"
+            aria-haspopup="dialog"
+            aria-expanded={networkOpen.value}
+            onClick={(e) => {
+              const btn = e.currentTarget as HTMLElement;
+              if (networkOpen.value) {
+                networkOpen.value = false;
+              } else {
+                openNetwork(btn);
+              }
+            }}
+          >
+            <GearIcon />
+          </button>
+          <Overlay
+            open={networkOpen.value}
+            onClose={() => (networkOpen.value = false)}
+            anchor={networkAnchor.value}
+            backdrop={false}
+            panelClass="ws-picker-confirm ws-picker-net"
+          >
+            <h2 class="ws-picker-net-title">Network access</h2>
+            <p class="ws-picker-net-desc">
+              How this machine's Lucidos is reachable. The gateway fronts every
+              workspace; engines can follow it or bind per-workspace.
+            </p>
+            <div class="ws-picker-net-modes" role="radiogroup" aria-label="Gateway bind">
+              {(
+                [
+                  ['loopback', 'Loopback only'],
+                  ['address', 'Tailnet / IP'],
+                  ['all', 'All interfaces'],
+                ] as [BindMode, string][]
+              ).map(([m, label]) => (
+                <button
+                  key={m}
+                  type="button"
+                  role="radio"
+                  aria-checked={gwMode.value === m}
+                  class={`ws-picker-net-mode${gwMode.value === m ? ' active' : ''}`}
+                  onClick={() => (gwMode.value = m)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {gwMode.value === 'address' && (
+              <>
+                <input
+                  class="ws-picker-input"
+                  type="text"
+                  placeholder={networkConfig.value?.detected_tailscale_ip ?? '100.x.y.z'}
+                  value={gwAddress.value}
+                  aria-invalid={gwAddress.value.trim() !== '' && !isValidIp(gwAddress.value)}
+                  aria-label="Gateway bind IP address"
+                  onInput={(e) => (gwAddress.value = (e.target as HTMLInputElement).value)}
+                />
+                {gwAddress.value.trim() !== '' && !isValidIp(gwAddress.value) ? (
+                  <span class="ws-picker-net-error">Not a valid IP address.</span>
+                ) : networkConfig.value?.detected_tailscale_ip ? (
+                  <span class="ws-picker-net-hint">
+                    Detected Tailscale:{' '}
+                    <button
+                      type="button"
+                      class="ws-picker-net-detected"
+                      title="Use this address"
+                      onClick={fillDetectedTailscaleIp}
+                    >
+                      {networkConfig.value.detected_tailscale_ip}
+                    </button>
+                  </span>
+                ) : (
+                  <span class="ws-picker-net-hint">Your Tailscale 100.x address, or a LAN IP.</span>
+                )}
+              </>
+            )}
+            <label class="ws-picker-net-toggle">
+              <input
+                type="checkbox"
+                checked={gwInherit.value}
+                onChange={(e) => (gwInherit.value = (e.target as HTMLInputElement).checked)}
+              />
+              <span>Engines inherit gateway bind</span>
+            </label>
+            <p class="ws-picker-net-hint">
+              When off, each workspace sets its own engine bind in its Settings →
+              Network access.
+            </p>
+            <p class="ws-picker-net-restart">
+              Takes effect after the gateway / engine restarts.
+            </p>
+            <div class="ws-picker-confirm-actions">
+              <button class="ws-picker-btn" onClick={() => (networkOpen.value = false)}>
+                Cancel
+              </button>
+              <button
+                class="ws-picker-btn ws-picker-btn-confirm"
+                disabled={
+                  busy.value ||
+                  networkSaving.value ||
+                  !networkConfig.value ||
+                  (gwMode.value === 'address' &&
+                    (gwAddress.value.trim() === '' || !isValidIp(gwAddress.value)))
+                }
+                onClick={onSaveNetwork}
+              >
+                {networkSaving.value ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+          </Overlay>
           {gatewayStatus.value && !gatewayStatus.value.packaged && (
             <>
               <button
@@ -623,8 +843,8 @@ export function WorkspacePicker() {
                       class="ws-picker-open"
                       role="button"
                       tabIndex={0}
-                      aria-label={`Open ${w.name}`}
-                      onClick={() => openWorkspace(w.id)}
+                      aria-label={state === 'unhealthy' ? `Retry ${w.name}` : `Open ${w.name}`}
+                      onClick={() => openOrRetry(w, state)}
                       onKeyDown={(e) => {
                         // Only the row itself opens on Enter/Space — a keydown
                         // bubbling up from a focused action button (rename, play,
@@ -632,12 +852,21 @@ export function WorkspacePicker() {
                         if (e.target !== e.currentTarget) return;
                         if (e.key === 'Enter' || e.key === ' ') {
                           e.preventDefault();
-                          openWorkspace(w.id);
+                          openOrRetry(w, state);
                         }
                       }}
                     >
                       <span class={`ws-picker-dot ws-picker-dot-${state}`} title={w.last_error || STATE_LABEL[state]} />
                       <span class="ws-picker-name">{w.name}</span>
+                      {typeof w.unread_count === 'number' && w.unread_count > 0 && (
+                        <span
+                          class="ws-picker-badge"
+                          title={`${w.unread_count} unread`}
+                          aria-label={`${w.unread_count} unread notifications`}
+                        >
+                          {w.unread_count > 99 ? '99+' : w.unread_count}
+                        </span>
+                      )}
                       <div class="ws-picker-actions" onClick={(e) => e.stopPropagation()}>
                         {running ? (
                           <div class="ws-picker-stop-wrap">

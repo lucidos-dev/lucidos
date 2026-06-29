@@ -133,7 +133,7 @@ Marketplace HTTP surface:
 - `POST /api/v1/plugins/marketplaces` with `{ "source": "...", "name"?: "..." }` -> register or rename a marketplace.
 - `DELETE /api/v1/plugins/marketplaces/{id}` -> unregister a marketplace.
 - `GET /api/v1/plugins/catalog` -> live scan result `{ marketplaces, plugins, errors }`. Each installed plugin row also carries `setup_thread_id`, `setup_complete`, and `app_id` to drive the card's Install→Setup→Open button.
-- `GET /api/v1/plugins/installed` -> `{ plugins }` from the `PluginInstalled` projection (no marketplace scan). Each row carries `id`, `name`, `version`, `source?`, `app_id?`, `content` (the shipped content-dir kinds), and `files` (every installed `data/`-relative path). Backs the Plugins panel's installed-plugins view (the default **Installed only** filter) so it works offline and lists plugins whose marketplace was removed.
+- `GET /api/v1/plugins/installed` -> `{ plugins }` from the `PluginInstalled` projection (no marketplace scan). Each row carries `id`, `name`, `version`, `source?`, `app_id?`, `content` (the shipped content-dir kinds), `files` (every installed `data/`-relative path), and `modified` + `modified_paths` (see "Local modifications" below). Backs the Plugins panel's installed-plugins view (the default **Installed only** filter) so it works offline and lists plugins whose marketplace was removed.
 - `POST /api/v1/plugins/install-request` with `{ "source": "..." }` -> stage an install request payload for the existing confirmation panel.
 - `POST /api/v1/plugins/uninstall-request` with `{ "id": "..." }` -> stage an uninstall request payload (resolves the plugin id, partitions its files into present/missing) for the uninstall confirmation panel. The button counterpart of the `uninstall_plugin` LLM tool.
 
@@ -319,6 +319,20 @@ What this means for plugin authors:
 - **Sharing a path between plugins is allowed but messy.** If two plugins both ship `knowhow/sites/linkedin.com/selectors.md`, whichever installs second wins (overwrite). Uninstalling either one suggests deleting the file even though the other plugin still relies on it. Avoid path collisions across plugins where possible.
 - **Reinstall after uninstall is supported.** Calling `install_plugin` on the same source after `uninstall_plugin` works -- the engine treats the uninstall as a tombstone and the next install is fresh.
 
+## Local modifications (the "Modified" badge)
+
+A plugin's shipped content lives under `data/` like any other artifact, so the user (or the Lucidos Agent, or a coding-agent thread) can edit it after install. When that happens the Plugins list shows a **Modified** badge on the plugin's row, and updating the plugin warns that the update will overwrite the local changes.
+
+This state is **derived on read, never stored** — there is no "PluginModified" event. The engine diffs the plugin's current on-disk content against the install commit (`payload.data.manifest.commit`) and returns `modified` + `modified_paths` on the installed summary / catalog row (`registry::plugin_modification_status`). Because it is a pure function of git + disk, it **self-heals**: revert an edit and the badge clears; update the plugin and the new install commit becomes the baseline, so the badge resets.
+
+What counts as a modification, per content type:
+
+- **Apps** (`apps/<id>/`): any edit, delete, or **added** file inside the plugin's app directory (a directory diff against the install commit).
+- **Knowhow / scripts / auth-modules**: an edit or delete of a file the plugin *recorded*. A brand-new file you drop into `knowhow/` (etc.) is *not* attributed to a plugin — those roots are shared by the user and other content.
+- **Triggers** (`triggers/<slug>/trigger.toml`): a change to the trigger's *definition*. `trigger.toml` is a gitignored, re-serialized projection (ADR 0019), so it is compared semantically (ignoring `slug` / `plugin_id` / `group_id`), not byte-for-byte — re-serialization after install never counts as a modification.
+
+Deferred (not built yet, but the recorded paths are the breadcrumb for them): preserving a local patch across an update (a 3-way merge) and proposing it upstream as a PR to the plugin repo.
+
 ## Events emitted
 
 Two `SystemEvent` variants (`engine/event_bus.rs:244-261`). Both carry `actor: Option<MessageOrigin>`. Both have `aggregate()` returning `"plugin"`. The `aggregate_id` is the plugin's `id` field.
@@ -336,7 +350,8 @@ Emitted on every successful install (including overwrites and updates -- the var
       "manifest": { "id": "browser-learning", "version": "0.1.0", "name": "...", "description": "...", "source": "https://github.com/lucidos-dev/plugins/tree/main/browser-learning", "engine": "..." },
       "files": ["knowhow/browser-skills.md", "..."],
       "installed_at": "2026-04-29T12:34:56+00:00",
-      "source_type": "git"
+      "source_type": "git",
+      "commit": "<workspace-repo sha of the install commit>"
     },
     "files": ["knowhow/browser-skills.md", "knowhow/browser-knowhow-reflection.md"],
     "installed_at": "2026-04-29T12:34:56+00:00",
@@ -348,7 +363,7 @@ Emitted on every successful install (including overwrites and updates -- the var
 
 The two outer wrappers come from how Lucidos persists `SystemEvent`: serde's `tag = "type", content = "data"` adds `{type, data}`, and `install_from_unpacked_with_bus` packs the raw manifest into a payload map under `manifest` before assigning that map to `SystemEvent::PluginInstalled.manifest`. Net effect: the raw manifest fields (`id`, `version`, `source`, ...) sit at `payload.data.manifest.manifest.*`. `InstalledRecord` reads them at that path; do the same in any new consumer.
 
-`source_type` is `"git"` for both plain git URLs and GitHub tree URLs, `"archive"` for `.lucidos-plugin` installs. `files` is the same list at the top level (`payload.data.files`) and inside the nested `manifest` blob (`payload.data.manifest.files`) -- the nested copy is what `latest_install` reads when looking up "what files belong to this plugin?" for the uninstall guide.
+`source_type` is `"git"` for both plain git URLs and GitHub tree URLs, `"archive"` for `.lucidos-plugin` installs. `files` is the same list at the top level (`payload.data.files`) and inside the nested `manifest` blob (`payload.data.manifest.files`) -- the nested copy is what `latest_install` reads when looking up "what files belong to this plugin?" for the uninstall guide. `commit` (at `payload.data.manifest.commit`) is the workspace-repo sha of the "Install plugin: ..." commit -- the baseline the Modified badge diffs against (see "Local modifications" below). Legacy rows installed before this field was recorded simply never show as modified.
 
 > **Historical bug, fixed.** Earlier `InstalledRecord::source()` read `payload.manifest.source` -- two layers too shallow -- and silently returned `None`, surfacing as the misleading `"installed manifest is missing 'source' -- cannot fetch latest"` error from `check_plugin_updates` even when the source was recorded. The matching `aggregate_id()` derivation read `manifest.id` (also too shallow), which made every PluginInstalled row land with `aggregate_id = "unknown"` and broke `latest_install(pool, &id)` lookups. Both are fixed; the e2e tests in `engine/tools/plugins.rs` (the `e2e_*` cases) lock the round-trip in. Plugins installed before the fix may still have `aggregate_id = "unknown"` in the events table; reinstall to refresh.
 

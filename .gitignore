@@ -17,6 +17,10 @@ signers/*/Cargo.lock
 # Archives
 *.tgz
 
+# Docs site build output (mkdocs) + its local venv
+/site/
+.venv-docs/
+
 # Lucidos local data (workspaces are external)
 data/
 .lucidos/

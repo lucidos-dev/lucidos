@@ -1,6 +1,6 @@
 import { test, expect, type Page, type Locator } from './fixtures';
 import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer, openDrawerView, waitForVisibleInput, ensureOnThreadPane, clickVisibleElement, isMobileViewport, REAL_THREAD_ROW } from './helpers';
-import { clearAllThreads } from './db-helpers';
+import { clearAllThreads, psql } from './db-helpers';
 
 /** Send a first message, then click Compose and type a draft. Returns the
  *  prompt-input locator, the original (active) thread id, and the new draft
@@ -85,9 +85,52 @@ test.describe('Per-thread drafts', () => {
     if (!clicked) throw new Error('No visible real thread row found');
     await ensureOnThreadPane(page);
 
-    // Thread draft restored
+    // Thread draft restored. The timeout is the suite's default `expect` timeout
+    // (30s, playwright.config.ts) — NOT an explicit 5s. On the contended nightly
+    // the mobile-webkit textarea hydration can lag behind a WebContent
+    // starvation freeze (the documented emulation paint stall — see
+    // docs/e2e-test-decisions.md "mobile-webkit navigation wedge"); that is a
+    // slow-but-correct restore that should pass, not flake-then-pass-on-retry.
+    // A genuine clobber/not-stored bug leaves the draft empty FOREVER, so it
+    // still fails loudly even at 30s — the longer wait sharpens the signal, it
+    // does not mask one. (The explicit 5s here was the sole reason draft 65
+    // surfaced as a retry-recovered flake on 2026-06-28; the draft restores
+    // correctly, just slower than 5s under starvation.)
     const threadInput = await waitForVisibleInput(page);
-    await expect(threadInput).toHaveValue('thread draft text', { timeout: 5_000 });
+    const restoredThreadId = await threadInput.getAttribute('data-thread-id');
+    try {
+      await expect(threadInput).toHaveValue('thread draft text');
+    } catch (assertErr) {
+      // Classify the failure FACE so a future nightly flake self-diagnoses,
+      // instead of re-opening the multi-session "which face is it?" guessing
+      // (the drafts:65 saga — docs/plans/2026-06-27-mobile-webkit-shard-contention.md
+      // chased six unit-level fixes blind because the live failure was never
+      // classified). The textarea binds to the local composeDrafts signal, so an
+      // empty textarea after the full 30s is NOT a transient paint stall. Query
+      // the PERSISTED draft (thread_summaries.compose_text, written synchronously
+      // by the compose PUT) to split the two remaining faces:
+      //   • persisted === the draft → CLOBBER: stored server-side but wiped from
+      //     (or never re-synced into) the local signal — a product clear-path bug.
+      //   • persisted === ''        → NOT-STORED: the PUT never landed — a
+      //     fill()→updateCompose event race, or a failed/never-fired PUT.
+      let persisted: string;
+      try {
+        persisted = restoredThreadId
+          ? psql(`SELECT compose_text FROM thread_summaries WHERE thread_id = '${restoredThreadId}'`)
+          : '<no data-thread-id on restored input>';
+      } catch (psqlErr) {
+        persisted = `<persisted-draft query failed: ${(psqlErr as Error).message}>`;
+      }
+      const domValue = await threadInput.inputValue().catch(() => '<unreadable>');
+      const face = persisted === 'thread draft text'
+        ? 'CLOBBER (persisted server-side but absent from the textarea after 30s — a local clear-path wiped/never-restored the draft; product bug)'
+        : 'NOT-STORED (no persisted draft — the compose PUT never landed: fill()->updateCompose race or failed PUT)';
+      throw new Error(
+        `drafts:65 draft-restore FAILED — face: ${face}. ` +
+        `textarea value=${JSON.stringify(domValue)}, persisted compose_text=${JSON.stringify(persisted)}, ` +
+        `thread=${restoredThreadId}. Original: ${(assertErr as Error).message}`,
+      );
+    }
   });
 
   test('Compose always opens a fresh blank draft, preserving previous compose drafts', async ({ page }) => {

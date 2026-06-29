@@ -23,6 +23,10 @@ export interface WorkspaceStatus {
    *  renders a per-workspace toggle bound to it (ADR 0014). */
   autostart: boolean;
   last_error?: string;
+  /** Unread-notification count for this workspace's per-row badge. Present only
+   *  for a RUNNING (healthy, polled) engine — the gateway has no DB handle, so a
+   *  stopped workspace reports no count. Omitted (not 0) when unknown. */
+  unread_count?: number;
 }
 
 async function controlJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -129,6 +133,34 @@ export async function getGatewayStatus(): Promise<GatewayStatus> {
  *  binds and the picker's poll reconnects. */
 export async function reloadGateway(): Promise<void> {
   await controlJson<void>('/gateway/reload', { method: 'POST' });
+}
+
+// ── Network access (machine-global gateway bind) ────────────────────────────
+
+/** The machine-global network bind config from `~/.lucidos/network.toml`.
+ *  Mirrors the gateway `network_config` handler. `gateway_bind` is `loopback` |
+ *  `all` | an IP; `inherit` controls whether engines follow the gateway bind. */
+export interface GatewayNetworkConfig {
+  gateway_bind: string;
+  inherit: boolean;
+  detected_tailscale_ip: string | null;
+}
+
+export async function getGatewayNetworkConfig(): Promise<GatewayNetworkConfig> {
+  return controlJson<GatewayNetworkConfig>('/network-config');
+}
+
+/** Write the machine-global gateway bind + engine-inherit toggle. Takes effect
+ *  after a gateway / engine restart. */
+export async function setGatewayNetworkConfig(body: {
+  gateway_bind: string;
+  inherit: boolean;
+}): Promise<void> {
+  await controlJson<void>('/network-config', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
 }
 
 // ── Restore from backup (picker) ───────────────────────────────────────────

@@ -869,6 +869,57 @@ fn show_native_notification(title: String, body: String, link: serde_json::Value
     notifications::show(&title, &body, link);
 }
 
+/// Remove an already-delivered native banner — the cross-device dismiss
+/// counterpart of [`show_native_notification`]. `id = Some(notification_id)`
+/// removes that one banner; `None` removes ALL delivered banners (the
+/// mark-all-read path). Driven by the engine's `NativePushDismissRequested` SSE
+/// when a notification is read on any device (`store/actions/native-push.ts`).
+/// Delegates to the [`notifications`] module, which also drops the stashed deep
+/// link so a tap on a now-removed banner can't route. No-op in `tauri dev`
+/// (unbundled binary) and on non-macOS — see `notifications.rs`.
+#[tauri::command]
+fn dismiss_native_notification(id: Option<String>) {
+    notifications::dismiss(id);
+}
+
+/// Report whether the main app window is currently *active* — focused AND
+/// on-screen (visible, not minimized). The frontend pulls this at startup to
+/// SEED its `native-window-active` cache BEFORE registering the event listener
+/// (`utils/nativeWindow.ts`): Tauri does not replay the transition events
+/// emitted from `on_window_event` to a listener that registers after the fact,
+/// and the cache defaults to `true`. Without the seed, a freshly (re)loaded
+/// page that is actually backgrounded/trayed — crash-watchdog reload, version
+/// refresh, cold/unfocused launch — keeps the `true` default and wrongly pongs
+/// the device as active, so the engine suppresses the OS push into an invisible
+/// in-app toast (no banner). See `system-knowhow/notifications.md` §3/§4.
+///
+/// Any state read that fails resolves to the SAFE direction (inactive →
+/// `false`), so an uncertain seed surfaces the banner rather than suppressing
+/// it. No-op-ish off the main window (returns `false`).
+#[tauri::command]
+fn get_native_window_active(app: tauri::AppHandle) -> bool {
+    get_main_window(&app)
+        .map(|w| {
+            let focused = w.is_focused().unwrap_or(false);
+            // Conservative on read failure: treat unknown visibility as not
+            // visible so we never wrongly report active (which would suppress).
+            let visible = w.is_visible().unwrap_or(false);
+            let minimized = w.is_minimized().unwrap_or(false);
+            focused && visible && !minimized
+        })
+        .unwrap_or(false)
+}
+
+/// Drain the deep links from native-banner taps the page may not have been
+/// listening for (see `notifications::take_pending_taps`). The frontend calls
+/// this at startup (cold path) and on each `native-notification-tapped` signal
+/// (warm path); the drain is atomic, so each tap routes exactly once. Naturally
+/// empty in `tauri dev` / off-macOS. See `store/actions/native-push.ts`.
+#[tauri::command]
+fn take_pending_native_taps() -> Vec<serde_json::Value> {
+    notifications::take_pending_taps()
+}
+
 /// Bridge the native window's *active* state (focused AND on-screen) to that
 /// window's webview as a `native-window-active` event (a bare bool). The embedded
 /// WKWebView can't observe macOS `orderOut:` — a window dismissed to the menu-bar
@@ -993,6 +1044,9 @@ pub fn run() {
             uninstall_lucidos,
             open_url_external,
             show_native_notification,
+            dismiss_native_notification,
+            get_native_window_active,
+            take_pending_native_taps,
             updater::check_app_update,
             updater::install_app_update_and_restart,
             set_titlebar_color,

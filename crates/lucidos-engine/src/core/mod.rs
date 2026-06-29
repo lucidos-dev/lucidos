@@ -148,6 +148,37 @@ pub fn redact_postgres_secrets_in_json(value: &mut serde_json::Value) {
     }
 }
 
+/// Shortest secret value we bother scrubbing. Below this, a "secret" is too
+/// generic (a 1-char password, "GET", an index) to redact without nuking
+/// legitimate text everywhere it appears. Auth tokens and real credentials are
+/// far longer, so this never weakens redaction of actual secrets.
+pub const MIN_REDACTABLE_SECRET_LEN: usize = 4;
+
+/// Replace every occurrence of each known secret value in `text` with
+/// `[REDACTED]`. Used to keep credential material out of logs and surfaced
+/// error messages where untrusted code (a WASM signer's `log()` host import, a
+/// `script_handshake` script's stderr) could otherwise echo it. Secrets shorter
+/// than [`MIN_REDACTABLE_SECRET_LEN`] are skipped (see the const). Longest
+/// secrets are scrubbed first so a secret that is a substring of another doesn't
+/// leave a partial match behind.
+pub fn redact_secret_values(text: &str, secrets: &[String]) -> String {
+    let mut ordered: Vec<&String> = secrets
+        .iter()
+        .filter(|s| s.len() >= MIN_REDACTABLE_SECRET_LEN)
+        .collect();
+    if ordered.is_empty() {
+        return text.to_string();
+    }
+    ordered.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    let mut out = text.to_string();
+    for secret in ordered {
+        if out.contains(secret.as_str()) {
+            out = out.replace(secret.as_str(), "[REDACTED]");
+        }
+    }
+    out
+}
+
 /// Directory structure within workspace/data/
 pub const DATA_DIR: &str = "data";
 pub const ARTIFACTS_DIR: &str = "data/artifacts";

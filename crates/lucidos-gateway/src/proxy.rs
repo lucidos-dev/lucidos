@@ -165,12 +165,36 @@ pub async fn proxy(
 /// engine, so the splash never shows for an installed PWA. The marker tells the SW
 /// to SHOW this response; it is never cached (still a 503 + `no-store`).
 pub fn starting_page(label: &str) -> Response {
+    // 2s meta-refresh, no escape link — the happy-path boot window.
+    boot_splash_response(splash_page_html(label, 2, false), "2")
+}
+
+/// The boot-splash ESCAPE page, served once a workspace has been stuck in its boot
+/// window past the gateway's budget ([`crate::server::BOOT_ESCAPE_BUDGET`]). An
+/// alive-but-unreachable engine (misconfigured bind, network partition) is never
+/// marked `Unhealthy`, so without this the splash would meta-refresh forever with
+/// no way out. It keeps a SLOWER (10s) refresh so a late-but-real recovery still
+/// lands on the workspace, AND shows a manual "Back to workspaces" link to the
+/// picker (`/~/?pick`, which stands down the cold-start auto-open so there is no
+/// picker↔workspace loop). Same 503 + boot-splash marker as [`starting_page`].
+pub fn stalled_page() -> Response {
+    boot_splash_response(
+        splash_page_html("This is taking longer than expected.", 10, true),
+        "10",
+    )
+}
+
+/// Shared 503 boot-splash response shell: `text/html`, `Retry-After`, `no-store`,
+/// and the `X-Lucidos-Boot-Splash: 1` marker so the PWA service worker
+/// (`networkFirstShell`) SHOWS the page rather than treating the non-ok
+/// navigation as an error and serving the cached app shell.
+fn boot_splash_response(html: String, retry_after: &'static str) -> Response {
     let mut resp = Response::builder().status(StatusCode::SERVICE_UNAVAILABLE);
     resp = resp.header(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
-    resp = resp.header(header::RETRY_AFTER, HeaderValue::from_static("2"));
+    resp = resp.header(header::RETRY_AFTER, HeaderValue::from_static(retry_after));
     resp = resp.header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     resp = resp.header("x-lucidos-boot-splash", HeaderValue::from_static("1"));
-    resp.body(Body::from(splash_page_html(label)))
+    resp.body(Body::from(html))
         .unwrap_or_else(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())
 }
 
@@ -190,11 +214,15 @@ pub fn starting_page(label: &str) -> Response {
 /// render before any engine can serve `/favicon.svg`. Geometry + gradient are the
 /// single-source values from the icon generator; keep them in sync if the brand
 /// changes there. `label` is interpolated verbatim — pass trusted, static text.
-fn splash_page_html(label: &str) -> String {
-    // Split the template around the label so the static CSS (full of `{}`) needs
-    // no `format!` brace-escaping.
-    const HEAD: &str = r##"<!doctype html><html><head><meta charset="utf-8">
-<meta http-equiv="refresh" content="2">
+/// `refresh_secs` sets the meta-refresh interval (2s on the happy-path
+/// [`starting_page`], slower on [`stalled_page`]); when `escape` is set a manual
+/// "Back to workspaces" link to the picker is shown below the label.
+fn splash_page_html(label: &str, refresh_secs: u32, escape: bool) -> String {
+    // Split the template around the refresh interval, the label, and the escape
+    // link so the static CSS (full of `{}`) needs no `format!` brace-escaping.
+    const HEAD_A: &str = r##"<!doctype html><html><head><meta charset="utf-8">
+<meta http-equiv="refresh" content=""##;
+    const HEAD_B: &str = r##"">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0a4ea8">
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><radialGradient id='g' gradientUnits='userSpaceOnUse' cx='30' cy='22' r='125'><stop offset='0' stop-color='%232d83e0'/><stop offset='1' stop-color='%230a4ea8'/></radialGradient></defs><rect width='100' height='100' rx='22' fill='url(%23g)'/><g transform='translate(13 13) scale(0.74)' fill='%23fff'><rect x='17' y='17' width='29' height='29' rx='7'/><rect x='17' y='54' width='29' height='29' rx='7'/><rect x='54' y='54' width='29' height='29' rx='7'/><path d='M68.5 12 C71 25 74 28.5 87 31 C74 33.5 71 37 68.5 50 C66 37 63 33.5 50 31 C63 28.5 66 25 68.5 12 Z'/></g></svg>">
@@ -222,6 +250,9 @@ change size/spacing/color across the cold-boot→workspace seam. The margin
 mirrors that splash's 1.5rem mark↔status gap (and zeros the default <p> bottom
 margin so vertical centering matches). Keep all four values in sync. */
 .mark-label{margin:1.5rem 0 0;font-size:.9375rem;letter-spacing:.01em;opacity:.82}
+/* The stalled-boot escape link (shown only past the boot budget). Matches the
+label's size/spacing, underlined so it reads as a tap target. */
+.mark-escape{display:inline-block;margin:1rem 0 0;font-size:.9375rem;letter-spacing:.01em;color:#fff;opacity:.92;text-decoration:underline;text-underline-offset:.2em}
 .lmk-tile,.lmk-spark{transform-box:fill-box;transform-origin:center}
 .lmk-tile{animation:tile-in .5s cubic-bezier(.34,1.56,.64,1) both}
 .lmk-tile-1{animation-delay:.15s}.lmk-tile-2{animation-delay:.28s}.lmk-tile-3{animation-delay:.41s}
@@ -240,9 +271,12 @@ margin so vertical centering matches). Keep all four values in sync. */
 </g>
 </svg>
 <p class="mark-label">"##;
-    const TAIL: &str = r##"</p>
-</body></html>"##;
-    format!("{HEAD}{label}{TAIL}")
+    // The picker link stands down the cold-start auto-open (`?pick`), so a manual
+    // tap can't loop back into the unreachable workspace.
+    const ESCAPE_LINK: &str =
+        r##"<a class="mark-escape" href="/~/?pick">Back to workspaces</a>"##;
+    let escape_html = if escape { ESCAPE_LINK } else { "" };
+    format!("{HEAD_A}{refresh_secs}{HEAD_B}{label}</p>\n{escape_html}\n</body></html>")
 }
 
 /// Build the shared reqwest client used for proxying to the workspace engines.
@@ -289,19 +323,47 @@ mod tests {
     }
 
     #[test]
-    fn splash_renders_the_phase_label_and_has_no_escape_link() {
-        let html = splash_page_html("Downloading memory model — first run, this can take a minute…");
+    fn starting_splash_renders_the_phase_label_and_has_no_escape_link() {
+        let html = splash_page_html("Downloading memory model — first run, this can take a minute…", 2, false);
         // The current boot-phase label is shown beneath the mark.
         assert!(html.contains("Downloading memory model — first run, this can take a minute…"));
         // The 2s auto-refresh that advances the label / drives the happy-path
         // transition is preserved.
         assert!(html.contains(r#"http-equiv="refresh" content="2""#));
-        // The "Open the workspace picker" escape link (and its reveal machinery)
-        // is gone — no anchor, no CSS class, no sessionStorage countdown.
+        // The happy-path splash has NO escape link (no anchor, no picker href) and
+        // none of the removed auto-redirect machinery.
+        assert!(!html.contains("<a "));
+        assert!(!html.contains("/~/?pick"));
+        assert!(!html.contains("Back to workspaces"));
         assert!(!html.contains("boot-escape"));
-        assert!(!html.contains("Open the workspace picker"));
         assert!(!html.contains("show-escape"));
         assert!(!html.contains("lucidos-boot-since"));
+    }
+
+    #[test]
+    fn stalled_splash_has_manual_escape_link_and_slower_refresh() {
+        let html = splash_page_html("This is taking longer than expected.", 10, true);
+        assert!(html.contains("This is taking longer than expected."));
+        // A slower (10s) refresh so a late-but-real recovery still lands on the
+        // workspace, rather than the happy-path 2s.
+        assert!(html.contains(r#"http-equiv="refresh" content="10""#));
+        // A MANUAL "Back to workspaces" link to the picker. `?pick` stands down the
+        // cold-start auto-open, so tapping it cannot loop back into the workspace.
+        assert!(html.contains(r##"href="/~/?pick""##));
+        assert!(html.contains("Back to workspaces"));
+        // It is a manual link, NOT the removed auto-redirect / countdown.
+        assert!(!html.contains("show-escape"));
+        assert!(!html.contains("lucidos-boot-since"));
+    }
+
+    #[test]
+    fn stalled_page_is_503_with_boot_splash_marker() {
+        let resp = stalled_page();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get("x-lucidos-boot-splash").map(|v| v.to_str().unwrap()),
+            Some("1")
+        );
     }
 
     #[test]

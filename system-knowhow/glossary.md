@@ -22,9 +22,14 @@ See also: `system-knowhow/notifications.md` §§1, 3.
 ### Active (thread state)
 A *thread* that is currently doing work — the system's turn — surfaced by the row's status icon, **not** by a separate section. A thread no longer changes section when it starts or stops running: it stays in the *Current section* and just shows (or drops) the Active indicator in place. Contrast the *Current section* (where it lives) and *attention* (the user's turn — a pending *change*, an awaiting answer, or a failure — surfaced by a count badge and the attention filter rather than by reordering Current).
 
+<!--gloss-app-start-->
 ### App
 A user-installed mini-application with its own UI (HTML/CSS/JS) at `data/apps/<id>/`, plus optional *knowhow* / *intents* / *scripts* / *triggers*. Chat is not per-app: every conversation is a regular *chat thread*. When an app is open in the panel-overlay slot, its `manifest.json` and discovered context flow into the *Lucidos Agent*'s prompt, so the agent can answer in-context. Quick edits to an app happen through the agent's file tools on the chat path; heavier edits spawn an *app coding-agent thread*. The *app manifest* is user-facing metadata shown in the UI; `knowhow/` and `intents/` are engine-facing context loaded into the LLM when the app is active. The app's interactive surface is the *app UI* — see entry.
 See also: `system-knowhow/building-an-app.md`, `docs/taxonomy.md` § Apps.
+<!--gloss-app-end-->
+
+### App-icon badge
+The unread-notification *count* painted on the installed app's **icon** — a PWA's home-screen icon via the web Badging API, or the Tauri macOS **dock** icon via the dock tile. Distinct from the *in-app surface*'s bell badge, which lives inside the Lucidos UI. The value depends on the install: a **workspace PWA** (installed at `/<slug>/`, or a direct engine at `/`) shows its own workspace's unread count; the **gateway-root PWA** (installed from the workspace picker at `/~/`) and the **Tauri desktop app** show the aggregate total across running workspaces. The aggregate is running-workspaces-only — the gateway HTTP-polls each running engine's count (it holds no database handle), so a stopped workspace contributes nothing. See `system-knowhow/notifications.md` § App-icon badge.
 
 ### App manifest
 The metadata file for an app at `data/apps/<id>/manifest.json`. Holds name, description, icon — what the UI shows. **Not** loaded into the LLM context; operational knowledge belongs in `knowhow/`, not the manifest.
@@ -35,9 +40,11 @@ The iframe that renders an app's HTML/CSS/JS (from `data/apps/<id>/ui/`) inside 
 ### API caller
 An external HTTP caller of the engine's `/api/v1/...` surface that did NOT self-identify as one of the known actors (`You`, `Lucidos Agent`, `Lucidos Engine`, `System`). Reaches the engine without an `x-lucidos-device-id` (no browser session) and without an `x-lucidos-agent-origin-token` (not a Lucidos-spawned subprocess). UI actor-chip label: "API caller" with the 🔌 icon; the origin popover discloses the User-Agent string for forensics. Reserved label so an anonymous mutating POST can never impersonate the user as "You". A Lucidos-spawned `run_python` / `run_bash` subprocess that hand-rolls `urllib.request` / `curl` instead of using the `lucidos` CLI used to fall in here — the venv agent-origin shim (`crates/lucidos-engine/src/runtime/python.rs`), a `.pth`-loaded `_lucidos_agent_origin` module that survives a host `sitecustomize.py` such as Homebrew's, now auto-forwards the agent-origin token on Python calls to the engine port so those land as `Lucidos Agent` instead.
 
+<!--gloss-artifact-start-->
 ### Artifact
 A user-owned file under `data/artifacts/`. Git-tracked, never auto-deleted. Includes notes, imported API data, project folders, screenshots, generated images. The durable counterpart to ephemeral runtime state under `.lucidos/`.
 See also: `system-knowhow/best-practices.md` § `artifacts/`.
+<!--gloss-artifact-end-->
 
 ### Auth module
 A WASM signer (plus optional `<name>.manifest.json` *signer manifest*) installed under `data/auth-modules/` to sign outbound proxy requests. Plugins can ship auth modules in their `auth-modules/` directory; the install-time LLM walks the user through wiring the matching `apis.json` snippet. Engine-side mechanics (host imports, capabilities, body modes) live under *signer* in `docs/glossary.md`.
@@ -97,8 +104,10 @@ See also: `system-knowhow/thread-events.md` § "Today the scheduler uses a block
 ### Environment variable
 A user-managed, **non-secret** `NAME=value` pair (Settings → System → Environment variables) that Lucidos injects as a real environment variable into every subprocess it spawns — `run_bash`, `run_python`, background tasks, scheduled scripts, *triggers*, and *coding agent* sessions — e.g. `CLAUDE_CODE_USE_VERTEX`, `LUCIDOS_REPO`, build flags, default model names. Stored DB-backed (the `environment_variables` table), editable in Settings or by the *Lucidos Agent* via the grouped `env_vars` tool (`list` / `set` / `delete`; `set_environment_variable` is a back-compat alias for `set`), and applied per-spawn so a change takes effect on the next tool call / agent turn with no engine restart. Deliberately distinct from a *credential*: env vars are non-secret (they appear in tool-call payloads, logs, and the *event* store — that's the point), whereas credentials hold secrets and feed the proxy auth pipeline. Names must be uppercase letters/digits/underscores (not starting with a digit) and may not clobber engine-owned names (`CRED_*`, `OAUTH_*`, `PG*`, `PATH`, internal `LUCIDOS_*`); engine-owned vars always win a collision. A credential can also be given a custom env var name so its secret injects as e.g. `GITHUB_TOKEN` **in addition to** the default `CRED_<NAME>` (an extra alias, so existing `CRED_<NAME>` references keep working).
 
+<!--gloss-event-start-->
 ### Event
 A past-tense fact about something that happened in the workspace. Always past-tense, including transient ones. Two persistence flavors live side by side: persisted events (written to the `events` table, replayable, drive projections, match triggers) and transient events (broadcast over SSE only, never persisted, never reach projections or the trigger matcher). Concrete subtypes: thread lifecycle events (`MessageReceived`, `ResponseGenerated`, …), system events (notifications, preferences, …), and *domain events*. There is no *command* concept — anything that would look imperative is reframed as a request event (e.g. `AppUiRefreshRequested`, not `RefreshAppUI`); a subscriber chooses whether to act.
+<!--gloss-event-end-->
 
 ### Imported
 The `data/imported/` directory where imported external repositories land (via `RepositoryImported` events). Treated as *artifacts* — content is flattened into the workspace's git tree, not kept as nested git repositories. Distinct from the *external-repo coding-agent thread* surface, which runs against a *repository* (a separately registered external git repo path).
@@ -115,8 +124,10 @@ See also: `docs/taxonomy.md` § Intent vs Knowhow, `system-knowhow/intent-regist
 How to achieve an *intent*, in technical terms — API details, data formats, quirks, workarounds, fallbacks. Evolves every time Lucidos learns something new. Lives in `data/knowhow/<id>.md` (shared) or scoped to an app / trigger. Discovered at runtime by the LLM via the `load_knowhow` tool, matched by the file's frontmatter `name` + `description`.
 See also: `system-knowhow/building-knowhow.md`, `docs/taxonomy.md` § Intent vs Knowhow.
 
+<!--gloss-live-cocreation-start-->
 ### Live co-creation
 The principle at the heart of Lucidos: you and the *Lucidos Agent* shape the whole living system — **data and presentation together** — continuously and in place, with no build → deploy → observe gap. Because the *Conversation* and the *Canvas* are both always live and a gesture apart — side by side on desktop, a swipe apart on mobile — and the Canvas is backed by the real workspace (apps read live data through the SDK), you research, build, and iterate the whole thing inside Lucidos in one continuous motion, instead of building something, deploying it, and only then seeing how it behaves against real data. The back-and-forth between Conversation and Canvas — whichever way it's rendered — is the surface of live co-creation; the depth is that a single conversation reaches the entire stack.
+<!--gloss-live-cocreation-end-->
 
 ### Lucidos Agent
 The LLM driving a *thread* on the user's behalf — chat responses, trigger-thread runs, sub-thread callbacks, anything the LLM authored. UI actor-chip label: "Lucidos Agent". Returned by `mcp_client_name(ActorMode::Agent)` in `crates/lucidos-engine/src/mcp/client.rs`. Contrast with *Lucidos Engine*.
@@ -156,6 +167,9 @@ A topical tag on a *plugin* (e.g. `finance`, `health`, `developer-tools`) used t
 
 ### Plugin manifest
 The `manifest.toml` file at the root of a *plugin*. Declares `id`, `version`, `name`, `description`, optional topical `categories` (see *plugin category*), and optional install-time `setup` steps. Schema in `system-knowhow/building-a-plugin.md`.
+
+### Plugin modified state
+Whether a *plugin*'s shipped content has been locally edited since it was installed — the user (or the *Lucidos Agent*, or a *coding-agent thread*) changed an app, knowhow, script, or trigger the plugin owns. Surfaced as a **Modified** badge on the plugin's row in the *Plugins panel* (tooltip lists the changed paths) and as a warning when updating the plugin (the update overwrites local edits). **Derived, not stored**: the engine diffs the plugin's current `data/` content against its install commit (recorded in `PluginInstalled`), so the state self-heals when an edit is reverted and resets when the plugin is updated/reinstalled. An added file inside a plugin's app directory counts; a brand-new file in a shared root (`knowhow/`, `scripts/`, `auth-modules/`) is not attributed to any plugin. See `system-knowhow/building-a-plugin.md` § "Local modifications".
 
 ### Plugins panel
 The top-level panel for discovering, installing, and managing *plugins* (including the *apps* they ship). It shows one unified list with an **Installed only** filter (a checkbox, **checked by default**): checked, the list shows every plugin on disk regardless of what it ships (app-bearing or not); unchecked, it widens to the whole marketplace catalog (installed + available — browse/install from registered *marketplaces*). A live search and a per-category filter (on the catalog) narrow the list and compose with the Installed-only filter. Each plugin shows as a card whose primary button progresses **Install** (or **Update**) → **Setup** → **Open**, with an **Uninstall** button once it is on disk; "Setup" appears while the plugin's *setup thread* is still running, "Open" launches its app once setup is done (or there was none). New installs/uninstalls route through the standard plugin confirmation panels, and the catalog re-scans whenever it is shown (the panel opens or **Installed only** is unchecked). The engine never silently updates installed marketplace plugins — when it finds a newer version it notifies the user, who applies the update from the card or the installed app's **Update** button (see *Marketplace*). When no marketplaces are registered yet, both the catalog empty state and the Settings → Marketplaces empty state offer a one-click **Add the official Lucidos marketplace** button (registering `github.com/lucidos-dev/plugins`); marketplaces are added/removed under Settings → Marketplaces. Distinct from the *Apps* panel, which lists the workspace's *apps*: an app that came from a plugin appears in Apps (open it) AND its plugin appears here (manage/update/uninstall it). The panel is also the home for plugins that ship no app — knowhow-, trigger-, script-, or auth-module-only bundles — and links to each shipped file. (History: it briefly had **Installed | Store** tabs, since replaced by the single Installed-only filter.) See ADR 0019.
@@ -219,6 +233,7 @@ A per-*thread*, *Lucidos Agent*-maintained list of *todo items* the agent is wor
 ### Top-thread
 A spawn with `relation: "top"` (the CLI default for `lucidos spawn-thread`). Has no parent and no callback wiring — appears in the main thread list as an independent top-level thread. The *spawning thread* is **not** resumed when it finishes.
 
+<!--gloss-trigger-start-->
 ### Trigger
 A workspace configuration that fires either on a schedule (`run.cron`) or on one of its *event subscriptions* (`on`). The `run` is one of two shapes:
 - `run.type: "intent"` — spawns a *trigger thread* whose LLM is given `run.intent` (the user's voice — non-technical prose) as a user message and discovers the knowhow it needs via `load_knowhow` at fire time. No per-trigger knowhow allowlist.
@@ -226,6 +241,7 @@ A workspace configuration that fires either on a schedule (`run.cron`) or on one
 
 Lifecycle (both shapes): defined by `TriggerCreated`; each firing emits `TriggerStarted` then `TriggerCompleted`.
 See also: `system-knowhow/building-a-trigger.md`, `docs/taxonomy.md` § Triggers.
+<!--gloss-trigger-end-->
 
 ### Trigger definition
 The on-disk `trigger.toml` at `data/triggers/<slug>/trigger.toml` — a **derived read-model** of a *trigger*'s durable config, maintained by the engine from the trigger events (written on create/update, removed on delete, rebuilt from events on boot). NOT the source of truth (events are) and **not version-controlled** (the engine adds it to the repo's local `.git/info/exclude`); a hand-edit is overwritten. It exists so a trigger is inspectable and so a *plugin* can SHIP a trigger by declaring one (plugin install parses the declaration into a `TriggerCreated`). See ADR 0019, `system-knowhow/building-a-trigger.md` § "On-disk trigger definition".

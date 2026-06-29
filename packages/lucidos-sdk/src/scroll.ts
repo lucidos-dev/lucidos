@@ -6,13 +6,17 @@
 // scrollY across both — keyed per-app so apps never inherit each other's
 // position.
 //
-// Storage: sessionStorage. Per-tab, per-origin. Survives iframe remount and
-// in-tab navigation but dies on tab close — long enough for the use case
-// (resume where you were today), short enough that yesterday's stale offsets
-// don't accumulate forever.
+// Storage: sessionStorage, workspace-scoped. Per-tab, per-origin. Survives
+// iframe remount and in-tab navigation but dies on tab close — long enough for
+// the use case (resume where you were today), short enough that yesterday's
+// stale offsets don't accumulate forever. The keys are namespaced per workspace
+// (`ws:<slug>:…`) via `_storage.ts` because app iframes are a separate realm the
+// parent's storage override doesn't reach.
 //
 // Save trigger: `pagehide` on window. Fires when the iframe element is removed
 // from the DOM (parent unmounts) and on tab close. Reliable in iframes.
+
+import { wsSessionGet, wsSessionSet, wsSessionRemove } from './_storage';
 
 const SCROLL_KEY_PREFIX = 'lucidos-scroll-app-';
 const APP_PATH_RE = /^\/app\/([^/]+)/;
@@ -62,7 +66,7 @@ export function installScrollMemory(): () => void {
 
   // Restore — but never fight an explicit anchor target.
   if (!window.location.hash) {
-    const saved = parseSavedScroll(sessionStorage.getItem(key));
+    const saved = parseSavedScroll(wsSessionGet(key));
     if (saved !== null && saved > 0) {
       const root = document.documentElement;
       if (isFullyRestorable(saved, root.scrollHeight, root.clientHeight)) {
@@ -117,9 +121,9 @@ export function installScrollMemory(): () => void {
     const y = window.scrollY;
     try {
       if (y <= 0) {
-        sessionStorage.removeItem(key);
+        wsSessionRemove(key);
       } else {
-        sessionStorage.setItem(key, String(Math.floor(y)));
+        wsSessionSet(key, String(Math.floor(y)));
       }
     } catch (err) {
       // Quota exceeded or storage disabled (third-party cookie blocking, etc.).

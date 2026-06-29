@@ -10,9 +10,19 @@
  *
  * `installWorkspaceStorage` overrides `getItem`/`setItem`/`removeItem` on the
  * `localStorage` instance so every key is transparently prefixed with the
- * workspace id (`ws:<slug>:<key>`), EXCEPT a small allowlist of genuinely
- * device-global keys (see `GLOBAL_KEYS`). All ~40 existing call sites — and any
- * future one — are covered without per-callsite changes.
+ * workspace id (`ws:<slug>:<key>`), EXCEPT the two cross-workspace picker keys
+ * (see `GLOBAL_KEYS`). All ~40 existing call sites — and any future one — are
+ * covered without per-callsite changes. EVERYTHING ELSE is workspace-scoped,
+ * including the theme, fonts, scale, and the device id (each workspace gets its
+ * own device identity). The only escape is the picker keys, which are
+ * cross-workspace by definition (written inside a workspace, read by the picker
+ * where namespacing is a no-op). The same scoping must be applied in the OTHER
+ * realms that reach this origin's storage and bypass this prototype override —
+ * the `index.html` FOUC IIFE, the engine-served `sdk-prefs.js`
+ * (`crates/lucidos-engine/src/api/sdk_prefs.rs`), and the SDK
+ * (`packages/lucidos-sdk/src/_storage.ts`) — or a parent write won't match an
+ * iframe read. A Vitest guard (`no-raw-storage.test.ts`) fails the build on any
+ * raw `localStorage`/`sessionStorage` access outside the sanctioned files.
  *
  * When the workspace id is null (the gateway picker `/~/`, a legacy direct
  * engine at base `''`, or unit tests with no stamped `<base>`), the install is a
@@ -32,43 +42,36 @@ const NAMESPACE_PREFIX = 'ws:';
 const MIGRATION_MARKER = '__migrated';
 
 /**
- * Keys that must NOT be namespaced — they are device-global by design:
- *   • `lucidos-device-id` — browser/device identity, shared across workspaces and
- *     read raw by the SDK (`packages/lucidos-sdk/src/preferences.ts`).
- *   • appearance prefs — a user expects a consistent look across workspaces on
- *     the same device.
- *   • service-worker / build keys — they track the checkout-shared `dist/` build,
- *     which is byte-identical across workspaces.
- *   • `lucidos-last-workspace` — the last-active workspace slug, written from
- *     inside a workspace and read by the picker; it spans workspaces by design,
- *     so it must stay raw on both ends (see `lastWorkspace.ts`).
- *   • `lucidos-last-workspace-count` — the picker's last-known workspace count,
- *     used to size its loading skeleton; a picker-surface key kept raw for the
- *     same reason (see `lastWorkspace.ts`).
+ * The ONLY keys that stay raw (unscoped). Both are cross-workspace by definition:
+ * written from inside a workspace (`/<slug>/`, where storage is namespaced) but
+ * read by the picker (`/~/` or `/`, where namespacing is a no-op and storage is
+ * raw). A namespaced key would never match across those contexts, so they MUST
+ * stay raw on both ends (see `lastWorkspace.ts`).
+ *
+ * Everything else — theme, fonts, scale, device id, nav history, etc. — is
+ * workspace-scoped. Notably `lucidos-device-id` is per-workspace now: each
+ * workspace has its own device identity (its own device row, push subscription,
+ * presence). That is intentional.
  */
 export const GLOBAL_KEYS: ReadonlySet<string> = new Set([
-  'lucidos-device-id',
-  'lucidos-theme',
-  'lucidos-font-family',
-  'lucidos-ui-scale',
-  'lucidos-animation-speed-slider',
-  'lucidos-sw-update-dismissed',
-  'lucidos-chunk-reload-at',
   LAST_WORKSPACE_KEY,
   LAST_WORKSPACE_COUNT_KEY,
 ]);
 
 /**
- * Non-`lucidos-`-prefixed keys that ARE workspace-specific and so must still be
- * migrated/namespaced. (Most workspace keys start with `lucidos-`; these don't.)
+ * Former-global appearance keys. These used to be raw/shared, so a one-time
+ * migration SEEDS each workspace's namespaced value from the legacy raw value
+ * (so the user's look carries over once). Device id is deliberately NOT seeded —
+ * seeding it would re-share the identity, defeating per-workspace scoping.
  */
-const EXTRA_WORKSPACE_KEYS: ReadonlySet<string> = new Set([
-  'pinned_apps',
-  'file-preview-open',
-  'app-window-open',
-]);
+const APPEARANCE_SEED_KEYS: readonly string[] = [
+  'lucidos-theme',
+  'lucidos-font-family',
+  'lucidos-ui-scale',
+  'lucidos-animation-speed-slider',
+];
 
-/** A key is device-global (kept raw) iff it is in the allowlist. */
+/** A key is global (kept raw) iff it is in the picker-key allowlist. */
 export function isGlobalKey(key: string): boolean {
   return GLOBAL_KEYS.has(key);
 }
@@ -78,42 +81,38 @@ export function namespacedKey(key: string, ws: string): string {
   return `${NAMESPACE_PREFIX}${ws}:${key}`;
 }
 
-/** Whether an existing raw key should be moved into the workspace namespace by
- *  the one-time migration: a workspace key that is not already namespaced and not
- *  device-global. */
-export function shouldMigrate(key: string): boolean {
+/** Whether the one-time migration should SEED this workspace's namespaced value
+ *  from a legacy raw value: only the former-global appearance keys, and only when
+ *  not already namespaced. */
+export function shouldSeed(key: string): boolean {
   if (key.startsWith(NAMESPACE_PREFIX)) return false; // already namespaced
-  if (isGlobalKey(key)) return false; // device-global, stays raw
-  return key.startsWith('lucidos-') || EXTRA_WORKSPACE_KEYS.has(key);
+  return APPEARANCE_SEED_KEYS.includes(key);
 }
 
 /**
- * One-time migration: copy existing unprefixed workspace keys into the active
- * workspace's namespace, then remove the originals. Runs against RAW storage
- * methods (call before the namespacing overrides are installed), so it never
- * double-prefixes. Idempotent via a namespaced marker; never clobbers an
- * already-namespaced value (newer data wins, the stale original is dropped).
+ * One-time per-workspace migration. Runs against RAW storage methods (call before
+ * the namespacing overrides are installed), idempotent via a namespaced marker.
+ *
+ * Policy (the contamination fix): under the shared gateway origin, pre-existing
+ * raw per-workspace keys are a cross-workspace mush — adopting them bakes another
+ * workspace's state (e.g. a never-opened nav-history overlay) into this one. So
+ * we DO NOT adopt arbitrary raw keys. We only SEED the former-global appearance
+ * keys, copying the legacy raw value into this workspace's namespace (preserving
+ * the user's look once) WITHOUT deleting the raw original — every workspace seeds
+ * from the same legacy value, and nothing reads it raw anymore so it's a harmless
+ * orphan. Everything else (nav, overlay, folders, scroll, filters, device id)
+ * starts clean per workspace.
  */
 export function migrateUnprefixedKeys(storage: Storage, ws: string): void {
   const marker = namespacedKey(MIGRATION_MARKER, ws);
   if (storage.getItem(marker) !== null) return;
 
-  // Snapshot keys first — we mutate `storage` while iterating.
-  const keys: string[] = [];
-  for (let i = 0; i < storage.length; i++) {
-    const k = storage.key(i);
-    if (k !== null) keys.push(k);
-  }
-
-  for (const k of keys) {
-    if (!shouldMigrate(k)) continue;
+  for (const k of APPEARANCE_SEED_KEYS) {
+    if (!shouldSeed(k)) continue; // defensive; APPEARANCE_SEED_KEYS are all seedable
     const target = namespacedKey(k, ws);
-    // Don't overwrite an existing namespaced value (re-entrancy / a prior run).
-    if (storage.getItem(target) === null) {
-      const val = storage.getItem(k);
-      if (val !== null) storage.setItem(target, val);
-    }
-    storage.removeItem(k);
+    if (storage.getItem(target) !== null) continue; // already set for this ws — keep it
+    const val = storage.getItem(k);
+    if (val !== null) storage.setItem(target, val);
   }
 
   storage.setItem(marker, '1');
@@ -158,8 +157,16 @@ export function installWorkspaceStorage(storage: Storage, ws: string | null): vo
     const rawGet = proto.getItem;
     const rawSet = proto.setItem;
     const rawRemove = proto.removeItem;
+    // Idempotent: an already-`ws:`-prefixed key passes through untouched. Real
+    // app keys never start with `ws:`, so this can only be a value already
+    // namespaced by a caller — e.g. the SDK's `_storage.ts` helpers, which
+    // namespace by hand for the iframe realm and would otherwise be
+    // double-prefixed (`ws:slug:ws:slug:key`) if ever invoked in this overridden
+    // parent realm. Re-prefixing is always a bug, so guard it at the override.
     const mapKey = (key: string): string =>
-      isGlobalKey(key) ? key : namespacedKey(key, ws);
+      key.startsWith(NAMESPACE_PREFIX) || isGlobalKey(key)
+        ? key
+        : namespacedKey(key, ws);
 
     proto.getItem = function (this: Storage, key: string) {
       return rawGet.call(this, mapKey(key));

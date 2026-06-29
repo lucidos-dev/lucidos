@@ -1,0 +1,329 @@
+# Clean-machine smoke test for the one-click installer.
+#
+# Drives install.sh exactly as a stranger would on a fresh box, then verifies
+# the app actually came up — not just that the script exited 0. The installer's
+# launch() runs the dev server in the FOREGROUND and never returns, so we run it
+# in the background and verify via the engine's own /health endpoint.
+#
+# Runs in the PUBLIC mirror (lucidos-dev/lucidos). Public repos get UNLIMITED
+# free GitHub-hosted Actions minutes on every runner, including macOS — no 10x
+# multiplier, no monthly cap — so we run the full macOS + Ubuntu matrix freely.
+#
+# Release-candidate gate model: push the RC to a branch in lucidos-dev, let this
+# workflow verify a clean-machine install AND the signed DMG on fresh runners,
+# and only tag/publish the real release once both are green. The gate is split
+# across two triggers because the two artifacts become testable at different
+# times in Phase A:
+#
+#   * SOURCE INSTALL (job: smoke) — needs only the RC branch tree, so it auto-runs
+#     on `push` to rc/**. Checkout-based (fetch_repo reuses the checked-out tree,
+#     no clone) clean-machine install on macOS + Ubuntu. Gates BEFORE any tag.
+#
+#   * DMG VERIFY (job: dmg-verify) — needs the built+signed+notarized DMG, which
+#     Phase A produces LOCALLY (signing identity never leaves the Mac) and then
+#     uploads to an `rc-<ver>` PRERELEASE in lucidos-dev. That upload fires
+#     `release: prereleased`, so this job downloads the rc DMG asset onto a FRESH
+#     macOS runner (one that has never trusted your cert) and runs spctl +
+#     stapler validate + a mount/launch — the real "does a stranger's Mac accept
+#     this DMG" check. Gates BEFORE the real tag.
+#
+#   * SAFETY NET (job: smoke, on `release: published`) — the only trigger that
+#     exercises the REAL stranger path (curl|sh -> git clone lucidos-dev), because
+#     the published tag must exist first. Post-publish; reports fast, can't gate.
+#
+# NOTE: only effective once lucidos-dev is public. Before the public flip this
+# repo is still private, so runs bill against the private free tier (~2000
+# min/month, macOS 10x) — the first launch relies on the manual DMG verify plus,
+# if desired, a single on-demand run.
+#
+# Verification ladder (see "Verify" step):
+#   1. installer bootstraps deps + clones + starts the build
+#   2. engine answers /api/v1/health with status: ok   (real readiness, polled)
+#   3. /health JSON sane: engine_version == repo VERSION, llm_configured present
+#   4. frontend (Vite) serves HTTP 200 on the port the installer wrote
+#
+# First run compiles the Rust engine from source (10-20+ min), so the health
+# poll allows a generous timeout.
+
+name: install-smoke
+
+on:
+  # Gate: dispatch on the RC ref, or auto-run on every push to an rc/** branch,
+  # and wait for green before tagging/publishing the release.
+  workflow_dispatch:
+    inputs:
+      os:
+        description: 'Which runners to use'
+        type: choice
+        default: 'both'
+        options: [both, ubuntu-only, macos-only]
+  push:
+    branches: ['rc/**']        # release candidates -> auto clean-machine gate
+  # release events drive two different jobs:
+  #   prereleased/released (prerelease==true) -> rc-<ver> uploaded in Phase A:
+  #     gate the signed DMG (dmg-verify). BOTH actions are accepted because
+  #     creating an rc via `gh release create --prerelease` can surface `released`
+  #     instead of `prereleased`; the prerelease==true guard keeps the GA out.
+  #   published (prerelease==false) -> real tag exists: post-publish curl|sh +
+  #     clone safety net (smoke).
+  release:
+    types: [prereleased, released, published]
+  schedule:
+    - cron: '0 4 * * 1'        # weekly Mon 04:00 UTC — catch toolchain drift
+
+# install.sh defaults LUCIDOS_HOME=$HOME/lucidos and clones from GitHub. In CI
+# we already have the repo checked out, so point it at the checkout and skip the
+# network clone — we want to test THIS commit's installer + sources.
+env:
+  LUCIDOS_HOME: ${{ github.workspace }}
+  LUCIDOS_WORKSPACE: ${{ github.workspace }}/.smoke-ws
+  HEALTH_TIMEOUT_SECS: '2400'   # 40 min: first-run source build is slow
+
+jobs:
+  smoke:
+    name: install-smoke (${{ matrix.os }})
+    # ONLY runs in the public mirror — this file also lives in the private source
+    # repo (kennethtiller/lucidos), where macOS bills at 10x; the repo guard keeps
+    # it inert there. On a release event the source smoke is the post-publish safety
+    # net for the REAL GA only, so it runs solely on `published` with
+    # prerelease==false. An rc-<ver> prerelease upload (which ALSO fires `published`,
+    # prerelease==true) is the DMG-verify trigger, not a source-install one — skip it
+    # here so the source smoke (already run on push to rc/**) doesn't double-run.
+    if: >-
+      github.repository == 'lucidos-dev/lucidos'
+      && (github.event_name != 'release'
+          || github.event.release.prerelease == false)
+    strategy:
+      fail-fast: false
+      matrix:
+        # Source-install smoke runs on Ubuntu only (see note below); the macOS
+        # artifact is gated by dmg-verify. Manual dispatch's 'os' input is kept
+        # for API compatibility but always resolves to ubuntu-latest here.
+        # macOS source-install is intentionally NOT run here: GitHub's hosted
+        # Apple-Silicon macOS runners are themselves VMs with no nested
+        # virtualization, so Colima/Docker (which install.sh needs for Postgres
+        # on the from-source dev path) cannot start. macOS end-users install via
+        # the signed DMG, which the dmg-verify job already gates clean-machine.
+        # install.sh's macOS path stays covered by local dev + dmg-verify.
+        os: ${{ fromJSON(
+          (github.event_name == 'workflow_dispatch' && inputs.os == 'macos-only') && '["ubuntu-latest"]'
+          || '["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # macOS GitHub runners cannot run Docker Desktop. install.sh needs a
+      # Docker daemon for Postgres, so provide one via Colima. (Ubuntu runners
+      # ship Docker natively — no setup needed there.)
+      #
+      # macos-latest is Apple Silicon (arm64); two failure modes to dodge:
+      #   * The default QEMU VM driver needs nested hardware virtualization the
+      #     hosted runner doesn't expose (HV_UNSUPPORTED), so use Apple's
+      #     Virtualization.framework driver instead (--vm-type vz).
+      #   * Lima >=1.0 dropped qemu as a dependency, so `qemu-img` — still needed
+      #     to convert the qcow2 base image to the raw disk the vz driver uses —
+      #     is missing on a fresh box. That is the observed "error at 'creating
+      #     and starting'" failure; `brew install qemu` puts qemu-img back on PATH.
+      - name: Start Docker daemon (macOS via Colima)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install colima docker qemu
+
+          start_colima() {
+            colima start --vm-type vz --cpu 3 --memory 6 --disk 30 --mount-type virtiofs
+          }
+
+          # A cold VM boot occasionally flakes on a busy runner; retry once from a
+          # clean slate, and dump colima/lima logs if it still won't come up.
+          if ! start_colima; then
+            echo "::warning::colima start failed — resetting and retrying once"
+            colima delete --force >/dev/null 2>&1 || true
+            sleep 5
+            if ! start_colima; then
+              echo "::error::colima failed to start; dumping diagnostics"
+              colima status 2>&1 || true
+              cat "$HOME/.colima/_lima/colima/ha.stderr.log" 2>/dev/null || true
+              cat "$HOME"/.colima/_lima/colima/serial*.log 2>/dev/null || true
+              ls -la "$HOME/.colima" 2>/dev/null || true
+              exit 1
+            fi
+          fi
+
+          docker info
+
+      - name: Run install.sh (background — launch() never returns)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$LUCIDOS_WORKSPACE"
+          # Run the actual installer from this checkout. It detects the existing
+          # checkout (fetch_repo) and uses it instead of cloning. Mock mode
+          # (no provider creds) is exactly the credential-less first-run path.
+          nohup bash ./install.sh > "$RUNNER_TEMP/install.log" 2>&1 &
+          echo "INSTALL_PID=$!" >> "$GITHUB_ENV"
+          echo "Installer started (pid $!). Log: $RUNNER_TEMP/install.log"
+
+      - name: Verify the app actually came up
+        shell: bash
+        run: |
+          set -uo pipefail
+          ports_file="$LUCIDOS_WORKSPACE/.lucidos/ports"
+
+          # --- wait for the installer to write the ports file (stack starting) ---
+          echo "Waiting for ports file: $ports_file"
+          for i in $(seq 1 600); do            # up to 10 min just to START serving
+            [ -f "$ports_file" ] && break
+            if ! kill -0 "${INSTALL_PID:-0}" 2>/dev/null; then
+              echo "::error::installer exited before writing a ports file"
+              tail -n 150 "$RUNNER_TEMP/install.log" || true
+              exit 1
+            fi
+            sleep 1
+          done
+          [ -f "$ports_file" ] || { echo "::error::no ports file after 10m"; tail -n 200 "$RUNNER_TEMP/install.log"; exit 1; }
+
+          # The ports file records ONE user-facing engine port: API_PORT == VITE_PORT.
+          # The engine serves both /api/v1/health AND the built frontend (dist/) on it.
+          # shellcheck disable=SC1090
+          source "$ports_file"
+          port="${API_PORT:-${VITE_PORT:?ports file has no API_PORT/VITE_PORT}}"
+          echo "User-facing engine port: $port"
+
+          # health_get PORT  → echoes the /health body on the right scheme, or empty.
+          # Mirrors scripts/status.sh:_engine_health_json — try https first (PROTO
+          # may be TLS and isn't always written to the ports file), then http.
+          health_get() {
+            local p="$1" out
+            out="$(curl -sk --connect-timeout 2 --max-time 5 "https://localhost:$p/api/v1/health" 2>/dev/null)" && [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+            out="$(curl -s  --connect-timeout 2 --max-time 5 "http://localhost:$p/api/v1/health"  2>/dev/null)" && [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+            return 1
+          }
+
+          # --- rung 2: engine /health == ok (allow the long first-run build) ---
+          echo "Polling /api/v1/health on port $port (timeout ${HEALTH_TIMEOUT_SECS}s)…"
+          deadline=$(( $(date +%s) + HEALTH_TIMEOUT_SECS ))
+          body=""
+          until [ "$(date +%s)" -ge "$deadline" ]; do
+            body="$(health_get "$port" || true)"
+            if echo "$body" | grep -q '"status":"ok"'; then echo "Engine healthy."; break; fi
+            if ! kill -0 "${INSTALL_PID:-0}" 2>/dev/null; then
+              echo "::error::installer process died during build/launch"
+              tail -n 150 "$RUNNER_TEMP/install.log"; exit 1
+            fi
+            sleep 10
+          done
+          echo "$body" | grep -q '"status":"ok"' || { echo "::error::/health never reported ok within ${HEALTH_TIMEOUT_SECS}s"; tail -n 200 "$RUNNER_TEMP/install.log"; exit 1; }
+          echo "health: $body"
+
+          # --- rung 3: built the right version + clean mock-mode boot ---
+          # The repo version lives in the RELEASE file and surfaces in /health as
+          # the "release" field; "engine_version" is an independent build calver.
+          repo_version="$(tr -d ' \t\r\n' < RELEASE)"
+          echo "$body" | grep -q "\"release\":\"$repo_version\"" \
+            || { echo "::error::health release != RELEASE ($repo_version) — stale or wrong build"; exit 1; }
+          echo "$body" | grep -q '"llm_configured"' \
+            || { echo "::error::/health missing llm_configured — unexpected health shape"; exit 1; }
+          echo "Version matches ($repo_version) and health shape is sane."
+
+          # --- rung 4: frontend is reachable (engine serves dist/ on the same port) ---
+          # Determine scheme from whichever one /health answered on.
+          scheme="http"; curl -sk --max-time 5 "https://localhost:$port/api/v1/health" >/dev/null 2>&1 && scheme="https"
+          fe_url="$scheme://localhost:$port/"
+          code="$(curl -k -s -o /dev/null -w '%{http_code}' "$fe_url" || echo 000)"
+          [ "$code" = "200" ] || { echo "::error::frontend $fe_url returned HTTP $code"; exit 1; }
+          echo "Frontend serving 200 at $fe_url"
+
+          echo "OK — clean-machine smoke test passed on ${{ matrix.os }}"
+
+      - name: Tear down
+        if: always()
+        shell: bash
+        run: |
+          ./scripts/stop.sh -w "$LUCIDOS_WORKSPACE" || true
+          kill "${INSTALL_PID:-0}" 2>/dev/null || true
+
+      - name: Upload installer log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-log-${{ matrix.os }}
+          path: ${{ runner.temp }}/install.log
+          if-no-files-found: ignore
+
+  # ── DMG VERIFY ───────────────────────────────────────────────────────────────
+  # Gates the signed/notarized DMG before the real release. Fires when Phase A
+  # uploads the rc-<ver> PRERELEASE (release `prereleased` OR `released`, guarded on
+  # prerelease==true — see the release-types note above). Downloads the DMG
+  # asset onto a CLEAN macOS runner — one that has never trusted your Developer ID
+  # cert and has no prior state — and confirms Gatekeeper accepts it, the
+  # notarization ticket is stapled, and the app actually mounts + launches. This
+  # is strictly stronger than verifying on your dev box (which already trusts the
+  # cert). Signing stays local; CI only CONSUMES the artifact.
+  dmg-verify:
+    name: dmg-verify (macOS, clean)
+    # Public mirror only (see the smoke job's repo guard) — never bill the private
+    # source repo's 10x macOS minutes. Fires for an rc-<ver> PRERELEASE only: accept
+    # both `prereleased` and `released` (rc creation can surface either action) and
+    # guard on prerelease==true so the real GA publish never triggers it.
+    if: >-
+      github.repository == 'lucidos-dev/lucidos'
+      && github.event_name == 'release'
+      && github.event.release.prerelease == true
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download the rc DMG from the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/dmg"
+          echo "Fetching DMG asset(s) from prerelease $TAG"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.dmg' --dir "$RUNNER_TEMP/dmg"
+          DMG="$(ls "$RUNNER_TEMP/dmg"/*.dmg | head -1)"
+          [ -f "$DMG" ] || { echo "::error::no .dmg asset on prerelease $TAG"; exit 1; }
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+          echo "Downloaded: $DMG ($(du -h "$DMG" | cut -f1))"
+
+      - name: Gatekeeper accepts it (notarized Developer ID)
+        run: |
+          set -euo pipefail
+          echo "spctl assessment:"
+          spctl -a -t open --context context:primary-signature -vv "$DMG" 2>&1 | tee /tmp/spctl.out
+          grep -q 'source=Notarized Developer ID' /tmp/spctl.out \
+            || { echo "::error::DMG not accepted as Notarized Developer ID"; exit 1; }
+
+      - name: Notarization ticket is stapled
+        run: |
+          set -euo pipefail
+          xcrun stapler validate "$DMG" || { echo "::error::stapler validate failed — ticket not stapled"; exit 1; }
+
+      - name: App mounts and launches
+        run: |
+          set -euo pipefail
+          MNT="$(mktemp -d)"
+          hdiutil attach "$DMG" -mountpoint "$MNT" -nobrowse -quiet
+          APP="$(ls -d "$MNT"/*.app | head -1)"
+          echo "Mounted app: $APP"
+          # Verify the .app itself is signed + accepted, then launch headless and
+          # confirm the process comes up before tearing down.
+          codesign --verify --deep --strict --verbose=2 "$APP" \
+            || { echo "::error::app bundle failed codesign --verify"; hdiutil detach "$MNT" -quiet || true; exit 1; }
+          open -g "$APP" || { echo "::error::open failed"; hdiutil detach "$MNT" -quiet || true; exit 1; }
+          ok=0
+          for i in $(seq 1 30); do
+            if pgrep -f "$APP" >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          # Clean up the launched app + mount regardless.
+          pkill -f "$APP" 2>/dev/null || true
+          hdiutil detach "$MNT" -quiet || true
+          [ "$ok" = "1" ] || { echo "::error::app did not start within 30s of launch"; exit 1; }
+          echo "OK — DMG accepted, stapled, mounts, and launches on a clean macOS runner."
+

@@ -238,6 +238,42 @@ load-dependent; treat a falling `webkit_reaps` count and zero flaky-recovered
 mobile-webkit specs over several nightlies as the real signal. Do not interpret a
 single green local `e2e-browser.sh` as full proof.
 
+#### `drafts.spec.ts:65` — the per-test assertion timeout, not the wedge
+
+`drafts.spec.ts:65` ("thread draft persists when switching to compose and back")
+was the longest-running mobile-webkit flake (six sessions of compose-draft clobber
+fixes — see `docs/plans/2026-06-27-mobile-webkit-shard-contention.md` and
+`docs/plans/2026-06-28-drafts-sse-empty-clear-guard.md`). After all four inbound
+draft-clear paths were guarded (`stageDraftFromApi`, `applyRemoteCompose`, the
+`MessageReceived` echo — all gated on `hasLocalDraftEdit`), it still surfaced once
+on the 2026-06-28 nightly as a **retry-recovered flake** — but with a *different
+shape* than the value='' clobber: the restore assertion **timed out** (the textarea
+hadn't hydrated within 5s, then recovered on the fresh-context retry).
+
+Root cause of that face: **the test's own assertion timeout, not a product gap.**
+The restore step asserted `toHaveValue('thread draft text', { timeout: 5_000 })` —
+an explicit **5s**, 6× tighter than the suite's 30s `expect` default. On a re-focus
+the draft restore does **zero** network round-trips (`loadThreadEvents` early-returns
+when `eventsLoaded`; the draft is already in the local `composeDrafts` signal), and
+the sync into the textarea is one render+effect cycle. The only thing that makes it
+slow is the documented **WebContent starvation paint freeze** (variant 2 above) —
+a slow-**but-correct** restore. The 5s assertion converted that into a failure where
+the 30s default would have passed.
+
+Fix (test-only, 2026-06-29): the restore assertion now uses the suite's default
+`expect` timeout (no explicit 5s). This is **not** masking — a genuine clobber /
+not-stored bug leaves the draft empty *forever*, so it still fails loudly at 30s; the
+longer wait only stops a slow-but-correct restore from flaking. The assertion is also
+**instrumented**: on failure it queries the persisted draft
+(`thread_summaries.compose_text`, written synchronously by the compose PUT) and
+classifies the face — `compose_text === the draft` → **CLOBBER** (stored server-side
+but absent from the textarea after 30s; a product clear-path bug), `compose_text ===
+''` → **NOT-STORED** (the PUT never landed: a `fill()`→`updateCompose` race or a
+failed PUT). This ends the multi-session "which face is it?" guessing: a future
+occurrence self-diagnoses in the failure message instead of needing a fresh blind
+investigation. Do **not** re-tighten this assertion back to a short explicit timeout —
+that is the exact change that re-introduces the flake.
+
 #### WebKit RSS reaper — host-resource safety net (distinct from the test-suite self-heal)
 
 The mitigations above (`gotoWithRetry` + `retries: 1`) protect the **test result**:

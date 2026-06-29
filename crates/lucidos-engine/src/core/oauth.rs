@@ -230,7 +230,20 @@ impl OAuthStore {
         .await
     }
 
-    /// Get the first OAuth account for a provider (ordered by created_at ASC)
+    /// Resolve the active OAuth account for a provider: the most-recently
+    /// CONNECTED one (`created_at DESC`).
+    ///
+    /// When two accounts share a provider (e.g. an old narrow-scope `drive.file`
+    /// connection plus a newer full-`drive` one), a fresh connect must win —
+    /// otherwise the stale connection permanently shadows the broader token and
+    /// re-connecting can never take effect (the cause of the silent
+    /// `403 insufficient authentication scopes` on shared-drive endpoints).
+    ///
+    /// `created_at` (not `updated_at`) is the right key: a re-connect of an
+    /// existing account is an in-place upsert that leaves `created_at` alone,
+    /// while `updated_at` is also bumped by every token refresh — so
+    /// `updated_at DESC` would keep whichever account was last *used* winning,
+    /// which is exactly the stale account in the buggy state this fixes.
     pub async fn get_by_provider(
         pool: &PgPool,
         provider: &str,
@@ -242,7 +255,7 @@ impl OAuthStore {
                    created_at, updated_at
             FROM oauth_accounts
             WHERE provider = $1
-            ORDER BY created_at ASC
+            ORDER BY created_at DESC
             LIMIT 1
             "#,
         )

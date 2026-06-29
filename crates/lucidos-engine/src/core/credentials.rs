@@ -348,7 +348,12 @@ impl CredentialStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Find a credential whose base_url matches the given URL prefix
+    /// Find a credential whose base_url scopes the given URL.
+    ///
+    /// Matching is URL-aware: same scheme, host, effective port, and a path
+    /// prefix on a segment boundary. A raw string prefix check would inject a
+    /// credential scoped to `https://api.example.com` into
+    /// `https://api.example.com.evil.test/`.
     pub async fn find_by_url(pool: &PgPool, url: &str) -> Result<Option<Credential>, sqlx::Error> {
         let results = sqlx::query_as::<_, CredentialRow>(&format!(
             "SELECT {CREDENTIAL_COLUMNS} FROM credentials ORDER BY length(base_url) DESC"
@@ -357,13 +362,40 @@ impl CredentialStore {
         .await?;
 
         for row in results {
-            if url.starts_with(&row.2) {
+            if credential_base_url_matches(&row.2, url) {
                 return Ok(Some(parse_credential(row)));
             }
         }
 
         Ok(None)
     }
+}
+
+fn credential_base_url_matches(base_url: &str, request_url: &str) -> bool {
+    let Ok(base) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    let Ok(request) = reqwest::Url::parse(request_url.trim()) else {
+        return false;
+    };
+
+    if base.scheme() != request.scheme()
+        || base.host_str() != request.host_str()
+        || base.port_or_known_default() != request.port_or_known_default()
+    {
+        return false;
+    }
+
+    let base_path = base.path().trim_end_matches('/');
+    if base_path.is_empty() {
+        return true;
+    }
+
+    let request_path = request.path();
+    request_path == base_path
+        || request_path
+            .strip_prefix(base_path)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Build CRED_* environment variables from a list of credentials.
@@ -576,11 +608,11 @@ mod tests {
 
     #[test]
     fn name_transform_uppercases_and_replaces_separators() {
-        let cred = make_cred("snake.storage familien-prod", AuthType::ApiKey, "v");
+        let cred = make_cred("snake.storage shared-prod", AuthType::ApiKey, "v");
         let env: std::collections::HashMap<_, _> =
             credential_env_vars(vec![cred]).into_iter().collect();
         assert_eq!(
-            env.get("CRED_SNAKE_STORAGE_FAMILIEN_PROD")
+            env.get("CRED_SNAKE_STORAGE_SHARED_PROD")
                 .map(String::as_str),
             Some("v")
         );
@@ -606,5 +638,49 @@ mod tests {
         // Non-secret fields stay visible for debugging.
         assert!(dbg.contains("oauth:google"));
         assert!(dbg.contains("OauthClient"));
+    }
+
+    #[test]
+    fn credential_url_match_requires_same_origin_not_string_prefix() {
+        assert!(credential_base_url_matches(
+            "https://api.example.com",
+            "https://api.example.com/v1/users"
+        ));
+        assert!(!credential_base_url_matches(
+            "https://api.example.com",
+            "https://api.example.com.evil.test/v1/users"
+        ));
+        assert!(!credential_base_url_matches(
+            "https://api.example.com",
+            "http://api.example.com/v1/users"
+        ));
+    }
+
+    #[test]
+    fn credential_url_match_respects_path_segment_boundary() {
+        assert!(credential_base_url_matches(
+            "https://api.example.com/v1",
+            "https://api.example.com/v1/users"
+        ));
+        assert!(credential_base_url_matches(
+            "https://api.example.com/v1/",
+            "https://api.example.com/v1/users"
+        ));
+        assert!(!credential_base_url_matches(
+            "https://api.example.com/v1",
+            "https://api.example.com/v10/users"
+        ));
+    }
+
+    #[test]
+    fn credential_url_match_rejects_invalid_urls() {
+        assert!(!credential_base_url_matches(
+            "api.example.com",
+            "https://api.example.com/v1"
+        ));
+        assert!(!credential_base_url_matches(
+            "https://api.example.com",
+            "not a url"
+        ));
     }
 }

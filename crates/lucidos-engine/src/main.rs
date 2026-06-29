@@ -2,8 +2,8 @@ use lucidos_engine::api::{create_router, SharedEngine};
 use lucidos_engine::engine::LucidosEngine;
 use lucidos_engine::llm::{build_active_provider, ProviderBuildContext, ProviderBuildOutcome};
 use lucidos_engine::log;
+use lucidos_engine::net_config;
 use lucidos_engine::scheduler::SchedulerManager;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -270,8 +270,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = dotenvy::dotenv();
 
     // Raise file descriptor limit — macOS defaults to 256 which is too low
-    // for an engine running multiple coding-agent sessions, SSE streams, DB pool, and
-    // a Vite dev proxy simultaneously.
+    // for an engine running multiple coding-agent sessions, SSE streams, the DB
+    // pool, and static file serving simultaneously.
     raise_fd_limit();
 
     log!("[Startup] Lucidos Engine starting...");
@@ -790,21 +790,53 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(3000);
-    // Bind to [::] (dual-stack) — accepts both IPv4 and IPv6 connections.
-    // macOS defaults to IPV6_V6ONLY=0, so [::]:port handles IPv4 too.
-    // This avoids ECONNREFUSED when clients resolve localhost to ::1.
-    //
-    // Under the workspace gateway (ADR 0013) the engine binds loopback only
-    // (`LUCIDOS_BIND_LOOPBACK=1`) — the gateway is the sole network-facing
-    // surface and proxies over `http://127.0.0.1:<port>`.
-    let bind_loopback = std::env::var("LUCIDOS_BIND_LOOPBACK")
+    // SECURITY: resolve the bind with a loopback-first precedence (see
+    // `net_config`): the behind-gateway floor (`LUCIDOS_BIND_LOOPBACK`) → an
+    // explicit `LUCIDOS_BIND_ADDR` → `LUCIDOS_BIND_ALL` → the machine + per-
+    // workspace config (`~/.lucidos/network.toml` `[engine] inherit` picks the
+    // gateway bind vs this workspace's `network_bind` preference) → loopback.
+    // Default with nothing set is loopback-only (a directly-launched engine has
+    // no request-level API auth); a malformed value fails safe to loopback,
+    // never to all-interfaces. `[::]` (dual-stack) is used for the all-interfaces
+    // case — macOS defaults IPV6_V6ONLY=0 so it serves IPv4 too. A packaged
+    // gateway engine sets `LUCIDOS_BIND_LOOPBACK=1` (the `behind_gateway`
+    // signal), pinning it to loopback while the gateway proxies it over
+    // `http://127.0.0.1:<port>`.
+    let loopback_signal = std::env::var("LUCIDOS_BIND_LOOPBACK")
         .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
-    let addr = if bind_loopback {
-        SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, api_port))
+    let bind_addr_env = std::env::var("LUCIDOS_BIND_ADDR").ok();
+    let bind_all_env = std::env::var("LUCIDOS_BIND_ALL").ok();
+    let net = net_config::read_network_toml();
+    // The per-workspace bind only matters when engines do NOT inherit the
+    // gateway bind; read it from this workspace's DB then.
+    let per_workspace_bind = if !loopback_signal && !net.engine_inherit {
+        lucidos_engine::core::preferences::PreferenceStore::get(
+            shared_engine.pool(),
+            net_config::NETWORK_BIND_PREF_KEY,
+        )
+        .await
+        .ok()
+        .flatten()
     } else {
-        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, api_port))
+        None
     };
+    let bind_choice = net_config::resolve_engine_bind(
+        loopback_signal,
+        bind_addr_env.as_deref(),
+        bind_all_env.as_deref(),
+        net.engine_inherit,
+        net.gateway_bind.as_deref(),
+        per_workspace_bind.as_deref(),
+    );
+    // Every address to listen on. A specific `Address` ALSO binds loopback (see
+    // `net_config::bind_socket_addrs`) so the gateway proxy/health probe, the dev
+    // scripts, and the engine's own restart callback — all over `127.0.0.1` — keep
+    // working. `addr` (the primary) is used only for the startup log; `bind_label`
+    // already notes the retained loopback.
+    let addrs = net_config::bind_socket_addrs(&bind_choice, api_port);
+    let addr = addrs[0];
+    let bind_label = net_config::bind_scope_label(&bind_choice);
 
     let handle = axum_server::Handle::new();
     tokio::spawn(shutdown_signal(
@@ -817,26 +849,35 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tls_cert = std::env::var("LUCIDOS_TLS_CERT").ok();
     let tls_key = std::env::var("LUCIDOS_TLS_KEY").ok();
 
+    // Serve every resolved address concurrently, sharing the one graceful-shutdown
+    // `Handle` so a single shutdown stops all sockets. A bind failure on any
+    // address fails fast (same as the prior single-bind semantics).
     if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
         let tls_config =
             axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path).await?;
         log!(
-            "[Startup] API server listening on https://[::]:{}  (HTTP/2 + TLS, dual-stack)",
-            api_port
+            "[Startup] API server listening on https://{}  (HTTP/2 + TLS, {})",
+            addr,
+            bind_label
         );
-        axum_server::bind_rustls(addr, tls_config)
-            .handle(handle)
-            .serve(app.into_make_service())
-            .await?;
+        futures::future::try_join_all(addrs.into_iter().map(|a| {
+            axum_server::bind_rustls(a, tls_config.clone())
+                .handle(handle.clone())
+                .serve(app.clone().into_make_service())
+        }))
+        .await?;
     } else {
         log!(
-            "[Startup] API server listening on http://[::]:{}  (dual-stack)",
-            api_port
+            "[Startup] API server listening on http://{}  ({})",
+            addr,
+            bind_label
         );
-        axum_server::bind(addr)
-            .handle(handle)
-            .serve(app.into_make_service())
-            .await?;
+        futures::future::try_join_all(addrs.into_iter().map(|a| {
+            axum_server::bind(a)
+                .handle(handle.clone())
+                .serve(app.clone().into_make_service())
+        }))
+        .await?;
     }
 
     Ok(())

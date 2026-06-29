@@ -12,9 +12,15 @@
 import type { Tap } from '@lucidos/sdk';
 import { isTauri } from '../../utils/platform';
 import { isPageActive } from '../../utils/pageActive';
-import { showNativeNotification, listen } from '../../utils/tauri';
+import {
+  showNativeNotification,
+  dismissNativeNotification,
+  takePendingNativeTaps,
+  listen,
+} from '../../utils/tauri';
 import { dispatchDeepLink } from './in-app-notification-toast';
 import { parseDeepLinkFromSwMessage } from './notification-deeplink';
+import { postClientLog } from '../../utils/liveness';
 
 /** Wall-clock budget after which a `NativePushRequested` is too stale to show.
  *  Mirrors `TOAST_REQUEST_STALE_AFTER_MS`: the engine emits this only after the
@@ -50,6 +56,49 @@ export function handleNativePushRequested(payload: NativePushRequestedPayload): 
   void showNativeBanner(payload);
 }
 
+/** Payload of the engine's `NativePushDismissRequested` SSE — the cross-device
+ *  dismiss counterpart of `NativePushRequested`. `notification_id` is `null` for
+ *  a dismiss-all (the mark-all-read path), otherwise the one banner to remove. */
+export interface NativePushDismissRequestedPayload {
+  notification_id: string | null;
+  /** Engine wall-clock at emit time. Drives the freshness gate. */
+  sent_at_ms: number;
+}
+
+/** SSE handler for the engine's cross-device dismiss trigger. When a
+ *  notification is read on any device, the engine broadcasts this so a connected
+ *  Tauri desktop app REMOVES the already-delivered native banner(s). Gates:
+ *   - not Tauri → no-op (the open web can't silently remove a Web Push banner —
+ *     Safari revokes a subscription after 3 silent pushes — so browser / PWA
+ *     banners persist until manually swiped; in-app unread still syncs via
+ *     `NotificationRead`);
+ *   - stale frame → no-op (a late SSE-queue flush; this bounds — does not fully
+ *     eliminate, since `removeAllDeliveredNotifications` is blunt — the window in
+ *     which a late dismiss-all could clear a banner for a notification created
+ *     after the all-read).
+ *  NO `isPageActive()` gate (unlike show): a banner exists only because the
+ *  device was inactive when shown; by dismiss time it may be active again, and
+ *  removeDeliveredNotifications is a harmless no-op when nothing matches.
+ *  See system-knowhow/notifications.md §4. */
+export function handleNativePushDismiss(payload: NativePushDismissRequestedPayload): void {
+  if (!isTauri()) return;
+  if (Date.now() - payload.sent_at_ms > NATIVE_PUSH_STALE_AFTER_MS) return;
+  void dismissNativeBanner(payload);
+}
+
+async function dismissNativeBanner(payload: NativePushDismissRequestedPayload): Promise<void> {
+  try {
+    await dismissNativeNotification({ notificationId: payload.notification_id });
+  } catch (err) {
+    // Telemetry carve-out (.claude/rules/frontend.md): runs on a background SSE
+    // frame without user intent. A failed dismiss is non-fatal — the stale OS
+    // banner just persists until the user swipes it (the pre-dismiss behaviour),
+    // and the bell badge (NotificationRead SSE) already reflects the read state.
+    // A toast would be wrong: the user isn't looking at the app.
+    console.warn('[NativePush] Failed to dismiss native notification:', err);
+  }
+}
+
 async function showNativeBanner(payload: NativePushRequestedPayload): Promise<void> {
   try {
     const title = payload.title.length > 0 ? payload.title : 'Lucidos';
@@ -76,16 +125,48 @@ async function showNativeBanner(payload: NativePushRequestedPayload): Promise<vo
   }
 }
 
-/** Wire native-notification taps to the deep-link router. The Rust
- *  `show_native_notification` command emits `native-notification-tapped` with
- *  the SW-message-shaped deep link when the user clicks a banner; route it
- *  through the SAME `dispatchDeepLink` the web-push SW tap uses, so a native tap
- *  marks-read + navigates identically to a web-push tap. Tauri-only; returns an
- *  unlisten. Call once at startup. See system-knowhow/notifications.md §4. */
+/** Wire native-notification taps to the deep-link router, routed through the
+ *  SAME `dispatchDeepLink` the web-push SW tap uses (so a native tap marks-read +
+ *  navigates identically — by default opening the notification-detail modal, the
+ *  `Tap::Modal` default).
+ *
+ *  DURABLE delivery: the deep link is NOT read off the live event payload. The
+ *  Rust delegate stashes every tapped deep link and emits
+ *  `native-notification-tapped` only as a wake signal; we DRAIN the stash
+ *  (`takePendingNativeTaps`) on BOTH this startup path (cold) and each signal
+ *  (warm). This is the fix for taps lost when the page wasn't listening at emit
+ *  time — webview reloaded / suspended-while-trayed / client relaunched — which
+ *  Tauri does not replay. The Rust drain is atomic, so every tap routes exactly
+ *  once across both paths and never re-fires on a later reload. Tauri-only;
+ *  returns an unlisten. Call once at startup. See notifications.rs +
+ *  system-knowhow/notifications.md §4. */
 export async function setupNativePushTapRouting(): Promise<() => void> {
   if (!isTauri()) return () => {};
-  return listen<Record<string, unknown>>('native-notification-tapped', (e) => {
-    const target = parseDeepLinkFromSwMessage(e.payload);
-    if (target) dispatchDeepLink(target);
+  const drainAndDispatch = async (source: 'signal' | 'startup'): Promise<void> => {
+    try {
+      const taps = await takePendingNativeTaps();
+      if (taps.length > 0) {
+        postClientLog('native-tap', 'drain', { source, count: taps.length });
+      }
+      for (const raw of taps) {
+        const target = parseDeepLinkFromSwMessage(raw);
+        if (target) dispatchDeepLink(target);
+      }
+    } catch (err) {
+      // Telemetry carve-out (.claude/rules/frontend.md): runs at startup or on a
+      // background signal, no user intent. A failed drain leaves taps stashed for
+      // the next signal / reload; the bell badge (NotificationCreated) still
+      // reflects the notification. A toast would be wrong — the user isn't looking.
+      console.warn('[NativePush] Failed to drain pending taps:', err);
+    }
+  };
+  const unlisten = await listen('native-notification-tapped', () => {
+    void drainAndDispatch('signal');
   });
+  // Cold path: route any tap that arrived before this listener was registered —
+  // the exact race the durable Rust-side stash exists for. Runs after the
+  // listener is wired so a tap landing mid-setup is covered by whichever drain
+  // wins (the atomic take guarantees it isn't dispatched twice).
+  void drainAndDispatch('startup');
+  return unlisten;
 }

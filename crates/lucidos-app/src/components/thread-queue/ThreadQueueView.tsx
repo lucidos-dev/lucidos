@@ -191,7 +191,7 @@ export function ThreadQueueView() {
   return (
     <div class="content-view active">
       <div class="list-rows">
-        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton fill />}>
           {loadable.status === 'loaded'
             ? (() => {
                 const { entries, policy } = loadable.data;

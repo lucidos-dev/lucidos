@@ -355,6 +355,27 @@ pub enum SystemEvent {
         tap: Tap,
         sent_at_ms: i64,
     },
+    /// SSE-only, never persisted. The cross-device counterpart of a *read*: when
+    /// a notification is read on one device, the engine broadcasts this so a
+    /// connected Tauri desktop app REMOVES the already-delivered native macOS
+    /// banner(s) for it — `UNUserNotificationCenter.removeDeliveredNotifications`
+    /// (single) / `removeAllDeliveredNotifications` (all). This is the macOS-only
+    /// half of cross-device dismiss: the open web can't silently remove a Web
+    /// Push banner (Safari revokes a subscription after 3 silent pushes), so
+    /// browser / PWA pages ignore this event — see
+    /// `docs/plans/2026-05-18-cross-device-notification-dismiss-design.md` and
+    /// `system-knowhow/notifications.md` §4. `notification_id = None` means
+    /// "dismiss all" (the mark-all-read path); `Some(id)` dismisses one.
+    /// `sent_at_ms` drives the page-side freshness gate, which drops a late
+    /// SSE-queue flush — bounding (not fully eliminating, since
+    /// `removeAllDeliveredNotifications` is blunt) the window in which a delayed
+    /// dismiss-all could clear a banner for a notification created after an
+    /// all-read.
+    NativePushDismissRequested {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notification_id: Option<Uuid>,
+        sent_at_ms: i64,
+    },
     /// A plugin was installed (or updated — overwrite=true reuses this variant).
     /// `manifest` carries the full parsed manifest so future fields are additive.
     /// `files` are paths under `data/` so a future tracked-uninstall can derive
@@ -862,6 +883,7 @@ impl SystemEvent {
             Self::PresenceCheck { .. } => "PresenceCheck",
             Self::NotificationToastRequested { .. } => "NotificationToastRequested",
             Self::NativePushRequested { .. } => "NativePushRequested",
+            Self::NativePushDismissRequested { .. } => "NativePushDismissRequested",
             Self::PluginInstalled { .. } => "PluginInstalled",
             Self::PluginUninstalled { .. } => "PluginUninstalled",
             Self::PluginInstallCanceled { .. } => "PluginInstallCanceled",
@@ -948,6 +970,7 @@ impl SystemEvent {
         "PresenceCheck",
         "NotificationToastRequested",
         "NativePushRequested",
+        "NativePushDismissRequested",
         "PluginInstalled",
         "PluginUninstalled",
         "PluginInstallCanceled",
@@ -997,7 +1020,8 @@ impl SystemEvent {
             | Self::NotificationRead { .. }
             | Self::NotificationsAllRead { .. }
             | Self::NotificationToastRequested { .. }
-            | Self::NativePushRequested { .. } => "notification",
+            | Self::NativePushRequested { .. }
+            | Self::NativePushDismissRequested { .. } => "notification",
             Self::PreferencesChanged { .. }
             | Self::LanguageSet { .. }
             | Self::TimezoneSet { .. } => "preference",
@@ -1107,6 +1131,10 @@ impl SystemEvent {
             | Self::NativePushRequested {
                 notification_id, ..
             } => notification_id.to_string(),
+            // `None` = dismiss-all; there is no single notification to key on.
+            Self::NativePushDismissRequested { notification_id, .. } => notification_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "all".to_string()),
             // Raw manifest is nested one layer in — see `InstalledRecord` for the path.
             Self::PluginInstalled { manifest, .. } => manifest
                 .get("manifest")

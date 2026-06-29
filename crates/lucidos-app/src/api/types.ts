@@ -114,6 +114,18 @@ export interface EnvVarsListResponse {
   env_vars: EnvironmentVariable[];
 }
 
+/** GET /api/v1/network-config — the per-workspace engine bind plus the inherited
+ *  machine-global gateway bind, for Settings → System → Network access. Mirrors
+ *  the engine `NetworkConfigResponse`. `engine_bind` is `loopback` | `all` | an
+ *  IP; when `inherit` is true the engine binds `gateway_bind` and the pane
+ *  disables the engine field (showing the inherited value). */
+export interface NetworkConfigResponse {
+  engine_bind: string;
+  inherit: boolean;
+  gateway_bind: string;
+  detected_tailscale_ip: string | null;
+}
+
 /** A chat model in the DB-backed registry (Settings → Models). Mirrors the
  *  engine `core::models::Model`. `provider` is the backend that serves it
  *  ('vertex' | 'anthropic' | 'openai' | 'openrouter' | 'local'); `source` is

@@ -165,6 +165,8 @@ fn catalog_plugin(
         setup_thread_id: None,
         setup_complete: false,
         app_id: None,
+        modified: false,
+        modified_paths: vec![],
     }
 }
 

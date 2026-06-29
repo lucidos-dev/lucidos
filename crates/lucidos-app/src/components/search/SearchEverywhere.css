@@ -6,7 +6,8 @@
     /* Own GPU compositing layer — same rationale as file-search-overlay. */
     will-change: opacity;
     /* Click-through: clicks outside the modal pass to underlying elements
-       (e.g. compose button). Outside-click detection uses a document listener. */
+       (e.g. compose button). Outside-click dismiss is owned by the central
+       <Overlay> component (useDismissOnOutside + overlayStack). */
     pointer-events: none;
 }
 

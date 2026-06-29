@@ -189,6 +189,15 @@ Two paths, picked per request:
 
 While the app coding-agent thread is open the user can preview the in-flight app via `?thread_id=<id>` on the app UI URL — the panel-overlay slot swaps from the live workspace copy to the WIP worktree copy. SDK calls (`lucidos.data.*`, `lucidos.events.*`) still hit live workspace data — data-coupled UI edits show their full effect only after Apply.
 
+### Checking your work with `capture_app` / `refresh_app`
+
+`capture_app` / `refresh_app` are **agent self-check tools** — they reload the open app UI and snapshot it back to you so you can see the effect of an edit. Use them *only while actively iterating on an app with the user*, i.e. when that app is the subject of the current turn (the user just asked you to change it). Don't reach for them in threads that aren't about an app (research, data tasks, general chat) — there's nothing to capture.
+
+- **You usually don't need them at all.** The engine already auto-refreshes every app you edited when your turn finishes (see the chat path above), so for an ordinary edit-and-finish turn, just edit and stop. Reserve a manual `capture_app` for when you genuinely need to *look* at the result mid-turn before deciding the next edit; don't spam `refresh_app`.
+- **On "No app UI is currently open", prefer the visible path: tell the user / ask them to open the app.** That's the error's first suggested recovery, and it's the default here. Silently calling `navigate_ui(target=app-ui)` to open the app yourself is acceptable **only** when you're mid app-iteration and opening *that* app is clearly the expected next step. Don't open apps out of the blue — a thread yanking an app onto the user's screen while they're doing something else is the friction to avoid.
+- **Never retry the same `capture_app` / `refresh_app` call after it fails.** Re-issuing the identical call trips the circuit breaker. If the first call reports "No app UI is currently open", **switch strategy** (ask the user, or `navigate_ui` once) — do not repeat the same call.
+- **In background / trigger / cron threads, don't attempt `capture_app` / `refresh_app` (or navigate-to-app) at all.** There's no originating device, so the frontend won't navigate and the capture can't succeed; and pulling an app open on the user's screen from a background task is exactly the out-of-the-blue behavior to avoid. (`navigate_ui` is scoped to the device that sent the prompt in this thread; a deviceless turn navigates nothing.)
+
 ## Common mistakes to avoid
 
 - **Storing data in `apps/{id}/`.** App data goes in `artifacts/{app-id}/`. The app code is git-tracked source; the data is user state. (See `best-practices.md`.)

@@ -6,6 +6,7 @@ import { refreshChangesState, clearRestartInFlight, RESTART_LS_KEY, RESTART_TOAS
 import { loadUnreadNotifications } from './notifications';
 import { isNewerVersion } from '../../utils/version';
 import { syncClientUpdateFromBuild } from './client-update';
+import { gatewayPickerHref } from '../../utils/basePath';
 
 /** User-facing copy when `submitChat` couldn't reach the engine — laptop
  *  woke up to a stale connection, the engine is genuinely down, etc.
@@ -20,6 +21,51 @@ export function getUnreachableEngineMsg(): string {
 
 /** True once we've been connected at least once (distinguishes initial connect from reconnect). */
 let hasEverConnected = false;
+
+/** sessionStorage one-shot so the cold-start bounce fires at most once until we
+ *  next connect. Raw `sessionStorage` (NOT workspace-namespaced) — like
+ *  main.tsx's `recoverFromBrokenContext` guard — so it survives the cross-slug
+ *  hop to the picker and is shared per-tab. Cleared on the first successful
+ *  connect so a LATER cold session (after a real drop + reload) can bounce again. */
+const BOUNCE_GUARD_KEY = 'lucidos-picker-bounce';
+
+/** Pure: should a cold boot that can't reach its engine bounce to the workspace
+ *  picker? Only when we have NEVER connected this session (so an established
+ *  session that briefly drops is not yanked away mid-work), a picker is reachable
+ *  (`null` on a legacy direct engine with no gateway), and we haven't already
+ *  bounced (the one-shot). */
+export function shouldBounceToPicker(opts: {
+  connectedEver: boolean;
+  pickerHref: string | null;
+  alreadyBounced: boolean;
+}): boolean {
+  return !opts.connectedEver && opts.pickerHref !== null && !opts.alreadyBounced;
+}
+
+/** Cold-start recovery: if the very first connect never lands, return to the
+ *  workspace picker (the always-reachable recovery surface) instead of stranding
+ *  the user in a cached shell that can't load — the reported PWA
+ *  "auto-open-into-an-unreachable-engine" case. One-shot guarded and loop-safe:
+ *  the picker target `/~/?pick` stands the cold-start auto-open redirect down, so
+ *  the picker renders its list rather than bouncing straight back. No-op once
+ *  connected, with no picker (legacy root), or after a prior bounce. */
+export function bounceToPickerIfStranded(): void {
+  const pickerHref = gatewayPickerHref();
+  let alreadyBounced = false;
+  try {
+    alreadyBounced = sessionStorage.getItem(BOUNCE_GUARD_KEY) === '1';
+  } catch {
+    /* storage off — treat as not-yet-bounced */
+  }
+  if (!shouldBounceToPicker({ connectedEver: hasEverConnected, pickerHref, alreadyBounced })) return;
+  try {
+    sessionStorage.setItem(BOUNCE_GUARD_KEY, '1');
+  } catch {
+    /* storage off — bounce anyway; the one-shot just isn't persisted */
+  }
+  // pickerHref is non-null here (shouldBounceToPicker guarded it).
+  window.location.replace(pickerHref as string);
+}
 
 /** Consecutive `/health` failures tolerated before flipping the dot to
  *  disconnected. The engine is local and almost never down, and the dot is
@@ -356,6 +402,13 @@ export async function checkConnection(): Promise<boolean> {
 
   if (connected) {
     hasEverConnected = true;
+    // Reset the cold-start bounce one-shot so a LATER cold session (a real drop
+    // then reload) can bounce again. Cheap; runs only while connected.
+    try {
+      sessionStorage.removeItem(BOUNCE_GUARD_KEY);
+    } catch {
+      /* storage off */
+    }
   }
 
   return connected;

@@ -1,5 +1,6 @@
 # Lucidos
 
+<!--intro-start-->
 Lucidos is an AI companion that shares your whole workspace. You talk, build, run, automate, and remember together - in one place. Chat lives alongside your work in a persistent split view on desktop, and as a separate pane you can swipe to on mobile. You're never leaving your work to talk to the AI; you're always working with it - manifesting your intent in a rich, extensible interface.
 
 > *If you can describe it, it exists*
@@ -7,9 +8,11 @@ Lucidos is an AI companion that shares your whole workspace. You talk, build, ru
 A local, event-driven, AI-native operating system. You own and store all the data yourself. The prompt is the primary interface, but Lucidos is a unified, integrated environment where configurable LLMs know all about your apps, triggers (scheduled or event-driven), and files. Describe an app and it's running in seconds - no build step, no deploy. Built to augment the *user*, it remembers everything you do. While it is not an "autonomous" role playing entity, you can automate anything. Nothing happens without a user intent, though - which is a central concept for Lucidos.
 
 The integrated environment makes for a smooth user experience, where researching a topic, storing the findings, spinning up an app around them, and pulling in data from external sources — whether through scheduled syncs or direct API calls — can all be done in one simple flow. Local data lives in a Postgres event store or as git-versioned artifacts.
+<!--intro-end-->
 
 ---
 
+<!--quickstart-start-->
 ## One-click install
 
 On a clean macOS or Linux machine:
@@ -49,6 +52,7 @@ dependency bootstrap). Once the domain lands this will also be served from
 `https://lucidos.dev/install.sh`.
 
 Prefer to drive the setup yourself? The manual path is below.
+<!--quickstart-end-->
 
 ### Desktop app (.dmg)
 
@@ -197,12 +201,14 @@ After this, Safari and Chrome on iOS will trust your dev server's HTTPS certific
 - **Skills** — Interactive plugins combining LLM instructions with optional web UIs.
 - **Prompt-first UI** — Everything doable in apps must be doable via the prompt.
 
+<!--invariants-start-->
 ### Key Invariants
 
 - Events are immutable
 - Git commits are consequences, not causes
 - No hidden state or silent decisions
 - Replay reconstructs truth, not creativity
+<!--invariants-end-->
 
 ---
 

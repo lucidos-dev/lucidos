@@ -50,10 +50,11 @@ mod imp {
     use objc2::rc::Retained;
     use objc2::runtime::{Bool, NSObject, NSObjectProtocol, ProtocolObject};
     use objc2::{define_class, msg_send, AllocAnyThread};
-    use objc2_foundation::{NSError, NSString};
+    use objc2_foundation::{NSArray, NSError, NSString};
     use objc2_user_notifications::{
-        UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationRequest,
-        UNNotificationResponse, UNUserNotificationCenter, UNUserNotificationCenterDelegate,
+        UNAuthorizationOptions, UNMutableNotificationContent, UNNotification,
+        UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse,
+        UNUserNotificationCenter, UNUserNotificationCenterDelegate,
     };
     use tauri::{AppHandle, Emitter};
 
@@ -76,6 +77,21 @@ mod imp {
     fn pending() -> &'static Mutex<HashMap<String, serde_json::Value>> {
         static P: OnceLock<Mutex<HashMap<String, serde_json::Value>>> = OnceLock::new();
         P.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Deep links from taps the page may not have been listening for at emit
+    /// time — webview reloaded / suspended-while-trayed / client relaunched.
+    /// The live `app.emit` is a best-effort warm-path wake; this stash is the
+    /// DURABLE carrier, drained by the page via [`take_pending_taps`] both on
+    /// startup (cold path) and on each `native-notification-tapped` signal (warm
+    /// path). The Mutex makes each drain atomic, so a tap routes exactly once
+    /// across both paths and never re-fires on a later reload. Capped like
+    /// [`pending`] (FIFO drop) so a long-resident client whose signals are all
+    /// missed can't grow it unbounded. See `store/actions/native-push.ts` and
+    /// `system-knowhow/notifications.md` §4.
+    fn pending_taps() -> &'static Mutex<Vec<serde_json::Value>> {
+        static T: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
+        T.get_or_init(|| Mutex::new(Vec::new()))
     }
 
     define_class!(
@@ -101,7 +117,21 @@ mod imp {
                 let action = response.actionIdentifier().to_string();
                 let routed = !super::is_dismiss_action(&action);
 
-                let link = pending().lock().unwrap().remove(&identifier);
+                let link = pending().lock().unwrap().remove(&identifier).or_else(|| {
+                    // Relaunch / evicted-map fallback: the UN request identifier
+                    // IS the engine notification_id, and a modal-default tap only
+                    // needs that to open the notification detail. So a tap on a
+                    // banner from a previous client process (empty in-process map)
+                    // still routes to the inbox modal — graceful degradation: a
+                    // navigate-kind tap falls back to modal. Empty id → nothing.
+                    (!identifier.is_empty())
+                        .then(|| serde_json::json!({ "notification_id": identifier }))
+                });
+                eprintln!(
+                    "[Tauri] native notification tap: id={identifier:?} routed={routed} \
+                     link_present={}",
+                    link.is_some()
+                );
                 if routed {
                     if let Some(app) = APP.get() {
                         // Any tap (not a dismiss) brings the app forward, even if
@@ -110,6 +140,18 @@ mod imp {
                         // so the reshown page counts as active again.
                         crate::show_main_window(app);
                         if let Some(link) = link {
+                            // Stash for DURABLE delivery, then fire the warm-path
+                            // wake. The page drains the stash (take_pending_taps)
+                            // on BOTH the startup cold path and this signal, so the
+                            // tap routes exactly once even if this emit lands on a
+                            // page whose listener isn't registered yet.
+                            {
+                                let mut taps = pending_taps().lock().unwrap();
+                                if taps.len() >= MAX_PENDING {
+                                    taps.remove(0);
+                                }
+                                taps.push(link.clone());
+                            }
                             let _ = app.emit("native-notification-tapped", link);
                         }
                     }
@@ -118,6 +160,26 @@ mod imp {
                 // UN requires the completion handler be invoked once processing
                 // is done, or the system logs warnings / may kill the callback.
                 completion_handler.call(());
+            }
+
+            #[unsafe(method(userNotificationCenter:willPresentNotification:withCompletionHandler:))]
+            fn will_present(
+                &self,
+                _center: &UNUserNotificationCenter,
+                _notification: &UNNotification,
+                completion_handler: &block2::DynBlock<dyn Fn(UNNotificationPresentationOptions)>,
+            ) {
+                // macOS suppresses a banner for the FRONTMOST app unless the
+                // delegate opts in here. The engine only emits NativePushRequested
+                // (→ the page's show()) on the no-active-device branch, so a show()
+                // always SHOULD surface — return the banner even if the window
+                // happens to be frontmost (e.g. a stale active-state signal got it
+                // wrong, the inverse of the "only sometimes" miss). Safe: a banner
+                // and an in-app toast can't both fire for one notification (engine
+                // gates them on opposite branches). See notifications.md §4.
+                completion_handler.call((UNNotificationPresentationOptions::Banner
+                    | UNNotificationPresentationOptions::List
+                    | UNNotificationPresentationOptions::Sound,));
             }
         }
     );
@@ -197,10 +259,78 @@ mod imp {
         UNUserNotificationCenter::currentNotificationCenter()
             .addNotificationRequest_withCompletionHandler(&request, None);
     }
+
+    /// Remove already-delivered native banner(s) — the cross-device dismiss
+    /// counterpart of [`show`]. `id = Some(notification_id)` removes the one
+    /// banner whose request identifier matches (set at [`show`] time); `None`
+    /// removes ALL delivered banners (the mark-all-read path). Also drops the
+    /// stashed deep link(s) from [`pending`] so a tap on a now-removed banner
+    /// can't route. No-op in dev (see [`setup`]). An empty `Some("")` is a
+    /// malformed single id → no-op (never an accidental dismiss-all), matching
+    /// [`show`]'s empty-identifier handling.
+    ///
+    /// UN's remove methods are safe to call from any thread (like
+    /// `addNotificationRequest` in [`show`]), so no main-thread marshaling.
+    pub fn dismiss(id: Option<String>) {
+        if tauri::is_dev() {
+            return;
+        }
+        let center = UNUserNotificationCenter::currentNotificationCenter();
+        match id {
+            Some(identifier) if !identifier.is_empty() => {
+                let ids = NSArray::from_retained_slice(&[NSString::from_str(&identifier)]);
+                center.removeDeliveredNotificationsWithIdentifiers(&ids);
+                pending().lock().unwrap().remove(&identifier);
+            }
+            // Empty single id — nothing actionable; do NOT fall through to all.
+            Some(_) => {}
+            None => {
+                center.removeAllDeliveredNotifications();
+                pending().lock().unwrap().clear();
+            }
+        }
+    }
+
+    /// Set the dock-icon badge to `count` (the AGGREGATE unread total across
+    /// running workspaces — the Tauri window fronts the gateway, so its app icon
+    /// represents all workspaces). `0` clears the badge; `>99` shows "99+".
+    ///
+    /// MUST be called on the main thread — `MainThreadMarker::new()` returns
+    /// `None` off it and we bail (the desktop poll marshals here via
+    /// `run_on_main_thread`). Unlike [`setup`]/[`show`] this works in dev too: the
+    /// dock tile exists for an unbundled `cargo run` app (only UN needs a bundle).
+    pub fn set_dock_badge(count: u64) {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::NSApplication;
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let tile = NSApplication::sharedApplication(mtm).dockTile();
+        if count > 0 {
+            let label = if count > 99 {
+                "99+".to_string()
+            } else {
+                count.to_string()
+            };
+            tile.setBadgeLabel(Some(&NSString::from_str(&label)));
+        } else {
+            tile.setBadgeLabel(None);
+        }
+    }
+
+    /// Drain (and clear) every deep link stashed by a tap the page may not have
+    /// been listening for. The frontend calls this on startup (cold path) AND on
+    /// each `native-notification-tapped` signal (warm path); the Mutex makes the
+    /// drain atomic so each tap routes exactly once across both paths and can't
+    /// re-fire on a later reload. Naturally empty in dev (the delegate never
+    /// fires) and once every tap has been consumed. See `native-push.ts`.
+    pub fn take_pending_taps() -> Vec<serde_json::Value> {
+        std::mem::take(&mut *pending_taps().lock().unwrap())
+    }
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{setup, show};
+pub use imp::{dismiss, set_dock_badge, setup, show, take_pending_taps};
 
 /// Non-macOS desktop has no native notification path (the engine still
 /// web-pushes browser / PWA clients); these are no-ops so call sites stay
@@ -210,6 +340,23 @@ pub fn setup(_app: &tauri::AppHandle) {}
 
 #[cfg(not(target_os = "macos"))]
 pub fn show(_title: &str, _body: &str, _link: serde_json::Value) {}
+
+/// No native banner removal off macOS (no native notification path here); a
+/// no-op so the Tauri command stays platform-agnostic.
+#[cfg(not(target_os = "macos"))]
+pub fn dismiss(_id: Option<String>) {}
+
+/// No dock badge off macOS (the native app-icon badge is a macOS dock-tile
+/// concept). Browser / PWA clients still get the Badging API on every platform.
+#[cfg(not(target_os = "macos"))]
+pub fn set_dock_badge(_count: u64) {}
+
+/// No native tap stash off macOS (no native notification path here); always
+/// empty so the Tauri command stays platform-agnostic.
+#[cfg(not(target_os = "macos"))]
+pub fn take_pending_taps() -> Vec<serde_json::Value> {
+    Vec::new()
+}
 
 #[cfg(test)]
 mod tests {

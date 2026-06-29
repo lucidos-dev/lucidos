@@ -4,6 +4,7 @@ Source of truth for how workspace content is **organized**. Referenced by both t
 
 **Terms** (intent, knowhow, script, app, trigger, artifact, manifest, thread, sub-thread, top-thread, spawning thread, parent thread, event, domain event, workspace, plugin) are defined in [`system-knowhow/glossary.md`](../system-knowhow/glossary.md). This file uses those definitions and adds the structural / placement / ownership story on top.
 
+<!--concepts-content-types-start-->
 ## Three Content Types
 
 | Type | Stability | Who maintains | Example |
@@ -11,9 +12,11 @@ Source of truth for how workspace content is **organized**. Referenced by both t
 | **Intent** | Stable — changes when the user's needs change | User | "Find relevant jobs, store them, notify me of new ones and deadlines" |
 | **Knowhow** | Evolves — refined every time Lucidos learns something new | Lucidos | "Use `.product-card img` selector, vendor CDN requires base64 conversion" |
 | **Script** | Changes when tools or APIs change | Either | `download_images.py`, `validate_images.py` |
+<!--concepts-content-types-end-->
 
 See [`system-knowhow/glossary.md`](../system-knowhow/glossary.md) for the canonical definitions.
 
+<!--concepts-intent-knowhow-start-->
 ### Intent vs Knowhow
 
 The intent describes **what the user wants** — written in user terms, like what you'd tell a competent assistant. The knowhow describes **how to do it well** — technical details that Lucidos accumulates over time.
@@ -23,6 +26,7 @@ The intent describes **what the user wants** — written in user terms, like wha
 - No → it's knowhow
 
 Example: A product-watch intent says "find relevant listings for me, store them, notify me if there are new ones or upcoming deadlines." The knowhow explains how vendor logos are extracted, how prices are normalized, what CORS workarounds are needed. When Lucidos discovers a new quirk, it updates the knowhow — the intent stays the same.
+<!--concepts-intent-knowhow-end-->
 
 ### Frontmatter
 

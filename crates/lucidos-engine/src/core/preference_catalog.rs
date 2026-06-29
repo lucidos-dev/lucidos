@@ -309,6 +309,7 @@ pub const INTERNAL_KEYS: &[(&str, &str)] = &[
     ("capture_context", "a debug-only context-capture toggle; change it in Settings if you really need to"),
     ("backup_last_run", "internal backup state, not a setting"),
     ("keybindings", "keyboard shortcuts are managed in Settings → Keyboard Shortcuts"),
+    ("network_bind", "the per-workspace engine network bind (loopback / all interfaces / a specific tailnet IP) — a security setting changed in Settings → System → Network access, not via set_preference"),
 ];
 
 /// Find the catalog spec for an agent-settable key.

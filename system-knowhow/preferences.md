@@ -91,6 +91,11 @@ surface):
   last run, and recent history.
 - `keybindings` — Settings → Keyboard Shortcuts.
 - `capture_context` — a debug-only toggle.
+- `network_bind` — this workspace's engine network bind (`loopback` / `all` /
+  a specific tailnet IP). A security setting changed in Settings → System →
+  Network access, never via `set_preference`. Takes effect on the next engine
+  restart. (The machine-global gateway bind + the engine-inherit toggle live in
+  `~/.lucidos/network.toml`, not here.)
 
 > Keep this file in lockstep with `core/preference_catalog.rs` — a `cargo test`
 > sync test fails if a catalog key is missing here (see

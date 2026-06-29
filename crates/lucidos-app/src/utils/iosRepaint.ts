@@ -1,26 +1,52 @@
 import { isIOS } from './platform';
 
 /** Force iOS Safari / WKWebView to repaint a compositor layer whose backing
- *  texture it has blanked — content is present in the DOM but renders black /
- *  invisible. iOS recycles layer textures inside scroll containers (scroll-snap
- *  / momentum-scroll parents); a large DOM mutation or an `overflow` freeze can
- *  leave the layer showing a stale-or-empty texture with no repaint scheduled.
+ *  texture it has blanked — content is present in the DOM (events loaded,
+ *  exchanges rendered, real laid-out height) but renders black / invisible. This
+ *  is the documented WKCompositingView-removal class of blank: WebKit stops
+ *  committing the layer tree (`_didCommitLayerTree`), so the layer freezes on a
+ *  stale-or-empty texture until something forces a fresh commit — a scroll,
+ *  rotation, or layout change. (Distinct from WebContent-process death, which
+ *  fires `webViewWebContentProcessDidTerminate`; the iOS PWA is Safari's own
+ *  WKWebView, so a frontend repaint is the ONLY recovery lever on that surface.)
  *
- *  Toggling a sub-pixel `translateZ` across two animation frames invalidates the
- *  cached texture and forces a fresh paint — the same effect a real scroll
- *  gesture has, applied proactively. No-op off iOS and for detached nodes.
+ *  Three layered, additive nudges across two animation frames — applied in frame
+ *  one, restored in frame two — so the intermediate state is genuinely painted
+ *  and can't be coalesced into a no-op:
+ *    1. A sub-pixel `translateZ` transform round-trip (the original primitive;
+ *       cheap, and the only lever for a non-scrollable element).
+ *    2. A forced synchronous layout read (`void el.offsetHeight`) after the
+ *       nudge — the documented most-reliable JS repaint trigger; flushes the
+ *       pending layout so the nudged frame paints instead of being swallowed.
+ *    3. A real ±1px `scrollTop` nudge on a scrollable element — re-commits the
+ *       layer tree exactly as a manual finger-scroll does (the user-confirmed
+ *       recovery). The restore yields: it puts `scrollTop` back to the captured
+ *       baseline ONLY if our nudge is still the current value, so a concurrent
+ *       scroll write — `useScrollMemory`'s saved-position restore on thread open,
+ *       `useAutoScroll`'s bottom-pin during streaming — is never clobbered. ±1
+ *       stays inside the 80px `scrolledUp` stickiness window AND the 2px chevron
+ *       slack (scrollState.ts), so it never trips auto-scroll or the chevron.
+ *  Plain `translateZ` alone is widely reported as unreliable (it stops flicker but
+ *  the repaint can still not land), which matches the field reports this fixes.
  *
- *  Returns a cleanup that cancels the pending frames so a caller can hand it
- *  straight back from a `useEffect`; fire-and-forget callers may ignore it. */
+ *  No-op off iOS and for detached nodes. Returns a cleanup that cancels the
+ *  pending frames AND restores both baselines so a caller can hand it straight
+ *  back from a `useEffect`; fire-and-forget callers may ignore it. */
 
 /** Per-element in-flight toggle. Tracks the scheduled frames and the TRUE
- *  baseline transform (captured once, on the first call of a burst) so a
- *  superseding call restores cleanly instead of capturing an intermediate
- *  nudge as its baseline. */
+ *  baselines (transform + scroll position, captured once on the first call of a
+ *  burst) so a superseding call restores cleanly instead of capturing an
+ *  intermediate nudge as its baseline. */
 interface InFlightToggle {
   raf1: number;
   raf2: number | undefined;
   prev: string;
+  /** Scroll baseline captured ONCE per burst (reused on supersede so the ±1
+   *  nudge can't drift the position by 1px per superseded call). `scrollable`
+   *  gates every scroll write so a non-scrollable element (or an off-iOS no-op)
+   *  never touches `scrollTop`. */
+  prevScrollTop: number;
+  scrollable: boolean;
 }
 const inFlight = new WeakMap<object, InFlightToggle>();
 
@@ -40,20 +66,37 @@ export function forceIOSRepaint(el: HTMLElement | null | undefined): (() => void
   // was recreated. Cancelling the stale frames and rescheduling means a resume
   // repaint always lands.
   const existing = inFlight.get(el);
-  // Capture the baseline ONCE and reuse it for every superseding call in the
+  // Capture the baselines ONCE and reuse them for every superseding call in the
   // burst, so overlapping resume events can't capture an intermediate nudged
-  // value and accumulate `translateZ(0.1px) translateZ(0.1px) …`.
+  // value and accumulate `translateZ(0.1px) translateZ(0.1px) …` or drift the
+  // scroll position by 1px per superseded call.
   const prev = existing ? existing.prev : el.style.transform;
+  const scrollable = existing ? existing.scrollable : el.scrollHeight > el.clientHeight;
+  const prevScrollTop = existing ? existing.prevScrollTop : el.scrollTop;
+  // The value the nudge will leave behind — direction-safe so it never clamps to
+  // a no-op at either extreme. Derived from the (reused) baseline so a supersede
+  // recomputes the same value.
+  const nudgedScrollTop = prevScrollTop > 0 ? prevScrollTop - 1 : prevScrollTop + 1;
+
+  // Undo our OWN nudge only — restore to the baseline iff `scrollTop` is still the
+  // value we nudged it to. If anything else moved it meanwhile (useScrollMemory's
+  // saved-position restore on open, useAutoScroll's bottom-pin during streaming, a
+  // real user scroll), yield and leave it — never clobber a concurrent writer.
+  const restoreScroll = () => {
+    if (scrollable && el.scrollTop === nudgedScrollTop) el.scrollTop = prevScrollTop;
+  };
+
   if (existing) {
     cancelAnimationFrame(existing.raf1);
     if (existing.raf2 !== undefined) cancelAnimationFrame(existing.raf2);
     // Undo any partial nudge so the fresh toggle is a real round-trip from the
-    // baseline — re-writing the same transform value can be coalesced away by
-    // the engine without forcing the repaint we're after.
+    // baseline — re-writing the same value can be coalesced away without forcing
+    // the repaint we're after.
     if (el.style.transform !== prev) el.style.transform = prev;
+    restoreScroll();
   }
 
-  const entry: InFlightToggle = { raf1: 0, raf2: undefined, prev };
+  const entry: InFlightToggle = { raf1: 0, raf2: undefined, prev, prevScrollTop, scrollable };
   inFlight.set(el, entry);
   // Only clear the slot if it's still ours — a later superseding call may have
   // replaced the entry, and a dropped-then-resumed stale frame must not evict it.
@@ -61,17 +104,28 @@ export function forceIOSRepaint(el: HTMLElement | null | undefined): (() => void
   entry.raf1 = requestAnimationFrame(() => {
     if (!el.isConnected) { done(); return; }
     el.style.transform = prev ? `${prev} translateZ(0.1px)` : 'translateZ(0.1px)';
+    // ±1px scroll nudge — a real scrollTop change forces WKWebView to re-commit
+    // the frozen layer tree, the way a manual scroll recovers the blank.
+    if (scrollable) el.scrollTop = nudgedScrollTop;
+    // Force a synchronous layout flush so the nudged state actually paints this
+    // frame (the documented reliable repaint trigger) rather than being coalesced
+    // with the restore on the next frame.
+    void el.offsetHeight;
     entry.raf2 = requestAnimationFrame(() => {
-      if (el.isConnected) el.style.transform = prev;
+      if (el.isConnected) {
+        el.style.transform = prev;
+        restoreScroll();
+      }
       done();
     });
   });
   return () => {
     cancelAnimationFrame(entry.raf1);
     if (entry.raf2 !== undefined) cancelAnimationFrame(entry.raf2);
-    // Restore the baseline so an explicit cleanup mid-toggle never leaves a
+    // Restore both baselines so an explicit cleanup mid-toggle never leaves a
     // stale nudge behind (which the next call would otherwise read as baseline).
     if (el.style.transform !== prev) el.style.transform = prev;
+    restoreScroll();
     done();
   };
 }
@@ -79,10 +133,21 @@ export function forceIOSRepaint(el: HTMLElement | null | undefined): (() => void
 /** Delays (ms) for the thread-OPEN repaint burst: an immediate toggle plus
  *  setTimeout-spaced retries. setTimeout (not chained rAFs) is the load-bearing
  *  choice — it survives the frame coalescing/dropping that can swallow a one-shot
- *  toggle on a cold open. The ~300ms span also covers a layer that blanks a beat
- *  AFTER the initial mount/paint, which an immediate-only toggle has already
- *  restored past before the blank lands. */
-const OPEN_REPAINT_BURST_DELAYS_MS = [0, 100, 300];
+ *  toggle on a cold open. The span also covers a layer that blanks a beat AFTER
+ *  the initial mount/paint, which an immediate-only toggle has already restored
+ *  past before the blank lands.
+ *
+ *  The tail reaches 1000ms (was 300ms): under PROLONGED use — many thread switches
+ *  in one long-lived iOS PWA session — WKWebView degrades and blanks an
+ *  already-loaded thread's layer noticeably later than a cold open does, past the
+ *  old 300ms window, so the open burst's last attempt fired before the blank and
+ *  the thread stayed black until a manual scroll. Reported as "after a while,
+ *  opening a thread shows an empty body" (the body is in the DOM — no skeleton, no
+ *  empty-state — it just isn't painted). The extra spaced attempts are each a
+ *  full supersede-safe toggle, so they never accumulate and cost nothing on a
+ *  healthy layer (the toggle is a sub-pixel transform round-trip). Exported for
+ *  the invariant test. */
+export const OPEN_REPAINT_BURST_DELAYS_MS = [0, 100, 300, 600, 1000];
 
 /** Drop-resilient repaint for the thread-OPEN path. A single `forceIOSRepaint`
  *  suffices for the streaming path (a trailing throttle re-fires) and the resume

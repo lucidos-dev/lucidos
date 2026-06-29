@@ -385,6 +385,16 @@ self.addEventListener('push', (event) => {
         tap: raw && raw.tap,
       };
 
+  // App-icon badge (Badging API). The engine carries the workspace's current
+  // unread count in the TOP-LEVEL `app_badge` field (sibling of `web_push` /
+  // `notification`, see build_push_payload). Mirror it onto the installed PWA
+  // icon so a CLOSED workspace PWA stays accurate on Chrome/Android — a
+  // per-workspace PWA badges ITS OWN workspace's unreads. iOS sets the badge
+  // natively from the same field without running this handler, so this is the
+  // non-iOS path. Best-effort + feature-gated; `0` clears it.
+  const appBadge =
+    raw && typeof raw.app_badge === 'number' ? raw.app_badge : null;
+
   // Every push must leave a visible notification on screen when waitUntil
   // resolves — the userVisibleOnly:true contract. This applies to iOS too: an
   // experiment that skipped showNotification on iOS+declarative (betting the OS
@@ -426,6 +436,15 @@ self.addEventListener('push', (event) => {
       : self.location.origin + SCOPE_PATH,
     data,
   }));
+
+  if (appBadge !== null && typeof self.navigator.setAppBadge === 'function') {
+    // clearAppBadge ships paired with setAppBadge, but guard it anyway so a 0
+    // count can't throw synchronously (before .catch) on a partial impl —
+    // matches the page-side applyAppBadge's optional-chaining.
+    const badgePromise =
+      appBadge > 0 ? self.navigator.setAppBadge(appBadge) : self.navigator.clearAppBadge?.();
+    if (badgePromise) event.waitUntil(badgePromise.catch(() => {}));
+  }
 });
 
 self.addEventListener('message', (event) => {

@@ -26,6 +26,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use wasmtime::{Engine, Module};
 
 // ── proxy_pipeline_builder helpers ──────────────────────────────────────
@@ -284,6 +285,16 @@ const REPLACE_BODY_WAT: &str = r#"
       (i64.const 24))))
 "#;
 
+/// A deliberately non-terminating signer: `sign` enters an unconditional loop
+/// and never returns. The execution budget (epoch interruption) must kill it.
+const LOOP_FOREVER_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "sign") (param i32 i32) (result i64)
+    (loop $l (br $l))
+    (i64.const 0)))
+"#;
+
 // ── proxy_wasm_signer::tests::wasm_signer_layer_* (Engine-creating) ────
 // Real-artifact variants moved to crates/lucidos-e2e/tests/wasm_signers.rs
 // (run via ./scripts/e2e-wasm.sh).
@@ -305,6 +316,42 @@ async fn wasm_signer_layer_runs_echo_signer_end_to_end() {
     assert_eq!(m.add_headers[0].1, "ok");
     assert!(m.add_query.is_empty());
     assert!(m.replace_body.is_none());
+}
+
+/// A non-terminating signer is killed by the execution budget rather than
+/// pinning the request-execution task forever. The outer `timeout` is a test
+/// safety net — if the budget mechanism regressed, the test fails (does not
+/// hang). Multi-thread runtime so the epoch ticker thread can advance the epoch
+/// while the runaway call occupies a worker. (This is the core fix for the
+/// "WASM signer has no execution budget" finding.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_signer_layer_kills_a_runaway_looping_signer() {
+    let engine = Arc::new(build_wasmtime_engine().unwrap());
+    let module = compile_wat("runaway", LOOP_FOREVER_WAT, &engine);
+    let resolver = Arc::new(MapResolver(HashMap::new()));
+    let layer = WasmSignerLayer::new("runaway".into(), module, engine, resolver, vec![], vec![])
+        .with_budget(Duration::from_millis(150));
+
+    let body = bytes::Bytes::new();
+    let prior = HashMap::new();
+    let input = make_layer_input(&body, &prior);
+
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(20), layer.apply(&input)).await;
+    let elapsed = started.elapsed();
+
+    let result = outcome.expect("apply() must return — a runaway signer must not hang the task");
+    let err = result.expect_err("a non-terminating signer must be rejected, not succeed");
+    assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
+    assert!(
+        err.1.contains("runaway") && err.1.contains("budget"),
+        "error must name the signer and the budget; got: {}",
+        err.1
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "budget should trip promptly; took {elapsed:?}"
+    );
 }
 
 #[tokio::test]

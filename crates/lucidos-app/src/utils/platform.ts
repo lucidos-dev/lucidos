@@ -3,6 +3,23 @@ export function isTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
 
+/** Product token appended to the user-agent string we send at device
+ *  registration when running in the Tauri native desktop app. The embedded
+ *  WKWebView's real `navigator.userAgent` is indistinguishable from Safari, so
+ *  without this the engine (and the Lucidos Agent's device context) can't tell a
+ *  desktop client from a browser — and the agent wrongly gives browser-permission
+ *  notification advice. The engine's `parse_user_agent` recognizes this token and
+ *  renders the device as "Lucidos desktop app on <OS>". Standard product-token
+ *  practice; kept to ONLY the registration string, never the live navigator UA. */
+export const DESKTOP_APP_UA_TOKEN = 'Lucidos-Desktop';
+
+/** The user-agent string to register this device with: the raw `navigator.userAgent`,
+ *  plus the desktop-app product token when running as the native desktop client.
+ *  Pure (takes the client flag as an argument) so it's unit-testable without `window`. */
+export function registrationUserAgent(rawUa: string, isDesktopApp: boolean): string {
+  return isDesktopApp ? `${rawUa} ${DESKTOP_APP_UA_TOKEN}` : rawUa;
+}
+
 /** Check if running on a Mac or iOS device */
 export const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
 

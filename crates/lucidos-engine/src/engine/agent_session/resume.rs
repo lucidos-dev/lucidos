@@ -338,7 +338,19 @@ pub(crate) async fn latest_originating_event_id(
     for et in event_types {
         query = query.bind(*et);
     }
-    query.fetch_optional(pool).await.ok().flatten()
+    query
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            log!(
+                "[AgentSession] Failed to look up latest originating event id for {}: {}",
+                thread_id,
+                e
+            );
+            e
+        })
+        .ok()
+        .flatten()
 }
 
 /// Return the most-recent CC session id recorded for a thread, so the spawn /

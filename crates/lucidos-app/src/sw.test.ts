@@ -64,6 +64,10 @@ function loadSw(opts: { buildId?: string; scope?: string } = {}) {
     // awareness); root scope keeps the existing root-path assertions valid.
     scope: opts.scope ?? 'https://example.com/',
   };
+  // WorkerNavigator with the Badging API — the push handler mirrors the
+  // payload's `app_badge` onto the installed PWA icon (see sw.js push handler).
+  const setAppBadge = vi.fn((_count?: number) => Promise.resolve());
+  const clearAppBadge = vi.fn(() => Promise.resolve());
   const mockSelf = {
     addEventListener: (type: string, handler: (event: any) => void) => {
       handlers[type] = handler;
@@ -71,6 +75,7 @@ function loadSw(opts: { buildId?: string; scope?: string } = {}) {
     skipWaiting: vi.fn(),
     location: { origin: 'https://example.com' },
     registration: mockRegistration,
+    navigator: { setAppBadge, clearAppBadge },
   };
   // matchAll satisfies swDebugLog's best-effort broadcast (returns no clients
   // by default); claim satisfies the activate handler. Push / notificationclick
@@ -91,6 +96,8 @@ function loadSw(opts: { buildId?: string; scope?: string } = {}) {
     matchAll,
     openWindow,
     skipWaiting: mockSelf.skipWaiting,
+    setAppBadge,
+    clearAppBadge,
   };
 }
 
@@ -780,6 +787,40 @@ describe('Service Worker push handler — declarative envelope', () => {
       navigate: '/#notification=nid-1',
       tap: { kind: 'navigate', to: { target: 'changes' } },
     });
+  });
+
+  it('declarative push: app_badge sets the app-icon badge', async () => {
+    // The engine carries the workspace's unread count in the top-level
+    // `app_badge` field; the SW mirrors it onto the installed PWA icon so a
+    // CLOSED workspace PWA stays accurate on Chrome/Android.
+    const { handlers, setAppBadge, clearAppBadge } = loadSw();
+    const ev = pushEvent(
+      declarativeEnvelope({ title: 'T', body: 'B', tag: 'nid-1', data: {} }, { app_badge: 3 }),
+    );
+    handlers.push(ev);
+    await Promise.all(ev._waited);
+    expect(setAppBadge).toHaveBeenCalledWith(3);
+    expect(clearAppBadge).not.toHaveBeenCalled();
+  });
+
+  it('declarative push: app_badge 0 clears the app-icon badge', async () => {
+    const { handlers, setAppBadge, clearAppBadge } = loadSw();
+    const ev = pushEvent(
+      declarativeEnvelope({ title: 'T', body: 'B', tag: 'nid-1', data: {} }, { app_badge: 0 }),
+    );
+    handlers.push(ev);
+    await Promise.all(ev._waited);
+    expect(clearAppBadge).toHaveBeenCalledTimes(1);
+    expect(setAppBadge).not.toHaveBeenCalled();
+  });
+
+  it('declarative push: no app_badge field leaves the badge untouched', async () => {
+    const { handlers, setAppBadge, clearAppBadge } = loadSw();
+    const ev = pushEvent(declarativeEnvelope({ title: 'T', body: 'B', tag: 'nid-1', data: {} }));
+    handlers.push(ev);
+    await Promise.all(ev._waited);
+    expect(setAppBadge).not.toHaveBeenCalled();
+    expect(clearAppBadge).not.toHaveBeenCalled();
   });
 
   it('declarative push: missing navigate falls back to bare origin', async () => {

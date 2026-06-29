@@ -85,7 +85,7 @@ pub(crate) async fn run_plugin_marketplace_update_check(
         return report;
     }
 
-    let installed = match installed_plugin_summaries(&pool).await {
+    let installed = match installed_plugin_summaries(&pool, &workspace).await {
         Ok(installed) => installed,
         Err(e) => {
             report.errors.push(format!("read installed plugins: {e}"));

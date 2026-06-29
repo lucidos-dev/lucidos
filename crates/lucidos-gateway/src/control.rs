@@ -6,9 +6,12 @@
 //! edit), delete-to-trash, and a manual restart for an unhealthy stack.
 
 use crate::error::ApiError;
+use crate::net_config;
 use crate::server::{GatewayState, RestoreStatus};
-use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
-use axum::http::StatusCode;
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Request, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -28,6 +31,10 @@ pub fn router() -> Router<GatewayState> {
         // Gateway self-update: is a rebuilt binary waiting, and adopt it (re-exec).
         .route("/gateway/status", get(gateway_status))
         .route("/gateway/reload", post(gateway_reload))
+        // Machine-global network bind (the gateway's own bind + the engine
+        // inherit toggle) — the picker's Network access control writes
+        // ~/.lucidos/network.toml here.
+        .route("/network-config", get(network_config).put(set_network_config))
         .route("/workspaces/:id/rename", post(rename))
         .route("/workspaces/:id/restart", post(restart))
         .route("/workspaces/:id/stop", post(stop))
@@ -38,6 +45,137 @@ pub fn router() -> Router<GatewayState> {
         // `report_boot_phase`.
         .route("/workspaces/:id/boot-phase", post(set_boot_phase))
         .route("/workspaces/:id", delete(delete_workspace))
+        // Request-level authorization for the whole destructive control plane.
+        .layer(middleware::from_fn(control_authz))
+}
+
+// ── Control-plane request authorization ────────────────────────────────────
+//
+// The control plane (workspace create/restart/stop/delete-to-trash/restore,
+// gateway reload) lives at `/~/api/v1/control/*` on the GATEWAY origin. App UIs
+// are served same-origin at `/<slug>/app/<id>/` with `allow-same-origin`, so
+// without a gate an app's JS could `fetch('/~/api/v1/control/workspaces/<slug>/
+// stop', {method:'POST'})` and stop/delete the workspace it runs in.
+//
+// This is an EXPLICIT, documented gate (see ADR 0014). What it closes and the
+// one residual it cannot (same-origin app iframes share the gateway origin, so
+// no header is a perfect discriminator):
+//
+//   * Non-browser clients (the dev launcher / `stop.sh` curl, the engine→gateway
+//     boot-phase report, the packaged smoke test) send NO fetch metadata — they
+//     are allowed, protected instead by the gateway's loopback bind (default;
+//     opened only by explicit `LUCIDOS_GATEWAY_BIND_ALL`).
+//   * Cross-site / cross-origin browser requests are rejected via the
+//     forge-proof `Sec-Fetch-Site` + `Origin`/`Host` checks (a page cannot set
+//     these via `fetch()`). This fully closes the classic CSRF vector.
+//   * Browser requests whose `Referer` is an app-iframe document
+//     (`/<slug>/app/...`) are rejected. The picker (`/~/...`) and the workspace
+//     shell (`/<slug>/...`, no `app` segment) pass.
+//
+// RESIDUAL: a deliberately malicious *same-origin* app could influence its own
+// `Referer` (the fetch `referrer` option accepts same-origin URLs), so the
+// Referer block is strong defense-in-depth, not an absolute boundary. The
+// complete fix is to serve app iframes from a DISTINCT origin (then they are
+// cross-origin and the forge-proof Sec-Fetch/Origin checks alone suffice); that
+// is recorded as future work in ADR 0014 and is out of scope for this change.
+
+/// Axum middleware: reject a control-plane request that a browser app iframe (or
+/// a cross-site page) originated. Allows non-browser clients and same-origin
+/// picker / workspace-shell requests. See the module note above.
+async fn control_authz(req: Request, next: Next) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()));
+    if control_request_allowed(req.headers(), host.as_deref()) {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            "control plane is not reachable from app iframes or cross-origin requests",
+        )
+            .into_response()
+    }
+}
+
+/// Read a header as a trimmed, non-empty `&str`.
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Pure authorization decision for a control-plane request (extracted so the
+/// policy is exhaustively unit-tested). See the module note for the full model.
+fn control_request_allowed(headers: &HeaderMap, host: Option<&str>) -> bool {
+    let sec_fetch_site = header_str(headers, "sec-fetch-site");
+    let origin = header_str(headers, "origin");
+    let referer = header_str(headers, "referer");
+
+    // Non-browser client (CLI launcher, engine→gateway report, curl): no fetch
+    // metadata at all → allow. Protected by the loopback bind topology.
+    if sec_fetch_site.is_none() && origin.is_none() && referer.is_none() {
+        return true;
+    }
+
+    // Browser-originated. Require same-origin (forge-proof: `fetch()` cannot set
+    // `Sec-Fetch-*` or `Origin`). Reject cross-site / same-site.
+    if let Some(site) = sec_fetch_site {
+        if !matches!(site, "same-origin" | "none") {
+            return false;
+        }
+    }
+    // When Origin is present, its authority must match the request Host (covers
+    // browsers without Sec-Fetch metadata; another CSRF guard).
+    if let (Some(origin), Some(host)) = (origin, host) {
+        if !origin_matches_host(origin, host) {
+            return false;
+        }
+    }
+
+    // Reject requests originating from an APP IFRAME document. Defense in depth
+    // (see RESIDUAL in the module note).
+    if let Some(referer) = referer {
+        if referer_is_app_iframe(referer) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Whether `origin` (e.g. `https://localhost:5251`) has the same authority as
+/// the request `host` (e.g. `localhost:5251`). Compares the host:port only.
+fn origin_matches_host(origin: &str, host: &str) -> bool {
+    let origin_authority = origin
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(origin)
+        .trim_end_matches('/');
+    origin_authority.eq_ignore_ascii_case(host)
+}
+
+/// Whether a `Referer` URL points at an app-iframe document. App UIs are served
+/// at `/<slug>/app/<id>/…`, so the second path segment is `app`. The picker
+/// (`/~/…`) and the workspace shell (`/<slug>/…`, no `app` segment) are not.
+fn referer_is_app_iframe(referer: &str) -> bool {
+    // Strip scheme://authority to get the path; tolerate a bare path too.
+    let after_scheme = referer.split_once("://").map(|(_, r)| r).unwrap_or(referer);
+    let path = match after_scheme.find('/') {
+        // Referer had an authority — path starts at the first '/'.
+        Some(idx) if referer.contains("://") => &after_scheme[idx..],
+        // No authority (already a path) — use as-is.
+        _ if referer.starts_with('/') => referer,
+        _ => return false,
+    };
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let mut segments = path.split('/').filter(|s| !s.is_empty());
+    let _slug = segments.next();
+    matches!(segments.next(), Some("app"))
 }
 
 /// Reject a malformed workspace id (defense in depth — the path-segment lookup
@@ -235,6 +373,46 @@ async fn gateway_reload(State(state): State<GatewayState>) -> Result<StatusCode,
     Ok(StatusCode::ACCEPTED)
 }
 
+/// Body for the machine-global network bind write.
+#[derive(Deserialize)]
+struct NetworkConfigBody {
+    /// `loopback` | `all` | a literal IP. Validated server-side.
+    gateway_bind: String,
+    /// Whether every workspace engine inherits this gateway bind (vs reads its
+    /// own per-workspace `network_bind` preference).
+    inherit: bool,
+}
+
+/// GET /~/api/v1/control/network-config — the machine-global gateway bind +
+/// engine-inherit toggle (from `~/.lucidos/network.toml`) plus a best-effort
+/// Tailscale `100.x` hint, for the picker's Network access control.
+async fn network_config() -> Json<Value> {
+    let net = net_config::read_network_toml();
+    Json(json!({
+        "gateway_bind": net.gateway_bind.unwrap_or_else(|| "loopback".to_string()),
+        "inherit": net.engine_inherit,
+        "detected_tailscale_ip": net_config::detect_tailscale_ipv4().await,
+    }))
+}
+
+/// PUT /~/api/v1/control/network-config — write the machine-global config.
+/// Validated server-side (loopback / all / a parseable IP); takes effect only
+/// after a gateway / engine restart (a live socket cannot be re-bound).
+async fn set_network_config(
+    Json(body): Json<NetworkConfigBody>,
+) -> Result<StatusCode, ApiError> {
+    net_config::validate_bind_input(&body.gateway_bind).map_err(ApiError::bad_request)?;
+    // Normalize keyword case so the stored value is canonical.
+    let gateway_bind = match body.gateway_bind.trim().to_ascii_lowercase().as_str() {
+        "loopback" => "loopback".to_string(),
+        "all" => "all".to_string(),
+        _ => body.gateway_bind.trim().to_string(),
+    };
+    net_config::write_network_toml(&gateway_bind, body.inherit)
+        .map_err(|e| ApiError::internal(format!("failed to write network.toml: {e}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Dismiss a terminal restore result (back to Idle). 409 while one is running.
 async fn clear_restore(State(state): State<GatewayState>) -> Result<StatusCode, ApiError> {
     state.clear_restore_status()?;
@@ -356,4 +534,119 @@ async fn delete_workspace(
         .await
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod authz_tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    const HOST: &str = "localhost:5251";
+
+    #[test]
+    fn no_fetch_metadata_is_allowed() {
+        // The dev launcher / stop.sh curl, the engine→gateway boot-phase report,
+        // the packaged smoke test: no Origin/Sec-Fetch/Referer → allowed
+        // (protected by the loopback bind, not this gate).
+        assert!(control_request_allowed(&headers(&[]), Some(HOST)));
+        assert!(control_request_allowed(
+            &headers(&[("user-agent", "curl/8.0")]),
+            Some(HOST)
+        ));
+    }
+
+    #[test]
+    fn picker_same_origin_request_is_allowed() {
+        let h = headers(&[
+            ("sec-fetch-site", "same-origin"),
+            ("origin", "https://localhost:5251"),
+            ("referer", "https://localhost:5251/~/"),
+        ]);
+        assert!(control_request_allowed(&h, Some(HOST)));
+    }
+
+    #[test]
+    fn workspace_shell_request_is_allowed() {
+        // The shell at /<slug>/ (e.g. the workspace switcher hitting gateway
+        // status/reload) — no `app` segment → allowed.
+        let h = headers(&[
+            ("sec-fetch-site", "same-origin"),
+            ("origin", "https://localhost:5251"),
+            ("referer", "https://localhost:5251/dev/"),
+        ]);
+        assert!(control_request_allowed(&h, Some(HOST)));
+    }
+
+    #[test]
+    fn app_iframe_request_is_rejected() {
+        // The core finding: an app at /<slug>/app/<id>/ must not drive control.
+        for referer in [
+            "https://localhost:5251/dev/app/habit-tracker/",
+            "https://localhost:5251/dev/app/habit-tracker/index.html",
+            "https://localhost:5251/myws/app/demo-director/sub/page?x=1",
+        ] {
+            let h = headers(&[
+                ("sec-fetch-site", "same-origin"),
+                ("origin", "https://localhost:5251"),
+                ("referer", referer),
+            ]);
+            assert!(
+                !control_request_allowed(&h, Some(HOST)),
+                "app-iframe referer must be rejected: {referer}"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_site_browser_request_is_rejected() {
+        for site in ["cross-site", "same-site"] {
+            let h = headers(&[
+                ("sec-fetch-site", site),
+                ("origin", "https://evil.example"),
+                ("referer", "https://evil.example/"),
+            ]);
+            assert!(
+                !control_request_allowed(&h, Some(HOST)),
+                "Sec-Fetch-Site {site} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_host_mismatch_is_rejected() {
+        // A browser without Sec-Fetch metadata but a foreign Origin → CSRF.
+        let h = headers(&[("origin", "https://attacker.example")]);
+        assert!(!control_request_allowed(&h, Some(HOST)));
+    }
+
+    #[test]
+    fn origin_matches_host_compares_authority() {
+        assert!(origin_matches_host("https://localhost:5251", "localhost:5251"));
+        assert!(origin_matches_host("http://Localhost:5251/", "localhost:5251"));
+        assert!(!origin_matches_host("https://localhost:5252", "localhost:5251"));
+        assert!(!origin_matches_host("https://evil.example", "localhost:5251"));
+    }
+
+    #[test]
+    fn referer_is_app_iframe_detects_app_segment_only() {
+        assert!(referer_is_app_iframe("https://h/dev/app/x/"));
+        assert!(referer_is_app_iframe("https://h:5251/myws/app/demo/index.html?a=1"));
+        assert!(referer_is_app_iframe("/dev/app/x")); // bare path tolerated
+        // Not app-iframe documents:
+        assert!(!referer_is_app_iframe("https://h/~/")); // picker
+        assert!(!referer_is_app_iframe("https://h/dev/")); // workspace shell
+        assert!(!referer_is_app_iframe("https://h/dev/api/v1/threads")); // shell API
+        assert!(!referer_is_app_iframe("https://h/")); // root
+        assert!(!referer_is_app_iframe("https://h/appworkspace/")); // slug literally "appworkspace"
+    }
 }

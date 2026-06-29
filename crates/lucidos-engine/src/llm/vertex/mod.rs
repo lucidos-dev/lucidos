@@ -52,11 +52,21 @@ pub fn read_location(handle: &LocationHandle) -> String {
     })
 }
 
+/// Derive the Vertex AI API host for a given `location`.
+///
+/// Three cases, because Vertex serves them on different hosts:
+/// - `global` → the default `aiplatform.googleapis.com`.
+/// - A **multi-region** (`us`, `eu`) → the dedicated
+///   `aiplatform.{location}.rep.googleapis.com` host. Multi-regions are NOT
+///   served by the default host nor by a `{location}-aiplatform.googleapis.com`
+///   regional host — hitting those 404s with a Google robot HTML page.
+/// - Any specific region (e.g. `europe-west1`) →
+///   `{location}-aiplatform.googleapis.com`.
 pub fn vertex_host(location: &str) -> String {
-    if location == "global" {
-        "aiplatform.googleapis.com".to_string()
-    } else {
-        format!("{}-aiplatform.googleapis.com", location)
+    match location {
+        "global" => "aiplatform.googleapis.com".to_string(),
+        "us" | "eu" => format!("aiplatform.{}.rep.googleapis.com", location),
+        _ => format!("{}-aiplatform.googleapis.com", location),
     }
 }
 
@@ -334,6 +344,43 @@ impl LlmProvider for VertexProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertex_host_covers_global_multiregion_and_specific_region() {
+        // global → default host
+        assert_eq!(vertex_host("global"), "aiplatform.googleapis.com");
+        // multi-regions → dedicated .rep.googleapis.com host
+        assert_eq!(vertex_host("us"), "aiplatform.us.rep.googleapis.com");
+        assert_eq!(vertex_host("eu"), "aiplatform.eu.rep.googleapis.com");
+        // a specific region → {region}-aiplatform.googleapis.com
+        assert_eq!(
+            vertex_host("europe-west1"),
+            "europe-west1-aiplatform.googleapis.com"
+        );
+    }
+
+    #[test]
+    fn endpoint_multiregion_eu_uses_rep_host_and_keeps_path() {
+        let provider =
+            VertexProvider::new("my-project".into(), "eu".into(), "claude-opus-4-8".into())
+                .unwrap();
+        let url = provider.endpoint_for_model("claude-opus-4-8");
+        // Host must be the multi-region REP endpoint, NOT the default host or a
+        // bogus `eu-aiplatform.googleapis.com` regional host (the 404 bug).
+        assert!(
+            url.starts_with("https://aiplatform.eu.rep.googleapis.com/"),
+            "eu multi-region must use the rep host: {}",
+            url
+        );
+        // Path is unchanged — only the host derivation differs.
+        assert!(
+            url.ends_with(
+                "/v1/projects/my-project/locations/eu/publishers/anthropic/models/claude-opus-4-8:streamRawPredict"
+            ),
+            "path must be unchanged for multi-region: {}",
+            url
+        );
+    }
 
     #[test]
     fn endpoint_global_location_no_region_prefix() {

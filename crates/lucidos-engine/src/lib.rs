@@ -72,6 +72,7 @@ pub mod mcp;
 pub mod memory;
 #[cfg(test)]
 mod migration_tests;
+pub mod net_config;
 pub mod paths;
 pub mod runtime;
 pub mod scheduler;

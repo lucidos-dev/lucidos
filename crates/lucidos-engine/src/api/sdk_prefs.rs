@@ -19,6 +19,14 @@
 //! `crates/lucidos-app/src/store/actions/preferences.ts` — are immediately
 //! visible to every iframe load. No cookie or DB roundtrip is needed.
 //!
+//! These keys are PER-WORKSPACE (`crates/lucidos-app/src/utils/workspaceStorage.ts`):
+//! the parent writes them under `ws:<slug>:<key>`. This script runs in the iframe
+//! realm, which the parent's `Storage.prototype` override does NOT reach, so it
+//! derives the workspace slug itself from `location.pathname` (the app iframe
+//! loads at `/<slug>/app/<id>/…`; mirrors `packages/lucidos-sdk/src/_storage.ts`)
+//! and reads the namespaced keys — or the parent's write wouldn't match and the
+//! iframe would FOUC. Direct access (`/app/<id>/`) → no slug → raw key.
+//!
 //! The SDK's `lucidos.ui.applyPreferences()` continues to handle live SSE
 //! updates; it just overwrites the values this script set.
 
@@ -31,7 +39,16 @@ use super::*;
 // must run before any TS module bootstraps.
 const SDK_PREFS_JS: &str = r##"(function() {
   var d = document.documentElement;
-  var raw = localStorage.getItem("lucidos-theme");
+  // Per-workspace key namespacing (mirrors workspaceStorage.ts + sdk/_storage.ts).
+  // App iframes load at /<slug>/app/<id>/ with no <base>, so derive the slug from
+  // everything before "/app/". Direct access (/app/<id>/) -> no slug -> raw key.
+  var p = (location.pathname || "");
+  var ai = p.indexOf("/app/");
+  var pre = ai >= 0 ? p.slice(0, ai) : "";
+  var seg = pre.replace(/^\/+|\/+$/g, "");
+  var slug = (seg === "" || seg === "~") ? null : seg;
+  function wsKey(name) { return slug ? "ws:" + slug + ":" + name : name; }
+  var raw = localStorage.getItem(wsKey("lucidos-theme"));
   var theme = (raw === "light" || raw === "dark" || raw === "system") ? raw : "dark";
   var resolved = theme === "system"
     ? (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark")
@@ -50,14 +67,14 @@ const SDK_PREFS_JS: &str = r##"(function() {
     "ibm-plex-mono": "'IBM Plex Mono', monospace",
     "fira-code": "'Fira Code', monospace"
   };
-  var fontKey = localStorage.getItem("lucidos-font-family");
+  var fontKey = localStorage.getItem(wsKey("lucidos-font-family"));
   d.style.setProperty("--font-ui", FONTS[fontKey] || FONTS.monospace);
   // Programming ligatures, only for fonts that ship them (Fira Code); every
   // other font gets `normal` (CSS initial -> unchanged). Mirrors FONT_FEATURES
   // in preferences.ts and the same map in the index.html FOUC IIFE.
   var FEATURES = { "fira-code": '"liga" 1, "calt" 1' };
   d.style.setProperty("font-feature-settings", FEATURES[fontKey] || "normal");
-  var scale = localStorage.getItem("lucidos-ui-scale");
+  var scale = localStorage.getItem(wsKey("lucidos-ui-scale"));
   if (scale) {
     // Mirrors clampUiScale in preferences.ts — keep (75, 200, 12.5) in sync.
     var legacy = { small: 100, medium: 112.5, large: 125 };
@@ -96,17 +113,43 @@ mod tests {
 
     #[test]
     fn script_reads_theme_from_localstorage() {
-        assert!(SDK_PREFS_JS.contains("localStorage.getItem(\"lucidos-theme\")"));
+        assert!(SDK_PREFS_JS.contains("localStorage.getItem(wsKey(\"lucidos-theme\"))"));
     }
 
     #[test]
     fn script_reads_font_family_from_localstorage() {
-        assert!(SDK_PREFS_JS.contains("localStorage.getItem(\"lucidos-font-family\")"));
+        assert!(SDK_PREFS_JS.contains("localStorage.getItem(wsKey(\"lucidos-font-family\"))"));
     }
 
     #[test]
     fn script_reads_ui_scale_from_localstorage() {
-        assert!(SDK_PREFS_JS.contains("localStorage.getItem(\"lucidos-ui-scale\")"));
+        assert!(SDK_PREFS_JS.contains("localStorage.getItem(wsKey(\"lucidos-ui-scale\"))"));
+    }
+
+    #[test]
+    fn script_namespaces_keys_per_workspace() {
+        // The iframe realm has no access to the parent's Storage.prototype
+        // override, so it must derive the workspace slug and namespace the keys
+        // itself — or a parent `ws:<slug>:lucidos-theme` write would never match
+        // the iframe read and every app would FOUC. The slug comes from the path
+        // before `/app/` (mirrors sdk/_storage.ts + _fetch.ts).
+        assert!(SDK_PREFS_JS.contains("indexOf(\"/app/\")"));
+        assert!(SDK_PREFS_JS.contains("\"ws:\" + slug + \":\" + name"));
+        // Direct access (no slug) must fall back to the raw key.
+        assert!(SDK_PREFS_JS.contains("slug ? \"ws:\""));
+    }
+
+    #[test]
+    fn script_has_no_unscoped_appearance_reads() {
+        // Guard against a regression that drops the wsKey() wrapper. No raw,
+        // string-literal read of a per-workspace appearance key may remain.
+        for key in ["lucidos-theme", "lucidos-font-family", "lucidos-ui-scale"] {
+            let raw = format!("localStorage.getItem(\"{key}\")");
+            assert!(
+                !SDK_PREFS_JS.contains(&raw),
+                "sdk-prefs.js must not read {key} unscoped — wrap it in wsKey()"
+            );
+        }
     }
 
     #[test]

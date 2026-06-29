@@ -3,7 +3,7 @@ import {
   GLOBAL_KEYS,
   isGlobalKey,
   namespacedKey,
-  shouldMigrate,
+  shouldSeed,
   migrateUnprefixedKeys,
   installWorkspaceStorage,
 } from './workspaceStorage';
@@ -64,31 +64,37 @@ describe('pure helpers', () => {
     );
   });
 
-  it('isGlobalKey covers device id, appearance, and sw/build keys', () => {
-    expect(isGlobalKey('lucidos-device-id')).toBe(true);
-    expect(isGlobalKey('lucidos-theme')).toBe(true);
-    expect(isGlobalKey('lucidos-font-family')).toBe(true);
-    expect(isGlobalKey('lucidos-ui-scale')).toBe(true);
-    expect(isGlobalKey('lucidos-animation-speed-slider')).toBe(true);
-    expect(isGlobalKey('lucidos-sw-update-dismissed')).toBe(true);
-    expect(isGlobalKey('lucidos-chunk-reload-at')).toBe(true);
+  it('isGlobalKey: ONLY the two cross-workspace picker keys stay raw', () => {
+    expect(isGlobalKey('lucidos-last-workspace')).toBe(true);
+    expect(isGlobalKey('lucidos-last-workspace-count')).toBe(true);
+    expect(GLOBAL_KEYS.size).toBe(2);
+    // Everything else is now workspace-scoped — including device id + appearance.
+    expect(isGlobalKey('lucidos-device-id')).toBe(false);
+    expect(isGlobalKey('lucidos-theme')).toBe(false);
+    expect(isGlobalKey('lucidos-font-family')).toBe(false);
+    expect(isGlobalKey('lucidos-ui-scale')).toBe(false);
+    expect(isGlobalKey('lucidos-animation-speed-slider')).toBe(false);
+    expect(isGlobalKey('lucidos-sw-update-dismissed')).toBe(false);
+    expect(isGlobalKey('lucidos-chunk-reload-at')).toBe(false);
     expect(isGlobalKey('lucidos-focused-thread')).toBe(false);
   });
 
-  it('shouldMigrate: workspace keys yes, global/namespaced/foreign no', () => {
-    expect(shouldMigrate('lucidos-focused-thread')).toBe(true);
-    expect(shouldMigrate('lucidos-nav-history')).toBe(true);
-    expect(shouldMigrate('pinned_apps')).toBe(true);
-    expect(shouldMigrate('file-preview-open')).toBe(true);
-    expect(shouldMigrate('app-window-open')).toBe(true);
-    // dynamic keys
-    expect(shouldMigrate('lucidos-scroll-thread-abc')).toBe(true);
-    expect(shouldMigrate('lucidos-scroll-content-apps')).toBe(true);
-    // excluded
-    expect(shouldMigrate('lucidos-device-id')).toBe(false);
-    expect(shouldMigrate('lucidos-theme')).toBe(false);
-    expect(shouldMigrate('ws:alpha:lucidos-focused-thread')).toBe(false);
-    expect(shouldMigrate('some-other-app-key')).toBe(false);
+  it('shouldSeed: only former-global appearance keys, never device id or per-workspace state', () => {
+    // Seeded once from the legacy raw value so the user's look carries over.
+    expect(shouldSeed('lucidos-theme')).toBe(true);
+    expect(shouldSeed('lucidos-font-family')).toBe(true);
+    expect(shouldSeed('lucidos-ui-scale')).toBe(true);
+    expect(shouldSeed('lucidos-animation-speed-slider')).toBe(true);
+    // Device id is NOT seeded — each workspace gets a fresh identity.
+    expect(shouldSeed('lucidos-device-id')).toBe(false);
+    // Per-workspace state is NOT adopted (contamination fix) — starts clean.
+    expect(shouldSeed('lucidos-focused-thread')).toBe(false);
+    expect(shouldSeed('lucidos-nav-history')).toBe(false);
+    expect(shouldSeed('pinned_apps')).toBe(false);
+    expect(shouldSeed('file-preview-open')).toBe(false);
+    expect(shouldSeed('lucidos-scroll-thread-abc')).toBe(false);
+    // Already-namespaced never re-seeds.
+    expect(shouldSeed('ws:alpha:lucidos-theme')).toBe(false);
   });
 });
 
@@ -151,17 +157,48 @@ describe('installWorkspaceStorage — cross-workspace isolation', () => {
   });
 });
 
-describe('installWorkspaceStorage — device-global keys stay raw', () => {
-  it('device id is written/read at its raw key', () => {
+describe('installWorkspaceStorage — device id + appearance are now scoped', () => {
+  it('device id is per-workspace (namespaced, not raw)', () => {
     const storage = makeStorage();
     installWorkspaceStorage(storage, 'alpha');
     storage.setItem('lucidos-device-id', 'dev-123');
-    expect(rawKeys(storage)).toContain('lucidos-device-id');
-    expect(rawKeys(storage)).not.toContain('ws:alpha:lucidos-device-id');
+    expect(rawKeys(storage)).toContain('ws:alpha:lucidos-device-id');
+    expect(rawKeys(storage)).not.toContain('lucidos-device-id');
     expect(storage.getItem('lucidos-device-id')).toBe('dev-123');
   });
 
-  it('every allowlisted key stays raw', () => {
+  it('two workspaces get independent device identities', () => {
+    const a = makeStorage();
+    const b = makeStorage();
+    installWorkspaceStorage(a, 'alpha');
+    installWorkspaceStorage(b, 'beta');
+    a.setItem('lucidos-device-id', 'id-alpha');
+    b.setItem('lucidos-device-id', 'id-beta');
+    expect(a.getItem('lucidos-device-id')).toBe('id-alpha');
+    expect(b.getItem('lucidos-device-id')).toBe('id-beta');
+  });
+
+  it('theme is per-workspace (namespaced)', () => {
+    const storage = makeStorage();
+    installWorkspaceStorage(storage, 'alpha');
+    storage.setItem('lucidos-theme', 'light');
+    expect(rawKeys(storage)).toContain('ws:alpha:lucidos-theme');
+    expect(rawKeys(storage)).not.toContain('lucidos-theme');
+  });
+
+  it('is idempotent — an already-namespaced key is not double-prefixed', () => {
+    // Guards the SDK-in-parent-realm footgun: a key that already carries the
+    // `ws:<slug>:` prefix (e.g. handed in by the SDK's own _storage helper) must
+    // pass through untouched rather than becoming `ws:slug:ws:slug:key`.
+    const storage = makeStorage();
+    installWorkspaceStorage(storage, 'alpha');
+    storage.setItem('ws:alpha:lucidos-theme', 'light');
+    expect(rawKeys(storage)).toContain('ws:alpha:lucidos-theme');
+    expect(rawKeys(storage)).not.toContain('ws:alpha:ws:alpha:lucidos-theme');
+    expect(storage.getItem('ws:alpha:lucidos-theme')).toBe('light');
+  });
+
+  it('ONLY the picker keys stay raw', () => {
     const storage = makeStorage();
     installWorkspaceStorage(storage, 'alpha');
     for (const k of GLOBAL_KEYS) {
@@ -186,46 +223,62 @@ describe('installWorkspaceStorage — null workspace passes through', () => {
   });
 });
 
-describe('one-time migration', () => {
-  it('moves existing unprefixed workspace keys into the namespace', () => {
+describe('one-time migration (seed appearance, never adopt, fresh device id)', () => {
+  it('seeds appearance keys from legacy raw values, leaving the raw original', () => {
     const storage = makeStorage({
-      'lucidos-focused-thread': 't1',
-      'lucidos-nav-history': 'nav',
-      'pinned_apps': '["a"]',
-      'lucidos-device-id': 'dev-123', // global — must stay
+      'lucidos-theme': 'light',
+      'lucidos-font-family': 'fira-code',
     });
     installWorkspaceStorage(storage, 'alpha');
 
-    expect(storage.getItem('lucidos-focused-thread')).toBe('t1');
-    expect(storage.getItem('lucidos-nav-history')).toBe('nav');
-    expect(storage.getItem('pinned_apps')).toBe('["a"]');
-    // originals removed
+    // appearance carried over into this workspace
+    expect(storage.getItem('lucidos-theme')).toBe('light');
+    expect(storage.getItem('lucidos-font-family')).toBe('fira-code');
     const keys = rawKeys(storage);
-    expect(keys).not.toContain('lucidos-focused-thread');
-    expect(keys).toContain('ws:alpha:lucidos-focused-thread');
-    // device id untouched at raw key
-    expect(keys).toContain('lucidos-device-id');
+    expect(keys).toContain('ws:alpha:lucidos-theme');
+    // legacy raw left as a harmless orphan so a second workspace can seed too
+    expect(keys).toContain('lucidos-theme');
   });
 
-  it('is idempotent — second run moves nothing', () => {
-    const storage = makeStorage({ 'lucidos-nav-history': 'nav' });
-    migrateUnprefixedKeys(storage, 'alpha');
-    // user writes a fresh raw key after migration (pre-override scenario)
-    storage.setItem('lucidos-late-key', 'late');
-    migrateUnprefixedKeys(storage, 'alpha');
-    // the late raw key survives untouched because the marker short-circuits
-    expect(storage.getItem('lucidos-late-key')).toBe('late');
-    expect(rawKeys(storage)).toContain('lucidos-late-key');
-  });
-
-  it('never clobbers an existing namespaced value (newer wins)', () => {
+  it('does NOT adopt cross-contaminated per-workspace keys (the bug fix)', () => {
     const storage = makeStorage({
-      'ws:alpha:lucidos-nav-history': 'new',
-      'lucidos-nav-history': 'old',
+      'lucidos-nav-history': 'phantom-overlay-from-another-workspace',
+      'pinned_apps': '["foreign"]',
+      'lucidos-focused-thread': 't-foreign',
+    });
+    installWorkspaceStorage(storage, 'alpha');
+
+    // none of the foreign per-workspace state bleeds in — clean slate
+    expect(storage.getItem('lucidos-nav-history')).toBe(null);
+    expect(storage.getItem('pinned_apps')).toBe(null);
+    expect(storage.getItem('lucidos-focused-thread')).toBe(null);
+    expect(rawKeys(storage)).not.toContain('ws:alpha:lucidos-nav-history');
+  });
+
+  it('does NOT seed device id — each workspace generates a fresh one', () => {
+    const storage = makeStorage({ 'lucidos-device-id': 'legacy-shared-id' });
+    installWorkspaceStorage(storage, 'alpha');
+    // the legacy shared id is not adopted into the workspace namespace
+    expect(storage.getItem('lucidos-device-id')).toBe(null);
+    expect(rawKeys(storage)).not.toContain('ws:alpha:lucidos-device-id');
+  });
+
+  it('is idempotent — second run seeds nothing new', () => {
+    const storage = makeStorage({ 'lucidos-theme': 'light' });
+    migrateUnprefixedKeys(storage, 'alpha');
+    // user changes the namespaced theme; a re-run must not clobber it back to legacy
+    storage.setItem('ws:alpha:lucidos-theme', 'dark');
+    migrateUnprefixedKeys(storage, 'alpha');
+    expect(storage.getItem('ws:alpha:lucidos-theme' as string)).toBe('dark');
+  });
+
+  it('never clobbers an already-set namespaced appearance value', () => {
+    const storage = makeStorage({
+      'ws:alpha:lucidos-theme': 'dark',
+      'lucidos-theme': 'light',
     });
     migrateUnprefixedKeys(storage, 'alpha');
-    expect(storage.getItem('ws:alpha:lucidos-nav-history' as string)).toBe('new');
-    expect(rawKeys(storage)).not.toContain('lucidos-nav-history');
+    expect(storage.getItem('ws:alpha:lucidos-theme' as string)).toBe('dark');
   });
 
   it('sets the namespaced marker so it runs once', () => {

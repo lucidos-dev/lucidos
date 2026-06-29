@@ -828,6 +828,80 @@ pub(super) async fn delete_preference(
     }
 }
 
+// ===== Network access (per-workspace engine bind) =====
+
+/// GET response for the per-workspace Network access pane. `engine_bind` is this
+/// workspace's own `network_bind` preference; `inherit` + `gateway_bind` are read
+/// from the machine-global `~/.lucidos/network.toml` so the pane can grey out the
+/// engine field (showing the inherited value) when engines inherit the gateway
+/// bind. `detected_tailscale_ip` is a best-effort hint for the IP field.
+#[derive(Serialize)]
+pub(super) struct NetworkConfigResponse {
+    engine_bind: String,
+    inherit: bool,
+    gateway_bind: String,
+    detected_tailscale_ip: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct SetNetworkConfigRequest {
+    engine_bind: String,
+}
+
+/// GET /api/v1/network-config — the per-workspace engine bind + the inherited
+/// machine-global gateway bind, for Settings → System → Network access.
+pub(super) async fn get_network_config(
+    State(state): State<AppState>,
+) -> Result<Json<NetworkConfigResponse>, (StatusCode, String)> {
+    let engine_bind = PreferenceStore::get(&state.pool, crate::net_config::NETWORK_BIND_PREF_KEY)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read network bind preference: {}", e),
+            )
+        })?
+        .unwrap_or_else(|| "loopback".to_string());
+    let net = crate::net_config::read_network_toml();
+    Ok(Json(NetworkConfigResponse {
+        engine_bind,
+        inherit: net.engine_inherit,
+        gateway_bind: net.gateway_bind.unwrap_or_else(|| "loopback".to_string()),
+        detected_tailscale_ip: crate::net_config::detect_tailscale_ipv4().await,
+    }))
+}
+
+/// PUT /api/v1/network-config — set this workspace's engine bind. Validated
+/// server-side (loopback / all / a parseable IP); takes effect on the next
+/// engine restart (a live socket cannot be re-bound).
+pub(super) async fn put_network_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SetNetworkConfigRequest>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    if let Err(msg) = crate::net_config::validate_bind_input(&request.engine_bind) {
+        return Err((StatusCode::BAD_REQUEST, msg));
+    }
+    // Normalize keyword case so the stored value is canonical (the resolver is
+    // case-insensitive, but a clean value reads better in the timeline / file).
+    let value = match request.engine_bind.trim().to_ascii_lowercase().as_str() {
+        "loopback" => "loopback".to_string(),
+        "all" => "all".to_string(),
+        _ => request.engine_bind.trim().to_string(),
+    };
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    // Route through the single preference write chokepoint so it emits
+    // PreferencesChanged like every other settings write.
+    match state
+        .engine
+        .apply_preference_write(crate::net_config::NETWORK_BIND_PREF_KEY, &value, None, actor)
+        .await
+    {
+        Ok(_) => Ok(ApiResult::ok()),
+        Err(e) => Ok(ApiResult::err(format!("Failed to set network bind: {}", e))),
+    }
+}
+
 // ===== Pinned App UIs Endpoints =====
 
 #[derive(Deserialize)]
@@ -1307,6 +1381,13 @@ pub(super) fn router() -> Router<AppState> {
                 .post(create_env_var)
                 .put(update_env_var)
                 .delete(delete_env_var),
+        )
+        // Per-workspace engine network bind (Settings → System → Network
+        // access). The machine-global gateway bind + inherit toggle live on the
+        // gateway control plane (`/~/api/v1/control/network-config`).
+        .route(
+            "/network-config",
+            get(get_network_config).put(put_network_config),
         )
         // Model registry — the DB-backed chat model list (Settings → Models).
         // Drives the Lucidos Agent picker + RoutingProvider provider selection.

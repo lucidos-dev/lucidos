@@ -5,7 +5,7 @@ import {
   stagePluginInstall,
 } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
-import { marketplaceCatalog, panelOverlay, showToast } from '../store';
+import { marketplaceCatalog, panelOverlay, showConfirm, showToast } from '../store';
 import { setLoadingIfFresh, toFailed } from '../types';
 import type { MarketplacePlugin } from '../types';
 import { pushNavState } from './navigation';
@@ -79,6 +79,22 @@ export async function removePluginMarketplaceAction(id: string): Promise<void> {
 }
 
 export async function installMarketplacePlugin(plugin: MarketplacePlugin): Promise<void> {
+  // An update overwrites the plugin's shipped content. If the user has locally
+  // modified that content (the "Modified" badge), warn before staging — the
+  // update will discard their changes. A fresh install, or an update with no
+  // local edits, proceeds straight through.
+  if (plugin.status === 'update_available' && plugin.modified) {
+    const paths = plugin.modified_paths ?? [];
+    const changed = paths.length
+      ? ` Changed: ${paths.slice(0, 6).join(', ')}${paths.length > 6 ? ', …' : ''}.`
+      : '';
+    const ok = await showConfirm(
+      `You've locally modified "${plugin.name}". Updating to v${plugin.version} will overwrite your changes.${changed}`,
+      'Update anyway',
+      { title: 'Overwrite local changes?', variant: 'danger' },
+    );
+    if (!ok) return;
+  }
   try {
     const request = await stagePluginInstall(plugin.source);
     panelOverlay.value = { type: 'form', form: { type: 'plugin-install', request } };

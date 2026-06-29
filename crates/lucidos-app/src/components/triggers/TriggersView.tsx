@@ -56,7 +56,7 @@ export function TriggersView() {
   return (
     <div class="content-view active">
       <div class="list-rows">
-        <LoadingFade showSkeleton={showTriggersLoading} skeleton={<ListSkeleton />}>
+        <LoadingFade showSkeleton={showTriggersLoading} skeleton={<ListSkeleton fill />}>
           {triggersLoadable.status === 'loaded' ? (
             <TriggersLoaded
               triggersData={triggersLoadable.data}

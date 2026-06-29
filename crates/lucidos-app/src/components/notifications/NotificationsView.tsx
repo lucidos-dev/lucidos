@@ -82,7 +82,7 @@ export function NotificationsView() {
       {loadable.status === 'failed' ? (
         <LoadableError noun="notifications" error={loadable.error} />
       ) : (
-        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton fill />}>
           {loadable.status === 'loaded' ? (
             items.length === 0 ? (
               <div class="empty-state">{emptyMessage}</div>

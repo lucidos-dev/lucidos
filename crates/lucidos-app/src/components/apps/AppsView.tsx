@@ -62,7 +62,7 @@ export function AppsView() {
     body = <LoadableError noun="apps" error={loadable.error} />;
   } else {
     body = (
-      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton fill />}>
         {loadable.status === 'loaded'
           ? (() => {
               const pluginInfo = pluginInfoByAppId();

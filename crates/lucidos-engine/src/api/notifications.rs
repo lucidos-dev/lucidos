@@ -202,10 +202,17 @@ pub(super) async fn mark_notification_read(
                 }
             })
             .await;
-        // No cross-device read-marker push — see work-tracker
-        // `pwa-read-on-another-device-noise`. OS-level banners on other
-        // devices persist until manually swiped; in-app unread state still
-        // syncs via the `NotificationRead` SSE event above.
+        // Cross-device dismiss (macOS desktop only): tell any connected Tauri
+        // app to REMOVE the already-delivered native banner for this id. The
+        // open web can't silently remove a Web Push banner (Safari revokes a
+        // subscription after 3 silent pushes), so browser / PWA banners still
+        // persist until manually swiped; in-app unread state syncs via the
+        // `NotificationRead` SSE above. See notifications.md §4.
+        crate::scheduler::push::emit_native_push_dismiss_requested(
+            &state.engine.event_bus,
+            Some(id),
+        )
+        .await;
     }
 
     Ok(Json(MarkReadResponse { success }))
@@ -233,8 +240,14 @@ pub(super) async fn mark_all_notifications_read(
                 crate::engine::event_bus::SystemEvent::NotificationsAllRead { actor }
             })
             .await;
-        // No cross-device read-marker push — see work-tracker
-        // `pwa-read-on-another-device-noise`.
+        // Cross-device dismiss (macOS desktop only): `None` = remove ALL
+        // delivered native banners on connected Tauri apps. Web / PWA banners
+        // persist (no silent Web Push removal). See notifications.md §4.
+        crate::scheduler::push::emit_native_push_dismiss_requested(
+            &state.engine.event_bus,
+            None,
+        )
+        .await;
     }
 
     Ok(Json(MarkReadResponse { success: count > 0 }))

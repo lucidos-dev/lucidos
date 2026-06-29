@@ -81,6 +81,66 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** active
 - **Investigation:** `ios-pwa-blackout`
 
+### Thread-render blank-body probe
+
+- **Added:** 2026-06-28
+- **Lives in:** `crates/lucidos-app/src/utils/threadRenderProbe.ts`
+  (`reportThreadRenderProbe` / `classifyThreadRender`) + its call sites in
+  `crates/lucidos-app/src/components/chat/ThreadView.tsx` (the settle-probe effect
+  and the `rebuild_corrupted_thread` breadcrumb in the corruption watchdog). Posts
+  to the engine's `/api/v1/internal/client-log` endpoint → engine.log
+  `[Client/render]` lines.
+- **Impermanent because:** Pure telemetry to chase the "thread summary renders but
+  the conversation body is blank, recovers on scroll" report on the iOS PWA. The
+  data is confirmed present in the DB for every instance, so the fault is downstream
+  of the store, but a compositor PAINT loss is invisible to JS — the probe captures
+  the discriminating facts (last-rendered vs. fresh-recomputed exchange counts,
+  content-DOM child count + height, `animating`, channel) a fixed delay after a
+  thread settles and folds them into a class (`missed-rerender` / `empty-render` /
+  `dom-missing` / `content-present`) so the next repro distinguishes a stale render
+  from a render gap from paint loss. Compensates for nothing in the design.
+  **2026-06-29 finding:** every probe in a full afternoon of iOS-PWA use
+  (~24 samples) classified `content-present` — zero render-side classes — so the
+  blank is confirmed to be compositor **paint loss**, not a store/render fault.
+  That drove the scroll-nudge repaint escalation below; the probe stays until the
+  fix is confirmed to keep the blank from surfacing over a usage window.
+- **Removal / resolution condition:** When the **iOS-PWA blackout investigation**
+  (`ios-pwa-blackout`) is closed — i.e. the blank-body root cause is identified and
+  fixed and the `[Client/render] thread_render_probe` breadcrumb is no longer needed
+  to confirm it. Verify no open work relies on the `class` field, then delete
+  `threadRenderProbe.ts` + its test and remove the settle-probe effect and the
+  `rebuild_corrupted_thread` breadcrumb call from `ThreadView.tsx`. (The
+  paired repaint hardening — the extended `OPEN_REPAINT_BURST_DELAYS_MS` tail, the
+  settle re-burst, and the `forceIOSRepaint` scroll-nudge + forced layout-read
+  escalation [`docs/plans/2026-06-29-ios-pwa-blank-thread-scroll-nudge-repaint.md`]
+  — is a real fix, NOT telemetry, and stays.)
+- **Status:** active
+- **Investigation:** `ios-pwa-blackout`
+
+### Click-lag main-thread blocker probe
+
+- **Added:** 2026-06-24 (registered 2026-06-29 by the nightly harden sweep — the
+  probe predated this row)
+- **Lives in:** `crates/lucidos-app/src/utils/perfProbe.ts` (`startPerfProbe`) +
+  its call site in `crates/lucidos-app/src/main.tsx` (`startPerfProbe()`, guarded
+  by `!IS_PICKER`, with the `TEMP:` comment). Logs `[perf-probe]` lines to the
+  browser console only (no engine post).
+- **Impermanent because:** Pure diagnostic chasing the "button/drawer clicks slow
+  to register" lag in the dev workspace. It wires three `PerformanceObserver`s
+  (Event Timing, Long Animation Frames, long tasks) that stay quiet below their
+  thresholds and, on a slow interaction, split the cost into input-delay / handler
+  / render and name the script behind a long frame — the discriminating "JS
+  re-render vs DOM layout vs paint" signal. Compensates for nothing in the design;
+  its own header says "REMOVE once the cause is found."
+- **Removal / resolution condition:** When the **click-lag investigation**
+  (`click-lag`) is closed — the main-thread blocker behind the laggy clicks is
+  identified and fixed and the `[perf-probe]` console lines are no longer needed to
+  reproduce or confirm it. Verify no open work relies on the `[perf-probe]` output,
+  then delete `perfProbe.ts` and remove the `startPerfProbe()` call + import +
+  `TEMP:` comment from `main.tsx`.
+- **Status:** active
+- **Investigation:** `click-lag`
+
 ---
 
 ## 2. Model-tolerance measures
@@ -149,4 +209,21 @@ measure now eligible for removal** — search this file for the id to find them 
   reports) over a representative iOS-PWA usage window. On close, flip every measure
   tagged `Investigation: ios-pwa-blackout` to `removed` per its own removal steps.
 - **Status:** open
-- **Measures referencing this investigation:** iOS-PWA liveness diagnostic (§1).
+- **Measures referencing this investigation:** iOS-PWA liveness diagnostic (§1),
+  Thread-render blank-body probe (§1).
+
+### `click-lag` — button/drawer clicks slow to register (dev workspace)
+
+- **Opened:** 2026-06-24 (registered 2026-06-29 by the nightly harden sweep)
+- **Lives in:** n/a (investigation)
+- **Impermanent because:** An investigation closes once its question is answered.
+  Button and drawer clicks intermittently feel slow to register in the dev
+  workspace; the cause — a main-thread blocker (long JS re-render, forced layout,
+  or paint loss) — is not yet pinned. The probe built to chase it (see measure
+  below) exists only until the cause is understood and fixed.
+- **Removal / resolution condition:** Root cause identified and fixed, confirmed by
+  the absence of fresh threshold-crossing `[perf-probe]` lines during normal
+  dev-workspace interaction. On close, flip every measure tagged
+  `Investigation: click-lag` to `removed` per its own removal steps.
+- **Status:** open
+- **Measures referencing this investigation:** Click-lag main-thread blocker probe (§1).

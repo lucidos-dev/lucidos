@@ -5,6 +5,7 @@ import type { DeviceInfo } from '../../api/types';
 import { registerDevice as apiRegisterDevice, listDevices as apiListDevices, renameDevice as apiRenameDevice, setDevicePush as apiSetDevicePush, deleteDevice as apiDeleteDevice, setPreference } from '../../api/client';
 import { showToast, showConfirm } from '../store';
 import { errorDetail } from '../../utils/errorDetail';
+import { isTauri, registrationUserAgent } from '../../utils/platform';
 
 const DEVICE_ID_KEY = 'lucidos-device-id';
 
@@ -25,7 +26,10 @@ export function getDeviceId(): string {
 export async function registerCurrentDevice(): Promise<void> {
   const deviceId = getDeviceId();
   try {
-    await apiRegisterDevice(deviceId, navigator.userAgent);
+    // Tag the registered UA with the desktop-app token when in Tauri, so the
+    // engine (and the Lucidos Agent's device context) can tell the native
+    // desktop client from a browser and give the right notification advice.
+    await apiRegisterDevice(deviceId, registrationUserAgent(navigator.userAgent, isTauri()));
   } catch (e) {
     // Telemetry carve-out (.claude/rules/frontend.md): startup probe runs on
     // every page load without user intent. A toast on every transient backend

@@ -43,7 +43,7 @@ pub fn get_save_thread_image_tool() -> ToolDefinition {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Destination path relative to data/artifacts/ (e.g., 'projects/allergi/photo.jpg'). The image is committed to git."
+                    "description": "Destination path relative to data/artifacts/ (e.g., 'projects/reports/photo.jpg'). The image is committed to git."
                 }
             },
             "required": ["image", "path"]

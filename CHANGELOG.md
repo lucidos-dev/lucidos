@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.14.0 — 2026-06-29
+
+### Added
+- **Network access UI** — configure the engine/gateway network bind from Settings and the workspace picker; durable scope-split bind (gateway machine-global, engine per-workspace), with click-to-fill of the detected Tailscale IP.
+- **Plugin Modified badge** — the Plugins list now shows a per-plugin *Modified* state derived from the install commit, and warns before an update would overwrite local edits.
+- **App-icon unread badges** — native dock-icon badge with the aggregate unread total, per-workspace PWA app-icon badges, and gateway-aggregated per-workspace counts.
+- **Cross-device native notification dismiss** — dismissing a notification on one device removes the delivered native banner(s) on your other desktop devices.
+- **Documentation site** — mkdocs-material docs site with anti-drift transclusion and deploy-on-release.
+- **Public-repo RC gate (CI)** — clean-machine source install + signed-DMG verification on fresh macOS/Ubuntu runners before publish.
+
+### Changed
+- **Vertex AI region** moved into the Settings → Providers section.
+- **OAuth account resolution** — provider tokens now resolve to the newest connected account; the Accounts UI shows a created date per account.
+- Sleeker Network access modal; skeletons fill the full content height; notification-detail title sized to match the list row.
+
+### Fixed
+- **Security hardening** — engine API now defaults to a loopback bind (opt in to all-interfaces via `LUCIDOS_BIND_ALL`); gateway control plane is authorized against app iframes; WASM signer execution budget + credential-leak scrubbing; scoped credential-URL matching.
+- **Networking** — retain loopback when binding a specific address; bounded gateway boot-splash escape; route us/eu Vertex multi-region locations to the `rep.googleapis.com` host.
+- **Workspace storage** — workspace-scope *all* browser storage (theme, device-id) with an idempotent namespacing override and a regression guard.
+- **Frontend recovery** — recover gracefully from navigating into an unreachable workspace; gate the picker skeleton behind a 300ms delay to stop the fast-load flash.
+- **iOS PWA** — fix the blank thread body (compositor paint loss) via a scroll-nudge + forced layout flush.
+- **Notifications** — reliable native desktop banners with durable deeplink; the agent is now aware it's running in the Tauri desktop app.
+- **Cross-platform install** — OS-aware sleep/clamshell prevention so Linux source installs run clean.
+- Muted-gold light-mode warning toast.
 ## v0.13.1 — 2026-06-28
 
 ### Fixed

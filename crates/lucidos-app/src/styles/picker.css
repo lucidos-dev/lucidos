@@ -98,6 +98,144 @@
   }
 }
 
+/* Network access control — pinned to the header's top-LEFT (the reload control
+   owns top-right) so it stays clear of the centered brand. Mirrors the reload
+   control's subtle styling. */
+.ws-picker-net-btn {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: none;
+  border-radius: 0.5rem;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.55);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.ws-picker-net-btn svg {
+  width: 1.125rem;
+  height: 1.125rem;
+}
+.ws-picker-net-btn:hover {
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+}
+.ws-picker-net-btn:disabled {
+  cursor: default;
+}
+
+/* Network access popover (anchored to the gear). Wider than the small confirm
+   popovers since it holds a form. Inherits ws-picker-confirm's chrome. Tuned for
+   a compact, refined rhythm: secondary prose uses translucent white (the picker's
+   white-on-blue stand-in for --text-secondary, applied via color not opacity so
+   the accent inside it stays full-strength). */
+.ws-picker-net {
+  width: min(21rem, calc(100vw - 2rem));
+  text-align: left;
+}
+.ws-picker-net-title {
+  margin: 0 0 0.25rem;
+  font-size: 0.9375rem;
+  font-weight: 600;
+}
+.ws-picker-net-desc {
+  margin: 0 0 0.625rem;
+  font-size: 0.8125rem;
+  color: rgba(255, 255, 255, 0.62);
+  line-height: 1.4;
+}
+
+/* Three-mode bind picker as a single connected segmented control: an inset
+   track holds equal-width segments, the selected one lifts to a white thumb
+   (the picker's accent idiom — matching the unread badge / play pill). */
+.ws-picker-net-modes {
+  display: flex;
+  gap: 0.1875rem;
+  padding: 0.1875rem;
+  margin-bottom: 0.5rem;
+  background: rgba(0, 0, 0, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 0.5rem;
+}
+.ws-picker-net-mode {
+  flex: 1 1 0;
+  padding: 0.375rem 0.25rem;
+  border: none;
+  border-radius: 0.375rem;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 0.75rem;
+  font-weight: 500;
+  line-height: 1.25;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.ws-picker-net-mode:hover:not(.active) {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
+.ws-picker-net-mode.active {
+  background: rgba(255, 255, 255, 0.92);
+  color: #0c3f86;
+  font-weight: 600;
+  box-shadow: 0 0.0625rem 0.1875rem rgba(3, 25, 60, 0.35);
+}
+.ws-picker-net-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.625rem;
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
+.ws-picker-net-hint {
+  margin: 0.25rem 0 0;
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.6);
+  line-height: 1.4;
+}
+/* The detected Tailscale IP is a click-to-fill affordance: accent-tinted and
+   underlines on hover, so one tap drops it into the address field. Full-strength
+   color (its parent hint uses color, not opacity) so it reads as interactive. */
+.ws-picker-net-detected {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-weight: 600;
+  color: #bcd8ff;
+  cursor: pointer;
+  border-radius: 0.25rem;
+}
+.ws-picker-net-detected:hover,
+.ws-picker-net-detected:focus-visible {
+  color: #e7f1ff;
+  text-decoration: underline;
+  outline: none;
+}
+.ws-picker-net-error {
+  display: block;
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  color: #ffd9d4;
+}
+.ws-picker-net-restart {
+  margin: 0.625rem 0 0;
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.7);
+  font-style: italic;
+}
+/* A touch of breathing room above Save / Cancel after the compacted body. */
+.ws-picker-net .ws-picker-confirm-actions {
+  margin-top: 0.75rem;
+}
+
 /* Brand lockup: the animated mark with the wordmark vertically centered to it,
    the pair centered horizontally in the header. */
 .ws-picker-brand {
@@ -312,6 +450,27 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Per-workspace unread-notification count. Sits between the (flex-grow) name and
+ * the row actions, so a long name ellipsizes before crowding the badge. A calm
+ * white-on-translucent pill — distinct from the status dot's green/gold/red so it
+ * reads as a count, not a health state. */
+.ws-picker-badge {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.25rem;
+  height: 1.25rem;
+  padding: 0 0.375rem;
+  border-radius: 0.625rem;
+  background: rgba(255, 255, 255, 0.92);
+  color: #0a3d91;
+  font-size: 0.75rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
 }
 
 .ws-picker-actions {

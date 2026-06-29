@@ -27,6 +27,12 @@ pub struct HostState {
     pub secrets: Vec<Vec<u8>>,
     /// Module name for log prefixing.
     pub module_name: String,
+    /// Sensitive substrings that must be scrubbed from anything the module
+    /// emits through the `log` host import — the resolved secret material (in
+    /// its various encodings) plus the auth-header/token values handed to this
+    /// signer via `prior_layer_outputs`. Without this a buggy/hostile signer
+    /// could `log()` an upstream `script_handshake` auth token into engine logs.
+    pub log_redactions: Vec<String>,
 }
 
 // ---- Pure-Rust primitive helpers (no wasmtime types) -------------------
@@ -335,6 +341,10 @@ pub fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), wasmt
                 Err(_) => return,
             };
             let msg = String::from_utf8_lossy(&bytes);
+            // Scrub secret material before it reaches the log — a signer can
+            // see upstream auth tokens (via prior_layer_outputs) and could echo
+            // them here.
+            let msg = crate::core::redact_secret_values(&msg, &caller.data().log_redactions);
             let module_name = caller.data().module_name.clone();
             crate::log!("[wasm-signer:{}] {}", module_name, msg);
         },

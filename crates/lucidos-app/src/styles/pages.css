@@ -463,6 +463,21 @@
     border-color: color-mix(in srgb, var(--accent-green) 35%, var(--border-color));
 }
 
+/* "Modified" badge — the plugin's shipped content has been locally edited
+   (a future update overwrites it). Amber to read as caution, matching the
+   status-pill shape it sits beside. */
+.app-store-modified-chip {
+    flex: 0 0 auto;
+    padding: 0.125rem 0.375rem;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--accent-yellow) 35%, var(--border-color));
+    color: var(--accent-yellow);
+    font-size: 0.68rem;
+    font-weight: 700;
+    line-height: 1.2;
+    cursor: default;
+}
+
 .app-store-plugin-meta {
     display: flex;
     flex-wrap: wrap;

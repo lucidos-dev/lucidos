@@ -654,7 +654,7 @@ async fn installed_summary_surfaces_setup_thread_and_app_id() {
     .await
     .expect("install with a setup thread must succeed");
 
-    let summaries = super::installed_plugin_summaries(&pool)
+    let summaries = super::installed_plugin_summaries(&pool, &scratch)
         .await
         .expect("read installed summaries");
     let plugin = summaries
@@ -689,7 +689,7 @@ async fn installed_summary_omits_setup_and_app_when_absent() {
         .await
         .expect("install must succeed");
 
-    let summaries = super::installed_plugin_summaries(&pool)
+    let summaries = super::installed_plugin_summaries(&pool, &scratch)
         .await
         .expect("read installed summaries");
     let plugin = summaries

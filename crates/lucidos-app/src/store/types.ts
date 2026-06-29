@@ -444,6 +444,13 @@ export interface InstalledPlugin {
   app_id?: string;
   content: string[];
   files: string[];
+  /** True when the user has locally modified the plugin's shipped content since
+   *  install (derived server-side by diffing the current content against the
+   *  install commit). Drives the Plugins-list "Modified" badge. */
+  modified?: boolean;
+  /** The data/-relative paths that currently differ from the install (the badge
+   *  tooltip). Empty/absent unless `modified`. */
+  modified_paths?: string[];
 }
 
 
@@ -570,6 +577,14 @@ export interface MarketplacePlugin {
   /** The plugin's primary app (`data/apps/<id>/`), if it ships one. The card's
    *  "Open" button launches it; absent → nothing to open. */
   app_id?: string;
+  /** True when the user has locally modified the plugin's shipped content since
+   *  install (overlaid from the installed projection). Always false/absent for an
+   *  available (not-installed) catalog row. Drives the "Modified" badge and the
+   *  update-overwrite warning. */
+  modified?: boolean;
+  /** The data/-relative paths that currently differ from the install (the badge
+   *  tooltip + the update-warning detail). Empty/absent unless `modified`. */
+  modified_paths?: string[];
 }
 
 export interface MarketplaceScanError {

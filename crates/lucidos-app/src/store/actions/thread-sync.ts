@@ -14,6 +14,8 @@ import {
 import {
   handleNativePushRequested,
   type NativePushRequestedPayload,
+  handleNativePushDismiss,
+  type NativePushDismissRequestedPayload,
 } from './native-push';
 import { addRestartGroup } from './chat-changes';
 import { changeToastMessage } from './changeToast';
@@ -753,6 +755,15 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // receive the web push. Browser / PWA pages ignore it (handleNativePush-
       // Requested gates on isTauri). See system-knowhow/notifications.md §4.
       handleNativePushRequested(data as unknown as NativePushRequestedPayload);
+      break;
+
+    case 'NativePushDismissRequested':
+      // A notification was read (here or on another device); the engine asks a
+      // connected Tauri desktop app to REMOVE its already-delivered native
+      // banner(s). Browser / PWA pages ignore it (handleNativePushDismiss gates
+      // on isTauri — the open web can't silently remove a Web Push banner). See
+      // system-knowhow/notifications.md §4.
+      handleNativePushDismiss(data as unknown as NativePushDismissRequestedPayload);
       break;
 
     case 'PreferencesChanged':

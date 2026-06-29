@@ -88,14 +88,17 @@
       truth for the user's theme/font/scale (preferences.ts mirrors every
       change there); reading it synchronously before any stylesheet
       evaluates makes first paint match the user's choice without a cookie
-      or DB roundtrip. Same-origin iframes (sandbox includes
-      allow-same-origin) inherit the same localStorage, so the parent and
-      every app iframe agree on first-paint values.
+      or DB roundtrip. These keys are PER-WORKSPACE (workspaceStorage.ts),
+      so they live under `ws:<slug>:…`. This script runs before the app
+      bundle installs the namespacing override, so it prefixes by hand via
+      `wsKey()` (slug from the stamped <base href>, mirroring basePath.ts).
+      Same-origin app iframes derive the SAME slug from their `/<slug>/…`
+      URL (sdk_prefs.rs + sdk/_storage.ts), so the parent and every app
+      iframe agree on first-paint values.
     -->
     <script>
       (function() {
         var d = document.documentElement;
-        var raw = localStorage.getItem('lucidos-theme');
         // The workspace picker (gateway sigil surface, <base href="/~/">) is a
         // pre-workspace page that renders standalone — preferences.ts never runs
         // on it, so this FOUC resolve is its ONLY theme application. With no
@@ -103,6 +106,17 @@
         // is saved on this origin, instead of the app's dark default.
         var baseEl = document.querySelector('base');
         var isPicker = !!baseEl && baseEl.getAttribute('href') === '/~/';
+        // Per-workspace key namespacing (mirrors workspaceStorage.ts +
+        // basePath.ts). Slug from the stamped <base href="/<slug>/">; picker
+        // (/~/) and legacy root (/) → no slug → raw key (their own fallback).
+        var wsSlug = (function () {
+          var href = baseEl && baseEl.getAttribute('href');
+          if (!href) return null;
+          var seg = href.replace(/^\/+|\/+$/g, '');
+          return (seg === '' || seg === '~') ? null : seg;
+        })();
+        function wsKey(name) { return wsSlug ? 'ws:' + wsSlug + ':' + name : name; }
+        var raw = localStorage.getItem(wsKey('lucidos-theme'));
         var fallbackTheme = isPicker ? 'system' : 'dark';
         var theme = (raw === 'light' || raw === 'dark' || raw === 'system') ? raw : fallbackTheme;
         var mqLight = matchMedia('(prefers-color-scheme: light)').matches;
@@ -122,14 +136,14 @@
           'ibm-plex-mono': "'IBM Plex Mono', monospace",
           'fira-code': "'Fira Code', monospace"
         };
-        var fontKey = localStorage.getItem('lucidos-font-family');
+        var fontKey = localStorage.getItem(wsKey('lucidos-font-family'));
         d.style.setProperty('--font-ui', FONTS[fontKey] || FONTS.monospace);
         // Programming ligatures, only for fonts that ship them (Fira Code);
         // every other font gets `normal` (CSS initial → unchanged). Mirrors
         // FONT_FEATURES in preferences.ts and the same map in api/sdk_prefs.rs.
         var FEATURES = { 'fira-code': '"liga" 1, "calt" 1' };
         d.style.setProperty('font-feature-settings', FEATURES[fontKey] || 'normal');
-        var scale = localStorage.getItem('lucidos-ui-scale');
+        var scale = localStorage.getItem(wsKey('lucidos-ui-scale'));
         if (scale) {
           // Snap to the 12.5% grid (see UI_SCALE_STEP) so a pre-grid saved
           // value like "115" doesn't paint at 115% for one frame before the
@@ -181,7 +195,7 @@
             window.__themeLogEvt('pageshow', {
               persisted: e.persisted,
               dataTheme: d.getAttribute('data-theme'),
-              rawNow: localStorage.getItem('lucidos-theme'),
+              rawNow: localStorage.getItem(wsKey('lucidos-theme')),
               mqLightNow: matchMedia('(prefers-color-scheme: light)').matches
             });
           });

@@ -4,11 +4,13 @@
 //! `check_plugin_updates` survey. Read-only over the event store.
 
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::core::plugin_marketplaces::InstalledPluginSummary;
 use crate::core::plugins::{self, compare_versions, PluginManifest, UpdateDecision};
 use crate::core::DATA_DIR;
+use crate::triggers::definition::TriggerDefinition;
 
 use super::source::{detect_source, fetch_source};
 
@@ -79,6 +81,7 @@ async fn project_installs(
 
 pub(crate) async fn installed_plugin_summaries(
     pool: &sqlx::PgPool,
+    workspace_path: &Path,
 ) -> Result<Vec<InstalledPluginSummary>, Box<dyn std::error::Error + Send + Sync>> {
     Ok(project_installs(pool)
         .await?
@@ -89,6 +92,7 @@ pub(crate) async fn installed_plugin_summaries(
             let app_id = primary_app_id(&files, &id);
             let content =
                 crate::core::plugin_marketplaces::content_dirs_from_files(files.iter().map(String::as_str));
+            let status = plugin_modification_status(workspace_path, &rec);
             InstalledPluginSummary {
                 id: id.clone(),
                 name: rec.name().unwrap_or(&id).to_string(),
@@ -98,6 +102,8 @@ pub(crate) async fn installed_plugin_summaries(
                 app_id,
                 content,
                 files,
+                modified: status.modified,
+                modified_paths: status.modified_paths,
             }
         })
         .collect())
@@ -170,6 +176,18 @@ impl InstalledRecord {
         self.payload
             .pointer("/data/manifest/manifest/setup")
             .and_then(|v| v.as_str())
+    }
+    /// The workspace-repo commit sha captured when this version was installed
+    /// (the "Install plugin: <id> v<version>" commit). The baseline
+    /// [`plugin_modification_status`] diffs the plugin's current on-disk content
+    /// against to decide whether the user has locally modified it. `None` for
+    /// legacy rows installed before the sha was recorded — those degrade to
+    /// "not modified" (no baseline to diff against).
+    pub(crate) fn commit(&self) -> Option<&str> {
+        self.payload
+            .pointer("/data/manifest/commit")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
     }
 }
 
@@ -406,6 +424,158 @@ pub(crate) async fn find_plugin_owning_app(
     Ok(None)
 }
 
+/// Whether a plugin's shipped content currently differs from what it installed,
+/// and which `data/`-relative paths differ. Derived on read (git + disk); never
+/// stored.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ModificationStatus {
+    pub(crate) modified: bool,
+    pub(crate) modified_paths: Vec<String>,
+}
+
+/// Compare two trigger definitions on their *functional* fields only — ignoring
+/// `slug` (normalized to the directory name at registration), `plugin_id`
+/// (stamped at registration, absent in the shipped authored file), and
+/// `group_id` (user-organizational, not a content edit). Used for the trigger
+/// arm of [`plugin_modification_status`], because `trigger.toml` is a gitignored,
+/// re-serialized projection (ADR 0019) whose bytes drift from the shipped form on
+/// every rebuild — only a semantic compare is meaningful.
+fn trigger_functional_eq(a: &TriggerDefinition, b: &TriggerDefinition) -> bool {
+    let normalize = |d: &TriggerDefinition| {
+        let mut d = d.clone();
+        d.slug = String::new();
+        d.plugin_id = None;
+        d.group_id = None;
+        d
+    };
+    normalize(a) == normalize(b)
+}
+
+/// Decide whether the user has locally modified a plugin's shipped content since
+/// it was installed, and list the changed `data/`-relative paths. Pure read over
+/// the workspace git repo + disk — no stored state, so it self-heals when an edit
+/// is reverted and resets when the plugin is updated (the new install commit is
+/// the fresh baseline).
+///
+/// Per content type, against the plugin's install commit:
+/// - **app dirs** (`apps/<id>/`): a tree→workdir diff (including untracked files)
+///   scoped to the dir — catches edits, deletes, and user-ADDED files in the app.
+/// - **flat files** (`knowhow/` / `scripts/` / `auth-modules/` and any non-
+///   `trigger.toml` file the plugin recorded): the same diff scoped to each
+///   recorded path — edits/deletes only (a brand-new file in those shared roots
+///   isn't attributable to the plugin).
+/// - **triggers** (`triggers/<slug>/trigger.toml`): NOT byte-diffed — the file is
+///   a gitignored, re-serialized projection, so the shipped definition (parsed
+///   from the install-commit blob) is compared field-by-field against the current
+///   on-disk definition via [`trigger_functional_eq`].
+///
+/// Returns not-modified for a legacy record with no recorded install commit, or
+/// when the repo / commit can't be opened (best-effort — a badge is not worth
+/// erroring a list load over).
+pub(crate) fn plugin_modification_status(
+    workspace_path: &Path,
+    record: &InstalledRecord,
+) -> ModificationStatus {
+    let unmodified = ModificationStatus::default();
+    let Some(commit_sha) = record.commit() else {
+        return unmodified;
+    };
+    let files = record.files();
+
+    // Partition recorded files by how each content type must be compared.
+    let mut app_dirs: BTreeSet<String> = BTreeSet::new();
+    let mut flat_files: Vec<String> = Vec::new();
+    let mut trigger_files: Vec<String> = Vec::new();
+    for f in &files {
+        if let Some(rest) = f.strip_prefix("apps/") {
+            if let Some(seg) = rest.split('/').next().filter(|s| !s.is_empty()) {
+                app_dirs.insert(format!("apps/{}", seg));
+                continue;
+            }
+        }
+        if f.starts_with("triggers/") && f.ends_with("/trigger.toml") {
+            trigger_files.push(f.clone());
+            continue;
+        }
+        flat_files.push(f.clone());
+    }
+
+    let repo = match git2::Repository::open(workspace_path) {
+        Ok(r) => r,
+        Err(_) => return unmodified,
+    };
+    let tree = match repo
+        .revparse_single(commit_sha)
+        .and_then(|obj| obj.peel_to_commit())
+        .and_then(|c| c.tree())
+    {
+        Ok(t) => t,
+        Err(_) => return unmodified,
+    };
+
+    let mut changed: BTreeSet<String> = BTreeSet::new();
+
+    // App dirs + flat files: one tree→workdir diff scoped to their pathspecs.
+    // Skip entirely when there are none, since an empty pathspec set would diff
+    // the whole tree.
+    if !app_dirs.is_empty() || !flat_files.is_empty() {
+        let mut opts = git2::DiffOptions::new();
+        opts.include_untracked(true).recurse_untracked_dirs(true);
+        for dir in &app_dirs {
+            opts.pathspec(format!("data/{}", dir));
+        }
+        for f in &flat_files {
+            opts.pathspec(format!("data/{}", f));
+        }
+        if let Ok(diff) = repo.diff_tree_to_workdir_with_index(Some(&tree), Some(&mut opts)) {
+            for delta in diff.deltas() {
+                for path in [delta.old_file().path(), delta.new_file().path()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Ok(rel) = path.strip_prefix("data") {
+                        if let Some(rel) = rel.to_str() {
+                            if !rel.is_empty() {
+                                changed.insert(rel.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Triggers: semantic compare of the shipped vs current definition.
+    for tf in &trigger_files {
+        let shipped = tree
+            .get_path(Path::new(&format!("data/{}", tf)))
+            .ok()
+            .and_then(|entry| repo.find_blob(entry.id()).ok())
+            .map(|blob| blob.content().to_vec())
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|text| TriggerDefinition::from_toml(&text).ok());
+        let Some(shipped) = shipped else {
+            // No baseline blob (legacy / not committed) → can't judge; skip.
+            continue;
+        };
+        let current = std::fs::read_to_string(workspace_path.join(DATA_DIR).join(tf))
+            .ok()
+            .and_then(|text| TriggerDefinition::from_toml(&text).ok());
+        match current {
+            Some(current) if trigger_functional_eq(&shipped, &current) => {}
+            // Differs, or the projection is gone (trigger removed) → modified.
+            _ => {
+                changed.insert(tf.clone());
+            }
+        }
+    }
+
+    ModificationStatus {
+        modified: !changed.is_empty(),
+        modified_paths: changed.into_iter().collect(),
+    }
+}
+
 /// `check_plugin_updates(id?)` core. With `id == None`, surveys every
 /// currently-installed plugin (newest `PluginInstalled` not followed by
 /// `PluginUninstalled`); otherwise checks just the named plugin. Returns the
@@ -558,7 +728,9 @@ mod tests {
         .await
         .expect("seed PluginInstalled");
 
-        let summaries = installed_plugin_summaries(&pool).await.expect("summaries");
+        let summaries = installed_plugin_summaries(&pool, std::path::Path::new("."))
+            .await
+            .expect("summaries");
         let demo = summaries
             .iter()
             .find(|s| s.id == "demo")
@@ -593,7 +765,9 @@ mod tests {
         .await
         .expect("seed PluginInstalled");
 
-        let summaries = installed_plugin_summaries(&pool).await.expect("summaries");
+        let summaries = installed_plugin_summaries(&pool, std::path::Path::new("."))
+            .await
+            .expect("summaries");
         let notes = summaries
             .iter()
             .find(|s| s.id == "notes-only")
@@ -603,5 +777,184 @@ mod tests {
         assert!(notes.app_id.is_none());
 
         teardown_test_db(&db_name).await;
+    }
+}
+
+/// Tests for [`plugin_modification_status`] — pure over git + disk, no DB.
+#[cfg(test)]
+mod modification_status_tests {
+    use super::{plugin_modification_status, InstalledRecord};
+    use crate::triggers::config::TriggerRun;
+    use crate::triggers::definition::TriggerDefinition;
+    use std::path::{Path, PathBuf};
+
+    fn temp_workspace() -> PathBuf {
+        let p = std::env::temp_dir().join(format!("lucidos_modstatus_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(p.join("data")).unwrap();
+        git2::Repository::init(&p).unwrap();
+        p
+    }
+
+    fn write_data(ws: &Path, rel: &str, content: &str) {
+        let p = ws.join("data").join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, content).unwrap();
+    }
+
+    /// Stage shipped files on disk and make the install commit; return its sha.
+    fn install_commit(ws: &Path, files: &[&str]) -> String {
+        let rels: Vec<String> = files.iter().map(|s| s.to_string()).collect();
+        crate::core::commit_data_paths_added(ws, &rels, "Install plugin: demo v1.0.0").unwrap()
+    }
+
+    /// An `InstalledRecord` whose payload carries `commit` (when `Some`) + `files`,
+    /// mirroring the real `PluginInstalled` payload shape `InstalledRecord` reads.
+    fn record(commit: Option<&str>, files: &[&str]) -> InstalledRecord {
+        let mut manifest = serde_json::json!({
+            "manifest": { "id": "demo", "name": "Demo", "version": "1.0.0" },
+        });
+        if let Some(c) = commit {
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .insert("commit".into(), serde_json::json!(c));
+        }
+        InstalledRecord {
+            payload: serde_json::json!({ "data": { "manifest": manifest, "files": files } }),
+        }
+    }
+
+    const TRIGGER_TOML: &str = "name = \"Watcher\"\n\n[[on]]\nevent_type = \"FooHappened\"\n\n[run]\ntype = \"intent\"\nintent = \"do the thing\"\n";
+
+    #[test]
+    fn clean_install_is_not_modified() {
+        let ws = temp_workspace();
+        write_data(&ws, "apps/demo/index.html", "<h1>hi</h1>");
+        write_data(&ws, "knowhow/demo.md", "notes");
+        let sha = install_commit(&ws, &["apps/demo/index.html", "knowhow/demo.md"]);
+        let rec = record(Some(&sha), &["apps/demo/index.html", "knowhow/demo.md"]);
+        let status = plugin_modification_status(&ws, &rec);
+        assert!(
+            !status.modified,
+            "a freshly installed plugin must not be modified: {:?}",
+            status.modified_paths
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn editing_an_app_file_marks_modified() {
+        let ws = temp_workspace();
+        write_data(&ws, "apps/demo/index.html", "<h1>hi</h1>");
+        let sha = install_commit(&ws, &["apps/demo/index.html"]);
+        write_data(&ws, "apps/demo/index.html", "<h1>EDITED</h1>");
+        let status = plugin_modification_status(&ws, &record(Some(&sha), &["apps/demo/index.html"]));
+        assert!(status.modified);
+        assert_eq!(status.modified_paths, vec!["apps/demo/index.html".to_string()]);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn adding_a_file_in_app_dir_marks_modified() {
+        let ws = temp_workspace();
+        write_data(&ws, "apps/demo/index.html", "x");
+        let sha = install_commit(&ws, &["apps/demo/index.html"]);
+        // User adds a new (untracked) file inside the plugin's app dir.
+        write_data(&ws, "apps/demo/extra.js", "console.log(1)");
+        let status = plugin_modification_status(&ws, &record(Some(&sha), &["apps/demo/index.html"]));
+        assert!(status.modified, "an added file in the plugin app dir must count");
+        assert!(status.modified_paths.iter().any(|p| p == "apps/demo/extra.js"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn unrelated_new_file_in_shared_root_does_not_mark() {
+        let ws = temp_workspace();
+        write_data(&ws, "knowhow/demo.md", "notes");
+        let sha = install_commit(&ws, &["knowhow/demo.md"]);
+        // A brand-new knowhow file the plugin never shipped → not attributable.
+        write_data(&ws, "knowhow/my-own.md", "mine");
+        let status = plugin_modification_status(&ws, &record(Some(&sha), &["knowhow/demo.md"]));
+        assert!(
+            !status.modified,
+            "an unrelated new knowhow file must not flag the plugin: {:?}",
+            status.modified_paths
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn editing_recorded_knowhow_marks_modified() {
+        let ws = temp_workspace();
+        write_data(&ws, "knowhow/demo.md", "notes");
+        let sha = install_commit(&ws, &["knowhow/demo.md"]);
+        write_data(&ws, "knowhow/demo.md", "EDITED notes");
+        let status = plugin_modification_status(&ws, &record(Some(&sha), &["knowhow/demo.md"]));
+        assert!(status.modified);
+        assert_eq!(status.modified_paths, vec!["knowhow/demo.md".to_string()]);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn reverting_an_edit_self_heals() {
+        let ws = temp_workspace();
+        write_data(&ws, "knowhow/demo.md", "notes");
+        let sha = install_commit(&ws, &["knowhow/demo.md"]);
+        write_data(&ws, "knowhow/demo.md", "EDITED");
+        write_data(&ws, "knowhow/demo.md", "notes"); // revert to installed content
+        assert!(!plugin_modification_status(&ws, &record(Some(&sha), &["knowhow/demo.md"])).modified);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn legacy_record_without_commit_is_not_modified() {
+        let ws = temp_workspace();
+        write_data(&ws, "knowhow/demo.md", "notes");
+        install_commit(&ws, &["knowhow/demo.md"]);
+        write_data(&ws, "knowhow/demo.md", "EDITED"); // even with an edit on disk...
+        // ...a record with no baseline commit cannot be judged → not modified.
+        assert!(!plugin_modification_status(&ws, &record(None, &["knowhow/demo.md"])).modified);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn trigger_reserialized_projection_is_not_modified() {
+        // The shipped authored trigger.toml is committed; the on-disk projection
+        // is re-serialized (different bytes) AND carries the registration stamps
+        // (slug + plugin_id). A byte diff would false-positive; the semantic
+        // compare (ignoring slug/plugin_id/group_id) must read as not-modified.
+        let ws = temp_workspace();
+        write_data(&ws, "triggers/watch/trigger.toml", TRIGGER_TOML);
+        let sha = install_commit(&ws, &["triggers/watch/trigger.toml"]);
+        let mut def = TriggerDefinition::from_toml(TRIGGER_TOML).unwrap();
+        def.slug = "watch".to_string();
+        def.plugin_id = Some("demo".to_string());
+        let reserialized = def.to_toml().unwrap();
+        assert_ne!(reserialized, TRIGGER_TOML, "test premise: bytes differ");
+        write_data(&ws, "triggers/watch/trigger.toml", &reserialized);
+        let status =
+            plugin_modification_status(&ws, &record(Some(&sha), &["triggers/watch/trigger.toml"]));
+        assert!(
+            !status.modified,
+            "a re-serialized-but-equivalent trigger must not flag: {:?}",
+            status.modified_paths
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn editing_trigger_definition_marks_modified() {
+        let ws = temp_workspace();
+        write_data(&ws, "triggers/watch/trigger.toml", TRIGGER_TOML);
+        let sha = install_commit(&ws, &["triggers/watch/trigger.toml"]);
+        let mut def = TriggerDefinition::from_toml(TRIGGER_TOML).unwrap();
+        def.run = TriggerRun::Intent {
+            intent: "do something ELSE".to_string(),
+        };
+        write_data(&ws, "triggers/watch/trigger.toml", &def.to_toml().unwrap());
+        let status =
+            plugin_modification_status(&ws, &record(Some(&sha), &["triggers/watch/trigger.toml"]));
+        assert!(status.modified, "an edited trigger intent must flag modified");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

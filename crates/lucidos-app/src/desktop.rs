@@ -72,6 +72,12 @@ pub const DEFAULT_ENGINE_PORT: u16 = 5252;
 /// (migrations + embedding-model warmup can be slow on a fresh workspace).
 const ENGINE_HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How often the desktop process refreshes the dock-icon badge from the gateway's
+/// aggregate unread total (macOS only). Independent of the webview's own polling
+/// so the badge is correct whichever page (picker or a workspace) is loaded.
+#[cfg(target_os = "macos")]
+const DOCK_BADGE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 const GATEWAY_RESOURCE_NAME: &str = "lucidos-gateway";
 const ENGINE_RESOURCE_NAME: &str = "lucidos-engine";
 const FRONTEND_RESOURCE_NAME: &str = "frontend";
@@ -280,6 +286,35 @@ pub fn engine_port() -> u16 {
 pub fn launch(app: &AppHandle) {
     if tauri::is_dev() {
         return;
+    }
+
+    // Dock-icon badge: poll the gateway's aggregate unread total (across running
+    // workspaces) and mirror it onto the app icon. Its own thread — independent
+    // of the service/health/navigate flow below and of whichever page the webview
+    // shows — so the desktop badge always reflects the TOTAL, not just the active
+    // workspace. macOS only (the dock tile is a macOS concept). The AppKit write
+    // is marshalled to the main thread; the fetch tolerates the gateway not being
+    // up yet (returns None until it answers).
+    #[cfg(target_os = "macos")]
+    {
+        let handle = app.clone();
+        std::thread::spawn(move || {
+            let port = engine_port();
+            let mut last: Option<u64> = None;
+            loop {
+                if let Some(total) = fetch_unread_total(port) {
+                    // Only touch AppKit when the value actually changed — avoids a
+                    // main-thread hop every 5s when nothing moved.
+                    if last != Some(total) {
+                        last = Some(total);
+                        let _ = handle.run_on_main_thread(move || {
+                            crate::notifications::set_dock_badge(total);
+                        });
+                    }
+                }
+                std::thread::sleep(DOCK_BADGE_POLL_INTERVAL);
+            }
+        });
     }
 
     let handle = app.clone();
@@ -947,6 +982,43 @@ fn http_ok(port: u16, path: &str) -> bool {
     let _ = stream.read_to_string(&mut buf);
     let first = buf.lines().next().unwrap_or_default();
     first.contains(" 200 ") || first.ends_with(" 200")
+}
+
+/// Like [`http_ok`] but returns the response body on a 200 (else `None`). The
+/// desktop client deliberately has no reqwest dependency, so this minimal raw
+/// HTTP/1.0 GET is reused for the dock-badge poll's small JSON read.
+#[cfg(target_os = "macos")]
+fn http_get_body(port: u16, path: &str) -> Option<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let req = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut buf = String::new();
+    let _ = stream.read_to_string(&mut buf);
+    let (head, body) = buf.split_once("\r\n\r\n")?;
+    let first = head.lines().next().unwrap_or_default();
+    if first.contains(" 200 ") || first.ends_with(" 200") {
+        Some(body.to_string())
+    } else {
+        None
+    }
+}
+
+/// Sum the unread count across running workspaces from the gateway control API —
+/// the dock-badge total. `None` (no badge change) when the gateway is unreachable
+/// or the body doesn't parse; a workspace with no `unread_count` (stopped /
+/// unhealthy) contributes 0, matching the gateway's running-only aggregation.
+#[cfg(target_os = "macos")]
+fn fetch_unread_total(port: u16) -> Option<u64> {
+    let body = http_get_body(port, "/~/api/v1/control/workspaces")?;
+    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let workspaces = json.get("workspaces")?.as_array()?;
+    Some(
+        workspaces
+            .iter()
+            .filter_map(|w| w.get("unread_count").and_then(|v| v.as_u64()))
+            .sum(),
+    )
 }
 
 #[cfg(test)]

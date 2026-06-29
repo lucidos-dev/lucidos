@@ -1,8 +1,10 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { focusedThreadId, threadMap, activeStreamingBuffer, threadsLoaded, promptAnimating, revealOnFocus } from '../../store/store';
+import { focusedThreadId, threadMap, activeStreamingBuffer, threadsLoaded, promptAnimating, revealOnFocus, connectionStatus } from '../../store/store';
 import { getThreadEventsBump } from '../../store/threadActivity';
 import { unfocusThread } from '../../store/actions/threads';
 import { loadThreadEvents, forceRetryThreadEvents } from '../../store/actions/thread-loading';
+import { checkConnection } from '../../store/actions/connection';
+import { gatewayPickerHref } from '../../utils/basePath';
 import { rebuildCorruptedThreadEvents } from '../../store/actions/thread-sync';
 import { useAutoScroll, renderExchanges, ScrollControls } from './CreateThreadView';
 import { ThreadStatusIcon, threadVisualStatus } from '../shared/ThreadStatusIcon';
@@ -17,12 +19,15 @@ import { useScrollMemory, hasSavedScroll, threadScrollKey } from '../../hooks/us
 import { useDelayedFlag, useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { ThreadSkeleton } from './ThreadSkeleton';
 import { forceIOSRepaint, forceIOSRepaintBurst, createRepaintThrottle } from '../../utils/iosRepaint';
+import { isIOS } from '../../utils/platform';
 import { onPageResume } from '../../utils/pageResume';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { refreshClient } from '../../hooks/sw-update';
 import { recordPerfSample } from '../../utils/perfQueue';
 import { takeThreadOpenStart, takeThreadRerenderStart } from '../../utils/threadOpenMarks';
 import { readRenderPhaseTotals } from '../../utils/renderPhaseTimers';
+import { reportThreadRenderProbe } from '../../utils/threadRenderProbe';
+import { postClientLog } from '../../utils/liveness';
 
 /** Only sample a grouping fold this slow (ms) — keeps cheap incremental folds
  *  (streaming tokens) out of the perf log; we only want the expensive full
@@ -41,6 +46,12 @@ const renderCountByThread = new Map<string, number>();
 
 /** Escalating retry delays for the empty-thread safety retry. */
 const EMPTY_THREAD_RETRY_DELAYS = [500, 2000, 5000];
+
+/** Delay (ms) after a thread is focused before the settle probe samples render
+ *  state and re-fires the repaint burst. Past the open burst's tail (1000ms) so a
+ *  late blank is covered, and short enough to sample BEFORE the user typically
+ *  recovers it with a manual scroll. See the settle-probe effect + threadRenderProbe.ts. */
+const SETTLE_PROBE_DELAY_MS = 1500;
 
 /** Ref shape shared by retryCountRef and watchdogRef. */
 type ThreadRetryRef = { id: string; count: number } | null;
@@ -91,6 +102,7 @@ export type EmptyReason =
     | { kind: 'animating' }
     | { kind: 'failed'; threadId: string }
     | { kind: 'corrupt'; threadId: string }
+    | { kind: 'disconnected'; threadId: string }
     | { kind: 'empty' };
 
 /** Derive the empty reason from thread state. During the compose→thread send
@@ -112,11 +124,18 @@ export function emptyReason(
     eventsLoadFailed: boolean,
     hasContent: boolean,
     threadId: string,
+    disconnected: boolean,
 ): EmptyReason {
     if (animating) return { kind: 'animating' };
     if (eventsLoadFailed) return { kind: 'failed', threadId };
     if (eventsLoaded && hasContent) return { kind: 'corrupt', threadId };
     if (eventsLoaded) return { kind: 'empty' };
+    // The thread never loaded AND the engine is unreachable (the dot is red). Show
+    // an honest "can't reach this workspace" state instead of a spinner that
+    // degrades to "Tap to reload" — a full reload from the SW cache just re-renders
+    // the same dead shell. `disconnected` ONLY overrides `loading`: a load that
+    // actually failed/completed (failed/corrupt/empty above) is already honest.
+    if (disconnected) return { kind: 'disconnected', threadId };
     return { kind: 'loading', threadId };
 }
 
@@ -143,6 +162,25 @@ function ThreadEmptyState({ reason }: { reason: EmptyReason }) {
                     <p>{message}</p>
                     <button class="action-btn" onClick={() => forceRetryThreadEvents(reason.threadId)}>Retry</button>
                     <button class="thread-empty-reload" onClick={() => refreshClient()}>Reload page</button>
+                </div>
+            );
+        }
+        case 'disconnected': {
+            // Engine unreachable (red dot) and this thread never loaded. Retry
+            // re-probes the connection + reloads the thread's events (NOT a page
+            // reload — offline, that just re-serves the cached shell). "Back to
+            // workspaces" is the always-reachable recovery surface; shown only
+            // when a gateway picker exists (null on a legacy direct engine).
+            const pickerHref = gatewayPickerHref();
+            return (
+                <div class="thread-empty-state thread-empty-error">
+                    <p>Can't reach this workspace</p>
+                    <button class="action-btn" onClick={() => { void checkConnection(); forceRetryThreadEvents(reason.threadId); }}>Retry</button>
+                    {pickerHref && (
+                        <button class="thread-empty-reload" onClick={() => { window.location.href = pickerHref; }}>
+                            Back to workspaces
+                        </button>
+                    )}
                 </div>
             );
         }
@@ -233,6 +271,12 @@ export function ThreadView() {
         },
         [threadId, eventCount, pendingCount, hasContent, animating, eventsBump],
     );
+    // Track the exchange count this render actually produced. The settle probe
+    // below compares it against a FRESH recompute from the store to tell a
+    // missed re-render (rendered 0, store has N) apart from a genuine empty —
+    // see utils/threadRenderProbe.ts.
+    const lastRenderedExchangesLenRef = useRef(0);
+    lastRenderedExchangesLenRef.current = exchanges.length;
     const streamingBuffer = animating ? '' : activeStreamingBuffer.value;
 
     // Perf instrumentation: when a grouping fold was slow, sample it (with the
@@ -467,7 +511,11 @@ export function ThreadView() {
     // loaded-empty. Delay-gated so a fast / prefetched open never shows it. This
     // mirrors emptyReason(...).kind === 'loading' but is also valid before the
     // thread is in the map (cold start: eventsLoaded/eventsLoadFailed are false).
-    const isThreadLoadingNow = !hasExchanges && !animating && !eventsLoadFailed && !eventsLoaded;
+    // Suppressed when disconnected so the shimmer doesn't sit over the honest
+    // "Can't reach this workspace" state (emptyReason maps that same case to
+    // 'disconnected', not 'loading').
+    const isThreadLoadingNow = !hasExchanges && !animating && !eventsLoadFailed && !eventsLoaded
+        && connectionStatus.value !== 'disconnected';
     const showThreadSkeleton = useDelayedFlag(isThreadLoadingNow);
     // Remember whether the skeleton was shown for this thread, so the content
     // fade-in below can step aside and let the overlay crossfade do the reveal.
@@ -585,10 +633,53 @@ export function ThreadView() {
         if (hasExhaustedRetries(watchdogRef, threadId, 2)) return;
         const timer = setTimeout(() => {
             incrementRetry(watchdogRef, threadId);
+            // Breadcrumb the recovery so the next repro shows whether the
+            // empty-render/corrupted-Map path fired (vs. the paint path, which
+            // leaves no recovery trace). ios-pwa-blackout investigation.
+            postClientLog('render', 'rebuild_corrupted_thread', {
+                thread_id: threadId,
+                event_count: eventThread.events.size,
+                channel: eventThread.meta.channel,
+            });
             rebuildCorruptedThreadEvents(threadId);
         }, 300);
         return () => clearTimeout(timer);
     }, [threadId, eventsLoaded, exchanges.length, eventCount]);
+
+    // Settle probe + late repaint (iOS): a fixed delay after a thread is focused,
+    // sample the render state and re-fire the open repaint burst ONCE. Armed on
+    // threadId alone (NOT eventsLoaded), and reads fresh store/DOM at fire time, so
+    // it still runs when a post-load store write failed to re-render this view —
+    // the "summary present, body empty, recovers on scroll" report. The probe
+    // breadcrumb (iOS-PWA-only, skips genuinely-empty threads) records whether the
+    // body is missing in the DOM (render gap), stale vs. the store (missed
+    // re-render), or present-and-laid-out (compositor paint loss). The extra burst
+    // is a transform-only, supersede-safe toggle — harmless on a healthy layer,
+    // and it recovers a layer that WKWebView blanked after the open burst's window
+    // under prolonged use. One-shot per focus; the cleanup clears it on switch.
+    useEffect(() => {
+        if (!threadId || !isIOS()) return;
+        const timer = setTimeout(() => {
+            const thread = threadMap.value.get(threadId);
+            if (!thread) return;
+            const fresh = computeExchanges(thread);
+            reportThreadRenderProbe({
+                threadId,
+                channel: thread.meta.channel,
+                isCodingAgent: thread.meta.channel === 'claude_code',
+                renderedExchangesLen: lastRenderedExchangesLenRef.current,
+                freshExchangesLen: fresh.length,
+                eventCount: thread.events.size,
+                eventsLoaded: thread.eventsLoaded,
+                hasContentEvents: hasContentEvents(thread.events),
+                animating: promptAnimating.value,
+                contentChildCount: areaRef.current?.childElementCount ?? null,
+                contentScrollHeight: areaRef.current?.scrollHeight ?? null,
+            });
+            forceIOSRepaintBurst(areaRef.current);
+        }, SETTLE_PROBE_DELAY_MS);
+        return () => clearTimeout(timer);
+    }, [threadId]);
 
     useAutoScroll(areaRef, [eventCount, streamingBuffer, pendingCount], true);
 
@@ -680,11 +771,17 @@ export function ThreadView() {
         // page load (localStorage hydrates focusedThreadId) and loadAllThreads
         // completing (thread enters map). On iOS Safari PWA cold start this
         // can be several seconds.
+        // While we wait for the thread to enter the map, honour the disconnected
+        // signal too: a cold boot into an unreachable engine never populates the
+        // map, so without this the skeleton would spin into "Tap to reload".
+        const waitingReason: EmptyReason = connectionStatus.value === 'disconnected'
+            ? { kind: 'disconnected', threadId }
+            : { kind: 'loading', threadId };
         return (
             <div class="thread-view">
                 <div class="thread-content-wrap">
                     <div class="thread-content visible">
-                        <ThreadEmptyState key={threadId} reason={{ kind: 'loading', threadId }} />
+                        <ThreadEmptyState key={threadId} reason={waitingReason} />
                     </div>
                     <ThreadSkeletonOverlay show={showThreadSkeleton} />
                 </div>
@@ -711,7 +808,7 @@ export function ThreadView() {
                     <MobileThreadTitleBar />
 
                     {exchanges.length === 0 ? (
-                        <ThreadEmptyState key={threadId} reason={emptyReason(animating, eventsLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!)} />
+                        <ThreadEmptyState key={threadId} reason={emptyReason(animating, eventsLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!, connectionStatus.value === 'disconnected')} />
                     ) : (
                         renderExchanges(exchanges, threadId!, streamingBuffer, renderFromIndex)
                     )}

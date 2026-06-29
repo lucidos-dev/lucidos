@@ -13,6 +13,9 @@ vi.mock('../../utils/pageActive', () => ({
 const showNativeNotification = vi.fn(
   (_opts: { title: string; body: string; deepLink: Record<string, unknown> }) => Promise.resolve(),
 );
+const dismissNativeNotification = vi.fn((_opts: { notificationId: string | null }) => Promise.resolve());
+// Drain stub: defaults to empty; per-test override with mockResolvedValueOnce.
+const takePendingNativeTaps = vi.fn((): Promise<Record<string, unknown>[]> => Promise.resolve([]));
 let listenHandler: ((e: { payload: Record<string, unknown> }) => void) | null = null;
 const listenUnlisten = vi.fn();
 const listen = vi.fn((_event: string, handler: (e: { payload: Record<string, unknown> }) => void) => {
@@ -22,6 +25,9 @@ const listen = vi.fn((_event: string, handler: (e: { payload: Record<string, unk
 vi.mock('../../utils/tauri', () => ({
   showNativeNotification: (opts: { title: string; body: string; deepLink: Record<string, unknown> }) =>
     showNativeNotification(opts),
+  dismissNativeNotification: (opts: { notificationId: string | null }) =>
+    dismissNativeNotification(opts),
+  takePendingNativeTaps: () => takePendingNativeTaps(),
   listen: (event: string, handler: (e: { payload: Record<string, unknown> }) => void) =>
     listen(event, handler),
 }));
@@ -31,11 +37,18 @@ vi.mock('./in-app-notification-toast', () => ({
   dispatchDeepLink: (...args: unknown[]) => dispatchDeepLink(...args),
 }));
 
+// Breadcrumb telemetry — assert nothing, just keep it from hitting the network.
+vi.mock('../../utils/liveness', () => ({
+  postClientLog: vi.fn(),
+}));
+
 import {
   handleNativePushRequested,
+  handleNativePushDismiss,
   setupNativePushTapRouting,
   NATIVE_PUSH_STALE_AFTER_MS,
   type NativePushRequestedPayload,
+  type NativePushDismissRequestedPayload,
 } from './native-push';
 
 /** Fire a NativePushRequested the way the SSE channel would. The engine emits
@@ -110,32 +123,123 @@ describe('NativePushRequested → native desktop banner', () => {
   });
 });
 
-describe('setupNativePushTapRouting → dispatchDeepLink', () => {
+describe('setupNativePushTapRouting → drain → dispatchDeepLink', () => {
   beforeEach(() => {
     isTauri.mockReturnValue(true);
     listenHandler = null;
     listen.mockClear();
     dispatchDeepLink.mockClear();
+    takePendingNativeTaps.mockClear();
+    takePendingNativeTaps.mockResolvedValue([]); // default: nothing stashed
   });
 
-  it('registers a Tauri listener and routes a tap through dispatchDeepLink', async () => {
+  it('registers a Tauri listener and drains the stash (not the event payload)', async () => {
     await setupNativePushTapRouting();
     expect(listen).toHaveBeenCalledWith('native-notification-tapped', expect.any(Function));
     expect(listenHandler).toBeTruthy();
+  });
 
-    // Simulate the Rust command emitting a tap with the SW-message shape.
-    listenHandler!({
-      payload: { notification_id: 'n-9', thread_id: 't-2', event_id: 'e-2', tap: { kind: 'modal' } },
-    });
+  it('routes a tap stashed BEFORE the listener existed (cold / startup drain)', async () => {
+    // The durable-delivery fix: a tap that fired while the page wasn't listening
+    // is drained on startup, not lost. Default Tap::Modal shape.
+    takePendingNativeTaps.mockResolvedValueOnce([
+      { notification_id: 'n-9', thread_id: 't-2', event_id: 'e-2', tap: { kind: 'modal' } },
+    ]);
+    await setupNativePushTapRouting();
+    await flush();
     expect(dispatchDeepLink).toHaveBeenCalledWith(
       expect.objectContaining({ notification: 'n-9', thread: 't-2', event: 'e-2' }),
     );
   });
 
-  it('does not register a listener outside Tauri', async () => {
+  it('drains and routes on the live signal (warm path)', async () => {
+    await setupNativePushTapRouting(); // startup drain empty
+    await flush();
+    expect(dispatchDeepLink).not.toHaveBeenCalled();
+
+    // A subsequent tap stashes + wakes the signal; the listener drains it.
+    takePendingNativeTaps.mockResolvedValueOnce([
+      { notification_id: 'n-1', tap: { kind: 'modal' } },
+    ]);
+    listenHandler!({ payload: {} });
+    await flush();
+    expect(dispatchDeepLink).toHaveBeenCalledWith(
+      expect.objectContaining({ notification: 'n-1' }),
+    );
+  });
+
+  it('dispatches every tap when several were stashed', async () => {
+    takePendingNativeTaps.mockResolvedValueOnce([
+      { notification_id: 'a', tap: { kind: 'modal' } },
+      { notification_id: 'b', tap: { kind: 'modal' } },
+    ]);
+    await setupNativePushTapRouting();
+    await flush();
+    expect(dispatchDeepLink).toHaveBeenCalledTimes(2);
+  });
+
+  it('an empty drain dispatches nothing', async () => {
+    await setupNativePushTapRouting();
+    await flush();
+    expect(dispatchDeepLink).not.toHaveBeenCalled();
+  });
+
+  it('does not register a listener or drain outside Tauri', async () => {
     isTauri.mockReturnValue(false);
     const un = await setupNativePushTapRouting();
     expect(listen).not.toHaveBeenCalled();
+    expect(takePendingNativeTaps).not.toHaveBeenCalled();
     expect(typeof un).toBe('function');
+  });
+});
+
+/** Fire a NativePushDismissRequested the way the SSE channel would. Uses `in`
+ *  (not `??`) so an explicit `notification_id: null` (dismiss-all) is preserved
+ *  rather than coerced back to the default id. */
+function emitDismiss(overrides: Partial<NativePushDismissRequestedPayload> = {}): void {
+  handleNativePushDismiss({
+    notification_id:
+      'notification_id' in overrides ? (overrides.notification_id as string | null) : 'notif-1',
+    sent_at_ms: overrides.sent_at_ms ?? Date.now(),
+  });
+}
+
+describe('NativePushDismissRequested → remove native desktop banner', () => {
+  beforeEach(() => {
+    isTauri.mockReturnValue(true);
+    isPageActive.mockReturnValue(false);
+    dismissNativeNotification.mockClear();
+  });
+
+  it('removes one banner by id', async () => {
+    emitDismiss({ notification_id: 'n-7' });
+    await flush();
+    expect(dismissNativeNotification).toHaveBeenCalledWith({ notificationId: 'n-7' });
+  });
+
+  it('removes all banners when notification_id is null (mark-all-read)', async () => {
+    emitDismiss({ notification_id: null });
+    await flush();
+    expect(dismissNativeNotification).toHaveBeenCalledWith({ notificationId: null });
+  });
+
+  it('no-ops when not running in Tauri (web can\'t silently remove a push banner)', async () => {
+    isTauri.mockReturnValue(false);
+    emitDismiss();
+    await flush();
+    expect(dismissNativeNotification).not.toHaveBeenCalled();
+  });
+
+  it('drops a stale frame past the freshness budget (late dismiss-all guard)', async () => {
+    emitDismiss({ notification_id: null, sent_at_ms: Date.now() - NATIVE_PUSH_STALE_AFTER_MS - 1 });
+    await flush();
+    expect(dismissNativeNotification).not.toHaveBeenCalled();
+  });
+
+  it('dismisses regardless of page-active state (no isPageActive gate)', async () => {
+    isPageActive.mockReturnValue(true);
+    emitDismiss({ notification_id: 'n-9' });
+    await flush();
+    expect(dismissNativeNotification).toHaveBeenCalledWith({ notificationId: 'n-9' });
   });
 });

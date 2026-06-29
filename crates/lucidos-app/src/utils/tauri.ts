@@ -104,6 +104,48 @@ export async function showNativeNotification(opts: {
   });
 }
 
+/**
+ * Remove an already-delivered native macOS banner via the app's
+ * `dismiss_native_notification` command (notifications.rs →
+ * `UNUserNotificationCenter.removeDeliveredNotifications(withIdentifiers:)` /
+ * `removeAllDeliveredNotifications`). The cross-device dismiss counterpart of
+ * `showNativeNotification`: when a notification is read elsewhere, the engine
+ * broadcasts `NativePushDismissRequested` and the connected desktop app removes
+ * its banner. `notificationId === null` removes ALL delivered banners (the
+ * mark-all-read path). No-op in dev / off macOS (Rust side). Only call when
+ * isTauri() is true.
+ */
+export async function dismissNativeNotification(opts: {
+  notificationId: string | null;
+}): Promise<void> {
+  // `id` matches the Rust command param name (`Option<String>`); null → dismiss all.
+  await invoke('dismiss_native_notification', { id: opts.notificationId });
+}
+
+/**
+ * Report whether the native main window is currently *active* — focused AND
+ * on-screen (visible, not minimized) — read live from AppKit by the Rust
+ * `get_native_window_active` command. The page pulls this at startup to SEED its
+ * `native-window-active` cache before registering the event listener, because
+ * Tauri doesn't replay the transition events to a late-registering listener and
+ * the cache defaults to `true` (see utils/nativeWindow.ts). Only call when
+ * isTauri() is true. */
+export function getNativeWindowActive(): Promise<boolean> {
+  return invoke<boolean>('get_native_window_active');
+}
+
+/**
+ * Drain (and clear) the deep links from native-banner taps the page may not
+ * have been listening for at emit time (webview reloaded / suspended-while-
+ * trayed / client relaunched). Returned in SW-message shape so each routes
+ * through the same dispatchDeepLink as a live tap / web-push tap. The drain is
+ * atomic in Rust, so calling it from both the startup cold path and the
+ * `native-notification-tapped` warm signal routes each tap exactly once. Only
+ * call when isTauri() is true. */
+export function takePendingNativeTaps(): Promise<Record<string, unknown>[]> {
+  return invoke<Record<string, unknown>[]>('take_pending_native_taps');
+}
+
 // --- App auto-update (packaged desktop app) ---
 
 /** Check GitHub Releases for a newer signed packaged build. Returns the new

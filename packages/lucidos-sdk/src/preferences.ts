@@ -1,5 +1,6 @@
 import { request, requestVoid } from './_fetch';
 import { assertString } from './_validate';
+import { wsLocalGet } from './_storage';
 
 export type Preferences = Record<string, string>;
 
@@ -8,11 +9,15 @@ export type Preferences = Record<string, string>;
  * parent stores user-facing prefs (theme, font, scale) device-scoped under
  * this id; reading without it returns only globally-scoped rows, so e.g.
  * `theme` is missing and the iframe defaults to dark.
+ *
+ * The device id is PER-WORKSPACE (`ws:<slug>:lucidos-device-id`), so read it
+ * through `wsLocalGet` (the parent's prototype override doesn't reach this
+ * realm) — see `_storage.ts`.
  */
 const DEVICE_ID_KEY = 'lucidos-device-id';
 
 function parentDeviceId(): string | undefined {
-  return localStorage.getItem(DEVICE_ID_KEY) ?? undefined;
+  return wsLocalGet(DEVICE_ID_KEY) ?? undefined;
 }
 
 export const preferences = {

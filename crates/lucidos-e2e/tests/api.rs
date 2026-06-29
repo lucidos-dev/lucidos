@@ -106,3 +106,6 @@ mod credentials_test;
 
 #[path = "api_support/backup_key_test.rs"]
 mod backup_key_test;
+
+#[path = "api_support/network_config_test.rs"]
+mod network_config_test;

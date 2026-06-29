@@ -219,3 +219,58 @@ and the outcome-asymmetry are removed; `ProbeOutcome` is retained for the
   (`read_engine_version` / `read_app_version`) is a hot-path smell that is now
   harmless (a slow health response no longer culls a live engine), left for a
   follow-up. See `docs/plans/2026-06-27-gateway-never-respawn-alive-engine.md`.
+
+## Addendum (2026-06-29): control-plane request authz + engine bind defaults to loopback
+
+Two security findings against the topology above, fixed together (plan:
+`docs/plans/2026-06-29-harden-four-security-findings.md`).
+
+**1. The gateway control plane (`/~/api/v1/control/*`) is now request-authorized.**
+The control plane drives workspace lifecycle (create/restart/stop/autostart/
+rename/delete-to-trash/restore, gateway reload). It is served on the gateway
+**origin**, and app UIs are served same-origin at `/<slug>/app/<id>/` with
+`allow-same-origin` — so without a gate an app's JS could
+`fetch('/~/api/v1/control/workspaces/<slug>/stop', {method:'POST'})` and
+stop/delete the workspace it runs in. A tower middleware on the control router
+(`crates/lucidos-gateway/src/control.rs`, `control_request_allowed`) now applies
+an **explicit, documented** gate:
+
+- **Non-browser clients** (the dev launcher / `stop.sh` curl, the engine→gateway
+  boot-phase report, the packaged smoke test) send no fetch metadata → allowed,
+  protected by the gateway's **loopback bind** (default; opened only by explicit
+  `LUCIDOS_GATEWAY_BIND_ALL`).
+- **Cross-site / cross-origin browser requests** are rejected via the forge-proof
+  `Sec-Fetch-Site` + `Origin`/`Host` checks (`fetch()` cannot set these). This
+  fully closes the classic CSRF vector.
+- **Browser requests whose `Referer` is an app-iframe document**
+  (`/<slug>/app/...`, i.e. second path segment `app`) are rejected; the picker
+  (`/~/...`) and the workspace shell (`/<slug>/...`) pass.
+
+**Residual (deliberately accepted, future work):** while app iframes share the
+gateway **origin**, no header is a perfect discriminator — a deliberately
+malicious same-origin app could influence its own `Referer` (the fetch
+`referrer` option accepts same-origin URLs), so the Referer block is strong
+defense-in-depth, not an absolute boundary. The complete fix is to serve app
+iframes from a **distinct origin** (they then become cross-origin and the
+forge-proof `Sec-Fetch`/`Origin` checks alone suffice). That is a larger change
+(separate-origin serving + an SDK postMessage bridge) and is out of scope here.
+
+**2. A directly-launched engine now binds loopback by default.** Previously
+`crates/lucidos-engine/src/main.rs` bound `[::]` (all interfaces) unless
+`LUCIDOS_BIND_LOOPBACK` was set, with no request-level API auth — dangerous for a
+hand-launched engine on a reachable network. The flag is **inverted**: the engine
+binds `127.0.0.1` by default, and binds all interfaces only on explicit
+**`LUCIDOS_BIND_ALL`** opt-in. The "Engine binds" row of the Dev runtime topology
+table still holds, achieved differently:
+
+- **Packaged** engine: gateway sets `LUCIDOS_BIND_LOOPBACK=1` (still the engine's
+  `behind_gateway` signal) and does NOT set `LUCIDOS_BIND_ALL` → loopback-only,
+  unchanged.
+- **Dev** engine (gateway-spawned, `LUCIDOS_NO_GATEWAY`, e2e, tauri-dev): the
+  spawner now sets `LUCIDOS_BIND_ALL=1` (gateway `stack.rs` dev branch;
+  `scripts/lib/workspace.sh` `start_engine`) → all interfaces on the user-facing
+  port, unchanged reachability.
+
+`LUCIDOS_BIND_LOOPBACK` keeps its meaning as the `behind_gateway` signal
+(`api/actor.rs`); it no longer drives the bind decision (the default already is
+loopback). `LUCIDOS_BIND_ALL` is the sole bind-widening switch.

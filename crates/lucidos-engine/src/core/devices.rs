@@ -216,8 +216,25 @@ pub(crate) fn resolve_device_name(stored: Option<&str>, id: &str) -> String {
     format!("device-{}", short)
 }
 
+/// Product token the Tauri native desktop client appends to its registered
+/// user-agent string (see `registrationUserAgent` in
+/// `crates/lucidos-app/src/utils/platform.ts`). The WKWebView's real UA is
+/// indistinguishable from Safari, so this token is the only signal that lets the
+/// agent's device context tell the desktop app from a browser — keep the literal
+/// in sync with the frontend constant.
+const DESKTOP_APP_UA_TOKEN: &str = "Lucidos-Desktop";
+
 /// Parse a raw user-agent string into a short "Browser/Version on OS" summary.
+/// A user-agent carrying the [`DESKTOP_APP_UA_TOKEN`] is rendered as the Lucidos
+/// native desktop app instead of a browser, so the agent gives native-OS (not
+/// browser-permission) notification advice in the desktop client.
 fn parse_user_agent(ua: &str) -> String {
+    let os = parse_os(ua);
+
+    if ua.contains(DESKTOP_APP_UA_TOKEN) {
+        return format!("Lucidos desktop app on {}", os);
+    }
+
     let browser = ["Chrome", "Firefox", "Safari", "Edge", "Opera"]
         .iter()
         .find_map(|name| {
@@ -234,7 +251,12 @@ fn parse_user_agent(ua: &str) -> String {
         })
         .unwrap_or_else(|| "Unknown browser".to_string());
 
-    let os = if ua.contains("iPhone") {
+    format!("{} on {}", browser, os)
+}
+
+/// Map a raw user-agent to a short OS label.
+fn parse_os(ua: &str) -> &'static str {
+    if ua.contains("iPhone") {
         "iOS"
     } else if ua.contains("iPad") {
         "iPadOS"
@@ -248,14 +270,41 @@ fn parse_user_agent(ua: &str) -> String {
         "Linux"
     } else {
         "Unknown OS"
-    };
-
-    format!("{} on {}", browser, os)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_user_agent_renders_desktop_token_as_lucidos_desktop_app() {
+        // The Tauri client registers a Safari-like UA with the desktop-app token
+        // appended; it must read as the desktop app, NOT Safari, so the agent
+        // gives native-OS notification advice instead of browser-permission advice.
+        let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
+                  (KHTML, like Gecko) Version/18.0 Safari/605.1.15 Lucidos-Desktop";
+        assert_eq!(parse_user_agent(ua), "Lucidos desktop app on macOS");
+    }
+
+    #[test]
+    fn parse_user_agent_leaves_browsers_unchanged() {
+        // A real browser / PWA UA (no token) keeps the "Browser/Version on OS" shape.
+        assert_eq!(
+            parse_user_agent(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+            ),
+            "Chrome/149.0.0.0 on macOS"
+        );
+        assert_eq!(
+            parse_user_agent(
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) \
+                 AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
+            ),
+            "Safari/604.1 on iOS"
+        );
+    }
 
     async fn backdate_last_seen(pool: &PgPool, id: &str, days_ago: i64) {
         sqlx::query("UPDATE devices SET last_seen_at = NOW() - make_interval(days => $1::int) WHERE id = $2")

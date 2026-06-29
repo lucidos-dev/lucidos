@@ -36,6 +36,7 @@ macro_rules! log {
 mod boot_phase;
 mod control;
 mod error;
+mod net_config;
 mod postgres;
 mod proxy;
 mod registry;

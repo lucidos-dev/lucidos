@@ -797,7 +797,7 @@ struct GitVersion {
 }
 
 /// Log every API request with method, path, status, and duration.
-/// Skips noisy endpoints (health checks, SSE streams, dev proxy) to keep logs readable.
+/// Skips noisy endpoints (health checks, the SSE stream) to keep logs readable.
 async fn request_logger(req: axum::extract::Request, next: Next) -> Response {
     let uri_path = req.uri().path();
     let should_log = match uri_path {
@@ -925,8 +925,8 @@ pub fn create_router(
     // path finds it under the path's domain.
     //
     // The fallback is load-bearing: without it, an unmatched `/api/v1/*`
-    // request would fall through the nest to the outer router's dev-proxy
-    // fallback instead of returning 404.
+    // request would fall through the nest to the outer router's static
+    // frontend fallback instead of returning 404.
     let api_routes = Router::new()
         .merge(history::router())
         .merge(chat::router())

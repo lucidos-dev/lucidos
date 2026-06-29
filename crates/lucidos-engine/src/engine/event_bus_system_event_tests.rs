@@ -206,3 +206,33 @@ fn native_push_requested_is_transient_on_notification_aggregate() {
     assert_eq!(e.event_type(), "NativePushRequested");
     assert_eq!(e.aggregate_id(), Uuid::nil().to_string());
 }
+
+#[test]
+fn native_push_dismiss_requested_is_transient_on_notification_aggregate() {
+    // Transient cross-device dismiss signal — broadcast to SSE, never written to
+    // events. `Some(id)` removes one delivered native banner on connected Tauri
+    // apps; `None` removes all. Lives on the `notification` aggregate.
+    let one = SystemEvent::NativePushDismissRequested {
+        notification_id: Some(Uuid::nil()),
+        sent_at_ms: 0,
+    };
+    assert!(!one.is_persisted());
+    assert_eq!(one.aggregate(), "notification");
+    assert_eq!(one.event_type(), "NativePushDismissRequested");
+    assert_eq!(one.aggregate_id(), Uuid::nil().to_string());
+
+    let all = SystemEvent::NativePushDismissRequested {
+        notification_id: None,
+        sent_at_ms: 0,
+    };
+    assert!(!all.is_persisted());
+    // `None` (dismiss-all) keys on the sentinel "all" rather than a single id.
+    assert_eq!(all.aggregate_id(), "all");
+
+    // Wire shape: `None` omits the field; `Some` carries it.
+    let json_all = serde_json::to_value(&all).unwrap();
+    assert_eq!(json_all["type"], "NativePushDismissRequested");
+    assert!(json_all["data"].get("notification_id").is_none());
+    let json_one = serde_json::to_value(&one).unwrap();
+    assert_eq!(json_one["data"]["notification_id"], Uuid::nil().to_string());
+}

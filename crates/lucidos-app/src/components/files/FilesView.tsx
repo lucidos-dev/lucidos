@@ -112,7 +112,7 @@ function WorkspaceFilesView() {
   // dropzone + source switcher now live in the parent's `files-source-switcher`
   // row (main refactor), so this only owns the artifacts list.
   return (
-    <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+    <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton fill />}>
       {loadable.status === 'loaded' ? (
         <div class="artifacts-desktop">
           {loadable.data.length > 0 && <FolderTree />}

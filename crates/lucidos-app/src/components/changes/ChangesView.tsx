@@ -95,7 +95,7 @@ export function ChangesView() {
 
   return (
     <div class="panel-content">
-      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton fill />}>
         {bothLoaded ? (() => {
           const pending = pendingLoadable.data;
           const applied = appliedLoadable.data;

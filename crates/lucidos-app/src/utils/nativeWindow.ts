@@ -14,7 +14,7 @@
 // leaves web behavior unchanged. See system-knowhow/notifications.md §1, §4.
 
 import { isTauri } from './platform';
-import { listen } from './tauri';
+import { getNativeWindowActive, listen } from './tauri';
 
 let nativeWindowActive = true;
 
@@ -32,11 +32,30 @@ export function setNativeWindowActive(active: boolean): void {
 
 /** Subscribe to native-window active changes (Tauri only). Updates the cache
  *  BEFORE invoking `onChange`, so a handler that reads isNativeWindowActive() /
- *  isPageActive() sees the new value. Returns an unlisten; a no-op off-Tauri. */
+ *  isPageActive() sees the new value. Returns an unlisten; a no-op off-Tauri.
+ *
+ *  SEEDS the cache from the authoritative AppKit state (the Rust
+ *  `get_native_window_active` command) BEFORE registering the listener. This is
+ *  load-bearing: Tauri does not replay the `native-window-active` transition
+ *  events (emitted from on_window_event) to a listener that registers after the
+ *  fact, and the cache defaults to `true` — so without the seed a freshly
+ *  (re)loaded page that is actually backgrounded/trayed (crash-watchdog reload,
+ *  version refresh, cold/unfocused launch) keeps reporting the device active,
+ *  and the engine suppresses the OS push into an invisible in-app toast (no
+ *  banner). See system-knowhow/notifications.md §3/§4. */
 export async function startNativeWindowActiveTracking(
   onChange?: (active: boolean) => void,
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
+  try {
+    const active = await getNativeWindowActive();
+    setNativeWindowActive(active);
+    onChange?.(active);
+  } catch {
+    // Best-effort seed (telemetry carve-out, .claude/rules/frontend.md): a
+    // failed seed leaves the cache at its default; the next focus transition /
+    // heartbeat corrects it. No user intent here.
+  }
   return listen<boolean>('native-window-active', (e) => {
     setNativeWindowActive(e.payload);
     onChange?.(e.payload);

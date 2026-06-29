@@ -29,7 +29,7 @@ fn declarative_envelope_has_web_push_magic_and_notification_object() {
     // spec — Safari 18.5+ keys off `web_push: 8030` to read the declarative
     // `notification.navigate` tap target. The iOS SW `push` handler may still
     // run to render the visible banner, so the declarative URL has to be right.
-    let payload = build_push_payload("Hi", "There", None, None, None, None, &Tap::Modal, None);
+    let payload = build_push_payload("Hi", "There", None, None, None, None, &Tap::Modal, None, None);
     assert_eq!(payload["web_push"], 8030);
     assert!(payload["notification"].is_object());
     assert!(
@@ -47,11 +47,32 @@ fn declarative_envelope_has_web_push_magic_and_notification_object() {
 }
 
 #[test]
+fn payload_app_badge_reflects_unread_count() {
+    // Declarative Web Push top-level `app_badge` (sibling of `web_push` /
+    // `notification`) drives the installed PWA's home-screen badge — iOS reads
+    // it in its parent process without running the SW, the only badge path for
+    // a closed iOS PWA. It carries the workspace's OWN unread count, so a
+    // per-workspace PWA badges its own workspace.
+    let payload =
+        build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None, Some(3));
+    assert_eq!(payload["app_badge"], 3);
+
+    // 0 is emitted (clears the badge when everything is read), not omitted.
+    let cleared =
+        build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None, Some(0));
+    assert_eq!(cleared["app_badge"], 0);
+
+    // None → field omitted entirely (count unreadable; don't touch the badge).
+    let absent = build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None, None);
+    assert!(absent.get("app_badge").is_none());
+}
+
+#[test]
 fn payload_minimal_has_title_body_and_modal_tap() {
     // Hard cut: `tap` is always present in `notification.data` — the SW
     // routes off it and the wake-push payload must match byte-for-byte
     // for tag-replace to dedupe cleanly.
-    let payload = build_push_payload("Hi", "There", None, None, None, None, &Tap::Modal, None);
+    let payload = build_push_payload("Hi", "There", None, None, None, None, &Tap::Modal, None, None);
     assert_eq!(payload["notification"]["title"], "Hi");
     assert_eq!(payload["notification"]["body"], "There");
     let data = &payload["notification"]["data"];
@@ -74,6 +95,7 @@ fn payload_includes_thread_id_for_deep_link() {
         None,
         &Tap::Modal,
         None,
+        None,
     );
     assert_eq!(
         payload["notification"]["data"]["thread_id"],
@@ -94,6 +116,7 @@ fn payload_omits_thread_id_when_link_absent() {
         None,
         &Tap::Modal,
         None,
+        None,
     );
     let data = &payload["notification"]["data"];
     assert!(data.get("thread_id").is_none());
@@ -113,6 +136,7 @@ fn payload_carries_all_fields_when_provided() {
         Some(tid),
         Some(eid),
         &Tap::Modal,
+        None,
         None,
     );
     let data = &payload["notification"]["data"];
@@ -136,6 +160,7 @@ fn payload_includes_event_id_when_set() {
         Some(eid),
         &tap,
         None,
+        None,
     );
     let data = &payload["notification"]["data"];
     assert_eq!(data["event_id"], eid.to_string());
@@ -146,13 +171,13 @@ fn payload_includes_event_id_when_set() {
 fn payload_omits_event_id_when_not_provided() {
     let tid = uuid::Uuid::new_v4();
     let tap = nav_thread(&tid.to_string(), None);
-    let payload = build_push_payload("Hi", "There", None, None, Some(tid), None, &tap, None);
+    let payload = build_push_payload("Hi", "There", None, None, Some(tid), None, &tap, None, None);
     assert!(payload["notification"]["data"].get("event_id").is_none());
 }
 
 #[test]
 fn payload_always_includes_tap_even_when_modal_default() {
-    let payload = build_push_payload("Hi", "There", None, None, None, None, &Tap::Modal, None);
+    let payload = build_push_payload("Hi", "There", None, None, None, None, &Tap::Modal, None, None);
     assert_eq!(
         payload["notification"]["data"]["tap"],
         serde_json::json!({"kind": "modal"})
@@ -171,6 +196,7 @@ fn payload_includes_navigate_tap_for_cta_app() {
         None,
         None,
         &tap,
+        None,
         None,
     );
     let tap_val = &payload["notification"]["data"]["tap"];
@@ -204,7 +230,7 @@ fn wake_payload_carries_wake_flag_plus_original_content() {
         created_at: chrono::Utc::now(),
         tap: nav_thread(&tid.to_string(), Some(&eid.to_string())),
     };
-    let payload = build_wake_payload(&n, None);
+    let payload = build_wake_payload(&n, None, None);
     assert_eq!(payload["wake"], true);
     assert_eq!(payload["web_push"], 8030);
     let notif = &payload["notification"];
@@ -235,6 +261,7 @@ fn payload_includes_navigate_tap_for_cta_thread() {
         None,
         &tap,
         None,
+        None,
     );
     let tap_val = &payload["notification"]["data"]["tap"];
     assert_eq!(tap_val["kind"], "navigate");
@@ -260,7 +287,7 @@ fn declarative_navigate_falls_back_to_scope_relative_query_when_scope_missing() 
     let tid = uuid::Uuid::new_v4();
     let eid = uuid::Uuid::new_v4();
     let tap = nav_thread(&tid.to_string(), Some(&eid.to_string()));
-    let payload = build_push_payload("T", "B", Some(nid), None, Some(tid), Some(eid), &tap, None);
+    let payload = build_push_payload("T", "B", Some(nid), None, Some(tid), Some(eid), &tap, None, None);
     let nav = payload["notification"]["navigate"].as_str().unwrap();
     assert!(
         nav.starts_with('?') && !nav.starts_with('/'),
@@ -293,6 +320,7 @@ fn declarative_navigate_uses_absolute_scope_url_for_ios() {
         Some(eid),
         &tap,
         Some("https://lucidos.test/dev/"),
+        None,
     );
     let nav = payload["notification"]["navigate"].as_str().unwrap();
     assert!(
@@ -320,6 +348,7 @@ fn declarative_navigate_normalizes_scope_url_before_query_append() {
         None,
         &Tap::Modal,
         Some("https://lucidos.test/dev?stale=1#frag"),
+        None,
     );
     assert_eq!(
         payload["notification"]["navigate"],
@@ -333,7 +362,7 @@ fn declarative_navigate_omits_tap_param_for_modal_kind() {
     // `notification=…`, but the `tap=` param is redundant: the page-side
     // dispatcher defaults missing tap to modal. Keeps URLs short.
     let nid = uuid::Uuid::new_v4();
-    let payload = build_push_payload("T", "B", Some(nid), None, None, None, &Tap::Modal, None);
+    let payload = build_push_payload("T", "B", Some(nid), None, None, None, &Tap::Modal, None, None);
     let nav = payload["notification"]["navigate"].as_str().unwrap();
     assert!(nav.contains(&format!("notification={}", nid)));
     assert!(
@@ -349,7 +378,7 @@ fn declarative_navigate_root_when_no_params() {
     // — a scope-relative ref that resolves to the workspace (`/<slug>/`) root
     // on iOS. A bare "/" would escape to the origin root (the gateway picker),
     // the same multi-workspace trap the parametrized URLs avoid.
-    let payload = build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None);
+    let payload = build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None, None);
     assert_eq!(payload["notification"]["navigate"], ".");
     assert_eq!(payload["notification"]["data"]["navigate"], ".");
 }
@@ -365,6 +394,7 @@ fn declarative_navigate_scope_root_when_no_params_and_scope_present() {
         None,
         &Tap::Modal,
         Some("https://lucidos.test/dev/"),
+        None,
     );
     assert_eq!(
         payload["notification"]["navigate"],
@@ -380,7 +410,7 @@ fn declarative_notification_tag_carries_notification_id_for_dedup() {
     // duplicates. Engine produces the tag now so Safari's declarative path
     // gets the same dedup as the SW path.
     let nid = uuid::Uuid::new_v4();
-    let payload = build_push_payload("T", "B", Some(nid), None, None, None, &Tap::Modal, None);
+    let payload = build_push_payload("T", "B", Some(nid), None, None, None, &Tap::Modal, None, None);
     assert_eq!(payload["notification"]["tag"], nid.to_string());
 }
 
@@ -389,7 +419,7 @@ fn declarative_notification_tag_falls_back_to_default_when_no_id() {
     // Legacy callers without a notification_id still need a tag — the
     // engine fills in "lucidos-notification" so the OS dedup channel
     // exists.
-    let payload = build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None);
+    let payload = build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None, None);
     assert_eq!(payload["notification"]["tag"], "lucidos-notification");
 }
 
@@ -418,6 +448,7 @@ fn declarative_notification_data_carries_hash_navigate_url_for_chrome_sw() {
         None,
         &tap,
         Some("https://lucidos.test/dev/"),
+        None,
     );
     let nav_ios = payload["notification"]["navigate"].as_str().unwrap();
     let nav_sw = payload["notification"]["data"]["navigate"]

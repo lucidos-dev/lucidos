@@ -1,5 +1,6 @@
 import { requestVoid } from './_fetch';
 import { assertPlainObject } from './_validate';
+import { wsLocalGet } from './_storage';
 import { preferences as prefsModule } from './preferences';
 import { sse } from './sse';
 import { Select, enhanceSelects } from './select';
@@ -174,7 +175,7 @@ export const ui = {
     // "system" via matchMedia.
     let theme: string = resolveThemePreference(
       prefs['theme'],
-      localStorage.getItem('lucidos-theme'),
+      wsLocalGet('lucidos-theme'),
       () => document.documentElement.getAttribute('data-theme'),
     );
     if (theme === 'system') {
@@ -190,7 +191,7 @@ export const ui = {
     // Font — load Google Fonts on demand, map to CSS value. Fall back to the
     // `lucidos-font-family` localStorage value sdk-prefs.js read before the
     // hard default, so a missing server value doesn't reset the client font.
-    const fontKey = prefs['font-family'] || localStorage.getItem('lucidos-font-family') || 'monospace';
+    const fontKey = prefs['font-family'] || wsLocalGet('lucidos-font-family') || 'monospace';
     const googleUrl = GOOGLE_FONT_URLS[fontKey];
     if (googleUrl && !loadedFonts.has(fontKey)) {
       loadedFonts.add(fontKey);
@@ -210,7 +211,7 @@ export const ui = {
     // Fall back to the `lucidos-ui-scale` localStorage value sdk-prefs.js read
     // so a missing server value doesn't drop the client-applied scale.
     const rawScale = prefs['ui-scale'] || prefs['text-size'] || prefs['font-size']
-      || localStorage.getItem('lucidos-ui-scale');
+      || wsLocalGet('lucidos-ui-scale');
     if (rawScale) {
       const legacy: Record<string, number> = { small: 100, medium: 112.5, large: 125 };
       let n = legacy[rawScale];

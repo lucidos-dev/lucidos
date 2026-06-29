@@ -1424,11 +1424,12 @@ source "$(dirname "${BASH_SOURCE[0]}")/codesign.sh"
 
 # ── enable_clamshell_prevention ────────────────────────────────────────
 enable_clamshell_prevention() {
+    [ "$(uname)" = "Darwin" ] || return 0   # macOS-only (pmset/clamshell); no-op on Linux/CI
     mkdir -p "$SLEEP_LOCK_DIR"
     cleanup_stale_sleep_locks
 
     local ws_hash
-    ws_hash="$(echo -n "$WORKSPACE" | md5 -q)"
+    ws_hash="$(hash_string "$WORKSPACE")"
     echo "$$" > "$SLEEP_LOCK_DIR/$ws_hash"
 
     ensure_sudoers_pmset
@@ -1444,9 +1445,47 @@ enable_clamshell_prevention() {
 # Prevent idle/disk sleep while this script runs (-w $$).
 # Clamshell sleep is handled separately by pmset above.
 start_caffeinate() {
+    [ "$(uname)" = "Darwin" ] || return 0   # macOS-only (caffeinate); no-op on Linux/CI
     caffeinate -im -w $$ &
     CAFFEINATE_PID=$!
     enable_clamshell_prevention
+}
+
+# ── Network bind (dev) ───────────────────────────────────────────────────
+# Post the loopback-default security flip, a directly-launched engine and the
+# dev gateway default to 127.0.0.1 only. Dev needs network access (the picker +
+# the direct engine reachable over Tailscale / LAN), so these helpers opt into
+# all-interfaces — UNLESS the user has created ~/.lucidos/network.toml, in which
+# case they STEP ASIDE and let the Rust resolvers (+ each workspace's own
+# `network_bind` preference) derive the configured bind (a specific tailnet IP,
+# or a loopback lockdown). The file is the single source of truth for the
+# address; the shell only chooses "force all-interfaces vs defer to the file".
+network_toml_exists() {
+    [ -f "$HOME/.lucidos/network.toml" ]
+}
+
+# Bind for a directly-launched engine (start_engine). e2e must stay reachable on
+# localhost regardless of a developer's personal network.toml, so it always
+# forces all-interfaces.
+apply_dev_engine_bind() {
+    if [ "${SCRIPT_NAME:-}" = "e2e" ]; then
+        export LUCIDOS_BIND_ALL=1
+        return
+    fi
+    if network_toml_exists; then
+        unset LUCIDOS_BIND_ALL   # engine resolver reads ~/.lucidos/network.toml
+    else
+        export LUCIDOS_BIND_ALL=1
+    fi
+}
+
+# Bind for the dev gateway (start_gateway). Same rule, gateway-scoped var.
+apply_dev_gateway_bind() {
+    if network_toml_exists; then
+        unset LUCIDOS_GATEWAY_BIND_ALL  # gateway resolver reads network.toml
+    else
+        export LUCIDOS_GATEWAY_BIND_ALL=1
+    fi
 }
 
 # ── start_engine ────────────────────────────────────────────────────────
@@ -1454,6 +1493,15 @@ start_caffeinate() {
 # Reuses an existing healthy engine if one is already running for this workspace.
 # Sets ENGINE_PID.
 start_engine() {
+    # Direct-front launch (legacy no-gateway dev, tauri-dev, e2e): the engine IS
+    # the user-facing door on its own port. The engine now defaults to LOOPBACK
+    # (security: a directly-launched engine has no API auth), so opt into the
+    # network here — deferring to ~/.lucidos/network.toml when the user set an
+    # explicit bind there. The gateway path does NOT use this function — it
+    # spawns engines itself with the right bind (see gateway stack.rs
+    # spawn_engine).
+    apply_dev_engine_bind
+
     # Check if an existing engine is already healthy on our port
     if [ -f "$ENGINE_PIDFILE" ]; then
         local existing_pid
@@ -1683,8 +1731,9 @@ start_gateway() {
     # iOS PWA over Tailscale). Without this opt-in a gateway rebuild+reload comes
     # up on 127.0.0.1 only and the gateway is unreachable remotely. Packaged
     # (desktop.rs::spawn_gateway, LUCIDOS_PACKAGED=1) does NOT run start_gateway,
-    # so it stays loopback-only.
-    export LUCIDOS_GATEWAY_BIND_ALL="1"
+    # so it stays loopback-only. Defers to ~/.lucidos/network.toml when the user
+    # set an explicit gateway bind there (a specific tailnet IP / loopback).
+    apply_dev_gateway_bind
     # The gateway serves the picker from dist/ and passes LUCIDOS_STATIC_DIR
     # through to the engines it spawns so they serve dist/ too (set by swap_ports;
     # re-exported here for clarity).

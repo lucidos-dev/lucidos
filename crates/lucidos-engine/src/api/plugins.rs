@@ -229,12 +229,14 @@ pub(super) async fn catalog(
             &format!("read marketplace registry: {e}"),
         )
     })?;
-    let installed = installed_plugin_summaries(&state.pool).await.map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("read installed plugins: {e}"),
-        )
-    })?;
+    let installed = installed_plugin_summaries(&state.pool, &state.workspace_path)
+        .await
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("read installed plugins: {e}"),
+            )
+        })?;
     let workspace_path = state.workspace_path.clone();
     let mut catalog =
         tokio::task::spawn_blocking(move || scan_catalog(&workspace_path, &registry, &installed))
@@ -257,12 +259,14 @@ pub(super) async fn catalog(
 pub(super) async fn installed(
     State(state): State<AppState>,
 ) -> Result<Json<InstalledPluginsResponse>, (StatusCode, Json<JsonValue>)> {
-    let plugins = installed_plugin_summaries(&state.pool).await.map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("read installed plugins: {e}"),
-        )
-    })?;
+    let plugins = installed_plugin_summaries(&state.pool, &state.workspace_path)
+        .await
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("read installed plugins: {e}"),
+            )
+        })?;
     Ok(Json(InstalledPluginsResponse { plugins }))
 }
 
@@ -642,6 +646,8 @@ mod tests {
             setup_thread_id: Some(tid.to_string()),
             setup_complete: false,
             app_id: None,
+            modified: false,
+            modified_paths: vec![],
         }
     }
 

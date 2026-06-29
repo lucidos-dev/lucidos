@@ -23,6 +23,8 @@ fn candidate(id: &str, name: &str, version: &str) -> MarketplacePlugin {
         setup_thread_id: None,
         setup_complete: false,
         app_id: Some(id.to_string()),
+        modified: false,
+        modified_paths: vec![],
     }
 }
 

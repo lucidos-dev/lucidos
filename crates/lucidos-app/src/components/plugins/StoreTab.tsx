@@ -70,6 +70,17 @@ function fileCountLabel(count: number): string {
   return `${count} ${count === 1 ? 'file' : 'files'}`;
 }
 
+/** Tooltip for the "Modified" badge: warns that a future update overwrites the
+ *  local changes, and lists the changed paths (capped so the tooltip stays
+ *  readable). */
+function modifiedTooltip(paths?: string[]): string {
+  const base = 'You have locally modified this plugin — a future update will overwrite your changes.';
+  if (!paths || paths.length === 0) return base;
+  const shown = paths.slice(0, 6).join(', ');
+  const more = paths.length > 6 ? `, +${paths.length - 6} more` : '';
+  return `${base} Changed: ${shown}${more}`;
+}
+
 function matchesQuery(plugin: MarketplacePlugin, query: string): boolean {
   if (!query) return true;
   return (
@@ -107,6 +118,8 @@ function orphanRow(p: InstalledPlugin): MarketplacePlugin {
     status: 'installed',
     installed_version: p.version,
     app_id: p.app_id,
+    modified: p.modified,
+    modified_paths: p.modified_paths,
   };
 }
 
@@ -203,7 +216,7 @@ export function StoreTab() {
 
   return (
     <div class="list-rows">
-      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton fill />}>
         {primary.status === 'loaded' ? (
           <StoreTabLoaded
             installedOnly={installedOnly}
@@ -365,6 +378,11 @@ function StoreTabLoaded({
                 <span class={`app-store-status app-store-status-${plugin.status}`}>
                   {statusLabel(plugin)}
                 </span>
+                {plugin.modified && (
+                  <span class="app-store-modified-chip" data-tooltip={modifiedTooltip(plugin.modified_paths)}>
+                    Modified
+                  </span>
+                )}
               </div>
               {plugin.description && <div class="list-row-details">{plugin.description}</div>}
               <div class="app-store-plugin-meta">

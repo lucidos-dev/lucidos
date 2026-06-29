@@ -1321,7 +1321,12 @@ pub(crate) async fn install_from_unpacked_with_bus(
     // git-based backups). One commit covers all content dirs (apps/, knowhow/,
     // triggers/, scripts/, auth-modules/). The confirm flow holds
     // `lock_workspace_repo` around this call so it can't race other repo writes.
-    crate::core::commit_data_paths_added(
+    // Capture the install commit sha — it is the baseline a later read diffs the
+    // plugin's on-disk content against to decide whether the user has locally
+    // modified it (the Plugins-list "Modified" badge). Recorded in the
+    // `PluginInstalled` payload below; an update re-commits and re-stamps it, so
+    // the badge resets. See `registry::plugin_modification_status`.
+    let install_commit = crate::core::commit_data_paths_added(
         workspace_path,
         &installed_files,
         &format!("Install plugin: {} v{}", manifest.id, manifest.version),
@@ -1342,6 +1347,7 @@ pub(crate) async fn install_from_unpacked_with_bus(
     payload.insert("files".into(), serde_json::json!(installed_files));
     payload.insert("installed_at".into(), serde_json::json!(installed_at));
     payload.insert("source_type".into(), serde_json::json!(source_type.as_str()));
+    payload.insert("commit".into(), serde_json::json!(install_commit));
     if let Some(tid) = setup_thread_id {
         payload.insert("setup_thread_id".into(), serde_json::json!(tid.to_string()));
     }

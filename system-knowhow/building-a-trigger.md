@@ -287,7 +287,7 @@ If you genuinely need a different trigger (different *workflow*, not a tweak of 
 
 Don't call `create_trigger` from the user's first message. Most "create a trigger for X" requests leave at least one of these unsettled — confirm before writing the trigger. Skip questions only when the user has already answered them in the same turn.
 
-1. **Recurring or one-shot?** "Notify me at 5pm today" is a one-shot — handle inline, don't create a trigger. Triggers are for things that should keep happening. If the user explicitly wants a one-shot trigger anyway (e.g. "create a test trigger that fires once in 2 min"), ask whether it should delete itself after firing — it won't on its own. See "One-shot triggers" below for the procedure.
+1. **Recurring or one-shot?** "Notify me at 5pm today" is a one-shot — handle inline, don't create a trigger. Triggers are for things that should keep happening. If the user explicitly wants a one-shot trigger anyway (e.g. "create a test trigger that fires once in 2 min"), ask whether it should delete itself after firing — it won't on its own. Create it with `go_to_review` omitted (so the fire-thread lands in Archive, not the Current section) unless the user explicitly wants to read the run afterwards. See "One-shot triggers" below for the procedure.
 2. **Cron or `on`?** "Every morning at 8" is cron. "When my package ships" is an event subscription. If the user names several events the same workflow should react to ("when X *or* Y happens"), they belong in one trigger with multiple `on` entries — not parallel triggers. If the event doesn't exist yet, name the work (emit the event from somewhere, then trigger on it) and confirm.
 3. **What's the run.intent in the user's voice?** One sentence the user would actually say. If you're tempted to write the procedure here, stop and put it in knowhow instead.
 4. **Should it notify, and on what?** Default is silent — `send_notification` only fires when there's something the user wants to hear about. Confirm whether a successful run should notify, and what the message should look like.
@@ -299,6 +299,8 @@ Don't ask all six in one wall — pick the ones the user's request actually leav
 ## One-shot triggers
 
 Most one-shot requests ("remind me at 5pm today") should be handled inline without a trigger at all. Create a one-shot trigger only when the user explicitly asks for one (testing, demo, deliberate scheduling).
+
+**Leave `go_to_review` at its default (false / omitted)** so the single fire-thread goes straight to Archive instead of surfacing in the Current section. A one-shot reminder/test trigger's job is done the moment it fires — its thread isn't something the user needs to read afterward. This holds **even when the trigger sends a `send_notification` and/or deletes itself**: the notification is the user-facing output, and self-deletion is still the right outcome, but the thread itself stays in Archive. Only set `go_to_review: true` if the user explicitly wants to read the run afterwards.
 
 A one-shot trigger does **not** self-clean. After firing, the cron expression no longer matches anything, but the trigger row stays in the trigger list — visible in pickers, the filter dropdown, and `list_triggers` output — until something deletes it. There are two acceptable ways to handle this; pick one with the user before creating:
 

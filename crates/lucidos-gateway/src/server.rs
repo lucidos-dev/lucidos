@@ -18,6 +18,7 @@
 
 use crate::boot_phase::{self, BootPhase};
 use crate::error::ApiError;
+use crate::net_config;
 use crate::postgres::{self, PgBackend, PgHandle};
 use crate::proxy;
 use crate::registry::{self, Registry, Workspace, SIGIL};
@@ -30,7 +31,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -102,6 +102,35 @@ const RESTART_CAP: u32 = 5;
 /// engine that is still ALIVE is never culled — whatever the probe says (see
 /// [`respawn_decision`]) — so there is no separate "slow" threshold.
 const DEAD_MISS_THRESHOLD: u32 = 2;
+/// How long a workspace may sit in the boot window (continuously non-healthy
+/// since its boot phase was first set) before the boot splash escapes to the
+/// manual "Back to workspaces" page (see [`proxy::stalled_page`]). Must exceed a
+/// legitimate slow first-run boot: `BOOT_GRACE` (120s) plus migrations, the
+/// memory-model download (the splash label warns "this can take a minute"), and
+/// recovery. The escape is needed because an alive-but-unreachable engine (e.g. a
+/// misconfigured bind, network partition) is NEVER marked `Unhealthy`
+/// ([`respawn_decision`] never culls an alive process), so without a time budget
+/// the splash would meta-refresh forever with no way out.
+const BOOT_ESCAPE_BUDGET: Duration = Duration::from_secs(240);
+
+/// One workspace's live boot-window state, mirrored in `boot_phases`. `phase`
+/// drives the splash label; `since` is when the window OPENED (first
+/// `set_boot_phase` of this episode) and is preserved across phase updates so the
+/// elapsed-time budget ([`BOOT_ESCAPE_BUDGET`]) accumulates. The whole entry is
+/// dropped when the workspace becomes healthy / is stopped.
+#[derive(Clone, Copy)]
+struct BootProgress {
+    phase: BootPhase,
+    since: Instant,
+}
+
+/// Whether a boot window that opened `elapsed` ago has stalled long enough to
+/// show the manual escape page instead of the auto-refreshing "starting" splash.
+/// `None` (no boot window — healthy/stopped/unknown) is never stalled. Pure so the
+/// budget policy is unit-tested.
+fn boot_window_stalled(elapsed: Option<Duration>) -> bool {
+    elapsed.is_some_and(|e| e >= BOOT_ESCAPE_BUDGET)
+}
 
 /// Shared, cheaply-cloneable gateway handle.
 #[derive(Clone)]
@@ -165,7 +194,7 @@ struct GatewayInner {
     /// `boot-phase` control endpoint. Entries are removed once the workspace is
     /// healthy / stopped so a later cold open never shows a stale phase. Mirrors
     /// the `routes` map (cheap `RwLock`, off the stack-mutex path).
-    boot_phases: RwLock<HashMap<String, BootPhase>>,
+    boot_phases: RwLock<HashMap<String, BootProgress>>,
     /// Single-slot state of the picker's restore-from-backup flow (see
     /// [`RestoreStatus`]). Polled via the control API; never persisted.
     restore: RwLock<RestoreStatus>,
@@ -224,7 +253,15 @@ impl GatewayState {
     /// and by the `boot-phase` control endpoint when the engine reports.
     pub fn set_boot_phase(&self, id: &str, phase: BootPhase) {
         if let Ok(mut p) = self.inner.boot_phases.write() {
-            p.insert(id.to_string(), phase);
+            // Preserve `since` across phase updates: it marks when THIS boot window
+            // opened, so the escape budget ([`BOOT_ESCAPE_BUDGET`]) accumulates
+            // over the whole episode rather than resetting on every phase advance.
+            p.entry(id.to_string())
+                .and_modify(|bp| bp.phase = phase)
+                .or_insert(BootProgress {
+                    phase,
+                    since: Instant::now(),
+                });
         }
     }
 
@@ -244,8 +281,20 @@ impl GatewayState {
             .boot_phases
             .read()
             .ok()
-            .and_then(|p| p.get(id).map(|phase| phase.label()))
+            .and_then(|p| p.get(id).map(|bp| bp.phase.label()))
             .unwrap_or(boot_phase::DEFAULT_LABEL)
+    }
+
+    /// How long `id`'s current boot window has been open, or `None` when there is
+    /// no boot window (healthy / stopped / never opened). Cheap `RwLock` read off
+    /// the stack-mutex path — safe on the proxy hot path. Drives the boot-splash
+    /// escape decision ([`boot_window_stalled`]).
+    fn boot_elapsed(&self, id: &str) -> Option<Duration> {
+        self.inner
+            .boot_phases
+            .read()
+            .ok()
+            .and_then(|p| p.get(id).map(|bp| bp.since.elapsed()))
     }
 
     /// The single workspace's slug when exactly one is registered, else `None`.
@@ -284,6 +333,8 @@ impl GatewayState {
                     health: Health::Unhealthy,
                     autostart: ws.autostart,
                     last_error: Some("not started".to_string()),
+                    // Stopped workspace → no engine to poll → no badge.
+                    unread_count: None,
                 });
             }
         }
@@ -465,6 +516,7 @@ impl GatewayState {
                 health_misses: 0,
                 last_spawn: Some(Instant::now()),
                 last_error: None,
+                last_unread: None,
             },
             Err(e) => {
                 crate::log!("[Gateway] workspace '{}' failed to start: {}", ws.id, e);
@@ -481,6 +533,7 @@ impl GatewayState {
                     health_misses: 0,
                     last_spawn: None,
                     last_error: Some(e.to_string()),
+                    last_unread: None,
                 }
             }
         };
@@ -573,6 +626,7 @@ impl GatewayState {
                 health: Health::Unhealthy,
                 autostart: ws.autostart,
                 last_error: Some("stack missing after create".to_string()),
+                unread_count: None,
             },
         };
         Ok(status)
@@ -792,6 +846,7 @@ impl GatewayState {
                     health_misses: 0,
                     last_spawn: Some(Instant::now()),
                     last_error: None,
+                    last_unread: None,
                 };
                 self.set_route(&ws.id, ws.port);
                 self.inner
@@ -1161,15 +1216,26 @@ impl GatewayState {
         // stack lock held, so one slow engine never serializes the whole pass.
         let scheme = self.engine_scheme();
         let client = &self.inner.health_client;
-        let outcomes: Vec<ProbeOutcome> = futures::future::join_all(
-            candidates
-                .iter()
-                .map(|t| stack::probe_health(client, scheme, t.port)),
+        // Probe health and, for an engine that answers healthy, its unread count
+        // in the same concurrent pass (the count fetch only runs on a healthy
+        // probe, so unhealthy/booting engines cost no extra request). This is the
+        // sole unread-count path — the gateway holds no DB handle (ADR 0014 §1) —
+        // so a stopped workspace yields `None` and shows no badge.
+        let outcomes: Vec<(ProbeOutcome, Option<u64>)> = futures::future::join_all(
+            candidates.iter().map(|t| async move {
+                let outcome = stack::probe_health(client, scheme, t.port).await;
+                let unread = if outcome == ProbeOutcome::Healthy {
+                    stack::fetch_unread_count(client, scheme, t.port).await
+                } else {
+                    None
+                };
+                (outcome, unread)
+            }),
         )
         .await;
 
         // Apply phase: re-acquire each stack briefly to write the result back.
-        for (t, outcome) in candidates.into_iter().zip(outcomes) {
+        for (t, (outcome, unread)) in candidates.into_iter().zip(outcomes) {
             let mut s = t.stack.lock().await;
             // The lock was dropped across the probe, so the stack may have changed
             // under us. Discard a stale result rather than apply it to a
@@ -1185,10 +1251,16 @@ impl GatewayState {
                 s.restart_attempts = 0;
                 s.health_misses = 0;
                 s.last_error = None;
+                // Refresh the per-workspace badge count (None if the fetch failed
+                // even though health passed — show no badge rather than a stale one).
+                s.last_unread = unread;
                 // Booted — drop the boot phase so a later cold open starts clean.
                 self.clear_boot_phase(&t.id);
                 continue;
             }
+
+            // Not healthy → no trustworthy count; clear the badge for this tick.
+            s.last_unread = None;
 
             let since_spawn = s.last_spawn.map(|t| t.elapsed()).unwrap_or(Duration::MAX);
             let alive = engine_process_alive(&mut s);
@@ -1420,14 +1492,19 @@ pub async fn run() -> Result<(), BoxError> {
     // + probe it over https. A packaged engine serves plain http on loopback.
     let engine_tls = !engine_loopback && std::env::var_os("LUCIDOS_TLS_CERT").is_some();
     // The gateway fronts every workspace API and its own destructive control
-    // plane. Default to loopback so a packaged/default launch is not exposed to
-    // the LAN; deployments that intentionally front Lucidos on the network must
-    // opt in explicitly.
-    let gateway_bind_all = matches!(
-        std::env::var("LUCIDOS_GATEWAY_BIND_ALL")
-            .unwrap_or_default()
-            .trim(),
-        "1" | "true" | "yes" | "on"
+    // plane. Resolve its bind with a loopback-first precedence (see
+    // `net_config`): an explicit `LUCIDOS_GATEWAY_BIND_ADDR` → `LUCIDOS_GATEWAY_
+    // BIND_ALL` → the machine-global `~/.lucidos/network.toml` `[gateway] bind` →
+    // loopback. Default with nothing set is loopback-only so a packaged/default
+    // launch is never exposed to the LAN; a malformed value fails safe to
+    // loopback, never to all-interfaces.
+    let network = net_config::read_network_toml();
+    let gateway_bind_addr_env = std::env::var("LUCIDOS_GATEWAY_BIND_ADDR").ok();
+    let gateway_bind_all_env = std::env::var("LUCIDOS_GATEWAY_BIND_ALL").ok();
+    let gateway_bind_choice = net_config::resolve_gateway_bind(
+        gateway_bind_addr_env.as_deref(),
+        gateway_bind_all_env.as_deref(),
+        network.gateway_bind.as_deref(),
     );
     let pg_backend = PgBackend::from_env()?;
     // Packaged desktop runtime sets `LUCIDOS_PACKAGED=1` (mirrors its
@@ -1460,11 +1537,7 @@ pub async fn run() -> Result<(), BoxError> {
     );
     crate::log!(
         "[Gateway] gateway bind: {}",
-        if gateway_bind_all {
-            "all interfaces (explicit opt-in)"
-        } else {
-            "loopback-only"
-        }
+        net_config::bind_scope_label(&gateway_bind_choice)
     );
     crate::log!("[Gateway] postgres backend: {:?}", pg_backend);
 
@@ -1512,14 +1585,18 @@ pub async fn run() -> Result<(), BoxError> {
         });
     }
 
-    serve(state, gateway_port, gateway_bind_all).await
+    serve(state, gateway_port, gateway_bind_choice).await
 }
 
 /// Build the gateway router and serve it (TLS when certs are configured, like
 /// the engine). `/~/api/v1/health` + `/~/api/v1/control/*` are the gateway's
 /// own; every other path falls through to [`fallback`] (smart root, picker
 /// static under `/~/`, else proxy `/<slug>/*`).
-async fn serve(state: GatewayState, port: u16, bind_all: bool) -> Result<(), BoxError> {
+async fn serve(
+    state: GatewayState,
+    port: u16,
+    bind_choice: net_config::BindChoice,
+) -> Result<(), BoxError> {
     let router = Router::new()
         .route("/~/api/v1/health", get(gateway_health))
         .nest("/~/api/v1/control", crate::control::router())
@@ -1536,35 +1613,38 @@ async fn serve(state: GatewayState, port: u16, bind_all: bool) -> Result<(), Box
         router
     };
 
-    let addr = gateway_bind_addr(port, bind_all);
+    // Every address to listen on. A specific `Address` ALSO binds loopback (see
+    // `net_config::bind_socket_addrs`) so the dev launch scripts' control POSTs
+    // and each spawned engine's Apply-restart callback — both over `127.0.0.1` —
+    // keep reaching the gateway. `addr` (the primary) is only for the log.
+    let addrs = net_config::bind_socket_addrs(&bind_choice, port);
+    let addr = addrs[0];
     let handle = axum_server::Handle::new();
     install_shutdown(handle.clone());
 
     let tls_cert = std::env::var("LUCIDOS_TLS_CERT").ok();
     let tls_key = std::env::var("LUCIDOS_TLS_KEY").ok();
+    // Serve every resolved address concurrently under the one shared shutdown
+    // `Handle`; a bind failure on any address fails fast.
     if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
         let cfg = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await?;
         crate::log!("[Gateway] listening on https://{} (TLS)", addr);
-        axum_server::bind_rustls(addr, cfg)
-            .handle(handle)
-            .serve(router.into_make_service())
-            .await?;
+        futures::future::try_join_all(addrs.into_iter().map(|a| {
+            axum_server::bind_rustls(a, cfg.clone())
+                .handle(handle.clone())
+                .serve(router.clone().into_make_service())
+        }))
+        .await?;
     } else {
         crate::log!("[Gateway] listening on http://{}", addr);
-        axum_server::bind(addr)
-            .handle(handle)
-            .serve(router.into_make_service())
-            .await?;
+        futures::future::try_join_all(addrs.into_iter().map(|a| {
+            axum_server::bind(a)
+                .handle(handle.clone())
+                .serve(router.clone().into_make_service())
+        }))
+        .await?;
     }
     Ok(())
-}
-
-fn gateway_bind_addr(port: u16, bind_all: bool) -> SocketAddr {
-    if bind_all {
-        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port))
-    } else {
-        SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port))
-    }
 }
 
 fn permissive_cors_enabled() -> bool {
@@ -1628,6 +1708,16 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
         Some(port) => {
             if rest == "manifest.json" {
                 return serve_workspace_manifest(&state, &slug);
+            }
+            // A document navigation to a workspace stuck in its boot window past
+            // the budget ([`BOOT_ESCAPE_BUDGET`]) escapes to the manual "Back to
+            // workspaces" page instead of the forever-refreshing starting splash —
+            // an alive-but-unreachable engine (e.g. a misconfigured bind) is never
+            // marked `Unhealthy`, so the time budget is the only honest signal.
+            // Non-document traffic (API/SSE/assets from an already-open tab) still
+            // proxies; the frontend owns its own disconnected recovery.
+            if is_document_navigation(&req) && boot_window_stalled(state.boot_elapsed(&slug)) {
+                return proxy::stalled_page();
             }
             let target = format!("{}://127.0.0.1:{port}", state.engine_scheme());
             // The route is set the instant `bring_up` spawns the engine — while
@@ -2045,21 +2135,6 @@ mod tests {
     }
 
     #[test]
-    fn gateway_bind_addr_defaults_to_loopback_unless_explicitly_opened() {
-        let loopback = gateway_bind_addr(5251, false);
-        assert_eq!(
-            loopback,
-            SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 5251))
-        );
-
-        let all_interfaces = gateway_bind_addr(5251, true);
-        assert_eq!(
-            all_interfaces,
-            SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 5251))
-        );
-    }
-
-    #[test]
     fn permissive_cors_is_disabled_unless_explicitly_enabled() {
         for value in [None, Some(""), Some("0"), Some("false"), Some("off")] {
             assert!(!permissive_cors_enabled_value(value), "value: {value:?}");
@@ -2096,6 +2171,18 @@ mod tests {
         assert_eq!(out["name"], "Lucidos");
         assert_eq!(out["display"], "standalone");
         assert_eq!(out["icons"][0]["src"], "icons/icon-192.png");
+    }
+
+    #[test]
+    fn boot_window_stalled_only_past_budget() {
+        // No boot window (healthy / stopped) is never stalled.
+        assert!(!boot_window_stalled(None));
+        // Within budget → still the auto-refreshing starting splash.
+        assert!(!boot_window_stalled(Some(Duration::from_secs(0))));
+        assert!(!boot_window_stalled(Some(BOOT_ESCAPE_BUDGET - Duration::from_secs(1))));
+        // At/past budget → escape to the manual "Back to workspaces" page.
+        assert!(boot_window_stalled(Some(BOOT_ESCAPE_BUDGET)));
+        assert!(boot_window_stalled(Some(BOOT_ESCAPE_BUDGET + Duration::from_secs(60))));
     }
 
     /// Installing from `http(s)://host:<gateway-port>/<workspace>/` must also stay in the

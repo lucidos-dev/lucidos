@@ -68,6 +68,17 @@ pub async fn run_handshake_script(
         // "can't open file" message — common cause is a typo in apis.json.
         return Err(RunError::NotFound(script_abs.display().to_string()));
     }
+    // Collect the secret env values (CRED_*/OAUTH_*) so any that the script
+    // echoes to stderr (a traceback dumping os.environ, a debug print) is
+    // scrubbed out of the error we surface to the caller / logs — a script's
+    // stderr is returned verbatim in the 502, and these env vars carry live
+    // credentials and OAuth tokens.
+    let secret_values: Vec<String> = env_vars
+        .iter()
+        .filter(|(k, _)| k.starts_with("CRED_") || k.starts_with("OAUTH_"))
+        .map(|(_, v)| v.clone())
+        .collect();
+
     let mut cmd = Command::new("python3");
     cmd.arg(&script_abs);
     for (k, v) in env_vars {
@@ -83,9 +94,13 @@ pub async fn run_handshake_script(
         Err(_) => return Err(RunError::Timeout),
     };
     if !output.status.success() {
+        let stderr = crate::core::redact_secret_values(
+            &String::from_utf8_lossy(&output.stderr),
+            &secret_values,
+        );
         return Err(RunError::NonZeroExit {
             code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            stderr,
         });
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -204,6 +219,58 @@ sys.exit(2)
                 );
             }
             other => panic!("expected NonZeroExit, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_zero_exit_stderr_redacts_credential_env_values() {
+        // A failing script that leaks a CRED_/OAUTH_ env value to stderr (a
+        // traceback dumping os.environ, an over-eager debug print) must not have
+        // that secret echoed back in the surfaced error — stderr is returned
+        // verbatim into the 502 / logs.
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = write_script(
+            tmp.path(),
+            "leaky.py",
+            r#"
+import os, sys
+print("login failed; token was " + os.environ.get("CRED_SVC", ""), file=sys.stderr)
+print("oauth=" + os.environ.get("OAUTH_GOOGLE_ACCESS_TOKEN", ""), file=sys.stderr)
+sys.exit(3)
+"#,
+        );
+        let err = run_handshake_script(
+            tmp.path(),
+            &rel,
+            vec![
+                ("CRED_SVC".to_string(), "sk-live-supersecret-value".to_string()),
+                (
+                    "OAUTH_GOOGLE_ACCESS_TOKEN".to_string(),
+                    "ya29.oauth-access-token".to_string(),
+                ),
+            ],
+        )
+        .await
+        .expect_err("expected non-zero exit");
+        match err {
+            RunError::NonZeroExit { code, stderr } => {
+                assert_eq!(code, Some(3));
+                assert!(
+                    !stderr.contains("sk-live-supersecret-value"),
+                    "CRED_ value must be redacted from stderr; got: {stderr:?}"
+                );
+                assert!(
+                    !stderr.contains("ya29.oauth-access-token"),
+                    "OAUTH_ value must be redacted from stderr; got: {stderr:?}"
+                );
+                assert!(
+                    stderr.contains("[REDACTED]"),
+                    "redaction marker should be present; got: {stderr:?}"
+                );
+                // Non-secret context is preserved so the operator still sees the failure.
+                assert!(stderr.contains("login failed"), "got: {stderr:?}");
+            }
+            other => panic!("expected NonZeroExit, got {other:?}"),
         }
     }
 

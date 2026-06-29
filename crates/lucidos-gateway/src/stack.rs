@@ -1,10 +1,12 @@
 //! One workspace stack = the spawned engine process + its health state.
 //!
 //! Engine bind depends on the build (ADR 0014 "Dev runtime topology"): **packaged**
-//! engines bind **loopback only** (`LUCIDOS_BIND_LOOPBACK=1`) so the gateway is
-//! the sole network-facing surface; **dev** engines bind all interfaces on their
-//! own port so the app is reachable directly there too (see `spawn_engine`'s
-//! `loopback` arg). Either way engines are spawned **detached** (`setsid`) so a
+//! engines bind **loopback only** so the gateway is the sole network-facing
+//! surface (the engine defaults to loopback; `LUCIDOS_BIND_LOOPBACK=1` is also
+//! set as its `behind_gateway` signal); **dev** engines bind all interfaces on
+//! their own port (`LUCIDOS_BIND_ALL=1`) so the app is reachable directly there
+//! too (see `spawn_engine`'s `loopback` arg). Either way engines are spawned
+//! **detached** (`setsid`) so a
 //! gateway crash/restart doesn't take them down; a re-adopting gateway reconnects
 //! via the pidfile + a health probe (engine-statelessness). Supervision is
 //! health-probe based, so it works identically for spawned + re-adopted engines.
@@ -50,6 +52,11 @@ pub struct StackRuntime {
     pub health_misses: u32,
     pub last_spawn: Option<Instant>,
     pub last_error: Option<String>,
+    /// Last unread-notification count fetched from this engine (the picker's
+    /// per-workspace badge + the aggregate Tauri / gateway-PWA total). `None`
+    /// when the engine isn't healthy / hasn't been polled yet — a stopped
+    /// workspace contributes no badge. Refreshed by the supervise loop.
+    pub last_unread: Option<u64>,
 }
 
 /// Serializable status view for the control API / picker.
@@ -64,6 +71,11 @@ pub struct WorkspaceStatus {
     pub autostart: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Unread-notification count for this workspace's per-row badge. Omitted
+    /// (not `0`) when unknown — a stopped/unhealthy/unpolled engine has no
+    /// count, so the picker shows no badge rather than a misleading zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unread_count: Option<u64>,
 }
 
 impl StackRuntime {
@@ -75,6 +87,7 @@ impl StackRuntime {
             health: self.health,
             autostart: self.ws.autostart,
             last_error: self.last_error.clone(),
+            unread_count: self.last_unread,
         }
     }
 }
@@ -121,17 +134,32 @@ pub fn spawn_engine(
         // Packaged: loopback only — the gateway is the sole network-facing
         // surface and terminates TLS, so the engine serves plain HTTP on
         // loopback. Strip any inherited TLS config (else it would serve https
-        // and the gateway's http proxy would fail).
+        // and the gateway's http proxy would fail). `LUCIDOS_BIND_LOOPBACK=1`
+        // is the engine's `behind_gateway` signal; the engine ALSO defaults to a
+        // loopback bind when `LUCIDOS_BIND_ALL` is unset (which it is here), so
+        // this stays loopback-only.
         cmd.env("LUCIDOS_BIND_LOOPBACK", "1")
+            .env_remove("LUCIDOS_BIND_ALL")
             .env_remove("LUCIDOS_TLS_CERT")
             .env_remove("LUCIDOS_TLS_KEY");
     } else {
-        // Dev: the engine is the direct front on its port. Bind all interfaces
-        // and KEEP the inherited TLS (LUCIDOS_TLS_CERT/KEY) so
-        // `https://localhost:<port>/` reaches it directly; the gateway proxies
-        // to it over the matching scheme. Clear the loopback flag so a respawn
-        // stays network-bound.
+        // Dev: the engine is the direct front on its port. KEEP the inherited
+        // TLS (LUCIDOS_TLS_CERT/KEY) so `https://localhost:<port>/` reaches it
+        // directly; the gateway proxies to it over the matching scheme. Clear
+        // the loopback flag so a respawn stays network-capable and not flagged
+        // as behind-gateway.
+        //
+        // Bind: default to all interfaces (the engine defaults to loopback now,
+        // so this must be explicit) — BUT defer to ~/.lucidos/network.toml when
+        // it exists, so the engine's own resolver derives the configured bind
+        // (`[engine] inherit` → the gateway bind, else this workspace's own
+        // `network_bind` preference) instead of being masked by BIND_ALL.
         cmd.env_remove("LUCIDOS_BIND_LOOPBACK");
+        if crate::net_config::network_toml_exists() {
+            cmd.env_remove("LUCIDOS_BIND_ALL");
+        } else {
+            cmd.env("LUCIDOS_BIND_ALL", "1");
+        }
     }
 
     // Detach into its own session so a gateway death doesn't cascade.
@@ -247,6 +275,26 @@ pub fn build_health_client() -> reqwest::Client {
         .expect("failed to build gateway health client")
 }
 
+/// Fetch a running engine's unread-notification count via the count-only probe
+/// (`?limit=0`) the engine already exposes — reused so the gateway needs no new
+/// engine endpoint. Best-effort: any transport / non-2xx / parse failure returns
+/// `None`, so a slow or just-restarted engine simply shows no badge that tick.
+///
+/// This HTTP read is the ONLY count path: the gateway deliberately holds no DB
+/// handle (ADR 0014 §1), so a STOPPED workspace contributes nothing to the
+/// per-row badge or the aggregate total — the settled "running workspaces only"
+/// behavior. `text()` + manual parse avoids pulling reqwest's `json` feature.
+pub async fn fetch_unread_count(client: &reqwest::Client, scheme: &str, port: u16) -> Option<u64> {
+    let url = format!("{scheme}://127.0.0.1:{port}/api/v1/notifications?limit=0");
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+    json.get("unread_count")?.as_u64()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,10 +322,40 @@ mod tests {
             health_misses: 0,
             last_spawn: None,
             last_error: None,
+            last_unread: None,
         };
         let json = serde_json::to_value(stack.status()).unwrap();
         assert_eq!(json["autostart"], serde_json::json!(true));
         assert_eq!(json["health"], serde_json::json!("healthy"));
         assert_eq!(json["id"], serde_json::json!("dev"));
+        // Unknown count → field omitted (no misleading zero badge).
+        assert!(json.get("unread_count").is_none());
+    }
+
+    /// A polled count surfaces as `unread_count` for the picker's per-row badge.
+    #[test]
+    fn workspace_status_serializes_unread_count_when_known() {
+        let ws = Workspace {
+            id: "dev".into(),
+            name: "Dev".into(),
+            dir: "/ws/dev".into(),
+            port: 5173,
+            database_url: None,
+            autostart: false,
+        };
+        let stack = StackRuntime {
+            ws,
+            resolved_dir: PathBuf::from("/ws/dev"),
+            pg: PgHandle::External,
+            engine: None,
+            health: Health::Healthy,
+            restart_attempts: 0,
+            health_misses: 0,
+            last_spawn: None,
+            last_error: None,
+            last_unread: Some(4),
+        };
+        let json = serde_json::to_value(stack.status()).unwrap();
+        assert_eq!(json["unread_count"], serde_json::json!(4));
     }
 }

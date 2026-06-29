@@ -10,11 +10,12 @@ const SKELETON_FADE_MS = 250;
  *  delayed loader lacks (a slow load otherwise hard-snaps from skeleton to
  *  content). No content is withheld: `children` (the loaded content) renders
  *  immediately when ready; the skeleton just lingers briefly and fades out over
- *  it. Pair with a delay-only gate (`useDelayedFlag`/`useDelayedLoading`) on
- *  `showSkeleton` so fast loads never show the skeleton at all — EXCEPT on a
- *  full-screen surface with no competing content behind the loader (e.g. the
- *  workspace picker), which passes an ungated boolean so the skeleton shows
- *  immediately. See `.claude/rules/frontend.md` § "full-screen surface".
+ *  it. Always pair with a delay-only gate (`useDelayedFlag`/`useDelayedLoading`)
+ *  on `showSkeleton` so fast loads never show the skeleton at all — including
+ *  full-screen surfaces (the workspace picker gates it too: its boot splash +
+ *  header/footer chrome cover the brief pre-skeleton window, so an ungated
+ *  skeleton just blinked under the clearing splash on a fast load). See
+ *  `.claude/rules/frontend.md`.
  *
  *  Layout: the content wrapper and the skeleton share one grid cell (stacked).
  *  While loading, the skeleton sizes the cell (children is typically null); once

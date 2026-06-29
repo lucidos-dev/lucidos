@@ -564,9 +564,11 @@ lucidos.preferences.get(deviceId?: string | null): Promise<Preferences>
 lucidos.preferences.set(key: string, value: string, deviceId?: string): Promise<void>
 ```
 
-`get()` defaults to the parent device id (read from the shared `lucidos-device-id`
-in localStorage), so iframes see the same merged view as the parent UI. Pass
-`null` to fetch only globally-scoped preferences.
+`get()` defaults to the parent device id, so iframes see the same merged view as
+the parent UI. The device id is per-workspace (each workspace has its own device
+identity); the SDK reads it from the workspace-scoped `lucidos-device-id`
+(`ws:<slug>:lucidos-device-id`) so the iframe and the parent agree. Pass `null`
+to fetch only globally-scoped preferences.
 
 ### Types
 

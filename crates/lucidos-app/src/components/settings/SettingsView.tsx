@@ -3,7 +3,7 @@ import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oau
 import { devices, getDeviceId, loadDevices, updateDeviceName, toggleDevicePush, removeDevice } from '../../store/actions/devices';
 import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentInAppBrowser, setInAppBrowser, type Theme, type FontFamily } from '../../store/actions/preferences';
 import { openScaleModal } from '../shared/scaleModalState';
-import { formatDateTime } from '../../utils/formatTime';
+import { formatDateTime, formatShortDateWithYear } from '../../utils/formatTime';
 import { loadOAuthAccounts, disconnectOAuthAccount, grantOAuthScope } from '../../store/actions/oauth';
 import { initPushSubscription } from '../../store/actions/push';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
@@ -358,10 +358,20 @@ const VERTEX_REGIONS = [
   { value: 'asia-east1', label: 'asia-east1 (Taiwan)' },
 ];
 
-function VertexRegionSetting() {
+/** The Vertex provider block inside the "Providers" section. Unlike the other
+ *  providers it has no credential to enter — it authenticates via ambient GCP
+ *  Application Default Credentials (`gcloud auth application-default login`), so
+ *  its only knob is the region. Renders just the rows (the enclosing "Providers"
+ *  `settings-section` is owned by `SettingsView`), matching the other provider
+ *  components. */
+function VertexProviderSettings() {
   return (
-    <div class="settings-section">
-      <div class="settings-section-title" data-search-anchor="models:vertex-ai">Vertex AI</div>
+    <>
+      <div class="settings-row">
+        <span class="settings-row-label" data-search-anchor="models:vertex-ai">
+          Vertex AI
+        </span>
+      </div>
       <div class="settings-row" data-search-anchor="models:region">
         <span class="settings-row-label">Region</span>
         <Dropdown
@@ -372,7 +382,13 @@ function VertexRegionSetting() {
           onChange={setVertexRegion}
         />
       </div>
-    </div>
+      <div class="settings-row-note">
+        Serves the Claude models (Opus / Sonnet / Haiku) on the <strong>vertex</strong> provider
+        via Google Cloud. No key to enter — it uses your <strong>gcloud</strong> Application Default
+        Credentials (<code>gcloud auth application-default login</code>); the region above is the
+        only setting.
+      </div>
+    </>
   );
 }
 
@@ -489,6 +505,10 @@ export function SettingsView() {
               <div class="list-row-details">
                 {account.email || 'No email'}
                 {account.scopes && <> &middot; {formatScopes(account.scopes)}</>}
+                {' '}&middot;{' '}
+                <span data-tooltip={formatDateTime(new Date(account.created_at))}>
+                  Connected {formatShortDateWithYear(new Date(account.created_at))}
+                </span>
               </div>
             </div>
             <div class="list-row-actions">
@@ -774,9 +794,9 @@ export function SettingsView() {
             />
           </div>
         </div>
-        <VertexRegionSetting />
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="models:providers">Providers</div>
+          <VertexProviderSettings />
           <AnthropicProviderSettings />
           <OpenAiProviderSettings />
           <OpenRouterProviderSettings />
@@ -895,6 +915,7 @@ export function SettingsView() {
       case 'keyboard-shortcuts': return <KeyboardShortcutsSection />;
       case 'disk-usage': return <SystemPage panel="disk-usage" />;
       case 'environment-variables': return <SystemPage panel="environment-variables" />;
+      case 'network-access': return <SystemPage panel="network-access" />;
       case 'debugging': return <SystemPage panel="debugging" />;
       default: return null;
     }

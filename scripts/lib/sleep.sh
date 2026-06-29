@@ -4,10 +4,25 @@
 # Only `pmset disablesleep 1` prevents lid-close sleep.
 # Lock directory coordinates multiple workspaces: only the last to exit
 # re-enables sleep.
-# macOS-only: uses `md5 -q` and `pmset` (no Linux equivalent needed).
+# macOS-only side effects: caffeinate/pmset/clamshell prevention have no Linux
+# equivalent, so the entry-point functions (release_sleep_lock here;
+# start_caffeinate + enable_clamshell_prevention in workspace.sh) no-op on
+# non-Darwin and the engine starts/stops cleanly on Linux/CI. String hashing is
+# portable (md5 or md5sum) via hash_string.
 
 SLEEP_LOCK_DIR="/tmp/lucidos-sleep-locks"
 SUDOERS_FILE="/etc/sudoers.d/lucidos-pmset"
+
+# Portable string hash for the per-workspace lock filename. macOS ships `md5 -q`;
+# Linux/CI ships `md5sum`. Prefer `md5 -q` when present so the filename is
+# byte-identical to historical macOS runs.
+hash_string() {
+    if command -v md5 >/dev/null 2>&1; then
+        printf '%s' "$1" | md5 -q
+    else
+        printf '%s' "$1" | md5sum | cut -d' ' -f1
+    fi
+}
 
 # Ensure passwordless sudo for pmset disablesleep.
 # Creates a sudoers.d entry on first run (requires one sudo prompt).
@@ -50,9 +65,10 @@ cleanup_stale_sleep_locks() {
 # Release the lock for a workspace and re-enable sleep if no locks remain.
 # $1 = workspace path (defaults to $WORKSPACE)
 release_sleep_lock() {
+    [ "$(uname)" = "Darwin" ] || return 0   # macOS-only (pmset/clamshell); no-op on Linux/CI
     local ws="${1:-$WORKSPACE}"
     local ws_hash
-    ws_hash="$(echo -n "$ws" | md5 -q)"
+    ws_hash="$(hash_string "$ws")"
     rm -f "$SLEEP_LOCK_DIR/$ws_hash"
 
     cleanup_stale_sleep_locks

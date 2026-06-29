@@ -1,5 +1,12 @@
 /* --- Settings --- */
 
+/* Inline validation error under a settings field (e.g. a bad IP in Network
+   access). Muted-size, danger-colored. */
+.settings-field-error {
+    font-size: 0.8125rem;
+    color: var(--accent-red);
+}
+
 /* Pulse-highlight target after navigating from Search Everywhere. */
 @keyframes settings-search-highlight-pulse {
     0% {

@@ -1,5 +1,5 @@
 import { useEffect } from 'preact/hooks';
-import { checkConnection, handleResume } from '../store/actions/connection';
+import { checkConnection, handleResume, bounceToPickerIfStranded } from '../store/actions/connection';
 import { loadArtifacts, openUrl } from '../store/actions/artifacts';
 import { loadUnreadNotifications, loadNotifications } from '../store/actions/notifications';
 import { loadApps } from '../store/actions/apps';
@@ -38,6 +38,12 @@ import { isKnownAppFrame } from '../utils/appFrame';
 import { withBase, SCOPE_PATH } from '../utils/basePath';
 
 const CONNECTION_POLL_INTERVAL = 5000;
+// Cold-start recovery window: if the very first connect hasn't landed by this
+// point, return to the workspace picker rather than strand the user in a cached
+// shell that can't load (the PWA auto-open-into-an-unreachable-engine case).
+// ~2 health polls (immediate + 5s) plus slack. No-op once connected; the bounce
+// itself is one-shot guarded in connection.ts.
+const COLD_START_BOUNCE_MS = 10_000;
 // Catches Chrome's idle-SW LRU eviction (Chromium issue #370536109:
 // notificationclick silently dropped) without churning the recovery path,
 // which is itself cooldown-debounced.
@@ -477,6 +483,13 @@ export function useStartup(): void {
       checkConnection();
     }, CONNECTION_POLL_INTERVAL);
 
+    // Cold-start recovery: if we never reach the engine, bounce back to the
+    // workspace picker (the always-reachable recovery surface). No-op once
+    // connected / with no picker / after a prior bounce. See connection.ts.
+    const coldStartBounceTimer = window.setTimeout(() => {
+      bounceToPickerIfStranded();
+    }, COLD_START_BOUNCE_MS);
+
     // WKWebView crash recovery: send periodic heartbeats to the Tauri Rust side.
     // If heartbeats stop (content process crashed → white screen), the Rust
     // watchdog reloads the webview automatically.
@@ -493,6 +506,7 @@ export function useStartup(): void {
       unmounted = true;
       stopLiveness();
       clearInterval(connectionInterval);
+      clearTimeout(coldStartBounceTimer);
       stopSwProbe();
       if (heartbeatInterval) clearInterval(heartbeatInterval);
       stopAppUpdateChecks();
