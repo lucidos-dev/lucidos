@@ -1,0 +1,225 @@
+/* ─── Shared modal overlay base ─── */
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: var(--z-modal);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: modal-in var(--duration-fast) ease;
+}
+
+/* UI-blocking overlay — blocks interaction while the client refreshes (swaps
+   the service worker and reloads). Engine restart no longer blocks here: the
+   gateway boot splash + GET-gate + SSE reconnect make it a recoverable
+   non-event, so the tab stays interactive and shows only a light dismissible
+   "Restarting engine…" toast.
+   z-index above --z-control-panel so the header (.pane-header-brand,
+   .collapsed-thread-actions, .message-route-panel all sit at 2200) is
+   covered by the dim overlay and its buttons aren't clickable through.
+   .toast-container sits a step higher so the "Refreshing…" toast stays visible. */
+.ui-blocking-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: calc(var(--z-control-panel) + 100);
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: not-allowed;
+    -webkit-user-select: none;
+    user-select: none;
+    animation: modal-in var(--duration-normal) ease-out;
+}
+
+/* While the UI is blocked, nothing may float above the dim blocker except the
+   toast container (--z-toast). The elements that outrank the overlay in normal
+   use all sit at the tooltip layer (--z-tooltip = 10000, kept that high so a
+   modal never clips them): the JS tooltip, a pseudo-fullscreen app iframe, and
+   the landscape-rotate lock. UiBlockingOverlay flags :root[data-ui-blocked] so
+   they step aside while blocked. */
+
+/* Tooltip is transient — hide it outright (a ghost behind the 50% scrim would
+   look broken). inert already stops new tooltips firing (the hover targets are
+   inert), so this only clears one already on screen when the block began. */
+:root[data-ui-blocked] #tooltip {
+    display: none !important;
+}
+
+/* Full-screen opaque panels: drop below the overlay (don't hide) so the dim
+   scrim covers them and the toast stays visible, then they pop back to the top
+   when the block ends. */
+:root[data-ui-blocked] .app-ui-inline.app-ui-fullscreen,
+:root[data-ui-blocked] .landscape-lock {
+    z-index: calc(var(--z-modal) - 1) !important;
+}
+
+/* While any <Overlay> is open, the main UI behind it goes inert — no hover
+   highlight, no activation; a click just lands on `.app-shell` (which the dismiss
+   contract treats as outside → dismiss). The hover analog of the outside-click
+   swallow. `Toast` and the modal scrims render OUTSIDE `.app-shell`, so they stay
+   interactive. The overlay panels themselves (incl. the inline popovers like the
+   control panel / dropdowns, which DO render inside `.app-shell`) are re-enabled
+   via `[data-overlay-panel]`, and the toggle that opened the overlay via
+   `[data-overlay-anchor]` (set in `Overlay.tsx`) — the anchor MUST stay clickable
+   so re-activating it closes via its OWN handler (the documented anchor
+   exemption), not by being routed through the outside-dismiss path.
+   `pointer-events` is used (not `inert`) precisely because a descendant can
+   override an inert ancestor, which `inert` can't.
+
+   The inert is applied to `.app-shell`'s CHILDREN (`.app-shell > *`), not
+   `.app-shell` itself: `.app-shell` must remain a real hit target so an outside
+   click LANDS ON IT (a backdrop-less popover has no scrim of its own — the click
+   would otherwise fall through to `#app` and the dismiss-via-outside-click path
+   couldn't resolve a target inside the app). `pointer-events` inherits, so every
+   descendant of an inert child is inert too; panels/anchors re-set it to `auto`.
+   Driven by `data-overlay-open` on <html>, ref-counted in `Overlay.tsx`. */
+:root[data-overlay-open] .app-shell > * {
+    pointer-events: none;
+}
+:root[data-overlay-open] [data-overlay-panel],
+:root[data-overlay-open] [data-overlay-anchor] {
+    pointer-events: auto;
+}
+
+/* Reduced motion: disable non-essential transitions globally */
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+/* Shared "fetching…" placeholder marker. Lets a loading row look distinct
+ * from a "loaded with zero items" row without each component growing its own
+ * keyframes block. */
+@keyframes loading-pulse {
+    0%, 100% { opacity: 0.5; }
+    50% { opacity: 0.85; }
+}
+.loading-skeleton {
+    font-style: italic;
+    opacity: 0.7;
+    animation: loading-pulse 1.4s ease-in-out infinite;
+}
+
+/* AI running-text shimmer — the standard "actively working" affordance: a
+ * highlight band sweeps across the text itself (clipped to the glyphs) instead
+ * of a separate spinner. Applied to text that should read as "live" — the
+ * in-progress step description and a drawer section header that contains a
+ * running thread. Reuses the same 200%→-200% sweep direction as the skeleton
+ * `shimmer` keyframe. `color` is the no-clip fallback (and the reduced-motion
+ * resting color). */
+@keyframes running-shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+.running-shimmer {
+    background: linear-gradient(
+        90deg,
+        var(--text-muted) 0%,
+        var(--text-muted) 35%,
+        var(--text-primary) 50%,
+        var(--text-muted) 65%,
+        var(--text-muted) 100%
+    );
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: var(--text-secondary);
+    animation: running-shimmer 2.6s linear infinite;
+}
+
+/* Inverted running-text shimmer — the section-header variant. The resting text
+ * stays full-strength (`--text-primary`, so the bold section label reads
+ * normally) and a MUTED band sweeps across instead of a bright one. Used on the
+ * drawer section header that holds a running thread, where the standard
+ * dim-base + bright-sweep competed with the bold label and read as "dimmed"
+ * rather than "live". The in-thread step/status shimmer keeps the standard
+ * direction. Overrides only the gradient + resting color; the text-clip,
+ * `background-size`, and animation are inherited from `.running-shimmer` (apply
+ * both). Must use `background-image` (not the `background` shorthand) — the
+ * shorthand would reset `background-size` to `auto`, collapsing the 200%-wide
+ * gradient the sweep animation needs and freezing it static. */
+.running-shimmer-invert {
+    background-image: linear-gradient(
+        90deg,
+        var(--text-primary) 0%,
+        var(--text-primary) 35%,
+        var(--text-muted) 50%,
+        var(--text-primary) 65%,
+        var(--text-primary) 100%
+    );
+    color: var(--text-primary);
+}
+
+/* Mini spinner — small inline spinning ring for "in progress" indicators */
+.mini-spinner {
+    --spinner-color: var(--text-secondary);
+    display: inline-block;
+    width: 0.75rem;
+    height: 0.75rem;
+    animation: spin 1.2s linear infinite;
+    vertical-align: middle;
+    flex-shrink: 0;
+    border: var(--spinner-weight) solid var(--spinner-color);
+    border-top-color: transparent;
+    border-radius: 50%;
+    box-sizing: border-box;
+}
+
+/* Centered loading spinner — full-width centered ring for view/panel loading states */
+.loading-spinner {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 3rem 0;
+    width: 100%;
+}
+
+.loading-spinner::after {
+    --spinner-color: var(--text-secondary);
+    content: '';
+    display: block;
+    width: 1.5rem;
+    height: 1.5rem;
+    border: var(--spinner-weight) solid var(--spinner-color);
+    border-top-color: transparent;
+    border-radius: 50%;
+    box-sizing: border-box;
+    animation: spin 0.8s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .list-row,
+    .list-row-add-card,
+    .action-btn,
+    .dropdown-trigger,
+    .dropdown-option,
+    .icon-btn {
+        transition: none;
+    }
+
+    .progress-bar-fill {
+        transition: none;
+    }
+
+    .mini-spinner,
+    .loading-spinner::after {
+        animation: none;
+    }
+
+    /* Drop the sweep AND the text-clip so the glyphs fall back to a solid,
+     * visible color (a clipped-but-unanimated gradient would freeze mid-sweep). */
+    .running-shimmer {
+        animation: none;
+        background: none;
+        -webkit-text-fill-color: currentColor;
+        color: var(--text-secondary);
+    }
+
+    /* The inverted variant rests at the full-strength label color, not the
+     * dimmed `--text-secondary` the standard shimmer falls back to. */
+    .running-shimmer-invert {
+        color: var(--text-primary);
+    }
+}

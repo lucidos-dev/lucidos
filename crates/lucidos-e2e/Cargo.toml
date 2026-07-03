@@ -1,0 +1,31 @@
+[package]
+name = "lucidos-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+# The `e2e-test-hooks` feature pulls in the in-process push-log writer and
+# the GET /api/_test/push-log endpoint that browser/API e2e tests assert
+# against — see system-knowhow/notifications.md §5.4.
+lucidos-engine = { path = "../lucidos-engine", features = ["e2e-test-hooks"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono"] }
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures = "0.3"
+image = "0.25"
+# Used by tests/wasm_signers.rs — heavy integration tests that exercise real
+# `signers/*/foo.wasm` artifacts built by `./signers/build-all.sh`.
+bytes = "1"
+axum = "0.7"

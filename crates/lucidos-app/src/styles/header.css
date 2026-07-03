@@ -1,0 +1,28 @@
+/* Notifications bell */
+.notifications-bell {
+    position: relative;
+}
+
+.badge {
+    position: absolute;
+    top: 0.125rem;
+    right: 0.125rem;
+    /* Blue "needs attention" accent. Every count / notification badge shares
+       this blue — notification bell, the needs-attention filter toggle, mobile
+       unread, the control-panel .brand-badge update count, and the .drawer-badge
+       changes count. Semantic status badges (git add/modify/delete) keep their
+       own colors. */
+    background: var(--accent);
+    color: white;
+    font-size: var(--font-size-3xs);
+    font-weight: bold;
+    border-radius: 0.5625rem;
+    min-width: 0.875rem;
+    min-height: 0.875rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 0.1875rem;
+    line-height: 0.875rem;
+    box-sizing: border-box;
+}

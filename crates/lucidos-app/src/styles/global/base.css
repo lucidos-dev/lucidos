@@ -1,0 +1,449 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html {
+    font-size: var(--user-ui-scale, 100%);
+    -webkit-text-size-adjust: 100%;
+    background: var(--bg-primary);
+    color-scheme: dark;
+}
+
+:root {
+    /* Font stacks */
+    --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
+    --font-ui: var(--font-mono);
+    /* Neutral system sans-serif — the gateway workspace picker opts out of the
+       app's monospace --font-ui for a calmer, brand-neutral surface. Native
+       stack so it needs no font load and is unaffected by a user font preference
+       (which only overrides --font-ui). */
+    --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+
+    /* Z-index scale */
+    --z-float: 20;
+    --z-dropdown: 100;
+    --z-sticky: 200;
+    --z-drawer: 300;
+    --z-control-panel: 2200;
+    /* Modal overlays must sit above the floating header chrome (2200) so the
+       dim backdrop actually covers it — otherwise header buttons punch
+       through, show tooltips on hover, and outside-click never lands on the
+       overlay. Same level as .ui-blocking-overlay (--z-control-panel + 100). */
+    --z-modal: 2300;
+    /* Toasts sit above --z-modal and .ui-blocking-overlay (both at 2300) so they
+       remain visible over any open modal. */
+    --z-toast: 2400;
+    /* NOTE: the boot splash sits above all of the above (z-index 2500), but it is
+       inlined in index.html (it must paint before this bundle's CSS loads), so it
+       hardcodes 2500 there rather than referencing a token defined here. */
+    --z-tooltip: 10000;
+
+    /* Transitions */
+    --duration-fast: 0.15s;
+    --duration-normal: 0.2s;
+    --duration-slow: 0.3s;
+    /* For deliberate state-change cues that must register with the user
+     * (e.g. Send → Cancel morph). Reach for normal/slow first. */
+    --duration-emphasis: 0.5s;
+
+    /* Layout */
+    --divider-width: 0.1875rem;
+    --content-max-width: 50rem;
+    /* Height of the desktop transcript's top fade (the mask that dissolves
+       messages as they scroll up under the thread title header — see
+       .thread-content in chat/input-messages.css). Shared so the deep-link /
+       navigation scroll clearance (.chat-exchange scroll-margin-top in
+       chat/response.css) lands an element BELOW this band, not inside it where
+       its top / focus-marker border would be faded out. */
+    --thread-top-fade: 1.5rem;
+    /* Height of the mobile transcript's top fade — the gradient below the sticky
+       thread-title bar (.mobile-thread-title-row::after in mobile.css) that
+       dissolves content scrolling up under the bar. Shared with the mobile
+       .chat-exchange scroll-margin-top (chat/response.css) so a navigated turn
+       lands clear of it. Mobile's desktop-mask analog; kept a touch shorter. */
+    --mobile-title-fade: 0.75rem;
+    /* How far the navigation focus marker (.nav-focus-stuck, host-components.css)
+       reaches beyond a turn's box: outline-offset (0.1875rem) + outline width
+       (0.1875rem). The transcript reserves this much extra room past each fade
+       (top padding past --thread-top-fade, bottom padding past --prompt-fade) so
+       a marker on the first/last turn clears the fade instead of being dissolved
+       by it — the "highlight border isn't fully visible on the top/bottom turn"
+       report. Keep in sync with .nav-focus-stuck if its outline changes. */
+    --nav-focus-reach: 0.375rem;
+    /* Desktop floating scroll chevrons (.scroll-to-top / .scroll-to-bottom in
+       chat/input-messages.css). Since these were pulled IN from the right gutter
+       to sit OVER the centered transcript (fix 956b47519), a deep-link / turn-nav
+       landing near the top would tuck the element (and its focus-marker outline)
+       right under the up-chevron with no room. Shared here so the landing
+       clearance (.chat-exchange scroll-margin-top, chat/response.css) is computed
+       from the chevron's OWN size + top inset and can never drift from it. */
+    --scroll-chevron-size: 2rem;   /* button diameter (width == height) */
+    --scroll-chevron-top: 0.75rem; /* desktop top inset (see @media hover) */
+    /* Upward reach of the transcript's bottom dissolve — the bg-colored box-shadow
+       cast over the scroll area by .prompt-area (panels/content.css). The
+       transcript's bottom padding reserves this plus --nav-focus-reach so the
+       last turn's focus marker clears it. Keep matched to that box-shadow. */
+    --prompt-fade: 1rem;
+    /* Left inset shared by a turn's body content — LLM response body and every
+       initiator body (change card, question, permission, child completion) line
+       up against the same edge. Also the UNIFORM gap the navigation focus marker
+       leaves to a turn's content on all four sides (chat/response.css). */
+    --turn-body-inset: 0.4rem;
+    /* Vertical feed-rhythm padding on every transcript turn (.initiator-panel /
+       .response-panel in chat/input-messages.css) — the space between adjacent
+       turns (there is no divider line). Named so the navigation focus marker can
+       hand this padding back as margin when it tightens a focused turn's box to a
+       uniform gap (chat/response.css .nav-focus-stuck rule). */
+    --turn-feed-pad-y: 0.85rem;
+
+    /* Icon sizes (used by .icon-btn variants) */
+    --icon-size-sm: 0.875rem;
+    --icon-size-md: 1rem;
+    --icon-size-lg: 1.25rem;
+
+    /* Type scale — the only sanctioned font sizes. Snap to the nearest step;
+       don't reintroduce eyeballed in-between values (0.8/0.85/0.72rem …). The
+       `rem` units keep every step scaling with the user's UI-scale preference
+       (html font-size = var(--user-ui-scale)). This block is MIRRORED into the
+       engine's api/sdk_iframe.css :root so app iframes (which never load this
+       file) get the same scale via the appended shared-components.css — keep the
+       two in sync. em/percentage/inherit font-sizes stay literal on purpose
+       (they're deliberately relative). */
+    --font-size-3xs: 0.5625rem;   /* 9px — micro-label / tiny uppercase badge */
+    --font-size-2xs: 0.625rem;    /* 10px — dots, micro-meta */
+    --font-size-xs: 0.6875rem;    /* 11px — dense metadata */
+    --font-size-sm: 0.75rem;      /* 12px — labels, secondary */
+    --font-size-md: 0.8125rem;    /* 13px — body default */
+    --font-size-lg: 0.875rem;     /* 14px — emphasis */
+    --font-size-xl: 1rem;         /* 16px — section headings */
+    --font-size-2xl: 1.125rem;    /* 18px — larger headings */
+    --font-size-3xl: 1.25rem;     /* 20px — large headings */
+    --font-size-display: 2.25rem; /* 36px — hero */
+
+    /* Spacing scale — the sanctioned structural padding/gap steps. MIRROR of the
+       app-iframe --space-* scale in the engine's api/sdk_iframe.css :root (apps
+       never load this file, so the two are defined separately) — the VALUES must
+       stay identical so a shared component (e.g. .list-row in shared-components.css,
+       which is served to app iframes) renders the same rhythm in both. Do NOT
+       redefine an existing step's value here without changing sdk_iframe.css too —
+       apps in the wild key off these. Content-pane views snap their structural
+       padding to these and share the --space-lg (1rem) horizontal gutter; see the
+       "content-pane padding" rule in .claude/rules/frontend.md. */
+    --space-xs: 0.25rem;   /* 4px */
+    --space-sm: 0.5rem;    /* 8px */
+    --space-md: 0.75rem;   /* 12px */
+    --space-lg: 1rem;      /* 16px — the content-pane horizontal gutter */
+    --space-xl: 1.5rem;    /* 24px */
+
+    --dot-gap: 0.35rem;
+
+    /* Default spinner stroke weight */
+    --spinner-weight: 0.125rem;
+
+    /* Brand blue — the icon-mark identity color (see WorkspacePicker mark).
+       Theme-independent; the badge text on the header pill uses --brand-blue-deep
+       in both themes. The header BAR background (--header-gradient) is defined
+       per-theme below — vivid brand blue on the white app, deep navy on the dark
+       app — and must NOT live here: :root (0,1,0) would out-specify the dark
+       theme block's bare `html` selector (0,0,1) and clobber the override. */
+    --brand-blue: #1a6fd0;
+    --brand-blue-deep: #0a4ea8;
+
+    /* Focus ring — the single soft accent band shared by every focusable button
+       (.action-btn, .icon-btn, dropdowns, question options, …). `--accent` is
+       resolved per theme at use time, so one definition covers both. The
+       transparent outline each rule keeps alongside this is the forced-colors
+       fallback. Redefine --focus-ring on a context (e.g. the blue app header)
+       to recolor the ring there without touching every button rule. */
+    --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+/* Dark theme (default) */
+html, html[data-theme="dark"] {
+    /* Very dark blue, anchored on the brand/logo blue (--brand-blue-deep
+       #0a4ea8) but much darker — the app's near-black surfaces retinted toward
+       navy so the whole dark theme reads as "logo blue, dark" rather than grey.
+       The ladder keeps roughly the same lightness steps as the old GitHub-dark
+       greys, just shifted onto the logo hue (~215°). The anti-flash literals in
+       index.html / preferences.ts / sdk_prefs.rs / sdk_iframe.css must match
+       --bg-primary exactly (they paint before this CSS loads). */
+    --bg-primary: #07172e;
+    --bg-secondary: #0d2244;
+    --bg-tertiary: #163052;
+    --bg-quaternary: #21406c;
+    --border-color: #2c456a;
+    --bg-hover: #122a4a;
+    --bg-selected: #163356;
+    /* Accent-tinted "picked" surface: user message bubble, selected/answered
+       question option, freetext resolution, collapsed-turn stub. One recipe so
+       the whole picked family stays in lockstep (overridden per theme below). */
+    --picked-surface: color-mix(in srgb, var(--accent) 12%, var(--bg-tertiary));
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --text-muted: #6e7681;
+    --text-on-accent: #fff;
+    --accent: #58a6ff;
+    --accent-light: #7ab8ff;
+    /* Action-button blue — darker than the bright sky-blue --accent (which stays
+       the link/badge/active-state accent), but lifted a little off the brand
+       blue toward that accent so it isn't too heavy. Carries white text with
+       good contrast either way. */
+    --accent-action: color-mix(in srgb, var(--brand-blue) 82%, var(--accent));
+    --accent-green: #3fb950;
+    --accent-yellow: #d29922;
+    --accent-red: #f85149;
+    --accent-orange: #D97757;
+    --initiator-you: #3b82f6;
+    --initiator-agent: #fbbf24;
+    --initiator-engine: #14b8a6;
+    --initiator-coding-agent: #fb923c;
+    /* Reason hues — only ever paint the summary line of an engine panel. */
+    --reason-trigger: #f59e0b;
+    --reason-applied: #10b981;
+    --reason-failed: #ef4444;
+    --reason-muted: #888888;
+    --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.3);
+    --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.4);
+    --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.4);
+    --syntax-key: #9cdcfe;
+    --syntax-string: #ce9178;
+    --syntax-number: #b5cea8;
+    --syntax-keyword: #569cd6;
+    --syntax-comment: #6a9955;
+    --syntax-control: #c586c0;
+    --syntax-type: #4ec9b0;
+    --syntax-function: #dcdcaa;
+    /* Header bar — a muted, deeper blue in dark mode: clearly reads as brand-blue
+       chrome but calmer than the vivid light-mode blue (which glows as a bright
+       slab against the near-black app), without sinking into murky navy. Light
+       foreground stays legible on it. */
+    --header-gradient: linear-gradient(180deg, #15549e 0%, #0b3868 100%);
+    /* Active-pane cue — the mobile active pane dot (.mobile-dot.active) wears
+       this fill + layered neon bloom on the header bar. The body is a soft cool
+       BLUE — landing between the prior brand blue and near-white (a midpoint of
+       the two), so it reads bright and high-contrast on --header-gradient's deep
+       blue stop while keeping a clear blue tint rather than going fully white; the
+       soft blue bloom reinforces the brand identity. Per theme it's tuned only
+       slightly — the light override below is a touch lighter/more opaque to stay
+       crisp on the brighter light bar. */
+    --focus-pill-bg: rgba(169, 197, 232, 0.87);
+    --focus-pill-glow: 0 0 0.25rem rgba(178, 206, 240, 0.42),
+                       0 0 0.625rem rgba(158, 190, 232, 0.28);
+    /* Focused-pane header wash — a faint lighter-blue overlay filling the focused
+       pane's header segment (the .header-focus-wash box), so the whole segment
+       reads a touch lighter-blue than the deep bar — the visual cue for which pane
+       is focused. Same soft cool-blue hue as the active-pane dot at a much lower
+       alpha so it lightens without flattening the brand blue; it crossfades in/out
+       as focus moves between panes. */
+    --focus-header-tint: rgba(169, 197, 232, 0.12);
+    /* Reclaimed macOS title-bar band (.titlebar-strip) — solid = the gradient's
+       TOP stop above, so the strip is seamless with the header's top edge. */
+    --titlebar-strip-bg: #15549e;
+}
+
+/* iOS PWA dark-mode brand-blue correction (iPhone OLED).
+   The dark-mode brand blues above are genuine blue (~212° hue), but iPhone OLED
+   panels emit *saturated deep* blue with a violet bias, so the blue header
+   chrome reads slightly purple in the iOS PWA while looking correct on every
+   other display. `main.tsx` adds `.ios-pwa` to <html> only for an iOS standalone
+   PWA (isIOSPwa()), so this nudges ONLY the deep header blues a couple of degrees
+   toward cyan for that context — desktop, Android, and iOS-in-Safari are
+   pixel-identical. The nudge is deliberately faint (~a quarter off the base
+   blue): the same shift reads far stronger on the large header slab.
+   `--accent` is intentionally NOT overridden — the lighter sky-blue accent does
+   not pick up the OLED violet, and nudging it shifted accent-derived chrome
+   (the --focus-ring band and the info-toast border) off the app's standard blue.
+   Higher specificity than the `html, html[data-theme="dark"]` block above. */
+html.ios-pwa[data-theme="dark"] {
+    --header-gradient: linear-gradient(180deg, #15579c 0%, #0b3a66 100%);
+    --titlebar-strip-bg: #15579c;
+}
+
+/* Light theme */
+html[data-theme="light"] {
+    color-scheme: light;
+    --bg-primary: #ffffff;
+    --bg-secondary: #f6f8fa;
+    --bg-tertiary: #e1e4e8;
+    --bg-quaternary: #d0d7de;
+    --border-color: #d0d7de;
+    --bg-hover: #eaeef2;
+    --bg-selected: #eff2f5;
+    /* Lighter in light mode — a softer tint over the near-white secondary surface
+       instead of the heavier grey tertiary, so the bubble reads gentler. */
+    --picked-surface: color-mix(in srgb, var(--accent) 10%, var(--bg-secondary));
+    --text-primary: #1f2328;
+    --text-secondary: #656d76;
+    --text-muted: #8b949e;
+    --text-on-accent: #fff;
+    --accent: #0969da;
+    --accent-light: #218bff;
+    /* Action-button blue — light mode uses the brand blue instead of the much
+       brighter accent-light scale, keeping filled CTAs anchored on white while
+       preserving strong contrast for the white label. */
+    --accent-action: var(--brand-blue);
+    --accent-green: #1a7f37;
+    --accent-yellow: #9a6700;
+    --accent-red: #cf222e;
+    --accent-orange: #c26a4a;
+    /* Light-theme variants — darkened so each hue passes contrast on the white surface. */
+    --initiator-you: #2563eb;
+    --initiator-agent: #ca8a04;
+    --initiator-engine: #0d9488;
+    --initiator-coding-agent: #ea7c2a;
+    --reason-trigger: #b45309;
+    --reason-applied: #047857;
+    --reason-failed: #b91c1c;
+    --reason-muted: #6e7781;
+    --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.08);
+    --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.1);
+    --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.1);
+    --syntax-key: #0550ae;
+    --syntax-string: #0a3069;
+    --syntax-number: #0550ae;
+    --syntax-keyword: #cf222e;
+    --syntax-comment: #6e7781;
+    --syntax-control: #8250df;
+    --syntax-type: #953800;
+    --syntax-function: #8250df;
+    /* Header bar — vivid brand blue on the white app (deep-navy dark-mode
+       variant is in the dark theme block above). */
+    --header-gradient: linear-gradient(180deg, var(--brand-blue) 0%, var(--brand-blue-deep) 100%);
+    /* Active-pane cue — a touch lighter/more opaque than the dark-theme value so
+       the soft-blue dot stays crisp on the brighter light bar (see the dark block
+       for the intent). */
+    --focus-pill-bg: rgba(191, 213, 243, 0.93);
+    --focus-pill-glow: 0 0 0.25rem rgba(198, 220, 248, 0.5),
+                       0 0 0.625rem rgba(186, 212, 244, 0.34);
+    /* Focused-pane header wash — a touch lighter/more opaque than the dark value
+       so it stays visible on the brighter light bar (see the dark block). */
+    --focus-header-tint: rgba(191, 213, 243, 0.16);
+    /* Reclaimed macOS title-bar band (.titlebar-strip) — solid = the gradient's
+       TOP stop above (--brand-blue), so the strip is seamless with the header. */
+    --titlebar-strip-bg: var(--brand-blue);
+}
+
+button,
+[role="button"],
+label {
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+/* Global tooltip (JS-positioned, appended to body) */
+#tooltip {
+    position: fixed;
+    z-index: var(--z-tooltip);
+    max-width: 30rem;
+    padding: 0.5rem 0.75rem;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.625rem;
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    font-weight: 400;
+    font-style: normal;
+    line-height: 1.4;
+    text-align: left;
+    text-transform: none;
+    letter-spacing: normal;
+    white-space: normal;
+    word-wrap: break-word;
+    pointer-events: none;
+    opacity: 0;
+    display: none;
+    transition: opacity var(--duration-fast);
+    box-shadow: var(--shadow-sm);
+}
+
+#tooltip-arrow {
+    position: absolute;
+    top: -0.3125rem;
+    width: 0.625rem;
+    height: 0.625rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-right: none;
+    border-bottom: none;
+    transform: translateX(-0.3125rem) rotate(45deg);
+}
+
+#tooltip.above #tooltip-arrow {
+    top: auto;
+    bottom: -0.3125rem;
+    border: 1px solid var(--border-color);
+    border-left: none;
+    border-top: none;
+}
+
+#tooltip-title {
+    font-weight: 600;
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+    margin-bottom: 0.5rem;
+}
+
+#tooltip-title:empty {
+    display: none;
+}
+
+#tooltip-text {
+    position: relative;
+    white-space: pre-line;
+}
+
+/* Structured two-column label/value tooltip (e.g. thread drawer rows). The dim
+   label sits in the left column, the bright value right-aligned in the right —
+   `display: contents` lets each .tt-row's children join the parent grid so the
+   columns stay aligned across every row. */
+#tooltip-text.tooltip-rows {
+    display: grid;
+    grid-template-columns: auto auto;
+    column-gap: 1.5rem;
+    row-gap: 0.25rem;
+    white-space: nowrap;
+}
+
+#tooltip-text.tooltip-rows .tt-row {
+    display: contents;
+}
+
+#tooltip-text.tooltip-rows .tt-label {
+    color: var(--text-muted);
+}
+
+#tooltip-text.tooltip-rows .tt-value {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    justify-self: end;
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+#tooltip-text.tooltip-rows .tt-dot {
+    flex: none;
+    width: 0.4rem;
+    height: 0.4rem;
+    border-radius: 50%;
+    background: var(--text-muted);
+}
+
+#tooltip-text.tooltip-rows .tt-dot-running { background: var(--accent); }
+#tooltip-text.tooltip-rows .tt-dot-changes { background: var(--accent-green); }
+#tooltip-text.tooltip-rows .tt-dot-waiting { background: var(--accent-yellow); }
+#tooltip-text.tooltip-rows .tt-dot-failed { background: var(--accent-red); }
+
+body {
+    font-family: var(--font-ui);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    background: var(--bg-primary);
+    min-height: 100vh;
+    color: var(--text-primary);
+}

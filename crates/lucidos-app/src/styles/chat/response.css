@@ -1,0 +1,1414 @@
+/* --- Response turn — flat, card-less. The executor's reply: a header row
+   (executor chip + status + timestamp) over a flush body. Inter-turn feed
+   padding comes from the shared `.initiator-panel, .response-panel` rule in
+   input-messages.css (no divider line). Body collapses on header click. */
+.response-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding-left: var(--turn-body-inset);
+    margin-bottom: 0.7rem;
+    min-height: 1.2rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    flex-wrap: wrap;
+}
+
+.response-executor-icon {
+    flex-shrink: 0;
+    font-size: var(--font-size-lg);
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+}
+
+.response-executor-icon svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+    color: var(--initiator-coding-agent);
+}
+
+.response-executor-label {
+    font-weight: 600;
+    color: var(--text-primary);
+    flex-shrink: 0;
+}
+
+/* Status + timestamp pair: visually grouped on the right since they describe
+   the same thing — the current state of the response and when it last updated. */
+.response-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-left: auto;
+    flex-shrink: 0;
+}
+
+.response-timestamp {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+.response-body {
+    padding: 0;
+}
+
+/* ContinuationStarted engine note — collapsed by default, expands inline when
+   the user clicks the subline. Sits inside an initiator-panel body so it
+   inherits the panel's padding; we only style the disclosure summary and
+   the expanded preformatted block. */
+.resume-note {
+    margin-top: 0.25rem;
+    font-size: var(--font-size-md);
+    color: var(--text-secondary);
+}
+
+.resume-note > summary {
+    cursor: pointer;
+    user-select: none;
+    color: var(--text-secondary);
+}
+
+.resume-note > summary:hover {
+    color: var(--text-primary);
+}
+
+.resume-note-body {
+    margin: 0.375rem 0 0 0;
+    padding: 0.5rem 0.625rem;
+    border-left: 0.125rem solid var(--border-subtle, var(--border-color));
+    background: var(--bg-secondary);
+    white-space: pre-wrap;
+    font-size: var(--font-size-sm);
+    line-height: 1.4;
+    color: var(--text-secondary);
+}
+
+/* Reason colors — the ONLY surviving variant color on a flat turn. The name is
+   now plain; only the summary line is tinted to convey *why* the engine spoke
+   (trigger fired, change applied/failed/discarded/reverted). Applies whether the
+   summary is a plain <div> or the clickable .initiator-summary-link button. */
+.initiator-panel-trigger          .initiator-summary { color: var(--reason-trigger); }
+.initiator-panel-change-applied   .initiator-summary { color: var(--reason-applied); }
+.initiator-panel-change-failed    .initiator-summary { color: var(--reason-failed); }
+.initiator-panel-change-discarded .initiator-summary,
+.initiator-panel-change-reverted  .initiator-summary { color: var(--reason-muted); }
+
+/* Action buttons (Diff/Revert) render in a footer at the bottom-right of the
+   turn — keeps the timestamp alone in the header's top-right slot.
+   padding-bottom MUST stay 0: the footer is the panel's last child, so any bottom
+   padding here stacks on top of the panel's own padding and shows up as an
+   oversized BOTTOM gap under the navigation focus marker — the marker's gap on
+   each side equals that side's total padding, and the .initiator-panel.nav-focus-stuck
+   rule below normalizes every side to var(--turn-body-inset). Only the TOP padding
+   (separating the buttons from the body above) belongs here; the bottom spacing is
+   the panel's job. Guarded by turn-header-gutter.test.ts. */
+.initiator-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    padding: 0.5rem 0 0;
+}
+
+/* --- Change body — surfaces description, file count, and error message
+   inside a change-lifecycle initiator panel. */
+.change-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: var(--font-size-sm);
+}
+
+.change-body-desc {
+    color: var(--text-muted);
+    word-break: break-word;
+}
+
+.change-body-meta {
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+.change-body-error {
+    color: var(--text-primary);
+    word-break: break-word;
+    padding: 0.375rem 0.5rem;
+    background: color-mix(in srgb, var(--accent-red) 8%, transparent);
+    border-radius: 0.25rem;
+}
+
+/* Invisible stand-in for the Diff/Revert buttons of a ChangeApplied panel
+   while its Change row is still loading on first open. Occupies the exact
+   button-row height so the real actions slot in without a vertical shift
+   (see changeActions' reserveWhileLoading). */
+.change-actions-placeholder {
+    visibility: hidden;
+    pointer-events: none;
+}
+
+.message-channel-tag {
+    float: right;
+    clear: right;
+    margin-left: 0.75rem;
+    margin-bottom: 0.25rem;
+}
+
+.channel-error {
+    background: color-mix(in srgb, var(--accent-red) 20%, transparent);
+    color: var(--accent-red);
+    border-color: var(--accent-red);
+}
+
+/* Chat exchange wrapper (initiator + response turns). Inter-turn spacing now
+   comes from each turn's own feed padding (no divider line), so no bottom
+   margin. */
+.chat-exchange {
+    margin-bottom: 0;
+    padding: 0;
+    /* Block formatting context so a focused first/last panel's compensating
+       vertical margin (the .nav-focus-stuck rule below hands the feed padding back
+       as margin) stays CONTAINED — otherwise a first-child margin-top / last-child
+       margin-bottom collapses through this padding-less exchange and the panel's
+       content shifts by the reduced padding. flow-root establishes the BFC without
+       clipping (unlike overflow: hidden, which would clip the marker's outline). */
+    display: flow-root;
+    /* Room above a deep-linked landing for its focus border. The navigation focus
+       marker's border (.nav-focus-stuck) is an `outline` offset just BEYOND the
+       element box, and .chat-exchange has no top padding, so without this the top
+       edge of the border lands above the scroll-container top / behind the header
+       stack and is clipped — "the top of the border isn't visible". This base
+       value is the bare focus-border gap; the desktop and mobile rules below add
+       it on top of their respective top-of-transcript occlusion (the desktop fade
+       mask / the mobile header stack). */
+    --deep-link-focus-gap: 0.5rem;
+    scroll-margin-top: var(--deep-link-focus-gap);
+}
+
+/* Desktop: a navigated-to element must clear BOTH occlusions stacked at the top
+   of the transcript, whichever is taller (hence max()):
+     1. the top --thread-top-fade band, mask-faded so messages dissolve under the
+        thread title header (see .thread-content in chat/input-messages.css) — land
+        below it plus the focus-border gap so the element's top edge AND its
+        .nav-focus-stuck outline are fully opaque instead of hidden in the fade;
+     2. the floating up-chevron (.scroll-to-top), which since fix 956b47519 sits
+        OVER the centered transcript rather than out in the gutter — land below its
+        footprint (safe-area inset + top inset + diameter) plus --nav-focus-reach so
+        the focus-marker outline clears it too. Without this the element (and its
+        outline) tucked right under the chevron with no room — the reported
+        regression. The env(safe-area-inset-top) term MIRRORS the chevron's own top
+        (max(--scroll-chevron-top, env(safe-area-inset-top) + --scroll-chevron-top)
+        == env + inset on desktop, since env >= 0): on a viewport-fit / notched
+        device at desktop width (e.g. iPad landscape PWA) the chevron rides down by
+        the notch, so the clearance must too — omitting it would let the element
+        land under the chevron again once the inset exceeds the breathing room.
+   Both branches add +0.5rem breathing room. Computed from the chevron's OWN
+   variables (base.css) so moving/resizing it keeps this clearance in lockstep.
+   Matches the mask's min-width breakpoint. */
+@media (min-width: 769px) {
+    .chat-exchange {
+        scroll-margin-top: max(
+            calc(var(--thread-top-fade) + var(--deep-link-focus-gap) + 0.5rem),
+            calc(env(safe-area-inset-top, 0px) + var(--scroll-chevron-top) + var(--scroll-chevron-size) + var(--nav-focus-reach) + 0.5rem)
+        );
+    }
+}
+
+.chat-exchange:last-child {
+    margin-bottom: 0;
+}
+
+/* scrollToEventAndPulse lands the event at the scroll-container top, which would
+   sit behind the fixed/sticky chrome stacked there ("covered a bit"). The scroll
+   (smoothScrollToElement in scrollState.ts) reads this scroll-margin-top and
+   subtracts it, so the event lands clear of the three opaque layers above the
+   transcript on mobile:
+     1. the fixed app header — --mobile-header-height, pinned fully visible for
+        the duration of the deep-link scroll (scrollState.isHeaderPinnedForScroll
+        + useHideOnScroll.onScroll) so this static offset is exact;
+     2. the sticky .mobile-thread-title-row — --mobile-thread-title-height tracks
+        the bar's live height so a wrapped title still clears;
+     3. the --mobile-title-fade overlay below the title row (.mobile-thread-title-row
+        .scrolled::after), opaque at its top edge while the transcript is scrolled.
+   Plus --deep-link-focus-gap so the focus border (an outline offset just beyond
+   the box) clears the header stack too (same reason as the desktop base above).
+   The event lands below all four, exactly under the thread title header with its
+   whole border visible. */
+@media (max-width: 768px) {
+    .chat-exchange {
+        scroll-margin-top: calc(
+            var(--mobile-header-height, 3rem)
+            + var(--mobile-thread-title-height, 2.75rem)
+            + var(--mobile-title-fade)
+            + var(--deep-link-focus-gap)
+        );
+    }
+}
+
+/* The deep-link highlight (a sticky border that fades out on dismiss) is the
+   shared NAVIGATION FOCUS MARKER — `.nav-focus-stuck` in
+   styles/global/host-components.css, driven by components/shared/focusMarker.ts.
+   scrollState.ts scopes it to the panel that HOLDS the deep-link's subject — NOT
+   the whole `.chat-exchange` — so a sibling panel in the same turn isn't
+   highlighted too: an event deep-link → `.initiator-panel` (the event, not the
+   response below it); a change deep-link → `.response-panel` on a proposing turn
+   (where ChangeProposed lives) but `.initiator-panel` on a resolution card (which
+   carries the change body, not any folded-in continuation work). It falls back to
+   the whole exchange only if that panel is absent. Defined once there so chat,
+   settings, and plugin navigations share one look. */
+
+/* Uniform gap on ALL FOUR sides between the navigation focus marker and a turn's
+   content. The marker (the .nav-focus-stuck outline, defined in
+   host-components.css) hugs the panel's padding box with a fixed outline-offset,
+   so the gap it shows on each side equals the panel's padding there — and a turn's
+   padding is NOT uniform:
+     - horizontal: content is inset var(--turn-body-inset) on the LEFT
+       (.initiator-header / .response-header / body padding-left) but sits FLUSH on
+       the RIGHT — so the marker shows a left gap and no right gap;
+     - vertical: the feed-rhythm padding var(--turn-feed-pad-y) top and bottom, far
+       larger than that inset — so the marker's top/bottom gap dwarfs its sides
+       ("padding isn't the same top/bottom as left/right").
+   Normalize every side to var(--turn-body-inset):
+     - RIGHT: grow the box rightward by that inset (padding-right) and cancel it for
+       layout (negative margin-right) so the content-box width and sibling turns
+       stay put — settling the marker in / clearing it never reflows the card.
+       (LEFT already has the inset via the body's padding-left; the panel keeps
+       padding-left: 0.)
+     - TOP/BOTTOM: shrink the feed padding to the same inset and hand the removed
+       space back as margin, so the turn's content and its neighbours don't move
+       (net-zero) while the outline hugs tight. .chat-exchange establishes a block
+       formatting context (display: flow-root, below) so a first/last focused
+       panel's margin can't collapse through the exchange and shift its content.
+   The turn lives inside .thread-content's 0.75rem side padding, and the inset +
+   the marker reach stay clear of that edge (no clip, no horizontal scrollbar).
+   Scoped to the panels: this is the PANEL-level marker — a deep-link (Changes
+   panel / notification) lands on the specific `.initiator-panel` or
+   `.response-panel` (scrollState.ts `scrollToChangeAndPulse` / `scrollToEventAndPulse`).
+   The WHOLE-TURN marker (keyboard ⌘↑/⌘↓ nav, which marks the `.chat-exchange`) is
+   normalized by the sibling rule below. */
+.initiator-panel.nav-focus-stuck,
+.response-panel.nav-focus-stuck {
+    padding: var(--turn-body-inset) var(--turn-body-inset) var(--turn-body-inset) 0;
+    margin-top: calc(var(--turn-feed-pad-y) - var(--turn-body-inset));
+    margin-bottom: calc(var(--turn-feed-pad-y) - var(--turn-body-inset));
+    margin-right: calc(-1 * var(--turn-body-inset));
+}
+
+/* Uniform gap on ALL FOUR sides when the marker lands on a WHOLE TURN. Keyboard
+   ⌘↑/⌘↓ turn-nav marks the `.chat-exchange` (TURN_SELECTOR in scrollState.ts), not
+   an inner panel — so the panel rule above never applies and the outline hugged the
+   exchange box while the panel's feed padding (var(--turn-feed-pad-y) top/bottom) and
+   left content inset leaked through, sitting flush right: top/bottom ~2× the left
+   gap and the right gap collapsed to just the outline offset. This is the exchange's
+   counterpart to the panel rule; it normalizes every side to var(--turn-body-inset).
+
+   The exchange has NO padding of its own — its content is the panel(s), which carry
+   the gap-defining padding. It mirrors the panel rule's shape (padding inset on
+   TOP/RIGHT/BOTTOM, LEFT already supplied by the inner content's padding-left) with
+   two differences forced by the exchange:
+     - NO negative margin-right: the exchange is auto-centered
+       (.thread-content > * { margin: 0 auto }), so a negative margin-right would
+       fight the centering. The var(--turn-body-inset) padding-right narrows the
+       content box by that inset instead (a tiny, transient reflow only while the
+       marker shows) — the trade the panel rule avoids but the exchange can't.
+     - The feed rhythm that defines TOP/BOTTOM lives on the PANEL children, not the
+       exchange — so drop the first panel's feed padding-top and the last panel's
+       feed padding-bottom (they'd stack on the exchange padding and inflate the
+       gap), and hand the removed feed rhythm back as margin on the exchange (OUTSIDE
+       its outline, so the gap stays tight) — content and neighbouring turns don't
+       move, exactly like the panel rule's vertical handling. */
+.chat-exchange.nav-focus-stuck {
+    padding: var(--turn-body-inset) var(--turn-body-inset) var(--turn-body-inset) 0;
+    margin-top: calc(var(--turn-feed-pad-y) - var(--turn-body-inset));
+    margin-bottom: calc(var(--turn-feed-pad-y) - var(--turn-body-inset));
+}
+.chat-exchange.nav-focus-stuck > .initiator-panel:first-child,
+.chat-exchange.nav-focus-stuck > .response-panel:first-child {
+    padding-top: 0;
+}
+.chat-exchange.nav-focus-stuck > .initiator-panel:last-child,
+.chat-exchange.nav-focus-stuck > .response-panel:last-child {
+    padding-bottom: 0;
+}
+/* Error turns append an .exchange-error AFTER the panels, so no panel is
+   :last-child and no feed padding-bottom is removed there — the error box (which
+   carries no feed padding) is the bottom content. The margin-bottom above then has
+   nothing to hand back and would just push the next turn down by the exchange's own
+   padding-bottom. Cancel that instead (margin-bottom: -inset) so the error turn
+   stays net-zero, while the exchange padding-bottom still supplies the gap. */
+.chat-exchange.nav-focus-stuck:has(> .exchange-error:last-child) {
+    margin-bottom: calc(-1 * var(--turn-body-inset));
+}
+
+/* Response content — markdown rules inherited from .markdown-content in global.css */
+.response-content {
+    line-height: 1.6;
+    font-size: var(--font-size-sm);
+    padding-left: var(--turn-body-inset);
+    white-space: normal;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    max-width: 100%;
+}
+
+.response-content li p {
+    margin: 0;
+}
+
+.response-content a.artifact-link,
+.response-content a.app-link {
+    text-decoration: underline dashed;
+    cursor: pointer;
+}
+
+@media (hover: hover) {
+    .response-content a.artifact-link:hover,
+    .response-content a.app-link:hover {
+        text-decoration: underline solid;
+    }
+}
+
+
+/* Welcome message */
+.welcome-message {
+    white-space: normal;
+    padding-top: 1.5rem;
+}
+
+.welcome-message h2 {
+    margin: 0 0 0.25rem 0;
+}
+
+.welcome-message p {
+    margin: 0.75rem 0;
+}
+
+.welcome-message .disclaimer {
+    margin: 1.5rem 0 0 0;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    line-height: 1.5;
+}
+
+/* Fixed prose with one short inline link — wrap only at spaces so "MIT" never
+   splits mid-word. The shared .markdown-content rules set word-break: break-all
+   on links (and break-word on the container) to break long URLs/tokens in agent
+   responses; neither applies to this known-short license copy, where break-all
+   would split the "MIT license" link as "MI" / "T". The `a` override is the
+   load-bearing one — break-all sits directly on the anchor, so a value on the
+   parent <p> alone can't reach it. */
+.welcome-message .disclaimer,
+.welcome-message .disclaimer a {
+    word-break: normal;
+}
+
+/* ── Welcome entrance ──
+   The welcome eases in (fade + a small upward slide) AFTER the prompt textarea
+   has finished sliding up to its resting position — never at the same time.
+   CreateThreadView holds back the `.welcome-revealing` class until the prompt's
+   FLIP move completes (the `promptAnimating` signal clears on the transform's
+   transitionend), so the surface starts hidden and animates in once the textarea
+   has settled. The base `opacity: 0` prevents any flash before the class lands;
+   `.thread-content` flows at natural height with `overflow: visible` in the
+   compose-empty layout (shell.css), so the 0.5rem slide is never clipped. Matches
+   the `.thread-view.revealing` slide-in's duration/easing (input-messages.css). */
+.thread-content .welcome-message {
+    opacity: 0;
+}
+
+.thread-content.welcome-revealing .welcome-message {
+    animation: welcome-enter var(--duration-slow) ease-out both;
+}
+
+@keyframes welcome-enter {
+    from {
+        opacity: 0;
+        transform: translateY(0.5rem);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* Reduced motion: entrance is instant — no fade, no slide, and never held
+   hidden (the keyframe is off, so force the surface fully visible). */
+@media (prefers-reduced-motion: reduce) {
+    .thread-content .welcome-message {
+        opacity: 1;
+    }
+
+    .thread-content.welcome-revealing .welcome-message {
+        animation: none;
+    }
+}
+
+/* --- Thread-open skeleton ---------------------------------------------------
+   Placeholder bubbles shown while a thread's events load (ThreadSkeleton.tsx),
+   instead of a blank gap or a spinner that flashes on slow loads. Reuses the
+   global `shimmer` keyframes (drawer.css). Rendered inside ThreadSkeletonOverlay
+   (a fading sibling of the scroll container) so it crossfades OUT as the real
+   exchanges appear underneath. */
+.thread-skeleton {
+    display: flex;
+    flex-direction: column;
+    gap: 1.75rem;
+    padding: 1.25rem 0.25rem;
+}
+
+/* Fading skeleton overlay over the scroll area. Absolute inside the
+   position:relative `.thread-content-wrap`, opaque, and pointer-events:none so
+   it never blocks scrolling/taps; it covers the (empty) scroll area while the
+   load is in flight, then fades out over the rendered exchanges (is-fading).
+   The inner skeleton is width-capped + centered to match `.thread-content > *`
+   so its bubbles line up with where the real messages land. */
+.thread-skeleton-overlay {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    padding: 0.5rem 0.75rem 0.75rem;
+    background: var(--bg-primary);
+    pointer-events: none;
+    opacity: 1;
+    transition: opacity var(--duration-normal) ease;
+}
+
+.thread-skeleton-overlay > .thread-skeleton {
+    max-width: var(--content-max-width);
+    margin-left: auto;
+    margin-right: auto;
+}
+
+.thread-skeleton-overlay.is-fading {
+    opacity: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .thread-skeleton-overlay {
+        transition: none;
+    }
+}
+
+.thread-skeleton-exchange {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+}
+
+.thread-skeleton-lines {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+}
+
+.thread-skeleton-block {
+    border-radius: 0.4rem;
+    background: linear-gradient(
+        90deg,
+        var(--bg-tertiary) 25%,
+        color-mix(in srgb, var(--accent) 18%, var(--bg-tertiary)) 50%,
+        var(--bg-tertiary) 75%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+}
+
+.thread-skeleton-user {
+    align-self: flex-end;
+    width: 42%;
+    height: 2.25rem;
+    border-radius: 0.75rem;
+}
+
+.thread-skeleton-line {
+    height: 0.85rem;
+    width: 92%;
+}
+
+.thread-skeleton-line-short {
+    width: 56%;
+}
+
+/* Content fade-in on first appearance (skeleton/empty → exchanges). Opacity-only
+   so it never perturbs the scroll container's metrics (scroll-to-bottom, saved
+   scroll, deep-link, window expansion all read .thread-content scrollTop/Height);
+   added imperatively in a layout effect (ThreadView) BEFORE paint so content
+   never flashes at full opacity first. The class lingers harmlessly after the
+   one-shot animation; the next open removes+reflows+re-adds it to replay. */
+.thread-content.content-entering {
+    animation: thread-content-enter var(--duration-normal) ease-out;
+}
+
+@keyframes thread-content-enter {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .thread-skeleton-block {
+        animation: none;
+    }
+
+    .thread-content.content-entering {
+        animation: none;
+    }
+}
+
+/* First-run provider onboarding (no LLM provider configured) */
+.welcome-provider-setup {
+    margin: 1.25rem 0;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.5rem;
+}
+
+.welcome-provider-setup-btn {
+    font-size: var(--font-size-xl);
+}
+
+.welcome-provider-setup-hint {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: var(--font-size-md);
+    line-height: 1.4;
+}
+
+/* ── Compact welcome (configured workspace) ──
+   A small first-run surface: a short greeting, a label, and a single-item
+   carousel of suggestions. The box is centered at `--content-max-width` (so it
+   lines up with the prompt textarea on both sides) with left-aligned text. Kept
+   compact so it reads well on every viewport and the prompt stays centered. The
+   compose-empty layout that gives the welcome its natural height (instead of a
+   filled scroll area) is owned by shell.css. */
+.welcome-hero {
+    /* Width + centering match the transcript children and the prompt below: both
+       are capped at `--content-max-width` and centered (`.thread-content > *`,
+       `.prompt-input-container`), so the welcome lines up with the prompt
+       textarea on both sides. (Inherited from `.thread-content > *` — kept
+       explicit here so the intent reads at a glance.) */
+    max-width: var(--content-max-width);
+    margin-left: auto;
+    margin-right: auto;
+    text-align: left;
+    /* Anchor the dismiss pill (below) to this centered content box instead of the
+       full-width pane, so it sits at the content's top-right edge. */
+    position: relative;
+    /* Neutralize the base `.welcome-message` top padding — the surface is compact
+       and positioned by the centered compose-empty group (later rule wins). */
+    padding-top: 0;
+}
+
+.welcome-hero h2 {
+    margin: 0 0 0.5rem 0;
+    font-size: var(--font-size-xl);
+    font-weight: 600;
+}
+
+/* Lead-in label framing the carousel below as suggestions. Higher specificity
+   than `.welcome-message p` (0,2,0 > 0,1,1) so its margin wins. */
+.welcome-hero .welcome-suggestions-label {
+    margin: 0 0 0.625rem 0;
+    color: var(--text-muted);
+    font-size: var(--font-size-md);
+}
+
+/* Suggestions as a single-item carousel: ‹ suggestion › — one suggestion at a
+   time flanked by chevron buttons (no scrolling, no cards). */
+.welcome-carousel {
+    position: relative;
+    display: flex;
+    align-items: center;
+    margin: 0 0 1.25rem 0;
+}
+
+/* Circular bordered chevrons — same treatment as the notification detail nav
+   (.notification-detail-nav in panels/content.css) and the thread-view scroll
+   chevrons. Absolutely positioned so they FLOAT over the left/right ends of the
+   full-width suggestion box (below) at fixed spots — out of flow, so the
+   disabled-at-end state can't shift the box or the centered suggestion. Both
+   chevrons stay on screen on every step; the inapplicable one is `:disabled`
+   (greyed) rather than hidden. */
+.welcome-carousel-nav {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 1;
+    width: 2rem;
+    height: 2rem;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
+    backdrop-filter: blur(0.5rem);
+    -webkit-backdrop-filter: blur(0.5rem);
+    border: 0.125rem solid var(--border-color);
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.85;
+    transition: opacity 0.2s, background-color 0.15s, color 0.15s, border-color 0.15s;
+}
+
+/* Float each chevron near the edge it belongs to, inset 0.5rem so it clears the
+   box's rounded corner and leaves breathing room out to the box border — source
+   order is prev, viewport, next, so :first-child is the ‹ (left) and :last-child
+   the › (right). */
+.welcome-carousel-nav:first-child { left: 0.5rem; }
+.welcome-carousel-nav:last-child { right: 0.5rem; }
+
+/* Disabled "when applicable" — kept on screen, greyed and non-interactive at the
+   first / last suggestion. Deliberately does NOT set `pointer-events: none`
+   (unlike .icon-btn:disabled): the chevron now floats OVER the full-width
+   suggestion box, so making it transparent to pointers would let a tap on the
+   greyed chevron fall through to the box and prefill the suggestion. As a
+   disabled <button> it already swallows the tap — no action fires, and it blocks
+   the box beneath from receiving the click. `:hover` is `:not(:disabled)`-gated,
+   so keeping pointer events doesn't reintroduce a hover state. */
+.welcome-carousel-nav:disabled {
+    opacity: 0.3;
+    cursor: default;
+}
+
+@media (hover: hover) {
+    .welcome-carousel-nav:not(:disabled):hover {
+        opacity: 1;
+        background: var(--bg-hover);
+        color: var(--text-primary);
+        border-color: var(--text-muted);
+    }
+}
+
+/* Carousel viewport: the sole in-flow child, so it spans the full carousel width
+   (the chevrons float over its ends). Stacks every suggestion in a SINGLE grid
+   cell, so the row track sizes to the tallest suggestion (hidden cards stay laid
+   out and still contribute their height) — the viewport height is stable across
+   slides and the vertically-centered chevrons no longer bounce as the visible
+   card's length changes. */
+.welcome-carousel-viewport {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: grid;
+}
+
+/* The suggestions — tappable cards spanning the full carousel width, with the
+   chevrons floating over their left/right ends. Resets the native <button> chrome
+   (font-family doesn't inherit on buttons) and adopts the same translucent-bordered
+   treatment as the chevron nav so it reads as interactive without a hover (mobile
+   has none). Clicking the current one prefills the prompt. The wide 3.25rem
+   horizontal padding holds the text in exactly the position it had when the box
+   sat *between* the chevrons (2rem chevron + 0.5rem gap + 0.75rem old padding) —
+   so widening the box under the chevrons didn't push the text out to the edges.
+   All cards share the grid cell (`grid-area: 1 / 1`) and the default grid
+   `stretch` so every card renders at the uniform tallest-card height; the flex
+   centering keeps shorter text vertically centered within that height. */
+.welcome-hero .welcome-carousel-item {
+    grid-area: 1 / 1;
+    min-width: 0;
+    margin: 0;
+    padding: 0.5rem 3.25rem;
+    display: flex;
+    align-items: center;
+    font-family: inherit;
+    /* Primary (near-black) so the suggestion stands out by contrast rather than
+       size — the small italic copy still reads as the focal line. */
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    font-style: italic;
+    line-height: 1.45;
+    text-align: left;
+    cursor: pointer;
+    background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
+    border: 0.0625rem solid var(--border-color);
+    border-radius: 0.625rem;
+    -webkit-tap-highlight-color: transparent;
+    transition: background-color 0.15s, color 0.15s, border-color 0.15s;
+}
+
+/* Non-current cards stay laid out (so they keep driving the track height) but are
+   removed from sight and hit-testing — the markup also drops them from the tab
+   order and the a11y tree (aria-hidden / tabindex in WelcomeMessage.tsx). */
+.welcome-hero .welcome-carousel-item[aria-hidden="true"] {
+    visibility: hidden;
+    pointer-events: none;
+}
+
+@media (hover: hover) {
+    .welcome-hero .welcome-carousel-item:hover {
+        background: var(--bg-hover);
+        border-color: var(--text-muted);
+    }
+}
+
+/* Dismiss: a sleek, chrome-less ghost control pinned to the top-right of the
+   welcome surface. No border or fill at rest — just a quiet, compact label that
+   lifts into a soft fully-rounded pill on hover. `.welcome-hero` is
+   `position: relative`, so this anchors to the centered content box — landing at
+   the content's top-right edge (aligned with the prompt's right edge), not the
+   full-width pane corner. */
+.welcome-dismiss {
+    position: absolute;
+    top: 0;
+    right: 0;
+    z-index: 1;
+    padding: 0.25rem 0.625rem;
+    background: transparent;
+    border: none;
+    border-radius: 999px;
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    opacity: 0.75;
+    cursor: pointer;
+    transition: color var(--duration-fast) ease,
+                background var(--duration-fast) ease,
+                opacity var(--duration-fast) ease;
+}
+
+.welcome-dismiss:hover {
+    color: var(--text-secondary);
+    background: var(--bg-hover);
+    opacity: 1;
+}
+
+/* Error state */
+.error {
+    color: var(--accent-red);
+    padding: 0.75rem;
+    background: color-mix(in srgb, var(--accent-red) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent-red) 40%, transparent);
+    border-radius: 0.375rem;
+    font-size: var(--font-size-md);
+}
+
+
+/* Thread empty state — fallback when no exchanges render. The error/empty
+   paths use real text content so iOS Safari can't show blank; the loading
+   skeleton lives in ThreadSkeletonOverlay (gated by useDelayedFlag, so it's
+   deliberately blank for the first SPINNER_DELAY_MS) and crossfades out as the
+   exchanges appear. */
+.thread-empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.75rem;
+    padding: 3rem 1rem;
+    color: var(--text-muted);
+    font-size: var(--font-size-lg);
+}
+
+.thread-empty-state p {
+    margin: 0;
+}
+
+.thread-empty-error p {
+    color: var(--accent-red);
+}
+
+.thread-empty-reload {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+    padding: 0.25rem 0.5rem;
+    text-decoration: underline;
+    text-underline-offset: 0.125rem;
+}
+
+/* CC question divider — body of an UserQuestionAsked initiator panel. The
+   surrounding .initiator-body provides padding/border/background, so the
+   body itself is just a vertical stack of the question text, options, and
+   (in answered state) the resolution block. */
+.question-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.question-text {
+    color: var(--text-primary);
+    font-weight: 600;
+    line-height: 1.5;
+}
+
+/* Links the LLM pastes into a question (e.g. a PR URL) — styled like the
+   standard markdown-content anchor. word-break keeps a long URL from
+   overflowing the card. */
+.question-text a {
+    color: var(--accent);
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+    text-underline-offset: 0.125rem;
+    word-break: break-all;
+}
+
+@media (hover: hover) {
+    .question-text a:hover {
+        text-decoration-color: var(--accent);
+    }
+}
+
+/* Option indicator — radio circle (single-select) or checkbox box (multi-
+   select). Distinct shape from the start so the user can tell the mode apart
+   before any click. Selected state echoes the accent tint already used on
+   .question-option[aria-pressed="true"] and .question-option-selected. */
+.question-option-indicator {
+    display: inline-block;
+    flex-shrink: 0;
+    width: 0.875rem;
+    height: 0.875rem;
+    border: 1px solid var(--text-muted);
+    background: transparent;
+    transition:
+        background-color var(--duration-normal),
+        border-color var(--duration-normal);
+}
+
+.question-option-indicator-radio {
+    border-radius: 50%;
+}
+
+.question-option-indicator-checkbox {
+    border-radius: 0.1875rem;
+}
+
+.question-option-indicator-selected {
+    border-color: var(--accent);
+    background:
+        radial-gradient(circle, var(--accent) 35%, transparent 38%);
+}
+
+/* The row already shows the accent tint via [aria-pressed="true"], so the
+   indicator only needs the check glyph itself — no fill on top of the tint. */
+.question-option-indicator-checkbox.question-option-indicator-selected {
+    position: relative;
+    background: transparent;
+}
+
+.question-option-indicator-checkbox.question-option-indicator-selected::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 0.25rem;
+    height: 0.5rem;
+    border: solid var(--accent);
+    border-width: 0 0.125rem 0.125rem 0;
+    transform: translate(-55%, -65%) rotate(45deg);
+}
+
+.question-options {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+/* Two-column grid shared by the live button and the resolved-state row.
+   Indicator + label sit on row 1; .question-option-desc spans both columns
+   on row 2 so the description can use the full card width on mobile instead
+   of squeezing into the narrow column to the right of the checkbox. The
+   surfaces share the layout block so OptionContent's flat fragment can't
+   silently break in one and not the other. */
+.question-option,
+.question-option-static {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    column-gap: 0.625rem;
+    row-gap: 0.25rem;
+    align-items: start;
+    width: 100%;
+    padding: 0.75rem 0.875rem;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    color: var(--text-primary);
+    text-align: left;
+    white-space: normal;
+}
+
+/* Answered recap rows are borderless, like the user message bubble — the picked
+   one carries the accent tint, the rest read as dimmed. (Live options keep their
+   border for tap affordance.) */
+.question-option-static {
+    border-color: transparent;
+}
+
+.question-option {
+    cursor: pointer;
+    font-family: inherit;
+    transition:
+        background-color var(--duration-normal),
+        border-color var(--duration-normal),
+        transform var(--duration-fast);
+}
+
+.question-option .question-option-indicator,
+.question-option-static .question-option-indicator {
+    /* Match the cap height of the option label so the dot aligns with the
+       first line of text rather than floating above it. */
+    margin-top: 0.1875rem;
+}
+
+.question-option:focus-visible {
+    /* Shared --focus-ring. */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+@media (hover: hover) {
+    .question-option:hover {
+        background: var(--picked-surface);
+        border-color: color-mix(in srgb, var(--accent) 50%, var(--border-color));
+    }
+}
+
+.question-option:active {
+    transform: scale(0.99);
+}
+
+.question-option-label {
+    font-weight: 500;
+    font-size: var(--font-size-lg);
+    line-height: 1.4;
+    word-break: break-word;
+}
+
+.question-option-desc {
+    grid-column: 1 / -1;
+    color: var(--text-secondary);
+    font-size: var(--font-size-md);
+    line-height: 1.45;
+    word-break: break-word;
+}
+
+.question-hint {
+    color: var(--text-muted);
+    font-size: var(--font-size-md);
+    font-style: italic;
+}
+
+/* Highlighted: the picked option in Selected answers — accent tint, no border
+   (matches the user message bubble). Same treatment for live multi-select
+   toggles via aria-pressed, so changing the accent recipe touches one block. */
+.question-option-selected,
+.question-option[aria-pressed="true"] {
+    border-color: transparent;
+    background: var(--picked-surface);
+}
+
+/* Dimmed: non-chosen options after resolution. Muted color, subdued surface. */
+.question-option-dimmed {
+    opacity: 0.55;
+    color: var(--text-muted);
+}
+
+.question-option-dimmed .question-option-label {
+    text-decoration: line-through;
+    text-decoration-color: var(--text-muted);
+}
+
+/* Terminated: the surrounding response was canceled / aborted / failed /
+   overtaken before any answer landed. TerminatedQuestionBody sets `disabled`
+   on every option so taps can't land — these rules make that state visible.
+   Same recipe as `question-option-dimmed`, applied to every option in the
+   card, plus `not-allowed` cursor and a hover override so the accent tint
+   from the live hover rule doesn't bleed in. */
+.question-body-terminated .question-option:disabled {
+    opacity: 0.55;
+    color: var(--text-muted);
+    cursor: not-allowed;
+}
+
+.question-body-terminated .question-option:disabled .question-option-label {
+    text-decoration: line-through;
+    text-decoration-color: var(--text-muted);
+}
+
+@media (hover: hover) {
+    .question-body-terminated .question-option:disabled:hover {
+        background: var(--bg-tertiary);
+        border-color: var(--border-color);
+    }
+}
+
+/* FreeText resolution block — borderless accent tint echoing the selected-option
+   surface and the user message bubble, so the user's typed answer reads as the
+   equivalent "picked" surface rather than a separate outlined card. */
+.question-freetext {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.5rem 0.75rem;
+    border-radius: 0.375rem;
+    background: var(--picked-surface);
+}
+
+.question-freetext-label {
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.question-freetext-text {
+    color: var(--text-primary);
+    line-height: 1.5;
+    word-break: break-word;
+    white-space: pre-wrap;
+}
+
+/* Right-align inside the .question-body flex column. The full-opacity
+   "this is the picked affordance" rule comes from .permission-btn-picked,
+   stacked alongside on the same button. */
+.question-cancel-picked.action-btn:disabled {
+    align-self: flex-end;
+}
+
+/* CC permission divider — body of a CodingAgentPermissionRequest initiator
+   panel. Like .question-body, the .initiator-body wrapper provides chrome;
+   the body is just a vertical stack of the prompt text and action rows. After
+   the user resolves the request the same buttons stay rendered (disabled, with
+   the picked one marked and the rest struck through) so layout doesn't jump
+   and history reads at a glance. */
+.permission-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.875rem;
+}
+
+.permission-text {
+    color: var(--text-primary);
+    font-weight: 500;
+    line-height: 1.5;
+    word-break: break-word;
+}
+
+/* MCP permission card — the tool arguments the agent wants to call with.
+   Monospace, dimmed, scrollable when long so a big args blob doesn't blow out
+   the card height. */
+.permission-mcp-args {
+    margin: 0.5rem 0 0;
+    padding: 0.5rem 0.625rem;
+    background: var(--bg-secondary, rgba(127, 127, 127, 0.1));
+    border-radius: 0.375rem;
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+    font-size: var(--font-size-md);
+    line-height: 1.45;
+    font-weight: 400;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 12rem;
+    overflow: auto;
+}
+
+.permission-actions {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+.permission-actions-secondary {
+    margin-top: -0.375rem;
+}
+
+.permission-actions-secondary code {
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+    font-size: 0.875em;
+}
+
+/* Disabled "this is what got picked" affordance — keeps full opacity (the
+   default .action-btn:disabled fades to 40%, which would visually demote the
+   choice). Used by permission picked scope AND question card cancel; the name
+   lives in the permission-card namespace for historical reasons. */
+.permission-btn-picked.action-btn:disabled {
+    opacity: 1;
+}
+
+/* Rejected (not-picked) buttons on an answered permission card — strike them
+   through and drop them to a muted slate. The default .action-btn:disabled
+   opacity (0.4) already greys the colour; the line-through tells the user
+   these buttons WERE on offer but were not chosen. */
+.permission-btn-rejected.action-btn:disabled {
+    background-color: var(--bg-tertiary);
+    color: var(--text-muted);
+    text-decoration: line-through;
+    text-decoration-color: var(--text-muted);
+    opacity: 0.7;
+}
+
+.permission-btn-rejected.action-btn:disabled code {
+    text-decoration: line-through;
+}
+
+/* Shared across the "this is the affordance you picked" treatment on every
+   answered timeline card — permission picked, question canceled. The class
+   name lives in the permission-card namespace for historical reasons but the
+   visual is generic. */
+.permission-btn-check {
+    margin-right: 0.125rem;
+}
+
+/* Permissions settings: per-row editable allowlist (cc-allowed-tools and
+   agent-allowed-commands). Each pattern is a monospace input + Delete button. */
+.allowlist-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+}
+
+.allowlist-empty {
+    color: var(--text-muted);
+    font-size: var(--font-size-lg);
+    padding: 0.25rem 0;
+}
+
+.allowlist-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+}
+
+.allowlist-row-input {
+    flex: 1;
+    min-width: 0;
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+    font-size: var(--font-size-lg);
+    line-height: 1.5;
+    padding: 0.375rem 0.625rem;
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    box-sizing: border-box;
+}
+
+.allowlist-actions {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    margin-top: 0.625rem;
+}
+
+/* Pushes Revert/Save to the right, leaving "Add pattern" on the left. */
+.allowlist-actions-spacer {
+    flex: 1;
+}
+
+/* Copyable blocks — <copy>...</copy> rendered by renderMarkdown */
+.copyable-block {
+    position: relative;
+    display: inline;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    padding: 0.125rem 0.375rem;
+    color: var(--text-primary);
+    -webkit-box-decoration-break: clone;
+    box-decoration-break: clone;
+}
+
+.copyable-block-multi {
+    display: block;
+    padding: 0.5rem 2.25rem 0.5rem 0.75rem;
+    margin: 0.5rem 0;
+    white-space: pre-wrap;
+}
+
+/* Inline-flow: absolute positioning inside a wrapping inline .copyable-block
+   would land the button mid-height of the wrapped lines. */
+.copy-btn {
+    display: inline-flex;
+    align-items: center;
+    vertical-align: middle;
+    margin-left: 0.25rem;
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 0.125rem;
+    line-height: 0;
+    border-radius: 0.1875rem;
+    transition: color var(--duration-fast) ease;
+}
+
+.copy-btn svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+}
+
+.copy-btn:hover {
+    color: var(--text-primary);
+}
+
+.copy-btn-copied {
+    color: var(--accent-green);
+}
+
+.copy-btn-copied:hover {
+    color: var(--accent-green);
+}
+
+.copyable-block-multi .copy-btn {
+    position: absolute;
+    top: 0.375rem;
+    right: 0.25rem;
+    margin-left: 0;
+}
+
+@media (max-width: 768px) {
+    .copyable-block-multi .copy-btn,
+    .code-block-copy-btn {
+        padding: 0.25rem;
+    }
+
+    .copyable-block-multi .copy-btn svg,
+    .code-block-copy-btn svg {
+        width: var(--icon-size-md);
+        height: var(--icon-size-md);
+    }
+
+    /* Tap-area extender via ::before — same pattern as .action-btn::before
+       in mobile.css. Sibling .copyable-block-multi .copy-btn already has
+       position: absolute, so only .code-block-copy-btn needs the anchor. */
+    .code-block-copy-btn {
+        position: relative;
+    }
+
+    .copyable-block-multi .copy-btn::before,
+    .code-block-copy-btn::before {
+        content: '';
+        position: absolute;
+        inset: -0.375rem -0.25rem;
+    }
+
+    .code-block-wrapper pre {
+        padding-top: 2.25rem;
+    }
+}
+
+/* Fenced code block. Lang label + copy button live in one .code-block-header
+   overlay row — single absolute element rather than two absolute siblings of
+   <pre>, so positioning has one source of truth. */
+.code-block-wrapper {
+    position: relative;
+}
+
+.code-block-wrapper pre {
+    margin-top: 0;
+    padding-top: 1.75rem;
+}
+
+/* Click-through overlay — header itself doesn't intercept taps so the user
+   can still select code under it. The button child re-enables its own. */
+.code-block-header {
+    position: absolute;
+    top: 0.375rem;
+    left: 0.625rem;
+    right: 0.375rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    pointer-events: none;
+    z-index: 2;
+}
+
+.code-block-header > * {
+    pointer-events: auto;
+}
+
+.code-block-lang {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    -webkit-user-select: none;
+    user-select: none;
+    pointer-events: none;
+}
+
+/* Load-bearing for code blocks without a language fence: with no lang
+   sibling, the lone button would otherwise sit at flex-start (left). */
+.code-block-copy-btn {
+    margin-left: auto;
+}
+
+/* JS-detected, not CSS @media: (hover)/(pointer) media queries are unreliable
+   across iOS Safari standalone, iPadOS with trackpad, and hybrid touch laptops,
+   and width-based queries can't tell a narrow desktop window from a touch
+   device. See main.tsx — body.is-touch is set on touch devices. */
+body:not(.is-touch) .code-block-copy-btn {
+    opacity: 0;
+    transition: opacity var(--duration-fast) ease;
+}
+
+body:not(.is-touch) .code-block-wrapper:hover .code-block-copy-btn,
+body:not(.is-touch) .code-block-copy-btn.copy-btn-copied {
+    opacity: 1;
+}
+
+/* Flat — no border/background; the surrounding InitiatorPanel owns the chrome. */
+.child-completion-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+.child-completion-header-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+}
+.child-completion-prefix {
+    color: var(--text-secondary);
+}
+.child-completion-status {
+    display: inline-flex;
+    align-items: center;
+    font-size: var(--font-size-sm);
+    padding: 0.125rem 0.5rem;
+    border-radius: 0.25rem;
+    font-weight: 600;
+}
+.child-completion-status-success {
+    background: color-mix(in srgb, var(--accent-green) 18%, transparent);
+    color: var(--accent-green);
+}
+.child-completion-status-failure {
+    background: color-mix(in srgb, var(--accent-red) 18%, transparent);
+    color: var(--accent-red);
+}
+.child-completion-status-no-changes {
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+}
+.child-completion-status-canceled {
+    background: color-mix(in srgb, var(--accent-yellow) 18%, transparent);
+    color: var(--accent-yellow);
+}
+.child-completion-disclosure {
+    font-size: var(--font-size-md);
+    color: var(--text-muted);
+}
+.child-completion-disclosure > summary {
+    cursor: pointer;
+    user-select: none;
+}
+.child-completion-disclosure > summary:hover {
+    color: var(--text-secondary);
+}
+.child-completion-summary {
+    margin-top: 0.375rem;
+    color: var(--text-secondary);
+}
+
+/* Benign empty completion: the model ended its turn cleanly with no text.
+   A neutral, muted note — deliberately NOT error styling (that's reserved for
+   a real ResponseFailed). States what happened instead of a blank body. */
+.response-empty-note {
+    color: var(--text-muted);
+    font-style: italic;
+    font-size: var(--font-size-lg);
+}

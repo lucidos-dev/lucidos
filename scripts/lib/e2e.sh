@@ -1,0 +1,357 @@
+#!/bin/bash
+
+E2E_WORKSPACE="$HOME/workspaces/e2e-test"
+
+# Resolve paths: scripts/lib/e2e.sh → scripts/lib/ → scripts/ → project root
+_E2E_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_E2E_SCRIPTS_DIR="$(dirname "$_E2E_LIB_DIR")"
+_E2E_PROJECT_DIR="$(dirname "$_E2E_SCRIPTS_DIR")"
+
+# Use mock LLM provider by default for e2e tests (override with LUCIDOS_MODEL=... before calling)
+export LUCIDOS_MODEL="${LUCIDOS_MODEL:-mock}"
+
+# E2E builds opt into the `e2e-test-hooks` cargo feature so the engine
+# compiles in the push-log stub (replaces real web-push send with an
+# in-process write) and the `GET /api/v1/_test/push-log` endpoint that
+# Playwright tests assert against. See system-knowhow/notifications.md §5.4.
+export ENGINE_BUILD_FEATURES="${ENGINE_BUILD_FEATURES:-e2e-test-hooks}"
+
+# e2e runs on a RELEASE engine by default (docs/plans/2026-06-28-e2e-always-release-build.md).
+# The debug engine's CPU cost is the dominant driver of the mobile-webkit
+# WebContent cold-start contention wedge — running release eliminates that flake
+# class and matches the packaged/prod engine (which IS release). The test-only
+# `seed-change-for-test` endpoint stays reachable on release because it is gated on
+# `cfg!(any(debug_assertions, feature = "e2e-test-hooks"))` and the e2e build passes
+# that feature (ENGINE_BUILD_FEATURES above). `build_or_find_engine` reads $RELEASE.
+#   - LUCIDOS_E2E_DEBUG=1 → fall back to the fast debug build for local single-spec
+#     iteration (the opt-out is authoritative).
+#   - otherwise RELEASE defaults to 1; an explicit caller RELEASE is honored.
+if [ -n "${LUCIDOS_E2E_DEBUG:-}" ]; then
+    export RELEASE=""
+else
+    export RELEASE="${RELEASE:-1}"
+fi
+
+# Cap cargo parallelism for the release compile so a full-core release codegen
+# (wasmtime / aws-lc / ravif each eat 1–2 GB) can't blow past RAM into swap and
+# hang the host (seen 2026-06-28 during this campaign). Half the cores by default;
+# override with CARGO_BUILD_JOBS. Only applied to the release build path.
+if [ -n "$RELEASE" ] && [ -z "${CARGO_BUILD_JOBS:-}" ]; then
+    _e2e_cores="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+    _e2e_jobs=$(( _e2e_cores / 2 ))
+    [ "$_e2e_jobs" -lt 1 ] && _e2e_jobs=1
+    export CARGO_BUILD_JOBS="$_e2e_jobs"
+fi
+
+# Source shared infrastructure — provides detect_tls, setup_postgres, start_engine,
+# start_vite, etc. Set the globals workspace.sh expects from its caller.
+SCRIPT_DIR="$_E2E_SCRIPTS_DIR"
+PROJECT_DIR="$_E2E_PROJECT_DIR"
+FRONTEND_DIR="$_E2E_PROJECT_DIR/crates/lucidos-app"
+SCRIPT_NAME="e2e"
+
+source "$_E2E_LIB_DIR/ports.sh"
+source "$_E2E_LIB_DIR/workspace.sh"
+source "$_E2E_LIB_DIR/e2e_lock.sh"
+source "$_E2E_LIB_DIR/webkit_reaper.sh"
+source "$_E2E_LIB_DIR/host_load_guard.sh"
+
+# ── ensure_workspace_running ────────────────────────────────────────────
+# Starts the e2e workspace if not running. Ensures both engine AND Vite are up.
+# Uses LUCIDOS_MODEL=mock by default so tests don't hit real LLM APIs.
+ensure_workspace_running() {
+    # Set up workspace globals (pidfiles, log path, PG_NAME)
+    export WORKSPACE="$E2E_WORKSPACE"
+    resolve_workspace
+
+    # Allocate ports and detect TLS
+    allocate_ports "$WORKSPACE"
+    detect_tls
+
+    # After allocate_ports: API_PORT = internal Vite port, VITE_PORT = engine port
+    local engine_port="$VITE_PORT"
+    local vite_port="$API_PORT"
+
+    # ── Engine ──
+    if curl -sk "${PROTO}://localhost:${engine_port}/api/v1/health" >/dev/null 2>&1; then
+        echo "Engine already running on port $engine_port"
+        # Set up env vars that swap_ports normally provides
+        swap_ports
+    else
+        echo "Starting e2e workspace (LUCIDOS_MODEL=$LUCIDOS_MODEL)..."
+        setup_postgres
+        purge_orphan_migrations
+        # Apps loaded in iframes fetch /api/v1/sdk.js — without dist/sdk.js the
+        # engine serves a stub that lacks lucidos.ui/data, breaking SDK e2e tests.
+        build_sdk
+        BUILD="1"
+        build_or_find_engine
+        swap_ports
+        start_engine
+    fi
+
+    # ── Frontend (ADR 0014: the engine serves the built dist/ directly) ──
+    # No Vite dev server / proxy. swap_ports exported LUCIDOS_STATIC_DIR, so the
+    # legacy engine started above serves dist/ at / (base path '', no gateway).
+    # The e2e run tests a fixed build, so a one-shot `vite build` suffices.
+    if [ ! -f "$FRONTEND_DIR/dist/index.html" ]; then
+        echo "Building frontend (vite build)..."
+        (cd "$FRONTEND_DIR" && npx vite build) || { echo "ERROR: frontend build failed" >&2; return 1; }
+    fi
+
+    # Final check: the engine must serve the built frontend at / (retry up to 30s)
+    echo -n "Verifying engine serves the frontend"
+    local frontend_ready=""
+    for i in {1..30}; do
+        if curl -sk "${PROTO}://localhost:${engine_port}/" 2>/dev/null | grep -q "<!DOCTYPE" 2>/dev/null; then
+            echo " ready!"
+            frontend_ready="yes"
+            break
+        fi
+        echo -n "."
+        sleep 1
+    done
+
+    if [ -z "$frontend_ready" ]; then
+        echo ""
+        echo "WARNING: Engine not serving the built frontend (is LUCIDOS_STATIC_DIR set / dist/ built?)"
+    fi
+
+    # Export for test scripts
+    export VITE_PORT="$engine_port"
+}
+
+# Remove orphan dirs under $E2E_WORKSPACE/.lucidos/worktrees/ — directories
+# with no .git pointer, or with a .git pointer to a gitdir that no longer
+# exists. CC test sessions register worktrees in their spawning repo's
+# .git/worktrees/; when that registration disappears (parent repo's worktree
+# pruned first, partial cleanup, etc.) the directory remains. With dozens of
+# leftover dirs the engine's startup recovery iterates over them and exceeds
+# its 30s API readiness budget.
+prune_orphan_worktree_dirs() {
+    local wt_root="$E2E_WORKSPACE/.lucidos/worktrees"
+    [ -d "$wt_root" ] || return 0
+
+    local removed=0
+    local d
+    for d in "$wt_root"/*; do
+        [ -d "$d" ] || continue
+        if [ -z "$(ls -A "$d" 2>/dev/null)" ]; then
+            rmdir "$d" 2>/dev/null && removed=$((removed + 1))
+            continue
+        fi
+        if [ -f "$d/.git" ]; then
+            local gitdir
+            gitdir=$(sed -n 's/^gitdir: //p' "$d/.git" 2>/dev/null | head -1)
+            if [ -n "$gitdir" ] && [ ! -d "$gitdir" ]; then
+                rm -rf "$d" 2>/dev/null && removed=$((removed + 1))
+            fi
+        fi
+    done
+    [ "$removed" -gt 0 ] && echo "Pruned $removed orphan worktree dir(s)" || true
+}
+
+cleanup_e2e_worktrees() {
+    echo "Cleaning up e2e worktrees..."
+    local original_dir="$PWD"
+    cd "$E2E_WORKSPACE" || return
+
+    # Prune stale worktree entries (paths that no longer exist on disk)
+    git worktree prune 2>/dev/null
+
+    # Remove all non-main worktrees (created by CC tests)
+    local removed=0
+    while IFS= read -r line; do
+        local wt_path
+        wt_path=$(echo "$line" | awk '{print $1}')
+        # Skip the main working tree
+        [ "$wt_path" = "$E2E_WORKSPACE" ] && continue
+        git worktree remove --force "$wt_path" 2>/dev/null && removed=$((removed + 1))
+    done < <(git worktree list 2>/dev/null)
+
+    # Clean up leftover e2e-test branches
+    git branch --list 'e2e-test/*' 'claude-code/*' 'merge-tmp/*' 2>/dev/null | xargs -r git branch -D 2>/dev/null
+
+    # CC test worktrees are physically inside this workspace but registered in
+    # the canonical lucidos repo (where `git worktree add` ran). Without this the
+    # repo accumulates stale entries every test run; engine recovery then iterates
+    # over hundreds of dead worktrees on next startup and exceeds its 30s API
+    # readiness budget.
+    #
+    # SAFETY — this repo is SHARED with every real CC session: dev/personal
+    # worktrees and their `claude-code/*` branches all live here, and
+    # `$_E2E_PROJECT_DIR` is whichever checkout invoked the script — frequently a
+    # CC worktree of this same repo. So the ONLY safe discriminator for "created
+    # by an e2e run" is the worktree path living under $E2E_WORKSPACE. NEVER
+    # delete branches by name (`claude-code/*`) or by ancestry: a just-started
+    # real session has no commits ahead of main yet, so an ancestry sweep deletes
+    # live user work — this force-deleted an active session's branch and wiped its
+    # worktree on 2026-06-13. Delete ONLY the branch each removed e2e worktree was
+    # checked out on, captured from the same `git worktree list` record.
+    cd "$_E2E_PROJECT_DIR" 2>/dev/null || { cd "$original_dir"; return; }
+    git worktree prune 2>/dev/null
+    local wt_path="" cur_branch=""
+    local -a e2e_branches=()
+    while IFS= read -r line; do
+        case "$line" in
+            "worktree "*) wt_path="${line#worktree }" ;;
+            "branch "*)   cur_branch="${line#branch refs/heads/}" ;;
+            "")
+                case "$wt_path" in
+                    "$E2E_WORKSPACE"/*)
+                        git worktree remove --force "$wt_path" 2>/dev/null && removed=$((removed + 1))
+                        [ -n "$cur_branch" ] && e2e_branches+=("$cur_branch")
+                        ;;
+                esac
+                wt_path=""; cur_branch=""
+                ;;
+        esac
+    done < <(git worktree list --porcelain 2>/dev/null; printf '\n')
+    if [ "${#e2e_branches[@]}" -gt 0 ]; then
+        local br
+        for br in "${e2e_branches[@]}"; do
+            git branch -D "$br" 2>/dev/null || true
+        done
+    fi
+
+    cd "$original_dir"
+    [ "$removed" -gt 0 ] && echo "Removed $removed worktree(s)" || true
+
+    prune_orphan_worktree_dirs
+}
+
+# ── kill_orphan_simulator ────────────────────────────────────────────
+# The Simulator's Virtualization VM survives `simctl shutdown` (XPC service
+# persists for fast reboot) and holds multiple GB resident — pkill it too.
+# Gate on CoreSimulatorService being alive so we don't clobber other
+# Virtualization.framework consumers (Docker Desktop, etc.).
+kill_orphan_simulator() {
+    pgrep -x Simulator >/dev/null 2>&1 || pgrep -f "com.apple.CoreSimulator.CoreSimulatorService" >/dev/null 2>&1 || return 0
+    xcrun simctl shutdown all >/dev/null 2>&1 || true
+    killall Simulator 2>/dev/null || true
+    if pgrep -f "com.apple.CoreSimulator.CoreSimulatorService" >/dev/null 2>&1; then
+        pkill -f "com.apple.Virtualization.VirtualMachine" 2>/dev/null || true
+    fi
+}
+
+# ── setup_e2e_session ────────────────────────────────────────────────
+# Standard sub-script lifecycle: lock, ensure workspace running, optional
+# initial reset, and an EXIT trap teardown that mirrors the reset choice.
+# When invoked under the umbrella ($LUCIDOS_E2E_UMBRELLA set), defers all
+# of that to the umbrella and only refreshes port globals.
+# NO_RESET is read from the caller's env (sub-scripts already parse --no-reset).
+#
+# Usage:
+#   setup_e2e_session <lock-label>
+#       Skip cleanup_e2e_worktrees on teardown (api default).
+#   setup_e2e_session <lock-label> --cleanup-worktrees-on-teardown
+#       Browser tests can leave CC worktrees behind; clean them on exit too.
+setup_e2e_session() {
+    local label="$1"
+    local cleanup_on_teardown=""
+    case "${2:-}" in
+        "") ;;
+        --cleanup-worktrees-on-teardown) cleanup_on_teardown=1 ;;
+        *) echo "setup_e2e_session: unknown option '$2'" >&2; exit 1 ;;
+    esac
+
+    if [ -n "${LUCIDOS_E2E_UMBRELLA:-}" ]; then
+        # Umbrella owns lock + workspace + initial reset; we just need port globals.
+        ensure_workspace_running
+        return 0
+    fi
+
+    acquire_e2e_lock "$label" || exit 1
+    kill_orphan_simulator
+    ensure_workspace_running
+
+    # stop_webkit_reaper leads every branch so the host-memory guard started by
+    # e2e-browser.sh dies with the session. It's idempotent and a no-op when no
+    # reaper was started (e.g. e2e-api.sh), so it's safe in all branches.
+    if [ -n "${NO_RESET:-}" ]; then
+        # Leave the workspace running so the next invocation starts immediately
+        # instead of paying the boot cost again.
+        teardown_e2e() { stop_webkit_reaper; release_e2e_lock; }
+    elif [ -n "$cleanup_on_teardown" ]; then
+        teardown_e2e() {
+            stop_webkit_reaper
+            cleanup_e2e_worktrees
+            stop_e2e_workspace
+            release_e2e_lock
+        }
+    else
+        teardown_e2e() {
+            stop_webkit_reaper
+            stop_e2e_workspace
+            release_e2e_lock
+        }
+    fi
+    trap teardown_e2e EXIT
+    trap 'exit 130' INT TERM
+
+    if [ -z "${NO_RESET:-}" ]; then
+        cleanup_e2e_worktrees
+        reset_e2e_database
+    fi
+}
+
+stop_e2e_workspace() {
+    echo "Stopping e2e workspace..."
+    "$_E2E_SCRIPTS_DIR/stop.sh" -w "$E2E_WORKSPACE" 2>/dev/null || true
+    # ADR 0014: no long-lived frontend process to stop — the engine serves the
+    # built dist/ directly and the one-shot `vite build` exits on its own.
+}
+
+# Drops the public schema if any row in _sqlx_migrations references a version
+# whose .sql file no longer exists in the source. CC branches that get abandoned
+# without merging leave orphan migrations in the e2e DB; sqlx::Migrator then
+# refuses to start the engine with VersionMissing(...).
+purge_orphan_migrations() {
+    local migrations_dir="$_E2E_PROJECT_DIR/crates/lucidos-engine/migrations"
+    local container db
+    container="$(shared_pg_container)"
+    db="$(workspace_database_name)"
+
+    local valid_versions
+    valid_versions=$(ls "$migrations_dir" 2>/dev/null | grep -oE '^[0-9]{14}' | sort -u | paste -sd, -)
+    [ -z "$valid_versions" ] && return 0
+
+    # Checking first, separately, because Postgres parses both branches of a
+    # CASE expression even when one is unreachable — a single combined query
+    # errors out on a fresh DB. Two round trips lets the count query fail
+    # loudly on a real psql/container problem instead of being masked.
+    local table_exists
+    table_exists=$(docker exec "$container" psql -U lucidos -d "$db" -At -c \
+        "SELECT to_regclass('_sqlx_migrations') IS NOT NULL;")
+    [ "$table_exists" = "t" ] || return 0
+
+    local orphan_count
+    orphan_count=$(docker exec "$container" psql -U lucidos -d "$db" -At -c \
+        "SELECT count(*) FROM _sqlx_migrations WHERE version NOT IN ($valid_versions);")
+
+    if [ "${orphan_count:-0}" -gt 0 ]; then
+        echo "Found $orphan_count orphan migration(s) from abandoned branches — resetting schema"
+        docker exec "$container" psql -U lucidos -d "$db" -q -c \
+            "DROP SCHEMA public CASCADE; CREATE SCHEMA public; CREATE EXTENSION IF NOT EXISTS vector;"
+    fi
+}
+
+reset_e2e_database() {
+    local container db
+    container="$(shared_pg_container)"
+    db="$(workspace_database_name)"
+
+    echo "Resetting database..."
+    docker exec "$container" psql -U lucidos -d "$db" -q -c "
+        DO \$\$
+        DECLARE r RECORD;
+        BEGIN
+            FOR r IN SELECT tablename FROM pg_tables
+                WHERE schemaname = 'public' AND tablename != '_sqlx_migrations'
+            LOOP
+                EXECUTE 'TRUNCATE TABLE ' || quote_ident(r.tablename) || ' CASCADE';
+            END LOOP;
+        END \$\$;
+    "
+    echo "Database reset complete"
+}

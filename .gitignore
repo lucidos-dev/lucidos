@@ -1,0 +1,82 @@
+# Build artifacts
+/target/
+# Ad-hoc compiled binary at the repo root (a one-off debug build accidentally
+# auto-committed). Compiled binaries never belong in source.
+/test_url_generation
+# Per-signer build dirs and the copied artifact next to each signer's
+# Cargo.toml. Built by `signers/build-all.sh`; never checked in.
+signers/*/target/
+signers/*/*.wasm
+signers/*/Cargo.lock
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+
+# Archives
+*.tgz
+
+# Docs site build output (mkdocs) + its local venv
+/site/
+.venv-docs/
+
+# Lucidos local data (workspaces are external)
+data/
+.lucidos/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Embedding model cache
+.fastembed_cache/
+
+# Runtime files
+*.pid
+*.log
+.lucidos-engine.pid
+.frontend.pid
+lucidos-engine.log
+.lucidos-workspace
+.docker-workspace
+
+# Workspaces
+workspaces/
+
+# Worktrees
+.worktrees/
+.claude/worktrees/
+
+# TLS certs (mkcert, machine-specific)
+.certs/
+
+# Node.js
+node_modules/
+dist/
+# Atomic-dist-publish staging dir (vite build.outDir under LUCIDOS_ATOMIC_DIST,
+# renamed onto dist/ in closeBundle — ephemeral build output, never committed)
+dist.staging/
+dist.prev/
+# Checkout-level shared build-watch state (pid + log) for --built dev mode —
+# the singleton `vite build --watch` lives here, see scripts/lib/workspace.sh
+.build-watch/
+.env
+
+# Compiled JS next to TS sources (Vite serves .js over .ts, breaking the app)
+crates/lucidos-app/src/**/*.js
+
+# Playwright test artifacts
+test-results/
+playwright-report/
+
+# Version files and stamps (build.rs manages these — gitignored so worktrees
+# don't create merge conflicts. Only exist in main working directory.)
+VERSION
+crates/*/VERSION
+crates/*/.version_stamp
+
+# Desktop bundle staging (build-dmg.sh)
+crates/lucidos-app/bundle-resources/

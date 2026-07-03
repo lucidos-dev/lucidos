@@ -1,0 +1,130 @@
+/* Settings → System */
+
+.system-subpanel-switcher {
+    margin-bottom: 1.25rem;
+}
+
+.system-subpanel-options {
+    justify-content: flex-start;
+}
+
+.system-status-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.25rem 0 0.625rem;
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.system-status-row .status-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+}
+
+.system-status-row .status-dot.disconnected {
+    animation: progress-blink-red 0.6s ease-in-out infinite;
+}
+
+.system-info-list {
+    display: flex;
+    flex-direction: column;
+}
+
+.system-info-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 1rem;
+    padding: 0.375rem 0;
+    border-top: 1px solid var(--border-color);
+}
+
+.system-info-label {
+    flex: 0 0 auto;
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+}
+
+.system-info-value {
+    flex: 1 1 auto;
+    min-width: 0;
+    color: var(--text-secondary);
+    font-size: var(--font-size-md);
+    text-align: right;
+    overflow-wrap: anywhere;
+}
+
+.system-info-path {
+    font-family: var(--font-mono, monospace);
+    font-size: var(--font-size-sm);
+}
+
+.system-api-url {
+    background: none;
+    border: none;
+    padding: 0;
+    /* Drop only the UA button font-family; keep .system-info-value's font-size
+       (the `font` shorthand reset font-size to the page base, blowing it up). */
+    font-family: inherit;
+}
+
+/* Update markers ("*", "(latest: …)", "(update available)") stand out from the
+   muted --text-secondary value text by weight + contrast, not by an amber hue. */
+.system-update {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+.system-footnote {
+    margin-top: 0.5rem;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    line-height: 1.4;
+}
+
+/* Actionable callout (restart/update/network). Neutral raised surface + bold
+   text — distinct without the muddy amber. No left accent bar (see
+   .claude/rules/frontend.md — left-accent stripes on cards are forbidden). */
+.system-notice {
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+    font-weight: 600;
+    padding: 0.5rem 0.625rem;
+    margin-bottom: 0.625rem;
+    background: var(--bg-tertiary);
+    border-radius: 0.25rem;
+    line-height: 1.4;
+}
+
+.system-actions {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.system-actions .action-btn {
+    flex: 1 1 10rem;
+}
+
+/* Settings → System → Coding agents: the per-agent binary-path override row.
+   The input and its Save/Clear actions share one horizontal row so the buttons
+   sit level with the input rather than the title. Both action slots are always
+   rendered (disabled — greyed via .action-btn:disabled — when their action
+   isn't available), so the input width never shifts as you type. */
+.coding-agent-row-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.coding-agent-row-controls .device-name-input {
+    flex: 1;
+    min-width: 0;
+}
+
+.coding-agent-row-controls .list-row-actions {
+    flex-shrink: 0;
+    flex-wrap: nowrap;
+}

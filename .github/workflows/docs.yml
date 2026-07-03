@@ -1,0 +1,62 @@
+# Build + deploy the documentation site (docs.lucidos.dev).
+#
+# The site is mkdocs-material at the repo root (mkdocs.yml + docs/site/). Its
+# pages transclude canonical sources (README, glossary, taxonomy) at build time
+# via the include-markdown plugin, so `mkdocs build --strict` IS the gate: a
+# broken include or a dead link fails the build — and therefore the release docs
+# deploy — loudly, instead of silently shipping drift.
+#
+# Runs in the PUBLIC mirror (lucidos-dev/lucidos) only; the repo guard below keeps
+# it inert in the private source repo (matching install-smoke.yml).
+#
+# Fires on a published release (the docs ship with each release) and on manual
+# dispatch (re-deploy on demand). Deploys the built site/ to Cloudflare Pages.
+#
+# ── ONE-TIME MANUAL SETUP (the workflow assumes these already exist) ──────────
+#   1. A Cloudflare Pages project named `lucidos-docs` with a custom domain
+#      `docs.lucidos.dev` (DNS + domain attached in the Pages project).
+#   2. Repo secret CLOUDFLARE_API_TOKEN — a Cloudflare API token scoped to
+#      Account → Cloudflare Pages: Edit.
+#   3. Repo secret CLOUDFLARE_ACCOUNT_ID — the Cloudflare account id
+#      cda7caa3d9acd704d44059ffe4e9d0ff. (This is an account id, not a secret —
+#      it appears in dashboard URLs — but is read from the secret, not this file,
+#      so the value lives in exactly one place.)
+
+name: docs
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  deploy:
+    name: build + deploy docs
+    # ONLY runs in the public mirror — this file also lives in the private source
+    # repo, where the repo guard keeps it inert.
+    if: github.repository == 'lucidos-dev/lucidos'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install docs dependencies
+        run: pip install -r requirements-docs.txt
+
+      # The strict build is the gate: a broken transclusion or dead link fails
+      # here, before anything is deployed.
+      - name: Build (strict)
+        run: mkdocs build --strict
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy site --project-name=lucidos-docs --branch=main

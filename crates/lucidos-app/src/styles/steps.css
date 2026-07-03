@@ -1,0 +1,547 @@
+.steps-toggle {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: var(--font-size-sm);
+    font-family: var(--font-ui);
+    padding: 0.25rem 0;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+@media (hover: hover) {
+    .steps-toggle:hover {
+        color: var(--accent);
+    }
+}
+
+.step {
+    padding: 0.25rem 0.5rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+}
+
+.step-icon {
+    flex-shrink: 0;
+    line-height: 1.4;
+}
+
+.step.success .step-icon {
+    color: var(--accent-green);
+}
+
+.step.error .step-icon {
+    color: var(--accent-red);
+}
+
+.step.pending .step-icon {
+    color: var(--text-muted);
+}
+
+.step.empty {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+.step-context {
+    margin-left: 0.5rem;
+    color: var(--text-muted);
+    font-size: 0.85em;
+}
+
+.step-context.trimmed {
+    color: var(--accent-yellow);
+}
+
+
+/* Details toggle (intermediate text chunks) */
+.details-toggle {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    padding: 0.125rem 0;
+}
+
+@media (hover: hover) {
+    .details-toggle:hover {
+        color: var(--text-primary);
+    }
+}
+
+/* Response toggles (More/Less + Show/Hide steps) */
+.response-toggles {
+    display: flex;
+    gap: 0.75rem;
+    margin-bottom: 0.25rem;
+}
+
+/* Inline steps (between text chunks). Rendered as <button> so the entire row
+   opens the per-step detail modal — strip the native button chrome so it
+   reads as a row of text. */
+.inline-step {
+    display: flex;
+    align-items: baseline;
+    gap: 0.375rem;
+    padding: 0.125rem 0;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    font-family: var(--font-ui);
+    min-width: 0;
+    width: 100%;
+    background: none;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    /* Block iOS text selection / callout — tap should open the modal,
+       not select the row's text. */
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+}
+
+@media (hover: hover) {
+    .inline-step:hover .step-description {
+        color: var(--text-primary);
+    }
+}
+
+.inline-step:focus-visible {
+    /* Shared --focus-ring. */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+.inline-step .step-icon {
+    flex-shrink: 0;
+}
+
+.inline-step.success .step-icon {
+    color: var(--accent-green);
+}
+
+.inline-step.error .step-icon {
+    color: var(--accent-red);
+}
+
+/* In-progress step shows no leading icon — the shimmering description
+   (.running-shimmer) is the "live" affordance, so hide the empty icon slot to
+   keep the text flush-left rather than leaving its inter-item gap. */
+.inline-step.pending .step-icon {
+    display: none;
+}
+
+
+.inline-step .step-description {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+}
+
+/* Highlights ellipsis sequences in tool descriptions so the cut point reads
+   as a marker rather than literal content. Used wherever `highlightEllipsis`
+   wraps the trailing/middle "…" or "..." emitted by Rust `describe_tool` /
+   `describe_cc_tool`. */
+.ellipsis-marker {
+    color: var(--accent-yellow);
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    padding: 0 0.125rem;
+}
+
+.inline-step .step-detail {
+    color: var(--text-muted);
+    font-size: 0.85em;
+    overflow-wrap: break-word;
+    word-break: break-word;
+    min-width: 0;
+    /* basis 0 + grow 1 — detail absorbs flex shrinkage first, so a short
+       description (e.g. "Memory searched") next to a long detail isn't
+       proportionally squeezed and ellipsized. */
+    flex: 1 1 0;
+}
+
+.inline-step .step-detail::before {
+    content: '\2014\00a0';
+}
+
+.inline-step .step-context {
+    margin-left: 0.25rem;
+    color: var(--text-muted);
+    font-size: 0.85em;
+}
+
+.inline-step .step-context.trimmed {
+    color: var(--accent-yellow);
+}
+
+/* Context section viewer — used inside StepDetailModal's Context tab to
+ * render the assembled LLM prompt as collapsible labeled sections. */
+.context-sections {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+/* Two-layer grouping: outer = API role (system / prior_message / user),
+ * inner = curated tier inside the user role. Indentation hierarchy:
+ * role (0) → inner group (1rem) → section (2rem). */
+.context-role {
+    margin-bottom: 0.75rem;
+}
+
+.context-role-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.375rem 0.5rem;
+    font-weight: 600;
+    background: var(--bg-tertiary);
+    border-radius: 0.25rem;
+    width: 100%;
+    text-align: left;
+    border: 0;
+    cursor: pointer;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+}
+
+.context-role-label {
+    flex: 1;
+}
+
+.context-role-chars {
+    margin-left: auto;
+    font-weight: 400;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+}
+
+.context-inner-group {
+    margin: 0.25rem 0 0.25rem 1rem;
+}
+
+.context-inner-header {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.25rem 0.375rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    width: 100%;
+    text-align: left;
+    border: 0;
+    cursor: pointer;
+    background: transparent;
+    font-family: var(--font-ui);
+    font-size: var(--font-size-md);
+}
+
+.context-inner-label {
+    flex: 1;
+}
+
+.context-inner-chars {
+    margin-left: auto;
+    font-weight: 400;
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+.context-inner-group .context-section {
+    margin-left: 1rem;
+}
+
+.context-header {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-family: var(--font-mono, monospace);
+    display: flex;
+    width: 100%;
+    text-align: left;
+}
+
+@media (hover: hover) {
+    .context-header:hover {
+        color: var(--text-primary);
+    }
+}
+
+.context-section-header {
+    font-size: var(--font-size-sm);
+    padding: 0.25rem 0;
+    align-items: center;
+    gap: 0.375rem;
+}
+
+.context-section-name {
+    flex: 1;
+}
+
+.context-section-chars {
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+.context-section-content {
+    font-family: var(--font-mono, monospace);
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    background: var(--bg-tertiary);
+    padding: 0.5rem;
+    border-radius: 0.25rem;
+    margin: 0.25rem 0 0.5rem 1rem;
+    max-height: 18.75rem;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.4;
+}
+
+/* Top-aligned so the modal stays put as section rows expand/collapse —
+ * centered would re-center on every toggle and visibly dance. */
+.step-detail-overlay {
+    align-items: flex-start;
+    padding-top: 5vh;
+}
+
+.step-detail-modal {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    box-shadow: var(--shadow-lg);
+    padding: 1rem;
+    width: min(40rem, 90vw);
+    max-height: 90vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+}
+
+.step-detail-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+    font-size: var(--font-size-sm);
+}
+
+.step-detail-status {
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 600;
+}
+
+.step-detail-status.success {
+    color: var(--accent-green);
+}
+
+.step-detail-status.error {
+    color: var(--accent-red);
+}
+
+.step-detail-status.pending {
+    color: var(--text-muted);
+}
+
+.step-detail-timestamp {
+    color: var(--text-muted);
+    font-family: var(--font-mono, monospace);
+}
+
+.step-detail-description {
+    font-size: var(--font-size-xl);
+    font-weight: 500;
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+.step-detail-detail {
+    color: var(--text-secondary);
+    font-size: var(--font-size-lg);
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+.step-detail-full,
+.step-detail-reasoning {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    padding: 0.625rem 0.75rem;
+    font-family: var(--font-mono, monospace);
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    margin: 0;
+    max-height: 25rem;
+    overflow-y: auto;
+}
+
+/* Reasoning reads as secondary to the answer — slightly muted. */
+.step-detail-reasoning {
+    color: var(--text-secondary);
+}
+
+.step-detail-close {
+    align-self: flex-end;
+    margin-top: 0.25rem;
+}
+
+.step-detail-section-label {
+    font-size: var(--font-size-sm);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    font-weight: 600;
+    margin-top: 0.25rem;
+}
+
+.step-detail-result {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    padding: 0.625rem 0.75rem;
+    font-family: var(--font-mono, monospace);
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    margin: 0;
+    max-height: 25rem;
+    overflow-y: auto;
+}
+
+.step-detail-empty {
+    color: var(--text-muted);
+    font-size: var(--font-size-lg);
+    text-align: center;
+    padding: 1.5rem 0;
+}
+
+.step-detail-context {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.step-detail-context-meta {
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+}
+
+.step-detail-context-meta code {
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    padding: 0.0625rem 0.25rem;
+    border-radius: 0.1875rem;
+    font-size: var(--font-size-xs);
+}
+
+/* ContextCaptured panel — budget bar (shared .progress-bar), sections, usage. */
+.context-budget {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.context-budget-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+}
+
+.context-budget-row strong {
+    color: var(--text-primary);
+}
+
+.context-budget-trimmed {
+    color: var(--accent-yellow);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-size: var(--font-size-xs);
+}
+
+.context-usage {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+    padding-top: 0.5rem;
+}
+
+.context-usage strong {
+    color: var(--text-primary);
+}
+
+.context-legacy-badge {
+    margin-left: 0.5rem;
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+    padding: 0.0625rem 0.375rem;
+    border-radius: 0.1875rem;
+    font-size: var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+/* Command-guard checkpoint card (ADR 0002, Phase 4) — an inline Undo affordance
+   shown before an in-workspace destructive command. */
+.checkpoint-card {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    margin: 0.375rem 0;
+    padding: 0.5rem 0.75rem;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-subtle, var(--bg-tertiary));
+    border-radius: 0.375rem;
+    font-size: var(--font-size-md);
+}
+
+.checkpoint-icon {
+    flex: 0 0 auto;
+    color: var(--text-muted);
+    font-size: var(--font-size-xl);
+}
+
+.checkpoint-body {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+.checkpoint-summary {
+    color: var(--text-primary);
+}
+
+.checkpoint-command {
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.checkpoint-reverted {
+    flex: 0 0 auto;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+}

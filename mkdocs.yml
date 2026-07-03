@@ -1,0 +1,50 @@
+site_name: Lucidos
+site_url: https://docs.lucidos.dev
+site_description: Documentation for Lucidos — a local, event-driven, AI-native operating system.
+repo_url: https://github.com/lucidos-dev/lucidos
+repo_name: lucidos-dev/lucidos
+
+# Docs content lives in its own subtree. The repo's existing docs/ (ADRs, plans,
+# glossary, taxonomy) is NOT the nav root — those canonical files are transcluded
+# into docs/site/ pages at build time via the include-markdown plugin, so the
+# published docs cannot drift from their sources.
+docs_dir: docs/site
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+  palette:
+    # Light mode (default scheme) with a toggle to dark.
+    - scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    # Dark mode (slate scheme) with a toggle back to light.
+    - scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+plugins:
+  - search
+  - include-markdown
+
+markdown_extensions:
+  - admonition
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - toc:
+      permalink: true
+  - tables
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Concepts: concepts.md
+  - Tutorials:
+      - Build an app: tutorials/build-an-app.md
+      - Automate with a trigger: tutorials/automate-with-a-trigger.md

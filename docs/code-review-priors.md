@@ -1,0 +1,524 @@
+# Code-review priors — verified non-bugs
+
+Patterns in this codebase that **look like bugs to a fresh reviewer and are
+not**. Every entry was flagged by a review agent, then dismissed by reading
+the cited source. Review agents (human or LLM) should consult this file
+before flagging; re-flagging an entry here requires **new evidence** (the
+guard was removed, the contract changed), not re-derivation of the original
+suspicion.
+
+Maintenance: when a review dismisses a finding with evidence, add an entry
+(pattern-based, not line-number-based — line numbers rot). When a code change
+invalidates an entry, delete it in the same commit. Deliberate design *no*s
+with deeper rationale live in `docs/adr/`; this file is for the smaller
+"looks wrong, isn't" patterns that don't warrant an ADR.
+
+## Rust engine
+
+- **`graceful_kill_child_process_group`'s SIGTERM→sleep→SIGKILL does NOT race
+  pid recycling.** The function (`runtime/spawn_env.rs`) signals a process
+  *group* (`-pid`), sleeps the grace, then signals again — and a fresh reviewer
+  may worry the pid (= pgid) could be recycled during the `sleep().await` and
+  the second signal hit an unrelated group. It can't, at the one call site
+  (`claude_code.rs` `driver_task` teardown): the call is gated by
+  `if !child_reaped`, and the `tokio::process::Child` handle is held on the
+  stack across the whole grace — `child.wait()`/`try_wait()` run only *after*
+  the function returns. The group leader (the engine's direct child) therefore
+  stays an unreaped zombie for the entire grace, so its pid cannot be recycled
+  before the SIGKILL. Re-flag only if a caller starts reaping the child before
+  or during the call. (`runtime/spawn_env.rs`, `runtime/claude_code.rs`.)
+
+- **`starts_with`-guarded byte slicing is boundary-safe.** Sites like the
+  Result-flush in `agent_session/run_session/run.rs` slice
+  `result_trimmed[buf_trimmed.len()..]` only inside an
+  `result_trimmed.starts_with(buf_trimmed)` guard — a byte-exact prefix match
+  guarantees the index is a char boundary. Same for indices derived from
+  `str::find()` matches (the match start/end of an ASCII needle is always a
+  boundary). The "never slice by byte index" rule targets *arithmetic*
+  indices, not guard-derived ones.
+- **The CC fast-path has no `pending_followups` TOCTOU.** In
+  `chat/process/run.rs` the session lookup, `process_exited` check, counter
+  increment, send, and failure-rollback all run under one
+  `agent_sessions.lock().await` — the external watchdog can't remove the
+  session mid-sequence because removal takes the same lock.
+- **`save_thread` / `unsave_thread` do stamp the actor.** They use
+  `EventMeta::with_actor(actor)` on a `BusEvent::Thread` emit —
+  `emit_user_system` is for `SystemEvent`s; `BusEvent::Thread` emits are a
+  documented exception (`.claude/rules/rust.md` § "Mutating endpoints stamp
+  the actor").
+- **Command-guard preferences are read once per response, not per tool
+  call.** See the comment block at the top of the agentic loop
+  (`agentic_loop/run.rs`) — the toggles can't change mid-response.
+- **Failed coding-agent turns deliberately do NOT auto-propose changes.**
+  `propose_one_held_back_change` (agent_recovery/has_diff.rs) skips threads
+  whose last turn didn't end `Generated`: interrupted/canceled/failed
+  threads recover via Continue, and an Apply button on a failed turn's diff
+  would over-claim (same reasoning as ADR 0001). `coding_agent_has_diff`
+  keeps the Diff button visible meanwhile.
+- **Trigger threads run one indexed events-table lookup per persisted
+  event** (the `is_top_level` latest-start query in
+  `event_bus_projection_thread.rs`). Indexed, `LIMIT 1`, accepted cost.
+- **The scheduler subscriber receives per-token events before filtering.**
+  Broadcast channels deliver to every subscriber; the
+  `is_per_token_streaming` blocklist filters after `recv`. Accepted
+  semantics — the expensive work (trigger matching) is what's skipped.
+
+- **`startup_permit` releases by drop on every early return** — the spawn
+  semaphore permit acquired in `run_direct_agent` is an `OwnedSemaphorePermit`;
+  returning the function (spawn failure, input-send failure) drops it and
+  frees the slot. "Permit leak on error path" findings are misreading Rust
+  drop semantics; the explicit `drop(permit)` at Init is an *early* release,
+  not the only one.
+- **The 10-minute hung-subprocess watchdog can fire during a long silent
+  LLM thinking phase — for BOTH backends, by design.** CC's thinking deltas
+  arrive as `stream_event` frames the parser drops; Codex emits nothing
+  between items. Either way no AgentEvent flows, `last_event_at` stalls, and
+  a >10-min fully-silent gap fires the watchdog — whose action is a
+  `ContinuationRequested` auto-resume, not data loss. Flagging this for one
+  backend as a new bug requires showing the OTHER signal (tools in flight,
+  is_waiting) would have gated CC differently.
+- **The Codex driver always closes a turn with exactly one `Result`** — the
+  `!turn_terminal_seen` synthesis after child reap covers every "child died
+  without `turn.completed`" shape (OOM, auth failure, partial output), and
+  the interrupt path synthesizes its own. Findings claiming "no Result
+  reaches the engine if drain parsing fails" miss that the synthesis does
+  not depend on drain success. The driver tests pin both paths.
+- **`coding_agent` fields on ThreadEvents serialize unconditionally — on
+  purpose.** Events are append-only and never re-serialized back into the
+  store, so there is no "legacy row round-trip" to keep wire-quiet; an
+  explicit `"coding_agent":"claude-code"` on new events is self-describing.
+  `coding_agent_kind`'s `skip_serializing_if` is not "the pattern" — every
+  other `coding_agent` field (TextStreamed, ToolCalled, Idled, …) serializes
+  always, and SessionStarted's matches them.
+- **`-c model_reasoning_effort=\"high\"` passes literal quotes on purpose** —
+  codex's `-c` parses the value portion as TOML, so the quoted form is a
+  TOML string (and codex's documented fallback treats unparseable values as
+  raw literals, so both forms work). Not a shell-quoting bug: argv is not
+  shell-parsed.
+- **Codex `ask_user_question` synthesizes a fresh `codex-q-<uuid>` tool_use_id
+  per call on purpose** — an MCP server never sees a stable codex-side
+  tool-call id, so there is nothing durable to key crash-recovery on. The
+  accepted cost (documented at the synthesis site in
+  `mcp_permission_server.rs`): a codex child killed mid-question re-asks on
+  resume instead of replaying the persisted answer, so the user may answer
+  the same question twice across an engine restart. Don't "fix" by hashing
+  the question text — a legitimate repeat of the same question later in the
+  session would then silently replay a stale answer.
+- **Codex drivers synthesize a failed `Result` only for the IN-FLIGHT turn on
+  child death; inputs still queued get none** — deliberate parity between
+  the exec and app-server drivers. The engine's post-`Exited` path
+  (`finalize_direct_agent` + the safety net) settles the thread terminal,
+  and the lifecycle docs already accept that merged/abandoned inputs can
+  produce fewer Results than inputs. Emitting per-queued-input failures
+  would double-fail turns the engine has already classified.
+
+## Frontend
+
+- **`initiateEngineRestart` dismissing the `engine-new-version` switch toast on
+  a spawn-FAILURE path is intentional; the badge is the recovery affordance.** A
+  reviewer (Codex flagged this P2) may note that `initiateEngineRestart` dismisses
+  the "New version available → Switch to new version" toast up front, and on the
+  engine-still-alive failure catches (`ApiError` / Tauri string reject) leaves
+  `engineVersionReady` true — so `checkEngineVersion`'s rising edge
+  (`ready && !engineVersionReady`) never re-shows the toast, and the switch toast
+  is gone until readiness flips again. This is deliberate: (1) recovery is intact
+  via the control-panel badge + reload glyph — `engineNewVersionReady()` is
+  `engineVersionReady.value` in dev, still true, so the glyph long-press → Restart
+  → `initiateEngineRestart` retries (the plan's designated *persistent* affordance;
+  the toast is the ready-time convenience). (2) The obvious "fix" — resetting
+  `engineVersionReady = false` on failure to force a re-toast — would open the
+  client-refresh ordering gate `!(restartRequired || engineVersionReady)` while the
+  OLD engine is still running, violating a core invariant of
+  `docs/plans/2026-07-01-version-toast-single-surface-and-client-ordering.md`
+  (client must never refresh ahead of the engine switch). Dismissing at the top
+  (not deferred to after the request) is what gives the instant single surface the
+  fix exists for. Re-flag only if the badge/glyph recovery path is removed.
+  (`store/actions/chat-changes.ts` `initiateEngineRestart`,
+  `store/actions/engine-update.ts` `checkEngineVersion`,
+  `components/layout/ControlPanel.tsx` `engineNewVersionReady`.)
+- **`removeEventListener(type, fn, { capture: true })` DOES remove a listener
+  added with `{ capture: true, passive: true }`.** A reviewer seeing an
+  `addEventListener(…, { capture: true, passive: true })` paired with a
+  `removeEventListener(…, { capture: true })` may flag a "listener leak" from
+  the asymmetric options. It isn't one: per the DOM spec, listener removal
+  matches on `(type, callback, capture)` ONLY — the `passive` and `once` flags
+  are explicitly NOT part of the match. The minimal `{ capture: true }` on
+  removal is the idiomatic, correct form (the navigation focus marker's
+  gesture-clear listeners in `components/shared/focusMarker.ts` `applyNavFocus`
+  use exactly this). Re-flag only if the `callback` reference or the `capture`
+  flag actually differs between add and remove. (`components/shared/focusMarker.ts`.)
+- **`.thread-content` (the `tabindex=0` transcript scroll region) deliberately
+  shows NO focus outline in any focus state.** A reviewer (Codex flagged this as
+  a P2 a11y regression) may note that removing `.thread-content:focus-visible`'s
+  outline drops the only visible keyboard-focus cue on the direct-focus paths
+  (Tab into the pane, the `⌘⇧2` / Search-Everywhere `focusPaneMainControl`) where
+  no per-turn `.nav-focus-stuck` marker is applied. This is a deliberate,
+  maintainer-requested visual call: a whole-pane accent ring around the entire
+  conversation while arrow-scrolling reads as chrome, not affordance, and the
+  keyboard-scroll *function* (Arrow/Page keys, focus landing via `paneFocus.ts`)
+  is fully preserved — only the ring is gone. Navigation that lands on a specific
+  turn still shows the `.nav-focus-stuck` marker. Re-flag only if the maintainer
+  reverses the preference. (`styles/chat/input-messages.css` `.thread-content:focus`,
+  `components/layout/paneFocus.ts`.)
+- **A deep-link's PULSE element can differ from its SCROLL target — the scroll
+  deliberately targets the whole `.chat-exchange`, not the pulsed panel.** A
+  reviewer may flag that `scrollToChangeAndPulse` (and `scrollToEventAndPulse`)
+  pulse a descendant panel (`.response-panel` on a proposing turn, `.initiator-panel`
+  on a resolution card / event) while `scrollToSelectorAndPulse` scrolls (via
+  `smoothScrollToElement`) to the `.chat-exchange`, so for an exchange with an
+  atypically tall `.initiator-panel` (a user prompt taller than the viewport) the
+  pulsed `.response-panel` can land below the fold. This is deliberate: the scroll
+  MUST target the `.chat-exchange` because only it carries the `scroll-margin-top`
+  gap that keeps the focus border from being clipped under the fixed header /
+  sticky title (commit `9884ece31`) — retargeting the scroll to the pulse panel
+  would regress that. The pulse-vs-scroll split is inherent to scoping the
+  highlight (fixing the original "whole turn highlighted" bug); the below-fold
+  case needs the tall-initiator edge AND is degraded feedback, not a broken
+  landing (the user still scrolls to the exchange; the sticky border persists on
+  the panel). Re-flag only with a concrete fix that keeps the `.chat-exchange`
+  scroll-margin behavior intact. (`components/chat/scrollState.ts`.)
+- **Turn-nav anchors on the marked turn when present, and only falls back to
+  `scrollTop + gap` scroll-position stepping when there's no marker.** Turn-nav
+  (`components/chat/scrollState.ts`) lands a turn's top `gap` px below the
+  container (the `.chat-exchange scroll-margin-top` clearance). `pickTurnTarget`
+  chooses the step mode: when the nav focus marker sits on a listed turn it steps
+  by INDEX from that turn (`anchorIdx + direction`); otherwise it steps by scroll
+  position via `pickTurnIndex` (comparing `tops[i]` against `scrollTop + gap`). The
+  index anchor is what makes turns that share a CLAMPED scroll position reachable —
+  after collapsing the last turn, the collapsed turn and an appended "Change
+  applied" card cluster in the last (no-scroll-room) viewport, where pure
+  scroll-position stepping keys off a pinned `scrollTop` and re-selected the same
+  turn (the change card was unreachable — the reported bug). A marker means the
+  user has NOT scrolled since the last nav (any scroll gesture fades it), so index
+  stepping is unambiguous; the no-marker fallback still handles the
+  first-press-from-scroll case and the tested mid-turn "prev snaps to the current
+  turn's top" read (both happen precisely when no marker is present), so that
+  behavior is preserved. Re-flag only with evidence that a clustered turn is NOT
+  reachable via the marker anchor, or that the mid-turn/first-press fallback
+  regressed. (`components/chat/scrollState.ts` `stepThreadTurn` / `pickTurnTarget`.)
+- **The thread drawer's `id={navKeyDomId(...)}` on rows + section headers does
+  NOT violate `frontend.md` "No `id` on dual-rendered components".** The rows
+  (`ThreadRowContent`, `ComposingThreadRow`) and section headers carry real DOM
+  `id`s because the drawer container is the single keyboard tab stop
+  (`role="tree"`, `tabindex=0`) and points `aria-activedescendant` at the active
+  row's id — which strictly requires an id, the one thing roving-tabindex would
+  avoid but the chosen aria-activedescendant model needs. It's safe because
+  `ThreadDrawer` is single-mounted: `App.tsx` mounts only the visible layout's
+  pane tree (`mobile ? <MobileSwipeContainer/> : <ThreadDrawer/>`), a breakpoint
+  swap is an unmount-then-mount (never two copies coexisting), and within one
+  mounted drawer only one view renders at a time and a thread renders once — so
+  ids are unique. The rule's hazard (two simultaneous layout copies → wrong-copy
+  resolution) is absent. Cross-component lookups still use the `data-` pattern
+  (`openHighlightedThreadActions` queries `[data-thread-nav=…]`, like the
+  pre-existing highlight scroller), not `getElementById`. Re-flag only if a
+  second `ThreadDrawer` can mount concurrently. (`components/drawer/ThreadDrawer.tsx`.)
+- **`paneFocus.ts`'s `FOCUSABLE` excluding `[tabindex="-1"]` on EVERY native
+  term (not just the trailing `[tabindex]` term) is intentional, not an
+  over-broad selector.** A `<button tabindex="-1">` is non-tabbable by native
+  Tab, so the per-pane trap must skip it too; the old selector matched it via
+  `button:not([disabled])` and let the trap cycle onto it (a latent defect — it
+  could land on `aria-hidden` file inputs / the change-actions placeholder).
+  This makes the drawer a genuine single tab stop (its mouse-only row buttons are
+  `tabindex=-1`) and aligns the trap with native semantics. Re-flag only if a
+  control needs to be a trap stop *while* `tabindex=-1` (a contradiction).
+  (`components/layout/paneFocus.ts`.)
+- **`dispatchForwardedChord` setting `focusedPane = 'content'` for ALL
+  forwarded chords — including `toggleThreadDrawer` (⌘⇧1) — does NOT violate
+  "the drawer toggle never sets focus" (commit 585274dc3).** That rule governs
+  what `toggleThreads` *itself* does (unchanged: plain show/hide, signal-only
+  fallback only when closing a drawer that holds focus). The reconciliation is
+  a separate fact: a chord forwarded from an app iframe proves the user is in
+  the content pane (iframe keydowns only fire when the iframe has focus), and
+  iframe pointer events never reach the host's `focusPane('content')` handler,
+  so `focusedPane` is otherwise stale. Setting it for *every* forwarded chord
+  (not just the three-state toggles that read it) is the more correct design,
+  not over-reach: it also fixes `toggleThreads`' close-case housekeeping —
+  with a stale `focusedPane === 'drawer'`, closing the drawer from inside the
+  app would wrongly bounce focus to `'thread'` (pane.ts line 95); reconciling
+  to `'content'` first skips that. Narrowing the set to only the toggles that
+  read `focusedPane` would re-introduce the staleness. Re-flagging needs
+  evidence that a forwarded chord can originate from an iframe NOT in the
+  content pane.
+- **`<Overlay>`'s `data-overlay-anchor` marking uses an absolute
+  `removeAttribute`, NOT ref-counting like `openOverlayCount`** — and that's
+  fine. The asymmetry looks like a leak-in-reverse (two concurrently-open
+  overlays sharing one anchor node → the first to close strips the attribute
+  while the other still wants it), but no such usage exists: a toggle anchors
+  exactly one overlay, and stacked overlays have distinct anchors. The inert
+  count is ref-counted because every overlay shares the one `<html>`
+  `data-overlay-open` flag; the anchor attr is per-node and per-overlay, so
+  set/remove on the captured node is correct. Re-flagging needs a real call
+  site where one DOM node is the `anchor` prop of two simultaneously-open
+  `<Overlay>`s.
+- **`stepThreadPaneWidth` DOES cancel a pending drag snap** — it routes
+  through `setSplitRatio`, whose first line is `cancelPendingSnap()`. Only
+  `stepThreadDrawerWidth` needs the explicit call because it mutates
+  `threadDrawerWidth` directly. The two step paths are symmetric in effect,
+  not in spelling.
+- **`computeDrawerStepWidth` with a negative/too-small `maxPx` is a no-op,
+  not a clamp-to-minimum** — the `if (maxPx < MIN_DRAWER_WIDTH) return null`
+  guard runs before any clamping, so an unmounted `.content-row` (offsetWidth
+  0) can't lock the drawer at its minimum.
+- **`splitRatio` collapse predicates use exact float comparisons on
+  purpose** — `=== 0` / `>= 1` are the same predicates `SplitLayout` uses
+  for `data-thread-collapsed` / `data-content-collapsed`, and collapsed
+  states are only ever *written* as exact `0` / `1` (drag keeps the ratio
+  off the edges by 1px; snaps and toggles write the literals). Float-drift
+  scenarios ("ratio lands at 0.9999") describe states the layout treats as
+  not-collapsed too, so the toggle behavior stays consistent.
+- **`e2e/*.spec.ts` use literal localStorage keys** (`lucidos-split-ratio`,
+  …) rather than importing `SPLIT_RATIO_KEY` — deliberate: the literal in
+  the spec is a canary that the *persisted* contract didn't silently change.
+- **The Escape-capture handler cannot starve the keybinding recorder.**
+  `handleEscapeCapture` (useKeyboardShortcuts) and the recorder's listener
+  (KeyboardShortcutsSection) are both capture-phase listeners on `document`
+  — the same node — and `stopPropagation()` does not suppress other
+  listeners on the same node (only `stopImmediatePropagation` would). The
+  recorder always receives Escape regardless of registration order.
+- **`connection.ts`'s `.catch(() => {})` chains are documented
+  rejection-tracker silencers**, not swallowed errors —
+  `refreshThreadEvents` toasts user-visible failures itself after retrying.
+  The justifying comments at the call sites are the carve-out contract
+  (`.claude/rules/frontend.md` § best-effort telemetry).
+- **`clearStalePendingMessages` bumps inside its mutation guard** — when the
+  filter removes nothing, nothing was mutated, so no bump is owed.
+- **`appFilters` / `repoFilters` / `triggerFilters` returning `[]` until
+  loaded is deliberate** (documented at each site): filter *options* would
+  mislabel as "(deleted)" without the registry; this is not Loadable
+  masking of displayed data.
+- **`threadMap` never evicts threads in-session — by design.** Discarded
+  drafts stay with `state='discarded'` (replays would 410 otherwise); page
+  reload is the eviction. Consequently `perThread` bump signals and
+  `lazyChanges` grow in lockstep with `threadMap` — pruning them alone fixes
+  nothing real.
+- **`App.tsx` single-mounts the visible pane tree, while header chrome
+  still dual-renders** (`ControlPanel` in both `AppHeader` and
+  `MobileAppHeader`). Both halves are intentional — don't "fix" either
+  direction. The no-`id` rule still binds.
+- **`thread.events` is append-only with deduped seqs** — `handleEvent`
+  refuses to re-set an existing seq, nothing deletes entries, and wholesale
+  rebuilds replace the Map object. The incremental grouping cache
+  (`exchange-grouping.ts`) and any future memoization keyed on the Map
+  depend on this; see the contract comment at the `thread.events.set` site.
+- **The spinner can blink off for `SPINNER_DELAY_MS` at the map-wait →
+  events-loading boundary on slow cold starts.** ThreadView's two loading
+  phases render `ThreadEmptyState` at different tree positions, so the
+  remount restarts `DelayedSpinner`'s delay. Accepted trade-off: carrying
+  spinner state across that remount would need module-level timer state for
+  a rare, cosmetic path (iOS PWA cold start with slow event loads).
+- **`delayedFlagEffect` is deliberately exported** from
+  `hooks/useDelayedLoading.ts` even though `useDelayedFlag` is its only
+  non-test consumer — it's the fake-timer-testable kernel of the spinner
+  delay (this repo has no DOM test rig for hooks). Don't inline it back.
+- **`extractLocalFileTarget` excluding only `/data*` and `/apps*` (not
+  `/knowhow`, `/artifacts`, `/triggers`, …) is deliberate scope, not a leak.**
+  The helper (`utils/linkifyPaths.ts`) classifies a chat anchor href as a real
+  local-disk target to hand to the OS opener. It runs LAST in
+  `ChatExchange.handleLinkClick` — after the `.artifact-link`/`.app-link`/
+  `.nav-link` class handlers and after `extractAppIdFromHref`/
+  `extractNavTargetFromHref`. The `/data` and `/apps` guards exist only to catch
+  the absolute sub-paths those extractors *decline* (an artifact sub-file like
+  `/apps/<id>/styles.css`, or `/data/artifacts/x.pdf` when the artifact rewriter
+  didn't run). A bare-absolute workspace path under another prefix
+  (`/knowhow/x.md`, `/artifacts/x.pdf`) is NOT a shape the LLM/engine produces —
+  they emit `data/`-prefixed or relative paths, and a known artifact is
+  rewritten to `.artifact-link` (claimed by the earlier class handler) before
+  this fallback is reached. Such an href was ALSO already broken before this
+  branch existed (it 404'd against the app origin via the `/data/*`-only static
+  mount), so OS-opening it instead changes one dead link into another, not a
+  working path into a broken one. Re-flag only with a real producer that emits
+  an absolute `/knowhow|/artifacts|/triggers/…` anchor the user is expected to
+  click. (`utils/linkifyPaths.ts`, `components/chat/ChatExchange.tsx`.)
+- **The snapshot-staleness guards in `thread-loading.ts` (`upsertThread`
+  status, `applyEventRows` overlay) keyed on `last_activity` do NOT miss
+  status changes whose event omits `last_activity`** (e.g. `ChangeProposed`,
+  absent from `LAST_ACTIVITY_EVENTS`). The guard only *suppresses* a snapshot
+  that is provably OLDER than already-applied live state
+  (`snapshot.lastActivity < meta.updatedAt`); it never has to be the channel
+  that delivers a status flip. Live SSE applies every status change via its
+  per-event aggregate in `handleEvent` regardless of `last_activity`, and any
+  genuinely-later event that makes a refresh "stale" means SSE already holds
+  the more-current view. `info.last_activity`, `currentAggregate.lastActivity`
+  and `meta.updatedAt` are the SAME monotonic `thread_summaries.last_activity`
+  column, so the lexicographic `<` is a valid causal-freshness test — not a
+  cross-clock compare.
+- **`.boot-splash-status` uses `font-size: 15px` (px, not rem) on purpose — it
+  is NOT a violation of the "all sizes rem" rule.** The app's `<html>` font-size
+  is scaled by `var(--user-ui-scale)` (`base.css`), so a rem value would grow
+  with the user's UI scale (e.g. 22.5px at 150%). The boot splash must render the
+  status at the SAME size as the gateway "Starting engine…" splash
+  (`crates/lucidos-gateway/src/proxy.rs` `.mark-label`, `0.9375rem` × an
+  unscaled 16px root = 15px), which is an isolated document with no access to the
+  scale. Pinning a fixed 15px is the requirement — reverting it to rem
+  reintroduces the "status text jumps size across the cold-boot→workspace seam"
+  bug. The rem rule honors user scale; this is the deliberate case where scale
+  must NOT apply. Re-flag only if the gateway splash gains UI-scale awareness.
+  (`crates/lucidos-app/index.html` `.boot-splash-status`.)
+
+- **Provider-settings components treat a non-`loaded` credentials Loadable as
+  "not configured" — sibling-wide pattern, failure surfaced at the section
+  level.** `ApiKeyProviderSettings`, `AnthropicProviderSettings`, and
+  `LocalProviderSettings` all compute `existing` via
+  `status === 'loaded' ? find(...) : undefined`, so a failed credentials fetch
+  renders the unconfigured Save flow instead of a per-row error. This reads as a
+  "failed must look different from empty" violation, but the credentials-load
+  failure is surfaced by `SettingsView`'s `LoadableError` on the credentials
+  list, and the three siblings deliberately share one shape. A fix belongs as a
+  cross-component change (all three + a section-level gate), not a one-file
+  divergence in whichever component a diff happens to touch. Re-flag only as a
+  deliberate cross-component cleanup, or if `SettingsView` loses its
+  section-level error surface. (`components/settings/ApiKeyProviderSettings.tsx`,
+  `AnthropicProviderSettings.tsx`, `LocalProviderSettings.tsx`,
+  `SettingsView.tsx`.)
+- **Mobile header titles are ABSOLUTELY TRUE-centered on the row middle, with a
+  symmetric `max-width` reserve that clamps a long title's left edge past the
+  leading icons — this is the explicit product requirement, not the between-icons
+  flanking-spacer variant (which was tried and reverted for reading off-center).**
+  `.mobile-header-title` (`styles/mobile.css`) is `position:absolute; left:50%;
+  transform:translate(-50%,-50%); max-width:calc(100% - 10.5rem)` so it sits on
+  the viewport/row axis (like the pane dots + desktop header) regardless of the
+  leading (hamburger + nav / filter) and trailing (actions) cluster widths. The
+  requirement was stated as *"they should be centered, as long as they don't
+  overlap the left-side icons; if centering would overlap, move them right so the
+  left edge clears the rightmost left icon."* The symmetric reserve delivers both:
+  a short title reads centered; a long one clamps + ellipsizes with its left edge
+  just past the widest leading cluster (~5rem). An in-flow flanking-spacer title
+  (commit `14a512b8b`, reverted) satisfied no-overlap but centered BETWEEN the
+  clusters, so it drifted off the row middle whenever the clusters differed in
+  width — the "Appearance/Threads not centered" report. **Accepted right-side
+  residual (do NOT re-flag):** because the reserve is symmetric and the CONTENT
+  header's trailing action cluster is variable and can be wide (app/file previews:
+  refresh/open/fullscreen/notifications + toggles ≈ 4–5 icons), a very long content
+  title's ellipsis tail can pass *visually* under those trailing icons on a narrow
+  (375px) viewport — the tail end of the true-center trade-off the user chose over
+  the off-center flanking layout. It is tap-safe (see below) and the alternatives
+  are worse (off-center flanking was rejected; a reserve wide enough to clear 5
+  icons would truncate common content titles to ~60px). Overlap handling: the
+  title box is `pointer-events:none` (taps fall through; brand's visible children +
+  the content title re-enable them), and `.mobile-header-row .content-header-actions`
+  is `z-index`-lifted so a long CONTENT title's ellipsis tail can't intercept an
+  action (only shows through behind it). The brand's long **workspace name** can't
+  spill over the left icons because `.pane-header-brand-label` is bounded to the
+  centered box (`max-width:100%`) so `.workspace-name-label` ellipsis-truncates
+  within it. That truncation — NOT the name-hide budget — is the no-spill
+  guarantee, which is why `ConnectionStatus.tsx` MUST keep summing the trailing
+  `.pane-header-spacer` width into `available`: the absolutely-centered mobile
+  brand is shrink-to-content, so `brandLabel.clientWidth` has no slack past the
+  text, and the spacer is the room the name occupies. Dropping that spacer term
+  collapsed the budget to the text width and latched the name hidden — the
+  "workspace name gone from the brand" regression. (Desktop has no spacer siblings
+  and a fixed-width brand-label with its own slack, so the sum is a no-op there.)
+  Guarded by
+  `e2e/mobile-threads-title-alignment.spec.ts` (center ≈ row middle + left edge ≥
+  leading cluster). Re-flag only if the title loses `position:absolute` (regresses
+  to off-center) or the content actions lose their `z-index` lift. The content
+  title's tap tooltip (`e2e/tooltip-swipe-dismiss-mobile.spec.ts`) works because
+  `.mobile-content-title` re-enables `pointer-events`.
+  (`components/layout/MobileAppHeader.tsx`, `components/layout/ConnectionStatus.tsx`,
+  `styles/mobile.css` `.mobile-header-title` / `.mobile-content-title`.)
+
+## Scripts (bash)
+
+- **A single-quoted `trap` body that contains a double-quoted command path
+  runs the command correctly — the quotes are not literal.**
+  `trap '"$BIN/pg_ctl" -D "$DATA" -m fast stop || true' EXIT` registers the
+  literal string at trap-set time (single quotes), then re-parses it as a
+  shell command at fire time — at which point the inner double quotes are
+  ordinary quoting (removed during parsing) and `$BIN`/`$DATA` expand. It does
+  NOT try to exec a command literally named `"$BIN/pg_ctl"`. Verified
+  empirically: the trap invokes the real binary with correctly expanded,
+  space-safe argv. (`scripts/prototype/desktop-pg-pgvector-spike.sh`.)
+
+- **`curl … | sh` pipes only STDIN; STDOUT stays the terminal.** In a
+  `curl -fsSL …/install.sh | sh` invocation the pipe connects curl's stdout to
+  the shell's stdin (fd 0); the shell's stdout (fd 1) and stderr are inherited
+  from the controlling terminal. So a child script's `[ -t 1 ]` (stdout-is-a-tty)
+  test is TRUE under the documented one-liner — e.g. `install.sh` runs
+  `scripts/web-dev.sh`, whose `elif [ -t 1 ]` branch prints the listening line
+  and returns (it does NOT take the blocking `wait`-on-supervisor branch), so
+  the installer's success banner is reached. A reviewer reasoning "piped, so no
+  tty → it hangs" has conflated stdin with stdout. The only invocation that
+  makes fd 1 a non-tty is an explicit redirect (`curl … | sh > file`), which is
+  not the documented path. (`install.sh`, `scripts/web-dev.sh` tail.)
+
+## Plugins & triggers (ADR 0019)
+
+- **The `trigger.toml` projection is gitignored-by-`.git/info/exclude`, and that
+  degrades gracefully (to untracked files) when `.git` is a worktree *file*
+  rather than a dir.** `ensure_trigger_toml_gitignored` (`triggers/definition.rs`)
+  writes `<ws>/.git/info/exclude`; in a git worktree `.git` is a file, so the
+  write silently no-ops and the projected `trigger.toml` files show as untracked.
+  This is INTENDED and acceptable: real Lucidos *workspaces* are normal repos
+  (`.git` is a dir), and the files are a derived read-model regenerated from
+  events anyway — untracked is harmless. Re-flag only if workspaces start being
+  provisioned as worktrees. (`triggers/definition.rs`.)
+
+- **The boot rebuild rewrites every `trigger.toml` unconditionally (no
+  content/mtime compare).** `rebuild_trigger_definitions` runs once at boot in
+  `spawn_blocking` over a handful of triggers; the writes are deterministic
+  (identical bytes when unchanged) and the files are gitignored, so there's no
+  git churn and the cost is negligible. Not worth a content-equality
+  short-circuit. (`triggers/definition.rs`, `scheduler/mod.rs` boot path.)
+
+- **`appSearchOpen` / `appSearchQuery` are deliberately shared by the Apps and
+  Plugins panels.** Only one of the two panels is visible at a time, so one
+  search-state pair serves both (the store comment says so). A leftover query
+  can carry across a panel switch — this is the same accepted behavior the old
+  Installed/Store tabs had, not a new correctness break. Re-flag only if the
+  panels become simultaneously visible. (`store/store.ts`, `store/actions/apps.ts`.)
+
+- **`get_recent_threads` dropping the `coding_agent_proposed` out-of-window
+  bypass does NOT lose work behind the archive curtain.** The outer `WHERE` only
+  returns inbox rows + the contiguous archived window — it no longer force-loads
+  an archived `coding_agent_proposed` row. This looks like it violates the
+  "archived-with-pending-changes routes to Current" invariant
+  (`display_section`, test `archived_with_pending_changes_routes_to_current`), but
+  archived + `coding_agent_proposed=TRUE` is an UNREACHABLE state: `ChangeProposed`
+  (the event that sets `coding_agent_proposed`) and `CodingAgentIdled` both
+  transition the thread `to_inbox` (`thread_lifecycle.rs` transition table), so a
+  proposed CC thread is always inbox; `is_blocking` removes the Archive action
+  while an in-workspace change is pending; and the external-repo archive cascade
+  emits `ChangeApplied` (clearing proposed) before `ThreadArchived`. The
+  `display_section` arm is a defensive property, not proof of reachability.
+  Re-flag only if a path is added that sets `coding_agent_proposed` WITHOUT a
+  `ChangeProposed`/`to_inbox` transition. (`core/store/threads/summaries.rs`,
+  `engine/thread_lifecycle.rs`.)
+
+- **`base.css` is NOT served to app iframes — host-only theme tokens belong in its
+  theme blocks.** `/api/v1/sdk-iframe.css` is exactly two `include_str!` pieces
+  (`crates/lucidos-engine/src/api/sdk.rs`): the engine's own `sdk_iframe.css`
+  (which carries its OWN "keep in sync with base.css" token mirror) plus
+  `shared-components.css`. A reviewer may flag a new host-chrome token in
+  `base.css`'s `html`/`html[data-theme]` blocks (e.g. `--focus-pill-*`) as
+  "ships to every app iframe" or "belongs in `host-components.css`" — both wrong:
+  base.css never reaches apps, and `.claude/rules/frontend.md` explicitly keeps
+  ":root/theme token blocks" in `base.css` (`host-components.css` is for component
+  *rules*, not tokens; `--header-gradient`/`--titlebar-strip-bg` are the
+  host-chrome-token precedent). The js-sdk.md "Theme variables" drift rule applies
+  only to tokens added to `sdk_iframe.css`/`shared-components.css` themselves.
+  Re-flag only if the token is added to one of those two served files without the
+  doc row. (`styles/global/base.css`, `crates/lucidos-engine/src/api/sdk.rs`.)
+
+- **`openScaleModal` deliberately does NOT blur the UI-scale trigger button, and
+  the trigger uses plain `.settings-option`.** A reviewer (Codex did) may flag
+  that the value button stays `:focus`'d under the full-screen scale modal, so a
+  focus ring "could" show behind the dim backdrop on WebKit/iOS, and propose
+  blurring it on open. This was actually tried (a `document.activeElement.blur()`
+  in `openScaleModal`, plus a `.settings-value-button` class overriding the
+  outline) and **reverted at the user's explicit request** — the retained focus
+  ring behind the modal is original, long-standing behavior AND, empirically, is
+  NOT the "weird halo" users report: that halo is the *mobile slider thumb* (the
+  old `background-clip:padding-box` + transparent-border trick shrank the visible
+  dot to 1.25em and let iOS's default thumb bleed through; fixed by the solid
+  2.5em thumb in `toggle.css`). iOS also does not persist a focus ring on a
+  `<button>` after a tap. Re-flag only with evidence the *value button's* ring is
+  actually visible behind the modal AND is what a user reported. (`components/
+  shared/scaleModalState.ts`, `styles/settings/toggle.css`.)
+
+## Settled architecture questions
+
+- **No shared turn-lifecycle orchestrator across the agent-session loop and
+  the chat agentic loop** — ADR 0003. The seam already exists
+  (`lifecycle.rs` pure decision functions + the typed terminal helpers).
+- **External-repo coding-agent threads stay out of the change/dot/blocking
+  machinery** — ADR 0001.

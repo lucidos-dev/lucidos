@@ -1,0 +1,901 @@
+use super::memory::jaccard_similarity;
+use super::LucidosEngine;
+use crate::core::store::types::Step;
+use crate::llm::{ContentBlock, Message, MessageContent};
+use crate::memory::{EmbeddingProvider, MemoryEntry, QueryClassification};
+use uuid::Uuid;
+
+/// Tokens reserved out of the model's context window when sizing the input
+/// char budget — a heuristic margin so a long reply doesn't push the request
+/// total past the window. The engine never enforces this on the output side
+/// (the model is free to keep generating); the reserve just shrinks how
+/// much input we'll pack in. 8k covers a long assistant turn plus tool
+/// calls; smaller reserves stop being safe past ~32k responses, which we
+/// don't ship today.
+pub(super) const RESPONSE_TOKEN_RESERVE: usize = 8_000;
+
+/// Per-request char budget for `(system_prompt + tools + messages)`, derived
+/// from the model's actual context window. JSON-heavy tool calls average
+/// ~1.5 chars/token (prose is ~3.5); the 3/2 multiplier picks the
+/// conservative end so the char total never under-counts the token total.
+/// The 1M-token Opus build (`[1m]`) gets ~1.49M chars; the default 200k
+/// Claude gets ~288k chars (close to the previous hardcoded 300k); GPT-5 at
+/// 400k gets ~588k chars. Callers subtract their own prompt overhead
+/// (system prompt + tool definitions) before handing the remainder to
+/// `trim_context_if_needed`.
+///
+/// Why this exists: the old `AGENT_CONTEXT_CHAR_BUDGET = 300_000` constant
+/// was calibrated for the 200k-token default Claude and ignored the 1M
+/// window on the Opus `[1m]` build entirely, so trim pass 2 would silently
+/// drop the original user message in long tool loops even though the model
+/// could easily have held the whole thread. Per-model derivation lets us
+/// actually use the headroom we paid for.
+pub(super) fn agent_context_char_budget(model: &str) -> usize {
+    let usable_tokens = context_window_for(model).saturating_sub(RESPONSE_TOKEN_RESERVE);
+    // 3/2 = 1.5 chars/token (integer math).
+    usable_tokens.saturating_mul(3) / 2
+}
+
+/// Inverse of the budget's chars/token assumption: turn a measured char
+/// count into a conservative token estimate. Uses the same 1.5 chars/token
+/// ratio as [`agent_context_char_budget`] so the displayed
+/// `ContextCaptured.estimated_total_tokens` (and the `Context: N tokens`
+/// thought-stream line) stays honest against the trim budget.
+///
+/// History: was previously `chars / 4` (the prose ratio), which silently
+/// undercounted JSON-heavy tool-result content by ~2.4×. A May 25
+/// `workspace-learning` trigger reported "Context: 649 K tokens" to the
+/// UI then sent 1.54 M tokens to the API — past the 1 M-cap Opus
+/// window — and the request 400'd. Matching the budget's ratio means an
+/// estimate near the window is a real warning, not an optimistic one.
+pub(crate) fn estimate_tokens_from_chars(chars: usize) -> usize {
+    // Inverse of `chars = tokens * 3 / 2` → `tokens = chars * 2 / 3`.
+    chars.saturating_mul(2) / 3
+}
+
+/// Number of tail messages to always preserve (2 assistant+user pairs).
+pub(super) const PRESERVE_RECENT_MESSAGES: usize = 4;
+
+/// Compress conversation history when more than this many messages exist.
+pub(super) const HISTORY_COMPRESS_THRESHOLD: usize = 15;
+
+/// Always keep the last N messages verbatim.
+pub(super) const HISTORY_RECENT_MESSAGES: usize = 15;
+
+/// Hard safety-net truncation for individual messages — only catches extreme outliers
+/// (e.g., someone pasting a 50K log dump). Normal messages are never touched by this.
+pub(super) const HISTORY_MSG_TRUNCATE: usize = 15_000;
+
+/// Last N messages are always kept fully verbatim (no compaction, only safety-net truncation).
+pub(super) const HISTORY_VERBATIM_TAIL: usize = 4;
+
+/// Assistant messages outside the verbatim tail are compacted to this limit.
+/// User messages are never compacted — their exact phrasing matters for follow-ups.
+pub(super) const HISTORY_ASSISTANT_COMPACT: usize = 1500;
+
+/// Max bytes for a single read_file result returned to the LLM.
+pub(super) const READ_FILE_MAX_BYTES: usize = 50_000;
+
+/// Minimum content size before considering truncation of a single value.
+pub(super) const TRUNCATION_THRESHOLD: usize = 500;
+
+/// Threshold for Pass 1.5 — truncates `ToolResult` blocks in the PRESERVED
+/// tail (the last [`PRESERVE_RECENT_MESSAGES`]) when Pass 1 alone can't get
+/// under budget. Higher than [`TRUNCATION_THRESHOLD`] because tail
+/// preservation exists so the LLM can see what just happened — only the
+/// outlier "tool result that dumped 100 KB of events" gets cut, normal
+/// small results survive verbatim. The truncated note still reaches the
+/// LLM ("[content truncated — was N chars]") so it knows to re-query if
+/// the data actually mattered.
+pub(super) const TAIL_TRUNCATION_THRESHOLD: usize = 20_000;
+
+/// Sanitize file content before returning it to the LLM:
+/// 1. Strip base64 data URIs (e.g. embedded images) — they burn tokens and the LLM can't use them.
+/// 2. Apply `offset` (byte index, snapped down to a char boundary) for chunked reads.
+/// 3. Truncate the returned slice to READ_FILE_MAX_BYTES; the trailing message tells the
+///    LLM the exact `offset=` to pass on the next `read_file` call to continue.
+pub(super) fn sanitize_file_content_for_llm(content: String, path: &str, offset: usize) -> String {
+    static DATA_URI_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"data:[a-zA-Z0-9]+/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+")
+            .expect("data URI regex must compile")
+    });
+
+    let original_len = content.len();
+
+    // Strip base64 data URIs: data:image/png;base64,iVBOR... → [embedded image, 42KB]
+    let sanitized = DATA_URI_RE
+        .replace_all(&content, |caps: &regex::Captures| {
+            let matched = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+            let kb = matched.len() / 1024;
+            format!("[embedded image, {}KB]", kb)
+        })
+        .into_owned();
+
+    if sanitized.len() != original_len {
+        let stripped_kb = (original_len - sanitized.len()) / 1024;
+        log!(
+            "[Context] read_file '{}': stripped {}KB of base64 image data ({} → {} bytes)",
+            path,
+            stripped_kb,
+            original_len,
+            sanitized.len()
+        );
+    }
+
+    let total = sanitized.len();
+
+    // offset == total is the natural EOF sentinel (the previous chunk's continuation
+    // offset for an exact-multiple file lands here). Only > total is a usage error.
+    if offset > total {
+        return format!(
+            "Error: offset {} is past end of file ({} bytes total).",
+            offset, total
+        );
+    }
+
+    let start = sanitized.floor_char_boundary(offset);
+    let remaining = &sanitized[start..];
+
+    if remaining.len() <= READ_FILE_MAX_BYTES {
+        return remaining.to_string();
+    }
+
+    let chunk_end_rel = remaining.floor_char_boundary(READ_FILE_MAX_BYTES);
+    let next_offset = start + chunk_end_rel;
+    let chunk = &remaining[..chunk_end_rel];
+
+    log!(
+        "[Context] read_file '{}': returning bytes {}–{} of {}",
+        path,
+        start,
+        next_offset,
+        total
+    );
+
+    format!(
+        "{chunk}\n\n[Truncated. Showing bytes {start}–{next_offset} of {total}. \
+         Call read_file with offset={next_offset} to continue.]"
+    )
+}
+
+/// Per-image char cost used by [`estimate_message_chars`] for budget sizing.
+///
+/// An image's base64 `data.len()` is NOT its cost to the model: providers
+/// tokenize an image by its (resized) pixel dimensions, not its byte length.
+/// Anthropic bills a resized image at roughly its tile count — on the order of
+/// ~1.6k tokens for a full-size photo, regardless of how many megabytes of
+/// base64 it serializes to. Counting `data.len()` (2–3 M chars for a phone
+/// photo) made one attached image dwarf the entire context budget, which forced
+/// trim Pass 2 to evict real conversation/tool context just to "fit" the image
+/// — or, with the image pinned, made the loop strip the bytes after the first
+/// LLM call so the model went blind to the image mid-turn ("the bot can't see
+/// my attached image"). Estimating the real token cost lets the image stay in
+/// context for the whole turn without distorting the budget.
+pub(super) const IMAGE_BUDGET_TOKEN_ESTIMATE: usize = 1_600;
+
+/// Estimate the total character count of all content in a message.
+pub(super) fn estimate_message_chars(message: &Message) -> usize {
+    match &message.content {
+        MessageContent::Text(s) => s.len(),
+        MessageContent::Blocks(blocks) => {
+            blocks
+                .iter()
+                .map(|b| match b {
+                    ContentBlock::Text { text } => text.len(),
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => id.len() + name.len() + input.to_string().len(),
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                    } => tool_use_id.len() + content.len(),
+                    // Count the real token cost (`* 3 / 2` = the 1.5 chars/token
+                    // ratio the budget assumes), not the base64 byte length.
+                    ContentBlock::Image { .. } => IMAGE_BUDGET_TOKEN_ESTIMATE * 3 / 2,
+                })
+                .sum()
+        }
+    }
+}
+
+/// Per-model prompt-token budget. The ContextCaptured modal uses this to
+/// render the budget bar's denominator. Anthropic's 1M-context Opus build
+/// is signalled by the `[1m]` suffix the engine pins when invoking it; the
+/// bare model id stays at the default 200k. OpenAI's `gpt-5` family is 400k.
+/// Unknown models fall back to 200k — slight under-report on a 1M-context
+/// fork is preferable to over-promising headroom we can't deliver.
+pub fn context_window_for(model: &str) -> usize {
+    if model.contains("[1m]") {
+        return 1_000_000;
+    }
+    if model.starts_with("claude-") {
+        return 200_000;
+    }
+    if model.starts_with("gpt-5") {
+        return 400_000;
+    }
+    200_000
+}
+
+/// Replace every `ContentBlock::Image` in `blocks` with a text placeholder
+/// produced by `placeholder()`. Returns total base64 bytes removed (used for
+/// logging by callers).
+pub(super) fn replace_image_blocks(
+    blocks: &mut [ContentBlock],
+    placeholder: impl Fn() -> String,
+) -> usize {
+    let mut stripped = 0usize;
+    for block in blocks.iter_mut() {
+        if let ContentBlock::Image { data, .. } = block {
+            stripped += data.len();
+            *block = ContentBlock::Text {
+                text: placeholder(),
+            };
+        }
+    }
+    stripped
+}
+
+/// Trim the agent loop message history to fit within a character budget.
+///
+/// Three passes:
+/// 0. Strip image bytes from every message except the last and `keep_image_idx`.
+/// 1. Truncate large tool results/inputs in old messages.
+/// 2. If still over budget, remove oldest message pairs from index 1 onward.
+///
+/// `messages[0]` and the last `PRESERVE_RECENT_MESSAGES` messages are never
+/// removed or truncated in pass 2. If `protected_idx` is `Some(i)`, the message
+/// at that index is also pinned: pass 2 stops before removing it, even if that
+/// leaves the loop over budget. Callers use this to pin the current turn's
+/// user message — once tool iterations push it out of the last
+/// `PRESERVE_RECENT_MESSAGES` slots, the recent-tail rule alone no longer
+/// covers it and pass 2 would otherwise drop the original request (and, with
+/// `keep_image_idx` pinning it, the attached image) from the prompt.
+///
+/// If `keep_image_idx` is `Some(i)`, pass 0 preserves the image bytes on the
+/// message at index `i` (the current turn's user message) in addition to the
+/// literal last message. The freshly-attached image must stay visible for the
+/// WHOLE turn: once the model makes a tool call the user message is no longer
+/// last, and stripping its image there blinds the model to it for the rest of
+/// the turn (the "the bot can't see my attached image" bug).
+///
+/// Returns the number of messages removed in pass 2.
+pub(super) fn trim_context_if_needed(
+    messages: &mut Vec<Message>,
+    budget: usize,
+    protected_idx: Option<usize>,
+    keep_image_idx: Option<usize>,
+) -> usize {
+    // The current user message is the LAST entry on the first iteration —
+    // `chat::process` builds `messages = resume_tool_blocks;
+    // messages.push(current_user_message)`. As the tool loop appends pairs it
+    // is no longer last, so `keep_image_idx` pins its image too. Every other
+    // message's images were already seen by the LLM on prior turns / iterations.
+    let mut image_bytes_stripped = 0usize;
+    let last_idx = messages.len().saturating_sub(1);
+    for (idx, msg) in messages.iter_mut().enumerate() {
+        if idx == last_idx || Some(idx) == keep_image_idx {
+            continue;
+        }
+        if let MessageContent::Blocks(blocks) = &mut msg.content {
+            image_bytes_stripped +=
+                replace_image_blocks(blocks, || "[image from earlier in conversation]".to_string());
+        }
+    }
+    if image_bytes_stripped > 0 {
+        log!(
+            "[Context] Context trimming: stripped {}KB of image data from older messages",
+            image_bytes_stripped / 1024
+        );
+    }
+
+    let total: usize = messages.iter().map(estimate_message_chars).sum();
+    if total <= budget {
+        return 0;
+    }
+
+    let len = messages.len();
+    let preserve_start = if len > PRESERVE_RECENT_MESSAGES {
+        len - PRESERVE_RECENT_MESSAGES
+    } else {
+        len
+    };
+
+    // Pass 1: truncate large values in old messages (skip message[0] and recent)
+    for message in &mut messages[1..preserve_start] {
+        if let MessageContent::Blocks(blocks) = &mut message.content {
+            for block in blocks.iter_mut() {
+                match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id: _,
+                        content,
+                    } => {
+                        if content.len() > TRUNCATION_THRESHOLD {
+                            let orig_len = content.len();
+                            *content = format!("[content truncated — was {} chars]", orig_len);
+                        }
+                    }
+                    ContentBlock::ToolUse { input, .. } => {
+                        truncate_large_json_strings(input);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let total_after_pass1: usize = messages.iter().map(estimate_message_chars).sum();
+    if total_after_pass1 <= budget {
+        log!("[Context] Context trimming: pass 1 reduced ~{}k -> ~{}k tokens ({} -> {} chars, {} msgs, budget ~{}k tokens)",
+            estimate_tokens_from_chars(total) / 1000, estimate_tokens_from_chars(total_after_pass1) / 1000,
+            total, total_after_pass1, messages.len(), estimate_tokens_from_chars(budget) / 1000
+        );
+        return 0;
+    }
+
+    // Pass 1.5: if still over budget, truncate large ToolResult blocks in the
+    // preserved tail (except the very last message). Tail preservation exists
+    // so the LLM can see what just happened — but a tail full of huge
+    // `query_events` dumps will blow the budget no matter how aggressively
+    // pass 2 removes old pairs. The cut still leaves the "[content truncated
+    // — was N chars]" note so the LLM can re-query if the data mattered.
+    let mut total_after_truncation = total_after_pass1;
+    if len > PRESERVE_RECENT_MESSAGES + 1 {
+        let tail_start = len - PRESERVE_RECENT_MESSAGES;
+        let tail_end = len - 1; // skip the very last message
+        for message in &mut messages[tail_start..tail_end] {
+            if let MessageContent::Blocks(blocks) = &mut message.content {
+                for block in blocks.iter_mut() {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id: _,
+                        content,
+                    } = block
+                    {
+                        if content.len() > TAIL_TRUNCATION_THRESHOLD {
+                            let orig_len = content.len();
+                            *content = format!("[content truncated — was {} chars]", orig_len);
+                        }
+                    }
+                }
+            }
+        }
+        total_after_truncation = messages.iter().map(estimate_message_chars).sum();
+        if total_after_truncation <= budget {
+            log!("[Context] Context trimming: pass 1.5 (tail trim) reduced ~{}k -> ~{}k tokens ({} -> {} chars, budget ~{}k tokens)",
+                estimate_tokens_from_chars(total_after_pass1) / 1000, estimate_tokens_from_chars(total_after_truncation) / 1000,
+                total_after_pass1, total_after_truncation, estimate_tokens_from_chars(budget) / 1000
+            );
+            return 0;
+        }
+    }
+
+    // Pass 2: remove oldest messages (from index 1) until under budget.
+    // Tool-use-aware: when removing an assistant message with ToolUse blocks,
+    // also remove the following user message (which contains matching ToolResult
+    // blocks). Never remove one without the other — orphaned ToolResult blocks
+    // cause API validation errors.
+    //
+    // `current_total` starts from the post-truncation count (after both Pass 1
+    // and Pass 1.5) — using the pre-1.5 number would over-credit the budget
+    // and cause Pass 2 to evict more old pairs than necessary.
+    let mut removed = 0;
+    let mut current_total = total_after_truncation;
+    // Track the protected message's position as removals shift it down. Once
+    // it reaches index 1 (or its tool_result pair-mate would be removed),
+    // stop — losing the pinned request is worse than going over budget.
+    //
+    // Protect down to the LOWER of `protected_idx` (the latest user input) and
+    // `keep_image_idx` (the image-bearing message). They're equal in the common
+    // case, but a mid-turn prompt injection moves `protected_idx` to the new
+    // last message while the image stays at a lower index — pass 0 keeps the
+    // image bytes, but pass 2 must also refuse to remove that whole message, or
+    // the image (and the original request) is lost anyway. Stopping at the min
+    // keeps both: everything from that index up survives.
+    let mut protected = match (protected_idx, keep_image_idx) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, None) => a,
+        (None, b) => b,
+    };
+    while current_total > budget && messages.len() > PRESERVE_RECENT_MESSAGES + 1 {
+        if messages.len() <= 1 {
+            break;
+        }
+
+        // Protected message currently at the only removable slot — stop.
+        if protected == Some(1) {
+            break;
+        }
+
+        let has_tool_use = match &messages[1].content {
+            MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. })),
+            _ => false,
+        };
+
+        // Pair removal would also drop messages[2]; if that's the protected
+        // message we'd corrupt it (lose the request line) rather than orphan
+        // a tool_use. Stop instead.
+        if has_tool_use && protected == Some(2) {
+            break;
+        }
+
+        // Remove the message at index 1
+        current_total -= estimate_message_chars(&messages[1]);
+        messages.remove(1);
+        removed += 1;
+        protected = protected.map(|p| p.saturating_sub(1));
+
+        // If it had tool_use blocks, the next message (now at index 1) must contain
+        // the matching tool_result blocks — remove it too to keep the pair intact.
+        if has_tool_use && messages.len() > 1 {
+            current_total -= estimate_message_chars(&messages[1]);
+            messages.remove(1);
+            removed += 1;
+            protected = protected.map(|p| p.saturating_sub(1));
+        }
+    }
+
+    log!("[Context] Context trimming: ~{}k -> ~{}k tokens ({} -> {} chars), removed {} messages, {} remaining (budget ~{}k tokens)",
+        estimate_tokens_from_chars(total) / 1000, estimate_tokens_from_chars(current_total) / 1000,
+        total, current_total, removed, messages.len(), estimate_tokens_from_chars(budget) / 1000
+    );
+    if current_total > budget {
+        log!(
+            "[Context] Warning: context still over budget after trimming (~{}k tokens, {} chars > {} budget)",
+            estimate_tokens_from_chars(current_total) / 1000,
+            current_total,
+            budget
+        );
+    }
+
+    removed
+}
+
+/// Recursively truncate large string values in a JSON Value.
+pub(super) fn truncate_large_json_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => {
+            if s.len() > TRUNCATION_THRESHOLD {
+                let orig_len = s.len();
+                let preview: String = s.chars().take(200).collect();
+                *s = format!(
+                    "{}...\n[truncated — full value was {} chars]",
+                    preview, orig_len
+                );
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_k, v) in map.iter_mut() {
+                truncate_large_json_strings(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                truncate_large_json_strings(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Truncate a string using head+tail preservation.
+/// Keeps 75% from the start and 25% from the end, with an omission marker in the middle.
+pub(super) fn truncate_head_tail(content: &str, max_chars: usize) -> String {
+    // Fast path: if byte length is under limit, char count must be too
+    if content.len() <= max_chars {
+        return content.to_string();
+    }
+    let chars: Vec<char> = content.chars().collect();
+    if chars.len() <= max_chars {
+        return content.to_string();
+    }
+    let total = chars.len();
+    let head_len = max_chars * 3 / 4;
+    let tail_len = max_chars / 4;
+    let head: String = chars[..head_len].iter().collect();
+    let tail: String = chars[total - tail_len..].iter().collect();
+    let omitted = total - head_len - tail_len;
+    format!(
+        "{}\n\n... ({} chars omitted) ...\n\n{}",
+        head, omitted, tail
+    )
+}
+
+/// Format a single conversation history message with tiered truncation.
+/// Only assistant messages outside the verbatim tail get compacted.
+/// Everything else uses the safety-net limit (HISTORY_MSG_TRUNCATE).
+///
+/// Before truncation, any verbatim occurrence of a loaded knowhow body is
+/// replaced with a one-line pointer back to the `[LOADED KNOWHOW]` section
+/// in this turn's prompt — the body lives there now and the LLM doesn't
+/// need to see it again inside `[CONVERSATION HISTORY]`. Match is by exact
+/// body substring (the loaded body is the same `[SYSTEM-KNOWHOW: <name>]`
+/// block produced by `core::knowhow::load_one_knowhow_section`); organic
+/// discussion of the marker that doesn't reproduce a real body survives
+/// unchanged.
+pub(super) fn format_history_content(
+    content: &str,
+    role: &str,
+    is_verbatim: bool,
+    loaded_knowhow_bodies: &[&str],
+) -> String {
+    let stripped = strip_loaded_knowhow_bodies(content, loaded_knowhow_bodies);
+    if !is_verbatim && role == "assistant" {
+        truncate_head_tail(&stripped, HISTORY_ASSISTANT_COMPACT)
+    } else {
+        truncate_head_tail(&stripped, HISTORY_MSG_TRUNCATE)
+    }
+}
+
+const LOADED_KNOWHOW_POINTER: &str = "(body in [LOADED KNOWHOW] section above)";
+
+/// Replace each verbatim occurrence of a loaded knowhow body with a one-line
+/// pointer to the `[LOADED KNOWHOW]` section. Bodies are matched as exact
+/// substrings — the loaded body is the formatted block returned by
+/// `load_one_knowhow_section`, which is what the LLM saw on the original
+/// `load_knowhow` tool result. Bodies for unloaded docs (or stray markers
+/// the LLM typed in discussion) pass through unchanged.
+fn strip_loaded_knowhow_bodies(content: &str, loaded_bodies: &[&str]) -> String {
+    if loaded_bodies.is_empty() {
+        return content.to_string();
+    }
+    let mut out = content.to_string();
+    for body in loaded_bodies {
+        if !body.is_empty() && out.contains(body) {
+            out = out.replace(body, LOADED_KNOWHOW_POINTER);
+        }
+    }
+    out
+}
+
+/// Bounds runaway tool-loop turns; ~6 typical tool calls fit in well under this.
+const HISTORY_STEPS_MAX_BYTES: usize = 2_000;
+
+/// Compact summary of an assistant turn's tool calls for the LLM's history
+/// string. Returns `None` when there's nothing tool-shaped to report
+/// (synthetic Thinking/MemorySearched steps lack `tool_name` and are
+/// skipped). Output is capped at [`HISTORY_STEPS_MAX_BYTES`].
+///
+/// `skip_tool_event_ids` is the set of `ToolCalled` event ids that are
+/// already represented as full `Message::Blocks(...)` pairs prepended to the
+/// LLM messages vec by `build_resume_tool_blocks_with_skip_ids`. Their
+/// summary lines are suppressed here so the LLM doesn't see the same tool
+/// call twice (once verbatim, once as a `[tools: ...]` summary).
+pub(crate) fn format_history_steps(
+    steps: &[Step],
+    skip_tool_event_ids: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let descs: Vec<String> = steps
+        .iter()
+        .filter(|s| s.tool_name.is_some())
+        .filter(|s| {
+            s.tool_called_event_id
+                .as_ref()
+                .map(|id| !skip_tool_event_ids.contains(id))
+                .unwrap_or(true)
+        })
+        .map(|s| {
+            let mark = if s.success { "ok" } else { "FAIL" };
+            // describe_tool's trailing "..." is for live progress, not history.
+            let desc = s.description.trim_end_matches("...");
+            format!("{} [{}]", desc, mark)
+        })
+        .collect();
+    if descs.is_empty() {
+        return None;
+    }
+    let joined = descs.join(" | ");
+    let capped = truncate_head_tail(&joined, HISTORY_STEPS_MAX_BYTES);
+    Some(format!(" [tools: {}]", capped))
+}
+
+/// Trim history context from the START (oldest messages) when over budget.
+/// This preserves the most recent messages, which are most relevant for follow-ups.
+pub(super) fn trim_history_from_oldest(history: &mut String, bytes_to_trim: usize) {
+    if bytes_to_trim >= history.len() {
+        history.clear();
+        return;
+    }
+    // Use floor_char_boundary to avoid slicing inside a multi-byte UTF-8 character
+    let start = history.floor_char_boundary(bytes_to_trim);
+    if let Some(pos) = history[start..].find('\n') {
+        *history = history[start + pos + 1..].to_string();
+    } else {
+        history.clear();
+    }
+}
+
+/// Render one memory entry as its `[Long-term Memory]` bullet. The trailing
+/// `[id: <uuid>]` is what lets the agent target the exact entry for deletion or
+/// correction via the `correct_memory_by_id` tool; the fuzzy `correct_memory`
+/// path needs no id. Keep this in sync with the id form the tool parses.
+fn format_memory_bullet(entry: &MemoryEntry) -> String {
+    let date = entry.src_created_at.format("%Y-%m-%d");
+    format!("- {}: {} [id: {}]\n", date, entry.summary, entry.id)
+}
+
+impl LucidosEngine {
+    pub(crate) async fn retrieve_context(
+        &self,
+        query: &str,
+        classification: &QueryClassification,
+    ) -> (String, usize) {
+        const MAX_CONTEXT_CHARS: usize = 50_000;
+        use crate::memory::{RETRIEVAL_MIN_IMPORTANCE as MIN_IMPORTANCE, RETRIEVAL_MIN_SIMILARITY as MIN_SIMILARITY};
+        const RESULTS_PER_QUERY: usize = 50;
+        const MAX_FACTS: usize = 25;
+        const KEYWORD_SIMILARITY_PROXY: f64 = 0.6;
+        const KEYWORD_BOOST: f64 = 1.2;
+        const JACCARD_DEDUP_THRESHOLD: f32 = 0.8;
+
+        let mut context = String::new();
+        let mut current_size = 0;
+
+        // Skip memory retrieval entirely if classification says it's not needed
+        if !classification.needs_memory {
+            log!(@Memory, "Query classified as not needing memory — skipping retrieval");
+            return (context, 0);
+        }
+
+        let Some(ref index) = self.memory_index else {
+            return (context, 0);
+        };
+
+        // Use pre-decomposed sub-queries from classification (already done in classify_query)
+        let sub_queries = if !classification.sub_queries.is_empty() {
+            classification.sub_queries.clone()
+        } else {
+            vec![query.to_string()]
+        };
+
+        let now = chrono::Utc::now();
+
+        // Collect entries with their best relevance score
+        let mut all_entries: std::collections::HashMap<Uuid, (MemoryEntry, f64)> =
+            std::collections::HashMap::new();
+
+        // Batch embed all sub-queries in a single call
+        let sub_query_strs: Vec<&str> = sub_queries.iter().map(|s| s.as_str()).collect();
+        let embeddings = match self.embedder.embed_batch(&sub_query_strs).await {
+            Ok(e) => e,
+            Err(e) => {
+                log!(@Memory, "Batch embedding failed: {}", e);
+                return (context, 0);
+            }
+        };
+
+        // Fire all semantic searches concurrently — using search_with_scores for real similarity
+        let semantic_futures: Vec<_> = embeddings
+            .iter()
+            .map(|emb| index.search_with_scores(emb, MIN_IMPORTANCE, RESULTS_PER_QUERY))
+            .collect();
+        let semantic_results = futures::future::join_all(semantic_futures).await;
+
+        for result in semantic_results {
+            match result {
+                Ok(scored_entries) => {
+                    for (entry, similarity) in scored_entries {
+                        if similarity < MIN_SIMILARITY {
+                            continue;
+                        }
+                        let age_days = super::memory::age_in_days(now, entry.src_created_at);
+                        let score =
+                            super::memory::relevance_score(similarity, entry.importance, age_days);
+                        all_entries
+                            .entry(entry.id)
+                            .and_modify(|(_, existing_score)| {
+                                if score > *existing_score {
+                                    *existing_score = score;
+                                }
+                            })
+                            .or_insert((entry, score));
+                    }
+                }
+                Err(e) => log!(@Memory, "Semantic search failed: {}", e),
+            }
+        }
+
+        // Keyword search: boost entries found by keyword match
+        let mut keywords: Vec<String> = Vec::new();
+        for sub_query in &sub_queries {
+            for word in sub_query.split_whitespace() {
+                let trimmed = word.trim_matches(|c: char| !c.is_alphanumeric());
+                // No uppercase filter: Norwegian common nouns like "bil"/"hund"
+                // are valid entity tags but never capitalize.
+                if trimmed.len() >= 3 {
+                    keywords.push(trimmed.to_string());
+                }
+            }
+        }
+        keywords.sort();
+        keywords.dedup();
+
+        let keyword_futures: Vec<_> = keywords
+            .iter()
+            .map(|kw| index.search_by_keyword(kw, MIN_IMPORTANCE, 20))
+            .collect();
+        let keyword_results = futures::future::join_all(keyword_futures).await;
+
+        // Track which entries already received a keyword boost (apply at most once)
+        let mut keyword_boosted: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        for result in keyword_results {
+            match result {
+                Ok(results) => {
+                    for entry in results.entries {
+                        let id = entry.id;
+                        let age_days = super::memory::age_in_days(now, entry.src_created_at);
+                        let score = super::memory::relevance_score(
+                            KEYWORD_SIMILARITY_PROXY,
+                            entry.importance,
+                            age_days,
+                        );
+                        all_entries
+                            .entry(id)
+                            .and_modify(|(_, existing)| {
+                                if keyword_boosted.insert(id) {
+                                    *existing *= KEYWORD_BOOST;
+                                }
+                            })
+                            .or_insert_with(|| {
+                                keyword_boosted.insert(id);
+                                (entry, score * KEYWORD_BOOST)
+                            });
+                    }
+                }
+                Err(e) => log!(@Memory, "Keyword search failed: {}", e),
+            }
+        }
+
+        if all_entries.is_empty() {
+            return (context, 0);
+        }
+
+        // Take top-N by relevance score
+        let mut scored: Vec<(MemoryEntry, f64)> = all_entries.into_values().collect();
+        scored.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(MAX_FACTS);
+
+        // Deduplicate near-identical facts (>80% word overlap) — keep higher-scored one
+        let mut keep = vec![true; scored.len()];
+        for i in 0..scored.len() {
+            if !keep[i] {
+                continue;
+            }
+            for j in (i + 1)..scored.len() {
+                if !keep[j] {
+                    continue;
+                }
+                if jaccard_similarity(&scored[i].0.summary, &scored[j].0.summary)
+                    > JACCARD_DEDUP_THRESHOLD
+                {
+                    keep[j] = false; // i has higher score (list is sorted)
+                }
+            }
+        }
+        let mut idx = 0;
+        scored.retain(|_| {
+            let k = keep[idx];
+            idx += 1;
+            k
+        });
+
+        // Group by topic for presentation
+        let mut topic_groups: std::collections::HashMap<String, Vec<(MemoryEntry, f64)>> =
+            std::collections::HashMap::new();
+        for (entry, score) in scored {
+            topic_groups
+                .entry(entry.topic.clone())
+                .or_default()
+                .push((entry, score));
+        }
+
+        // Sort chronologically within each topic
+        for entries in topic_groups.values_mut() {
+            entries.sort_by_key(|(e, _)| e.src_created_at);
+        }
+
+        // Prioritize topic groups by average relevance score
+        let mut sorted_topics: Vec<(String, Vec<(MemoryEntry, f64)>)> =
+            topic_groups.into_iter().collect();
+        sorted_topics.sort_by(|(_, a), (_, b)| {
+            let avg_a: f64 = a.iter().map(|(_, s)| s).sum::<f64>() / a.len() as f64;
+            let avg_b: f64 = b.iter().map(|(_, s)| s).sum::<f64>() / b.len() as f64;
+            avg_b
+                .partial_cmp(&avg_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Format as structured timeline
+        let mut memory_section = String::from("[Long-term Memory]\n\n");
+        let mut total_facts = 0;
+
+        for (topic, entries) in &sorted_topics {
+            let mut topic_block = format!("## {}\n", topic);
+            for (entry, _) in entries {
+                topic_block.push_str(&format_memory_bullet(entry));
+            }
+            topic_block.push('\n');
+
+            if current_size + topic_block.len() > MAX_CONTEXT_CHARS {
+                break;
+            }
+
+            memory_section.push_str(&topic_block);
+            current_size += topic_block.len();
+            total_facts += entries.len();
+        }
+
+        if total_facts > 0 {
+            context.push_str(&memory_section);
+        }
+
+        (context, total_facts)
+    }
+}
+
+#[cfg(test)]
+#[path = "context_tests/trim.rs"]
+mod context_trim_tests;
+
+#[cfg(test)]
+#[path = "context_tests/memory.rs"]
+mod memory_retrieval_tests;
+
+#[cfg(test)]
+#[path = "context_tests/format.rs"]
+mod history_format_tests;
+
+#[cfg(test)]
+#[path = "context_tests/sanitize.rs"]
+mod sanitize_file_content_tests;
+
+#[cfg(test)]
+mod context_window_tests {
+    use super::{agent_context_char_budget, context_window_for};
+
+    #[test]
+    fn context_window_for_known_models() {
+        assert_eq!(context_window_for("claude-opus-4-7[1m]"), 1_000_000);
+        assert_eq!(context_window_for("claude-opus-4-7"), 200_000);
+        assert_eq!(context_window_for("claude-sonnet-4-6"), 200_000);
+        assert_eq!(context_window_for("gpt-5"), 400_000);
+        assert_eq!(context_window_for("unknown-model"), 200_000);
+    }
+
+    /// The budget for the 1M-token Opus build must be substantially larger
+    /// than the budget for the 200k default — that's the entire point of
+    /// per-model derivation. The hardcoded 300k constant we replaced was
+    /// capping Opus at ~5× too small, so the new value must be at least
+    /// 4× the old default to be a real fix.
+    #[test]
+    fn opus_1m_budget_is_much_larger_than_default_claude() {
+        let opus_1m = agent_context_char_budget("claude-opus-4-7[1m]");
+        let default_claude = agent_context_char_budget("claude-opus-4-7");
+        assert!(
+            opus_1m >= default_claude * 4,
+            "1M Opus budget ({}) must be ≥ 4× default Claude budget ({})",
+            opus_1m,
+            default_claude
+        );
+        // And large enough to hold the 552 KB iPhone screenshot from the
+        // regression thread without trim pass 2 evicting anything.
+        assert!(opus_1m > 1_000_000, "Opus 1M budget too small: {}", opus_1m);
+    }
+
+    /// Pin the exact formula output for the default 200k Claude. The fuzzy
+    /// "close to 300k" range invited silent drift; the exact value
+    /// `(200_000 - 8_000) * 3 / 2 = 288_000` documents the math and trips
+    /// loudly if the multiplier or `RESPONSE_TOKEN_RESERVE` change without
+    /// a deliberate update here.
+    #[test]
+    fn default_claude_budget_matches_formula() {
+        assert_eq!(agent_context_char_budget("claude-opus-4-7"), 288_000);
+    }
+
+    /// And the same pin for the 1M Opus build — the regression scenario.
+    #[test]
+    fn opus_1m_budget_matches_formula() {
+        assert_eq!(agent_context_char_budget("claude-opus-4-7[1m]"), 1_488_000);
+    }
+}

@@ -1,0 +1,37 @@
+# Development mode: shared PostgreSQL with pgvector in Docker, engine runs natively on macOS
+#
+# PGDATA lives on one Docker named volume (`lucidos-pg-data-shared` by default),
+# not a host bind mount. Bind-mounting PGDATA on macOS routes every WAL fsync
+# through Docker Desktop's virtiofs, which throttles host writes and can crash
+# the VM under sustained load. ADR 0014 uses one shared cluster and one database
+# per workspace (`lucidos_<slug>`); legacy `lucidos-pg-<workspace-hash>`
+# containers are migration sources only until explicitly decommissioned.
+services:
+  postgres:
+    image: pgvector/pgvector:pg18
+    container_name: lucidos-pg-${LUCIDOS_PG_NAME:-shared}
+    ports:
+      - "${LUCIDOS_PG_PORT:-5432}:5432"
+    volumes:
+      # PG 18's image relocated PGDATA to /var/lib/postgresql/18/docker and
+      # declares its VOLUME at the parent /var/lib/postgresql (PG 17 used
+      # /var/lib/postgresql/data for both). Mount the named volume at the parent
+      # so the cluster under 18/docker persists; mounting the old /data path
+      # would leave PGDATA on an anonymous volume that is lost on each recreate.
+      - lucidos-pg-data:/var/lib/postgresql
+    labels:
+      - "lucidos.shared-postgres=true"
+    environment:
+      - POSTGRES_USER=lucidos
+      - POSTGRES_PASSWORD=lucidos
+      - POSTGRES_DB=postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lucidos"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: "no"
+
+volumes:
+  lucidos-pg-data:
+    name: lucidos-pg-data-${LUCIDOS_PG_NAME:-shared}

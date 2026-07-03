@@ -1,0 +1,1281 @@
+/* ─── App shell ─── */
+
+.app-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    height: 100dvh;
+    width: 100vw;
+    overflow: hidden;
+}
+
+/* Reclaimed macOS title-bar band. Under the packaged macOS Tauri build
+   (titleBarStyle:"Overlay") the webview spans the full window height and the OS
+   traffic lights float over the top-left. This strip fills that reclaimed band
+   so it reads as our blue chrome (continuous with the header below) instead of
+   the default black bar, and it IS the window drag region (the native bar that
+   used to provide dragging is gone). It sizes to --titlebar-inset, which the
+   macOS Tauri build sets to the title-bar height before first paint (see
+   `titlebar_inset_script` in src-tauri lib.rs); everywhere else (web, PWA,
+   non-macOS) the var is unset, so the strip is 0px tall and the layout is
+   byte-for-byte identical to before. The header and everything below it are
+   untouched — only this band is added on top. */
+.titlebar-strip {
+    flex: none;
+    height: var(--titlebar-inset, 0px);
+    background: var(--titlebar-strip-bg);
+}
+
+/* ─── Content row (thread drawer + split layout) ─── */
+
+.content-row {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* ─── Split layout ─── */
+
+.split-layout {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.pane {
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.pane-collapsed {
+    pointer-events: none;
+    visibility: hidden;
+}
+
+/* Same duration/easing as the header regions' left/width transitions — the
+   pane and the header section above it must arrive together or the header
+   reads as disconnected from the panel. flex-grow is transitioned alongside
+   flex-basis: maximizing a pane flips it from basis-driven (flex: 0 0 X%) to
+   grow-driven (flex: 1) sizing, and without easing flex-grow the 0→1 jump
+   snaps the pane to full width instantly while its header still slides. */
+.split-layout.snap-animate .pane {
+    transition: flex-grow var(--duration-slow) ease, flex-basis var(--duration-slow) ease,
+                visibility var(--duration-slow);
+}
+
+.pane-thread {
+    min-width: 0;
+}
+
+.pane-content {
+    min-width: 0;
+}
+
+/* Prevent any text from widening a pane beyond its container */
+.pane-thread,
+.pane-content {
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+/* --- Divider --- */
+
+.split-divider {
+    width: var(--divider-width);
+    cursor: col-resize;
+    background: var(--border-color);
+    flex-shrink: 0;
+    position: relative;
+    z-index: 2;
+    transition: background-color 0.15s;
+    touch-action: none;
+}
+
+@media (hover: hover) {
+    .split-divider.collapsed:hover {
+        background: var(--accent);
+    }
+}
+
+.split-divider.collapsed {
+    cursor: pointer;
+}
+
+/* --- Pane headers --- */
+
+.pane-header {
+    --header-padding-x: 0.625rem;
+    /* Brand-blue bar (both themes) with a LIGHT foreground scale. Every glyph,
+       label, and badge in the bar consumes these --header-* tokens so the
+       inversion lives in one place; popout panels anchored inside the header
+       subtree reset them back to the normal dark-on-light values (see the
+       "Brand-blue header" block at the end of this file). */
+    --header-fg: #ffffff;
+    --header-fg-muted: rgba(255, 255, 255, 0.72);
+    --header-control-hover-bg: rgba(255, 255, 255, 0.12);
+    --header-control-active-bg: rgba(255, 255, 255, 0.22);
+    /* Header divider: currently disabled (transparent) so the brand-blue bar
+       reads as one seamless header across the drawer/chat/content splits. The
+       full-height ::before/::after geometry is kept (matching the pane
+       .split-divider below) so re-enabling is just a color change here. */
+    --header-divider: transparent;
+    --header-badge-bg: #ffffff;
+    --header-badge-fg: var(--brand-blue-deep);
+    /* Base bar color: any inherited text / currentColor glyph (e.g. the
+       recovery spinner) reads light by default; explicit muted/active variants
+       and popout resets override below. */
+    color: var(--header-fg);
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0 var(--header-padding-x);
+    background: var(--header-gradient);
+    flex-shrink: 0;
+    height: 2.5rem;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.app-header {
+    padding-top: calc(0.25rem + env(safe-area-inset-top, 0px));
+    height: calc(2.5rem + 0.25rem + env(safe-area-inset-top, 0px));
+}
+
+.pane-header-brand {
+    display: flex;
+    align-items: center;
+    cursor: default;
+    min-width: 0;
+}
+
+.pane-header-brand-label {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+}
+
+/* Pointer cursor only on the visible children (text, badge, dot), not on the
+   empty centering space the brand-label reserves with flex:1. */
+.pane-header-brand-label > * {
+    cursor: pointer;
+}
+
+.pane-header-brand .pane-header-title {
+    font-size: var(--font-size-lg);
+    min-width: 0;
+}
+
+.recovery-indicator {
+    display: inline-flex;
+    align-items: center;
+    opacity: 0.7;
+}
+
+.recovery-spinner {
+    width: 0.875rem;
+    height: 0.875rem;
+    animation: spin 1.2s linear infinite;
+}
+
+
+
+.pane-header-title {
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.pane-header-spacer {
+    flex: 1;
+}
+
+.content-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+/* The pane containers are keyboard-focusable for pane navigation: the split
+   panes carry tabindex=-1 (focused as a fallback by focusPaneMainControl when a
+   pane has no focusable child), and the thread drawer is a role="tree" single
+   tab stop (tabindex=0, aria-activedescendant — see ThreadDrawer). When the
+   container itself holds DOM focus the browser paints its native outline around
+   the WHOLE pane. The active-pane cue is the header wash (plus the highlighted row
+   inside the drawer) — NOT a frame around the pane body, so suppress the
+   container's own focus outline. (Real focusable controls inside a pane keep their
+   own :focus-visible ring.) */
+.pane-thread:focus,
+.pane-content:focus,
+.thread-drawer:focus {
+    outline: none;
+}
+
+/* Focused-pane header wash — desktop-only; positioned + revealed inside the
+   min-width:769px block below. Hidden by default so it never takes a flex slot
+   in the mobile header. */
+.header-focus-wash {
+    display: none;
+}
+
+/* Hidden on desktop — mobile.css enables with display:flex */
+.mobile-nav-slot {
+    display: none;
+}
+
+/* --- Thread pane body --- */
+
+.thread-pane {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+    position: relative;
+}
+
+/* Compose-empty: center prompt vertically */
+.thread-pane.compose-empty {
+    justify-content: center;
+}
+
+.compose-empty .thread-content-wrap {
+    flex: 0 0 auto;
+}
+
+/* Compose-empty welcome: a COMPACT surface that flows at its natural height, so
+   the centered group (welcome + prompt) keeps the prompt near the middle on
+   desktop, and on mobile (where `.thread-pane-body` is bottom-docked) the
+   welcome sits just above the prompt. `.thread-content` is normally a fill +
+   scroll container (desktop `position: absolute; inset: 0`; mobile `flex: 1`);
+   here it flows at content height so the welcome is only as tall as it needs to
+   be. Only the compose-empty welcome is affected — a real transcript keeps its
+   fill + scroll behavior. The wrap therefore sizes to content (not `flex: 1`).
+   `.thread-content` only exists here when `hasContent` is true (CreateThreadView),
+   which in compose-empty mode means the welcome is showing. */
+.compose-empty .thread-content-wrap:has(> .thread-content.visible) {
+    flex: 0 0 auto;
+    min-height: 0;
+}
+
+/* Scoped to `.visible` (0,3,0) so it beats the base/mobile `.thread-content`
+   rules. The dismiss pill anchors to this (`position: relative`). */
+.compose-empty .thread-content.visible {
+    position: relative;   /* was absolute inset:0 (desktop) — flow at natural height */
+    inset: auto;
+    flex: none;           /* mobile sets flex:1 — don't grow in compose-empty */
+    overflow: visible;    /* compact: no inner scroll; the carousel scrolls itself */
+    /* No scrolling transcript to fade here, and the dismiss pill lives in this
+       area — kill the desktop top-fade mask so it isn't ghosted. */
+    -webkit-mask-image: none;
+    mask-image: none;
+    /* The base .thread-content padding reserves room past the top/prompt fades
+       for a focus marker; neither applies to the compact welcome (mask killed,
+       no scroll), so drop back to a tight padding instead of the large fade
+       clearance. */
+    padding: 0.5rem 0.75rem 0.75rem;
+}
+
+.compose-empty .prompt-area {
+    padding-top: 0;
+    margin-top: 0;
+}
+
+/* --- Content pane body --- */
+
+.content-pane {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    position: relative;
+}
+
+.content-pane-body {
+    flex: 1;
+    min-width: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    position: relative;
+}
+
+/* Focusable scroll region (tabindex=0, mirror of .thread-content): pane focus
+   lands DOM focus here so scroll keys work, but the active-pane cue is the header
+   wash — never a ring around the whole pane body. Same rationale as the
+   .pane-*:focus suppression above; controls inside keep their own
+   :focus-visible rings. */
+.content-pane-body:focus,
+.content-pane-body:focus-visible {
+    outline: none;
+}
+
+
+/* --- Hamburger toggle (panel menu) --- */
+
+.hamburger-panel {
+    padding: 0.5rem;
+    overflow: visible;
+}
+
+/* --- Mobile/Desktop header visibility --- */
+
+/* Mobile header sections: hidden on desktop */
+.mobile-threads-header,
+.mobile-thread-header,
+.mobile-content-header,
+.mobile-thread-title-row {
+    display: none;
+}
+
+/* Desktop header: shown on desktop, hidden on mobile */
+.desktop-header {
+    display: contents; /* pass-through for desktop layout */
+}
+
+/* Transparent wrappers — collapse to display:none hides all children at once */
+.thread-header-elements,
+.content-header-elements {
+    display: contents;
+}
+
+@media (max-width: 768px) {
+    .desktop-header {
+        display: none !important;
+    }
+}
+
+/* --- Panel navigation group (drawer toggle + back) --- */
+
+.panel-nav {
+    display: flex;
+    align-items: center;
+    gap: 0.125rem;
+}
+
+/* Threads header — hidden on mobile, only shown via desktop media query */
+.threads-header {
+    display: none;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+/* Thread toggle button — grid icon */
+.thread-toggle {
+    overflow: visible;
+    position: relative;
+}
+
+/* Slot holding the single unified Filter button (opens the merged View + Show
+   dropdown — see ThreadFilterDropdown). Sizes to the button; `position: relative`
+   is the positioning context for the anchored dropdown. The needs-attention
+   badge is absolutely positioned, so it never changes the slot's width and the
+   Threads title beside it holds its place as the count appears/clears. */
+.view-selector-slot {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    gap: 0.25rem;
+    position: relative;
+}
+
+/* Desktop: position burger, brand, and panel title to track the split layout */
+@media (min-width: 769px) {
+    /* Compute the divider x-position accounting for thread drawer offset.
+       --content-offset: thread drawer width (0px when closed, 300px when open)
+       --split-ratio: chat fraction of split layout (0–1)
+       --divider-x: actual position in the full-width header */
+    :root {
+        --co: var(--content-offset, 0px);
+        --sr: var(--split-ratio, 0.4);
+        --ddo: 0px; /* drawer-divider offset: 0 when closed */
+        --divider-x: calc(var(--co) + var(--ddo) + var(--sr) * (100% - var(--co) - var(--ddo)));
+        /* .collapsed-thread-actions footprint: left padding + 3 buttons + 2 gaps
+           (drawer toggle + prev/next; compose moved to the brand's right cluster) */
+        --collapsed-thread-actions-width: calc(0.5rem + 3 * 2.25rem + 2 * 0.25rem);
+    }
+
+    :root[data-thread-drawer-open] {
+        --ddo: var(--divider-width); /* account for drawer divider element */
+    }
+
+    .app-header {
+        position: relative;
+    }
+
+    /* Divider between chat and panel header areas — centered on the split bar.
+       Full-height + same width as the pane .split-divider below it, so the two
+       would read as one continuous divider. Painted with --header-divider,
+       currently transparent (seam disabled — see the token definition). */
+    .app-header::after {
+        content: '';
+        position: absolute;
+        left: var(--divider-x);
+        top: 0;
+        bottom: 0;
+        width: var(--divider-width);
+        background: var(--header-divider);
+        opacity: 1;
+        pointer-events: none;
+        transition: opacity 0.3s, left var(--duration-slow) ease;
+    }
+
+    /* Divider between thread drawer and chat header — tracks drawer divider */
+    .app-header::before {
+        content: '';
+        position: absolute;
+        left: var(--co);
+        top: 0;
+        bottom: 0;
+        width: var(--divider-width);
+        background: var(--header-divider);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.3s, left var(--duration-slow) ease;
+    }
+
+    :root[data-thread-drawer-open] .app-header::before {
+        opacity: 1;
+    }
+
+    /* Hide header dividers when either pane is collapsed */
+    :root[data-thread-collapsed] .app-header::after,
+    :root[data-content-collapsed] .app-header::after {
+        opacity: 0;
+    }
+
+    :root[data-thread-collapsed] .app-header::before {
+        opacity: 0;
+    }
+
+    /* Content-side header region — a flex container pinned between the split
+       divider and the header's right padding. panel-nav (left) and the action
+       icons (right) sit at the two edges (space-between); the title is
+       absolutely centered between them (below) so it lines up with the focus
+       pill on the pane's true middle, instead of centering in the leftover gap. */
+    .app-header .content-header-elements {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.25rem;
+        position: absolute;
+        left: calc(var(--divider-x) + var(--divider-width));
+        right: var(--header-padding-x);
+        top: 50%;
+        transform: translateY(-50%);
+        overflow: clip;
+        transition: left var(--duration-slow) ease,
+                    opacity var(--duration-slow) ease, visibility var(--duration-slow);
+    }
+
+    .app-header .panel-nav,
+    .app-header .content-header-actions {
+        flex-shrink: 0;
+    }
+
+    /* Thread toggle + nav — grouped at left edge when drawer is closed.
+       z-index must beat .pane-header-brand (--z-control-panel = 2200) which
+       starts at left:0 when the drawer is closed and would otherwise swallow
+       pointer events. Width is exposed via --collapsed-thread-actions-width
+       (defined on :root above) so the centered brand-label reserves room for it. */
+    .collapsed-thread-actions {
+        position: absolute;
+        left: 0.5rem;
+        top: 50%;
+        transform: translateY(-50%);
+        display: flex;
+        align-items: center;
+        gap: 0.25rem;
+        z-index: calc(var(--z-control-panel) + 1);
+        transition: opacity var(--duration-slow) ease, visibility var(--duration-slow);
+    }
+
+    /* Always mounted (AppHeader renders both nav-icon hosts); faded out while
+       the drawer header owns the icons, or while the whole thread side is
+       collapsed. Fading instead of unmounting is what lets the drawer toggle
+       animate the swap. */
+    :root[data-thread-drawer-open] .collapsed-thread-actions,
+    :root[data-thread-collapsed] .collapsed-thread-actions {
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+    }
+
+    /* Threads header — icon left, title centered, actions right, positioned in drawer width.
+       z-index 3 keeps the filter dropdown above .drawer-divider / .split-divider (both
+       z-index 2) — transform creates a stacking context, so the dropdown's own z-index
+       is trapped inside this one. */
+    .threads-header {
+        position: absolute;
+        left: 0;
+        width: var(--co);
+        top: 50%;
+        transform: translateY(-50%);
+        display: flex;
+        align-items: center;
+        gap: 0.25rem;
+        padding: 0 0.5rem; /* the drawer toggle now lives in the thread header, so
+                              the search/filter/title row starts at this padding */
+        z-index: 3;
+        /* Always mounted: width rides --co to 0 when the drawer closes, so
+           the drawer header slides shut in lockstep with the drawer body
+           instead of popping out. Clip hides the icon row as it shrinks. */
+        overflow: clip;
+        transition: width var(--duration-slow) ease,
+                    padding var(--duration-slow) ease,
+                    opacity var(--duration-slow) ease,
+                    visibility var(--duration-slow);
+    }
+
+    /* The filter dropdown renders inside .threads-header and opens below the
+       header — lift the clip while it's open or it renders cut off. */
+    .threads-header:has(.thread-filter-dropdown) {
+        overflow: visible;
+    }
+
+    /* Drawer closed (or thread pane collapsed → drawerVisible false): the
+       width transition is the exit animation; visibility transitions so the
+       clipped buttons leave the tab order only after the slide finishes.
+       padding must collapse too — border-box width bottoms out at the
+       horizontal padding (16px), leaving a phantom sliver otherwise. */
+    :root:not([data-thread-drawer-open]) .threads-header {
+        padding: 0;
+        visibility: hidden;
+        pointer-events: none;
+    }
+
+    /* Title fills the space after the Filter button (flex:1, so the search icon
+       stays pinned right) and CENTERS in that gap — i.e. midway between the
+       Filter button on its left and the Search icon on its right. The
+       needs-attention badge is absolutely positioned so it can't shift the
+       title as the count appears/clears. */
+    .threads-header-title {
+        flex: 1;
+        font-size: var(--font-size-lg);
+        font-weight: 600;
+        color: var(--text-primary);
+        white-space: nowrap;
+        text-align: center;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    /* Brand area spans from drawer edge to split divider. Children flow
+       left-to-right: thread-nav-group (back+compose) | brand-label (Lucidos
+       + dot + workspace, centered in available space) | search.
+       When the drawer is closed, the back+compose buttons live in
+       .collapsed-thread-actions outside the brand and overlap the brand's
+       left edge, so we reserve padding to keep them clear of brand-label. */
+    .app-header .pane-header-brand {
+        position: absolute;
+        left: calc(var(--co) + var(--ddo));
+        width: calc(var(--divider-x) - var(--co) - var(--ddo));
+        top: 50%;
+        transform: translateY(-50%);
+        z-index: var(--z-control-panel);
+        overflow-x: clip;
+        overflow-y: visible;
+        /* nav-group (left) and the actions cluster (right) sit at the box edges;
+           the brand-label is absolutely centered between them (below). */
+        justify-content: space-between;
+        transition: left var(--duration-slow) ease, width var(--duration-slow) ease,
+                    opacity var(--duration-slow) ease, visibility var(--duration-slow);
+    }
+
+    /* brand-label is absolutely centered on the pane's true middle. A FIXED
+       width — not shrink-to-content — is load-bearing: ConnectionStatus's
+       truncation logic reads brandLabel.clientWidth as the available space and
+       needs slack wider than the text to decide when to hide the workspace name.
+       The reserve on
+       each side clears the nav-group / actions clusters. pointer-events:none lets
+       the transparent box pass clicks through to those clusters and the brand's
+       own focus-on-click; the visible children re-enable pointer events. */
+    .app-header .pane-header-brand .pane-header-brand-label {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        width: calc(100% - 2 * var(--collapsed-thread-actions-width));
+        justify-content: center;
+        pointer-events: none;
+    }
+
+    .app-header .pane-header-brand .pane-header-brand-label > * {
+        pointer-events: auto;
+    }
+
+    /* Panel title absolutely centered on the content pane's true middle. The
+       +--header-padding-x/2 nudge compensates for this region stopping
+       --header-padding-x short of the header's right edge while the content pane
+       spans to the header edge — without it the title sits half the padding left
+       of the pane's true center. max-width reserves room each side for panel-nav
+       and the action icons; the title ellipsizes before reaching them.
+       pointer-events:none (with auto children) keeps the icons beneath it live. */
+    .app-header .pane-header-content-title {
+        position: absolute;
+        left: calc(50% + var(--header-padding-x) / 2);
+        top: 50%;
+        transform: translate(-50%, -50%);
+        max-width: calc(100% - 12rem);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: var(--dot-gap);
+        pointer-events: none;
+        font-size: var(--font-size-lg);
+        font-weight: 600;
+        color: var(--text-primary);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .app-header .pane-header-content-title .pane-header-title-text,
+    .app-header .pane-header-content-title .panel-url-title {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        pointer-events: auto;
+    }
+
+    /* Focused-pane wash: a faint lighter-blue overlay filling the focused pane's
+       header segment — the visual cue for which pane is focused. One invisible
+       positioning box PER PANE, each STATICALLY pinned over its own header segment
+       (drawer / thread / content) via the SAME geometry vars the three header
+       regions are positioned from (--co / --ddo / --divider-x), so each lines up
+       with — and slides in lockstep with — its region as the split or drawer width
+       changes. Focus moving between panes is a CROSSFADE, not a slide: the outgoing
+       pane's wash eases out and the incoming pane's eases in (opacity), while each
+       stays fixed to its own segment. The tint is painted by ::before so it can
+       spill past the box edges to cover the adjacent header divider(s), giving the
+       focused pane ONE continuous lighter band with no unwashed strip at the divider
+       seams. NO z-index and rendered as the header's first children, so it sits
+       above the header background yet under every control. Driven by
+       data-focused-pane on :root (set by SplitLayout); collapsed panes never show
+       theirs (the :not() guards). */
+    .header-focus-wash {
+        display: block;
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: 0;
+        width: 0;
+        opacity: 0;
+        pointer-events: none;
+        /* left/width transition only for GEOMETRY changes (split/drawer resize) —
+           position never changes on a focus shift, so it can't slide between panes.
+           opacity is the focus-shift crossfade, eased to 0.33s so the wash blooms
+           up like a light turning on rather than popping in. This single opacity
+           transition is what lets the data-pane-resizing kill-rule below switch it
+           off for 1:1 tracking during a divider drag. */
+        transition: left var(--duration-slow) ease, width var(--duration-slow) ease,
+                    opacity 0.33s ease-out;
+    }
+
+    /* Each box sits over its own segment ALWAYS (focused or not) — this is what
+       makes a focus shift a crossfade rather than a slide. */
+    .header-focus-wash[data-pane="drawer"] {
+        left: 0;
+        width: var(--co);
+    }
+    .header-focus-wash[data-pane="thread"] {
+        left: calc(var(--co) + var(--ddo));
+        width: calc(var(--divider-x) - var(--co) - var(--ddo));
+    }
+    .header-focus-wash[data-pane="content"] {
+        left: calc(var(--divider-x) + var(--divider-width));
+        width: calc(100% - var(--divider-x) - var(--divider-width));
+    }
+
+    /* The tint. It lives on ::before rather than the box background so its edges can
+       extend PAST the box (via negative left/right) to cover the adjacent header
+       divider(s) too — the box itself stops flush at each divider, leaving a thin
+       unwashed seam otherwise. Full box height, no z-index; it rides the box
+       opacity, so it crossfades with focus. The per-pane overhangs below push each
+       interior edge out by exactly the neighbouring divider's width. */
+    .header-focus-wash::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        background: var(--focus-header-tint);
+    }
+    /* Drawer: extend the RIGHT edge over the drawer divider (--ddo wide when open,
+       0 when closed). Left is the window edge. */
+    .header-focus-wash[data-pane="drawer"]::before {
+        right: calc(-1 * var(--ddo));
+    }
+    /* Thread: extend LEFT over the drawer divider (--ddo) and RIGHT over the split
+       divider (--divider-width). */
+    .header-focus-wash[data-pane="thread"]::before {
+        left: calc(-1 * var(--ddo));
+        right: calc(-1 * var(--divider-width));
+    }
+    /* Content: extend the LEFT edge over the split divider. Right is the window edge. */
+    .header-focus-wash[data-pane="content"]::before {
+        left: calc(-1 * var(--divider-width));
+    }
+
+    /* A focus shift only flips opacity — each box is already positioned over its own
+       segment above, so the outgoing pane's wash eases out while the incoming pane's
+       eases in (crossfade), never sliding across. Collapsed panes never reveal
+       theirs (the :not() guards). */
+    :root[data-focused-pane="drawer"][data-thread-drawer-open] .header-focus-wash[data-pane="drawer"],
+    :root[data-focused-pane="thread"]:not([data-thread-collapsed]) .header-focus-wash[data-pane="thread"],
+    :root[data-focused-pane="content"]:not([data-content-collapsed]) .header-focus-wash[data-pane="content"] {
+        opacity: 1;
+    }
+
+    /* While a divider drag is live (data-pane-resizing, set by
+       beginPaneResize in splitHelpers.ts), geometry transitions go off so the
+       header regions and the drawer track the pointer 1:1 with the panes —
+       the always-on var(--duration-slow) eases otherwise leave the header
+       visibly lagging behind the panels mid-drag. They come back on at
+       release so the deferred snap-to-minimum/hidden animates everything in
+       lockstep. */
+    :root[data-pane-resizing] .app-header::before,
+    :root[data-pane-resizing] .app-header::after,
+    :root[data-pane-resizing] .app-header .content-header-elements,
+    :root[data-pane-resizing] .app-header .pane-header-brand,
+    :root[data-pane-resizing] .threads-header,
+    :root[data-pane-resizing] .thread-drawer,
+    :root[data-pane-resizing] .header-focus-wash,
+    :root[data-pane-resizing] .split-layout.snap-animate .pane {
+        transition: none;
+    }
+
+    /* Ease the needs-attention / drafts toggles' active-state color change. */
+    .threads-header .icon-btn {
+        transition: color var(--duration-normal), background var(--duration-normal);
+    }
+}
+
+.thread-nav-group {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+}
+
+/* Right-side cluster of the brand: control panel + compose + search (+ recovery).
+   Pinned to the brand box's right edge by the brand's space-between; the centered
+   brand-label floats over the middle independently. */
+.pane-header-brand-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    flex-shrink: 0;
+}
+
+/* Drawer closed → the nav icons live in .collapsed-thread-actions instead;
+   collapse this group with a max-width slide + fade (display:none would pop
+   it out of the brand while the brand box is still animating). max-width
+   slightly above the natural 3 × 2.25rem icon row (drawer toggle + prev/next). */
+.desktop-header .pane-header-brand .thread-nav-group {
+    max-width: 7rem;
+    overflow: clip;
+    transition: max-width var(--duration-slow) ease,
+                opacity var(--duration-slow) ease, visibility var(--duration-slow);
+}
+
+:root:not([data-thread-drawer-open]) .desktop-header .pane-header-brand .thread-nav-group {
+    max-width: 0;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+}
+
+@media (min-width: 769px) {
+    /* Collapsing a pane fades its header regions out while their left/width
+       transitions slide them to zero — display:none here popped them out at
+       the start of the pane animation. (.collapsed-thread-actions has its
+       matching rule next to its base styles above.) */
+    :root[data-thread-collapsed] .app-header .threads-header,
+    :root[data-thread-collapsed] .app-header .pane-header-brand,
+    :root[data-content-collapsed] .app-header .content-header-elements {
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+    }
+}
+
+
+.workspace-name-label {
+    margin-left: 0.35rem;
+    color: var(--text-secondary);
+    font-size: var(--font-size-lg);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+    flex-shrink: 1;
+}
+
+/* Truncation priority: while a workspace label is rendered AND not hidden,
+   pin "lucidos" at its natural width so the workspace absorbs all flex shrink
+   first (instead of both labels truncating in parallel — "lucid... ● wo..."). */
+.pane-header-brand-label:has(> .workspace-name-label:not(.is-hidden)) .pane-header-title {
+    flex-shrink: 0;
+}
+
+/* Set by ConnectionStatus when even workspace shrunk to 0 plus its margin
+   gap doesn't fit. Stays in the DOM so scrollWidth keeps reporting the
+   natural text width — the JS measurement loop reads it to decide when to
+   un-hide. The :has() rule above flips lucidos back to flex-shrink: 1 once
+   this class is set, so brand can truncate with text-overflow: ellipsis. */
+.workspace-name-label.is-hidden {
+    flex: 0 0 0;
+    width: 0;
+    margin: 0;
+    visibility: hidden;
+}
+
+/* --- Connection status inline --- */
+
+.connection-status-inline {
+    display: flex;
+    align-items: center;
+    margin-left: 0.45rem;
+    margin-right: 0.125rem;
+    cursor: default;
+}
+
+/* Base status dot — shared by all contexts */
+.status-dot {
+    border-radius: 50%;
+    background: var(--text-muted);
+    flex-shrink: 0;
+}
+
+.status-dot.connected {
+    background: var(--accent-green);
+}
+
+.status-dot.disconnected {
+    background: var(--accent-red);
+}
+
+/* Size: standard (header) */
+.connection-status-inline .status-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+}
+
+/* Blink animation for standard-size dots */
+.connection-status-inline .status-dot.disconnected {
+    animation: progress-blink-red 0.6s ease-in-out infinite;
+}
+
+/* --- Header workspace selector --- */
+
+.pane-header-brand-label {
+    position: relative;
+}
+
+/* The workspace selector and its dim scrim are rebased onto the toast layer
+   (--z-toast = 2400) rather than --z-control-panel (2200): an explicitly-opened
+   selector must sit ON TOP of any toast (e.g. the persistent "Restart needed" /
+   "New version available" toast), which would otherwise paint over it. Tooltips
+   (--z-tooltip = 10000) stay above, so the refresh button's data-tooltip is
+   unaffected. The +40/+50 keeps the panel above its own scrim. */
+.control-panel-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: calc(var(--z-toast) + 40);
+    pointer-events: none;
+    background: rgba(0, 0, 0, 0.36);
+    animation: modal-in var(--duration-fast) ease;
+}
+
+.control-panel {
+    position: fixed;
+    z-index: calc(var(--z-toast) + 50);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    width: min(14rem, calc(100vw - 1rem));
+    max-height: min(24rem, calc(100vh - 1rem));
+    overflow-y: auto;
+    padding: 0.25rem;
+    box-shadow: var(--shadow-md);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-md);
+    white-space: normal;
+}
+
+.control-panel-empty {
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    padding: 0.625rem 0.75rem;
+}
+
+/* Workspace switcher loading skeleton — renders the real
+   `.control-panel-workspace-row` markup via the shared self-skeletonizing
+   primitives (Skeleton.tsx → `.sk-bar` leaves), so each row's height (min-height
+   2rem) matches a real switcher row exactly and the skeleton→list handoff doesn't
+   reflow. The `.sk-bar` fill + `shimmer` animation are shared (no bespoke skel
+   classes). */
+.control-panel-workspace-skel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+.control-panel-workspace-list {
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+/* The rows now live inside <LoadingFade>'s content wrapper (so the skeleton can
+   crossfade out over them), not as direct children of the flex list — re-apply
+   the row gap there so spacing is unchanged. The skeleton side carries its own
+   gap via `.control-panel-workspace-skel`. */
+.control-panel-workspace-list .loading-fade-content {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+.control-panel-workspace-row {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    min-height: 2rem;
+    padding: 0.4375rem 0.5rem;
+    color: var(--text-secondary);
+    text-decoration: none;
+    border: none;
+    background: transparent;
+    border-radius: 0.25rem;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: background 0.15s ease, color var(--duration-fast);
+}
+
+.control-panel-workspace-row.is-active {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+}
+
+@media (hover: hover) {
+    .control-panel-workspace-row:hover {
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+    }
+}
+
+.control-panel-workspace-row:focus-visible {
+    outline: none;
+    background: var(--bg-tertiary);
+}
+
+.control-panel-workspace-row .ws-picker-dot {
+    flex: 0 0 auto;
+}
+
+.control-panel-ws-name {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-weight: 600;
+    font-size: var(--font-size-md);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.control-panel-ws-port {
+    color: var(--text-muted);
+    margin-left: auto;
+    flex-shrink: 0;
+}
+
+/* The current workspace row is a static container (not a button/link); its
+   only interactive affordance is the refresh button. */
+.control-panel-current-row {
+    cursor: default;
+}
+
+/* On the current row the name only takes its content width so the checkmark
+   sits right behind it (rather than the name growing to fill the row). */
+.control-panel-ws-name-current {
+    flex: 0 1 auto;
+}
+
+.control-panel-ws-check {
+    width: 0.875rem;
+    height: 0.875rem;
+    color: var(--accent);
+    flex-shrink: 0;
+}
+
+/* Refresh button + the inline restart-confirm both sit at the trailing edge. */
+.control-panel-ws-refresh,
+.control-panel-ws-restart-confirm {
+    margin-left: auto;
+    flex-shrink: 0;
+}
+
+.control-panel-ws-refresh {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.5rem;
+    height: 1.5rem;
+    padding: 0;
+    border: none;
+    background: transparent;
+    border-radius: 0.25rem;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background var(--duration-fast), color var(--duration-fast);
+    touch-action: none;
+}
+
+.control-panel-ws-refresh svg {
+    width: 0.875rem;
+    height: 0.875rem;
+}
+
+.control-panel-ws-refresh:hover {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+}
+
+.control-panel-ws-refresh:focus-visible {
+    /* Shared --focus-ring, like every other icon button. */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+/* A restart is pending — draw attention to the refresh button. */
+.control-panel-ws-refresh.is-pending {
+    color: var(--accent);
+}
+
+/* An update is available — a small dot on the refresh button mirrors the brand
+   toggle's update badge inside the switcher. Non-interactive (the swallow contract
+   and long-press live on the button); the ring matches the active row's surface
+   (--bg-tertiary) so it reads as floating above the reload glyph. */
+.control-panel-ws-refresh-badge {
+    position: absolute;
+    top: 0.1875rem;
+    right: 0.1875rem;
+    width: 0.4375rem;
+    height: 0.4375rem;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 0.0625rem var(--bg-tertiary);
+    pointer-events: none;
+}
+
+.control-panel-ws-restart-confirm {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.control-panel-ws-cancel,
+.control-panel-ws-confirm {
+    border: none;
+    border-radius: 0.25rem;
+    padding: 0.1875rem 0.5rem;
+    font: inherit;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background var(--duration-fast), color var(--duration-fast);
+}
+
+.control-panel-ws-cancel {
+    background: transparent;
+    color: var(--text-muted);
+}
+
+.control-panel-ws-cancel:hover {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+}
+
+.control-panel-ws-confirm {
+    background: var(--accent-action);
+    color: var(--text-on-accent);
+}
+
+.control-panel-ws-confirm:hover {
+    background: color-mix(in srgb, var(--accent-action) 80%, #fff);
+}
+
+.control-panel-manage-row {
+    margin-top: 0.125rem;
+    border-top: 1px solid var(--border-color);
+    border-radius: 0;
+    padding-top: 0.5625rem;
+}
+
+/* Brand badge — flex sibling of the title (not a child), so the title can
+   keep overflow:hidden / text-overflow:ellipsis and truncate when narrow.
+   Negative margin tucks the badge over the trailing character of the title;
+   it shifts up so it sits above the baseline like a notification dot. */
+.brand-badge {
+    position: relative;
+    /* Nudged a little lower than a strict superscript so the "!" / spinner sits
+       closer to the title's cap height. */
+    top: -0.25rem;
+    /* Reset right from the base .badge absolute-positioning rule */
+    right: auto;
+    margin-left: -0.25rem;
+    flex-shrink: 0;
+}
+
+/* Building-a-new-version badge: a spinning refresh glyph in place of the "!".
+   Inherits the badge's white-on-accent color via currentColor. */
+.brand-badge-spinner {
+    display: inline-flex;
+    animation: spin 1s linear infinite;
+}
+
+.brand-badge-spinner svg {
+    display: block;
+    width: 0.625rem;
+    height: 0.625rem;
+}
+
+/* Slightly smaller on mobile — the badge rides a tighter header bar there, so
+   trim the base .badge box + the spinner glyph a notch. */
+@media (max-width: 768px) {
+    .brand-badge {
+        font-size: var(--font-size-3xs);
+        min-width: 0.75rem;
+        min-height: 0.75rem;
+        line-height: 0.75rem;
+        border-radius: 0.5rem;
+    }
+
+    .brand-badge-spinner svg {
+        width: 0.5625rem;
+        height: 0.5625rem;
+    }
+}
+
+/* ─── Brand-blue header: light foreground inversion ──────────────────────────
+   The header bar (.pane-header.app-header) is painted with --header-gradient,
+   so every glyph and label in the BAR flips to the light --header-* scale
+   (defined on .pane-header above). These rules live at the END of shell.css so
+   source order wins over the equal-specificity .app-header ... rules in the
+   desktop media block above. They cover desktop AND mobile (the mobile header
+   is the same element, .pane-header.app-header).
+
+   Popout panels that render *inside* the header subtree (filter dropdown,
+   anchored dropdowns) are NOT part of the blue bar:
+   they reset the --header-* tokens to the normal dark-on-light values at the
+   bottom of this block, so the same selectors render them conventionally. */
+
+.app-header .icon-btn {
+    color: var(--header-fg-muted);
+}
+
+.app-header .icon-btn.pinned,
+.app-header .icon-btn.filter-active,
+.app-header .icon-btn.view-selector-active {
+    color: var(--header-fg);
+    background: var(--header-control-active-bg);
+}
+
+.app-header .icon-btn:focus-visible {
+    /* Recolor the shared ring to the header foreground — the accent ring is
+       low-contrast on the blue header bar. The .icon-btn rule reads this
+       overridden --focus-ring for its box-shadow. */
+    --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--header-fg) 55%, transparent);
+}
+
+@media (hover: hover) {
+    .app-header .icon-btn:hover {
+        color: var(--header-fg);
+        background: var(--header-control-hover-bg);
+    }
+
+    .app-header .icon-btn.filter-active:hover,
+    .app-header .icon-btn.view-selector-active:hover {
+        color: var(--header-fg);
+        background: rgba(255, 255, 255, 0.3);
+    }
+}
+
+/* Titles + labels rendered directly on the bar. */
+.app-header .pane-header-title,
+.app-header .threads-header-title,
+.app-header .pane-header-content-title,
+.app-header .pane-header-title-text,
+.app-header .panel-url-title {
+    color: var(--header-fg);
+}
+
+.app-header .workspace-name-label {
+    color: var(--header-fg-muted);
+}
+
+/* The threads search field is a transparent input riding directly on the bar,
+   so its text, caret, placeholder, and leading icon all flip light. */
+.app-header .thread-search-bar-icon {
+    color: var(--header-fg-muted);
+}
+
+.app-header .thread-search-input {
+    color: var(--header-fg);
+    caret-color: var(--header-fg);
+}
+
+.app-header .thread-search-input::placeholder {
+    color: var(--header-fg-muted);
+}
+
+/* Count badges (notification bell, brand update count): a white pill with blue
+   text, so they read against the bar instead of vanishing into the blue. */
+.app-header .badge {
+    background: var(--header-badge-bg);
+    color: var(--header-badge-fg);
+}
+
+/* Connection dot rides directly on the bar. The theme --accent-green /
+   --accent-red DARKEN in light mode (#1a7f37 / #cf222e) and go muddy on the
+   blue bar, so override the TOKENS (not `background`) to bright values that read
+   on both the light-blue and dark-navy header. Overriding the token — rather
+   than `background` — is REQUIRED for the disconnected dot: its blink keyframe
+   (progress-blink-red) animates `background` via var(--accent-red), and an
+   animation beats a static declaration, so only a token override reaches it.
+   --text-muted (the connecting/unknown fill) flips to a faint white so it
+   isn't a near-invisible grey on the bar. The .connected/.disconnected base
+   rules then resolve these from the dot's own computed values. */
+.app-header .connection-status-inline .status-dot {
+    --accent-green: #3fb950;
+    --accent-red: #f85149;
+    --text-muted: var(--header-fg-muted);
+}
+
+/* Popout panels anchored in the header subtree are normal surfaces — restore
+   the default token values so the selectors above render dark-on-light there. */
+.app-header .thread-filter-dropdown,
+.app-header .dropdown-menu,
+.app-header .nav-history-menu {
+    --header-fg: var(--text-primary);
+    --header-fg-muted: var(--text-secondary);
+    --header-control-hover-bg: var(--bg-hover);
+    --header-control-active-bg: var(--bg-tertiary);
+    --header-badge-bg: var(--accent);
+    --header-badge-fg: #ffffff;
+    /* Undo the bar's base light color so inherited text in the popout reads
+       dark-on-light again. */
+    color: var(--text-primary);
+}

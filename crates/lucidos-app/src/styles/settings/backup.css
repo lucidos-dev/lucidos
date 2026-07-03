@@ -1,0 +1,60 @@
+/* Backup health card — surfaces running / last-run / staleness at the top of
+   the Backup section so the page answers "is my data backed up?" at a glance. */
+.backup-health-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-bottom: 0.75rem;
+    padding: 0.5rem 0.625rem;
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    background: var(--bg-primary);
+    font-size: var(--font-size-sm);
+}
+
+.backup-health-line {
+    color: var(--text-primary);
+}
+
+.backup-health-ok {
+    color: var(--text-muted);
+}
+
+.backup-health-success {
+    color: var(--accent-green);
+}
+
+.backup-health-error {
+    color: var(--accent-red);
+}
+
+.backup-health-muted {
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+/* Severity tints — a subtle accent wash over the card surface, with the neutral
+   border kept (matches the rest of Lucidos's inline notices). No heavy colored
+   border. */
+
+/* No recent good backup, but the last run didn't fail — a soft warning. */
+.backup-health-card[data-state="stale"] {
+    background: color-mix(in srgb, var(--accent-yellow) 8%, var(--bg-primary));
+}
+
+/* Last run failed — escalate the whole card to the error hue so a failure never
+   sits inside a cheerful yellow box. */
+.backup-health-card[data-state="error"] {
+    background: color-mix(in srgb, var(--accent-red) 8%, var(--bg-primary));
+}
+
+.backup-health-warn {
+    color: var(--accent-yellow);
+    font-weight: 600;
+}
+
+/* "View backups folder" deep link under the provider row. */
+.backup-folder-link-row {
+    margin-bottom: 0.75rem;
+    font-size: var(--font-size-xs);
+}

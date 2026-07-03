@@ -1,0 +1,806 @@
+/* File preview styles (used by FilePreviewInline) */
+
+/* highlight.js syntax theme — maps to --syntax-* CSS variables */
+.hljs-keyword,
+.hljs-literal { color: var(--syntax-keyword); }
+
+.hljs-built_in,
+.hljs-title.class_,
+.hljs-type { color: var(--syntax-type); }
+
+.hljs-title.function_,
+.hljs-title.invoke__ { color: var(--syntax-function); }
+
+.hljs-title { color: var(--syntax-key); }
+
+.hljs-attr,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-property,
+.hljs-selector-id { color: var(--syntax-key); }
+
+.hljs-string,
+.hljs-symbol,
+.hljs-regexp { color: var(--syntax-string); }
+
+.hljs-number { color: var(--syntax-number); }
+
+.hljs-comment,
+.hljs-doctag { color: var(--syntax-comment); font-style: italic; }
+
+.hljs-meta,
+.hljs-meta .hljs-keyword { color: var(--syntax-control); }
+
+.hljs-operator,
+.hljs-punctuation { color: var(--text-secondary); }
+
+.hljs-tag,
+.hljs-name,
+.hljs-selector-tag { color: var(--syntax-keyword); }
+
+.hljs-selector-class,
+.hljs-selector-pseudo { color: var(--syntax-type); }
+
+.hljs-section { color: var(--syntax-function); font-weight: 600; }
+
+.hljs-addition { color: var(--accent-green); }
+.hljs-deletion { color: var(--accent-red); }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 700; }
+
+/* CSV table */
+.csv-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--font-size-sm);
+}
+
+.csv-table th,
+.csv-table td {
+    padding: 0.5rem 0.75rem;
+    text-align: left;
+    border: 1px solid var(--border-color);
+}
+
+.csv-table th {
+    background: var(--bg-tertiary);
+    color: var(--accent);
+    font-weight: 600;
+}
+
+@media (hover: hover) {
+    .csv-table tr:hover {
+        background: var(--bg-hover);
+    }
+}
+
+/* Context-scoped override: shrink markdown inside the file-preview pane. The
+ * base `.markdown-content` rules (headings, lists, links, code, hr, strong, …)
+ * live ONCE in styles/global/shared-components.css — the single source of truth
+ * that's also served to app iframes. Don't re-add base markdown rules here. */
+.file-preview-content .markdown-content {
+    font-size: var(--font-size-md);
+    line-height: 1.4;
+    color: var(--text-primary);
+}
+
+/* ===== Credentials Panel ===== */
+
+.settings-panel {
+    /* --space-lg (1rem) gutter shared across content-pane views — the Settings
+       view lines its content up with the notification/apps/plugins/list views.
+       This is the side room the settings-row nav-focus marker clears within (see
+       settings/base.css). */
+    padding: var(--space-lg);
+}
+
+
+/* ===== Inline Form (panel pane forms) ===== */
+
+.inline-form {
+    padding: 1rem;
+    overflow-y: auto;
+    height: 100%;
+}
+
+
+/* Instructions callout — raised neutral surface only; no left accent bar (see
+   .claude/rules/frontend.md — left-accent stripes on callouts are forbidden). */
+.credential-instructions {
+    margin: 0 0 0.75rem 0;
+    padding: 0.625rem 0.875rem;
+    background: var(--bg-tertiary);
+    border-radius: 0.25rem;
+    color: var(--text-secondary);
+    font-size: 0.9em;
+    /* Engine emits multi-line prompts (numbered steps) — preserve newlines. */
+    white-space: pre-wrap;
+}
+
+.credential-oauth-endpoints {
+    margin-top: 0.5rem;
+    margin-bottom: 0.75rem;
+    padding: 0.5rem 0.75rem;
+    background: var(--bg-tertiary);
+    border-radius: 0.25rem;
+}
+
+.credential-oauth-endpoints > summary {
+    cursor: pointer;
+    color: var(--text-secondary);
+    font-size: 0.85em;
+    padding: 0.25rem 0;
+    user-select: none;
+}
+
+.credential-oauth-endpoints[open] > summary {
+    margin-bottom: 0.5rem;
+}
+
+/* ===== Plugin install panel ===== */
+
+.plugin-install-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    max-width: 50rem;
+}
+
+.plugin-install-header h2 {
+    margin: 0 0 0.5rem 0;
+    font-size: var(--font-size-2xl);
+    color: var(--text-primary);
+}
+
+/* The -row modifier (used by both the install and uninstall panels): title
+   block on the left, a top-right copy of the action buttons on the right. */
+.plugin-install-header-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+
+.plugin-install-header-text {
+    flex: 1;
+    min-width: 0;
+}
+
+.plugin-install-actions-top {
+    margin-top: 0;
+    flex-shrink: 0;
+}
+
+.plugin-install-title-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+}
+
+.plugin-install-name {
+    font-size: var(--font-size-3xl);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.plugin-install-version {
+    color: var(--text-muted);
+    font-size: var(--font-size-lg);
+    font-family: monospace;
+}
+
+.plugin-install-description {
+    margin: 0.375rem 0 0 0;
+    color: var(--text-secondary);
+    /* App primary body-text size (matches .response-content) so it reads as
+       normal prose, not oversized next to the panel's dense text. */
+    font-size: var(--font-size-sm);
+}
+
+.plugin-install-section {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    padding: 0.75rem 0.875rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.plugin-install-label {
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.plugin-install-source-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    justify-content: space-between;
+}
+
+.plugin-install-source-type {
+    font-size: var(--font-size-sm);
+    padding: 0.125rem 0.5rem;
+    border-radius: 0.25rem;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
+}
+
+.plugin-install-source-value {
+    background: var(--bg-tertiary);
+    padding: 0.375rem 0.5rem;
+    border-radius: 0.25rem;
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+    overflow-x: auto;
+    white-space: nowrap;
+}
+
+.plugin-install-files {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 12.5rem;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+.plugin-install-file {
+    font-family: monospace;
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+    padding: 0.1875rem 0.375rem;
+    border-radius: 0.1875rem;
+}
+
+.plugin-install-file-overwrite {
+    color: var(--accent-red);
+}
+
+.plugin-install-overwrites {
+    border-color: color-mix(in srgb, var(--accent-red) 35%, var(--border-color));
+}
+
+.plugin-install-warning-text {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: var(--font-size-md);
+}
+
+.plugin-install-empty {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+}
+
+.plugin-install-setup-body {
+    color: var(--text-primary);
+    /* App primary body-text size (matches .response-content). */
+    font-size: var(--font-size-sm);
+    line-height: 1.5;
+}
+
+.plugin-install-setup-body p:first-child {
+    margin-top: 0;
+}
+
+.plugin-install-setup-body p:last-child {
+    margin-bottom: 0;
+}
+
+.plugin-install-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+}
+
+/* ===== Apps panel + Plugins panel shared controls ===== */
+
+/* Plugins panel top filter row — holds the All | Installed segmented toggle
+   (.segmented-control, from shared-components.css) that narrows the one unified
+   catalog list. Shares the content-pane --space-lg (1rem) horizontal gutter so
+   the toggle lines up with the .list-row plugin rows below (and the
+   .apps-search-bar / .app-store-category-filter, all on --space-lg). */
+.plugins-filter-bar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin: var(--space-md) var(--space-lg) var(--space-sm);
+}
+
+.apps-search-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    margin: 0 var(--space-lg) var(--space-sm);
+    padding: var(--space-xs) var(--space-sm);
+    background: var(--bg-tertiary);
+    border-radius: 0.375rem;
+}
+
+.apps-search-icon {
+    flex: 0 0 auto;
+    width: 0.875rem;
+    height: 0.875rem;
+    color: var(--text-muted);
+}
+
+.apps-search-input {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    font-family: inherit;
+    padding: 0.125rem 0;
+}
+
+/* Installed-app marketplace + update labels */
+.app-row-title-line {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+    min-width: 0;
+}
+
+.app-row-title-line .list-row-name {
+    min-width: 0;
+}
+
+.app-marketplace-chip {
+    flex: 0 0 auto;
+    padding: 0.0625rem 0.375rem;
+    border-radius: 999px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+}
+
+.app-update-chip {
+    flex: 0 0 auto;
+    padding: 0.0625rem 0.375rem;
+    border-radius: 999px;
+    color: var(--accent);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border-color));
+    font-size: var(--font-size-xs);
+    font-weight: 700;
+}
+
+/* ===== Store tab (plugin catalog) + Marketplaces settings ===== */
+
+.app-store-marketplace-form {
+    display: grid;
+    grid-template-columns: minmax(14rem, 1fr) minmax(8rem, 14rem) auto;
+    gap: 0.5rem;
+    min-width: 0;
+    margin-bottom: 0.625rem;
+}
+
+.app-store-marketplace-form .settings-text-input {
+    min-width: 0;
+    width: 100%;
+}
+
+.app-store-empty {
+    padding: var(--space-md) var(--space-lg);
+    color: var(--text-muted);
+}
+
+.app-store-empty p {
+    margin: 0;
+}
+
+/* Empty-state suggestion: prompt text, the one-click "official marketplace"
+ * button, then the "register your own" fallback link, stacked and left-aligned.
+ * Reused in the Plugins panel catalog empty state and (with extra top spacing)
+ * under the Settings → Marketplaces "No marketplaces registered." row. */
+.app-store-empty-suggest {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.625rem;
+}
+
+.app-store-empty-suggest-settings {
+    margin-top: 0.5rem;
+}
+
+.app-store-empty-alt {
+    color: var(--text-muted);
+    font-size: var(--font-size-md);
+}
+
+.app-store-muted-row {
+    padding: var(--space-sm) var(--space-lg);
+    color: var(--text-muted);
+    font-size: var(--font-size-md);
+}
+
+.app-store-source-value {
+    display: block;
+    max-width: min(42rem, 100%);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    background: transparent;
+}
+
+/* Store cards stack as a column with the action buttons pinned to the
+   bottom-right — the same bottom placement the installed-app rows use — instead
+   of floating beside the (tall) title block at the top-right. The base
+   .list-row keeps justify-content: space-between, so in column direction the
+   info block sits at the top and the actions settle at the bottom. */
+.app-store-plugin-row {
+    flex-direction: column;
+    align-items: stretch;
+}
+
+/* Uniform gap for the navigation focus marker on a plugin row (a plugins
+   deep-link / Search-Everywhere jump). The marker (.nav-focus-stuck outline,
+   host-components.css) hugs the row's padding box, and a .list-row is padded
+   0.5rem top/bottom but 1rem left/right — so here the marker's SIDE gaps dwarf its
+   top/bottom (the mirror of the settings-row case). Shrink the sides to the same
+   0.5rem with a padding / positive margin pair that cancels for layout: the row is
+   a stretch flex item in .list-rows, so it keeps its content-box width and the
+   content stays put while the box (and its outline) pull inward to an even gap.
+   The box only shrinks inward, so the outline can't clip. */
+.app-store-plugin-row.nav-focus-stuck {
+    padding-left: 0.5rem;
+    padding-right: 0.5rem;
+    margin-left: 0.5rem;
+    margin-right: 0.5rem;
+}
+
+.app-store-plugin-row .list-row-actions {
+    align-self: flex-end;
+}
+
+.app-store-plugin-title-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    min-width: 0;
+}
+
+.app-store-plugin-title-row .list-row-name {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.app-store-status {
+    flex: 0 0 auto;
+    padding: 0.125rem 0.375rem;
+    border-radius: 999px;
+    border: 1px solid var(--border-color);
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+    font-weight: 700;
+    line-height: 1.2;
+}
+
+.app-store-status-update_available {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 35%, var(--border-color));
+}
+
+.app-store-status-installed {
+    color: var(--accent-green);
+    border-color: color-mix(in srgb, var(--accent-green) 35%, var(--border-color));
+}
+
+/* "Modified" badge — the plugin's shipped content has been locally edited
+   (a future update overwrites it). Amber to read as caution, matching the
+   status-pill shape it sits beside. */
+.app-store-modified-chip {
+    flex: 0 0 auto;
+    padding: 0.125rem 0.375rem;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--accent-yellow) 35%, var(--border-color));
+    color: var(--accent-yellow);
+    font-size: var(--font-size-xs);
+    font-weight: 700;
+    line-height: 1.2;
+    cursor: default;
+}
+
+.app-store-plugin-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+    margin-top: 0.375rem;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+}
+
+.app-store-content-chip {
+    padding: 0.0625rem 0.3125rem;
+    border-radius: 0.25rem;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+}
+
+.app-store-category-chip {
+    padding: 0.0625rem 0.3125rem;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--accent);
+}
+
+/* Category filter bar above the catalog list. Shares the content-pane --space-lg
+   (1rem) horizontal gutter with the .plugins-filter-bar / .apps-search-bar
+   controls above and the plugin rows below, so the pills line up instead of
+   sitting flush against the panel edge. */
+.app-store-category-filter {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+    padding: 0 var(--space-lg) var(--space-sm);
+}
+
+.app-store-category-pill {
+    padding: 0.1875rem 0.625rem;
+    border-radius: 999px;
+    border: 1px solid var(--border-color);
+    background: transparent;
+    color: var(--text-secondary);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.app-store-category-pill:hover {
+    border-color: color-mix(in srgb, var(--accent) 40%, var(--border-color));
+}
+
+.app-store-category-pill.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-contrast, #fff);
+}
+
+/* Placeholder pill rendered while the catalog loads (StoreTabSkeleton). Its
+   height matches a real .app-store-category-pill (font-size var(--font-size-sm)
+   = 0.75rem at the default line-height + 0.1875rem vertical padding + 1px border
+   ≈ 1.375rem) so the list rows below don't jump down once the real pills appear.
+   Reuses the shared `shimmer` keyframes (drawer.css). Width is set inline per pill. */
+.app-store-category-pill-skeleton {
+    height: 1.375rem;
+    border-radius: 999px;
+    background: linear-gradient(
+        90deg,
+        var(--bg-tertiary) 25%,
+        color-mix(in srgb, var(--accent) 18%, var(--bg-tertiary)) 50%,
+        var(--bg-tertiary) 75%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .app-store-category-pill-skeleton {
+        animation: none;
+    }
+}
+
+/* A plugin row deep-link (navigate_ui target `plugins`) scrolls to the row and
+   applies the shared NAVIGATION FOCUS MARKER (.nav-focus-stuck,
+   styles/global/host-components.css, via components/shared/focusMarker.ts) — same
+   sticky border that fades on dismiss as chat and settings. See StoreTab.tsx. */
+
+/* Error rows read from the red error text — no left accent stripe (see
+   .claude/rules/frontend.md — left-accent stripes on notices are forbidden). */
+.app-store-error-row .list-row-details {
+    color: var(--accent-red);
+}
+
+.app-store-marketplaces + .app-store-errors,
+.app-store-muted-row + .app-store-errors {
+    margin-top: 0.625rem;
+}
+
+@media (max-width: 760px) {
+    .app-store-marketplace-form {
+        grid-template-columns: 1fr;
+    }
+
+    .app-store-plugin-title-row {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 0.25rem;
+    }
+}
+
+.form-group {
+    margin-bottom: 1rem;
+}
+
+.form-group label {
+    display: block;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    margin-bottom: 0.375rem;
+}
+
+.form-group input {
+    width: 100%;
+    padding: 0.625rem 0.75rem;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-md);
+    outline: none;
+    transition: border-color 0.2s;
+}
+
+.form-group input:focus {
+    border-color: var(--accent);
+}
+
+.form-group .dropdown {
+    width: 100%;
+}
+
+.form-group .dropdown-input-wrap {
+    width: 100%;
+    background: var(--bg-tertiary);
+    border-radius: 0.25rem;
+}
+
+.form-group .dropdown-input {
+    padding: 0.625rem 0.75rem;
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+}
+
+.form-group label.form-checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    cursor: pointer;
+    margin-bottom: 0;
+}
+
+.form-group .form-checkbox-row input[type="checkbox"] {
+    width: auto;
+    margin: 0;
+    cursor: pointer;
+}
+
+/* Vertical stack of checkbox rows (e.g. the trigger side-effect grant). */
+.form-group .form-checkbox-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    margin-top: 0.25rem;
+}
+
+.form-group .dropdown-trigger {
+    width: 100%;
+    padding: 0.625rem 0.75rem;
+    background: var(--bg-tertiary);
+    border-radius: 0.25rem;
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+}
+
+.form-group .dropdown-option {
+    padding: 0.5rem 0.75rem;
+    font-size: var(--font-size-md);
+}
+
+.form-group input::placeholder {
+    color: var(--text-muted);
+}
+
+.form-group input:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+/* Masked secret field with reveal toggle (SecretInput) */
+.secret-input {
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+
+.secret-input input {
+    /* leave room for the eye toggle so text doesn't slide under it */
+    padding-right: 2.25rem;
+}
+
+.secret-input-toggle {
+    position: absolute;
+    right: 0.375rem;
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.75rem;
+    height: 1.75rem;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: color 0.2s;
+}
+
+.secret-input-toggle:hover {
+    color: var(--text-primary);
+}
+
+.secret-input-toggle svg {
+    width: 1rem;
+    height: 1rem;
+}
+
+.form-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 1.25rem;
+    padding-top: 1rem;
+}
+
+.form-actions .btn-cancel {
+    background: none;
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    padding: 0.375rem 0.75rem;
+    color: var(--text-secondary);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+@media (hover: hover) {
+    .form-actions .btn-cancel:hover {
+        color: var(--text-primary);
+        border-color: var(--text-secondary);
+    }
+}
+
+.form-actions .btn-save {
+    /* Shared action-button blue (see .action-btn) so every filled blue CTA
+       tracks one token across themes. */
+    background: var(--accent-action);
+    border: none;
+    border-radius: 0.25rem;
+    padding: 0.375rem 0.75rem;
+    color: var(--text-on-accent);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+@media (hover: hover) {
+    .form-actions .btn-save:hover {
+        background: color-mix(in srgb, var(--accent-action) 80%, #fff);
+    }
+}

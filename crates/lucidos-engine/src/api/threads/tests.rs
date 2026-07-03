@@ -1,0 +1,260 @@
+use super::events_snapshot::{
+    strip_context_capture_sections, strip_image_content_in_tool_result, strip_tool_result_content,
+};
+use super::search::{combined_score, dampen_text_score, TEXT_MATCH_DAMPEN_THRESHOLD};
+use crate::core::ThreadEventRow;
+use chrono::Utc;
+use serde_json::json;
+use uuid::Uuid;
+
+fn row(event_type: &str, payload: serde_json::Value) -> ThreadEventRow {
+    ThreadEventRow {
+        sequence: 1,
+        event_type: event_type.to_string(),
+        payload,
+        created: Utc::now(),
+        event_id: Uuid::new_v4(),
+    }
+}
+
+#[test]
+fn read_time_strip_replaces_image_content_in_tool_result() {
+    let huge_b64 = "A".repeat(2 * 1024 * 1024);
+    let mut row = row(
+        "ToolResult",
+        json!({
+            "name": "read_file",
+            "result": format!("[IMAGE_CONTENT:image/png]\n{}", huge_b64),
+            "images": [],
+        }),
+    );
+    let original_size = row.payload["result"].as_str().unwrap().len();
+    assert!(original_size > 1_000_000, "setup: payload should be huge");
+
+    strip_image_content_in_tool_result(&mut row);
+
+    let stripped = row.payload["result"].as_str().unwrap();
+    assert!(stripped.len() < 100, "stripped to {} bytes", stripped.len());
+    assert!(stripped.contains("image/png"));
+}
+
+#[test]
+fn read_time_strip_leaves_non_image_tool_results_alone() {
+    let mut row = row(
+        "ToolResult",
+        json!({ "name": "list_files", "result": "file1.txt\nfile2.txt", "images": [] }),
+    );
+    strip_image_content_in_tool_result(&mut row);
+    assert_eq!(row.payload["result"], "file1.txt\nfile2.txt");
+}
+
+#[test]
+fn read_time_strip_ignores_non_tool_result_events() {
+    let mut row = row(
+        "MessageReceived",
+        json!({ "text": "[IMAGE_CONTENT:image/png]\nABCD" }),
+    );
+    let before = row.payload.clone();
+    strip_image_content_in_tool_result(&mut row);
+    assert_eq!(row.payload, before, "unrelated events untouched");
+}
+
+#[test]
+fn read_time_strip_handles_missing_result_field() {
+    let mut row = row("ToolResult", json!({ "name": "x", "images": [] }));
+    let before = row.payload.clone();
+    strip_image_content_in_tool_result(&mut row);
+    assert_eq!(row.payload, before, "missing result field is a no-op");
+}
+
+#[test]
+fn context_capture_strip_drops_sections_and_tools_stamps_marker() {
+    let mut row = row(
+        "ContextCaptured",
+        json!({
+            "producer": "main_llm",
+            "model": "claude-opus-4-7",
+            "context_window": 200_000,
+            "sections": [
+                { "name": "system", "char_count": 10_000, "content": "A".repeat(10_000) },
+                { "name": "history", "char_count": 5_000 },
+            ],
+            "tools": ["search", "edit"],
+            "estimated_total_tokens": 4_200,
+            "usage": { "input_tokens": 4_100, "output_tokens": 50, "cache_read_tokens": 0, "cache_creation_tokens": 0 },
+            "trimmed": false,
+        }),
+    );
+    strip_context_capture_sections(&mut row);
+    let obj = row.payload.as_object().unwrap();
+    assert!(!obj.contains_key("sections"), "sections must be dropped");
+    assert!(!obj.contains_key("tools"), "tools must be dropped");
+    assert_eq!(obj.get("sections_stripped"), Some(&json!(true)));
+    // Lightweight fields preserved so the inline chip still renders.
+    assert_eq!(obj.get("producer"), Some(&json!("main_llm")));
+    assert_eq!(obj.get("model"), Some(&json!("claude-opus-4-7")));
+    assert_eq!(obj.get("context_window"), Some(&json!(200_000)));
+    assert_eq!(obj.get("estimated_total_tokens"), Some(&json!(4_200)));
+    assert!(obj.get("usage").is_some(), "usage preserved");
+}
+
+#[test]
+fn context_capture_strip_ignores_other_event_types() {
+    let mut row = row(
+        "ToolCalled",
+        json!({ "name": "do_thing", "args": {}, "sections": ["should_not_be_touched"] }),
+    );
+    let before = row.payload.clone();
+    strip_context_capture_sections(&mut row);
+    assert_eq!(row.payload, before);
+}
+
+#[test]
+fn context_capture_strip_is_idempotent() {
+    let mut row = row(
+        "ContextCaptured",
+        json!({
+            "producer": "main_llm",
+            "model": "m",
+            "context_window": 1,
+            "sections": [],
+            "tools": [],
+            "estimated_total_tokens": 0,
+            "trimmed": false,
+        }),
+    );
+    strip_context_capture_sections(&mut row);
+    let after_first = row.payload.clone();
+    strip_context_capture_sections(&mut row);
+    assert_eq!(row.payload, after_first, "second call is a no-op");
+}
+
+#[test]
+fn tool_result_strip_drops_result_keeps_name_and_images_stamps_marker() {
+    let huge_output = "bash output line\n".repeat(10_000);
+    let mut row = row(
+        "ToolResult",
+        json!({
+            "name": "run_bash",
+            "result": huge_output,
+            "images": ["abc123", "def456"],
+        }),
+    );
+    strip_tool_result_content(&mut row);
+    let obj = row.payload.as_object().unwrap();
+    assert!(!obj.contains_key("result"), "result must be dropped");
+    assert_eq!(obj.get("result_stripped"), Some(&json!(true)));
+    // Inline step row still needs the tool name + images (the chat
+    // exchange renders generated images inline via the existing
+    // `ToolResult` handler in thread-events.ts).
+    assert_eq!(obj.get("name"), Some(&json!("run_bash")));
+    assert_eq!(obj.get("images"), Some(&json!(["abc123", "def456"])));
+}
+
+#[test]
+fn tool_result_strip_ignores_other_event_types() {
+    let mut row = row(
+        "ContextCaptured",
+        json!({ "producer": "main_llm", "result": "should_not_be_touched" }),
+    );
+    let before = row.payload.clone();
+    strip_tool_result_content(&mut row);
+    assert_eq!(row.payload, before);
+}
+
+#[test]
+fn tool_result_strip_is_idempotent() {
+    let mut row = row(
+        "ToolResult",
+        json!({ "name": "x", "result": "out", "images": [] }),
+    );
+    strip_tool_result_content(&mut row);
+    let after_first = row.payload.clone();
+    strip_tool_result_content(&mut row);
+    assert_eq!(row.payload, after_first, "second call is a no-op");
+}
+
+#[test]
+fn tool_result_strip_handles_missing_result_field() {
+    // Image-only tool result — no `result` string was ever written.
+    let mut row = row("ToolResult", json!({ "name": "x", "images": ["abc"] }));
+    strip_tool_result_content(&mut row);
+    let obj = row.payload.as_object().unwrap();
+    assert!(!obj.contains_key("result"), "no result to begin with");
+    assert_eq!(obj.get("result_stripped"), Some(&json!(true)));
+    assert_eq!(obj.get("images"), Some(&json!(["abc"])));
+}
+
+/// A focused thread (few messages) keeps its full text score.
+#[test]
+fn dampen_preserves_score_for_focused_threads() {
+    assert_eq!(dampen_text_score(0.7, 1), 0.7);
+    assert_eq!(dampen_text_score(0.7, 50), 0.7);
+    assert_eq!(dampen_text_score(0.7, TEXT_MATCH_DAMPEN_THRESHOLD), 0.7);
+}
+
+/// A catch-all thread with thousands of messages must be crushed below the
+/// pure-semantic floor so it can't outrank focused thematic matches.
+#[test]
+fn dampen_crushes_huge_catch_all_threads() {
+    let dampened = dampen_text_score(0.7, 2023);
+    assert!(
+        dampened < 0.05,
+        "2023-msg thread should drop to noise; got {}",
+        dampened
+    );
+}
+
+/// A focused 6-message thread that fully matches must outrank a 2000-msg
+/// catch-all that happens to mention the tokens — even with both contributing
+/// the same raw text + semantic signal.
+#[test]
+fn focused_thread_outranks_catch_all_after_dampening() {
+    let focused = combined_score(Some(dampen_text_score(0.7, 6)), Some(0.89));
+    let catch_all = combined_score(Some(dampen_text_score(0.7, 2023)), Some(0.87));
+    assert!(
+        focused > catch_all,
+        "focused {} must outrank catch-all {}",
+        focused,
+        catch_all
+    );
+}
+
+/// Pure semantic noise must never outrank a real text content match.
+/// Multilingual-e5-small produces ~0.85+ similarity for almost any pair, so
+/// MAX(text=0.7, semantic=0.88) used to let unrelated threads dominate.
+#[test]
+fn text_match_outranks_pure_semantic_noise() {
+    let text = combined_score(Some(0.7), None);
+    let noise = combined_score(None, Some(0.88));
+    assert!(
+        text > noise,
+        "text {} must outrank semantic {}",
+        text,
+        noise
+    );
+}
+
+#[test]
+fn both_signals_outrank_either_alone() {
+    let both = combined_score(Some(0.7), Some(0.9));
+    let text_only = combined_score(Some(0.7), None);
+    let semantic_only = combined_score(None, Some(0.9));
+    assert!(both > text_only);
+    assert!(both > semantic_only);
+    assert!(
+        (both - 1.15).abs() < 1e-9,
+        "0.7 + 0.5*0.9 = 1.15, got {}",
+        both
+    );
+}
+
+#[test]
+fn semantic_only_is_halved() {
+    assert!((combined_score(None, Some(0.88)) - 0.44).abs() < 1e-9);
+}
+
+#[test]
+fn empty_signals_score_zero() {
+    assert_eq!(combined_score(None, None), 0.0);
+}

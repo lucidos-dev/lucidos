@@ -1,0 +1,217 @@
+/* Directory Picker */
+.dir-picker {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    width: min(32rem, calc(100vw - 2rem));
+    max-height: min(28rem, calc(100vh - 4rem));
+    display: flex;
+    flex-direction: column;
+    box-shadow: var(--shadow-lg);
+    overflow: hidden;
+}
+
+.dir-picker-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.75rem 1rem;
+}
+
+.dir-picker-title {
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.dir-picker-breadcrumb {
+    padding: 0.5rem 1rem;
+    min-height: 2rem;
+    display: flex;
+    align-items: center;
+}
+
+.dir-picker-segments {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.125rem;
+    cursor: text;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.dir-picker-segment {
+    font-size: var(--font-size-sm);
+    color: var(--accent);
+    cursor: pointer;
+    padding: 0.0625rem 0.125rem;
+    border-radius: 0.125rem;
+}
+
+@media (hover: hover) {
+    .dir-picker-segment:hover {
+        background: color-mix(in srgb, var(--accent) 15%, transparent);
+    }
+}
+
+.dir-picker-sep {
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+}
+
+.dir-picker-path-input {
+    width: 100%;
+    background: var(--bg-primary);
+    border: 1px solid var(--accent);
+    border-radius: 0.1875rem;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-sm);
+    padding: 0.25rem 0.375rem;
+    outline: none;
+}
+
+.dir-picker-list {
+    flex: 1;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    min-height: 8rem;
+    max-height: 16rem;
+    outline: none;
+}
+
+.dir-picker-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    padding: 0.375rem 1rem;
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-family: var(--font-ui);
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+    text-align: left;
+}
+
+@media (hover: hover) {
+    .dir-picker-row:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.dir-picker-row.selected {
+    background: var(--bg-hover);
+}
+
+.dir-picker-icon {
+    font-size: var(--font-size-lg);
+    flex-shrink: 0;
+}
+
+.dir-picker-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.dir-picker-empty {
+    padding: 1.5rem 1rem;
+    text-align: center;
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+}
+
+.dir-picker-error {
+    color: var(--accent-red);
+}
+
+.dir-picker-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.625rem 1rem;
+}
+
+.dir-picker-status {
+    font-size: var(--font-size-xs);
+}
+
+.dir-picker-git-badge {
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--accent-green);
+    background: color-mix(in srgb, var(--accent-green) 15%, transparent);
+    padding: 0.0625rem 0.375rem;
+    border-radius: 0.1875rem;
+}
+
+.dir-picker-actions {
+    display: flex;
+    gap: 0.5rem;
+}
+
+/* Add-repository form — sleek vertical card: name, path + browse, then a
+   right-aligned action footer (Cancel / Save) so the buttons sit under the
+   fields instead of floating beside the first input. (Distinct class from the
+   no-op `repo-add-form` marker still used by the env-var / mobile-access add
+   forms, which deliberately keep the .list-row layout.) */
+.repo-add-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+    padding: 0.75rem 1rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+}
+
+.repo-add-input {
+    width: 100%;
+    min-width: 0;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-md);
+    padding: 0.4375rem 0.625rem;
+    outline: none;
+    transition: border-color var(--duration-fast), box-shadow var(--duration-fast);
+}
+
+.repo-add-input::placeholder {
+    color: var(--text-muted);
+}
+
+.repo-add-input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 0.1875rem color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.repo-add-path-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+}
+
+.repo-add-path-row .repo-add-input {
+    flex: 1;
+}
+
+.repo-add-browse {
+    flex-shrink: 0;
+}
+
+.repo-add-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 0.125rem;
+}
+
