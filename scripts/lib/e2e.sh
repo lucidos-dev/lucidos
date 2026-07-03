@@ -54,6 +54,7 @@ source "$_E2E_LIB_DIR/ports.sh"
 source "$_E2E_LIB_DIR/workspace.sh"
 source "$_E2E_LIB_DIR/e2e_lock.sh"
 source "$_E2E_LIB_DIR/webkit_reaper.sh"
+source "$_E2E_LIB_DIR/host_load_guard.sh"
 
 # ── ensure_workspace_running ────────────────────────────────────────────
 # Starts the e2e workspace if not running. Ensures both engine AND Vite are up.

@@ -8,11 +8,41 @@ import {
   openExternal,
   type ConnectInfo,
 } from '../../utils/tauri';
+import { getNetworkConfig } from '../../api/client';
+import { openSettingsSubview } from '../../store/actions/menu';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { toFailed } from '../../store/types';
 import type { Loadable } from '../../store/types';
 import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
+
+/** What the "Local network" row should show, derived from the gateway's
+ *  configured bind. Loopback (the packaged default) means a LAN URL would be
+ *  DEAD — the gateway only listens on this Mac — so the row must point at the
+ *  Network access setting instead of advertising an unreachable URL. */
+export type LanRowState =
+  | { kind: 'disabled' }
+  | { kind: 'url'; url: string }
+  | { kind: 'none' };
+
+/** Pure: derive the LAN row from the configured gateway bind. A specific-IP
+ *  bind serves exactly that IP (plus loopback), so the row shows the bound
+ *  IP's URL rather than the detected LAN IP (which may be a different,
+ *  unreachable interface). Config-based, same "takes effect after restart"
+ *  caveat as Settings → Network access. */
+export function lanRowState(gatewayBind: string, lanIp: string | null, port: number): LanRowState {
+  const bind = gatewayBind.trim();
+  if (bind === '' || bind === 'loopback') return { kind: 'disabled' };
+  if (bind === 'all') {
+    return lanIp ? { kind: 'url', url: `http://${lanIp}:${port}` } : { kind: 'none' };
+  }
+  return { kind: 'url', url: `http://${bind}:${port}` };
+}
+
+interface MobileAccessInfo {
+  connect: ConnectInfo;
+  gatewayBind: string;
+}
 
 /** A connect URL with a copy-to-clipboard button. */
 function UrlRow({ label, url, hint }: { label: string; url: string; hint?: string }) {
@@ -47,7 +77,7 @@ function UrlRow({ label, url, hint }: { label: string; url: string; hint?: strin
  * (public) — the engine has no inbound API auth.
  */
 export function MobileAccessPage() {
-  const [info, setInfo] = useState<Loadable<ConnectInfo>>({ status: 'not-loaded' });
+  const [info, setInfo] = useState<Loadable<MobileAccessInfo>>({ status: 'not-loaded' });
   const [busy, setBusy] = useState<null | 'up' | 'serve'>(null);
   const [authKey, setAuthKey] = useState('');
   const showLoading = useDelayedLoading(info);
@@ -58,8 +88,15 @@ export function MobileAccessPage() {
       return;
     }
     setInfo({ status: 'loading' });
-    getConnectInfo()
-      .then(data => setInfo({ status: 'loaded', data }))
+    // The gateway bind decides whether the LAN URL is reachable at all
+    // (packaged defaults to loopback-only), so the row cannot render honestly
+    // without it — load both together and fail the pane loud on either.
+    const connectPromise = getConnectInfo();
+    const networkPromise = getNetworkConfig();
+    Promise.all([connectPromise, networkPromise])
+      .then(([connect, network]) =>
+        setInfo({ status: 'loaded', data: { connect, gatewayBind: network.gateway_bind } }),
+      )
       .catch(e => setInfo(toFailed(e)));
   }, []);
 
@@ -116,7 +153,9 @@ export function MobileAccessPage() {
     );
   }
 
-  const ts = info.data.tailscale;
+  const { connect, gatewayBind } = info.data;
+  const ts = connect.tailscale;
+  const lan = lanRowState(gatewayBind, connect.lan_ip, connect.port);
 
   return (
     <>
@@ -127,17 +166,38 @@ export function MobileAccessPage() {
           Open one on another device to use Lucidos from your phone.
         </p>
         <div class="list-rows">
-          <UrlRow label="This Mac" url={info.data.localhost_url} hint="localhost" />
-          {info.data.lan_url
-            ? <UrlRow label="Local network" url={info.data.lan_url} hint="same Wi-Fi only" />
-            : (
-              <div class="list-row">
-                <div class="list-row-info">
-                  <div class="title">Local network</div>
-                  <div class="list-row-details">No LAN address detected</div>
+          <UrlRow label="This Mac" url={connect.localhost_url} hint="localhost" />
+          {lan.kind === 'url' && (
+            <UrlRow
+              label="Local network"
+              url={lan.url}
+              hint="same Wi-Fi · plain HTTP — no PWA install or push (use Tailscale for those)"
+            />
+          )}
+          {lan.kind === 'disabled' && (
+            <div class="list-row">
+              <div class="list-row-info">
+                <div class="title">Local network</div>
+                <div class="list-row-details">
+                  Off — the gateway only listens on this Mac. Allow LAN access in Network access
+                  (applies after a restart).
                 </div>
               </div>
-            )}
+              <div class="list-row-actions">
+                <button class="action-btn" onClick={() => openSettingsSubview('network-access')}>
+                  Network access
+                </button>
+              </div>
+            </div>
+          )}
+          {lan.kind === 'none' && (
+            <div class="list-row">
+              <div class="list-row-info">
+                <div class="title">Local network</div>
+                <div class="list-row-details">No LAN address detected</div>
+              </div>
+            </div>
+          )}
           {ts.url && <UrlRow label="Tailscale" url={ts.url} hint="anywhere, HTTPS + push" />}
         </div>
       </div>

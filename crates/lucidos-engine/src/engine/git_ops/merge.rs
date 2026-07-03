@@ -521,15 +521,76 @@ async fn resolve_default_local_branch(repo_root: &Path) -> String {
 ///
 /// Repos with no `origin` remote (test fixtures, fresh init) keep the local
 /// branch name.
+///
+/// When the local default branch does NOT exist at all, the base must still
+/// resolve to a real ref — otherwise the Diff button's `<base>...<branch>` range
+/// errors with `fatal: unknown revision`. This is the external-repo case: a repo
+/// whose canonical branch was never checked out locally (the coding-agent
+/// worktree branched straight off `origin/<default>`), especially one whose
+/// default is neither `main` nor `master`, where [`default_local_branch`] falls
+/// through to its hardcoded `"main"` guess. We fall back to `origin/<default>`
+/// (the branch's true fork point) and ultimately to `HEAD`, never handing back a
+/// phantom branch name.
 pub(crate) async fn default_diff_base(repo_root: &Path) -> String {
     let local = default_local_branch(repo_root).await;
     let remote_tracking = format!("origin/{local}");
-    if git_ref_exists(repo_root, &remote_tracking).await
-        && !is_ancestor(repo_root, &remote_tracking, &local).await
-    {
+
+    if git_ref_exists(repo_root, &local).await {
+        // Local default exists — prefer it, unless it has diverged from
+        // origin/<default> (migration/force-push/rebase), in which case
+        // origin/<default> holds the branch's true fork point.
+        if git_ref_exists(repo_root, &remote_tracking).await
+            && !is_ancestor(repo_root, &remote_tracking, &local).await
+        {
+            return remote_tracking;
+        }
+        return local;
+    }
+
+    // No local default branch. Diff against origin/<default> when it exists —
+    // it's the ref the external-repo worktree was cut from.
+    if git_ref_exists(repo_root, &remote_tracking).await {
         return remote_tracking;
     }
-    local
+
+    // `local` is the phantom `"main"` guess (or a genuinely absent branch) and
+    // origin/<local> doesn't exist either. Try origin/HEAD's real target (the
+    // default may simply not be main/master).
+    if let Some(name) = read_origin_head_ref(repo_root).await {
+        let tracking = format!("origin/{name}");
+        if git_ref_exists(repo_root, &tracking).await {
+            return tracking;
+        }
+    }
+
+    // Last resort (no origin, non-main/master default — e.g. a local `trunk`):
+    // the PRIMARY worktree's tip commit. Deliberately NOT the string `"HEAD"`:
+    // this helper also runs inside a linked coding-agent worktree (via
+    // `diff_via_worktree`), where `HEAD` is the thread's OWN branch, so a
+    // `HEAD...HEAD` range would render an empty diff instead of the branch's
+    // changes. `git worktree list --porcelain` lists the primary worktree first,
+    // so its tip is the repo's base commit regardless of which worktree we're in.
+    if let Some(sha) = primary_worktree_head(repo_root).await {
+        return sha;
+    }
+    "HEAD".to_string()
+}
+
+/// The primary (main) worktree's tip commit SHA. `git worktree list
+/// --porcelain` always lists the primary worktree first, so its `HEAD <sha>`
+/// line is the repo's checked-out base commit even when this is called from a
+/// linked worktree whose own `HEAD` is a feature branch. `None` when the command
+/// fails or emits no `HEAD` line.
+async fn primary_worktree_head(repo_root: &Path) -> Option<String> {
+    let o = git_cmd(&["worktree", "list", "--porcelain"], repo_root)
+        .await
+        .ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("HEAD ").map(str::to_owned))
 }
 
 /// `true` if `git_ref` resolves to a commit in `repo_root`.

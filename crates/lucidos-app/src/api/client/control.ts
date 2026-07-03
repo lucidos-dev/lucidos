@@ -190,16 +190,7 @@ export async function restoreBackup(file: File, key: string, name?: string): Pro
   if (name && name.trim()) form.append('name', name.trim());
   // No explicit Content-Type — the browser sets the multipart boundary. Streams
   // the (possibly large) file rather than buffering a JSON-encoded copy.
-  const res = await fetch(`${CONTROL}/workspaces/restore`, { method: 'POST', body: form });
-  if (!res.ok) {
-    let reason = res.statusText;
-    try {
-      const body = await res.json();
-      if (body?.error) reason = body.error;
-    } catch { /* non-JSON body */ }
-    throw new Error(reason || `HTTP ${res.status}`);
-  }
-  return res.json();
+  return controlJson<RestoreStarted>('/workspaces/restore', { method: 'POST', body: form });
 }
 
 /** Current restore-flow state, for the picker's poll. */

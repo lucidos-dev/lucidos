@@ -9,14 +9,14 @@
     padding-left: var(--turn-body-inset);
     margin-bottom: 0.7rem;
     min-height: 1.2rem;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     flex-wrap: wrap;
 }
 
 .response-executor-icon {
     flex-shrink: 0;
-    font-size: 0.875rem;
+    font-size: var(--font-size-lg);
     line-height: 1;
     display: inline-flex;
     align-items: center;
@@ -45,7 +45,7 @@
 }
 
 .response-timestamp {
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
 }
 
@@ -59,7 +59,7 @@
    the expanded preformatted block. */
 .resume-note {
     margin-top: 0.25rem;
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     color: var(--text-secondary);
 }
 
@@ -79,7 +79,7 @@
     border-left: 0.125rem solid var(--border-subtle, var(--border-color));
     background: var(--bg-secondary);
     white-space: pre-wrap;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     line-height: 1.4;
     color: var(--text-secondary);
 }
@@ -95,12 +95,19 @@
 .initiator-panel-change-reverted  .initiator-summary { color: var(--reason-muted); }
 
 /* Action buttons (Diff/Revert) render in a footer at the bottom-right of the
-   turn — keeps the timestamp alone in the header's top-right slot. */
+   turn — keeps the timestamp alone in the header's top-right slot.
+   padding-bottom MUST stay 0: the footer is the panel's last child, so any bottom
+   padding here stacks on top of the panel's own padding and shows up as an
+   oversized BOTTOM gap under the navigation focus marker — the marker's gap on
+   each side equals that side's total padding, and the .initiator-panel.nav-focus-stuck
+   rule below normalizes every side to var(--turn-body-inset). Only the TOP padding
+   (separating the buttons from the body above) belongs here; the bottom spacing is
+   the panel's job. Guarded by turn-header-gutter.test.ts. */
 .initiator-footer {
     display: flex;
     justify-content: flex-end;
     gap: 0.5rem;
-    padding: 0.5rem 0;
+    padding: 0.5rem 0 0;
 }
 
 /* --- Change body — surfaces description, file count, and error message
@@ -109,7 +116,7 @@
     display: flex;
     flex-direction: column;
     gap: 0.25rem;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
 }
 
 .change-body-desc {
@@ -119,7 +126,7 @@
 
 .change-body-meta {
     color: var(--text-muted);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
 }
 
 .change-body-error {
@@ -139,17 +146,6 @@
     pointer-events: none;
 }
 
-/* User message sent to Claude Code (shown inline in streaming area) */
-.claude-code-user-msg {
-    background: var(--bg-tertiary);
-    border-left: 0.1875rem solid var(--accent);
-    padding: 0.5rem 0.75rem;
-    margin: 0.5rem 0;
-    font-size: 0.75rem;
-    white-space: pre-wrap;
-    color: var(--text-primary);
-}
-
 .message-channel-tag {
     float: right;
     clear: right;
@@ -163,79 +159,190 @@
     border-color: var(--accent-red);
 }
 
-/* Clear floats after channel tag so content starts below */
-.float-clear {
-    clear: both;
-}
-
 /* Chat exchange wrapper (initiator + response turns). Inter-turn spacing now
    comes from each turn's own feed padding (no divider line), so no bottom
    margin. */
 .chat-exchange {
     margin-bottom: 0;
     padding: 0;
+    /* Block formatting context so a focused first/last panel's compensating
+       vertical margin (the .nav-focus-stuck rule below hands the feed padding back
+       as margin) stays CONTAINED — otherwise a first-child margin-top / last-child
+       margin-bottom collapses through this padding-less exchange and the panel's
+       content shifts by the reduced padding. flow-root establishes the BFC without
+       clipping (unlike overflow: hidden, which would clip the marker's outline). */
+    display: flow-root;
+    /* Room above a deep-linked landing for its focus border. The navigation focus
+       marker's border (.nav-focus-stuck) is an `outline` offset just BEYOND the
+       element box, and .chat-exchange has no top padding, so without this the top
+       edge of the border lands above the scroll-container top / behind the header
+       stack and is clipped — "the top of the border isn't visible". This base
+       value is the bare focus-border gap; the desktop and mobile rules below add
+       it on top of their respective top-of-transcript occlusion (the desktop fade
+       mask / the mobile header stack). */
+    --deep-link-focus-gap: 0.5rem;
+    scroll-margin-top: var(--deep-link-focus-gap);
+}
+
+/* Desktop: a navigated-to element must clear BOTH occlusions stacked at the top
+   of the transcript, whichever is taller (hence max()):
+     1. the top --thread-top-fade band, mask-faded so messages dissolve under the
+        thread title header (see .thread-content in chat/input-messages.css) — land
+        below it plus the focus-border gap so the element's top edge AND its
+        .nav-focus-stuck outline are fully opaque instead of hidden in the fade;
+     2. the floating up-chevron (.scroll-to-top), which since fix 956b47519 sits
+        OVER the centered transcript rather than out in the gutter — land below its
+        footprint (safe-area inset + top inset + diameter) plus --nav-focus-reach so
+        the focus-marker outline clears it too. Without this the element (and its
+        outline) tucked right under the chevron with no room — the reported
+        regression. The env(safe-area-inset-top) term MIRRORS the chevron's own top
+        (max(--scroll-chevron-top, env(safe-area-inset-top) + --scroll-chevron-top)
+        == env + inset on desktop, since env >= 0): on a viewport-fit / notched
+        device at desktop width (e.g. iPad landscape PWA) the chevron rides down by
+        the notch, so the clearance must too — omitting it would let the element
+        land under the chevron again once the inset exceeds the breathing room.
+   Both branches add +0.5rem breathing room. Computed from the chevron's OWN
+   variables (base.css) so moving/resizing it keeps this clearance in lockstep.
+   Matches the mask's min-width breakpoint. */
+@media (min-width: 769px) {
+    .chat-exchange {
+        scroll-margin-top: max(
+            calc(var(--thread-top-fade) + var(--deep-link-focus-gap) + 0.5rem),
+            calc(env(safe-area-inset-top, 0px) + var(--scroll-chevron-top) + var(--scroll-chevron-size) + var(--nav-focus-reach) + 0.5rem)
+        );
+    }
 }
 
 .chat-exchange:last-child {
     margin-bottom: 0;
 }
 
-/* scrollToEventAndPulse uses scrollIntoView, which ignores the fixed/sticky
-   chrome stacked at the top of the scroll container — so the landed event would
-   sit behind it ("covered a bit"). scroll-margin-top adds back the three opaque
-   layers above the transcript on mobile:
+/* scrollToEventAndPulse lands the event at the scroll-container top, which would
+   sit behind the fixed/sticky chrome stacked there ("covered a bit"). The scroll
+   (smoothScrollToElement in scrollState.ts) reads this scroll-margin-top and
+   subtracts it, so the event lands clear of the three opaque layers above the
+   transcript on mobile:
      1. the fixed app header — --mobile-header-height, pinned fully visible for
         the duration of the deep-link scroll (scrollState.isHeaderPinnedForScroll
         + useHideOnScroll.onScroll) so this static offset is exact;
      2. the sticky .mobile-thread-title-row — --mobile-thread-title-height tracks
         the bar's live height so a wrapped title still clears;
-     3. the 1rem fade overlay below the title row (.mobile-thread-title-row.scrolled
-        ::after), opaque at its top edge while the transcript is scrolled.
-   The event lands flush below all three, exactly under the thread title header. */
+     3. the --mobile-title-fade overlay below the title row (.mobile-thread-title-row
+        .scrolled::after), opaque at its top edge while the transcript is scrolled.
+   Plus --deep-link-focus-gap so the focus border (an outline offset just beyond
+   the box) clears the header stack too (same reason as the desktop base above).
+   The event lands below all four, exactly under the thread title header with its
+   whole border visible. */
 @media (max-width: 768px) {
     .chat-exchange {
         scroll-margin-top: calc(
             var(--mobile-header-height, 3rem)
             + var(--mobile-thread-title-height, 2.75rem)
-            + 1rem
+            + var(--mobile-title-fade)
+            + var(--deep-link-focus-gap)
         );
     }
 }
 
-/* Brief highlight applied when a deep-link lands on a specific event or change.
-   The class rides the deep-link's pulse element, which is NOT always the whole
-   exchange: scrollToEventAndPulse scopes it to the matched exchange's
-   `.initiator-panel` (the event itself, e.g. a UserQuestionAsked tapped from a
-   push) so the agent response below the event isn't highlighted too, while
-   scrollToChangeAndPulse leaves it on the whole `.chat-exchange` turn. The
-   bare-class selector matches either host. Class is removed after ~1.8s by the
-   same scroll helper. Tracks --accent so theme changes carry through; matches
-   the settings-search-highlight-pulse pattern (settings.css) with a slightly
-   longer dwell. */
-.event-pulse {
-    animation: chat-exchange-pulse 1.8s ease-out 1;
-    border-radius: 0.375rem;
+/* The deep-link highlight (a sticky border that fades out on dismiss) is the
+   shared NAVIGATION FOCUS MARKER — `.nav-focus-stuck` in
+   styles/global/host-components.css, driven by components/shared/focusMarker.ts.
+   scrollState.ts scopes it to the panel that HOLDS the deep-link's subject — NOT
+   the whole `.chat-exchange` — so a sibling panel in the same turn isn't
+   highlighted too: an event deep-link → `.initiator-panel` (the event, not the
+   response below it); a change deep-link → `.response-panel` on a proposing turn
+   (where ChangeProposed lives) but `.initiator-panel` on a resolution card (which
+   carries the change body, not any folded-in continuation work). It falls back to
+   the whole exchange only if that panel is absent. Defined once there so chat,
+   settings, and plugin navigations share one look. */
+
+/* Uniform gap on ALL FOUR sides between the navigation focus marker and a turn's
+   content. The marker (the .nav-focus-stuck outline, defined in
+   host-components.css) hugs the panel's padding box with a fixed outline-offset,
+   so the gap it shows on each side equals the panel's padding there — and a turn's
+   padding is NOT uniform:
+     - horizontal: content is inset var(--turn-body-inset) on the LEFT
+       (.initiator-header / .response-header / body padding-left) but sits FLUSH on
+       the RIGHT — so the marker shows a left gap and no right gap;
+     - vertical: the feed-rhythm padding var(--turn-feed-pad-y) top and bottom, far
+       larger than that inset — so the marker's top/bottom gap dwarfs its sides
+       ("padding isn't the same top/bottom as left/right").
+   Normalize every side to var(--turn-body-inset):
+     - RIGHT: grow the box rightward by that inset (padding-right) and cancel it for
+       layout (negative margin-right) so the content-box width and sibling turns
+       stay put — settling the marker in / clearing it never reflows the card.
+       (LEFT already has the inset via the body's padding-left; the panel keeps
+       padding-left: 0.)
+     - TOP/BOTTOM: shrink the feed padding to the same inset and hand the removed
+       space back as margin, so the turn's content and its neighbours don't move
+       (net-zero) while the outline hugs tight. .chat-exchange establishes a block
+       formatting context (display: flow-root, below) so a first/last focused
+       panel's margin can't collapse through the exchange and shift its content.
+   The turn lives inside .thread-content's 0.75rem side padding, and the inset +
+   the marker reach stay clear of that edge (no clip, no horizontal scrollbar).
+   Scoped to the panels: this is the PANEL-level marker — a deep-link (Changes
+   panel / notification) lands on the specific `.initiator-panel` or
+   `.response-panel` (scrollState.ts `scrollToChangeAndPulse` / `scrollToEventAndPulse`).
+   The WHOLE-TURN marker (keyboard ⌘↑/⌘↓ nav, which marks the `.chat-exchange`) is
+   normalized by the sibling rule below. */
+.initiator-panel.nav-focus-stuck,
+.response-panel.nav-focus-stuck {
+    padding: var(--turn-body-inset) var(--turn-body-inset) var(--turn-body-inset) 0;
+    margin-top: calc(var(--turn-feed-pad-y) - var(--turn-body-inset));
+    margin-bottom: calc(var(--turn-feed-pad-y) - var(--turn-body-inset));
+    margin-right: calc(-1 * var(--turn-body-inset));
 }
 
-@keyframes chat-exchange-pulse {
-    0% {
-        background-color: transparent;
-        box-shadow: 0 0 0 0 transparent;
-    }
-    15% {
-        background-color: color-mix(in srgb, var(--accent) 25%, transparent);
-        box-shadow: 0 0 0 0.5rem color-mix(in srgb, var(--accent) 15%, transparent);
-    }
-    100% {
-        background-color: transparent;
-        box-shadow: 0 0 0 0 transparent;
-    }
+/* Uniform gap on ALL FOUR sides when the marker lands on a WHOLE TURN. Keyboard
+   ⌘↑/⌘↓ turn-nav marks the `.chat-exchange` (TURN_SELECTOR in scrollState.ts), not
+   an inner panel — so the panel rule above never applies and the outline hugged the
+   exchange box while the panel's feed padding (var(--turn-feed-pad-y) top/bottom) and
+   left content inset leaked through, sitting flush right: top/bottom ~2× the left
+   gap and the right gap collapsed to just the outline offset. This is the exchange's
+   counterpart to the panel rule; it normalizes every side to var(--turn-body-inset).
+
+   The exchange has NO padding of its own — its content is the panel(s), which carry
+   the gap-defining padding. It mirrors the panel rule's shape (padding inset on
+   TOP/RIGHT/BOTTOM, LEFT already supplied by the inner content's padding-left) with
+   two differences forced by the exchange:
+     - NO negative margin-right: the exchange is auto-centered
+       (.thread-content > * { margin: 0 auto }), so a negative margin-right would
+       fight the centering. The var(--turn-body-inset) padding-right narrows the
+       content box by that inset instead (a tiny, transient reflow only while the
+       marker shows) — the trade the panel rule avoids but the exchange can't.
+     - The feed rhythm that defines TOP/BOTTOM lives on the PANEL children, not the
+       exchange — so drop the first panel's feed padding-top and the last panel's
+       feed padding-bottom (they'd stack on the exchange padding and inflate the
+       gap), and hand the removed feed rhythm back as margin on the exchange (OUTSIDE
+       its outline, so the gap stays tight) — content and neighbouring turns don't
+       move, exactly like the panel rule's vertical handling. */
+.chat-exchange.nav-focus-stuck {
+    padding: var(--turn-body-inset) var(--turn-body-inset) var(--turn-body-inset) 0;
+    margin-top: calc(var(--turn-feed-pad-y) - var(--turn-body-inset));
+    margin-bottom: calc(var(--turn-feed-pad-y) - var(--turn-body-inset));
+}
+.chat-exchange.nav-focus-stuck > .initiator-panel:first-child,
+.chat-exchange.nav-focus-stuck > .response-panel:first-child {
+    padding-top: 0;
+}
+.chat-exchange.nav-focus-stuck > .initiator-panel:last-child,
+.chat-exchange.nav-focus-stuck > .response-panel:last-child {
+    padding-bottom: 0;
+}
+/* Error turns append an .exchange-error AFTER the panels, so no panel is
+   :last-child and no feed padding-bottom is removed there — the error box (which
+   carries no feed padding) is the bottom content. The margin-bottom above then has
+   nothing to hand back and would just push the next turn down by the exchange's own
+   padding-bottom. Cancel that instead (margin-bottom: -inset) so the error turn
+   stays net-zero, while the exchange padding-bottom still supplies the gap. */
+.chat-exchange.nav-focus-stuck:has(> .exchange-error:last-child) {
+    margin-bottom: calc(-1 * var(--turn-body-inset));
 }
 
 /* Response content — markdown rules inherited from .markdown-content in global.css */
 .response-content {
     line-height: 1.6;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     padding-left: var(--turn-body-inset);
     white-space: normal;
     word-wrap: break-word;
@@ -278,7 +385,7 @@
 .welcome-message .disclaimer {
     margin: 1.5rem 0 0 0;
     color: var(--text-muted);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     line-height: 1.5;
 }
 
@@ -456,13 +563,13 @@
 }
 
 .welcome-provider-setup-btn {
-    font-size: 0.9375rem;
+    font-size: var(--font-size-xl);
 }
 
 .welcome-provider-setup-hint {
     margin: 0;
     color: var(--text-secondary);
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     line-height: 1.4;
 }
 
@@ -493,7 +600,7 @@
 
 .welcome-hero h2 {
     margin: 0 0 0.5rem 0;
-    font-size: 1.125rem;
+    font-size: var(--font-size-xl);
     font-weight: 600;
 }
 
@@ -502,25 +609,30 @@
 .welcome-hero .welcome-suggestions-label {
     margin: 0 0 0.625rem 0;
     color: var(--text-muted);
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
 }
 
 /* Suggestions as a single-item carousel: ‹ suggestion › — one suggestion at a
    time flanked by chevron buttons (no scrolling, no cards). */
 .welcome-carousel {
+    position: relative;
     display: flex;
     align-items: center;
-    gap: 0.5rem;
     margin: 0 0 1.25rem 0;
 }
 
 /* Circular bordered chevrons — same treatment as the notification detail nav
    (.notification-detail-nav in panels/content.css) and the thread-view scroll
-   chevrons. Mounted always with a fixed slot (flex: none) so the disabled-at-end
-   state can't shift the centered suggestion. Both chevrons stay on screen on
-   every step; the inapplicable one is `:disabled` (greyed) rather than hidden. */
+   chevrons. Absolutely positioned so they FLOAT over the left/right ends of the
+   full-width suggestion box (below) at fixed spots — out of flow, so the
+   disabled-at-end state can't shift the box or the centered suggestion. Both
+   chevrons stay on screen on every step; the inapplicable one is `:disabled`
+   (greyed) rather than hidden. */
 .welcome-carousel-nav {
-    flex: none;
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 1;
     width: 2rem;
     height: 2rem;
     border-radius: 50%;
@@ -537,12 +649,24 @@
     transition: opacity 0.2s, background-color 0.15s, color 0.15s, border-color 0.15s;
 }
 
+/* Float each chevron near the edge it belongs to, inset 0.5rem so it clears the
+   box's rounded corner and leaves breathing room out to the box border — source
+   order is prev, viewport, next, so :first-child is the ‹ (left) and :last-child
+   the › (right). */
+.welcome-carousel-nav:first-child { left: 0.5rem; }
+.welcome-carousel-nav:last-child { right: 0.5rem; }
+
 /* Disabled "when applicable" — kept on screen, greyed and non-interactive at the
-   first / last suggestion (mirrors .icon-btn:disabled). */
+   first / last suggestion. Deliberately does NOT set `pointer-events: none`
+   (unlike .icon-btn:disabled): the chevron now floats OVER the full-width
+   suggestion box, so making it transparent to pointers would let a tap on the
+   greyed chevron fall through to the box and prefill the suggestion. As a
+   disabled <button> it already swallows the tap — no action fires, and it blocks
+   the box beneath from receiving the click. `:hover` is `:not(:disabled)`-gated,
+   so keeping pointer events doesn't reintroduce a hover state. */
 .welcome-carousel-nav:disabled {
     opacity: 0.3;
     cursor: default;
-    pointer-events: none;
 }
 
 @media (hover: hover) {
@@ -554,21 +678,26 @@
     }
 }
 
-/* Carousel viewport: takes the flex space between the chevrons and stacks every
-   suggestion in a SINGLE grid cell. The row track therefore sizes to the tallest
-   suggestion (hidden cards stay laid out and still contribute their height), so
-   the viewport height is stable across slides and the vertically-centered
-   chevrons no longer bounce as the visible card's length changes. */
+/* Carousel viewport: the sole in-flow child, so it spans the full carousel width
+   (the chevrons float over its ends). Stacks every suggestion in a SINGLE grid
+   cell, so the row track sizes to the tallest suggestion (hidden cards stay laid
+   out and still contribute their height) — the viewport height is stable across
+   slides and the vertically-centered chevrons no longer bounce as the visible
+   card's length changes. */
 .welcome-carousel-viewport {
     flex: 1 1 auto;
     min-width: 0;
     display: grid;
 }
 
-/* The suggestions — tappable cards flanked by the chevrons. Resets the native
-   <button> chrome (font-family doesn't inherit on buttons) and adopts the same
-   translucent-bordered treatment as the chevron nav so it reads as interactive
-   without a hover (mobile has none). Clicking the current one prefills the prompt.
+/* The suggestions — tappable cards spanning the full carousel width, with the
+   chevrons floating over their left/right ends. Resets the native <button> chrome
+   (font-family doesn't inherit on buttons) and adopts the same translucent-bordered
+   treatment as the chevron nav so it reads as interactive without a hover (mobile
+   has none). Clicking the current one prefills the prompt. The wide 3.25rem
+   horizontal padding holds the text in exactly the position it had when the box
+   sat *between* the chevrons (2rem chevron + 0.5rem gap + 0.75rem old padding) —
+   so widening the box under the chevrons didn't push the text out to the edges.
    All cards share the grid cell (`grid-area: 1 / 1`) and the default grid
    `stretch` so every card renders at the uniform tallest-card height; the flex
    centering keeps shorter text vertically centered within that height. */
@@ -576,14 +705,14 @@
     grid-area: 1 / 1;
     min-width: 0;
     margin: 0;
-    padding: 0.5rem 0.75rem;
+    padding: 0.5rem 3.25rem;
     display: flex;
     align-items: center;
     font-family: inherit;
     /* Primary (near-black) so the suggestion stands out by contrast rather than
        size — the small italic copy still reads as the focal line. */
     color: var(--text-primary);
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     font-style: italic;
     line-height: 1.45;
     text-align: left;
@@ -626,7 +755,7 @@
     border: none;
     border-radius: 999px;
     color: var(--text-muted);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     font-weight: 500;
     letter-spacing: 0.02em;
     opacity: 0.75;
@@ -649,7 +778,7 @@
     background: color-mix(in srgb, var(--accent-red) 10%, transparent);
     border: 1px solid color-mix(in srgb, var(--accent-red) 40%, transparent);
     border-radius: 0.375rem;
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
 }
 
 
@@ -666,7 +795,7 @@
     gap: 0.75rem;
     padding: 3rem 1rem;
     color: var(--text-muted);
-    font-size: 0.875rem;
+    font-size: var(--font-size-lg);
 }
 
 .thread-empty-state p {
@@ -681,47 +810,11 @@
     background: none;
     border: none;
     color: var(--text-muted);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     cursor: pointer;
     padding: 0.25rem 0.5rem;
     text-decoration: underline;
     text-underline-offset: 0.125rem;
-}
-
-/* Thread timeline events */
-.thread-event-row {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.25rem 1rem;
-    color: var(--text-secondary);
-    font-size: 0.8rem;
-}
-
-.thread-event-icon {
-    flex-shrink: 0;
-    width: 1rem;
-    text-align: center;
-}
-
-.event-applied .thread-event-icon { color: var(--accent-green); }
-.event-discarded .thread-event-icon { color: var(--accent-red); }
-.event-reverted .thread-event-icon { color: var(--text-secondary); }
-.event-start .thread-event-icon { color: var(--accent); }
-.event-end .thread-event-icon { color: var(--text-secondary); }
-
-.thread-event-label {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.thread-event-time {
-    flex-shrink: 0;
-    color: var(--text-muted);
-    font-size: 0.75rem;
 }
 
 /* CC question divider — body of an UserQuestionAsked initiator panel. The
@@ -877,7 +970,7 @@
 
 .question-option-label {
     font-weight: 500;
-    font-size: 0.875rem;
+    font-size: var(--font-size-lg);
     line-height: 1.4;
     word-break: break-word;
 }
@@ -885,14 +978,14 @@
 .question-option-desc {
     grid-column: 1 / -1;
     color: var(--text-secondary);
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     line-height: 1.45;
     word-break: break-word;
 }
 
 .question-hint {
     color: var(--text-muted);
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     font-style: italic;
 }
 
@@ -953,7 +1046,7 @@
 }
 
 .question-freetext-label {
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     color: var(--text-secondary);
     text-transform: uppercase;
@@ -1002,7 +1095,7 @@
     background: var(--bg-secondary, rgba(127, 127, 127, 0.1));
     border-radius: 0.375rem;
     font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     line-height: 1.45;
     font-weight: 400;
     color: var(--text-secondary);
@@ -1070,7 +1163,7 @@
 
 .allowlist-empty {
     color: var(--text-muted);
-    font-size: 0.875rem;
+    font-size: var(--font-size-lg);
     padding: 0.25rem 0;
 }
 
@@ -1084,7 +1177,7 @@
     flex: 1;
     min-width: 0;
     font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
-    font-size: 0.875rem;
+    font-size: var(--font-size-lg);
     line-height: 1.5;
     padding: 0.375rem 0.625rem;
     border: 1px solid var(--border-color);
@@ -1229,7 +1322,7 @@
 }
 
 .code-block-lang {
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     -webkit-user-select: none;
     user-select: none;
@@ -1274,7 +1367,7 @@ body:not(.is-touch) .code-block-copy-btn.copy-btn-copied {
 .child-completion-status {
     display: inline-flex;
     align-items: center;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     padding: 0.125rem 0.5rem;
     border-radius: 0.25rem;
     font-weight: 600;
@@ -1296,7 +1389,7 @@ body:not(.is-touch) .code-block-copy-btn.copy-btn-copied {
     color: var(--accent-yellow);
 }
 .child-completion-disclosure {
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     color: var(--text-muted);
 }
 .child-completion-disclosure > summary {
@@ -1317,5 +1410,5 @@ body:not(.is-touch) .code-block-copy-btn.copy-btn-copied {
 .response-empty-note {
     color: var(--text-muted);
     font-style: italic;
-    font-size: 0.85rem;
+    font-size: var(--font-size-lg);
 }

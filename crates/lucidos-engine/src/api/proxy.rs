@@ -156,6 +156,73 @@ pub fn filter_request_headers(headers: &HeaderMap) -> HeaderMap {
     filtered
 }
 
+/// Browser-origin guard for credential-injecting proxy HTTP routes.
+///
+/// CORS only controls whether a hostile page can read a response; it does not
+/// stop that page from issuing a simple POST to localhost / the gateway. Since
+/// `/proxy/*` resolves credentials and can trigger upstream side effects, reject
+/// browser requests that are not same-origin before any credential lookup.
+fn browser_proxy_request_allowed(headers: &HeaderMap) -> bool {
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok());
+
+    // Non-browser clients generally omit fetch metadata and Origin. Allow them;
+    // the engine/gateway bind topology is their protection boundary.
+    let sec_fetch_site = headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_ascii_lowercase);
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok());
+
+    if sec_fetch_site.is_none() && origin.is_none() {
+        return true;
+    }
+
+    if let Some(site) = sec_fetch_site.as_deref() {
+        if !matches!(site, "same-origin" | "none") {
+            return false;
+        }
+    }
+
+    if let Some(origin) = origin {
+        let Some(host) = host else {
+            return false;
+        };
+        if !origin_authority_matches_host(origin, host) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn origin_authority_matches_host(origin: &str, host: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(origin) else {
+        return false;
+    };
+    let Some(origin_host) = url.host_str() else {
+        return false;
+    };
+    let origin_port = url.port_or_known_default();
+    let origin_authority = match origin_port {
+        Some(port) => format!("{origin_host}:{port}"),
+        None => origin_host.to_string(),
+    };
+    let host = host.trim();
+    origin_authority.eq_ignore_ascii_case(host) || origin_host.eq_ignore_ascii_case(host)
+}
+
+fn forbidden_cross_origin_proxy_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        "cross-origin browser requests are not allowed for credentialed proxy routes",
+    )
+        .into_response()
+}
+
 /// Reject `..` traversal segments and backslashes in the proxy path. Without
 /// this, a caller can splice `/api/v1/proxy/x/../../admin` and most upstreams
 /// normalize the result, escaping any path prefix the operator set in
@@ -395,6 +462,9 @@ pub(super) async fn proxy_modules_reload(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
+    if !browser_proxy_request_allowed(&headers) {
+        return forbidden_cross_origin_proxy_response();
+    }
     match reload_proxy_modules_into(&state.engine, &state.workspace_path).await {
         Ok(names) => {
             let count = names.len();
@@ -475,6 +545,9 @@ async fn proxy_handle_inner(
     path: String,
     req: axum::extract::Request,
 ) -> Response {
+    if !browser_proxy_request_allowed(req.headers()) {
+        return forbidden_cross_origin_proxy_response();
+    }
     if has_traversal(&path) {
         return (
             StatusCode::BAD_REQUEST,

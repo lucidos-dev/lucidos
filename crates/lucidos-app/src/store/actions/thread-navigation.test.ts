@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { pushThreadEntry, removeEntriesById, replaceThreadEntry, MAX_THREAD_NAV_STACK, type ThreadNavEntry } from './thread-navigation';
+import { pushThreadEntry, removeEntriesById, MAX_THREAD_NAV_STACK, type ThreadNavEntry } from './thread-navigation';
 
 const T = (id: string): ThreadNavEntry => ({ type: 'thread', id });
 
@@ -44,38 +44,6 @@ describe('pushThreadEntry', () => {
     }
     expect(stack).toHaveLength(MAX_THREAD_NAV_STACK);
     expect(cursor).toBe(MAX_THREAD_NAV_STACK - 1);
-  });
-});
-
-describe('replaceThreadEntry', () => {
-  it('replaces the cursor entry, dropping forward history', () => {
-    const r = replaceThreadEntry([T('t0'), T('t1'), T('t2')], 1, T('t9'));
-    expect(r.stack).toEqual([T('t0'), T('t9')]);
-    expect(r.cursor).toBe(1);
-  });
-
-  it('replaces the only entry', () => {
-    const r = replaceThreadEntry([T('t0')], 0, T('t1'));
-    expect(r.stack).toEqual([T('t1')]);
-    expect(r.cursor).toBe(0);
-  });
-
-  it('is a no-op (with forward truncate) when cursor entry already matches', () => {
-    const r = replaceThreadEntry([T('t0'), T('t1'), T('t2')], 1, T('t1'));
-    expect(r.stack).toEqual([T('t0'), T('t1')]);
-    expect(r.cursor).toBe(1);
-  });
-
-  it('falls back to push when cursor is past end of stack', () => {
-    const r = replaceThreadEntry([T('t0')], 5, T('t1'));
-    expect(r.stack).toEqual([T('t0'), T('t1')]);
-    expect(r.cursor).toBe(1);
-  });
-
-  it('seeds an empty stack from cursor=-1 via push fallback', () => {
-    const r = replaceThreadEntry([], -1, T('thread-1'));
-    expect(r.stack).toEqual([T('thread-1')]);
-    expect(r.cursor).toBe(0);
   });
 });
 

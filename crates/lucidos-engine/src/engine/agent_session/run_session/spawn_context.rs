@@ -1,4 +1,6 @@
-use crate::engine::agent_session::node_modules_setup::has_install_marker;
+use crate::engine::agent_session::node_modules_setup::{
+    has_install_marker, member_node_modules_links,
+};
 use crate::engine::agent_session::prompts::{
     app_worktree_recovery_system_prompt, app_worktree_system_prompt, append_backend_rules,
     conflict_resolution_system_prompt, external_repo_recovery_system_prompt,
@@ -11,8 +13,53 @@ use crate::engine::git_ops::{
     resolve_worktree_base, worktree_add, worktree_current_branch,
 };
 use crate::engine::LucidosEngine;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+/// Hardlink a `node_modules` tree from `src` into the worktree at `dst`.
+/// Clears any partial `dst` first (a stale dir makes `cp` nest as `dst/src`),
+/// then tries instant hardlinks (`cp -al`), falling back to a full copy
+/// (`cp -a`, e.g. across filesystems). `label` names the tree in logs
+/// (e.g. "node_modules", "crates/lucidos-app/node_modules"). Best-effort: a
+/// failure is logged, not fatal — a missing frontend tree degrades tests, it
+/// doesn't break the session.
+async fn link_node_modules_tree(src: &Path, dst: &Path, label: &str) {
+    match tokio::fs::remove_dir_all(dst).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            log!(
+                "[AgentSession] Skipping {} link — failed to clear stale dir: {}",
+                label,
+                e
+            );
+            return;
+        }
+    }
+    log!("[AgentSession] Linking {} to worktree...", label);
+    // Try hardlinks first (instant, zero disk space); fall back to a full copy.
+    let hl = tokio::process::Command::new("cp")
+        .args(["-al", &src.to_string_lossy(), &dst.to_string_lossy()])
+        .output()
+        .await;
+    if matches!(&hl, Ok(o) if o.status.success()) {
+        log!("[AgentSession] {} hardlinked to worktree", label);
+        return;
+    }
+    match tokio::process::Command::new("cp")
+        .args(["-a", &src.to_string_lossy(), &dst.to_string_lossy()])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => log!("[AgentSession] {} copied to worktree", label),
+        Ok(o) => log!(
+            "[AgentSession] cp {} failed: {}",
+            label,
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => log!("[AgentSession] Failed to copy {}: {}", label, e),
+    }
+}
 
 /// Resolved worktree / branch / system-prompt context for a `run_direct_agent`
 /// spawn. Produced by [`LucidosEngine::resolve_run_worktree_context`], the
@@ -524,60 +571,12 @@ impl LucidosEngine {
                 if !has_install_marker(&wt_node_modules) {
                     let src_node_modules = repo_root.join("node_modules");
                     if has_install_marker(&src_node_modules) {
-                        // `cp src dst` nests as `dst/src` when dst already
-                        // exists, so any partial dir (e.g. Vite's `.vite/`
-                        // cache) must go before linking. Skip the link if
-                        // clearing fails — proceeding would silently nest
-                        // node_modules and break every subsequent run.
-                        let cleared = match tokio::fs::remove_dir_all(&wt_node_modules).await {
-                            Ok(()) => true,
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-                            Err(e) => {
-                                log!(
-                                    "[AgentSession] Skipping node_modules link — failed to clear stale dir: {}",
-                                    e
-                                );
-                                false
-                            }
-                        };
-                        if cleared {
-                            log!("[AgentSession] Linking node_modules to worktree...");
-                            // Try hardlinks first (instant, zero disk space).
-                            // Falls back to full copy if hardlinks fail (e.g. cross-filesystem).
-                            let hl = tokio::process::Command::new("cp")
-                                .args([
-                                    "-al",
-                                    &src_node_modules.to_string_lossy(),
-                                    &wt_node_modules.to_string_lossy(),
-                                ])
-                                .output()
-                                .await;
-                            let ok = matches!(&hl, Ok(o) if o.status.success());
-                            if ok {
-                                log!("[AgentSession] node_modules hardlinked to worktree");
-                            } else {
-                                match tokio::process::Command::new("cp")
-                                    .args([
-                                        "-a",
-                                        &src_node_modules.to_string_lossy(),
-                                        &wt_node_modules.to_string_lossy(),
-                                    ])
-                                    .output()
-                                    .await
-                                {
-                                    Ok(o) if o.status.success() => {
-                                        log!("[AgentSession] node_modules copied to worktree");
-                                    }
-                                    Ok(o) => log!(
-                                        "[AgentSession] cp node_modules failed: {}",
-                                        String::from_utf8_lossy(&o.stderr).trim()
-                                    ),
-                                    Err(e) => {
-                                        log!("[AgentSession] Failed to copy node_modules: {}", e)
-                                    }
-                                }
-                            }
-                        }
+                        // Fast path (~1-2s vs a 2-10min npm ci): hardlink main's
+                        // hoisted ROOT node_modules into the worktree. Workspace
+                        // MEMBER trees (un-hoistable deps like vitest) are linked
+                        // separately below, independent of this root-marker gate.
+                        link_node_modules_tree(&src_node_modules, &wt_node_modules, "node_modules")
+                            .await;
                     } else {
                         // npm ci wipes node_modules itself, so any stale Vite
                         // cache here is fine to leave. Run it at the WORKSPACE
@@ -602,6 +601,25 @@ impl LucidosEngine {
                             Err(e) => log!("[AgentSession] Failed to run npm ci in worktree: {}", e),
                         }
                     }
+                }
+
+                // Workspace MEMBER node_modules (un-hoistable deps like vitest,
+                // which npm nests in crates/lucidos-app/node_modules rather than
+                // the hoisted root) are the trees the ROOT link above misses.
+                // Provision them here — independent of the root marker — so a
+                // worktree created by the old root-only provisioning (root
+                // marker present, member tree absent) still gets its member tree
+                // on the next spawn/resume. `member_node_modules_links` returns
+                // only members present in main AND not already installed here, so
+                // this is a no-op on the npm-ci path (which installs members
+                // itself) and on a resume that already has them.
+                for (member_src, member_dst) in member_node_modules_links(repo_root, &wt_path) {
+                    let label = member_dst
+                        .strip_prefix(&wt_path)
+                        .unwrap_or(member_dst.as_path())
+                        .to_string_lossy()
+                        .into_owned();
+                    link_node_modules_tree(&member_src, &member_dst, &label).await;
                 }
             }
 

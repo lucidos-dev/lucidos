@@ -1,7 +1,7 @@
 //! LLM-facing schemas for cross-cutting tools that do not belong to a
 //! single domain family: navigate_ui, git_clone, get_backup_status,
-//! set_environment_variable, request_credential, connect_oauth_account,
-//! execute_intent, ask_user_question, todo_write.
+//! request_credential, connect_oauth_account, execute_intent,
+//! ask_user_question, todo_write.
 //!
 //! (manage_repositories / manage_models moved to the capability parity manifest —
 //! domains `repositories` / `models` — and are built by `capability_manifest`.)

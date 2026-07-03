@@ -1,7 +1,7 @@
 import { API, json, text } from './_core';
 import { lucidos } from '@lucidos/sdk';
 import type { AuthType, EmailAccountInfo, Notification, OAuthAccountInfo } from '../../store/types';
-import type { ApiResult, CredentialsListResponse, DeviceInfo, EnvVarsListResponse, MemoryEntriesResponse, MemorySourceResponse, MemoryStatsResponse, NetworkConfigResponse, NotificationsResponse } from '../types';
+import type { AgentBinariesResponse, ApiResult, CredentialsListResponse, DeviceInfo, EnvVarsListResponse, MemoryEntriesResponse, MemorySourceResponse, MemoryStatsResponse, NetworkConfigResponse, NotificationsResponse } from '../types';
 
 // --- Notifications (SDK delegation) ---
 export function getNotifications(params?: {
@@ -69,6 +69,15 @@ export function deleteEnvVarApi(name: string): Promise<ApiResult> {
   return json(`${API}/env-vars?name=${encodeURIComponent(name)}`, {
     method: 'DELETE',
   });
+}
+
+// --- Coding agent binaries (Settings → System → Coding agents) ---
+export function getCodingAgentBinaries(): Promise<AgentBinariesResponse> {
+  return json(`${API}/coding-agents/binaries`);
+}
+
+export function deletePreference(key: string): Promise<ApiResult> {
+  return json(`${API}/preferences?key=${encodeURIComponent(key)}`, { method: 'DELETE' });
 }
 
 // --- Network access (per-workspace engine bind; Settings → System) ---

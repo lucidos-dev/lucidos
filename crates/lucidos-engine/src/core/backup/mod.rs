@@ -410,6 +410,10 @@ pub async fn restore_archive_into(
     encrypted_path: &Path,
     progress: impl Fn(&str, usize, usize) + Send + Sync + 'static,
 ) -> Result<(), BoxError> {
+    // Fail fast (before decrypt/decompress) if the bundled PG client tools can't
+    // be resolved — restore drives pg_restore + psql. Path-bearing message.
+    pg_tools_preflight(database_url)?;
+
     let temp_dir = tempfile::tempdir()?;
     let progress = Arc::new(progress);
 
@@ -530,6 +534,11 @@ pub async fn create_backup(
         provider.name(),
         provider.id()
     );
+
+    // Fail fast if the bundled PG client tools can't be resolved (packaged
+    // build with a mis-staged `postgres/`), with a path-bearing message, before
+    // any upload-size walk / provider preflight / encryption.
+    pg_tools_preflight(database_url)?;
 
     // Estimate the upload size up front — one workspace walk on the blocking
     // pool — so the provider's preflight can fail fast BEFORE pg_dump, the
@@ -901,6 +910,65 @@ fn apply_pg_env(cmd: &mut std::process::Command, database_url: &str) -> Result<(
     Ok(())
 }
 
+/// Build a `Command` for a PostgreSQL client tool (`pg_dump` / `pg_restore` /
+/// `psql`), resolved + ready to run.
+///
+/// In a packaged build the relocatable PG client binaries live at
+/// `<resources>/postgres/bin` (`LUCIDOS_PG_BIN_DIR`), which is NOT on the
+/// launchd minimal PATH — a bare `Command::new("pg_dump")` ENOENTs mid-backup.
+/// So resolve against `LUCIDOS_PG_BIN_DIR` when set (failing fast with the path
+/// if the binary is missing) and make the bundled libpq loadable via
+/// `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH` from `LUCIDOS_PG_LIB_DIR`. In dev/docker
+/// neither var is set and we fall back to a bare PATH lookup (unchanged).
+fn pg_tool_command(name: &str, database_url: &str) -> Result<std::process::Command, BoxError> {
+    let bin_dir = std::env::var_os("LUCIDOS_PG_BIN_DIR").map(PathBuf::from);
+    let bin = resolve_pg_tool_path(name, bin_dir.as_deref())?;
+    let mut cmd = std::process::Command::new(bin);
+    if let Some(lib) = std::env::var_os("LUCIDOS_PG_LIB_DIR") {
+        cmd.env("DYLD_LIBRARY_PATH", &lib);
+        cmd.env("LD_LIBRARY_PATH", &lib);
+    }
+    apply_pg_env(&mut cmd, database_url)?;
+    Ok(cmd)
+}
+
+/// Pure resolution of a PG client tool path: an absolute `<bin_dir>/<name>`
+/// (must exist — fail fast with the path) when `bin_dir` is given, else the bare
+/// `name` for a PATH lookup. Split out from `pg_tool_command` so the
+/// resolution + the missing-binary error are unit-testable without env/spawn.
+fn resolve_pg_tool_path(name: &str, bin_dir: Option<&Path>) -> Result<PathBuf, BoxError> {
+    match bin_dir {
+        Some(dir) => {
+            let bin = dir.join(name);
+            if !bin.is_file() {
+                return Err(format!(
+                    "bundled PostgreSQL client '{name}' not found at {} \
+                     (LUCIDOS_PG_BIN_DIR) — backup/restore unavailable",
+                    bin.display()
+                )
+                .into());
+            }
+            Ok(bin)
+        }
+        None => Ok(PathBuf::from(name)),
+    }
+}
+
+/// Fail fast at the START of a backup/restore if the bundled PG client tools
+/// can't be resolved, with a descriptive path-bearing error — rather than
+/// getting a cryptic ENOENT deep inside `pg_dump`/`pg_restore`/`psql` after the
+/// run has already started. A no-op in dev (LUCIDOS_PG_BIN_DIR unset → bare
+/// PATH lookup, validated when the tool actually runs).
+fn pg_tools_preflight(database_url: &str) -> Result<(), BoxError> {
+    if std::env::var_os("LUCIDOS_PG_BIN_DIR").is_none() {
+        return Ok(());
+    }
+    for name in ["pg_dump", "pg_restore", "psql"] {
+        pg_tool_command(name, database_url)?;
+    }
+    Ok(())
+}
+
 /// Run pg_dump to export the database in custom archive format.
 ///
 /// Custom format (`-Fc`) is a compressed binary format restored via `pg_restore`.
@@ -910,8 +978,7 @@ fn apply_pg_env(cmd: &mut std::process::Command, database_url: &str) -> Result<(
 /// Connection details flow through libpq `PG*` env vars so the password
 /// stays out of argv.
 fn pg_dump(database_url: &str, output_path: &Path) -> Result<(), BoxError> {
-    let mut cmd = std::process::Command::new("pg_dump");
-    apply_pg_env(&mut cmd, database_url)?;
+    let mut cmd = pg_tool_command("pg_dump", database_url)?;
     let output = cmd
         .args([
             "--format=custom",
@@ -989,8 +1056,7 @@ fn pg_restore(database_url: &str, dump_path: &Path) -> Result<(), BoxError> {
     let dbname = pg_dbname(database_url)?;
 
     // Step 1: pg_restore outputs SQL to stdout
-    let mut restore_cmd = std::process::Command::new("pg_restore");
-    apply_pg_env(&mut restore_cmd, database_url)?;
+    let mut restore_cmd = pg_tool_command("pg_restore", database_url)?;
     let restore_output = restore_cmd
         .args([
             "--no-owner",
@@ -1024,8 +1090,7 @@ fn pg_restore(database_url: &str, dump_path: &Path) -> Result<(), BoxError> {
     }
 
     // Step 3: pipe filtered SQL to psql inside a single transaction
-    let mut psql_cmd = std::process::Command::new("psql");
-    apply_pg_env(&mut psql_cmd, database_url)?;
+    let mut psql_cmd = pg_tool_command("psql", database_url)?;
     let mut psql = psql_cmd
         .args(["--single-transaction", "--dbname", &dbname])
         .stdin(std::process::Stdio::piped())
@@ -1033,9 +1098,18 @@ fn pg_restore(database_url: &str, dump_path: &Path) -> Result<(), BoxError> {
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
-    let write_result = psql.stdin.take().unwrap().write_all(&filtered);
+    // Write stdin on a separate thread while `wait_with_output` drains
+    // stdout/stderr. A synchronous `write_all` before the wait can deadlock on
+    // a large restore: psql blocks once its stdout pipe fills, stops reading
+    // stdin, and our write blocks forever. The write result is checked AFTER
+    // the status so an EPIPE from an early psql death can't mask the real
+    // stderr message.
+    let mut stdin = psql.stdin.take().ok_or("failed to open psql stdin")?;
+    let writer = std::thread::spawn(move || stdin.write_all(&filtered));
     let psql_output = psql.wait_with_output()?;
-    write_result?;
+    let write_result = writer
+        .join()
+        .map_err(|_| "psql stdin writer thread panicked")?;
 
     if !psql_output.status.success() {
         let stderr = String::from_utf8_lossy(&psql_output.stderr);
@@ -1045,6 +1119,7 @@ fn pg_restore(database_url: &str, dump_path: &Path) -> Result<(), BoxError> {
         )
         .into());
     }
+    write_result?;
     Ok(())
 }
 
@@ -1054,8 +1129,7 @@ fn pg_restore(database_url: &str, dump_path: &Path) -> Result<(), BoxError> {
 /// statements. pg_restore --clean needs to DROP and recreate tables, which requires
 /// no other sessions holding locks. After termination, the pool auto-reconnects.
 fn terminate_other_connections(database_url: &str) -> Result<(), BoxError> {
-    let mut cmd = std::process::Command::new("psql");
-    apply_pg_env(&mut cmd, database_url)?;
+    let mut cmd = pg_tool_command("psql", database_url)?;
     let output = cmd
         .arg("-c")
         .arg("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()")

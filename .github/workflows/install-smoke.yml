@@ -160,10 +160,14 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$LUCIDOS_WORKSPACE"
-          # Run the actual installer from this checkout. It detects the existing
-          # checkout (fetch_repo) and uses it instead of cloning. Mock mode
-          # (no provider creds) is exactly the credential-less first-run path.
-          nohup bash ./install.sh > "$RUNNER_TEMP/install.log" 2>&1 &
+          # Run the actual installer from this checkout in SOURCE mode (--dev):
+          # this job is the from-source clean-machine gate (it points LUCIDOS_HOME
+          # at the checkout and polls for the dev ports file). Since step 3 the
+          # DEFAULT path downloads a prebuilt tarball (which 404s until a release
+          # is published), so the source gate must opt in with --dev. It detects
+          # the existing checkout (fetch_repo) and uses it instead of cloning;
+          # mock mode (no provider creds) is the credential-less first-run path.
+          nohup bash ./install.sh --dev > "$RUNNER_TEMP/install.log" 2>&1 &
           echo "INSTALL_PID=$!" >> "$GITHUB_ENV"
           echo "Installer started (pid $!). Log: $RUNNER_TEMP/install.log"
 
@@ -326,4 +330,237 @@ jobs:
           hdiutil detach "$MNT" -quiet || true
           [ "$ok" = "1" ] || { echo "::error::app did not start within 30s of launch"; exit 1; }
           echo "OK — DMG accepted, stapled, mounts, and launches on a clean macOS runner."
+
+  # ── TARBALL + SERVICE SMOKE ───────────────────────────────────────────────────
+  # End-to-end smoke for the NEW DEFAULT installer path (download a prebuilt headless
+  # tarball → verify its sha256 → extract → run) AND the always-on user-service
+  # registration — the two surfaces every `curl … | sh` user actually hits, but which
+  # today are covered ONLY by offline unit tests (scripts/lib/install_test.sh,
+  # scripts/lib/service_test.sh) and never exercised on a real machine in CI.
+  #
+  # ARTIFACT SOURCE — build in-job, drive the DEFAULT path over a file:// base URL.
+  # We deliberately do NOT `gh release download` the tarball: release-tarballs.yml is
+  # ARTIFACT-ONLY (it never attaches tarballs to a GitHub Release — its attach step is
+  # manual + opt-in), so a release-asset download would 404 on every release until that
+  # flow is wired, redding this job. Instead we build the Linux x86_64 tarball with
+  # scripts/build-headless.sh (exactly as release-tarballs.yml does) and point
+  # LUCIDOS_RELEASE_BASE_URL at the local dist/headless over file://. install.sh's
+  # default path then runs its REAL codepath against it: resolve the host triple →
+  # curl lucidos-<ver>-<triple>.tar.gz + .sha256 → MANDATORY fail-closed checksum
+  # verify → extract → register the systemd --user service. (Same file:// technique
+  # install_test.sh uses offline; strictly higher-value than --from-tarball, whose
+  # checksum is only optional.) When Releases start carrying tarball assets, a
+  # `gh release download` arm on `release: published` can be added alongside this.
+  #
+  # systemd --user ON ubuntu-latest: the hosted runner has no interactive login, so the
+  # per-user systemd instance isn't running by default. `loginctl enable-linger` starts
+  # user@<uid>.service + creates /run/user/<uid>; exporting XDG_RUNTIME_DIR +
+  # DBUS_SESSION_BUS_ADDRESS makes `systemctl --user` connect. install.sh's
+  # service_detect_manager probes exactly this — if it didn't work install.sh would
+  # degrade to a foreground launch that never returns, so the setup step ASSERTS the
+  # session is up and fails loud (rather than silently degrading).
+  #
+  # Verification ladder (the rungs this job adds on top of the offline tests):
+  #   1. the systemd --user service is registered + active (lucidos-gateway-<slug>)
+  #   2. gateway /~/api/v1/health → status:ok, role:gateway, release == RELEASE (the
+  #      sigil namespace — a bare /api/v1/health resolves as a workspace slug and 404s)
+  #   3. the ENGINE answers /api/v1/health: create a workspace → poll it healthy →
+  #      /<slug>/api/v1/health → status:ok, release == RELEASE (embedded Postgres, no
+  #      Docker — mirrors scripts/e2e-packaged.sh)
+  #   4. uninstall.sh (data-safe, no --purge) removes the service (unit gone) — doubling
+  #      as uninstall coverage
+  #
+  # Triggers: the same gate events as `smoke` (push to rc/**, workflow_dispatch, the
+  # weekly schedule, and release: published with prerelease==false). Public mirror only
+  # + Ubuntu only (free), same repo + release guards as the other jobs.
+  tarball-smoke:
+    name: tarball-smoke (ubuntu)
+    if: >-
+      github.repository == 'lucidos-dev/lucidos'
+      && (github.event_name != 'release'
+          || github.event.release.prerelease == false)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      LUCIDOS_PREFIX: ${{ github.workspace }}/.tarball-smoke-prefix
+      SLUG: smoke
+      GW_PORT: '5252'
+      TRIPLE: x86_64-unknown-linux-gnu
+      WS_HEALTH_TIMEOUT_SECS: '600'   # cold engine boot warms the embedding model
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Mirror release-tarballs.yml's build setup: pgvector compiles via PGXS (make +
+      # a C toolchain), the engine statically vendors OpenSSL (perl + cc), and the
+      # frontend build needs Node. Install explicitly so a runner-image change can't
+      # silently break the build.
+      - name: Install Linux build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential perl pkg-config curl
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'   # install.sh requires Node 18+; 20 is the current LTS
+
+      - name: Build the prebuilt headless tarball (the download artifact)
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d ' \t\r\n' < RELEASE)"
+          ./scripts/build-headless.sh --triple "$TRIPLE" --version "$version" --out-dir dist/headless
+          echo "--- artifacts:"; ls -la dist/headless
+          echo "--- checksum self-verify:"; ( cd dist/headless && shasum -a 256 -c ./*.tar.gz.sha256 )
+
+      # systemd --user must work BEFORE install.sh runs (else install.sh degrades to a
+      # foreground launch that never returns). Persist XDG_RUNTIME_DIR +
+      # DBUS_SESSION_BUS_ADDRESS to $GITHUB_ENV so install/verify/teardown inherit them.
+      # Fail loud (not silently degrade) if the user session won't come up.
+      - name: Enable the systemd --user session
+        shell: bash
+        run: |
+          set -euo pipefail
+          uid="$(id -u)"
+          sudo loginctl enable-linger "$USER"
+          xdg="/run/user/$uid"
+          echo "XDG_RUNTIME_DIR=$xdg" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$xdg/bus" >> "$GITHUB_ENV"
+          export XDG_RUNTIME_DIR="$xdg" DBUS_SESSION_BUS_ADDRESS="unix:path=$xdg/bus"
+          ok=0
+          for _ in $(seq 1 30); do
+            systemctl --user show-environment >/dev/null 2>&1 && { ok=1; break; }
+            sleep 1
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::systemctl --user is unavailable after enabling linger (cannot test the service path)"
+            loginctl show-user "$USER" 2>&1 | head -20 || true
+            exit 1
+          fi
+          echo "systemd --user session is up."
+
+      # DEFAULT mode (no --dev / --from-tarball): install.sh downloads the tarball +
+      # .sha256 from LUCIDOS_RELEASE_BASE_URL, verifies the checksum (mandatory, fail
+      # closed), extracts, and registers the systemd --user service. file:// points at
+      # the just-built dist/headless so the real default codepath runs offline. In
+      # service mode install.sh registers the BACKGROUND service and RETURNS (only the
+      # --no-service foreground path blocks), so no `nohup … &` is needed.
+      - name: Install via the default download path + register the service
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LUCIDOS_VERSION="$(tr -d ' \t\r\n' < RELEASE)"
+          export LUCIDOS_RELEASE_BASE_URL="file://$GITHUB_WORKSPACE/dist/headless"
+          mkdir -p "$LUCIDOS_PREFIX"
+          echo "base url: $LUCIDOS_RELEASE_BASE_URL"
+          bash ./install.sh \
+            --prefix "$LUCIDOS_PREFIX" --name "$SLUG" --port "$GW_PORT" \
+            > "$RUNNER_TEMP/install.log" 2>&1
+          echo "--- install.sh log tail:"; tail -n 40 "$RUNNER_TEMP/install.log"
+          grep -qi "checksum verified" "$RUNNER_TEMP/install.log" \
+            || { echo "::error::install log has no 'Checksum verified' line — the default download path did not run"; exit 1; }
+
+      - name: Verify service + gateway + engine health
+        shell: bash
+        run: |
+          set -uo pipefail
+          unit="lucidos-gateway-${SLUG}.service"   # == service_systemd_unit_name "$SLUG"
+          repo_version="$(tr -d ' \t\r\n' < RELEASE)"
+          base="http://localhost:$GW_PORT"
+
+          # ── rung 1: the always-on user service is registered + running ───────────
+          if ! systemctl --user is-active --quiet "$unit"; then
+            echo "::error::$unit is not active"
+            systemctl --user status "$unit" --no-pager 2>&1 | head -40 || true
+            exit 1
+          fi
+          unit_path="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$unit"   # == service_systemd_unit_path
+          if [ ! -f "$unit_path" ]; then echo "::error::unit file missing at $unit_path"; exit 1; fi
+          echo "rung 1 OK — $unit active, unit file at $unit_path"
+
+          # ── rung 2: gateway health (binds before embedded PG, so it comes up fast).
+          # Assert status:ok, role:gateway, and release == RELEASE. ─────────────────
+          gw=""
+          for _ in $(seq 1 60); do
+            gw="$(curl -fsS --max-time 5 "$base/~/api/v1/health" 2>/dev/null || true)"
+            echo "$gw" | grep -q '"status":"ok"' && break
+            sleep 1
+          done
+          echo "$gw" | grep -q '"status":"ok"'   || { echo "::error::gateway /~/api/v1/health not ok: $gw"; exit 1; }
+          echo "$gw" | grep -q '"role":"gateway"' || { echo "::error::gateway health missing role=gateway: $gw"; exit 1; }
+          echo "$gw" | grep -q "\"release\":\"$repo_version\"" \
+            || { echo "::error::gateway release != RELEASE ($repo_version) — stale or wrong build: $gw"; exit 1; }
+          echo "rung 2 OK — gateway healthy, release matches: $gw"
+
+          # ── rung 3: the ENGINE answers /api/v1/health. It is reachable only behind a
+          # workspace, so create one, poll it healthy, then hit it through the gateway
+          # proxy. Embedded Postgres (no Docker); first boot warms the embedding model,
+          # so allow a generous window. Mirrors scripts/e2e-packaged.sh. ─────────────
+          create="$(curl -s --max-time 30 -X POST "$base/~/api/v1/control/workspaces" \
+            -H 'Content-Type: application/json' -d '{"name":"smoke-ws"}' 2>/dev/null || true)"
+          ws="$(printf '%s' "$create" | python3 -c 'import sys,json; print(json.load(sys.stdin)["workspace"]["id"])' 2>/dev/null || true)"
+          [ -n "$ws" ] || { echo "::error::could not create workspace (response: $create)"; exit 1; }
+          echo "created workspace slug: $ws"
+
+          echo "polling workspace '$ws' to healthy (timeout ${WS_HEALTH_TIMEOUT_SECS}s)…"
+          deadline=$(( $(date +%s) + WS_HEALTH_TIMEOUT_SECS ))
+          health=""
+          until [ "$(date +%s)" -ge "$deadline" ]; do
+            list="$(curl -fsS --max-time 5 "$base/~/api/v1/control/workspaces" 2>/dev/null || true)"
+            health="$(printf '%s' "$list" | WS="$ws" python3 -c 'import sys,json,os; s=os.environ["WS"]; d=json.load(sys.stdin); print(next((w.get("health","") for w in d.get("workspaces",[]) if w.get("id")==s), ""))' 2>/dev/null || true)"
+            [ "$health" = "healthy" ] && break
+            [ "$health" = "unhealthy" ] && { echo "::error::workspace '$ws' became unhealthy"; exit 1; }
+            sleep 5
+          done
+          [ "$health" = "healthy" ] || { echo "::error::workspace '$ws' never became healthy within ${WS_HEALTH_TIMEOUT_SECS}s"; exit 1; }
+
+          body="$(curl -fsS --max-time 10 "$base/$ws/api/v1/health" 2>/dev/null || true)"
+          echo "$body" | grep -q '"status":"ok"'      || { echo "::error::engine /$ws/api/v1/health not ok: $body"; exit 1; }
+          echo "$body" | grep -q "\"release\":\"$repo_version\"" || { echo "::error::engine release != RELEASE ($repo_version): $body"; exit 1; }
+          echo "$body" | grep -q '"engine_version"'   || { echo "::error::engine health missing engine_version: $body"; exit 1; }
+          echo "$body" | grep -q '"llm_configured"'   || { echo "::error::engine health missing llm_configured: $body"; exit 1; }
+          echo "rung 3 OK — engine healthy through the gateway: $body"
+
+          echo "OK — tarball download + always-on service smoke passed on ubuntu-latest"
+
+      # Capture the gateway/engine journal BEFORE teardown (always), for diagnostics —
+      # the systemd --user unit logs to the journal, not a file.
+      - name: Capture the service journal
+        if: always()
+        shell: bash
+        run: |
+          journalctl --user -u "lucidos-gateway-${SLUG}.service" --no-pager \
+            > "$RUNNER_TEMP/journal.log" 2>&1 || true
+          echo "--- journal tail:"; tail -n 60 "$RUNNER_TEMP/journal.log" 2>/dev/null || true
+
+      # Teardown doubles as UNINSTALL coverage: a data-safe uninstall (no --purge) must
+      # stop + remove the service. Assert the unit is gone afterwards.
+      - name: Uninstall (data-safe) and assert the service is gone
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          unit="lucidos-gateway-${SLUG}.service"
+          bash ./uninstall.sh --prefix "$LUCIDOS_PREFIX" --name "$SLUG" \
+            > "$RUNNER_TEMP/uninstall.log" 2>&1 || true
+          echo "--- uninstall.sh log tail:"; tail -n 30 "$RUNNER_TEMP/uninstall.log" 2>/dev/null || true
+          if systemctl --user is-active --quiet "$unit"; then
+            echo "::error::$unit is still active after uninstall"; exit 1
+          fi
+          unit_path="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$unit"   # == service_systemd_unit_path
+          if [ -f "$unit_path" ]; then echo "::error::unit file still present after uninstall: $unit_path"; exit 1; fi
+          echo "uninstall removed the service ($unit gone)"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarball-smoke-logs
+          path: |
+            ${{ runner.temp }}/install.log
+            ${{ runner.temp }}/uninstall.log
+            ${{ runner.temp }}/journal.log
+          if-no-files-found: ignore
 

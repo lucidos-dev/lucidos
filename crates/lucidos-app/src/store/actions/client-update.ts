@@ -1,52 +1,45 @@
-import { updateAvailable, showToast, hasRefreshToast } from '../store';
+import { updateAvailable, showToast, removeToast, dismissToast, preferences } from '../store';
 import {
   getServedBuildId,
   refreshClient,
-  markSwUpdateDismissed,
   wasSwUpdateDismissed,
   noteUpdateBuildId,
 } from '../../hooks/sw-update';
 import { CLIENT_BUILD_ID } from 'virtual:build-id';
 
-/** Surface the "New version available → Refresh" toast for a genuinely-served
- *  newer build.
- *
- *  This is the SINGLE place the toast is shown. It is driven by the same honest
- *  build-id check that lights the badge (`syncClientUpdateFromBuild`), so the
- *  toast and the badge can never disagree — the bug where the badge showed but
- *  the toast didn't (because the toast used to hang off the fragile SW
- *  `updatefound` → `activated` event, which is missed when the new worker already
- *  activated before the page attached its listener, or while the page was
- *  backgrounded). Surfacing it from the build-id check is ALSO the moment a
- *  refresh is safe: the served `/sw.js` differs from the loaded bundle, so a
- *  reload genuinely lands on a newer build (not the old one mid-rebuild).
- *
- *  Two guards mirror the prior dedup contract:
- *   - `wasSwUpdateDismissed(served)` — the user already dismissed THIS exact
- *     served build; a genuinely newer build re-surfaces it. The badge is left to
- *     the caller (it stays lit — the update IS available — even when the toast is
- *     suppressed).
- *   - `hasRefreshToast()` — a refresh/restart toast already on screen is itself a
- *     way to act, so don't stack a redundant prompt. Today that's the pre-restart
- *     "Engine restart required" toast (its Restart button) or a live copy of this
- *     toast. The post-restart "Engine restarted" confirmation deliberately
- *     carries NO action, so it does NOT suppress this prompt — a restart that
- *     also rebuilt the client must still surface the refresh.
- *
- *  (`showToast` additionally no-ops while the engine is restarting, so this can't
- *  stack on the "Restarting engine…" status either.) */
-export function surfaceUpdateToast(servedBuildId: string): void {
+const UPDATE_TOAST_KEY = 'update-available';
+
+/** Show the "New version available → Refresh" toast. Called by
+ *  `syncClientUpdateFromBuild` only when a refresh is genuinely available (stale
+ *  AND not already dismissed for this served build), so it has no guards of its
+ *  own — on ARRIVAL the badge and this toast surface together from the ONE
+ *  upstream signal (INV-B). Dismissing (the X or "Later") only defers: it hides
+ *  the toast and remembers this build, but the badge stays lit so the user can
+ *  still refresh from it — hence the explicit "Later" affordance. */
+function surfaceUpdateToast(servedBuildId: string): void {
   // Record which build the toast offers so a key-only dismiss (the Toast close
-  // button → dismissToast('update-available')) can pin the right id.
+  // button or "Later" → dismissToast('update-available')) pins the right id.
   noteUpdateBuildId(servedBuildId);
-  if (wasSwUpdateDismissed(servedBuildId)) return;
-  if (hasRefreshToast()) return;
   showToast('New version available — refresh to sync', 'info', {
-    key: 'update-available',
+    key: UPDATE_TOAST_KEY,
+    // "Later" defers the refresh: same path as the X — remembers this build and
+    // hides the toast, while the reload badge stays lit as the update affordance.
+    secondaryAction: {
+      label: 'Later',
+      onClick: () => { dismissToast(UPDATE_TOAST_KEY); },
+    },
     action: {
       label: 'Refresh',
       onClick: () => {
-        markSwUpdateDismissed();
+        // Collapse this toast structurally (removeToast, NOT dismissToast):
+        // clicking Refresh is ACTING on the prompt, not deferring it, so it must
+        // NOT write the now-workspace-global `client_refresh_dismissed_build`
+        // preference — that would suppress the refresh toast on OTHER devices
+        // still running the stale bundle that haven't refreshed. Mirrors
+        // initiateEngineRestart's acting-not-deferring rule. If this device's
+        // reload lands still-stale, syncClientUpdateFromBuild re-surfaces it,
+        // which is correct.
+        removeToast(UPDATE_TOAST_KEY);
         // SW-aware: a bare reload keeps the current service worker, so it won't
         // pick up the new sw.js. refreshClient swaps to the new worker (or busts
         // the shell cache if it won't), so the badge clears on the next load.
@@ -56,31 +49,57 @@ export function surfaceUpdateToast(servedBuildId: string): void {
   });
 }
 
-/** Sync the "client update available" badge AND the refresh toast to whether the
- *  RUNNING code is older than the build the server is serving — `CLIENT_BUILD_ID`
- *  (the build that produced the code executing right now, stamped into the bundle
- *  at build time) vs the served `/sw.js` BUILD_ID (`getServedBuildId`).
+/** Sync the client-update **badge AND Refresh toast** — both from ONE signal — to
+ *  whether the RUNNING code is older than the build the server is serving:
+ *  `CLIENT_BUILD_ID` (the build that produced the code executing right now) vs the
+ *  served `/sw.js` BUILD_ID (`getServedBuildId`).
  *
- *  Comparing the LOADED bundle (not the controlling service worker's id) is the
- *  honest signal: it stays lit exactly while the running code is stale and
- *  clears the moment a reload lands on the served build — regardless of which
- *  worker controls the page (a claimed-but-not-reloaded SW reports the new id
- *  while the page still runs the old bundle, and a cache-busted reload can load
- *  the new bundle under an old controller). It is SELF-CORRECTING: every
- *  definitive check sets the badge true or false, so a transient false-positive
- *  can't latch it on forever the way a one-way `= true` did.
+ *  The engine only ever serves a client compatible with itself: in dev it serves
+ *  a boot-pinned `dist/` snapshot (see `api/frontend_snapshot.rs`), so a stale
+ *  loaded bundle means a *newer, compatible* client is being served — a refresh
+ *  is both wanted and safe. There is therefore no engine-pending gate here: the
+ *  serving layer, not this check, upholds "never a client for a non-running
+ *  engine" (incl. on reload). Comparing the LOADED bundle (not the controlling
+ *  worker's id) is the honest signal: it stays lit exactly while the running code
+ *  is stale and clears the moment a reload lands on the served build.
  *
- *  Runs on startup, on resume, and after a SW swap (controllerchange + the
- *  activated statechange). Two guards keep it from clearing a legitimately-lit
- *  badge on noise: the dev placeholder (`__…__`) carries no signal, and an
- *  indeterminate served id (offline / transient — `getServedBuildId` returns
- *  null) leaves the badge as is rather than mis-clearing it; the next check
- *  re-evaluates. */
+ *  Badge ⟺ toast on ARRIVAL: the badge is `stale`, and when a stale build is
+ *  first seen (not yet dismissed) the toast surfaces alongside it — so a lit
+ *  badge is always accompanied by the toast *on arrival* (INV-B). The two
+ *  decouple only on DISMISS: dismissing hides the toast and remembers this build
+ *  (`wasSwUpdateDismissed`), but the badge stays lit as the persistent refresh
+ *  affordance until the client is no longer stale. A genuinely newer served
+ *  build re-surfaces the toast. Self-correcting: every definitive check re-derives
+ *  the badge from staleness, so a transient false-positive can't latch. Runs on
+ *  startup, on resume, after a SW swap (controllerchange + the activated
+ *  statechange), and after an engine switch (connection.ts). Two guards keep it
+ *  from clobbering a legitimately-lit badge on noise: the dev placeholder
+ *  (`__…__`) carries no signal, and an indeterminate served id (offline /
+ *  transient — `getServedBuildId` returns null) leaves things as-is. */
 export async function syncClientUpdateFromBuild(): Promise<void> {
   if (CLIENT_BUILD_ID.startsWith('__')) return; // un-stamped dev build — no signal
+  // The refresh dismissal is now a GLOBAL preference (not synchronous
+  // localStorage), so until preferences load we can't tell whether this build was
+  // already dismissed. Skip rather than fail-open into a flash of an
+  // already-dismissed toast on cold start — useStartup re-runs this right after
+  // loadPreferences, and resume / PreferencesChanged re-derive thereafter. A
+  // 'failed' load proceeds (fail-open surfacing is the safe default).
+  if (preferences.value.status === 'not-loaded' || preferences.value.status === 'loading') return;
   const served = await getServedBuildId();
-  if (served === null) return; // couldn't determine — leave the badge unchanged
+  if (served === null) return; // couldn't determine — leave badge + toast unchanged
   const stale = served !== CLIENT_BUILD_ID;
+  // Badge = staleness alone: the persistent "refresh available" affordance that
+  // survives a dismiss (the user can still refresh from the reload badge).
   updateAvailable.value = stale;
-  if (stale) surfaceUpdateToast(served);
+  // Toast = staleness AND not-yet-dismissed-for-this-build: the one-time
+  // announcement. On arrival (stale, not dismissed) it appears with the badge;
+  // a dismiss defers it (badge stays), and a genuinely newer build re-surfaces it.
+  if (stale && !wasSwUpdateDismissed(served)) {
+    surfaceUpdateToast(served);
+  } else {
+    // In sync, or deferred for this build → hide the toast (badge stays if still
+    // stale). Structural removal only — never a user-dismiss (that would wrongly
+    // pin this build as dismissed).
+    removeToast(UPDATE_TOAST_KEY);
+  }
 }

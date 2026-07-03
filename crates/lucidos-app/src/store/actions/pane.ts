@@ -12,7 +12,7 @@ import {
   KEYBOARD_RESIZE_STEP_PX, MIN_THREAD_PANE_PX, MIN_CONTENT_PANE_PX,
 } from '../../components/layout/splitHelpers';
 import { isMobile } from '../../utils/viewport';
-import { focusPaneMainControl } from '../../components/layout/paneFocus';
+import { focusPaneMainControl, reconcilePaneFocus } from '../../components/layout/paneFocus';
 
 /** Set the focused pane AND move real DOM focus into it. Used by the keyboard
  *  toggles/shortcuts so "focus pane" actually lands focus on the pane's main
@@ -57,9 +57,10 @@ export function navigateToPane(view: MobileView) {
  *  collapsed. Navigation that lands content (Search Everywhere, a menu switch, a
  *  deep link) never lands DOM focus in the content pane, so without setting the
  *  focused pane group `focusedPane` stays 'thread' and Tab cycles the wrong
- *  pane. Signal-only (like the pointer-down `focusPane`) — the first Tab pulls
- *  DOM focus in via `handlePaneTab`, so we never yank focus mid-navigation.
- *  Always call this after setting `panelOverlay.value` so a click on a content
+ *  pane. `reconcilePaneFocus` then pulls DOM keyboard focus into the content pane
+ *  (when it isn't already there) so the marker, native scroll keys, and shortcuts
+ *  all point at the same pane — the focused-pane marker is kept in sync with real
+ *  focus. Always call this after setting `panelOverlay.value` so a click on a content
  *  link is never silently absorbed when the pane is closed. */
 export function revealContentPane() {
   if (isMobile()) {
@@ -68,6 +69,7 @@ export function revealContentPane() {
   }
   focusedPane.value = 'content';
   if (splitRatio.value >= 1) setSplitRatio(DEFAULT_SPLIT_RATIO);
+  reconcilePaneFocus('content');
 }
 
 /** Mirror of `revealContentPane` for navigation that lands on a THREAD — an
@@ -78,16 +80,17 @@ export function revealContentPane() {
  *  re-activate the Threads pane group (`focusedPane = 'thread'`) — but ONLY from
  *  the cross-group case (arriving from the Content pane group), so an existing
  *  'drawer'/'thread' focus is left alone and drawer ↑/↓ browsing isn't
- *  disturbed. Signal-only on desktop (like `focusPane`): the first Tab pulls DOM
- *  focus in via `handlePaneTab`, so focus is never yanked mid-navigation. Unlike
- *  a raw `navigateToPane('thread')` this keeps the desktop half (focused pane
- *  group) honest — the reason a bare mobile-gated navigate is wrong here, the
+ *  disturbed. `reconcilePaneFocus` then pulls DOM keyboard focus into the thread
+ *  pane (when it isn't already there) so the marker and real focus stay in sync.
+ *  Unlike a raw `navigateToPane('thread')` this keeps the desktop half (focused
+ *  pane group) honest — the reason a bare mobile-gated navigate is wrong here, the
  *  same way it is for content (see frontend.md). */
 export function revealThreadPane(): void {
   if (isMobile()) {
     navigateToPane('thread');
   } else if (focusedPane.value === 'content') {
     focusedPane.value = 'thread';
+    reconcilePaneFocus('thread');
   }
 }
 
@@ -96,11 +99,15 @@ export function revealThreadPane(): void {
  *  thread drawer) and on CLICK inside a header region — the header doubles as the
  *  Tauri window-drag region, so firing focus on click (not pointerdown) keeps a
  *  window drag from changing the focused pane (a native drag suppresses the
- *  click). Either way the focus indicator tracks where the user is working. Also
- *  called by the two-stage toggles. */
+ *  click). Either way the focused-pane marker tracks where the user is working, and
+ *  `reconcilePaneFocus` pulls DOM keyboard focus into the pane when the click
+ *  didn't land it there (e.g. a header-region click, or a click on non-focusable
+ *  pane chrome) so native scroll keys act on the pane the marker points at. A
+ *  click that lands focus on a control inside the pane is left untouched. */
 export function focusPane(pane: FocusedPane): void {
   if (isMobile()) return;
   focusedPane.value = pane;
+  reconcilePaneFocus(pane);
 }
 
 /** Show or hide the thread list (drawer). A plain visibility toggle — unlike the
@@ -110,10 +117,10 @@ export function focusPane(pane: FocusedPane): void {
  *  - **Mobile**: navigates to the threads pane (pane 0) so dots, header, and
  *    pane content all update atomically via the `mobileView` signal.
  *  - **Desktop**: flips `threadDrawerOpen`. When hiding a drawer that currently
- *    holds focus, focus falls back to the thread pane it was overlaying — a
- *    hidden pane must never stay the focused pane or the focus wash strands on an
- *    invisible region. That fix-up is signal-only; no DOM focus is moved, so the
- *    toggle never lands keyboard focus on a pane the way the old focus stage did.
+ *    holds focus, the focused pane falls back to the thread pane — a hidden pane
+ *    must never stay the focused pane or the marker strands on an invisible
+ *    region — and `reconcilePaneFocus` moves DOM keyboard focus (which
+ *    was in the now-hidden drawer) into the thread pane so the two stay in sync.
  *
  *  This is the ONLY correct way for UI elements to show/hide the thread list.
  *  Never toggle `threadDrawerOpen` directly on mobile — it bypasses mobileView
@@ -126,6 +133,7 @@ export function toggleThreads() {
   threadDrawerOpen.value = !threadDrawerOpen.value;
   if (!threadDrawerOpen.value && focusedPane.value === 'drawer') {
     focusedPane.value = 'thread';
+    reconcilePaneFocus('thread');
   }
 }
 

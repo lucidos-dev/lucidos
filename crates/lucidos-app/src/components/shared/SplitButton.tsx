@@ -16,9 +16,10 @@ import { ChevronUpIcon } from './icons';
  *  own handler while a tap on the (inert-while-open) primary face dismisses the
  *  menu rather than firing the primary action by accident.
  *
- *  Reused by the change-action banner (Apply + Diff/Discard/Archive) and the
- *  chat prompt's multi-select answer control (Submit + Cancel). Pass the same
- *  class on `primaryClassName`/`caretClassName` to keep the pill one colour. */
+ *  Reused by the change-action banner (Apply + Discard/Archive; the Diff button
+ *  sits outside this cluster) and the chat prompt's multi-select answer control
+ *  (Submit + Cancel). Pass the same class on `primaryClassName`/`caretClassName`
+ *  to keep the pill one colour. */
 export interface SplitButtonMenuItem {
   /** Stable key for the rendered <button>. */
   key: string;

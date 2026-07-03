@@ -14,7 +14,7 @@ import { MobileAppHeader } from './MobileAppHeader';
 import { SwipeTouch } from '../../utils/swipe';
 import { PanelNav } from './PanelNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
-import { ControlPanel, controlPanelBadgeCount, controlPanelBadgeTooltip, toggleControlPanelAtClick } from './ControlPanel';
+import { ControlPanel, BrandBadge, toggleControlPanelAtClick } from './ControlPanel';
 import { ThreadFilterDropdown, viewIcon } from './ThreadFilterDropdown';
 import { getContentTitle, getDiffDescription } from './headerHelpers';
 import { resolveHeaderDblClick } from './headerDblClick';
@@ -182,7 +182,6 @@ function useHeaderPaneSwipe(ref: { current: HTMLElement | null }): void {
 }
 
 export function AppHeader() {
-  const badgeCount = controlPanelBadgeCount();
   const [editingUrl, setEditingUrl] = useState(false);
   const [urlDraft, setUrlDraft] = useState('');
   const urlInputRef = useRef<HTMLInputElement>(null);
@@ -232,12 +231,17 @@ export function AppHeader() {
   return (
     <>
       <header ref={headerRef} class="pane-header app-header" data-mobile-view={mobileView.value} onClick={onHeaderClick} onDblClick={onHeaderDblClick}>
-        {/* Focused-pane indicator: a smooth rounded accent line pinned to the
-            header's bottom edge, spanning the focused pane's segment. First child
-            so DOM order keeps it under every header control. Positioned +
+        {/* Focused-pane wash: a faint lighter-blue tint over the focused pane's
+            header segment (drawer / thread / content) — the visual cue for which
+            pane is focused. One box per pane, each STATICALLY positioned over its
+            own segment; a focus shift CROSSFADES (the outgoing pane's wash eases
+            out, the incoming pane's eases in) rather than sliding. First children
+            so DOM order keeps them under every header control. Positioned +
             revealed entirely from CSS via :root[data-focused-pane] (shell.css);
             desktop-only. */}
-        <div class="header-focus-line" aria-hidden="true" />
+        <div class="header-focus-wash" data-pane="drawer" aria-hidden="true" />
+        <div class="header-focus-wash" data-pane="thread" aria-hidden="true" />
+        <div class="header-focus-wash" data-pane="content" aria-hidden="true" />
         <MobileAppHeader />
 
         {/* ─── Desktop: full header ─── */}
@@ -253,14 +257,6 @@ export function AppHeader() {
             <div class="collapsed-thread-actions" onClick={() => focusPane('thread')}>
               <ThreadToggleButton />
               <ThreadNav showTooltip />
-              <button
-                class="icon-btn header-icon"
-                onClick={() => unfocusThread()}
-                aria-label="New thread"
-                data-tooltip={tooltipWithShortcut('New thread', 'newThread')}
-              >
-                <ComposeIcon />
-              </button>
             </div>
             {/* Focus on click, not pointerdown, so a window drag never shifts
                 focus — see ThreadsHeader. */}
@@ -268,6 +264,27 @@ export function AppHeader() {
               <div class="thread-nav-group">
                 <ThreadToggleButton />
                 <ThreadNav showTooltip />
+              </div>
+              <span
+                class="pane-header-brand-label"
+                data-role="control-panel-toggle"
+                onClick={(e) => {
+                  // brand-label is absolutely centered on the pane; ignore clicks
+                  // on the empty space around the visible children.
+                  if (e.target === e.currentTarget) return;
+                  toggleControlPanelAtClick(e);
+                }}
+              >
+                <span class="pane-header-title">Lucidos</span>
+                <BrandBadge />
+                <ConnectionStatus />
+              </span>
+              {/* Right-side actions grouped so the centered brand-label can float
+                  over the pane's true middle (space-between pins this cluster to
+                  the right edge). Compose sits next to Search, mirroring the
+                  mobile thread header. */}
+              <span class="pane-header-brand-actions">
+                <ControlPanel layout="desktop" />
                 <button
                   class="icon-btn header-icon brand-compose-btn"
                   onClick={() => unfocusThread()}
@@ -276,33 +293,18 @@ export function AppHeader() {
                 >
                   <ComposeIcon />
                 </button>
-              </div>
-              <span
-                class="pane-header-brand-label"
-                data-role="control-panel-toggle"
-                onClick={(e) => {
-                  // brand-label stretches with flex:1 to center its content;
-                  // ignore clicks on the empty space around the visible children.
-                  if (e.target === e.currentTarget) return;
-                  toggleControlPanelAtClick(e);
-                }}
-              >
-                <span class="pane-header-title">Lucidos</span>
-                {badgeCount > 0 && <span class="badge brand-badge" data-tooltip={controlPanelBadgeTooltip()}>{badgeCount}</span>}
-                <ConnectionStatus />
+                <SearchEverywhereButton showTooltip />
+                {recoveryProgress.value && (
+                  <span
+                    class="recovery-indicator"
+                    data-tooltip={`Resuming sessions: ${recoveryProgress.value.completed}/${recoveryProgress.value.total}`}
+                  >
+                    <svg class="recovery-spinner" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M8 2a6 6 0 1 1-4.24 1.76" stroke-linecap="round" />
+                    </svg>
+                  </span>
+                )}
               </span>
-              <ControlPanel layout="desktop" />
-              <SearchEverywhereButton showTooltip />
-              {recoveryProgress.value && (
-                <span
-                  class="recovery-indicator"
-                  data-tooltip={`Resuming sessions: ${recoveryProgress.value.completed}/${recoveryProgress.value.total}`}
-                >
-                  <svg class="recovery-spinner" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M8 2a6 6 0 1 1-4.24 1.76" stroke-linecap="round" />
-                  </svg>
-                </span>
-              )}
             </span>
           </div>
           {/* Focus on click, not pointerdown, so a window drag never shifts

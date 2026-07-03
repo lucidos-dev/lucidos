@@ -34,23 +34,35 @@ pub enum AnswerResult {
 /// buttons. No-op when there's no pending question. Conflicts (rare race where
 /// the user answered between lookup and emit) are logged and swallowed —
 /// callers should not fail because of them.
+///
+/// Returns `true` when a pending question was actually cancel-stamped (a
+/// `UserQuestionAnswered(Canceled)` was emitted). The cancel/stop handlers fold
+/// this into their `{"canceled": bool}` response so a Stop that only had a
+/// question card to resolve still reports that it did something — the client
+/// then keeps its optimistic state (the card resolution is the incoming event)
+/// rather than treating the click as a stale no-op. A `Conflict` (already
+/// answered) reports `false`: nothing new was emitted.
 pub async fn resolve_pending_question_as_canceled(
     engine: &Arc<LucidosEngine>,
     thread_id: Uuid,
     actor: Option<MessageOrigin>,
-) {
+) -> bool {
     let Some(tool_use_id) = lookup_pending_question_tool_use_id(engine.pool(), thread_id).await
     else {
-        return;
+        return false;
     };
     let result =
         answer_pending_question(engine, thread_id, tool_use_id, AnswerKind::Canceled, actor).await;
-    if let AnswerResult::Conflict(msg) = result {
-        log!(
-            "[CCQuestion] resolve_pending_question_as_canceled({}): {}",
-            thread_id,
-            msg
-        );
+    match result {
+        AnswerResult::Resumed => true,
+        AnswerResult::Conflict(msg) => {
+            log!(
+                "[CCQuestion] resolve_pending_question_as_canceled({}): {}",
+                thread_id,
+                msg
+            );
+            false
+        }
     }
 }
 

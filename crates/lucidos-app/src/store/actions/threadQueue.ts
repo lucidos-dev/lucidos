@@ -40,16 +40,13 @@ export async function dropQueueEntry(entryId: string, summary: string): Promise<
   }
 }
 
-/** Persist a new capacity policy. Returns true on success so the editor can
- *  close only when the save landed. */
-export async function saveCapacityPolicy(policy: CapacityPolicy): Promise<boolean> {
+/** Persist a new capacity policy. Self-toasts both outcomes and never rejects. */
+export async function saveCapacityPolicy(policy: CapacityPolicy): Promise<void> {
   try {
     await putCapacityPolicy(policy);
     await loadThreadQueue();
     showToast('Capacity policy saved', 'info');
-    return true;
   } catch (error) {
     showToast('Failed to save capacity policy: ' + errorDetail(error), 'error');
-    return false;
   }
 }

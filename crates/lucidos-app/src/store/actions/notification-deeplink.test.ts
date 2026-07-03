@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import type { Tap } from '@lucidos/sdk';
 import {
   resolveDeepLink,
   parseDeepLinkFromUrl,
@@ -34,26 +35,33 @@ describe('resolveDeepLink', () => {
     });
   });
 
-  describe('none kind — mark-read only', () => {
-    it('marks read when tap.kind=none and a notification id is present', () => {
+  describe('none kind — retired, coerces to the openable modal path', () => {
+    // `tap:none` was removed (docs/plans/2026-07-02-remove-notification-tap-none.md);
+    // the SDK `Tap` type no longer includes it. But a historical `{kind:'none'}`
+    // can still arrive via untyped runtime data (an old SW message, a stale URL).
+    // resolveDeepLink must demote it to the openable view-notification path —
+    // never a passive mark-read / no-op.
+    const noneTap = { kind: 'none' } as unknown as Tap;
+
+    it('coerces a historical tap.kind=none (with a notification id) to view-notification', () => {
       expect(
-        resolveDeepLink({ notification: 'n-1', tap: { kind: 'none' } }),
-      ).toEqual({ type: 'mark-read', id: 'n-1' });
+        resolveDeepLink({ notification: 'n-1', tap: noneTap }),
+      ).toEqual({ type: 'view-notification', id: 'n-1' });
     });
 
-    it('ignores context fields — none never navigates', () => {
+    it('coerces none to view-notification even with context fields (never navigates)', () => {
       expect(
         resolveDeepLink({
           notification: 'n-1',
           thread: 't-9',
           event: 'e-7',
-          tap: { kind: 'none' },
+          tap: noneTap,
         }),
-      ).toEqual({ type: 'mark-read', id: 'n-1' });
+      ).toEqual({ type: 'view-notification', id: 'n-1' });
     });
 
-    it('noop when tap.kind=none arrives without a notification id', () => {
-      expect(resolveDeepLink({ tap: { kind: 'none' } })).toEqual({ type: 'noop' });
+    it('noop when a historical none arrives without a notification id (nothing to open)', () => {
+      expect(resolveDeepLink({ tap: noneTap })).toEqual({ type: 'noop' });
     });
   });
 
@@ -235,13 +243,15 @@ describe('parseDeepLinkFromSwMessage', () => {
     });
   });
 
-  it('accepts tap.kind=modal and tap.kind=none', () => {
+  it('accepts tap.kind=modal and DROPS the retired tap.kind=none', () => {
     expect(
       parseDeepLinkFromSwMessage({ notification_id: 'n-1', tap: { kind: 'modal' } })?.tap,
     ).toEqual({ kind: 'modal' });
+    // `none` is retired — validateTap no longer accepts it, so it drops to null
+    // and resolveDeepLink demotes the target to the openable modal default.
     expect(
       parseDeepLinkFromSwMessage({ notification_id: 'n-1', tap: { kind: 'none' } })?.tap,
-    ).toEqual({ kind: 'none' });
+    ).toBeNull();
   });
 
   it('fills in nulls for missing keys', () => {

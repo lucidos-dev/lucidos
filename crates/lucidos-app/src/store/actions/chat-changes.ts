@@ -1,4 +1,4 @@
-import { showToast, dismissToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, toasts, engineRestarting, engineStartedAt, engineVersion, latestEngineVersion, enginePackaged } from '../store';
+import { showToast, dismissToast, removeToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineStartedAt, engineVersion, latestEngineVersion, enginePackaged, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
 import { changeToastMessage } from './changeToast';
 import { toFailed } from '../types';
 import type { Loadable } from '../types';
@@ -9,16 +9,15 @@ import { invoke } from '../../utils/tauri';
 import { isNewerVersion } from '../../utils/version';
 import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { focusThread } from './threads';
-import { formatThreadLabel } from './thread-label';
 import type { Change } from '../../api/client';
 
+/** Shared key for the engine-restart PROGRESS toast (initiateEngineRestart) and
+ *  the restart FAILURE toast. It NO LONGER carries a pre-switch "New version
+ *  available" warning — that surface is owned solely by the poll-driven
+ *  engine-new-version toast (engine-update.ts), which fires only once the
+ *  background rebuild is actually `ready`. */
 export const RESTART_TOAST_KEY = 'restart-required';
 export const RESTART_LS_KEY = 'lucidos-restart-required';
-/** Fingerprint of the restart-needing change set the user has explicitly
- *  dismissed. While this matches the current fingerprint, the toast stays
- *  hidden — a new commit or new thread group changes the fingerprint and
- *  the toast comes back. */
-export const RESTART_DISMISSED_FP_LS_KEY = 'lucidos-restart-dismissed-fp';
 
 export const RESTART_GROUPS_LS_KEY = 'lucidos-restart-groups';
 const LEGACY_RESTART_REASONS_LS_KEY = 'lucidos-restart-reasons';
@@ -117,20 +116,14 @@ function persistRestartGroups(): void {
   }
 }
 
-/** Toast text shown while a restart is pending. The detailed per-thread
- *  change list lives in the Restart confirm dialog (ControlPanel) — the
- *  toast is intentionally short to avoid overwhelming the chat view on
- *  long sessions. */
-const RESTART_TOAST_MESSAGE = 'Engine restart required to apply changes.';
-
-/** Two-phase progress text for the in-flight restart status toast. A dev
- *  restart rebuilds the engine (cargo build) while the old engine is still up,
- *  then kills + respawns it — so the toast starts on the build phase and
- *  advances to the swap phase (in connection.ts) the moment the old engine
- *  goes unreachable. A packaged restart has no build step (launchd kickstart),
- *  so it starts directly on the swap phase. */
-export const RESTART_BUILD_MESSAGE = 'Building the new version…';
-export const RESTART_SWAP_MESSAGE = 'Starting and swapping to new engine…';
+/** Progress text for the in-flight switch status toast. In the new-version /
+ *  switch flow the binary is ALREADY built (Apply rebuilt it in the background /
+ *  the updater installed it), so the switch only respawns — there is no build
+ *  phase at switch time. Both constants now read "Starting new version…"; the
+ *  two names are kept because `connection.ts` / `restoreRestartToast` still
+ *  reference them across the build→swap phase transition. */
+export const RESTART_BUILD_MESSAGE = 'Starting new version…';
+export const RESTART_SWAP_MESSAGE = 'Starting new version…';
 
 /** Set restarting state, show info toast, and trigger the engine restart.
  *
@@ -145,6 +138,25 @@ export const RESTART_SWAP_MESSAGE = 'Starting and swapping to new engine…';
  *  In every case the engine goes away and `checkConnection()` clears
  *  `engineRestarting` on reconnect (started_at change). */
 export async function initiateEngineRestart(): Promise<void> {
+  // Single version surface: the switch replaces the poll-driven "New version
+  // available → Switch to new version" toast with the progress toast below.
+  // Remove it here (the canonical switch entry point) so every path — the toast's
+  // own button, the control-panel reload glyph, the SystemPage dialog — collapses
+  // to one toast instead of stacking "Starting new version…" on top of the
+  // still-visible "New version available." toast. Use removeToast (structural),
+  // NOT dismissToast: clicking Switch is ACTING on the prompt, not deferring it,
+  // so it must not mark this on-disk build dismissed (which would suppress the
+  // toast for a build still sitting on disk if the switch then FAILS). The badge
+  // is unaffected either way — dismissToast no longer clears engineVersionReady
+  // (dismiss = defer, badge persists), so a failed switch keeps the reload-glyph
+  // affordance regardless. A successful switch clears the signal via
+  // connection.ts's engineRestarted path anyway.
+  removeToast(NEW_VERSION_TOAST_KEY);
+  // Same collapse for the "frontend change applies on Switch" hint — the switch
+  // the user just started IS what delivers that queued change, so fold it into
+  // the progress toast rather than leaving it stacked. removeToast (structural),
+  // not dismissToast, for the same acting-not-deferring reason as above.
+  removeToast(FRONTEND_UPDATE_DEFERRED_TOAST_KEY);
   engineRestarting.value = true;
   // Persist the in-flight state so a page reload mid-restart restores the
   // PROGRESS toast (restoreRestartToast) instead of the pre-restart warning.
@@ -202,78 +214,38 @@ function isEngineOutdated(): boolean {
   return !!(ev && lev && isNewerVersion(lev, ev));
 }
 
-/** Stable fingerprint of the per-thread commits the toast is warning about.
- *  When the user adds a commit, the fingerprint changes and the previously
- *  dismissed toast comes back.
+/** Persist (or clear) the restart-pending state driven by `restartRequired` so
+ *  the control-panel badge and the restart confirm dialog (SystemPage) survive a
+ *  page reload.
  *
- *  Engine-outdated state is intentionally excluded: the engineVersion /
- *  latestEngineVersion signals are populated asynchronously (after the
- *  health check resolves), so they're null at restoreRestartToast() time.
- *  Including them in the fingerprint would make the restored fingerprint
- *  spuriously diverge from the dismissed one and silently invalidate the
- *  dismissal across reloads. The ControlPanel badge still reflects engine
- *  outdated; the toast just doesn't re-nag on its own. */
-function currentRestartFingerprint(): string {
-  const groups = restartGroups.value
-    .slice()
-    .sort((a, b) => a.threadId.localeCompare(b.threadId))
-    .map(g => [g.threadId, g.commits] as const);
-  return JSON.stringify(groups);
-}
-
-/** User clicked Dismiss on the restart toast: hide it for the *current* set
- *  of restart-needing changes. `restartRequired` stays true so the
- *  ControlPanel "Restart needed" indicator remains visible. */
-export function dismissRestartToast(): void {
-  localStorage.setItem(RESTART_DISMISSED_FP_LS_KEY, currentRestartFingerprint());
-  dismissToast(RESTART_TOAST_KEY);
-}
-
-/** Show or dismiss the restart-required toast based on restartRequired signal.
- *  Also persists to localStorage so the toast survives page reloads / Vite HMR.
- *  Honors a stored dismissal fingerprint: if the user dismissed the toast and
- *  the change set hasn't grown, stays hidden; otherwise the dismissal is
- *  cleared and the toast reappears. */
+ *  It does NOT show a pre-switch toast, and (in dev) does NOT light the
+ *  "New version available" badge at Apply time. That whole engine surface — the
+ *  poll-driven engine-new-version toast (engine-update.ts) AND the control-panel
+ *  badge / reload-glyph highlight (`engineNewVersionReady()` in ControlPanel.tsx)
+ *  — fires only once the background rebuild is actually `ready`, so nothing can
+ *  claim "available" before the build finishes. `restartRequired` here still
+ *  drives the restart-pending persistence + the client-refresh ordering guard
+ *  (client-update.ts holds a client refresh until after the engine switch), which
+ *  is a separate concern from that visible badge.
+ *
+ *  An in-flight restart owns RESTART_TOAST_KEY via the two-phase progress toast
+ *  (initiateEngineRestart / restoreRestartToast) — leave it untouched here so a
+ *  re-sync (SSE reconnect, startup/resume refreshChangesState, a freshly-applied
+ *  ChangeApplied → addRestartGroup) can't wipe the progress toast. */
 export function syncRestartToast(): void {
-  // A restart in flight owns RESTART_TOAST_KEY via the two-phase progress toast
-  // (initiateEngineRestart, or restoreRestartToast after a reload mid-restart).
-  // Leave it untouched here: a re-sync (SSE reconnect, a startup/resume
-  // refreshChangesState, a freshly-applied ChangeApplied → addRestartGroup) must
-  // NEITHER clobber it with the "restart required" warning + Restart button
-  // (restartRequired still true — nagging the user to start something already
-  // underway) NOR dismiss it when the applied change drops out of the pending
-  // list (restartRequired flips false — that would wipe the build/swap progress
-  // toast mid-restart). checkConnection clears everything on reconnect
-  // (started_at change). Keep persisting RESTART_LS_KEY while a restart is
-  // pending so the warning still restores if the restart never completes.
   if (engineRestarting.value) {
     if (restartRequired.value) localStorage.setItem(RESTART_LS_KEY, 'true');
     return;
   }
   if (restartRequired.value) {
     localStorage.setItem(RESTART_LS_KEY, 'true');
-    const dismissedFp = localStorage.getItem(RESTART_DISMISSED_FP_LS_KEY);
-    const currentFp = currentRestartFingerprint();
-    if (dismissedFp !== null && dismissedFp === currentFp) {
-      dismissToast(RESTART_TOAST_KEY);
-      return;
-    }
-    if (dismissedFp !== null) localStorage.removeItem(RESTART_DISMISSED_FP_LS_KEY);
-    // If warning toast already exists with same message, skip to avoid re-renders
-    const existing = toasts.value.find(t => t.key === RESTART_TOAST_KEY && t.type === 'warning');
-    if (existing && existing.message === RESTART_TOAST_MESSAGE) return;
-    showToast(RESTART_TOAST_MESSAGE, 'warning', {
-      key: RESTART_TOAST_KEY,
-      action: { label: 'Restart', onClick: () => initiateEngineRestart() },
-      secondaryAction: { label: 'Dismiss', onClick: () => dismissRestartToast(), variant: 'danger' },
-    });
   } else {
     localStorage.removeItem(RESTART_LS_KEY);
-    if (localStorage.getItem(RESTART_DISMISSED_FP_LS_KEY) !== null) {
-      localStorage.removeItem(RESTART_DISMISSED_FP_LS_KEY);
-    }
     restartGroups.value = [];
     persistRestartGroups();
+    // Clear any lingering keyed toast (e.g. a stale restart-failure toast) once
+    // the pending state resolves; the progress toast is excluded by the
+    // engineRestarting guard above.
     dismissToast(RESTART_TOAST_KEY);
   }
 }
@@ -298,8 +270,10 @@ function restoreRestartGroupsFromStorage(): void {
  *      completion detection so checkConnection still fires "Engine restarted" on
  *      reconnect. This takes precedence — re-showing the pre-restart warning here
  *      would nag the user to start a restart already underway.
- *   2. A restart is merely PENDING (`RESTART_LS_KEY`). Restore the
- *      "Engine restart required" warning toast (its Restart button). */
+ *   2. A restart is merely PENDING (`RESTART_LS_KEY`). Restore `restartRequired`
+ *      + the restart groups so the control-panel badge and restart confirm dialog
+ *      reappear. No toast — the engine "New version available" toast is owned by
+ *      the poll (engine-update.ts) once the rebuild is `ready`. */
 export function restoreRestartToast(): void {
   localStorage.removeItem(LEGACY_RESTART_REASONS_LS_KEY);
 
@@ -480,26 +454,18 @@ export async function applyAllChanges(): Promise<void> {
   // can't fire a second batch in the click→SSE gap.
   applyAllInProgress.value = true;
   try {
-    const result = await apiApplyAll();
-    // When the first change needs hardening (status === 'hardening'), the
-    // MissingHardeningDetected SSE handler (thread-sync.ts) fires the toast —
-    // uniform with merge conflict and single Apply, no double-fire here. The
-    // bulk button stays "Applying..." for the whole wait via applyAllInProgress
-    // until ApplyAllBatchCompleted (SSE) clears it.
-    const conflictThreadId = result.conflict_thread_id;
-    if (conflictThreadId) {
-      // Backend stopped at a conflict — surface the same toast as Apply Now.
-      // The SSE-driven toast (added in the MergeConflictDetected handler)
-      // covers the case where the user is not looking at the conflict
-      // thread; this one fires immediately on the batch's terminal HTTP
-      // response so Apply All has immediate feedback.
-      const label = formatThreadLabel(conflictThreadId);
-      showToast(
-        `Applied ${result.applied ?? 0} change(s) — merge conflict in ${label}, resolving automatically.`,
-        'warning',
-        { onClick: () => focusThread(conflictThreadId) },
-      );
-    }
+    // Both first-change outcomes that warrant a toast — hardening
+    // (status === 'hardening') and merge conflict (conflict_thread_id) — are
+    // surfaced by their SSE handlers in thread-sync.ts (MissingHardeningDetected
+    // / MergeConflictDetected), uniform with single Apply. We deliberately do
+    // NOT fire an HTTP-response toast here. Those SSE toasts are keyed and
+    // transition in place to "applied" / "resolved" (or dismiss) once the
+    // change resolves; an unkeyed HTTP toast can't be reached by that resolver,
+    // so it dangles forever as a stale "resolving automatically" warning even
+    // after the conflict is fixed and the batch applies (the bug this avoids).
+    // The bulk button stays "Applying..." via applyAllInProgress until
+    // ApplyAllBatchCompleted (SSE) clears it.
+    await apiApplyAll();
   } catch (e) {
     // No batch was started — drop the optimistic busy state so the button
     // doesn't stay stuck on "Applying...".

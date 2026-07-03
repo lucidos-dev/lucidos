@@ -141,29 +141,75 @@ const TASK_LIFECYCLE_RULE: &str = "TASK LIFECYCLE: After a background task ends,
     **expected**, not a bug. Treat the error as confirmation the task is done; do NOT retry the \
     call.";
 
-/// Encourage CC to ask via the structured `AskUserQuestion` tool — which the
-/// Lucidos UI renders as clickable buttons — instead of listing options in
-/// plaintext that the user has to retype. Applies to chat-style prompts only;
-/// hardening and merge-conflict sessions don't dialogue with the user.
-const ASK_USER_QUESTION_RULE: &str = "ASKING USERS: When you need an answer from the user — a yes/no decision, picking \
-     between approaches, choosing from a small list — use the `AskUserQuestion` tool. \
-     The Lucidos UI renders its options as clickable buttons; options listed only in your \
-     message text force the user to type their reply instead of clicking. ALWAYS provide the \
-     `question` field — the full question text shown on the card; the optional `header` \
-     chip-label is never a substitute, so don't put the question only in `header` (or only \
-     in your prose) and leave `question` empty. The engine rejects a call whose `question` \
-     is missing and makes you re-ask. ALWAYS use \
-     `AskUserQuestion` for any question with 2-4 discrete answers, including the binary \
-     yes/no case. This applies at ANY point in your reply, not just the end — mid-stream \
-     checkpoints (\"does the framing look right so far?\", \"is this the right direction \
-     before I continue?\", \"should I keep going with approach A?\") and end-of-turn \
-     confirmations (\"does this look complete?\", \"did I miss anything?\", \"should I \
-     proceed with approach A?\") all become buttons, not plaintext, even when they trail \
-     a long markdown answer. The trigger is question-shape (yes/no, A vs B, pick-from-list), \
-     not position in the message. If you find yourself typing a question mark and then \
-     waiting for the user to answer, stop and route it through `AskUserQuestion`. Reserve \
-     plaintext questions for genuinely open-ended ones (\"What name should I use for X?\") \
-     where pre-baked options would be guesses. \
+/// Tell the coding agent that background processes do NOT outlive the turn that
+/// started them. A coding-agent session is a per-turn subprocess: when the turn
+/// goes idle the engine tears down the whole process group (the agent + every
+/// child it spawned — see `lifecycle::terminate_decision` +
+/// `runtime::spawn_env::graceful_kill_child_process_group`), and nothing
+/// re-invokes the agent when a backgrounded job would later finish (that wake
+/// path exists only for the *chat* agent's tracked `run_bash_background` tool,
+/// which coding agents don't have). Left to its own devices the agent trusts its
+/// Bash tool's native "runs across turns, re-invokes you on exit" contract —
+/// true for the standalone CLI, false here — so it kicks off a long build in the
+/// background, ends the turn, and the build is killed; the next `--resume` turn
+/// starts it over. This bit us in a real DMG-build thread (three restarts, no
+/// artifact). The fix is guidance: foreground long commands, or poll them to
+/// completion within the same turn. Applies to chat-style prompts only (grouped
+/// with `TASK_LIFECYCLE_RULE`); merge-conflict sessions don't run builds.
+const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN: When your turn \
+    ends (you go idle), the Lucidos engine terminates your whole process group — you and every \
+    process you spawned. A command started with `run_in_background` (or `&` / `nohup` / any \
+    detached job) is therefore KILLED the instant you end the turn, and nothing re-invokes you \
+    when it would have finished; the next turn just starts it over from scratch. So NEVER kick \
+    off a long-running command in the background and then end your turn expecting to be woken \
+    with its result — you won't be. Instead: run the command in the FOREGROUND (that keeps your \
+    turn open while it runs), or, for work too long for a single foreground command's tool \
+    timeout, start it in the background and POLL it to completion WITHIN THE SAME TURN (loop \
+    `sleep 30; tail <logfile>` until it finishes) before you end the turn. Only finish once you \
+    actually have the command's result.";
+
+/// Encourage the coding agent to ask via the structured `AskUserQuestion` tool
+/// — which the Lucidos UI renders as clickable buttons — for the DECISIONS it
+/// needs to proceed, while forbidding post-work "does this look good?"
+/// confirmations. The forbidding half is load-bearing: a held-open question
+/// parks the thread in `waiting_for_user_answer`, which stalls hand-off (in an
+/// Apply-based worktree it blocks the Apply button — see
+/// [`APPLY_CONFIRMATION_NOTE`]), and for a visual/behavioral change the user
+/// can't even judge the result until it's landed — the two lock each other out
+/// (the "cant apply when you ask question" dark-mode-contrast thread). The prior
+/// wording actively told the agent to turn end-of-turn confirmations into button
+/// questions, which caused exactly that deadlock.
+///
+/// This shared rule is kept ENVIRONMENT-GENERIC (no "Apply" / "the change be
+/// proposed" / "Diff") because it is interpolated into external-repo prompts
+/// too, where there is no Apply — those sessions push and open PRs. The
+/// Apply-specific sharpening lives in [`APPLY_CONFIRMATION_NOTE`], added only by
+/// the Apply-based prompt builders. Applies to chat-style prompts only;
+/// hardening and merge-conflict sessions don't dialogue with the user. The
+/// regression test `chat_style_prompts_nudge_use_of_ask_user_question` pins both
+/// halves.
+const ASK_USER_QUESTION_RULE: &str = "ASKING USERS: Use the `AskUserQuestion` tool when you need a DECISION from the \
+     user to move forward — which of two approaches to take, an ambiguous requirement, a \
+     judgment call you can't make yourself — and ask it BEFORE or WHILE you do the work, \
+     when you actually need the answer to proceed. The Lucidos UI renders its options as \
+     clickable buttons; options listed only in your message text force the user to type \
+     their reply instead of clicking. ALWAYS provide the `question` field — the full \
+     question text shown on the card; the optional `header` chip-label is never a \
+     substitute, so don't put the question only in `header` (or only in your prose) and \
+     leave `question` empty. The engine rejects a call whose `question` is missing and \
+     makes you re-ask. Use `AskUserQuestion` for any such decision with 2-4 discrete \
+     answers, including the binary yes/no case. Mid-stream decision questions (\"border or \
+     bg?\", \"is this the right direction before I continue?\") are fine — nothing is \
+     blocked because there's no finished change yet.\n\n\
+     DO NOT ask a confirmation question about work you've ALREADY done or are wrapping up — \
+     \"does this look good?\", \"does this look complete?\", \"did I miss anything?\", \
+     \"want me to tweak the color?\". A held-open question parks the thread in the \
+     waiting-for-answer state, which stalls hand-off — the user can't take your finished \
+     work forward while a question is open. And for a visual or behavioral change the user \
+     often cannot even judge the result until it's landed and running, so \"does this look \
+     good?\" is unanswerable at that point. When the work is done, DON'T ask whether it's \
+     good: finish and hand it off, and let the user review the result. If it needs tuning, \
+     they'll tell you in a new message. Ask to DECIDE, never to CONFIRM finished work.\n\n\
      NEVER parallel-call `AskUserQuestion` alongside other tools — if you're asking a \
      question, stop the assistant message after the `AskUserQuestion` tool_use and do not \
      include any sibling tool_uses (no Bash, no Read, no TaskOutput, no second \
@@ -172,6 +218,24 @@ const ASK_USER_QUESTION_RULE: &str = "ASKING USERS: When you need an answer from
      events while the question is still on-screen — at which point the user's typed comment \
      can no longer be safely routed as a free-text answer, and your own parallel work has \
      wasted tokens on an unconfirmed direction. Wait for the answer, THEN continue.";
+
+/// Apply-specific sharpening of the "never CONFIRM finished work" half of
+/// [`ASK_USER_QUESTION_RULE`], added ONLY by the Apply-based prompt builders
+/// (Lucidos-source worktree + recovery, app worktree + recovery). It names the
+/// concrete mechanism — a held-open question parks the thread in
+/// `waiting_for_user_answer`, which blocks the Apply button
+/// (`is_blocking` / `available_thread_actions` in `thread_lifecycle.rs`). It is
+/// deliberately NOT in the shared rule, because external-repo prompts have no
+/// Apply (they push and open PRs) and the Apply-blocking rationale would
+/// mislead them into stopping without pushing. Reaches both backends: it is a
+/// separate placeholder in the builders, so `append_backend_rules`' Codex swap
+/// of `ASK_USER_QUESTION_RULE` leaves it intact.
+const APPLY_CONFIRMATION_NOTE: &str = "APPLYING YOUR WORK: Concretely, a question you leave open \
+     parks this thread in the waiting-for-answer state, which BLOCKS the Apply button — the user \
+     cannot Apply your change while a question is open, and for a visual change they can't judge \
+     it until they Apply. So when your change is ready, finish the turn and let the change be \
+     proposed, so the user can review the Diff, click Apply, and see it live — never gate a \
+     finished change behind a \"does this look good?\" question.";
 
 /// Permission allowlist rule — Claude Code ONLY. Lucidos passes
 /// `--allowedTools` when spawning CC, which overrides settings.json permission
@@ -272,11 +336,45 @@ const CODEX_ASK_USER_QUESTION_RULE: &str = "\
     answer labels; omit for free-text), `multi_select` (allow picking several). One question \
     per call. An answer of `(canceled)` means the user dismissed the question — stop and wait \
     for their next instruction instead of re-asking. Do not guess when the tool can ask. \
+    Ask to DECIDE, never to CONFIRM finished work: do NOT ask a \"does this look good / \
+    complete?\" question about a change you've already made. A held-open question just parks \
+    the thread and stalls hand-off, and the user can't judge a visual result until it's \
+    landed and running — finish and hand it off instead so they can review it. \
     NEVER parallel-call `ask_user_question` alongside other tools — if you're asking a \
     question, stop the assistant message after the `ask_user_question` tool call and do not \
     include any sibling tool calls.";
 
-/// Append backend-specific rules to a finished system prompt — the single
+/// Backend-INDEPENDENT teaching appended to every coding-agent prompt by
+/// [`append_backend_rules`] — the shared chokepoint that rides every flavor
+/// (normal, recovery, conflict, override) for both backends. Both Claude Code
+/// and Codex run their reasoning in a channel the Lucidos UI does not render:
+/// CC's extended-thinking blocks come back `display: "omitted"` (signature only,
+/// no `thinking_delta`) by default for the current models and stay empty even
+/// when summarized display is requested in headless `stream-json` mode (an
+/// upstream CC limitation — see `runtime/claude_code_parse.rs` and the
+/// `cc-reasoning-dormant` investigation in `docs/temporary-measures.md`), and
+/// Codex reasoning is dropped at parse. So anything the model parks in its
+/// reasoning is invisible to the user. Without this rule the agent drafts
+/// user-facing content there and then references it as if shown — the real
+/// "Caption copy: do the six lines above work?" card whose six lines never
+/// appeared. We cannot extract the reasoning text (it is a summary at best, and
+/// unavailable through the CC CLI we drive); the fix is guidance — tell the
+/// agent its reasoning is not shown so it puts must-see content in a visible
+/// message.
+const REASONING_NOT_VISIBLE_RULE: &str = "\n\n\
+    YOUR REASONING IS NOT SHOWN TO THE USER: In this UI your extended thinking / reasoning is \
+    NOT displayed — the user sees only your visible assistant messages and your tool calls, never \
+    your private reasoning. So any content the user must see or act on — draft copy you want \
+    approved, the options behind a question, a snippet you want reviewed, a summary of what you \
+    found — MUST go in a visible assistant message (or a structured tool field the UI renders, \
+    such as a question tool's `question` / `options`), NEVER only in your reasoning. Do not \
+    reference content as if the user can see it (\"the six lines above\", \"as shown in my \
+    analysis\") unless you actually put it in a visible message this turn. When in doubt, write \
+    it in the message.";
+
+/// Append backend-specific rules — plus the backend-independent
+/// [`REASONING_NOT_VISIBLE_RULE`], which rides every prompt here — to a finished
+/// system prompt — the single
 /// point where the two coding-agent backends diverge. Claude Code prompts gain
 /// [`PERMISSION_CONFIG_RULE`] (the `--allowedTools` / `~/.lucidos/cc-allowed-tools`
 /// mechanics are CC-only); Codex prompts replace [`ASK_USER_QUESTION_RULE`]
@@ -291,6 +389,10 @@ pub(super) fn append_backend_rules(
     prompt: String,
     coding_agent: crate::runtime::CodingAgent,
 ) -> String {
+    // Backend-INDEPENDENT: both backends hide the model's reasoning from the UI,
+    // so every prompt flavor gets the reasoning-not-visible rule here (the shared
+    // chokepoint) before the backend-specific teaching below.
+    let prompt = format!("{prompt}{REASONING_NOT_VISIBLE_RULE}");
     match coding_agent {
         crate::runtime::CodingAgent::ClaudeCode => format!("{prompt}{PERMISSION_CONFIG_RULE}"),
         crate::runtime::CodingAgent::Codex => {
@@ -338,7 +440,9 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
          {no_pull_requests}\n\n\
          {hardening}\n\n\
          {ask_user_question}\n\n\
+         {apply_confirmation}\n\n\
          {task_lifecycle}\n\n\
+         {background_process}\n\n\
          SESSION SUMMARY: After hardening completes, output a structured summary of what \
          was implemented in this session. List each change with its status (committed, applied, \
          pending). Include file names and brief descriptions. This is the last thing you output \
@@ -354,7 +458,9 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
         commit_cadence = COMMIT_CADENCE_RULE,
         hardening = HARDENING_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
+        apply_confirmation = APPLY_CONFIRMATION_NOTE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
+        background_process = BACKGROUND_PROCESS_RULE,
         process_safety = process_safety_rule(true),
     )
 }
@@ -385,12 +491,14 @@ pub(super) fn external_repo_system_prompt(
          {commit_cadence}\n\n\
          {ask_user_question}\n\n\
          {task_lifecycle}\n\n\
+         {background_process}\n\n\
          CRITICAL: Never run `exit` as a bash command. If the user asks you to exit or stop, \
          simply say goodbye and finish your response — the Lucidos engine manages your lifecycle. \
          Running `exit` in bash can crash the host application.{process_safety}",
         commit_cadence = COMMIT_CADENCE_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
+        background_process = BACKGROUND_PROCESS_RULE,
         process_safety = process_safety_rule(false),
     )
 }
@@ -413,6 +521,7 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
          {commit_cadence}\n\n\
          {ask_user_question}\n\n\
          {task_lifecycle}\n\n\
+         {background_process}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}",
         branch = branch_name,
         repo = repo_name,
@@ -420,6 +529,7 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
         commit_cadence = COMMIT_CADENCE_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
+        background_process = BACKGROUND_PROCESS_RULE,
         process_safety = process_safety_rule(false),
     )
 }
@@ -452,7 +562,9 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
          {no_pull_requests}\n\n\
          {hardening}\n\n\
          {ask_user_question}\n\n\
+         {apply_confirmation}\n\n\
          {task_lifecycle}\n\n\
+         {background_process}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}",
         preamble = workspace_preamble(workspace_name),
         branch = branch_name,
@@ -463,7 +575,9 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
         commit_cadence = COMMIT_CADENCE_RULE,
         hardening = HARDENING_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
+        apply_confirmation = APPLY_CONFIRMATION_NOTE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
+        background_process = BACKGROUND_PROCESS_RULE,
         process_safety = process_safety_rule(true),
     )
 }
@@ -525,7 +639,9 @@ pub(super) fn app_worktree_system_prompt(
          user to \"open a PR\" or \"submit a PR\". The engine is the merge mechanism: when \
          the user clicks Apply, your branch lands on the workspace git's `main`.\n\n\
          {ask_user_question}\n\n\
+         {apply_confirmation}\n\n\
          {task_lifecycle}\n\n\
+         {background_process}\n\n\
          SESSION SUMMARY: Output a structured summary of what was implemented in this \
          session. List each change with a brief description. This is the last thing you \
          output before finishing.\n\n\
@@ -534,7 +650,9 @@ pub(super) fn app_worktree_system_prompt(
          your lifecycle. Running `exit` in bash can crash the host application.{process_safety}",
         commit_cadence = COMMIT_CADENCE_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
+        apply_confirmation = APPLY_CONFIRMATION_NOTE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
+        background_process = BACKGROUND_PROCESS_RULE,
         app_knowhow = APP_KNOWHOW_RULE,
         process_safety = process_safety_rule(false),
     )
@@ -569,12 +687,16 @@ pub(super) fn app_worktree_recovery_system_prompt(
          {commit_cadence}\n\n\
          COMMANDS: Never use /cpa. Just commit with `git add` + `git commit -m \"…\"`.\n\n\
          {ask_user_question}\n\n\
+         {apply_confirmation}\n\n\
          {task_lifecycle}\n\n\
+         {background_process}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}",
         restart_not_rejection = RESTART_NOT_REJECTION_RULE,
         commit_cadence = COMMIT_CADENCE_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
+        apply_confirmation = APPLY_CONFIRMATION_NOTE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
+        background_process = BACKGROUND_PROCESS_RULE,
         app_knowhow = APP_KNOWHOW_RULE,
         process_safety = process_safety_rule(false),
     )
@@ -612,6 +734,7 @@ pub(crate) fn build_merge_prompt(
     merge_target: &str,
     context: Option<&str>,
     description: Option<&str>,
+    is_app: bool,
 ) -> String {
     let mut prompt = String::new();
     prompt.push_str("Your branch needs to be merged with main before it can be applied. ");
@@ -619,18 +742,37 @@ pub(crate) fn build_merge_prompt(
         prompt.push_str(ctx);
         prompt.push('\n');
     }
-    prompt.push_str(&format!(
-        "\n\
-        Please run the following steps:\n\n\
-        1. Run `git merge {} --no-edit` to merge into your branch\n\
-        2. If there are merge conflicts, resolve them (read the files, understand both sides, \
-           edit to keep both working, `git add` each resolved file, then `git commit --no-edit`)\n\
-        3. Run `/harden` to harden the merged code\n\
-        4. Run `cargo test -p lucidos-engine` and `cd crates/lucidos-app && npm test` to verify\n\
-        5. Fix any test failures before finishing\n\n\
-        If any conflict is ambiguous, ask the user before proceeding.",
-        merge_target,
-    ));
+    // App coding-agent threads own their own hardening — their worktree has no
+    // `cargo`/`tsc`/`scripts` and their session prompt opts out of `/harden`, so
+    // the merge prompt must NOT tell them to run `/harden` or the Lucidos-source
+    // test suites (mirrors the `is_app()` skip in `change_ops::apply_change` and
+    // `apply_now`). Lucidos-source threads keep the harden + test steps.
+    if is_app {
+        prompt.push_str(&format!(
+            "\n\
+            Please run the following steps:\n\n\
+            1. Run `git merge {} --no-edit` to merge into your branch\n\
+            2. If there are merge conflicts, resolve them (read the files, understand both sides, \
+               edit to keep both working, `git add` each resolved file, then `git commit --no-edit`)\n\
+            3. Do a quick bug-check pass on the merged result, and run the app's own test/lint \
+               commands if it ships any\n\n\
+            If any conflict is ambiguous, ask the user before proceeding.",
+            merge_target,
+        ));
+    } else {
+        prompt.push_str(&format!(
+            "\n\
+            Please run the following steps:\n\n\
+            1. Run `git merge {} --no-edit` to merge into your branch\n\
+            2. If there are merge conflicts, resolve them (read the files, understand both sides, \
+               edit to keep both working, `git add` each resolved file, then `git commit --no-edit`)\n\
+            3. Run `/harden` to harden the merged code\n\
+            4. Run `cargo test -p lucidos-engine` and `cd crates/lucidos-app && npm test` to verify\n\
+            5. Fix any test failures before finishing\n\n\
+            If any conflict is ambiguous, ask the user before proceeding.",
+            merge_target,
+        ));
+    }
     if let Some(desc) = description {
         prompt.push_str(&format!("\n\nThe change being applied: {}", desc));
     }
@@ -640,6 +782,42 @@ pub(crate) fn build_merge_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Lucidos-source merge prompt keeps the `/harden` + test steps — those
+    /// commands resolve from a Lucidos-source worktree and gate the merge.
+    #[test]
+    fn merge_prompt_lucidos_source_keeps_harden_and_tests() {
+        let prompt = build_merge_prompt("main", None, Some("desc"), false);
+        assert!(prompt.contains("git merge main"));
+        assert!(prompt.contains("/harden"));
+        assert!(prompt.contains("cargo test -p lucidos-engine"));
+        assert!(prompt.contains("desc"));
+    }
+
+    /// Regression: the *app* merge prompt must NOT tell the app session to run
+    /// `/harden` or the Lucidos-source test suites — app worktrees have none of
+    /// that tooling. This is the CC-assisted (diverged-main) counterpart of the
+    /// `apply_now` pre-merge harden-gate skip; without it, an app apply whose
+    /// `main` diverged still injected `/harden` + `cargo test` into the app
+    /// session (the "Create App Demo Video" / `demo-director` bug).
+    #[test]
+    fn merge_prompt_app_omits_harden_and_tests() {
+        let prompt = build_merge_prompt("main", None, Some("desc"), true);
+        assert!(prompt.contains("git merge main"), "still a real merge prompt");
+        assert!(prompt.contains("desc"), "still carries the change description");
+        assert!(
+            !prompt.contains("/harden"),
+            "app merge prompt must not mention /harden; got: {prompt}",
+        );
+        assert!(
+            !prompt.contains("cargo test"),
+            "app merge prompt must not mention cargo test; got: {prompt}",
+        );
+        assert!(
+            !prompt.contains("npm test"),
+            "app merge prompt must not mention npm test; got: {prompt}",
+        );
+    }
 
     /// Tokens that name Lucidos-only slash commands or Lucidos-source script
     /// paths. None of these resolve from an external repo's cwd, so the
@@ -884,6 +1062,146 @@ mod tests {
     }
 
     #[test]
+    fn coding_agent_prompts_warn_background_processes_die_at_turn_end() {
+        // A coding-agent session is a per-turn subprocess: at idle the engine
+        // tears down its whole process group, so a `run_in_background` job left
+        // running as the turn ends is killed, and nothing wakes the agent when
+        // it would have finished (only the chat agent's `run_bash_background`
+        // has that wake path). Without this guidance the agent trusts its native
+        // Bash-tool "runs across turns, re-invokes you" contract and loops — the
+        // real DMG-build thread restarted the build three times and never
+        // produced an artifact. Every chat-style prompt must carry the warning;
+        // the merge-conflict prompt (no builds) deliberately omits it.
+        let cases: &[(&str, String)] = &[
+            (
+                "worktree_system_prompt",
+                worktree_system_prompt("feature/x", "dev"),
+            ),
+            (
+                "external_repo_system_prompt",
+                external_repo_system_prompt("Acme", "feature/x", "origin/main"),
+            ),
+            (
+                "recovery_system_prompt",
+                recovery_system_prompt("feature/x", "dev"),
+            ),
+            (
+                "external_repo_recovery_system_prompt",
+                external_repo_recovery_system_prompt("Acme", "feature/x"),
+            ),
+            (
+                "app_worktree_system_prompt",
+                app_worktree_system_prompt("feature/x", "dev", "habit-tracker", "{}"),
+            ),
+            (
+                "app_worktree_recovery_system_prompt",
+                app_worktree_recovery_system_prompt("feature/x", "dev", "habit-tracker"),
+            ),
+        ];
+        for (label, prompt) in cases {
+            for needle in [
+                "BACKGROUND PROCESSES DON'T SURVIVE A TURN",
+                "run_in_background",
+                // The two workable patterns must both survive a rewrite:
+                // foreground, or poll-to-completion inside the same turn.
+                "FOREGROUND",
+                "WITHIN THE SAME TURN",
+            ] {
+                assert!(
+                    prompt.contains(needle),
+                    "{label} must warn that background processes die at turn end (`{needle}`)",
+                );
+            }
+        }
+
+        // The rule lives in the shared base, so both backends inherit it — the
+        // appended backend section can't strip it.
+        for agent in [
+            crate::runtime::CodingAgent::ClaudeCode,
+            crate::runtime::CodingAgent::Codex,
+        ] {
+            let full = append_backend_rules(worktree_system_prompt("feature/x", "dev"), agent);
+            assert!(
+                full.contains("BACKGROUND PROCESSES DON'T SURVIVE A TURN"),
+                "worktree_system_prompt must keep the background-process rule for {:?}",
+                agent,
+            );
+        }
+
+        // Merge-conflict sessions don't run builds — the rule would be noise.
+        assert!(
+            !conflict_resolution_system_prompt()
+                .contains("BACKGROUND PROCESSES DON'T SURVIVE A TURN"),
+            "merge-conflict prompt should omit the background-process rule",
+        );
+    }
+
+    #[test]
+    fn coding_agent_prompts_tell_agent_its_reasoning_is_not_visible() {
+        // Regression guard for the "Caption copy: do the six lines above work?"
+        // card whose six lines never rendered: the model drafted them in its
+        // reasoning (display-omitted / signature-only for the current models, and
+        // unavailable through the CC CLI we drive) and then referenced them as if
+        // shown. Every coding-agent prompt — every flavor, both backends — must
+        // tell the agent its reasoning is not shown so it puts must-see content in
+        // a visible message. The rule is injected at the shared
+        // `append_backend_rules` chokepoint, so build each flavor and run it
+        // through that (the same way the real spawn does).
+        let flavors: &[(&str, String)] = &[
+            ("worktree", worktree_system_prompt("feature/x", "dev")),
+            (
+                "external_repo",
+                external_repo_system_prompt("Acme", "feature/x", "origin/main"),
+            ),
+            ("recovery", recovery_system_prompt("feature/x", "dev")),
+            (
+                "external_repo_recovery",
+                external_repo_recovery_system_prompt("Acme", "feature/x"),
+            ),
+            (
+                "app_worktree",
+                app_worktree_system_prompt("feature/x", "dev", "habit-tracker", "{}"),
+            ),
+            (
+                "app_worktree_recovery",
+                app_worktree_recovery_system_prompt("feature/x", "dev", "habit-tracker"),
+            ),
+            (
+                "conflict_resolution",
+                conflict_resolution_system_prompt().to_string(),
+            ),
+        ];
+        for agent in [
+            crate::runtime::CodingAgent::ClaudeCode,
+            crate::runtime::CodingAgent::Codex,
+        ] {
+            for (label, base) in flavors {
+                let full = append_backend_rules(base.clone(), agent);
+                for needle in [
+                    "YOUR REASONING IS NOT SHOWN TO THE USER",
+                    "MUST go in a visible assistant message",
+                    "the six lines above",
+                ] {
+                    assert!(
+                        full.contains(needle),
+                        "{label} ({agent:?}) must tell the agent its reasoning is not shown (`{needle}`)",
+                    );
+                }
+            }
+        }
+        // The backend-independent prepend must not have broken the Codex
+        // ask-rule swap that `append_backend_rules` performs after it.
+        let codex = append_backend_rules(
+            worktree_system_prompt("feature/x", "dev"),
+            crate::runtime::CodingAgent::Codex,
+        );
+        assert!(
+            codex.contains("ask_user_question` tool (on the `lucidos` MCP"),
+            "Codex prompt must still swap in the MCP ask_user_question rule",
+        );
+    }
+
+    #[test]
     fn chat_style_prompts_nudge_use_of_ask_user_question() {
         let cases: &[(&str, String)] = &[
             (
@@ -913,29 +1231,107 @@ mod tests {
                     .to_lowercase()
                     .contains("default to `askuserquestion`"),
                 "{label} must keep the AskUserQuestion rule as an unconditional imperative \
-                 — softer phrasing (\"default to\") let CC slip back to plaintext for \
-                 yes/no questions trailing a long markdown answer",
+                 for DECISIONS — softer phrasing (\"default to\") let CC slip back to \
+                 plaintext for the choice-shaped questions it should route through the tool",
             );
+            // The rule must FORBID post-work confirmations, not encourage them. A
+            // held-open question parks the thread in `waiting_for_user_answer`, which
+            // stalls hand-off — and a visual result can't be judged until it's landed.
+            // The old wording told CC to turn end-of-turn "does this look complete?"
+            // into a button question, which caused the "cant apply when you ask
+            // question" deadlock. "does this look complete" must now appear as a DON'T
+            // example. This is the ENVIRONMENT-GENERIC half — the Apply-specific
+            // sharpening (which names the Apply button) is asserted separately and is
+            // intentionally absent from external-repo prompts.
             assert!(
                 prompt.contains("does this look complete"),
-                "{label} must include a concrete end-of-turn checkpoint example — the \
-                 abstract rule alone wasn't enough; CC needs to see the failure case \
-                 spelled out",
+                "{label} must name the concrete post-work confirmation it must NOT ask",
             );
+            for needle in [
+                "DO NOT ask a confirmation question",
+                "Ask to DECIDE, never to CONFIRM finished work",
+            ] {
+                assert!(
+                    prompt.contains(needle),
+                    "{label} must forbid post-work confirmations (missing: {needle:?})",
+                );
+            }
             assert!(
-                prompt.contains("mid-stream"),
-                "{label} must keep the mid-stream concept — end-only examples let CC \
-                 keep slipping plaintext yes/no questions in the middle of long answers \
-                 (\"does the framing look right so far?\"). Pinning the concept word \
-                 (not a specific example phrase) lets future rewrites reword the \
-                 examples freely, but fails loudly if mid-stream coverage gets dropped \
-                 entirely",
+                prompt.contains("Mid-stream decision questions"),
+                "{label} must keep mid-stream DECISION questions allowed — those don't \
+                 block anything (no finished change yet); only post-work confirmations \
+                 are forbidden. The distinction is the whole fix, so pin it",
             );
             assert!(
                 prompt.contains("NEVER parallel-call"),
                 "{label} must forbid parallel-calling `AskUserQuestion` alongside other \
                  tools (see ASK_USER_QUESTION_RULE)",
             );
+        }
+    }
+
+    /// The Apply-specific sharpening (`APPLY_CONFIRMATION_NOTE`) names the Apply
+    /// button — true only in Apply-based worktrees. It MUST reach the four
+    /// Apply-based prompts (Lucidos-source worktree + recovery, app worktree +
+    /// recovery) for BOTH backends (the Codex `ASK_USER_QUESTION_RULE` swap must
+    /// leave the separate note intact), and MUST NOT leak into external-repo
+    /// prompts, whose push/PR workflow has no Apply — telling that agent to "let
+    /// the user click Apply" could make it stop after committing without pushing
+    /// or opening a PR (the Codex-review finding this test pins).
+    #[test]
+    fn apply_confirmation_note_scoped_to_apply_based_prompts() {
+        let apply_based: &[(&str, String)] = &[
+            ("worktree", worktree_system_prompt("feature/x", "dev")),
+            ("recovery", recovery_system_prompt("feature/x", "dev")),
+            (
+                "app_worktree",
+                app_worktree_system_prompt("feature/x", "dev", "habit-tracker", "{}"),
+            ),
+            (
+                "app_worktree_recovery",
+                app_worktree_recovery_system_prompt("feature/x", "dev", "habit-tracker"),
+            ),
+        ];
+        for agent in [
+            crate::runtime::CodingAgent::ClaudeCode,
+            crate::runtime::CodingAgent::Codex,
+        ] {
+            for (label, base) in apply_based {
+                let full = append_backend_rules(base.clone(), agent);
+                assert!(
+                    full.contains("BLOCKS the Apply button"),
+                    "{label} ({agent:?}) must carry the Apply-specific confirmation note \
+                     — the Codex ask-rule swap must not strip the separate note",
+                );
+            }
+        }
+
+        // External-repo prompts must NOT mention Apply / change-proposal — they
+        // push and open PRs. Guards the exact leak the split fixes.
+        let external: &[(&str, String)] = &[
+            (
+                "external_repo",
+                external_repo_system_prompt("Acme", "feature/x", "origin/main"),
+            ),
+            (
+                "external_repo_recovery",
+                external_repo_recovery_system_prompt("Acme", "feature/x"),
+            ),
+        ];
+        for agent in [
+            crate::runtime::CodingAgent::ClaudeCode,
+            crate::runtime::CodingAgent::Codex,
+        ] {
+            for (label, base) in external {
+                let full = append_backend_rules(base.clone(), agent);
+                for banned in ["BLOCKS the Apply button", "click Apply", "the change be proposed"] {
+                    assert!(
+                        !full.contains(banned),
+                        "{label} ({agent:?}) must NOT carry Apply-specific wording \
+                         (found: {banned:?}) — external repos use push/PR, not Apply",
+                    );
+                }
+            }
         }
     }
 

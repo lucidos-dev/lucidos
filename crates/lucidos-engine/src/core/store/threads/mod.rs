@@ -193,6 +193,14 @@ pub struct ThreadSummary {
     /// `None` once the thread transitions out of `composing`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_mode: Option<String>,
+    /// Per-draft dropdown selections (target/scope, coding agent, Lucidos model
+    /// + reasoning, coding-agent model + reasoning) as a partial
+    /// `ComposeSelectionOverride`-shaped object. `None` = no per-draft picks
+    /// stored; the frontend resolves each unset field to its account default.
+    /// Carried on the `/api/v1/threads` initial fetch so a reload rehydrates
+    /// the draft's picks (the DB is the authoritative store, like `compose_text`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_selection: Option<serde_json::Value>,
 }
 
 /// SQL expression that extracts an app id from `{alias}.coding_agent_folder`.
@@ -310,6 +318,7 @@ struct ThreadRow {
     compose_text: String,
     compose_images: serde_json::Value,
     compose_mode: Option<String>,
+    compose_selection: Option<serde_json::Value>,
 }
 
 /// Per-event projection snapshot carried on persisted thread events
@@ -484,7 +493,7 @@ fn thread_cols(alias: &str) -> String {
         {a}.cc_repo_id, \
         {repo_name} AS cc_repo_name, \
         {a}.coding_agent_kind, {a}.coding_agent_folder, {a}.coding_agent, \
-        {a}.state, {a}.compose_text, {a}.compose_images, {a}.compose_mode",
+        {a}.state, {a}.compose_text, {a}.compose_images, {a}.compose_mode, {a}.compose_selection",
         a = alias,
         repo_name = repo_name_expr(&format!("{alias}.cc_repo_id")),
     )
@@ -551,6 +560,7 @@ impl EventStore {
                     compose_text: r.compose_text,
                     compose_images: r.compose_images,
                     compose_mode: r.compose_mode,
+                    compose_selection: r.compose_selection,
                 })
             })
             .collect()

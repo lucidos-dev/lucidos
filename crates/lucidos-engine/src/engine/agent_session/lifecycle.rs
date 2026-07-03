@@ -316,18 +316,32 @@ pub(super) fn conflict_resolution_cleanup_action(
 
 /// True when an arriving `Result` is the "stale --resume" signal — CC echoed
 /// our forwarded user message back as an empty answer because the persisted
-/// session id no longer exists. The run-loop responds by killing the worktree
-/// and retrying with a fresh spawn.
+/// session id no longer exists. The run-loop responds by retrying with a fresh
+/// spawn (reusing the existing worktree — it does NOT delete it).
 ///
 /// `cc_error.is_none()` is load-bearing: an empty Result with `is_error: true`
 /// is a real upstream failure (network drop, 5xx), not an expired session.
-/// Without that gate a transient API error would delete the worktree and
-/// branch, destroying user work.
+/// Without that gate a transient API error would trigger a spurious fresh-spawn
+/// retry.
+///
+/// `no_tool_calls_this_turn` is load-bearing for terse models. A genuinely dead
+/// resume produces an immediate EMPTY Result with ZERO activity (CC started a
+/// fresh conversation with no context and had nothing to say). A live but terse
+/// model — Fable-5 routinely emits ~0 assistant text and jumps straight to a
+/// tool call — ALSO produces `result_text_empty && buffered_text_empty`, but it
+/// MADE tool calls, which proves the session is alive and working. Requiring
+/// zero tool calls this turn distinguishes "dead session" from "alive but
+/// terse." Without it, every terse Fable resume was misclassified as stale,
+/// cancelled, and re-spawned — the 2026-07-02 false stale-resume that spawned a
+/// duplicate CC process on the shared worktree (2x quota burn). Opus/Sonnet
+/// stream substantive prose first (`buffered_text_empty` is false), so they
+/// never reached this predicate at all.
 pub(super) fn is_stale_resume_signal(
     has_resume_session: bool,
     result_text_empty: bool,
     buffered_text_empty: bool,
     no_prior_results_this_turn: bool,
+    no_tool_calls_this_turn: bool,
     user_message_present: bool,
     cc_error: bool,
 ) -> bool {
@@ -335,8 +349,33 @@ pub(super) fn is_stale_resume_signal(
         && result_text_empty
         && buffered_text_empty
         && no_prior_results_this_turn
+        && no_tool_calls_this_turn
         && user_message_present
         && !cc_error
+}
+
+/// CC's deterministic "the session I asked to `--resume` doesn't exist" error.
+///
+/// This is the COMPLEMENT of the `!cc_error` gate in `is_stale_resume_signal`:
+/// that heuristic must refuse to treat a `cc_error` as stale (a transient 5xx /
+/// network drop would otherwise `worktree remove` + strand user work), but CC's
+/// EXPLICIT `No conversation found with session ID: <id>` is not a transient
+/// failure — it means the persisted session id is gone and re-resuming it can
+/// never succeed. So it's the one whitelisted error string that still triggers
+/// the fresh-spawn recovery even though it arrives AS a `cc_error`.
+///
+/// Root cause it recovers (dev/bf997e21): a mid-flight `CLAUDE_CONFIG_DIR` switch
+/// relocates CC's per-session transcript store
+/// (`$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`), so a resume spawned under
+/// the new dir can't find a session created under the old one. Also covers a
+/// pruned/deleted transcript, a CC version upgrade, or a different machine.
+///
+/// Matched on the human-readable error text because the `result` event we parse
+/// exposes no structured "session not found" code (see `claude_code_parse.rs`).
+/// This is a tolerance for CC's error-string contract — tracked in
+/// `docs/temporary-measures.md`; switch to a structured signal if CC adds one.
+pub(super) fn is_definitive_session_not_found(cc_error: Option<&str>) -> bool {
+    cc_error.is_some_and(|e| e.contains("No conversation found with session ID"))
 }
 
 /// Decide what terminal event the stop arm of the run loop should emit.

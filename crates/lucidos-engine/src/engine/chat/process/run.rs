@@ -27,6 +27,8 @@ use super::context_build::{build_capture_sections, build_loaded_knowhow_block};
 pub(super) async fn resolve_route_overrides(
     pool: &sqlx::PgPool,
     use_coding_agent: Option<bool>,
+    thread_id: Option<Uuid>,
+    exclude_event_id: Option<Uuid>,
     model_override: Option<&str>,
     reasoning_effort: Option<&str>,
 ) -> (Option<String>, Option<String>) {
@@ -34,8 +36,14 @@ pub(super) async fn resolve_route_overrides(
         return (None, reasoning_effort.map(str::to_string));
     }
 
-    PreferenceStore::resolve_chat_overrides(
+    // Chat: honor per-thread memory — a follow-up with no explicit override
+    // reuses the model/effort this thread last ran with. `exclude_event_id`
+    // drops the current turn's own MessageReceived when it was pre-emitted
+    // upstream, so the thread never reads itself as its "previous" value.
+    PreferenceStore::resolve_chat_overrides_for_thread(
         pool,
+        thread_id,
+        exclude_event_id,
         model_override.map(str::to_string),
         reasoning_effort.map(str::to_string),
     )
@@ -112,9 +120,16 @@ impl LucidosEngine {
         // effort). For coding-agent turns, `None` must stay unset so the agent
         // path falls through to live/thread/backend settings instead of
         // inheriting the unrelated Lucidos chat reasoning preference.
+        // `pre_emitted_origin` here is the upstream value (the fast-path
+        // mutation below happens after this). When set, it is the current
+        // turn's already-persisted MessageReceived (`events.id`); exclude it so
+        // the per-thread lookup reads the PRIOR message, not this one. In the
+        // normal path it's `None` and the current turn isn't emitted until later.
         let (resolved_model, resolved_effort) = resolve_route_overrides(
             &self.pool,
             use_coding_agent,
+            thread_id,
+            pre_emitted_origin,
             model_override,
             reasoning_effort,
         )

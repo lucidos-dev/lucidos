@@ -188,6 +188,22 @@ async fn thread_save_and_unsave() {
         .expect("Save request failed");
     assert_eq!(save_resp.status(), 200);
 
+    // Idempotent: a duplicate save (e.g. an iOS PWA double-submit) must be a
+    // 200 no-op, not a 409. Before the fix the second request hit the action
+    // guard after the first flipped is_saved=TRUE and 409'd, whose client
+    // handler then reverted the pin icon + toasted a spurious error.
+    let save_again = client
+        .post(&save_url)
+        .json(&save_body)
+        .send()
+        .await
+        .expect("Duplicate save request failed");
+    assert_eq!(
+        save_again.status(),
+        200,
+        "Saving an already-saved thread must be an idempotent 200, not 409"
+    );
+
     // Verify it appears in saved
     let threads_url = format!("{}/api/v1/threads", base_url());
     let threads2: serde_json::Value = client
@@ -216,4 +232,18 @@ async fn thread_save_and_unsave() {
         .await
         .expect("Unsave request failed");
     assert_eq!(unsave_resp.status(), 200);
+
+    // Idempotent the other way too: a duplicate unsave on an already-unsaved
+    // thread is a 200 no-op, not a 409.
+    let unsave_again = client
+        .post(&unsave_url)
+        .json(&unsave_body)
+        .send()
+        .await
+        .expect("Duplicate unsave request failed");
+    assert_eq!(
+        unsave_again.status(),
+        200,
+        "Unsaving an already-unsaved thread must be an idempotent 200, not 409"
+    );
 }

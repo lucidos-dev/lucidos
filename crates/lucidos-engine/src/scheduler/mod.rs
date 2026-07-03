@@ -251,7 +251,9 @@ impl SchedulerManager {
     /// Per-query errors propagate so a DB failure aborts startup loudly
     /// instead of leaving the legacy table in place with no events emitted.
     ///
-    /// DEPRECATED — landed 2026-04-06 (commit 02515f4d9). Dead-on-arrival for any
+    /// DEPRECATED — landed 2026-04-06 (commit 02515f4d9). Temporary measure,
+    /// registered in docs/temporary-measures.md § "Scheduler one-time startup
+    /// migrations". Dead-on-arrival for any
     /// install created after that date (the `trigger_crons` table never exists).
     /// Removal blocked on confirming every live install has started up at least
     /// once since the migration shipped; once verified, drop this function, its
@@ -471,7 +473,9 @@ impl SchedulerManager {
     ///
     /// Idempotent: only matches triggers whose text starts with `"Run skill "` or `"Run trigger "`.
     ///
-    /// DEPRECATED — landed 2026-04-07 (commit d32b2a518). Dead-on-arrival for any
+    /// DEPRECATED — landed 2026-04-07 (commit d32b2a518). Temporary measure,
+    /// registered in docs/temporary-measures.md § "Scheduler one-time startup
+    /// migrations". Dead-on-arrival for any
     /// install created after that date (no triggers ever carry the stale placeholder).
     /// Removal blocked on confirming every live install has started up at least
     /// once since the fix shipped. Safe to drop together with

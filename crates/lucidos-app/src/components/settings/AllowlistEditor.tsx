@@ -5,7 +5,7 @@ import { errorDetail } from '../../utils/errorDetail';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { toFailed, type Loadable } from '../../store/types';
 import { LoadableError } from '../shared/LoadableError';
-import { ListSkeleton } from '../shared/ListSkeleton';
+import { ListSkeletonOf, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 
 interface AllowlistEditorProps {
@@ -40,6 +40,46 @@ export function parseAllowlist(contents: string): { header: string[]; patterns: 
 export function serializeAllowlist(header: string[], patterns: string[]): string {
   const clean = patterns.map((p) => p.trim()).filter((p) => p.length > 0);
   return [...header, ...clean].join('\n') + '\n';
+}
+
+/** Self-skeletonizing pattern row: rendered with no props inside a
+ *  SkeletonProvider (`<AllowlistRow />`) it draws itself as a loading placeholder
+ *  (an input-sized block + a small delete block) via the Sk* leaves; with real
+ *  props it renders the editable input + Delete button. The pattern list +
+ *  per-row callbacks live in the parent, so the skeleton call passes nothing. */
+function AllowlistRow({ pattern, placeholder, onInput, onDelete }: {
+  pattern?: string;
+  placeholder?: string;
+  onInput?: (value: string) => void;
+  onDelete?: () => void;
+}) {
+  return (
+    <div class="allowlist-row">
+      <SkBlock w="100%" h="2.25rem" round>
+        <input
+          class="allowlist-row-input"
+          type="text"
+          spellcheck={false}
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="off"
+          placeholder={placeholder}
+          value={pattern}
+          onInput={(e) => onInput?.((e.target as HTMLInputElement).value)}
+        />
+      </SkBlock>
+      <SkBlock w="3.75rem" h="2.25rem" round>
+        <button
+          type="button"
+          class="action-btn action-btn-danger"
+          aria-label={`Delete pattern ${pattern || '(empty)'}`}
+          onClick={() => onDelete?.()}
+        >
+          Delete
+        </button>
+      </SkBlock>
+    </div>
+  );
 }
 
 /** A list editor over a one-pattern-per-line allowlist file (`cc-allowed-tools`
@@ -123,7 +163,7 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
   return (
     <div class="settings-section">
       <div class="settings-section-title" data-search-anchor={props.anchor}>{props.title}</div>
-      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf containerClass="allowlist-rows" row={() => <AllowlistRow />} />}>
         {loadable.status === 'loaded' ? (
           <>
             <p class="settings-section-desc">{props.description}</p>
@@ -134,27 +174,13 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
               {patterns.map((pattern, i) => (
                 // Positional key: rows have no stable id and edits mutate in place
                 // rather than reorder, so the index is a correct identity here.
-                <div class="allowlist-row" key={i}>
-                  <input
-                    class="allowlist-row-input"
-                    type="text"
-                    spellcheck={false}
-                    autocomplete="off"
-                    autocorrect="off"
-                    autocapitalize="off"
-                    placeholder={props.placeholder}
-                    value={pattern}
-                    onInput={(e) => setPatternAt(i, (e.target as HTMLInputElement).value)}
-                  />
-                  <button
-                    type="button"
-                    class="action-btn action-btn-danger"
-                    aria-label={`Delete pattern ${pattern || '(empty)'}`}
-                    onClick={() => void deletePatternAt(i)}
-                  >
-                    Delete
-                  </button>
-                </div>
+                <AllowlistRow
+                  key={i}
+                  pattern={pattern}
+                  placeholder={props.placeholder}
+                  onInput={(value) => setPatternAt(i, value)}
+                  onDelete={() => void deletePatternAt(i)}
+                />
               ))}
             </div>
             <div class="allowlist-actions">

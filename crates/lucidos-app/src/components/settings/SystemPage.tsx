@@ -27,6 +27,7 @@ import { isTauri } from '../../utils/platform';
 import { invoke } from '../../utils/tauri';
 import { ENGINE_VERSION } from 'virtual:engine-version';
 import { BackupSection } from './BackupSection';
+import { CodingAgentBinariesSection } from './CodingAgentBinariesSection';
 import { LocaleSection } from './LocaleSection';
 import { DiskUsagePage } from './DiskUsagePage';
 import { MemoryInspector } from './MemoryInspector';
@@ -177,6 +178,8 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
 
         <LocaleSection />
 
+        <CodingAgentBinariesSection />
+
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="system:versions">Versions</div>
           <div class="system-info-list">
@@ -226,7 +229,7 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
           </div>
           {release && releaseDirty && (
             <div class="system-footnote">
-              <span class="system-update">*</span> code has changed since the {release} release
+              * code has changed since the {release} release
             </div>
           )}
         </div>

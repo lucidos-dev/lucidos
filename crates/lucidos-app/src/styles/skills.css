@@ -49,7 +49,7 @@
     display: flex;
     align-items: baseline;
     gap: 0.375rem;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
 }
 
 .trigger-cron-desc {
@@ -58,7 +58,7 @@
 
 .trigger-cron {
     font-family: var(--font-ui);
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
 }
 
@@ -66,27 +66,27 @@
     color: var(--accent);
     font-weight: 500;
     text-transform: uppercase;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
 }
 
 .trigger-paused {
     color: var(--text-muted);
     font-weight: 500;
     text-transform: uppercase;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
 }
 
 .trigger-no-more-runs {
     color: var(--text-muted);
     font-weight: 500;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     font-style: italic;
 }
 
 .trigger-type-schedule,
 .trigger-type-event,
 .trigger-type-hybrid {
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     text-transform: uppercase;
     padding: 0.0625rem 0.3125rem;
@@ -102,6 +102,33 @@
 .trigger-type-hybrid {
     background: color-mix(in srgb, var(--accent) 15%, transparent);
     color: var(--accent);
+}
+
+/* Last-run outcome chip on the trigger row (OK / failed). Sits inline after the
+   "Last run <time>" line so a threadless (script) trigger's health is visible at
+   a glance; absent until the trigger has run under an engine that records status. */
+.trigger-last-run {
+    display: flex;
+    align-items: baseline;
+    gap: 0.375rem;
+}
+
+.trigger-run-status {
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    padding: 0.0625rem 0.3125rem;
+    border-radius: 0.1875rem;
+}
+
+.trigger-run-status-ok {
+    background: color-mix(in srgb, var(--accent-green) 15%, transparent);
+    color: var(--accent-green);
+}
+
+.trigger-run-status-failed {
+    background: color-mix(in srgb, var(--accent-red) 15%, transparent);
+    color: var(--accent-red);
 }
 
 /* "from <plugin>" provenance chip on a plugin-installed trigger (ADR 0019). */
@@ -167,7 +194,7 @@
 
 .trigger-group-chevron {
     color: var(--text-muted);
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     width: 0.75rem;
     flex-shrink: 0;
 }
@@ -194,7 +221,7 @@
 
 .trigger-group-count {
     color: var(--text-muted);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     font-weight: 400;
 }
 
@@ -230,7 +257,7 @@
     display: flex;
     align-items: baseline;
     gap: 0.375rem;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     margin-top: 0.125rem;
 }
 
@@ -241,7 +268,7 @@
 
 .trigger-condition {
     font-family: var(--font-ui);
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
 }
 
@@ -257,7 +284,8 @@
 }
 
 .inline-form-body {
-    padding: 1rem;
+    /* --space-lg (1rem) content-pane gutter (see .claude/rules/frontend.md). */
+    padding: var(--space-lg);
 }
 
 .form-group textarea {
@@ -268,7 +296,7 @@
     border-radius: 0.25rem;
     color: var(--text-primary);
     font-family: var(--font-ui);
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     outline: none;
     transition: border-color 0.2s;
     resize: vertical;
@@ -299,8 +327,11 @@
     line-height: 1.4;
 }
 
+/* Single definition (a duplicate in pages.css was folded in here) — the
+   font-weight:normal matters for hints nested inside bold form labels. */
 .form-hint {
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
+    font-weight: normal;
     color: var(--text-muted);
     margin-top: 0.25rem;
 }
@@ -332,13 +363,13 @@
 }
 
 .cron-description {
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--text-primary);
 }
 
 .cron-expression {
     font-family: var(--font-ui);
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
 }
 
@@ -359,7 +390,7 @@
 }
 
 .form-error {
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     color: var(--accent-red);
     margin-top: 0.25rem;
 }
@@ -369,51 +400,4 @@
 /* Clickable list rows (e.g. single-UI apps) */
 .list-row.clickable {
     cursor: pointer;
-}
-
-
-/* App edit modal — UI component list */
-.app-edit-ui-list {
-    display: flex;
-    flex-direction: column;
-    gap: 0.375rem;
-}
-
-.app-edit-ui-item {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0.375rem 0.5rem;
-    background: var(--bg-primary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.25rem;
-}
-
-.app-edit-ui-name {
-    font-size: 0.75rem;
-    color: var(--text-primary);
-    font-weight: 500;
-}
-
-
-/* App UI component sub-list inside app rows */
-.app-ui-sub-list {
-    width: 100%;
-    display: flex;
-    flex-direction: column;
-    gap: 0.125rem;
-    padding-top: 0.25rem;
-    margin-top: 0.25rem;
-}
-
-.app-ui-sub-item {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0.1875rem 0 0.1875rem 0.5rem;
-}
-
-.app-ui-sub-name {
-    font-size: 0.75rem;
-    color: var(--text-secondary);
 }

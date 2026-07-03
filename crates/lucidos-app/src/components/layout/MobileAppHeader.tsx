@@ -10,7 +10,7 @@ import { ThreadNav } from '../shared/ThreadNav';
 import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './PanelNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
-import { ControlPanel, controlPanelBadgeCount, controlPanelBadgeTooltip, toggleControlPanelAtClick } from './ControlPanel';
+import { ControlPanel, BrandBadge, toggleControlPanelAtClick } from './ControlPanel';
 import { ThreadFilterDropdown, viewIcon } from './ThreadFilterDropdown';
 import { getContentTitle, getDiffDescription } from './headerHelpers';
 import { threadSearchQuery, mobileView, MOBILE_VIEWS, focusedThreadId, threadMap, drawerView, attentionThreadCount, type MobileView } from '../../store/store';
@@ -89,6 +89,8 @@ function MobileThreadsHeader() {
           </button>
           {filterOpen && <ThreadFilterDropdown onClose={closeFilter} toggleRef={toggleRef} />}
         </div>
+        {/* Title is absolutely centered on the row middle (see
+            .mobile-header-title); the spacer pins the trailing icons right. */}
         <span class="pane-header-title mobile-header-title">Threads</span>
         <div class="pane-header-spacer" />
         <button
@@ -113,13 +115,13 @@ function MobileThreadsHeader() {
 /** Mobile thread header — brand mode. Pane navigation is swipe-only (no
  *  threads/content toggle icons); the dot indicator remains as a tappable cue. */
 function MobileThreadHeader() {
-  const badgeCount = controlPanelBadgeCount();
-
   return (
     <div class="mobile-thread-header">
       <div class="mobile-header-row">
         <HamburgerButton />
         <div class="mobile-nav-slot"><ThreadNav /></div>
+        {/* Brand is absolutely centered on the row middle (see
+            .mobile-header-title); the spacer pins the trailing icons right. */}
         <span class="pane-header-brand mobile-header-title">
           <span
             class="pane-header-brand-label"
@@ -130,7 +132,7 @@ function MobileThreadHeader() {
             }}
           >
             <span class="pane-header-title">Lucidos</span>
-            {badgeCount > 0 && <span class="badge brand-badge" data-tooltip={controlPanelBadgeTooltip()}>{badgeCount}</span>}
+            <BrandBadge />
             <ConnectionStatus />
           </span>
           <ControlPanel layout="mobile" />
@@ -162,6 +164,9 @@ function MobileContentHeader() {
           <ContentBackButton />
           <ContentForwardButton />
         </div>
+        {/* Title is absolutely centered on the row middle (see
+            .mobile-header-title); the spacer pins the trailing actions right
+            (and keeps them right-aligned when there's no title). */}
         {title && <span class="pane-header-title mobile-header-title mobile-content-title" data-tooltip={diffDesc || title} data-tooltip-tap>{title}</span>}
         <div class="pane-header-spacer" />
         <ContentHeaderActions />

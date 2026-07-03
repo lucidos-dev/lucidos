@@ -125,6 +125,10 @@ export interface ToastOptions {
   durationMs?: number;
   /** false = hide the close (X) button. Default true. */
   dismissable?: boolean;
+  /** Stable key for in-place replacement. A later toast with the same key
+   *  updates the existing toast (message/type/etc.) instead of stacking a new
+   *  one — e.g. an 'Opening…' toast becoming 'Opened'. */
+  key?: string;
 }
 
 export interface PromptOptions {
@@ -324,7 +328,7 @@ export const ui = {
    * themed by the user's preferences). Fire-and-forget — there is no result.
    *
    * Only the serializable subset of the host toast is exposed: `message`, the
-   * `type` severity, and `opts` (`durationMs`, `dismissable`). The host's
+   * `type` severity, and `opts` (`durationMs`, `dismissable`, `key`). The host's
    * action-button callbacks can't cross the postMessage boundary, so they're
    * intentionally not available here. An unknown `type` degrades to `info`.
    */
@@ -338,6 +342,7 @@ export const ui = {
       type: safeType,
       durationMs: opts && typeof opts.durationMs === 'number' ? opts.durationMs : undefined,
       dismissable: opts && typeof opts.dismissable === 'boolean' ? opts.dismissable : undefined,
+      key: opts && typeof opts.key === 'string' && opts.key.length > 0 ? opts.key : undefined,
     };
     // No host parent (SDK loaded in a top-level window) — surface via console so
     // a standalone testing context still sees the feedback instead of silence.

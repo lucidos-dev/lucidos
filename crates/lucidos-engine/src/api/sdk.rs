@@ -73,8 +73,19 @@ fn find_sdk_bundle() -> String {
     // doesn't depend on cwd / exe-relative layout. No-op when unset (dev/docker).
     if let Some(dir) = std::env::var_os("LUCIDOS_SDK_DIR") {
         let path = std::path::Path::new(&dir).join("sdk.js");
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            return content;
+        match std::fs::read_to_string(&path) {
+            Ok(content) => return content,
+            // LUCIDOS_SDK_DIR is set (packaged) but the bundle is missing /
+            // unreadable — a real staging defect. Log a SERVER-side error so it
+            // isn't invisible (apps would otherwise silently lose
+            // `window.lucidos.*` with only a browser-console warning from the
+            // stub below). We still fall through to the stub so app pages load.
+            Err(e) => crate::log!(
+                "[SDK] LUCIDOS_SDK_DIR is set but {} is unreadable: {} — serving the SDK stub; \
+                 apps will lose window.lucidos.*",
+                path.display(),
+                e
+            ),
         }
     }
 

@@ -189,7 +189,11 @@ impl LucidosEngine {
                     Some(tid) => user_tasks::ORIGIN_THREAD_ID.scope(tid, inner).await,
                     None => inner.await,
                 };
-                self.record_trigger_executed(&config.id).await;
+                self.record_trigger_executed(
+                    &config.id,
+                    crate::triggers::TriggerRunStatus::from_success(result.is_ok()),
+                )
+                .await;
                 crate::scheduler::ACTIVE_TASK_COUNT.fetch_sub(1, Ordering::Relaxed);
                 if let Err(e) = result {
                     log!("[Scheduler] Event trigger '{}' failed: {}", config.name, e);
@@ -229,7 +233,11 @@ impl LucidosEngine {
                 .await;
                 crate::scheduler::ACTIVE_TASK_COUNT.fetch_sub(1, Ordering::Relaxed);
                 // Record after execution so crash mid-task → catch-up re-executes.
-                self.record_trigger_executed(&config.id).await;
+                self.record_trigger_executed(
+                    &config.id,
+                    crate::triggers::TriggerRunStatus::from_success(result.is_ok()),
+                )
+                .await;
                 if let Err(e) = result {
                     log!("[Scheduler] Task '{}' execution failed: {}", config.name, e);
                 }

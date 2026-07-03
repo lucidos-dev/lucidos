@@ -83,8 +83,9 @@ const CARD_STATUS: Record<VisualStatus, { word: string; tone: StatusTone }> = {
 /** Structured rows describing a started thread, rendered as a two-column
  *  label/value grid by the thread overflow menu's Info popover. `status` is the
  *  effective status the caller already derived for the row's dot, so the Status
- *  word and the dot can't disagree. (Drafts use `draftRowTooltip` instead — a
- *  draft has no overflow menu, so it keeps its hover/long-press tooltip.) */
+ *  word and the dot can't disagree. (Compose drafts use `draftRowTooltip`
+ *  instead — the meaningful subset for an unsent draft, rendered by the same
+ *  Info popover behind DraftOverflowMenu.) */
 export function threadInfoRows(meta: ThreadMeta, status: ThreadStatus): TooltipRow[] {
   // Fall back to createdAt/updatedAt if the attributed-recency fields are absent
   // (test fixtures); production always has them.
@@ -116,12 +117,13 @@ function draftContextRow(mode: ComposeChannelMode, scope: Scope, contextName: st
   return contextName ? { label: 'Repository', value: contextName } : { label: 'Type', value: 'Repository' };
 }
 
-/** Structured tooltip rows for a compose draft row, the draft counterpart of
- *  `threadInfoRows`. A draft has no agent activity or exchanges yet, so the
- *  tooltip is the meaningful subset: its Draft status, where it's headed, and
- *  when it was created. A draft is "Created" but never "Started" — being
- *  started is the first send, which is exactly the moment it stops being a
- *  draft (so `threadInfoRows` says "Started" and this says "Created"). */
+/** Structured Info rows for a compose draft row, the draft counterpart of
+ *  `threadInfoRows` (both rendered by the ⋯ menu's Info popover). A draft has no
+ *  agent activity or exchanges yet, so it's the meaningful subset: its Draft
+ *  status, where it's headed, and when it was created. A draft is "Created" but
+ *  never "Started" — being started is the first send, which is exactly the
+ *  moment it stops being a draft (so `threadInfoRows` says "Started" and this
+ *  says "Created"). */
 export function draftRowTooltip(
   mode: ComposeChannelMode,
   scope: Scope,

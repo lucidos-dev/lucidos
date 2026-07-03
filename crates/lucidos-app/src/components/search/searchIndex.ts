@@ -60,6 +60,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'system:versions', label: 'Versions', subview: 'system', path: 'Settings → System', anchor: 'system:versions', keywords: 'lucidos engine client build release uptime' },
   { id: 'system:maintenance', label: 'Maintenance', subview: 'system', path: 'Settings → System', anchor: 'system:maintenance', keywords: 'restart rebuild refresh update client engine' },
   { id: 'system:locale', label: 'Locale', subview: 'system', path: 'Settings → System', anchor: 'system:locale', keywords: 'language timezone region locale' },
+  { id: 'system:coding-agents', label: 'Coding agents', subview: 'system', path: 'Settings → System', anchor: 'system:coding-agents', keywords: 'coding agent claude codex binary path cli override auto-detect' },
   { id: 'system:language', label: 'Language', subview: 'system', path: 'Settings → System → Locale', anchor: 'system:language', keywords: 'language locale respond reply' },
   { id: 'system:timezone', label: 'Timezone', subview: 'system', path: 'Settings → System → Locale', anchor: 'system:timezone', keywords: 'timezone time zone iana triggers schedule' },
 

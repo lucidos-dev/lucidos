@@ -204,6 +204,10 @@ pub enum SystemEvent {
         #[serde(skip_serializing)]
         actor: Option<MessageOrigin>,
     },
+    /// App list-refresh hints. Broadcast-only (`is_persisted` = false), like
+    /// `AppUiRefreshRequested`: the `appsList` is a disk-scan projection and
+    /// these SSE signals keep it live; the durable record of an app change is
+    /// the git commit (and `ChangeApplied` for coding-agent applies).
     AppCreated {
         app_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -234,6 +238,55 @@ pub enum SystemEvent {
         app_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
+    },
+    /// A *frontend-only* Apply's in-process served-client advance was DEFERRED
+    /// because an engine version change is pending (a mixed change applied but
+    /// not yet *Switched*) — see `engine::frontend_refresh` INV-A. The rebuilt
+    /// `dist/` already holds a client built for the NEW engine, so it can't be
+    /// served on the still-running old one; the change ships when the user
+    /// Switches. This is the page-facing signal that lets the frontend tell the
+    /// user their just-applied change is queued rather than ignored. Transient
+    /// (never persisted — a pure UI hint, like `AppUiRefreshRequested`) and
+    /// dev-only by construction (`refresh_served_frontend_after_rebuild`
+    /// early-returns in packaged / headless before the emit path runs).
+    /// `sent_at_ms` drives the page-side freshness gate (drop a late SSE-queue
+    /// flush that arrives after the Switch already happened).
+    FrontendUpdateDeferred {
+        sent_at_ms: i64,
+    },
+    /// A dev engine advanced its boot-pinned served-frontend snapshot to the
+    /// checkout-shared `dist/` after ANOTHER workspace's *frontend-only* Apply
+    /// moved it — the applying engine advances only its OWN snapshot, so a peer
+    /// workspace would otherwise silently serve a stale client with no badge (see
+    /// `engine::frontend_refresh::spawn_served_frontend_sync`,
+    /// `docs/plans/2026-07-03-cross-workspace-frontend-only-refresh.md`).
+    /// INV-A-gated: only emitted when the running engine's source still matches
+    /// HEAD (no engine version change pending), so the newer client is compatible
+    /// with the running binary. Transient (never persisted — a pure UI signal like
+    /// `FrontendUpdateDeferred`) and dev-only by construction
+    /// (`spawn_served_frontend_sync` no-ops packaged / headless). The connected
+    /// client re-runs `syncClientUpdateFromBuild` to surface the Refresh
+    /// badge/toast. `sent_at_ms` is informational — the handler is idempotent and
+    /// self-correcting, so no page-side freshness gate is needed.
+    ServedFrontendAdvanced {
+        sent_at_ms: i64,
+    },
+    /// The engine's dev background-rebuild `build_state` transitioned
+    /// (`idle`|`building`|`ready`|`failed`) — emitted from `trigger_background_rebuild`
+    /// at build start (`building`) and completion (`ready`/`failed`, latest
+    /// generation only). A pure UI POKE so the connected client learns of a build
+    /// over the live SSE stream instead of waiting on the throttled 4s
+    /// version-status poll (which iOS suspends on a backgrounded PWA, so the
+    /// transient `building` window was never seen — the spinner badge never
+    /// showed). The frontend handler re-runs the authoritative `checkEngineVersion`
+    /// GET rather than trusting `state` directly, so a stale/duplicate poke can
+    /// only trigger a harmless re-check, never a false spin. Transient (never
+    /// persisted — like `ServedFrontendAdvanced`) and dev-only by construction
+    /// (`trigger_background_rebuild` no-ops packaged). `sent_at_ms` is
+    /// informational — the handler is idempotent, so no page-side freshness gate.
+    EngineBuildStateChanged {
+        state: String,
+        sent_at_ms: i64,
     },
     ArtifactCreated {
         artifact_path: String,
@@ -598,6 +651,13 @@ pub enum SystemEvent {
         image_hashes: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
+        /// Per-draft dropdown selections (target/scope, coding agent, Lucidos
+        /// model + reasoning, coding-agent model + reasoning) as a partial
+        /// `ComposeSelectionOverride`-shaped object. `None` = the PUT didn't
+        /// touch the selection (COALESCE-preserve); receivers hydrate their
+        /// per-draft store from it under the same origin/focus guards as text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selection: Option<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_device_id: Option<String>,
     },
@@ -869,6 +929,9 @@ impl SystemEvent {
             Self::AppUpdated { .. } => "AppUpdated",
             Self::AppDeleted { .. } => "AppDeleted",
             Self::AppUiRefreshRequested { .. } => "AppUiRefreshRequested",
+            Self::FrontendUpdateDeferred { .. } => "FrontendUpdateDeferred",
+            Self::ServedFrontendAdvanced { .. } => "ServedFrontendAdvanced",
+            Self::EngineBuildStateChanged { .. } => "EngineBuildStateChanged",
             Self::DomainEvent { .. } => "DomainEvent",
             Self::ArtifactCreated { .. } => "ArtifactCreated",
             Self::ArtifactUpdated { .. } => "ArtifactUpdated",
@@ -956,6 +1019,9 @@ impl SystemEvent {
         "AppUpdated",
         "AppDeleted",
         "AppUiRefreshRequested",
+        "FrontendUpdateDeferred",
+        "ServedFrontendAdvanced",
+        "EngineBuildStateChanged",
         "DomainEvent",
         "ArtifactCreated",
         "ArtifactUpdated",
@@ -1082,7 +1148,10 @@ impl SystemEvent {
             Self::ApplyAllBatchStarted { .. } | Self::ApplyAllBatchCompleted { .. } => {
                 "apply_all_batch"
             }
-            Self::EngineSupervisorRespawned { .. } => "engine",
+            Self::EngineSupervisorRespawned { .. }
+            | Self::FrontendUpdateDeferred { .. }
+            | Self::ServedFrontendAdvanced { .. }
+            | Self::EngineBuildStateChanged { .. } => "engine",
             Self::EmailSent { .. } => "email",
             Self::ProxyModulesReloaded { .. } => "proxy_modules",
             Self::ThreadQueued { .. }

@@ -174,21 +174,27 @@ describe('applySingleChange feedback', () => {
     expect(toasts.value.find(t => t.type === 'error')).toBeTruthy();
   });
 
-  it('applyAllChanges shows a toast when the batch stops at a conflict', async () => {
+  it('does NOT show an HTTP-response toast when the batch stops at a conflict — SSE handler covers it', async () => {
+    // Apply All conflicts are surfaced by the MergeConflictDetected SSE handler
+    // (see merge-conflict-toast.test.ts), uniform with single Apply and Apply
+    // All's hardening case. The SSE toast is keyed and transitions in place to
+    // "resolved" once the conflict is fixed; the old unkeyed HTTP toast here
+    // could never be reached by that resolver, so it dangled forever as a stale
+    // "resolving automatically" warning after the batch had already applied.
     threadMap.value = new Map([
       ['thread-X', { meta: { id: 'thread-X', title: 'Big refactor' } } as any],
     ]);
     mockedApplyAll.mockResolvedValue({
-      message: 'Applied 3 change(s), then hit a conflict.',
+      message: 'Started Apply All — first change hit a conflict, recovery is running.',
       restart_required: false,
       conflict_thread_id: 'thread-X',
-      applied: 3,
+      applied: 0,
       failed: 0,
     });
     await applyAllChanges();
-    const t = toasts.value.find(t => t.message.toLowerCase().includes('merge conflict'));
-    expect(t).toBeTruthy();
-    expect(t!.message).toContain('Big refactor');
-    expect(t!.message).toContain('3');
+    expect(toasts.value.find(t => t.message.toLowerCase().includes('merge conflict'))).toBeUndefined();
+    // The optimistic bulk-busy flag is untouched by the conflict response — only
+    // ApplyAllBatchCompleted (SSE) clears it.
+    expect(applyAllInProgress.value).toBe(true);
   });
 });

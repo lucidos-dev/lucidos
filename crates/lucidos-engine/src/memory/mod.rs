@@ -1,9 +1,11 @@
+pub mod embedder_slot;
 pub mod extractor;
 pub mod fastembed;
 pub mod pgvector;
 pub mod provider;
 pub mod reembed;
 
+pub use embedder_slot::EmbedderSlot;
 pub use extractor::{ExtractedFact, MemoryExtractor, QueryClassification, EXTRACTOR_VERSION};
 pub use fastembed::FastEmbedProvider;
 pub use pgvector::{MemoryEntry, MemorySource, MemoryStats, PgVectorIndex, SearchResult};

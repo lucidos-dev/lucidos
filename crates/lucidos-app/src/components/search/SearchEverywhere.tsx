@@ -241,10 +241,11 @@ export function SearchEverywhere() {
   function handleSelect(item: SearchResultItem) {
     saveRecent(item);
     close();
-    // After navigating, move real DOM focus into the destination pane's main
-    // control (the message input for a thread; the first focusable / iframe for
-    // an app, file, trigger, settings, or change) so a keyboard-driven selection
-    // continues there instead of stranding focus on <body> when the modal closes.
+    // After navigating, move real DOM focus into the destination pane's scroll
+    // surface (the transcript for a thread; the body scroller / iframe for an app,
+    // file, trigger, settings, or change) so a keyboard-driven selection continues
+    // there — Arrow/Page keys scroll it — instead of stranding focus on <body> when
+    // the modal closes. Typing still lands in the prompt via type-to-focus.
     // Desktop-only and a no-op when nothing is focusable — both the "(if any)"
     // cases — are handled inside focusPaneMainControl. Async navigations
     // (app/trigger/change resolve their target before revealing the content pane)

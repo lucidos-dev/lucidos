@@ -81,7 +81,7 @@ async fn update_credential_edits_all_fields_and_keeps_secret_when_omitted() {
 
 /// Editing an `email_password` credential must propagate the password AND the
 /// server settings to the `email_accounts` row — the table IMAP/SMTP read from.
-/// This is the regression the Telenor thread surfaced.
+/// This is the regression an email-account edit surfaced.
 #[tokio::test]
 async fn update_email_credential_syncs_email_accounts_row() {
     let client = http_client();

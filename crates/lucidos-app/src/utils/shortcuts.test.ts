@@ -90,6 +90,11 @@ describe('formatBinding', () => {
     expect(formatBinding(shortcutDef('maximizePaneGroup').defaultBinding, true)).toBe('⌘⇧↵');
     expect(formatBinding(shortcutDef('maximizePaneGroup').defaultBinding, false)).toBe('Ctrl+Shift+↵');
   });
+  it('renders the mod+arrow turn shortcuts as ⌘↑ / ⌘↓ (arrows are not OS-reserved alnum chords)', () => {
+    expect(formatBinding(shortcutDef('prevThreadTurn').defaultBinding, true)).toBe('⌘↑');
+    expect(formatBinding(shortcutDef('nextThreadTurn').defaultBinding, true)).toBe('⌘↓');
+    expect(formatBinding(shortcutDef('nextThreadTurn').defaultBinding, false)).toBe('Ctrl+↓');
+  });
 });
 
 describe('SHORTCUT_DEFS registry invariants', () => {
@@ -101,6 +106,23 @@ describe('SHORTCUT_DEFS registry invariants', () => {
     for (const def of SHORTCUT_DEFS) {
       expect(isBindableChord(def.defaultBinding), def.id).toBe(true);
     }
+  });
+  it('exposes turn-by-turn conversation shortcuts on the mod+arrow keys', () => {
+    // ⌘↑ / ⌘↓ step the transcript one turn (a .chat-exchange) at a time. Free of
+    // the mod+alt+arrow history shortcuts (alt differs) — the collision invariant
+    // above also covers this.
+    expect(shortcutDef('prevThreadTurn').defaultBinding).toEqual({ mod: true, shift: false, alt: false, key: 'ArrowUp' });
+    expect(shortcutDef('nextThreadTurn').defaultBinding).toEqual({ mod: true, shift: false, alt: false, key: 'ArrowDown' });
+    expect(shortcutDef('prevThreadTurn').category).toBe('Navigation');
+    expect(shortcutDef('nextThreadTurn').category).toBe('Navigation');
+  });
+  it('exposes the customizable "Open thread actions" drawer shortcut', () => {
+    // The keyboard route to a drawer row's ⋯ menu is a first-class registry entry
+    // (so it is documented + rebindable in Settings → Keyboard Shortcuts), not a
+    // hand-rolled key. The collision + bindable invariants above also cover it.
+    const def = shortcutDef('openThreadActions');
+    expect(def.category).toBe('Navigation');
+    expect(def.defaultBinding).toEqual({ mod: true, shift: true, alt: false, key: 'm' });
   });
 });
 

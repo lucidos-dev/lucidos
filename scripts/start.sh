@@ -57,7 +57,7 @@ if [ -z "$WORKSPACE" ]; then
 fi
 
 # Resolve to absolute path and save for next time
-WORKSPACE="$(cd "$WORKSPACE" 2>/dev/null && pwd || mkdir -p "$WORKSPACE" && cd "$WORKSPACE" && pwd)"
+WORKSPACE="$(mkdir -p "$WORKSPACE" && cd "$WORKSPACE" && pwd)"
 echo "$WORKSPACE" > "$WORKSPACE_FILE"
 
 # Check if already running

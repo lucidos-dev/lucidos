@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, _resetLinkifyCacheForTesting } from './linkifyPaths';
+import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, _resetLinkifyCacheForTesting } from './linkifyPaths';
 
 describe('extractNavTargetFromHref', () => {
   it.each([
@@ -148,6 +148,46 @@ describe('extractLocalFileTarget', () => {
     ['#anchor', null],
   ])('returns null for %s', (href, expected) => {
     expect(extractLocalFileTarget(href)).toBe(expected);
+  });
+});
+
+describe('extractBareAppRef', () => {
+  it.each([
+    // Bare single-segment tokens — the reported bug shape and variants.
+    ['habit-tracker', 'habit-tracker'],
+    ['Habit Tracker', 'Habit Tracker'],   // app name with a space
+    ['/habit-tracker', 'habit-tracker'],    // leading slash
+    ['habit-tracker/', 'habit-tracker'],    // trailing slash
+    ['/habit-tracker/', 'habit-tracker'],   // both
+    ['habit-tracker?v=2', 'habit-tracker'], // query stripped
+    ['habit-tracker#top', 'habit-tracker'], // fragment stripped
+    // Percent-decoded: markdown renders a spaced app-name destination encoded
+    // (`[x](<Habit Tracker>)` / `[x](Habit%20Tracker)` → href="Habit%20Tracker").
+    ['Habit%20Tracker', 'Habit Tracker'],
+    ['Caf%C3%A9', 'Café'],
+    ['foo%', 'foo%'], // malformed escape → keep raw, don't drop
+  ])('normalizes %s -> %s', (href, expected) => {
+    expect(extractBareAppRef(href)).toBe(expected);
+  });
+
+  it.each([
+    // Any URL scheme disqualifies — real links or handled elsewhere.
+    ['app:habit-tracker', null],
+    ['https://example.com', null],
+    ['http://example.com/x', null],
+    ['mailto:user@example.com', null],
+    ['file:///tmp/x', null],
+    ['thread:abc-123', null],
+    // Sub-paths belong to the app / artifact rewriters, not the bare-ref path.
+    ['apps/habit-tracker/index.html', null],
+    ['data/artifacts/report.pdf', null],
+    ['foo/bar', null],
+    // Empty / fragment-only.
+    ['', null],
+    ['/', null],
+    ['#anchor', null],
+  ])('returns null for %s', (href, expected) => {
+    expect(extractBareAppRef(href)).toBe(expected);
   });
 });
 
@@ -329,10 +369,21 @@ describe('linkifyPaths', () => {
     expect(result).not.toContain('class="nav-link"');
   });
 
-  it('linkifies app names in text', () => {
+  it('does NOT linkify a bare app name in text (auto-scan removed)', () => {
+    // The bare-text app-name/id scan was removed — an app named in prose is
+    // plain text. Apps become links only via an explicit anchor (covered below).
     const html = '<p>Use the Todo app</p>';
     const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
-    expect(result).toContain('<a href="#" class="app-link" data-app-id="todo">Todo</a>');
+    expect(result).toBe(html);
+    expect(result).not.toContain('app-link');
+    expect(result).not.toContain('data-app-id');
+  });
+
+  it('does NOT linkify a bare app id in text either (auto-scan removed)', () => {
+    const html = '<p>Open Job Tracker: job-tracker</p>';
+    const result = linkifyPaths(html, [], [{ name: 'Job Tracker', id: 'job-tracker' }]);
+    expect(result).toBe(html);
+    expect(result).not.toContain('app-link');
   });
 
   it('does not linkify app names inside <a> tags', () => {
@@ -508,6 +559,61 @@ describe('linkifyPaths', () => {
     expect(result).not.toContain('app-link');
   });
 
+  it.each([
+    'habit-tracker',      // bare id
+    '/habit-tracker',     // leading slash
+    'habit-tracker/',     // trailing slash
+    'habit-tracker?v=2',  // query
+  ])('rewrites a bare app-id href [text](%s) to an app-link', (href) => {
+    // The reported bug: the LLM wrote a link with the app id as a bare relative
+    // href, mirroring `[Notifications](notifications)`. None of the strict
+    // rewriters claim it (no apps/ prefix, no app: scheme, not a nav panel), so
+    // left alone the browser navigates to the relative href and the SPA fallback
+    // reloads the whole workspace. Text ≠ name, so the match is via the href.
+    const html = `<p>Open <a href="${href}">the tracker</a> here.</p>`;
+    const result = linkifyPaths(html, [], [{ name: 'Habit Tracker', id: 'habit-tracker' }]);
+    expect(result).toContain('href="#"');
+    expect(result).toContain('class="app-link"');
+    expect(result).toContain('data-app-id="habit-tracker"');
+    expect(result).toContain('>the tracker</a>');
+    expect(result).not.toContain(`href="${href}"`);
+  });
+
+  it('rewrites a bare app-NAME href to an app-link', () => {
+    const html = '<p>Open <a href="Habit Tracker">the list</a>.</p>';
+    const result = linkifyPaths(html, [], [{ name: 'Habit Tracker', id: 'habit-tracker' }]);
+    expect(result).toContain('data-app-id="habit-tracker"');
+    expect(result).not.toContain('href="Habit Tracker"');
+  });
+
+  it('rewrites a percent-encoded bare app-NAME href (spaced name)', () => {
+    // Markdown renders `[x](<Habit Tracker>)` / `[x](Habit%20Tracker)` as
+    // href="Habit%20Tracker"; the token must be decoded to match the raw name.
+    const html = '<p>Open <a href="Habit%20Tracker">the tracker</a>.</p>';
+    const result = linkifyPaths(html, [], [{ name: 'Habit Tracker', id: 'habit-tracker' }]);
+    expect(result).toContain('class="app-link"');
+    expect(result).toContain('data-app-id="habit-tracker"');
+    expect(result).not.toContain('href="Habit%20Tracker"');
+  });
+
+  it('leaves a bare href that names no known app alone', () => {
+    const html = '<p>See <a href="README">the readme</a>.</p>';
+    const result = linkifyPaths(html, [], [{ name: 'Habit Tracker', id: 'habit-tracker' }]);
+    expect(result).toContain('href="README"');
+    expect(result).not.toContain('app-link');
+  });
+
+  it('a bare nav-panel href still wins over a same-named bare app', () => {
+    // Reserved panel names route to their panel — the nav rewriter runs before
+    // the bare-app-ref rewriter, so even an app literally named `notifications`
+    // can't hijack the panel link.
+    const html = '<p>Open <a href="notifications">alerts</a>.</p>';
+    const result = linkifyPaths(html, [], [{ name: 'notifications', id: 'notifications' }]);
+    expect(result).toContain('class="nav-link"');
+    expect(result).toContain('data-nav-target="notifications"');
+    expect(result).not.toContain('app-link');
+  });
+
   it('leaves app:<unknown-id> anchors alone (same gate as apps/<unknown-id>)', () => {
     const html = '<p><a href="app:no-such-app">link</a></p>';
     const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
@@ -515,32 +621,18 @@ describe('linkifyPaths', () => {
     expect(result).not.toContain('app-link');
   });
 
-  it('linkifies app IDs when different from app name', () => {
-    const html = '<p>Open Job Tracker: job-tracker</p>';
-    const result = linkifyPaths(html, [], [{ name: 'Job Tracker', id: 'job-tracker' }]);
-    expect(result).toContain('<a href="#" class="app-link" data-app-id="job-tracker">job-tracker</a>');
-    expect(result).toContain('<a href="#" class="app-link" data-app-id="job-tracker">Job Tracker</a>');
-  });
-
-  it('does not duplicate app entries when name equals id', () => {
-    const html = '<p>Use todo for tasks</p>';
-    const result = linkifyPaths(html, [], [{ name: 'todo', id: 'todo' }]);
-    // Should only linkify once, not create double matches
-    expect(result).toContain('<a href="#" class="app-link" data-app-id="todo">todo</a>');
-  });
-
   it('emits href="#" on every generated link so iOS Safari/PWA fires tap→click', () => {
     // iOS Safari (and PWA in standalone mode) silently drops tap→click
     // translation on `<a>` without href — even with `cursor: pointer`, the
     // delegated chat click handler never fires and the user sees a dead link.
-    // This was reported as "App link from thread doesn't work iOS PWA":
-    // an autolinked app name inside a chat message wasn't navigating to the
-    // app on iOS PWA. preventDefault in ChatExchange's handleLinkClick
-    // suppresses the `#` scroll-to-top, so href="#" is purely an iOS-
-    // clickability marker, not a navigation target.
-    const html = '<p>Check user_profile.md or open the Todo app, or follow this <a href="data/artifacts/foo.md">file link</a></p>';
+    // preventDefault in ChatExchange's handleLinkClick suppresses the `#`
+    // scroll-to-top, so href="#" is purely an iOS-clickability marker, not a
+    // navigation target. Covers the three href="#" producers: a text
+    // artifact-link, a rewritten app anchor, and a rewritten artifact anchor.
+    // (App names are no longer scanned in text, so the app-link comes from an
+    // explicit `[the Todo app](app:todo)` link.)
+    const html = '<p>Check user_profile.md or open <a href="app:todo">the Todo app</a>, or follow this <a href="data/artifacts/foo.md">file link</a></p>';
     const result = linkifyPaths(html, ['user_profile.md', 'artifacts/foo.md'], [{ name: 'Todo', id: 'todo' }]);
-    // All three linkifier paths — text artifact-link, text app-link, rewritten anchor — emit href="#".
     expect(result).toContain('<a href="#" class="artifact-link" data-path="user_profile.md">');
     expect(result).toContain('<a href="#" class="app-link" data-app-id="todo">');
     expect(result).toContain('<a href="#" class="artifact-link" data-path="artifacts/foo.md">');
@@ -669,13 +761,17 @@ describe('linkifyPaths caching', () => {
   });
 
   it('invalidates when the artifact/app list changes (new reference, new content)', () => {
-    const html = '<p>Open Habit Tracker</p>';
-    // No apps → app name is NOT linkified.
+    // A deliberate app anchor: with no apps the strict rewriter declines and the
+    // href is left alone; once the app list contains it, the SAME html must
+    // rewrite to an app-link — proving the (paths, apps) change invalidates the
+    // cache. (Bare-text app-name scanning was removed, so this uses an anchor.)
+    const html = '<p><a href="apps/habit-tracker/index.html">Habit Tracker</a></p>';
     const before = linkifyPaths(html, [], []);
     expect(before).not.toContain('data-app-id');
-    // App list now contains the app → must reflect it, not the cached miss.
+    expect(before).toContain('href="apps/habit-tracker/index.html"');
     const after = linkifyPaths(html, [], [{ name: 'Habit Tracker', id: 'habit-tracker' }]);
     expect(after).toContain('data-app-id="habit-tracker"');
+    expect(after).not.toContain('href="apps/habit-tracker/index.html"');
   });
 
   it('cache:false produces the same output as the cached path but is not stored', () => {

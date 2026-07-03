@@ -6,6 +6,7 @@ import { recordPerfSample } from '../../utils/perfQueue';
 import { markThreadOpenStart } from '../../utils/threadOpenMarks';
 import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { applyDraftBatch, setDraft, clearDraft, type ComposeDraft } from '../composeDrafts';
+import { setComposeSelectionFromServer } from '../composeSelections';
 import { fetchThreads, fetchThreadEvents, fetchOlderThreads, fetchFilterFacets, fetchArchivedCount } from '../../api/threads';
 import type { ThreadSummary, ThreadEventRow } from '../../api/threads';
 import { isTransportError } from '../../api/client';
@@ -87,13 +88,24 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
  *  (single-thread upserts from search/link bootstrapping). Empty server-side
  *  drafts clear the entry instead of populating it — `EMPTY_DRAFT` covers
  *  reads, and an empty entry would only inflate the Map for no reason. */
+/** True when a thread-summary snapshot carries no compose draft (no text, no
+ *  images, no mode) — the "shared draft was sent/discarded (by anyone)" shape
+ *  the backend leaves after clearing compose fields. One helper so the upsert
+ *  focus-gate and stageDraftFromApi's clear decision can't drift apart (if they
+ *  disagreed, a focused draft could pass the gate then get re-staged). */
+function composeSnapshotIsEmpty(info: ThreadSummary): boolean {
+  return (info.compose_text || '') === '' &&
+    (info.compose_images || []).length === 0 &&
+    (info.compose_mode ?? null) === null;
+}
+
 function stageDraftFromApi(info: ThreadSummary, batch?: DraftBatch): void {
   const text = info.compose_text || '';
   // The backend column is still named `compose_images` (Phase 5 cleanup
   // will rename it); post-migration the JSONB array contains hash strings.
   const image_hashes = info.compose_images || [];
   const mode = info.compose_mode ?? null;
-  const isEmpty = text === '' && image_hashes.length === 0 && mode === null;
+  const isEmpty = composeSnapshotIsEmpty(info);
   // A bulk loadAllThreads/upsert snapshot must NEVER clear a non-empty draft
   // the user typed ON THIS DEVICE. The compose PUT is debounced and can fail or
   // time out under host contention; `composePutSettledAt` is then stamped (even
@@ -112,6 +124,12 @@ function stageDraftFromApi(info: ThreadSummary, batch?: DraftBatch): void {
   if (isEmpty && hasLocalDraftEdit(info.thread_id)) {
     return;
   }
+  // Rehydrate the per-draft dropdown selection from the DB (the authoritative
+  // store) so a reload restores the draft's picks. Past the local-edit guard
+  // above, so it won't clobber a locally-edited draft; the caller
+  // (`upsertThread`) already gates this whole call on the compose staleness
+  // guards. `null`/absent = no stored selection → clears the local entry.
+  setComposeSelectionFromServer(info.thread_id, info.compose_selection);
   if (batch) {
     batch.set(info.thread_id, isEmpty ? null : { text, image_hashes, mode });
     return;
@@ -207,7 +225,8 @@ export function upsertThread(
     // surfaces in any drawer section even after the projection moved on.
     //
     // Skip the compose fields under three conditions:
-    //   1. User is mid-edit on this thread's textarea (focus + matching id).
+    //   1. User is mid-edit on this thread's textarea (focus + matching id) —
+    //      but ONLY for a NON-empty snapshot (see below).
     //   2. A debounced/in-flight PUT covers the value the API would clobber.
     //   3. A local edit happened AFTER this GET went out — its response is
     //      stale wrt compose by definition. Without this, picker dismissal +
@@ -215,7 +234,17 @@ export function upsertThread(
     //      image (preview appears, then disappears).
     existing.meta.state = info.state;
     const isFocusedThread = info.thread_id === focusedThreadId.value;
-    const userIsTypingHere = isFocusedThread && isComposeFocusedHere(info.thread_id);
+    // An EMPTY server snapshot is a genuine "the shared draft was sent/discarded
+    // (by anyone)" signal — the backend clears compose_text on MessageReceived /
+    // SessionStarted / ThreadDiscarded. Focus must NOT block that clear, or a
+    // synced-from-peer draft stays as a ghost in a focused-but-untyped textarea
+    // (the same authorship-vs-focus bug fixed in the SSE ThreadComposeChanged /
+    // MessageReceived paths). A locally-authored draft is still protected: the
+    // other staleness guards below AND stageDraftFromApi's own hasLocalDraftEdit
+    // empty-guard both keep it. A NON-empty snapshot keeps the focus guard so a
+    // background refresh can't move the cursor / overwrite what the user sees.
+    const snapshotIsEmpty = composeSnapshotIsEmpty(info);
+    const userIsTypingHere = isFocusedThread && isComposeFocusedHere(info.thread_id) && !snapshotIsEmpty;
     // `>=` because both timestamps come from Date.now() (1ms resolution) — a
     // request fired in the same millisecond as the edit can race ahead of the
     // edit's PUT and would otherwise pass the guard.

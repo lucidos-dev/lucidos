@@ -168,6 +168,12 @@ export async function handleSaveThread(threadId: string): Promise<void> {
   try {
     await saveThread(threadId);
   } catch (e) {
+    // A 409 means the thread is already saved — the desired end-state already
+    // holds (a racing/duplicate submit, or a stale client hitting an older
+    // engine). Keep the optimistic pin and stay quiet; only real failures
+    // (network, 5xx) revert + toast. The server is idempotent now, so a fresh
+    // engine won't even 409 here — this is defense in depth.
+    if (e instanceof ApiError && e.httpCode === 409) return;
     updateThreadMeta(threadId, { saved: false });
     showToast(`Failed to pin thread: ${errorDetail(e)}`, 'error');
   }
@@ -185,6 +191,9 @@ export async function handleUnsaveThread(threadId: string): Promise<void> {
   try {
     await unsaveThread(threadId);
   } catch (e) {
+    // Mirror of the save path: a 409 means the thread is already unsaved, so
+    // the desired end-state holds — keep the optimistic unpin and stay quiet.
+    if (e instanceof ApiError && e.httpCode === 409) return;
     updateThreadMeta(threadId, { saved: true });
     showToast(`Failed to unpin thread: ${errorDetail(e)}`, 'error');
   }

@@ -683,71 +683,101 @@ impl LucidosEngine {
                         self.workspace_path(),
                         branch_to_thread.get(branch).copied(),
                     );
-                    // The deterministic `thread-<short>` path collides with any
-                    // partial-setup leftover (worktree_add succeeded but marker
-                    // write crashed, etc.) — the worktree scan would have skipped
-                    // it as not-discovered, but `git worktree add` refuses to
-                    // create into an existing dir. Clear it before retrying. The
-                    // random `cc-<uuid>` branch can't collide, but the cost is
-                    // identical and keeps the call site uniform.
-                    if matches!(tokio::fs::try_exists(&wt_path).await, Ok(true)) {
-                        if let Err(e) = tokio::fs::remove_dir_all(&wt_path).await {
-                            log!(
-                                "[Recovery] Failed to clear stale worktree dir {}: {}",
-                                wt_path.display(),
-                                e
-                            );
-                        }
+                    // NEVER delete a valid worktree here. A deterministic
+                    // `thread-<short>` dir on disk is one of: (a) a valid live
+                    // worktree ON THIS BRANCH — REUSE it as-is (it holds the user's
+                    // checkout; a partial-setup leftover such as a missing marker is
+                    // repaired below, not nuked); (b) a valid live worktree on a
+                    // DIFFERENT branch — the shared per-thread path is occupied by
+                    // another branch of the same thread (e.g. a duplicate
+                    // stale-resume branch), so we must NOT reuse it (recovery mode
+                    // skips branch verification → we'd resume this branch against the
+                    // wrong checkout) and must NOT delete it (it holds the other
+                    // branch's work); skip and let the occupant recover on its own
+                    // pass; (c) a genuinely stranded/broken dir
+                    // (`.git/worktrees/<name>` admin gone → nothing recoverable) —
+                    // cleared by `clear_stranded_worktree_dir` so the add can
+                    // recreate it; or (d) absent — created by the add. The
+                    // background WorktreeCleanup worker is the SOLE deleter of a
+                    // valid worktree. This replaced an unconditional `remove_dir_all`
+                    // that nuked a live worktree out from under recovery — 2026-07-02.
+                    let is_live_worktree = matches!(tokio::fs::try_exists(&wt_path).await, Ok(true))
+                        && crate::engine::git_ops::is_live_worktree_at(&wt_path).await;
+                    let on_our_branch = is_live_worktree
+                        && crate::engine::git_ops::worktree_current_branch(&wt_path)
+                            .await
+                            .as_deref()
+                            == Some(branch.as_str());
+
+                    if is_live_worktree && !on_our_branch {
+                        // Case (b): shared path occupied by a different branch's live
+                        // worktree. Reusing it would resume THIS branch on the wrong
+                        // checkout; deleting it would destroy the other branch's work.
+                        // Skip — the occupant is recovered on its own pass, and
+                        // duplicate branches for one thread are reconciled elsewhere.
+                        log!(
+                            "[Recovery] Skipping lost branch {} — shared worktree {} is live on a different branch (not reused, not deleted)",
+                            branch,
+                            wt_path.display()
+                        );
+                        continue;
                     }
 
-                    match worktree_add(&repo_root, &wt_path, &[branch]).await {
-                        Ok(o) if o.status.success() => {
-                            let marker = wt_path.join(WORKTREE_WORKSPACE_MARKER);
-                            let marker_content = if let Some(ref rid) = repo_id {
-                                format!("{}\n{}", ws_id, rid)
-                            } else {
-                                ws_id.clone()
-                            };
-                            if let Err(e) = tokio::fs::write(&marker, &marker_content).await {
+                    let prepared = if on_our_branch {
+                        log!(
+                            "[Recovery] Reusing existing valid worktree for lost session: {} (branch {})",
+                            wt_path.display(),
+                            branch
+                        );
+                        true
+                    } else {
+                        // Dir absent, or present-but-not-a-valid-worktree (stranded).
+                        // `clear_stranded_worktree_dir` removes the dir ONLY when
+                        // genuinely stranded (git admin gone); a valid worktree is
+                        // left untouched (and can't reach here — handled above).
+                        crate::engine::git_ops::clear_stranded_worktree_dir(&repo_root, &wt_path).await;
+                        match worktree_add(&repo_root, &wt_path, &[branch]).await {
+                            Ok(o) if o.status.success() => {
+                                log!("[Recovery] Created fresh worktree for lost session: {} (branch {})", wt_path.display(), branch);
+                                true
+                            }
+                            Ok(o) => {
                                 log!(
-                                    "[Recovery] Failed to write workspace marker for {}: {}",
+                                    "[Recovery] Failed to create worktree for branch {}: {}",
                                     branch,
-                                    e
+                                    String::from_utf8_lossy(&o.stderr).trim()
                                 );
+                                false
                             }
-                            // Add engine-injected paths to the worktree's git exclude
-                            // so external repos don't see them as untracked or
-                            // accidentally commit them.
-                            add_paths_to_worktree_exclude(&wt_path, WORKTREE_EXCLUDE_PATHS).await;
-                            log!("[Recovery] Created fresh worktree for lost session: {} (branch {})", wt_path.display(), branch);
-                            to_recover.push((wt_path, branch.clone(), repo_id, repo_root));
-                        }
-                        Ok(o) => {
-                            let stderr = String::from_utf8_lossy(&o.stderr);
-                            log!(
-                                "[Recovery] Failed to create worktree for branch {}: {}",
-                                branch,
-                                stderr.trim()
-                            );
-                            if let Some(&thread_id) = branch_to_thread.get(branch) {
-                                log!("[Recovery] Ending stuck session for thread {} — worktree creation failed", thread_id);
-                                end_stuck_session(self, thread_id).await;
+                            Err(e) => {
+                                log!("[Recovery] git worktree add failed for branch {}: {}", branch, e);
+                                false
                             }
                         }
-                        Err(e) => {
+                    };
+
+                    if prepared {
+                        let marker = wt_path.join(WORKTREE_WORKSPACE_MARKER);
+                        let marker_content = if let Some(ref rid) = repo_id {
+                            format!("{}\n{}", ws_id, rid)
+                        } else {
+                            ws_id.clone()
+                        };
+                        if let Err(e) = tokio::fs::write(&marker, &marker_content).await {
                             log!(
-                                "[Recovery] git worktree add failed for branch {}: {}",
+                                "[Recovery] Failed to write workspace marker for {}: {}",
                                 branch,
                                 e
                             );
-                            if let Some(&thread_id) = branch_to_thread.get(branch) {
-                                log!(
-                                    "[Recovery] Ending stuck session for thread {} — git error",
-                                    thread_id
-                                );
-                                end_stuck_session(self, thread_id).await;
-                            }
                         }
+                        // Add engine-injected paths to the worktree's git exclude
+                        // so external repos don't see them as untracked or
+                        // accidentally commit them.
+                        add_paths_to_worktree_exclude(&wt_path, WORKTREE_EXCLUDE_PATHS).await;
+                        to_recover.push((wt_path, branch.clone(), repo_id, repo_root));
+                    } else if let Some(&thread_id) = branch_to_thread.get(branch) {
+                        log!("[Recovery] Ending stuck session for thread {} — worktree unavailable", thread_id);
+                        end_stuck_session(self, thread_id).await;
                     }
                 }
                 None => {
@@ -855,11 +885,27 @@ impl LucidosEngine {
                 branch_name
             );
 
+            // Preserve a thread parked on an unanswered question: it's a stable
+            // checkpoint, not an interrupted turn. Leave it
+            // waiting_for_user_answer (no abort, no idle), worktree intact — the
+            // card stays answerable and answering resumes via
+            // ContinuationRequested → --resume. (Not added to recovering_threads:
+            // the catch-all settle only touches status='running', and the cleanup
+            // worker won't reclaim a non-terminal thread's worktree.)
+            if thread_has_unanswered_question(self.pool(), thread_id).await {
+                log!(
+                    "[Recovery] Preserving thread {} — parked on an unanswered question (branch {})",
+                    thread_id,
+                    branch_name
+                );
+                continue;
+            }
+
             // Prevent duplicate recovery for the same thread (e.g., two branches
             // mapping to the same thread_id from stale resume retries).
             if !recovering_threads.insert(thread_id) {
                 log!("[Recovery] Skipping duplicate recovery for thread {} (branch {}) — already recovering", thread_id, branch_name);
-                cleanup_stale_worktree(&wt_path, &branch_name, &repo_root).await;
+                cleanup_stale_worktree(&wt_path).await;
                 continue;
             }
 
@@ -962,32 +1008,48 @@ impl LucidosEngine {
                 .await;
             }
 
-            let coding_agent = self.thread_coding_agent(thread_id).await;
-            self.event_bus
-                .emit_or_log(
-                    crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::CodingAgentIdled {
-                            has_changes,
-                            is_external_repo,
-                            requires_restart,
-                            cc_session_id,
-                            coding_agent,
-                            reason: Some(ENGINE_RESTART_INTERRUPT_REASON.to_string()),
-                            worktree_path: Some(wt_path.to_string_lossy().into_owned()),
-                            // Snapshot the worktree's HEAD so the next spawn
-                            // can detect external edits the user made while
-                            // the engine was down. Best-effort — failures
-                            // (e.g. branch with zero commits) yield None.
-                            worktree_head_sha:
-                                crate::engine::agent_session::external_edits_for_recovery_head_sha(&wt_path).await,
-                            bg_bash_pending: false,
+            // Resume vs manual Continue, by cause. A user-initiated *Switch to new
+            // version* left a device-attributed teardown boundary → auto-resume
+            // (queued; `main.rs` emits `ContinuationRequested` once the spawn
+            // dispatcher is subscribed — recovery runs before it). A crash /
+            // involuntary death left no such boundary → surface the manual
+            // "Continue" affordance and do NOT auto-resume, so work that may have
+            // crashed the engine can't loop.
+            if switch_was_user_initiated(self.pool(), thread_id).await {
+                self.enqueue_switch_resume(thread_id);
+                log!(
+                    "[Recovery] Queued auto-resume after user switch for thread {} (branch {})",
+                    thread_id,
+                    branch_name
+                );
+            } else {
+                let coding_agent = self.thread_coding_agent(thread_id).await;
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::CodingAgentIdled {
+                                has_changes,
+                                is_external_repo,
+                                requires_restart,
+                                cc_session_id,
+                                coding_agent,
+                                reason: Some(ENGINE_RESTART_INTERRUPT_REASON.to_string()),
+                                worktree_path: Some(wt_path.to_string_lossy().into_owned()),
+                                // Snapshot the worktree's HEAD so the next spawn
+                                // can detect external edits the user made while
+                                // the engine was down. Best-effort — failures
+                                // (e.g. branch with zero commits) yield None.
+                                worktree_head_sha:
+                                    crate::engine::agent_session::external_edits_for_recovery_head_sha(&wt_path).await,
+                                bg_bash_pending: false,
+                            },
+                            meta,
                         },
-                        meta,
-                    },
-                    "[Recovery] CodingAgentIdled (engine_restart_interrupt)",
-                )
-                .await;
+                        "[Recovery] CodingAgentIdled (engine_restart_interrupt)",
+                    )
+                    .await;
+            }
         }
 
         // Catch-all (defense-in-depth): settle any coding-agent thread the
@@ -1003,6 +1065,64 @@ impl LucidosEngine {
 
         recovering_threads.into_iter().collect()
     }
+}
+
+/// True when the thread's most recent `UserQuestionAsked` has no later answer or
+/// terminal — i.e. it's parked waiting for the user. Such a thread is a stable,
+/// resumable checkpoint: recovery must preserve it (no abort, no idle) across a
+/// restart so the card stays answerable; answering resumes via the existing
+/// no-live-subprocess `ContinuationRequested` → `--resume` path
+/// (`ensure_resume_after_answer`). Holds for both a user switch (the teardown emit
+/// skips `is_waiting` sessions, so no boundary lands) and a crash (SIGKILL emits
+/// nothing) — a pending question survives either way.
+async fn thread_has_unanswered_question(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM events uqa \
+            WHERE uqa.aggregate_id = $1 AND uqa.event_type = 'UserQuestionAsked' \
+              AND NOT EXISTS ( \
+                  SELECT 1 FROM events later \
+                  WHERE later.aggregate_id = $1 AND later.sequence > uqa.sequence \
+                    AND later.event_type IN ( \
+                        'UserQuestionAnswered', 'ResponseAborted', 'CodingAgentIdled', \
+                        'ResponseGenerated', 'SessionEnded') \
+              ) \
+         )",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false)
+}
+
+/// True when the newest `ResponseAborted` (after the thread's last start-or-resume)
+/// carries a **device** actor — the fingerprint of a user-initiated *Switch to new
+/// version* (the teardown boundary emit stamps the device that clicked switch onto
+/// in-flight threads). A crash (SIGKILL) emits no teardown boundary, so this is
+/// false → the thread keeps the manual "Continue" affordance and is NOT
+/// auto-resumed: work that may have crashed the engine can't loop.
+///
+/// The start set includes `ContinuationStarted` / `OrphanRecoveryStarted` — a
+/// prior auto-resume's start — so once a switch-abort has been consumed by a
+/// resume, it no longer counts. That is the loop-breaker: if the auto-resumed CC
+/// crashes the engine again *before* emitting any lifecycle event (so
+/// `already_recovered` doesn't yet cover it), the next boot sees the resume start
+/// as newer than the device abort → this returns false → manual Continue.
+pub(crate) async fn switch_was_user_initiated(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM events WHERE aggregate_id = $1 \
+              AND event_type = 'ResponseAborted' \
+              AND payload->'actor'->>'kind' = 'device' \
+              AND sequence > COALESCE( \
+                  (SELECT MAX(sequence) FROM events WHERE aggregate_id = $1 \
+                     AND event_type IN ('MessageReceived','CodingAgentUserMessageSent', \
+                         'TriggerStarted','ContinuationStarted','OrphanRecoveryStarted')), 0))",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false)
 }
 
 /// Settle any coding-agent thread still `running` in the projection that boot

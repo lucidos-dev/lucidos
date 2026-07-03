@@ -31,6 +31,6 @@ echo "Building signer WASM artifacts..."
 ./signers/build-all.sh
 
 echo "Running wasm signer e2e tests..."
-CMD=(cargo test -p lucidos-e2e --test wasm_signers)
+CMD=(cargo test --locked -p lucidos-e2e --test wasm_signers)
 [ ${#CARGO_ARGS[@]} -gt 0 ] && CMD+=("--" "${CARGO_ARGS[@]}")
 "${CMD[@]}"

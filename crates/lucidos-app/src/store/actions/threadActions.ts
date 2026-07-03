@@ -167,13 +167,20 @@ function tagAction(
       return {
         kind,
         category: 'primary',
-        label: opts.requiresRestart ? 'Apply & Restart' : 'Apply',
+        // Apply is always non-disruptive — it merges the change. For an
+        // engine-affecting change it also kicks off a background rebuild that
+        // later surfaces as "New version available → Switch to new version"; the
+        // restart is that separate switch, never Apply itself. A restart-requiring
+        // change gets a compact "Apply*" marker (the tooltip explains the
+        // background-build/switch semantics); the former "Apply & Restart" dual
+        // label — which implied the restart happens on click — stays retired.
+        label: opts.requiresRestart ? 'Apply*' : 'Apply',
         // Tooltip prefers the partial-work warning (more critical) over the
-        // restart hint when both apply.
+        // new-version hint when both apply.
         tooltip: opts.incomplete
           ? 'This change was proposed by a turn that ended in failure. The worktree contents may be partial work. You will be asked to confirm.'
           : opts.requiresRestart
-            ? 'Engine restart required for these changes to be applied correctly. You will be prompted to restart'
+            ? 'Applies now (non-disruptive). A new engine version builds in the background; you’ll be prompted to switch to it when ready.'
             : undefined,
         invoke: async () => {
           if (opts.incomplete && !(await showConfirm(APPLY_INCOMPLETE_CONFIRM, 'Apply'))) return;

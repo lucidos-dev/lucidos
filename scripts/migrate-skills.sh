@@ -5,7 +5,7 @@
 # Content splitting (skill.md → prompts + knowhow) is Task 17b (LLM-assisted).
 #
 # Usage:
-#   ./scripts/migrate-skills.sh -w personal
+#   ./scripts/migrate-skills.sh -w dev
 #   ./scripts/migrate-skills.sh -w ~/workspaces/dev
 #
 # Idempotent: skips already-migrated entries. Does NOT delete data/skills/.
@@ -23,7 +23,7 @@ while [[ $# -gt 0 ]]; do
             echo "Migrates data/skills/ → data/apps/ + data/scripts/"
             echo ""
             echo "Examples:"
-            echo "  $0 -w personal"
+            echo "  $0 -w dev"
             echo "  $0 -w ~/workspaces/dev"
             exit 0
             ;;

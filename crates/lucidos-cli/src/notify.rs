@@ -6,8 +6,9 @@ use crate::workspace::{BoxError, Workspace};
 
 /// Tap kinds accepted by `--tap`. Wire shape matches the server's `Tap`
 /// discriminated union — see `crates/lucidos-engine/src/scheduler/notifications.rs`.
-/// `Modal` (default), `None` (passive), and `Navigate` (deep-link via the
-/// same router `navigate_ui` uses).
+/// `Modal` (default) and `Navigate` (deep-link via the same router `navigate_ui`
+/// uses). Every notification is openable — the passive `none` kind was retired
+/// (`docs/plans/2026-07-02-remove-notification-tap-none.md`).
 ///
 /// The CLI flag only picks the discriminant; the target/sub-field shape for
 /// `Navigate` is implied by the other flags (`--app-id` → navigate-to-app;
@@ -15,7 +16,6 @@ use crate::workspace::{BoxError, Workspace};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum CliTap {
     Modal,
-    None,
     Navigate,
 }
 
@@ -52,15 +52,14 @@ pub(crate) fn build_request_body(title: &str, message: &str, extras: &NotifyExtr
 }
 
 /// Build the structured `Tap` JSON the server's `Tap` enum decodes from.
-/// `Modal` / `None` are kind-only objects. `Navigate` infers the target
-/// from the other extras: presence of `--app-id` → `target=app`, presence
-/// of `--thread-id` → `target=thread` (carrying `event_id` if set). The
-/// caller has already validated that at least one of those is present
-/// when `--tap navigate` was passed (see `cmd_notify`).
+/// `Modal` is a kind-only object. `Navigate` infers the target from the other
+/// extras: presence of `--app-id` → `target=app`, presence of `--thread-id` →
+/// `target=thread` (carrying `event_id` if set). The caller has already
+/// validated that at least one of those is present when `--tap navigate` was
+/// passed (see `cmd_notify`).
 fn build_tap_value(tap: CliTap, extras: &NotifyExtras) -> Value {
     match tap {
         CliTap::Modal => json!({"kind": "modal"}),
-        CliTap::None => json!({"kind": "none"}),
         CliTap::Navigate => {
             // Order: thread-id wins when both are present (it's the more
             // common CTA shape — "answer this question"). If both are wanted
@@ -240,25 +239,6 @@ mod tests {
     fn cli_tap_wire_shape_pins_to_server_contract() {
         let modal = build_tap_value(CliTap::Modal, &NotifyExtras::default());
         assert_eq!(modal, json!({"kind": "modal"}));
-        let none = build_tap_value(CliTap::None, &NotifyExtras::default());
-        assert_eq!(none, json!({"kind": "none"}));
-    }
-
-    /// `--tap none` needs neither --app-id nor --thread-id (passive variant).
-    /// The body just carries `"tap":{"kind":"none"}` through to the server.
-    #[test]
-    fn body_includes_tap_none_without_app_or_thread() {
-        let body = build_request_body(
-            "FYI",
-            "Backup complete",
-            &NotifyExtras {
-                tap: Some(CliTap::None),
-                ..Default::default()
-            },
-        );
-        assert_eq!(body["tap"], json!({"kind": "none"}));
-        assert!(body.get("app_id").is_none());
-        assert!(body.get("thread_id").is_none());
     }
 
     /// Match `execute_send_notification`'s rule: empty string = absent.

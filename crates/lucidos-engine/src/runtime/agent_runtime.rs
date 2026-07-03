@@ -214,6 +214,28 @@ pub struct SpawnArgs<'a> {
     /// orchestration (which has the pool); empty for callers that don't inject
     /// (tests, engine-internal spawns with no user env).
     pub user_env_vars: &'a [(String, String)],
+    /// Pinned Claude Code config dir for a RESUME — the `CLAUDE_CONFIG_DIR` the
+    /// thread's session was created under. A resumed session must look up its
+    /// transcript under the same dir it was written in
+    /// (`$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`), so `build_command`
+    /// sets this as an engine-owned override AFTER `apply_lucidos_env`'s user-env
+    /// loop — a live user toggle of `CLAUDE_CONFIG_DIR` then can't strand the
+    /// resume (dev/bf997e21). `None` only for a thread's FIRST turn (no pin yet —
+    /// leaves the user's live env / CC's default untouched, which establishes the
+    /// pin) and for backends that don't key transcripts on a config dir (Codex
+    /// ignores it); every later spawn of a pinned thread re-injects the pin. See
+    /// `lookup_pinned_cc_config_dir`.
+    pub claude_config_dir: Option<&'a str>,
+    /// User-configured absolute path to this agent's CLI binary — the
+    /// `coding_agent_claude_path` / `coding_agent_codex_path` preference for
+    /// the backend being spawned, resolved by the spawn orchestration.
+    ///
+    /// `Some` wins over every probe/PATH lookup, and a path that doesn't
+    /// resolve to an executable file FAILS the spawn with an error naming the
+    /// preference — a typo must surface, never silently fall back (see
+    /// `spawn_env::resolve_binary_override`). `None` (unset — every install
+    /// before the preference existed) keeps the probe → PATH auto-detection.
+    pub binary_override: Option<&'a str>,
 }
 
 /// An in-band permission request raised by the agent's own protocol — the

@@ -71,6 +71,8 @@ export function useWindowDragRegion(
     const onDblClick = maximize
       ? (e: MouseEvent) => {
           if (canStart && !canStart(e.target as HTMLElement)) return;
+          // Best-effort like startWindowDrag above: a failed toggle leaves the
+          // window as-is (visibly unchanged); the next double-click retries.
           toggleWindowMaximize().catch(() => {});
         }
       : null;

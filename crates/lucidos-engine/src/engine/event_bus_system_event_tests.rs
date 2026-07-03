@@ -208,6 +208,67 @@ fn native_push_requested_is_transient_on_notification_aggregate() {
 }
 
 #[test]
+fn frontend_update_deferred_is_transient_on_engine_aggregate() {
+    // Transient UI hint — broadcast to SSE, never written to events. Emitted
+    // when a frontend-only Apply's served-client advance is deferred because an
+    // engine version change is pending (INV-A); the page renders a keyed toast.
+    // Lives on the `engine` aggregate alongside EngineSupervisorRespawned.
+    let e = SystemEvent::FrontendUpdateDeferred {
+        sent_at_ms: 1_700_000_000_000,
+    };
+    assert!(!e.is_persisted());
+    assert_eq!(e.aggregate(), "engine");
+    assert_eq!(e.event_type(), "FrontendUpdateDeferred");
+    assert_eq!(e.aggregate_id(), "global");
+    // Standard SystemEvent wire shape: `{type, data:{sent_at_ms}}`.
+    let json = serde_json::to_value(&e).unwrap();
+    assert_eq!(json["type"], "FrontendUpdateDeferred");
+    assert_eq!(json["data"]["sent_at_ms"], 1_700_000_000_000_i64);
+}
+
+#[test]
+fn served_frontend_advanced_is_transient_on_engine_aggregate() {
+    // Transient UI signal — broadcast to SSE, never written to events. Emitted
+    // when a dev engine advances its served-frontend snapshot to the shared dist/
+    // after a PEER workspace's frontend-only Apply (INV-A-gated). The connected
+    // client re-runs syncClientUpdateFromBuild. Lives on the `engine` aggregate
+    // alongside FrontendUpdateDeferred.
+    let e = SystemEvent::ServedFrontendAdvanced {
+        sent_at_ms: 1_700_000_000_000,
+    };
+    assert!(!e.is_persisted());
+    assert_eq!(e.aggregate(), "engine");
+    assert_eq!(e.event_type(), "ServedFrontendAdvanced");
+    assert_eq!(e.aggregate_id(), "global");
+    // Standard SystemEvent wire shape: `{type, data:{sent_at_ms}}`.
+    let json = serde_json::to_value(&e).unwrap();
+    assert_eq!(json["type"], "ServedFrontendAdvanced");
+    assert_eq!(json["data"]["sent_at_ms"], 1_700_000_000_000_i64);
+}
+
+#[test]
+fn engine_build_state_changed_is_transient_on_engine_aggregate() {
+    // Transient UI POKE — broadcast to SSE, never written to events. Emitted on
+    // every dev background-rebuild state transition so the connected client learns
+    // of a build over the live stream instead of the throttled version-status
+    // poll. The page handler re-runs the authoritative checkEngineVersion GET.
+    // Lives on the `engine` aggregate alongside ServedFrontendAdvanced.
+    let e = SystemEvent::EngineBuildStateChanged {
+        state: "building".to_string(),
+        sent_at_ms: 1_700_000_000_000,
+    };
+    assert!(!e.is_persisted());
+    assert_eq!(e.aggregate(), "engine");
+    assert_eq!(e.event_type(), "EngineBuildStateChanged");
+    assert_eq!(e.aggregate_id(), "global");
+    // Standard SystemEvent wire shape: `{type, data:{state, sent_at_ms}}`.
+    let json = serde_json::to_value(&e).unwrap();
+    assert_eq!(json["type"], "EngineBuildStateChanged");
+    assert_eq!(json["data"]["state"], "building");
+    assert_eq!(json["data"]["sent_at_ms"], 1_700_000_000_000_i64);
+}
+
+#[test]
 fn native_push_dismiss_requested_is_transient_on_notification_aggregate() {
     // Transient cross-device dismiss signal — broadcast to SSE, never written to
     // events. `Some(id)` removes one delivered native banner on connected Tauri

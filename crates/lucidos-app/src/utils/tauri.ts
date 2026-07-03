@@ -123,6 +123,18 @@ export async function dismissNativeNotification(opts: {
 }
 
 /**
+ * Wake the native dock-badge loop for an immediate recompute (Rust
+ * `nudge_dock_badge` command). The page calls this from its notification SSE
+ * handler so the macOS dock badge updates the instant a notification is read —
+ * in-app or from another device — instead of waiting for the desktop poll. The
+ * recompute reads the gateway's fresh `unread-total` aggregate, so this carries
+ * no count. Best-effort: errors are swallowed (no dock tile in dev / non-macOS).
+ * Only call when isTauri() is true. */
+export function nudgeDockBadge(): void {
+  invoke('nudge_dock_badge').catch(() => {});
+}
+
+/**
  * Report whether the native main window is currently *active* — focused AND
  * on-screen (visible, not minimized) — read live from AppKit by the Rust
  * `get_native_window_active` command. The page pulls this at startup to SEED its
@@ -144,6 +156,17 @@ export function getNativeWindowActive(): Promise<boolean> {
  * call when isTauri() is true. */
 export function takePendingNativeTaps(): Promise<Record<string, unknown>[]> {
   return invoke<Record<string, unknown>[]>('take_pending_native_taps');
+}
+
+/**
+ * Durable get-or-create of this device's id for `workspace` (its gateway slug),
+ * backed by a native JSON map in the App Support data dir that survives a DMG
+ * reinstall (unlike the WKWebView's `localStorage`, which a new bundle re-buckets).
+ * Returns the stored id when one exists, else stores and returns `candidate`. The
+ * caller seeds the result back into `localStorage` so the synchronous
+ * `getDeviceId()` is unchanged. Only call when isTauri() is true. */
+export function getOrCreateDeviceId(workspace: string, candidate: string): Promise<string> {
+  return invoke<string>('get_or_create_device_id', { workspace, candidate });
 }
 
 // --- App auto-update (packaged desktop app) ---
@@ -176,12 +199,13 @@ export interface TailscaleInfo {
 }
 
 /** localhost / LAN / Tailscale connect URLs for the engine (mirror of the Rust
- *  `ConnectInfo`). */
+ *  `ConnectInfo`). The LAN URL is derived client-side from `lan_ip` + `port` +
+ *  the gateway bind (`getNetworkConfig().gateway_bind`) — see
+ *  `MobileAccessPage.tsx::lanRowState`. */
 export interface ConnectInfo {
   port: number;
   localhost_url: string;
   lan_ip: string | null;
-  lan_url: string | null;
   tailscale: TailscaleInfo;
 }
 

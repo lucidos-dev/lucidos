@@ -110,6 +110,34 @@ describe('bootSplash controller', () => {
     // Second call must not throw or re-remove.
     expect(() => c.dismissBootSplash()).not.toThrow();
   });
+
+  it('dismiss reverts the root background only AFTER the splash node is removed (not mid-fade)', async () => {
+    fake = installFakeSplash(true);
+    const doc = (globalThis as any).document;
+    // Boot script (index.html) paints the brand gradient on <html> to cover the
+    // iOS bottom safe-area strip; dismiss must revert it so no blue lingers
+    // behind the app's own safe-area inset — but only once the splash is gone.
+    doc.documentElement.style.background =
+      '#0a4ea8 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed';
+    const c = await freshController();
+    c.dismissBootSplash();
+    // Still painted through the `.boot-splash-leaving` fade — reverting now would
+    // flash the dark safe-area strip while the splash is still visible.
+    expect(doc.documentElement.style.background).not.toBe('');
+    fake.fireAnimationEnd();
+    // Reverted once the splash node is actually removed.
+    expect(doc.documentElement.style.background).toBe('');
+  });
+
+  it('dismiss reverts the root background immediately when the splash node is already gone', async () => {
+    fake = installFakeSplash(false);
+    const doc = (globalThis as any).document;
+    doc.documentElement.style.background =
+      '#0a4ea8 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed';
+    const c = await freshController();
+    c.dismissBootSplash();
+    expect(doc.documentElement.style.background).toBe('');
+  });
 });
 
 describe('index.html inline boot splash', () => {
@@ -130,6 +158,17 @@ describe('index.html inline boot splash', () => {
     expect(html).toContain('class="boot-splash-mark"');
     // Decorative — must never intercept pointer events.
     expect(html).toContain('pointer-events: none');
+  });
+
+  it('paints the brand gradient on the root so the iOS bottom safe-area strip is covered', () => {
+    // A fixed `inset:0` .boot-splash does not reach the iOS standalone bottom
+    // safe-area strip, so the boot script must paint the brand gradient (solid
+    // #0a4ea8 fallback + fixed attachment) on <html> behind it — otherwise the
+    // dark var(--bg-primary) root shows as a black band under the splash. Mirrors
+    // the gateway splash (crates/lucidos-gateway/src/proxy.rs).
+    expect(html).toMatch(
+      /d\.style\.background\s*=\s*['"]#0a4ea8 radial-gradient\([^'"]*\) no-repeat fixed['"]/,
+    );
   });
 
   it('bakes a default, shown status so it never vanishes across the reload', () => {

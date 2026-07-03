@@ -100,7 +100,7 @@ async fn pending_change_after_session_ended_resumes_branch() {
     )
     .await;
 
-    let (sid, resume_branch) = resolve_resume_context(&pool, bus.changes_projection(), thread_id, None).await;
+    let (sid, resume_branch) = resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
     assert_eq!(sid, None);
     assert_eq!(resume_branch, Some(branch.to_string()));
 
@@ -164,7 +164,7 @@ async fn pending_change_branch_with_idled_session_recovers_sid() {
     )
     .await;
 
-    let (sid, resume_branch) = resolve_resume_context(&pool, bus.changes_projection(), thread_id, None).await;
+    let (sid, resume_branch) = resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
     assert_eq!(sid, Some("wrong-session".to_string()));
     assert_eq!(resume_branch, Some(canonical_branch.to_string()));
 
@@ -208,7 +208,7 @@ async fn pending_change_with_idled_session_recovers_cc_session_id() {
     )
     .await;
 
-    let (sid, resume_branch) = resolve_resume_context(&pool, bus.changes_projection(), thread_id, None).await;
+    let (sid, resume_branch) = resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
     assert_eq!(
         sid,
         Some(session_id.to_string()),
@@ -254,7 +254,7 @@ async fn applied_change_falls_through_to_fresh_start() {
     )
     .await;
 
-    let (sid, resume_branch) = resolve_resume_context(&pool, bus.changes_projection(), thread_id, None).await;
+    let (sid, resume_branch) = resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
     assert_eq!(sid, None);
     assert_eq!(resume_branch, None);
 
@@ -297,7 +297,7 @@ async fn cancel_then_idle_resumes_same_session() {
     // Auto-detect path (no caller sid): the most-recent closer is the idle, so
     // the resolver resumes the same session id on the SessionStarted branch.
     let (sid, resume_branch) =
-        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None).await;
+        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
     assert_eq!(
         sid,
         Some(session_id.to_string()),
@@ -362,7 +362,7 @@ async fn no_pending_change_with_session_ended_after_idle_recovers_via_caller_sid
     // auto-detect path sees SessionEnded as the latest lifecycle event
     // and refuses to resume.
     let (sid_without_caller, branch_without_caller) =
-        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None).await;
+        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
     assert_eq!(
         sid_without_caller, None,
         "auto-detect must return None when latest is SessionEnded — \
@@ -382,7 +382,8 @@ async fn no_pending_change_with_session_ended_after_idle_recovers_via_caller_sid
         );
 
         let (sid_with_caller, branch_with_caller) =
-            resolve_resume_context(&pool, bus.changes_projection(), thread_id, recovered_sid).await;
+            resolve_resume_context(&pool, bus.changes_projection(), thread_id, recovered_sid, None)
+                .await;
         assert_eq!(
             sid_with_caller,
             Some(session_id.to_string()),
@@ -405,9 +406,110 @@ async fn emit_settings_with_sid(bus: &EventBus, thread_id: Uuid, cc_session_id: 
             permission_mode: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             cc_session_id: cc_session_id.map(String::from),
+            claude_config_dir: None,
         },
     )
     .await;
+}
+
+async fn emit_settings_with_config_dir(
+    bus: &EventBus,
+    thread_id: Uuid,
+    cc_session_id: Option<&str>,
+    claude_config_dir: Option<&str>,
+) {
+    emit(
+        bus,
+        thread_id,
+        ThreadEvent::CodingAgentSettingsChanged {
+            model: None,
+            reasoning_effort: None,
+            permission_mode: None,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            cc_session_id: cc_session_id.map(String::from),
+            claude_config_dir: claude_config_dir.map(String::from),
+        },
+    )
+    .await;
+}
+
+/// The config dir pinned at Init is what a later resume must re-inject so CC finds
+/// the transcript under the same dir it was written in — the fix for dev/bf997e21.
+#[tokio::test]
+async fn lookup_finds_config_dir_from_init_settings() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    seed_session_started(&bus, thread_id, "sess-cfg", "claude-code/cfg").await;
+    emit_settings_with_config_dir(&bus, thread_id, Some("sess-cfg"), Some("/home/u/.claude")).await;
+
+    assert_eq!(
+        lookup_pinned_cc_config_dir(&pool, thread_id).await,
+        Some("/home/u/.claude".to_string()),
+        "the config dir stamped at Init must be resolvable for a later resume"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A legacy thread whose events predate the field resolves `None` — the spawn then
+/// falls back to the live env, and a failed resume is caught by the explicit
+/// session-not-found recovery. Must never surface a phantom dir.
+#[tokio::test]
+async fn lookup_config_dir_is_none_for_legacy_thread() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    seed_session_started(&bus, thread_id, "sess-legacy", "claude-code/legacy").await;
+    // Init settings with a sid but NO config dir (legacy row shape).
+    emit_settings_with_sid(&bus, thread_id, Some("sess-legacy")).await;
+
+    assert_eq!(
+        lookup_pinned_cc_config_dir(&pool, thread_id).await,
+        None,
+        "a thread with no recorded config dir must resolve None, not a phantom value"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The thread's pin is the FIRST recorded config dir and never moves: a
+/// settings-only emit with no dir doesn't shadow it, and a later respawn under a
+/// DIFFERENT account must not override it — that immovability is what stops a
+/// thread from switching provider after turn 1.
+#[tokio::test]
+async fn lookup_pinned_config_dir_prefers_first() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    seed_session_started(&bus, thread_id, "sess-1", "claude-code/multi-cfg").await;
+    emit_settings_with_config_dir(&bus, thread_id, Some("sess-1"), Some("/home/u/.claude-personal"))
+        .await;
+    // A settings-only change (model switch) carries no config dir — must not shadow.
+    emit_settings_with_config_dir(&bus, thread_id, None, None).await;
+
+    assert_eq!(
+        lookup_pinned_cc_config_dir(&pool, thread_id).await,
+        Some("/home/u/.claude-personal".to_string()),
+        "a settings-only emit with no config dir must not shadow the pinned dir"
+    );
+
+    // A respawn under a DIFFERENT dir must NOT move the pin — the thread stays on
+    // the account of its first session.
+    emit_settings_with_config_dir(&bus, thread_id, Some("sess-2"), Some("/home/u/.claude")).await;
+    assert_eq!(
+        lookup_pinned_cc_config_dir(&pool, thread_id).await,
+        Some("/home/u/.claude-personal".to_string()),
+        "the FIRST recorded config dir is the permanent pin; a later account must not override it"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
 }
 
 /// Reproduces the lost-session-id-on-mid-turn-restart bug.
@@ -474,6 +576,99 @@ async fn lookup_prefers_most_recent_session_id_across_event_types() {
         lookup_latest_cc_session_id(&pool, thread_id).await,
         Some("sess-3".to_string()),
         "a later CodingAgentIdled sid must win over an earlier Init sid"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The account-scoped session lookup returns the newest session recorded UNDER a
+/// given config dir, ignoring newer sessions under other accounts. This is what
+/// lets a resume target the pinned account's session after a mid-thread flip.
+#[tokio::test]
+async fn lookup_session_id_for_config_dir_scopes_to_account() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    seed_session_started(&bus, thread_id, "sess-personal", "claude-code/acct").await;
+    // Turn 1 under the personal account.
+    emit_settings_with_config_dir(
+        &bus,
+        thread_id,
+        Some("sess-personal"),
+        Some("/home/u/.claude-personal"),
+    )
+    .await;
+    // A LATER session recorded under a different account (the mis-pin flip).
+    emit_settings_with_config_dir(&bus, thread_id, Some("sess-work"), Some("/home/u/.claude")).await;
+
+    assert_eq!(
+        lookup_latest_cc_session_id_for_config_dir(&pool, thread_id, "/home/u/.claude-personal")
+            .await,
+        Some("sess-personal".to_string()),
+        "must return the session under the requested account, not the globally-newest one"
+    );
+    assert_eq!(
+        lookup_latest_cc_session_id_for_config_dir(&pool, thread_id, "/home/u/.claude").await,
+        Some("sess-work".to_string()),
+        "the other account resolves its own session"
+    );
+    assert_eq!(
+        lookup_latest_cc_session_id_for_config_dir(&pool, thread_id, "/home/u/.claude-nope").await,
+        None,
+        "an account with no recorded session resolves None"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Regression for the "thread mis-pinned onto another account can't get back" bug
+/// (thread 555ad2fb). A thread started under `.claude-personal` (session A), then
+/// a later fresh spawn recorded session B under `.claude` (a toggle flip). With
+/// the thread pinned to its FIRST account (`.claude-personal`), the auto-detect
+/// resume must target session A — not the globally-newest session B — so the next
+/// turn resumes the original conversation on the original account.
+#[tokio::test]
+async fn resolve_resume_context_resumes_session_under_pinned_account() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let branch = "claude-code/mis-pinned";
+
+    // Turn 1: session A under the personal account, then idled.
+    seed_session_started(&bus, thread_id, "sess-A", branch).await;
+    emit_settings_with_config_dir(&bus, thread_id, Some("sess-A"), Some("/home/u/.claude-personal"))
+        .await;
+    emit_idled(&bus, thread_id, Some("sess-A"), None).await;
+    // Toggle flip: a later session B recorded under a DIFFERENT account, then idled
+    // (this is the globally-newest session + lifecycle event).
+    emit_settings_with_config_dir(&bus, thread_id, Some("sess-B"), Some("/home/u/.claude")).await;
+    emit_idled(&bus, thread_id, Some("sess-B"), None).await;
+
+    // The pin is the FIRST account.
+    let pinned = lookup_pinned_cc_config_dir(&pool, thread_id).await;
+    assert_eq!(pinned.as_deref(), Some("/home/u/.claude-personal"));
+
+    // Auto-detect resume (no caller sid), scoped to the pin: resumes session A, not B.
+    let (sid, resume_branch) =
+        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, pinned.as_deref())
+            .await;
+    assert_eq!(
+        sid,
+        Some("sess-A".to_string()),
+        "a mis-pinned thread must resume the session under its FIRST account, not the newest one"
+    );
+    assert_eq!(resume_branch, Some(branch.to_string()));
+
+    // Sanity: without the pin (legacy), it would grab the globally-newest session B.
+    let (legacy_sid, _) =
+        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
+    assert_eq!(
+        legacy_sid,
+        Some("sess-B".to_string()),
+        "with no pin, the resolver falls back to the globally-newest session"
     );
 
     pool.close().await;

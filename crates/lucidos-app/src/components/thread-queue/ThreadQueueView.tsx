@@ -11,7 +11,7 @@ import type { CapacityPolicy, ThreadQueueEntry } from '../../store/types';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { formatShortDate, formatShortTime } from '../../utils/formatTime';
 import { LoadableError } from '../shared/LoadableError';
-import { ListSkeleton } from '../shared/ListSkeleton';
+import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { Dropdown } from '../shared/Dropdown';
 
@@ -38,60 +38,76 @@ export function openQueueEntryThread(entry: ThreadQueueEntry): void {
   focusThreadOrBootstrap(entry.thread_id);
 }
 
-function ThreadQueueItem({ entry }: { entry: ThreadQueueEntry }) {
-  const running = entry.status === 'admitted';
+/** Self-skeletonizing queue row: rendered with no entry inside a
+ *  SkeletonProvider (`<ThreadQueueRow />`) it draws itself as a loading
+ *  placeholder via the Sk* leaves; with a real entry it renders normally.
+ *  `entry` is optional only to support the skeleton call; real call sites pass
+ *  it. */
+function ThreadQueueRow({ entry }: { entry?: ThreadQueueEntry }) {
+  const sk = useSkeleton();
+  const running = entry?.status === 'admitted';
   // User-initiated entries aren't background queue rows — Run now / Drop act on
   // the projection, which doesn't hold them. A queued user thread is already
   // prioritized; cancel it from the chat itself, not here.
-  const actionable = !running && entry.kind !== 'user-chat';
+  const actionable = !!entry && !running && entry.kind !== 'user-chat';
   // Prefer the live thread title the user sees in the drawer / header; fall
   // back to the queued prompt for entries whose thread isn't loaded
   // (background work) or hasn't been titled yet. Reading threadMap here makes
   // the row re-render when ThreadTitleGenerated lands.
-  const thread = entry.thread_id ? threadMap.value.get(entry.thread_id) : undefined;
-  const title = thread ? threadDisplayTitle(thread) : entry.summary;
-  const navigable = !!entry.thread_id;
+  const thread = entry?.thread_id ? threadMap.value.get(entry.thread_id) : undefined;
+  const title = thread ? threadDisplayTitle(thread) : entry?.summary;
+  const navigable = !!entry?.thread_id;
   return (
     <div
-      class={`list-row thread-queue-row${navigable ? ' clickable' : ''}`}
+      class={`list-row thread-queue-row${!sk && navigable ? ' clickable' : ''}`}
       data-role="thread-queue-row"
-      onClick={navigable ? () => openQueueEntryThread(entry) : undefined}
+      onClick={!sk && navigable && entry ? () => openQueueEntryThread(entry) : undefined}
     >
       <div class="list-row-info">
-        <div class="title list-row-name">{title}</div>
+        <SkText class="title list-row-name" as="div" w="14rem">{title}</SkText>
         <div class="list-row-details">
-          <span class={running ? 'trigger-enabled' : 'trigger-paused'}>
-            {running ? 'Running' : 'Queued'}
-          </span>
-          <span class="label">{KIND_LABELS[entry.kind]}</span>
-          {entry.trigger_name && <span class="label">{entry.trigger_name}</span>}
+          <SkBlock w="3.5rem" h="1.25rem" round>
+            <span class={running ? 'trigger-enabled' : 'trigger-paused'}>
+              {running ? 'Running' : 'Queued'}
+            </span>
+          </SkBlock>
+          <SkBlock w="5rem" h="1.25rem" round>
+            <span class="label">{entry ? KIND_LABELS[entry.kind] : ''}</span>
+          </SkBlock>
+          {entry?.trigger_name && <span class="label">{entry.trigger_name}</span>}
         </div>
-        <div class="list-row-date">
-          {running && entry.admitted_at
+        <SkText class="list-row-date" as="div" w="10rem">
+          {running && entry?.admitted_at
             ? `Started ${formatTimestamp(entry.admitted_at)}`
-            : `Queued ${formatTimestamp(entry.queued_at)}`}
-        </div>
+            : entry
+              ? `Queued ${formatTimestamp(entry.queued_at)}`
+              : undefined}
+        </SkText>
       </div>
-      {actionable && (
+      {(sk || actionable) && (
         <div class="list-row-actions">
-          <button
-            class="action-btn action-btn-danger"
-            onClick={(e) => {
-              e.stopPropagation();
-              void dropQueueEntry(entry.id, entry.summary);
-            }}
-          >
-            Drop
-          </button>
-          <button
-            class="action-btn action-btn-confirm"
-            onClick={(e) => {
-              e.stopPropagation();
-              void runQueueEntryNow(entry.id);
-            }}
-          >
-            Run now
-          </button>
+          <SkBlock w="3.5rem" h="2rem" round>
+            <button
+              class="action-btn action-btn-danger"
+              onClick={(e) => {
+                e.stopPropagation();
+                if (entry) void dropQueueEntry(entry.id, entry.summary);
+              }}
+            >
+              Drop
+            </button>
+          </SkBlock>
+          <SkBlock w="4.5rem" h="2rem" round>
+            <button
+              class="action-btn action-btn-confirm"
+              onClick={(e) => {
+                e.stopPropagation();
+                if (entry) void runQueueEntryNow(entry.id);
+              }}
+            >
+              Run now
+            </button>
+          </SkBlock>
         </div>
       )}
     </div>
@@ -117,9 +133,8 @@ function CapacityPolicyEditor({ policy }: { policy: CapacityPolicy }) {
 
   async function save() {
     setSaving(true);
-    const ok = await saveCapacityPolicy(draft);
+    await saveCapacityPolicy(draft); // self-toasts on success/failure, never rejects
     setSaving(false);
-    if (!ok) return;
   }
 
   return (
@@ -191,7 +206,10 @@ export function ThreadQueueView() {
   return (
     <div class="content-view active">
       <div class="list-rows">
-        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton fill />}>
+        <LoadingFade
+          showSkeleton={showLoading}
+          skeleton={<ListSkeletonOf fill containerClass="list-rows" row={() => <ThreadQueueRow />} />}
+        >
           {loadable.status === 'loaded'
             ? (() => {
                 const { entries, policy } = loadable.data;
@@ -216,7 +234,7 @@ export function ThreadQueueView() {
                       <div class="empty thread-queue-empty">Nothing running.</div>
                     )}
                     {running.map((entry) => (
-                      <ThreadQueueItem key={entry.id} entry={entry} />
+                      <ThreadQueueRow key={entry.id} entry={entry} />
                     ))}
 
                     <div class="thread-queue-section-header">
@@ -228,7 +246,7 @@ export function ThreadQueueView() {
                       </div>
                     )}
                     {queued.map((entry) => (
-                      <ThreadQueueItem key={entry.id} entry={entry} />
+                      <ThreadQueueRow key={entry.id} entry={entry} />
                     ))}
                   </>
                 );

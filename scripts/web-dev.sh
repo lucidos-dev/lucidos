@@ -1,5 +1,18 @@
 #!/bin/bash
-# Start Lucidos in browser-based development mode (ADR 0014):
+# Start Lucidos in browser-based development mode (ADR 0014).
+#
+# ── This is the DEVELOPER entry point ───────────────────────────────────────
+# It optimizes for fast iteration: a DEBUG engine build by default (quick to
+# compile) and a long-lived `vite build --watch` that rebuilds dist/ on every
+# source change. END USERS and the one-click installer do NOT run this — they run
+# scripts/run.sh, a thin wrapper that reuses this exact orchestration but flips
+# two defaults for *using* Lucidos: a RELEASE engine build and a ONE-SHOT
+# `vite build` (no watcher left running). The ONLY behavioural fork between the
+# two is the LUCIDOS_FRONTEND_ONESHOT branch in start_vite (scripts/lib/
+# workspace.sh) — keep this script's dev defaults intact; don't "fix" it to
+# behave like the user launcher.
+# ────────────────────────────────────────────────────────────────────────────
+#
 #   - PostgreSQL with pgvector in Docker
 #   - Rust engine runs natively on macOS (fast iteration), serving the built
 #     frontend (dist/) DIRECTLY via LUCIDOS_STATIC_DIR — no Vite in the serving
@@ -25,6 +38,19 @@ parse_dev_args "$@"
 check_prereqs
 resolve_workspace
 allocate_ports "$WORKSPACE"
+
+# --engine-build (ADR: new-version-available/switch flow): rebuild the on-disk
+# engine binary in the BACKGROUND while the running engine keeps serving — no
+# kill, no respawn, no Vite. The Apply-triggered background rebuild spawns this;
+# the running engine detects the new on-disk build-id and surfaces "New version
+# available", and the disruptive switch respawns onto it separately. Build only,
+# then exit — no postgres/ports/kill needed to compile.
+if [ -n "$ENGINE_BUILD_ONLY" ]; then
+    build_or_find_engine
+    build_sdk
+    exit 0
+fi
+
 detect_tls
 setup_postgres
 kill_stale_processes

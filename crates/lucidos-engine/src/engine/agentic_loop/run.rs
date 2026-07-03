@@ -344,16 +344,20 @@ impl LucidosEngine {
                 Some(Box::new(move |delta: &str| {
                     let mut text = buf.lock().unwrap();
                     text.push_str(delta);
-                    // Mid-stream defense against Opus 4.7 emitting
-                    // `<ask_user_question>...</ask_user_question>` as text
-                    // instead of a structured tool call. Once the opening
-                    // fragment appears in the buffer, stop flushing deltas
-                    // so the user doesn't see the raw tag in their live
-                    // view. The post-response repair path in the no-
-                    // tool-calls branch below strips the tag, synthesises
-                    // a real tool call, and routes the question through
-                    // `walk_question_batch`. See `inline_question_repair`.
-                    if crate::engine::inline_question_repair::buffer_contains_inline_tag(&text) {
+                    // Mid-stream defense against the model emitting a tool call
+                    // as inline XML text instead of a structured tool_use block.
+                    // Two leak shapes: `<ask_user_question>...</ask_user_question>`
+                    // and the generic `<invoke name="...">...</invoke>`. Once the
+                    // opening fragment appears in the buffer, stop flushing deltas
+                    // so the user doesn't see the raw tag in their live view. The
+                    // post-response repair paths below strip the tag and synthesise
+                    // a real tool call. See `inline_question_repair` /
+                    // `inline_tool_call_repair`.
+                    if crate::engine::inline_question_repair::buffer_contains_inline_tag(&text)
+                        || crate::engine::inline_tool_call_repair::buffer_contains_inline_tool_call(
+                            &text,
+                        )
+                    {
                         return;
                     }
                     if should_flush(&text) {
@@ -584,6 +588,46 @@ impl LucidosEngine {
                     synth_id,
                 );
             }
+            // Post-response repair (generic tool call): the model sometimes
+            // emits a tool call as inline `<invoke name="...">...</invoke>` XML
+            // text instead of a structured tool_use block — the same leak class
+            // as the question repair above, a different tag (observed: a
+            // `bash_output` poll written as text mid-release, terminating the
+            // turn with raw XML as the response). Only when the model made NO
+            // real tool call (a genuine leak), reconstruct the call and push it
+            // so the existing tool-execution branch resumes the turn instead of
+            // persisting the XML. The detector requires a registered tool name +
+            // a non-code-fenced block, so prose/examples don't mis-fire. The
+            // synthesised call flows through the same command guard + circuit
+            // breakers as a real call. See `inline_tool_call_repair`.
+            let tool_call_repair = if response.tool_calls.is_empty() {
+                let known: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+                response.content.as_deref().and_then(|c| {
+                    crate::engine::inline_tool_call_repair::detect_inline_tool_call(c, &known)
+                })
+            } else {
+                None
+            };
+            if let Some(ref d) = tool_call_repair {
+                response.content = if d.cleaned_text.is_empty() {
+                    None
+                } else {
+                    Some(d.cleaned_text.clone())
+                };
+                let synth_id = format!("synth-tc-{}", uuid::Uuid::new_v4());
+                response.tool_calls.push(crate::llm::ToolCall {
+                    id: synth_id.clone(),
+                    name: d.name.clone(),
+                    arguments: d.arguments.clone(),
+                    thought_signature: None,
+                });
+                crate::log!(
+                    "[InlineToolCallRepair] thread={} synthesised '{}' tool call from inline <invoke> tag (synth_id={})",
+                    thread_id,
+                    d.name,
+                    synth_id,
+                );
+            }
             // Final flush — send any remaining buffered text and persist
             // remainder. This includes the assistant's preamble on a tool-call
             // turn ("Let me organize the cards…" before write_file): the loop
@@ -593,8 +637,15 @@ impl LucidosEngine {
             // reflect the repaired body.
             let (flush_text, remaining_to_persist) = {
                 let raw = raw_buffer.lock().unwrap();
+                // When EITHER repair fired, the raw buffer still holds the
+                // leaked tag (the streaming callback appends before suppressing),
+                // so force the flush/persist to the cleaned text — the final
+                // `response.content` both repairs leave behind. Otherwise fall
+                // back to the raw stream / content as before.
+                let cleaned_override = (inline_repair.is_some() || tool_call_repair.is_some())
+                    .then(|| response.content.as_deref().unwrap_or(""));
                 let effective: &str = effective_flush_text(
-                    inline_repair.as_ref().map(|d| d.cleaned_text.as_str()),
+                    cleaned_override,
                     raw.as_str(),
                     response.content.as_deref(),
                 );

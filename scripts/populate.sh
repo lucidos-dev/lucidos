@@ -60,7 +60,7 @@ fi
 # Build if requested
 if [ -n "$BUILD" ]; then
     echo "Building..."
-    cargo build --bin populate_memory
+    cargo build --locked --bin populate_memory
 fi
 
 echo ""
@@ -68,7 +68,7 @@ echo "Populating test data..."
 echo "  Workspace: $WORKSPACE"
 echo ""
 
-LUCIDOS_WORKSPACE="$WORKSPACE" cargo run --bin populate_memory
+LUCIDOS_WORKSPACE="$WORKSPACE" cargo run --locked --bin populate_memory
 
 echo ""
 echo "Done! Start the engine with:"

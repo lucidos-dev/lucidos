@@ -133,6 +133,38 @@ fi
 rm -rf "$S"
 
 echo ""
+echo "test: --emit-tarball is a recognized flag (not 'unknown argument')"
+# Compose it with a build mode + a mismatched --release-version so it hits the
+# fast version-stamp guard BEFORE any build — proving the flag parsed. A genuine
+# emit needs a full macOS build, which this offline suite never runs.
+out="$("$PROJECT_DIR/scripts/build-dmg.sh" --emit-tarball --release-build --release-version 99.99.99-build-dmg-test 2>&1)"
+rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "version-stamp mismatch" && ! echo "$out" | grep -q "unknown argument"; then
+    pass "--emit-tarball parses and composes with a build mode"
+else
+    fail "expected --emit-tarball to parse and hit the version guard; got rc=$rc out: $out"
+fi
+
+echo ""
+echo "test: --emit-tarball is documented in --help"
+out="$("$PROJECT_DIR/scripts/build-dmg.sh" --help 2>&1)"
+if echo "$out" | grep -q -- "--emit-tarball"; then
+    pass "--help documents --emit-tarball"
+else
+    fail "--help does not mention --emit-tarball: $out"
+fi
+
+echo ""
+echo "test: headless-tarball lib + its test ship alongside build-dmg.sh"
+for f in scripts/lib/headless_tarball.sh scripts/lib/headless_tarball_test.sh; do
+    if [ -f "$PROJECT_DIR/$f" ]; then
+        pass "$f exists"
+    else
+        fail "$f is missing"
+    fi
+done
+
+echo ""
 echo "test: release scripts keep the failure-emit contract (errtrace + ERR trap)"
 # A failing stage must emit ReleaseStepFailed, not exit silently. That relies on
 # `set -E` (so the ERR trap inherits into shell functions) AND an `on_err` ERR

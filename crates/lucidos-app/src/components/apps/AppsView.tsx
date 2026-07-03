@@ -11,7 +11,7 @@ import {
 import { loadPluginCatalog, installMarketplacePlugin } from '../../store/actions/plugin-marketplaces';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
-import { ListSkeleton } from '../shared/ListSkeleton';
+import { ListSkeletonOf } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { SearchIcon, CloseIcon } from '../shared/icons';
 import { AppRow, type AppPluginInfo } from './AppCard';
@@ -62,7 +62,7 @@ export function AppsView() {
     body = <LoadableError noun="apps" error={loadable.error} />;
   } else {
     body = (
-      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton fill />}>
+      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf fill containerClass="list-rows" row={() => <AppRow />} />}>
         {loadable.status === 'loaded'
           ? (() => {
               const pluginInfo = pluginInfoByAppId();

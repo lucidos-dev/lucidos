@@ -557,7 +557,7 @@ fn host_protection_env_vars_always_sets_host_pid() {
 fn host_protection_env_vars_includes_frontend_pid_when_pidfile_present() {
     let _guard = API_PORT_ENV_LOCK.lock().unwrap();
     let workspace = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(workspace.path().join(".lucidos")).unwrap();
+    std::fs::create_dir_all(workspace.path().join(".lucidos")).unwrap();
     std::fs::write(workspace.path().join(".lucidos/frontend.pid"), "54321\n").unwrap();
     let vars = host_protection_env_vars(workspace.path());
     assert_eq!(
@@ -586,7 +586,7 @@ fn host_protection_env_vars_omits_frontend_pid_when_pidfile_missing() {
 fn host_protection_env_vars_omits_frontend_pid_when_pidfile_blank() {
     let _guard = API_PORT_ENV_LOCK.lock().unwrap();
     let workspace = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(workspace.path().join(".lucidos")).unwrap();
+    std::fs::create_dir_all(workspace.path().join(".lucidos")).unwrap();
     std::fs::write(workspace.path().join(".lucidos/frontend.pid"), "   \n").unwrap();
     let vars = host_protection_env_vars(workspace.path());
     assert!(
@@ -602,7 +602,7 @@ fn host_protection_env_vars_omits_frontend_pid_when_pidfile_is_not_a_pid() {
     // regex match for that pid. Reject anything that isn't a clean u32.
     let _guard = API_PORT_ENV_LOCK.lock().unwrap();
     let workspace = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(workspace.path().join(".lucidos")).unwrap();
+    std::fs::create_dir_all(workspace.path().join(".lucidos")).unwrap();
     std::fs::write(
         workspace.path().join(".lucidos/frontend.pid"),
         "12345\n67890\n",
@@ -621,9 +621,9 @@ fn host_protection_env_vars_includes_api_port_when_engine_has_one() {
     // `lsof -ti :<port> | xargs kill` that target the engine port.
     let _guard = API_PORT_ENV_LOCK.lock().unwrap();
     let workspace = tempfile::tempdir().expect("tempdir");
-        // SAFETY: process-wide env mutation gated by API_PORT_ENV_LOCK.
-        unsafe {
-            std::env::set_var("LUCIDOS_API_PORT", "3007");
+    // SAFETY: process-wide env mutation gated by API_PORT_ENV_LOCK.
+    unsafe {
+        std::env::set_var("LUCIDOS_API_PORT", "3007");
     }
     let vars = host_protection_env_vars(workspace.path());
     unsafe {
@@ -639,8 +639,8 @@ fn host_protection_env_vars_includes_api_port_when_engine_has_one() {
 fn host_protection_env_vars_omits_api_port_when_engine_has_none() {
     let _guard = API_PORT_ENV_LOCK.lock().unwrap();
     let workspace = tempfile::tempdir().expect("tempdir");
-        unsafe {
-            std::env::remove_var("LUCIDOS_API_PORT");
+    unsafe {
+        std::env::remove_var("LUCIDOS_API_PORT");
     }
     let vars = host_protection_env_vars(workspace.path());
     assert!(
@@ -670,9 +670,15 @@ fn host_protection_env_vars_adds_loopback_base_url_under_gateway() {
         std::env::remove_var("LUCIDOS_API_PORT");
         std::env::remove_var("LUCIDOS_BIND_LOOPBACK");
     }
+    // The scheme comes from `net_config::tls_scheme()` (what THIS process
+    // serves), which reads ambient `LUCIDOS_TLS_*` — a dev-spawned test shell
+    // carries them, a fronted engine has them stripped. Assert through the same
+    // resolver so the test is env-agnostic; the scheme decision itself is
+    // covered by net_config's own tests.
+    let expected = format!("{}://127.0.0.1:62072", crate::net_config::tls_scheme());
     assert_eq!(
         host_pid_var(&vars, "LUCIDOS_API_BASE_URL"),
-        Some("http://127.0.0.1:62072"),
+        Some(expected.as_str()),
         "loopback engine base URL must be handed to subprocesses under the gateway"
     );
 }

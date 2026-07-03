@@ -15,6 +15,52 @@
  * Keep genuinely-reusable component classes in `shared-components.css`, not here.
  */
 
+/* ── Navigation focus marker (the "focus stick") ─────────────────────────────
+   Shared by every host navigation that lands on a specific inner element in a
+   scroll container — a chat event/change exchange, a settings item, a plugin row
+   (driven by components/shared/focusMarker.ts). Just a persistent BORDER
+   (.nav-focus-stuck) — no entrance animation. It sticks until the user takes any
+   action (scroll / keypress / click / new nav / explicit scroll), then smoothly
+   fades out via .nav-focus-fading before being removed.
+
+   The border is an `outline` with `outline-offset`, NOT a `border` or a
+   border-box box-shadow: outline is outside the box model (no layout shift — the
+   deep-link landing relies on scroll-margin staying exact), `outline-offset`
+   places it at the element's OUTER edge with a uniform gap to content (fixes the
+   "border should be at the outer edge with padding to content" report), and
+   `outline` follows `border-radius`. Its LOOK matches the shared keyboard
+   focus-ring (--focus-ring in base.css): a soft, semi-transparent accent band
+   (same 0.1875rem width + `color-mix(--accent 55%)`) rather than a solid,
+   saturated line — expressed as an outline so it keeps the box-model/forced-colors
+   properties above. Tracks --accent for theming. This per-turn marker is why the
+   `.thread-content` scroll region itself shows no focus outline (input-messages.css):
+   the marker signals focus, not a ring around the whole conversation. Always-on;
+   not applied to apps or whole-pane opens (trigger detail, file preview). */
+.nav-focus-stuck {
+    border-radius: 0.375rem;
+    outline: 0.1875rem solid color-mix(in srgb, var(--accent) 55%, transparent);
+    outline-offset: 0.1875rem;
+}
+
+/* Fade-out on dismiss. The transition lives on this modifier (not on
+   .nav-focus-stuck) so the border APPEARS instantly on landing and only the
+   removal animates: adding .nav-focus-fading is the "after-change" style that
+   carries the transition, so outline-color animates accent → transparent, then
+   focusMarker.ts removes both classes once the fade completes (NAV_FOCUS_FADE_MS
+   must match this duration). */
+.nav-focus-stuck.nav-focus-fading {
+    outline-color: transparent;
+    transition: outline-color 0.4s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    /* focusMarker.ts also skips the fade timer under reduced motion; this is the
+       CSS backstop so no outline-color transition runs. */
+    .nav-focus-stuck.nav-focus-fading {
+        transition: none;
+    }
+}
+
 /* Header-level icon buttons — 2.25rem tap target, large icons, background fills full area */
 .icon-btn.header-icon {
     position: relative;
@@ -244,7 +290,7 @@ html[data-theme="dark"] .split-button.open::before {
     border-radius: 0.375rem;
     color: var(--text-primary);
     font-family: var(--font-ui);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     padding: 0.25rem 0.5rem;
     cursor: pointer;
     outline: none;
@@ -298,7 +344,7 @@ html[data-theme="dark"] .split-button.open::before {
      * its content (e.g. a full-width `.form-group` dropdown) — content-width
      * triggers have no slack, so this is a no-op there. */
     margin-left: auto;
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
 }
 
@@ -323,7 +369,8 @@ html[data-theme="dark"] .split-button.open::before {
     z-index: var(--z-dropdown);
 }
 
-/* Per-thread overflow (⋯) menu — a sleek icon-list popover (ThreadOverflowMenu).
+/* Overflow (⋯) menu — a sleek icon-list popover (the shared OverflowMenu shell
+ * behind ThreadOverflowMenu + DraftOverflowMenu).
  * Portaled to <body> with `position: fixed` offsets from `useAnchoredPosition`
  * (set inline via panelStyle), so this rule owns only the box + rows, not
  * placement. Being a <body> child it must out-rank the header chrome
@@ -360,7 +407,7 @@ html[data-theme="dark"] .split-button.open::before {
     border: none;
     border-radius: 0.375rem;
     color: var(--text-primary);
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     font-family: var(--font-ui);
     text-align: left;
     cursor: pointer;
@@ -383,6 +430,13 @@ html[data-theme="dark"] .split-button.open::before {
 .thread-overflow-item:focus-visible {
     background: var(--bg-hover);
     outline: none;
+}
+
+/* Destructive overflow item (e.g. Delete draft) — red label + glyph, overriding
+ * the item's default text/muted-icon colors. */
+.thread-overflow-item-danger,
+.thread-overflow-item-danger svg {
+    color: var(--accent-red);
 }
 
 .thread-overflow-divider {
@@ -414,7 +468,7 @@ html[data-theme="dark"] .split-button.open::before {
     column-gap: 1.5rem;
     row-gap: 0.375rem;
     white-space: nowrap;
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
 }
 
 .thread-info-row {
@@ -512,7 +566,7 @@ html[data-theme="dark"] .split-button.open::before {
     width: 100%;
     padding: 0.25rem 0.5rem;
     font-family: var(--font-ui);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     background: var(--bg-secondary);
     border: none;
     border-bottom: 1px solid var(--border-color);
@@ -534,7 +588,7 @@ html[data-theme="dark"] .split-button.open::before {
 .dropdown-option {
     padding: 0.25rem 0.5rem;
     font-family: var(--font-ui);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     color: var(--text-primary);
     cursor: pointer;
     white-space: nowrap;
@@ -553,13 +607,34 @@ html[data-theme="dark"] .split-button.open::before {
     color: var(--text-primary);
 }
 
+/* Current-selection marker — a small accent dot at the trailing edge, NOT a
+ * full-row color/background treatment. A blue-text (or background) active row
+ * competed with the arrow-key `.focused` row (which owns the bg-tertiary
+ * highlight): traversing showed two "special" rows and you couldn't tell which
+ * one the arrows were on. The dot reads as "this is the current one" without
+ * claiming the row highlight. `padding-right` reserves the dot's gutter so a
+ * long label ellipsizes before it instead of underlapping the dot. Only shown
+ * where the dropdown reflects a persisted current setting; transient "last
+ * used" pickers pass markCurrent={false} (no `.active` class). */
 .dropdown-option.active {
-    color: var(--accent);
+    position: relative;
+    padding-right: 1.25rem;
+}
+
+.dropdown-option.active::after {
+    content: '';
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    width: 0.3125rem;
+    height: 0.3125rem;
+    border-radius: 50%;
+    background: var(--accent);
 }
 
 .dropdown-option.dropdown-option-header {
     color: var(--text-secondary);
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     text-transform: uppercase;
     letter-spacing: 0.05em;
     cursor: default;
@@ -590,7 +665,7 @@ html[data-theme="dark"] .split-button.open::before {
  * var(--text-secondary) matches the established option-description treatment
  * (.control-option-desc, .question-option-desc, .change-option-desc). */
 .dropdown-option-description {
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     color: var(--text-secondary);
     white-space: normal;
     max-width: 16rem;
@@ -644,7 +719,7 @@ html[data-theme="dark"] .split-button.open::before {
     border: none;
     color: var(--text-primary);
     font-family: var(--font-ui);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     padding: 0.25rem 0.5rem;
     outline: none;
     min-width: 0;

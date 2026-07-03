@@ -46,6 +46,73 @@ impl LucidosEngine {
         }
     }
 
+    /// Enforce the "a coding-agent thread has at most one pending change at a
+    /// time" invariant: discard every pending change for `thread_id` that the
+    /// `keep` predicate rejects. `ChangeDiscarded` is event-sourced, so a stale
+    /// row closes cleanly (its branch/worktree reset to main) instead of
+    /// dangling as `pending` — which the frontend reads as "has pending changes"
+    /// (`resolveThreadActions`) and which then suppresses Archive forever. See
+    /// docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md.
+    ///
+    /// The `keep` predicate is called synchronously per row, so callers scope
+    /// exactly what survives: `propose_change` keeps the branch being proposed
+    /// (dropping stale OTHER-branch changes), and the apply-time net keeps the
+    /// change that just applied.
+    pub(crate) async fn discard_pending_for_thread_except(
+        &self,
+        thread_id: Uuid,
+        actor: Option<MessageOrigin>,
+        keep: impl Fn(&crate::core::changes::Change) -> bool,
+    ) {
+        let pending = match self.changes().pending_for_thread(thread_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                log!(
+                    "[Changes] discard_pending_for_thread_except({}): pending_for_thread: {} — \
+                     skipping reconcile (stale pending changes remain in DB)",
+                    thread_id,
+                    e
+                );
+                return;
+            }
+        };
+        for change in &pending {
+            if keep(change) {
+                continue;
+            }
+            log!(
+                "[Changes] Reconcile: discarding stale pending change {} (branch {}) for thread {} — \
+                 thread already has a newer change",
+                change.id,
+                change.branch_name,
+                thread_id
+            );
+            if let Err(e) = self.discard_change(change.id, actor.clone()).await {
+                log!(
+                    "[Changes] Reconcile: failed to discard stale change {} for thread {}: {}",
+                    change.id,
+                    thread_id,
+                    e
+                );
+            }
+        }
+    }
+
+    /// Apply-time net for the "≤1 pending change per thread" invariant: after a
+    /// change applies, discard any OTHER pending change the thread still holds.
+    /// `propose_change` is the primary guard (it prevents a second pending change
+    /// from ever coexisting); this catches a pre-existing orphan that predates
+    /// that guard or reached the thread via a path that bypassed it.
+    pub(crate) async fn discard_orphaned_pending_siblings(
+        &self,
+        thread_id: Uuid,
+        keep_change_id: Uuid,
+        actor: Option<MessageOrigin>,
+    ) {
+        self.discard_pending_for_thread_except(thread_id, actor, |c| c.id == keep_change_id)
+            .await;
+    }
+
     /// Discard a single pending change.
     ///
     /// Phase 6.3 of the CC resume architecture: Discard preserves the thread's
@@ -93,6 +160,21 @@ impl LucidosEngine {
                 "[Changes] ChangeDiscarded",
             )
             .await;
+
+        // Feed the Apply-All driver: if this discarded change is a live batch
+        // member, mark it terminal so the batch advances instead of stalling.
+        // Symmetric to `emit_change_applied`'s `Applied` notify — a no-op for
+        // non-members. Without it, a member discarded mid-batch (e.g. the
+        // "≤1 pending change per thread" reconcile dropping a sibling that is
+        // also a batch member) would leave the driver spawning `apply_change`
+        // on a now-`discarded` row, which returns `Err` with no terminal event —
+        // the batch never completes and the "Applying changes…" toast sticks.
+        self.notify_apply_all(
+            crate::engine::apply_all_driver::ApplyAllDriveMsg::Failed(
+                change_id,
+                crate::engine::apply_all_driver::DISCARDED_MEMBER_REASON.to_string(),
+            ),
+        );
 
         // Other pending changes on the same branch? If so, leave the branch
         // and worktree untouched — wiping the branch back to main would also

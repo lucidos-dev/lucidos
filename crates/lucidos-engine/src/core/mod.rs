@@ -26,6 +26,7 @@ pub mod repositories;
 pub mod store;
 pub mod system_knowhow;
 pub mod user_dir;
+pub mod user_path;
 
 /// Get the database URL from the environment, with a default for local dev.
 pub fn database_url() -> String {
@@ -345,7 +346,8 @@ pub use mcp_servers::{McpServer, McpServerStore};
 pub use models::{Model, ModelStore};
 pub use preferences::{
     PreferenceStore, DEFAULT_CHAT_MODEL, DEFAULT_COMMAND_JUDGE_MODEL, DEFAULT_LOCAL_BASE_URL,
-    PREF_CHAT_MODEL, PREF_CHAT_REASONING_EFFORT, PREF_IMAGE_MODEL, PREF_LOCAL_BASE_URL,
+    PREF_CHAT_MODEL, PREF_CHAT_REASONING_EFFORT, PREF_CODING_AGENT_CLAUDE_PATH,
+    PREF_CODING_AGENT_CODEX_PATH, PREF_IMAGE_MODEL, PREF_LOCAL_BASE_URL,
     PREF_MODEL_COMMAND_JUDGE, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY, PREF_MODEL_TITLE,
     PREF_VERTEX_REGION,
 };

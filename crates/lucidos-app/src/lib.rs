@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::Mutex;
 use std::time::Instant;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -9,6 +9,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 
 mod desktop;
+mod device_id_store;
 mod mobile;
 mod notifications;
 mod updater;
@@ -75,6 +76,14 @@ struct PanelContentChannel(Mutex<Option<std::sync::mpsc::Sender<(String, String)
 
 /// Tracks the label of the currently active panel webview.
 struct PanelWebview(Mutex<Option<String>>);
+
+/// Sender that wakes the dock-badge loop (`desktop::launch`) for an immediate
+/// recompute. The frontend's `nudge_dock_badge` command sends on it when a
+/// notification SSE arrives, so the macOS dock badge updates the instant a
+/// notification is read (in-app or from another device) instead of on the next
+/// poll tick. The receiver lives in the badge thread (macOS, packaged); a send
+/// is a harmless no-op when there's no consumer (dev / non-macOS).
+struct DockBadgeNudge(Mutex<std::sync::mpsc::Sender<()>>);
 
 /// Tracks the last JS heartbeat timestamp for WKWebView crash recovery.
 /// WKWebView's content process can be terminated by macOS under memory pressure,
@@ -882,6 +891,18 @@ fn dismiss_native_notification(id: Option<String>) {
     notifications::dismiss(id);
 }
 
+/// Wake the dock-badge loop for an immediate recompute. The frontend calls this
+/// (under `isTauri()`) from its notification SSE handler so the macOS dock badge
+/// updates the instant a notification is read — in-app or from another device —
+/// instead of waiting for the periodic poll. Best-effort: a send failure (no
+/// receiver in dev / non-macOS, where there is no dock tile) is ignored. The
+/// recompute itself reads the gateway's fresh `unread-total` aggregate. See
+/// `desktop::launch` and `system-knowhow/notifications.md` § App-icon badge.
+#[tauri::command]
+fn nudge_dock_badge(state: tauri::State<'_, DockBadgeNudge>) {
+    let _ = state.0.lock().unwrap().send(());
+}
+
 /// Report whether the main app window is currently *active* — focused AND
 /// on-screen (visible, not minimized). The frontend pulls this at startup to
 /// SEED its `native-window-active` cache BEFORE registering the event listener
@@ -934,16 +955,163 @@ fn emit_window_active(app: &tauri::AppHandle, label: &str, active: bool) {
     let _ = app.emit_to(label, "native-window-active", active);
 }
 
+/// True while the packaged macOS client is running menu-bar-only: it has no
+/// visible app window, so it uses the `Accessory` activation policy and is absent
+/// from the Dock and the Cmd+Tab app switcher, living only in the menu-bar tray.
+/// Flipped by [`set_menu_bar_only`]; read by [`apply_unread_indicator`] to pick
+/// which surface shows the unread count. Starts `false` — the config declares a
+/// visible `main` window, so the app launches as a normal `Regular` Dock app.
+static MENU_BAR_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// The most recent aggregate unread total, so a `Regular`↔`Accessory` transition
+/// can re-route the SAME count to the surface that now exists (Dock badge vs tray
+/// title) without waiting for the next badge-loop poll. Written by
+/// [`apply_unread_indicator`].
+static LAST_UNREAD: AtomicU64 = AtomicU64::new(0);
+
+/// Pure: the client should be menu-bar-only exactly when no app window is visible.
+/// Split out so the rule is unit-testable without a running app.
+fn should_be_menu_bar_only(visible_app_windows: usize) -> bool {
+    visible_app_windows == 0
+}
+
+/// Pure: which surface shows the unread `count` for the current activation state,
+/// as `(dock_badge_label, tray_title_label)`. `Regular` → the Dock badge; menu-bar
+/// only → the tray-icon title (there is no Dock tile then). `0` clears both; a
+/// count over 99 collapses to "99+". Unit-testable without AppKit.
+fn unread_targets(menu_bar_only: bool, count: u64) -> (Option<String>, Option<String>) {
+    if count == 0 {
+        return (None, None);
+    }
+    let label = if count > 99 {
+        "99+".to_string()
+    } else {
+        count.to_string()
+    };
+    if menu_bar_only {
+        (None, Some(label))
+    } else {
+        (Some(label), None)
+    }
+}
+
+/// Route the aggregate unread `count` to the correct surface for the current
+/// activation state: the Dock badge while a window is open (`Regular`), the
+/// menu-bar tray-icon title while menu-bar-only (`Accessory`). Stores `count` in
+/// [`LAST_UNREAD`] so a later activation transition can re-route it. Called from
+/// the desktop badge loop (marshalled to the main thread) and from
+/// [`set_menu_bar_only`].
+pub(crate) fn apply_unread_indicator(app: &tauri::AppHandle, count: u64) {
+    LAST_UNREAD.store(count, std::sync::atomic::Ordering::SeqCst);
+    let menu_bar_only = MENU_BAR_ONLY.load(std::sync::atomic::Ordering::SeqCst);
+    let (dock, tray) = unread_targets(menu_bar_only, count);
+    notifications::set_dock_badge(dock);
+    notifications::set_tray_title(app, tray);
+}
+
+/// Switch the client between menu-bar-only (`Accessory`: gone from the Dock +
+/// Cmd+Tab) and normal (`Regular`: Dock + Cmd+Tab). On macOS this sets the
+/// NSApplication activation policy; on other platforms only the flag moves (the
+/// badge/tray writes are no-ops there). Then re-routes the unread indicator to the
+/// surface that now exists. See
+/// `docs/plans/2026-07-01-macos-client-menu-bar-only-on-window-close.md`.
+fn set_menu_bar_only(app: &tauri::AppHandle, menu_bar_only: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        let policy = if menu_bar_only {
+            tauri::ActivationPolicy::Accessory
+        } else {
+            tauri::ActivationPolicy::Regular
+        };
+        if let Err(e) = app.set_activation_policy(policy) {
+            eprintln!("[Tauri] Failed to set activation policy: {e}");
+        }
+    }
+    MENU_BAR_ONLY.store(menu_bar_only, std::sync::atomic::Ordering::SeqCst);
+    apply_unread_indicator(app, LAST_UNREAD.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+/// Drop the client to menu-bar-only IFF no app window is left visible. Called after
+/// a window is hidden (`CloseRequested` on `main`) or destroyed (a secondary
+/// New-Window closing), so closing the LAST window removes the app from the Dock +
+/// Cmd+Tab, while closing one of several leaves it a normal Dock app. `excluding`
+/// skips a window that is on its way out but might still be listed.
+fn enter_menu_bar_only_if_no_windows(app: &tauri::AppHandle, excluding: Option<&str>) {
+    let visible = app
+        .webview_windows()
+        .iter()
+        .filter(|(label, w)| {
+            is_app_window(label.as_str())
+                && Some(label.as_str()) != excluding
+                && w.is_visible().unwrap_or(false)
+        })
+        .count();
+    if should_be_menu_bar_only(visible) {
+        set_menu_bar_only(app, true);
+    }
+}
+
+/// Activate the app frontmost (macOS). No-op elsewhere. See [`show_main_window`].
+fn activate_app_frontmost() {
+    #[cfg(target_os = "macos")]
+    notifications::activate_app();
+}
+
+/// Close the whole client to the menu-bar tray — the Cmd+Q / "Close to Menu Bar"
+/// action. Destroys secondary New-Window windows and HIDES `main` (so reopen is
+/// instant and preserves page state), then drops to menu-bar-only. The always-on
+/// launchd services are untouched — the only full teardown is [`quit_lucidos`].
+///
+/// Packaged only. In dev there is no always-on service and no menu-bar tray
+/// (`install_tray` is skipped in dev), so hiding + going `Accessory` would strand
+/// the window with no way to reopen it and leave `tauri-dev.sh` running headless.
+/// So in dev this closes the window(s) instead, matching the default close-quits
+/// behavior (the last window closing lets the process exit) — the same reason
+/// `CloseRequested`/`Destroyed` above are `!is_dev()`-guarded.
+fn close_all_to_tray(app: &tauri::AppHandle) {
+    if tauri::is_dev() {
+        for (label, window) in app.webview_windows() {
+            if is_app_window(&label) {
+                let _ = window.close();
+            }
+        }
+        return;
+    }
+    // Flush geometry now — the window-state plugin's exit-time write never runs
+    // (we hide, never exit), so this is the moment to remember size/position.
+    if let Err(e) = app.save_window_state(window_state_flags()) {
+        eprintln!("[Tauri] Failed to persist window state on close-to-tray: {e}");
+    }
+    for (label, window) in app.webview_windows() {
+        if label == "main" {
+            let _ = window.hide();
+            emit_window_active(app, "main", false);
+        } else if is_app_window(&label) {
+            let _ = window.close();
+        }
+    }
+    enter_menu_bar_only_if_no_windows(app, None);
+}
+
 /// Show + focus the main window, recreating it if it was destroyed. Backs the
 /// menu-bar "Open Lucidos" item, the macOS Dock-click (Reopen), and a
 /// native-notification tap, so a window hidden on close can always be brought
-/// back. Emits `native-window-active = true` so the reshown page immediately
-/// counts as active again.
+/// back. Leaves menu-bar-only first (restores the `Regular` activation policy) so
+/// the window can come forward with a clickable app menu, then emits
+/// `native-window-active = true` so the reshown page immediately counts as active.
 pub(crate) fn show_main_window(app: &tauri::AppHandle) {
+    // Leaving menu-bar-only: restore `Regular` BEFORE showing so the window can be
+    // fronted and the app menu is clickable (the AppKit `Accessory`→`Regular`
+    // transition otherwise leaves the app behind / the menu bar unclickable).
+    set_menu_bar_only(app, false);
+
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.unminimize();
         let _ = win.show();
         let _ = win.set_focus();
+        // set_focus alone can leave an app that just left `Accessory` behind other
+        // apps / with an unclickable menu bar — explicitly activate frontmost.
+        activate_app_frontmost();
         // `set_focus()` also fires `WindowEvent::Focused(true)`, but emit
         // explicitly so the reshow is deterministic regardless of event timing.
         emit_window_active(app, "main", true);
@@ -1009,6 +1177,10 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Nudge channel for the dock-badge loop: the `nudge_dock_badge` command holds
+    // the sender (managed state); the receiver is handed to `desktop::launch`,
+    // whose macOS badge thread owns it. Created here so both ends are in scope.
+    let (dock_badge_nudge_tx, dock_badge_nudge_rx) = std::sync::mpsc::channel::<()>();
     tauri::Builder::default()
         .plugin(
             tauri_plugin_window_state::Builder::new()
@@ -1024,6 +1196,8 @@ pub fn run() {
             dirty: AtomicBool::new(false),
             last_change: Mutex::new(Instant::now()),
         })
+        .manage(device_id_store::DeviceIdStore::default())
+        .manage(DockBadgeNudge(Mutex::new(dock_badge_nudge_tx)))
         .invoke_handler(tauri::generate_handler![
             create_panel_webview,
             navigate_panel_webview,
@@ -1045,6 +1219,7 @@ pub fn run() {
             open_url_external,
             show_native_notification,
             dismiss_native_notification,
+            nudge_dock_badge,
             get_native_window_active,
             take_pending_native_taps,
             updater::check_app_update,
@@ -1055,6 +1230,7 @@ pub fn run() {
             mobile::get_connect_info,
             mobile::tailscale_up,
             mobile::tailscale_serve,
+            device_id_store::get_or_create_device_id,
         ])
         .on_window_event(|window, event| {
             let app = window.app_handle();
@@ -1075,6 +1251,11 @@ pub fn run() {
                         eprintln!("[Tauri] Failed to persist window state on close: {e}");
                     }
                     if !tauri::is_dev() && window.label() == "main" {
+                        // Red-X / Cmd+W on the main window: keep the client resident
+                        // — HIDE it (fast reopen, page state preserved) instead of
+                        // closing, then drop to the menu-bar tray if this was the
+                        // last visible window (out of the Dock + Cmd+Tab). Secondary
+                        // New-Window windows close normally (handled by Destroyed).
                         api.prevent_close();
                         let _ = window.hide();
                         // Trayed via orderOut: — the WKWebView won't report this
@@ -1084,7 +1265,17 @@ pub fn run() {
                         // active. Lets the engine send the OS native banner instead
                         // of a suppressed, invisible in-app toast.
                         emit_window_active(app, window.label(), false);
+                        enter_menu_bar_only_if_no_windows(app, Some(window.label()));
                     }
+                }
+                // A secondary New-Window closed (red-X / Cmd+W). Re-evaluate: if that
+                // was the last visible window, drop the client to the menu-bar tray.
+                // Packaged only — dev has no menu-bar residency. `main` never reaches
+                // here (its close is prevented + hidden above).
+                tauri::WindowEvent::Destroyed
+                    if !tauri::is_dev() && is_app_window(window.label()) =>
+                {
+                    enter_menu_bar_only_if_no_windows(app, Some(window.label()));
                 }
                 // Native focus changed (app switch, behind another app, Space
                 // change, app-hide, minimize). Bridge it so isPageActive() honors
@@ -1111,15 +1302,14 @@ pub fn run() {
         })
         .on_menu_event(|app, event| {
             // "Quit and Stop Background Service" (quit_lucidos) is the only teardown;
-            // "Close Window" (Cmd+Q) hides the client like the red X; "New Window"
-            // opens another client window. Window close (red X / Cmd+W) is handled
-            // in on_window_event above, not here.
+            // "Close to Menu Bar" (Cmd+Q) closes every client window and drops to the
+            // menu-bar tray (services keep running); "New Window" opens another client
+            // window. Per-window close (red X / Cmd+W) is the standard Close Window
+            // item, handled in on_window_event above, not here.
             if event.id() == "quit_lucidos" {
                 quit_lucidos(app.clone());
-            } else if event.id() == "close_main_window" {
-                if let Some(win) = app.get_webview_window("main") {
-                    let _ = win.close();
-                }
+            } else if event.id() == "close_to_menu_bar" {
+                close_all_to_tray(app);
             } else if event.id() == "uninstall_lucidos" {
                 uninstall_lucidos(app.clone());
             } else if event.id() == "new_window" {
@@ -1142,12 +1332,12 @@ pub fn run() {
                 }
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             // Install the app menu. The standard edit/window items keep the
-            // usual shortcuts; Cmd+Q maps to "Close Window" (hide the client) and
-            // the explicit "Quit and Stop Background Service" item drives
-            // on_menu_event → quit_lucidos. Best-effort: a menu build failure must
-            // not block app startup.
+            // usual shortcuts; Cmd+Q maps to "Close to Menu Bar" (closes all client
+            // windows to the menu-bar tray) and the explicit "Quit and Stop
+            // Background Service" item drives on_menu_event → quit_lucidos.
+            // Best-effort: a menu build failure must not block app startup.
             if let Err(e) = install_app_menu(app) {
                 eprintln!("[Tauri] Failed to install app menu: {e}");
             }
@@ -1223,8 +1413,9 @@ pub fn run() {
             notifications::setup(app.handle());
 
             // Packaged build: boot the bundled Postgres + engine and point the
-            // window at it. No-op in development (tauri-dev.sh supplies both).
-            desktop::launch(app.handle());
+            // window at it. No-op in development (tauri-dev.sh supplies both). The
+            // nudge receiver lets the dock-badge loop recompute on demand.
+            desktop::launch(app.handle(), dock_badge_nudge_rx);
             // Update detection is surfaced INSIDE the workspace UI: the web app
             // polls the `check_app_update` command and shows an in-app
             // "Update & restart" toast (see updater.rs). No native launch dialog.
@@ -1269,9 +1460,11 @@ pub fn run() {
 /// moving the cursor. Deriving from the default keeps that wiring; on macOS we
 /// then graft on our service-aware items.
 ///
-/// macOS customizations: Cmd+Q maps to "Close Window" (hides the client, leaving
-/// the always-on service running); the deliberate full teardown is the separate,
-/// unshortcutted "Quit and Stop Background Service" (`on_menu_event` →
+/// macOS customizations: Cmd+Q maps to "Close to Menu Bar" — it closes every
+/// client window and drops the app to the menu-bar tray (out of the Dock +
+/// Cmd+Tab) while the always-on service keeps running; per-window close stays the
+/// default File/Window "Close Window" (Cmd+W). The deliberate full teardown is the
+/// separate, unshortcutted "Quit and Stop Background Service" (`on_menu_event` →
 /// `quit_lucidos`; also in the menu-bar tray); plus "Uninstall Lucidos…" and a
 /// File-menu "New Window". Other platforms keep the default menu unchanged.
 fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
@@ -1285,20 +1478,26 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
         let items = menu.items()?;
 
         if let Some(MenuItemKind::Submenu(app_menu)) = items.first() {
-            // Drop the default Quit (its last item; Cmd+Q → terminate) so Cmd+Q
-            // is free for "Close Window", and graft on our service-aware items.
-            // Removing only Quit leaves About/Services/Hide intact, so the menu
-            // is still recognized as the Apple menu (the arrow-key fix above).
-            // The default's item before Quit is a separator, so the grafted items
-            // start straight at Uninstall (no leading separator → no double rule).
+            // Drop the default Quit (its last item; Cmd+Q → terminate) so Cmd+Q is
+            // free for "Close to Menu Bar", and graft on our service-aware items.
+            // Removing only Quit leaves About/Services/Hide intact, so the menu is
+            // still recognized as the Apple menu (the arrow-key fix above). The
+            // default's item before Quit is a separator, so the grafted items start
+            // straight at Uninstall (no leading separator → no double rule).
+            // Per-window close stays the default File/Window "Close Window" (Cmd+W).
             let last = app_menu.items()?.len();
             if last > 0 {
                 app_menu.remove_at(last - 1)?;
             }
             let uninstall =
                 MenuItem::with_id(app, "uninstall_lucidos", "Uninstall Lucidos…", true, None::<&str>)?;
-            let close_window =
-                MenuItem::with_id(app, "close_main_window", "Close Window", true, Some("Cmd+Q"))?;
+            let close_to_menu_bar = MenuItem::with_id(
+                app,
+                "close_to_menu_bar",
+                "Close to Menu Bar",
+                true,
+                Some("Cmd+Q"),
+            )?;
             let quit = MenuItem::with_id(
                 app,
                 "quit_lucidos",
@@ -1309,7 +1508,7 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
             app_menu.append_items(&[
                 &uninstall,
                 &PredefinedMenuItem::separator(app)?,
-                &close_window,
+                &close_to_menu_bar,
                 &quit,
             ])?;
         }
@@ -1339,6 +1538,32 @@ mod tests {
         assert!(!is_app_window("url-preview-3"));
         assert!(!is_app_window("lucidos-tray"));
         assert!(!is_app_window(""));
+    }
+
+    #[test]
+    fn should_be_menu_bar_only_iff_no_windows_visible() {
+        // No visible app window → drop to the menu-bar tray (Accessory).
+        assert!(should_be_menu_bar_only(0));
+        // Any visible window → stay a normal Dock app (Regular), incl. the
+        // main-hidden-but-a-secondary-still-open case.
+        assert!(!should_be_menu_bar_only(1));
+        assert!(!should_be_menu_bar_only(3));
+    }
+
+    #[test]
+    fn unread_targets_routes_by_activation_state() {
+        // Regular (a window is open): count on the Dock badge, nothing on the tray.
+        assert_eq!(unread_targets(false, 5), (Some("5".into()), None));
+        // Menu-bar only (Accessory): count on the tray title, no Dock tile.
+        assert_eq!(unread_targets(true, 5), (None, Some("5".into())));
+        // Zero clears both surfaces regardless of state.
+        assert_eq!(unread_targets(false, 0), (None, None));
+        assert_eq!(unread_targets(true, 0), (None, None));
+        // Over 99 collapses to "99+" on whichever surface is active.
+        assert_eq!(unread_targets(false, 150), (Some("99+".into()), None));
+        assert_eq!(unread_targets(true, 100), (None, Some("99+".into())));
+        // Boundary: exactly 99 is shown as-is.
+        assert_eq!(unread_targets(false, 99), (Some("99".into()), None));
     }
 
     #[test]

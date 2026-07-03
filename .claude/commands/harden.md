@@ -21,6 +21,7 @@ Run `git diff main...HEAD --name-only`. If every changed file ends in `.md` or `
 - Skip Phase 1 (`/code-review` looks for code-shaped bugs that don't apply to prose).
 - Skip Phase 2 Agent 1 (no code logic to bug-check).
 - Phase 2 Agents 2 and 3 (compliance, regression), Phase 3, Phase 4, Phase 5 still run.
+- Phase 2.5 auto-skips for docs-only via its own packaged-runtime gate.
 - Phase 4.5 already auto-skips for docs-only via its test-selection table.
 
 Do NOT extend this fast path to "string-only" or "comment-only" `.rs` edits. Strings can carry format args, escape sequences, regexes, or be parsed at runtime — any `.rs` change keeps the full cycle.
@@ -34,6 +35,31 @@ This is a backstop, not the first time invariants should appear. Do not invent a
 ## Phase 1: Run /code-review
 
 **Docs-only fast path:** if Phase 0.5 flagged this diff as docs-only, skip this phase entirely and proceed to Phase 2.
+
+### Phase 1 kickoff: launch Codex review in parallel (advisory, Claude Code only)
+
+Before running the `code-review` skill, kick off a Codex review of the branch diff **in the background** so it overlaps Phases 1–3 and adds ~no wall-clock (empirically ~2 min median on this repo, which fits inside the Claude review phases). It is a fourth reviewer running on the *same* cadence as the others — because `/harden` loops (Phase 4.5 failure → back to Phase 1), each iteration launches a fresh Codex review on the updated diff, exactly like `code-review` and the Phase 2 agents re-run.
+
+This step is **advisory**: its findings feed the same validate→fix pipeline as every other reviewer (joined in Phase 3), but Codex being unavailable, slow, erroring, or timing out NEVER blocks the hardened marker.
+
+- **Claude Code only.** A Codex-backed `/harden` run is already Codex reviewing this diff — skip this step and note "Codex review: skipped (Codex-backend run)".
+- **Docs-only:** this whole phase is skipped, so Codex review is skipped too (it's a code reviewer, not a prose reviewer).
+
+Resolve the companion script (installed with the `codex` plugin — do not hardcode a path) and launch the review in **one** Bash call, so the resolved path and the launch share a shell (variables do not persist across Bash tool calls). The `--background` flag queues the review and returns a job id immediately; `--base main` matches `/harden`'s diff base of `main...HEAD`:
+
+```bash
+CODEX_COMPANION=$(find "$HOME/.claude/plugins" -name codex-companion.mjs -path '*codex*' 2>/dev/null | sort | tail -1)
+if [ -z "$CODEX_COMPANION" ]; then
+  echo "Codex review: unavailable (plugin not installed) — proceeding"
+else
+  echo "CODEX_COMPANION=$CODEX_COMPANION"
+  node "$CODEX_COMPANION" review --scope branch --base main --background --json
+fi
+```
+
+From the output, **record two literals for the Phase 3 join**: the printed `CODEX_COMPANION=...` path and the returned job id string (don't rely on the shell variable — the join is a separate Bash call). If the plugin was unavailable, there is nothing to join. Do NOT wait for the review here — continue immediately into the `code-review` skill below.
+
+### Phase 1 review
 
 Run the **repo-owned** `code-review` skill (`.claude/skills/code-review/SKILL.md`) at **medium** effort. It reviews the branch diff for correctness bugs at the high-confidence end of the precision/recall slider — fewer findings, very low false-positive rate, complementary to Phase 2's broader bug-detection agent.
 
@@ -50,16 +76,19 @@ When `code-review` returns its findings:
 
 Do NOT pass `--comment` (that mode posts to GitHub PRs, which Lucidos does not use).
 
-**Report Phase 1 in prose — never reproduce the raw findings JSON.** The
-`code-review` skill's Output section tells you to emit its findings as a JSON
-array, and to `return []` when nothing survives. That array is the skill's
-*internal* contract for handing results back to this orchestrator — it is NOT
-for the reader. Translate it into one sentence of prose ("Phase 1: no findings"
-or "Phase 1 flagged N issues: …") and **do not paste the array — empty `[]`,
-`{}`, or populated — into your reply, fenced or inline.** A bare `[]` in the
-chat is meaningless noise to the user. (This is the source we own: the `[]` you
-see rendered in old threads is this array leaking through; suppressing it here
-is why the frontend no longer carries a strip-the-empty-array workaround.)
+**Report Phase 1 in prose — the findings are structured data, not a message.**
+The `code-review` skill reports its findings through a **structured channel** (its
+Output section): the `ReportFindings` tool on Claude Code — which renders them
+structurally, never as text — or, for backends without that tool, an in-band
+array it hands back with an explicit `No findings.` in the empty case. Either
+way the findings are the skill's handoff to *you*, NOT text for the reader:
+translate the result into one sentence of prose ("Phase 1: no findings" or
+"Phase 1 flagged N issues: …") and **never paste a findings array — empty `[]`/`{}`
+or populated, fenced or inline — into your reply.** A bare `[]` in the chat is
+meaningless noise; it is the recurring bug the structured-channel handoff exists
+to prevent. The fix is deliberately at the **source** (the repo-owned skill),
+NOT a frontend content-filter — see `docs/temporary-measures.md` § "code-review
+findings array leaking into chat".
 
 ## Phase 2: Run Three Hardening Agents
 
@@ -114,7 +143,41 @@ Do NOT flag:
 
 For each modified file, run `git log --oneline -10 <file>` to see recent history. Check if the current changes revert, contradict, or undermine recent fixes or intentional refactors. Only flag clear regressions where you can point to a specific prior commit that the new change undoes.
 
+## Phase 2.5: Packaged-Runtime Dependency & Fail-Fast Check
+
+**Gate:** run this phase only when `git diff main...HEAD` touches a packaged-runtime surface; otherwise note "Phase 2.5: not applicable" and skip. The trigger surfaces are any diff that:
+
+- adds or changes a subprocess spawn (`Command::new(...)`, `tokio::process::Command::new(...)`), an MCP server `command:` entry, a `--permission-prompt-tool` / hook `command`, or any other place that shells out by name;
+- reads a file/asset from disk at runtime, or flips an asset between `include_str!`/`include_bytes!` (baked) and disk-read (staged);
+- adds or reads a `LUCIDOS_*_DIR` / `*_BIN` env var, or a `current_exe()`-relative path walk;
+- edits the packaging / delivery / install contract: `scripts/lib/stage_runtime.sh` (`RESOURCE_NAMES`, `stage_runtime_assemble`), `scripts/build-dmg.sh`, `scripts/build-headless.sh`, `scripts/lib/service.sh`, `install.sh`, `crates/lucidos-app/src/desktop.rs` (`spawn_gateway` env), or the gateway's engine / embedded-Postgres provisioning.
+
+**Why:** the packaged macOS `.app` / headless tarball / `install.sh` service run under a minimal launchd/Finder PATH (`/usr/bin:/bin:/usr/sbin:/sbin`) and stage only a fixed `RESOURCE_NAMES` set — NOT the dev `target/{debug,release}/` tree with every binary side-by-side and a rich shell PATH. A dependency that resolves in dev can be absent or unreachable when packaged, and the failure typically surfaces as a cryptic mid-stream tool error or an indefinite boot-splash hang instead of a clear message. (The triggering incident: the `lucidos` CLI — needed for CC's permission MCP server — was not staged, so the first tool call died with `MCP tool … not found`. Worked catalog of this whole class: `data/artifacts/audits/packaged-app-bundle-and-failfast-audit.md`.)
+
+For each runtime dependency the diff adds or changes, confirm BOTH:
+
+- **Pattern A — staged + resolved, never PATH-dependent.** A binary/asset/dir the runtime requires must be (a) staged by EVERY delivery vehicle (`stage_runtime.sh` `RESOURCE_NAMES` + `stage_runtime_assemble`, surfaced in `desktop.rs::bundled_resources` / the service env) and (b) resolved by absolute path or a guaranteed-set env var — never a bare command name relying on PATH. A genuinely external user-install (`git`, `claude`, `codex`, `node`, `npx`, a non-bundled `psql`) is acceptable ONLY if it is resolved like `resolve_claude_binary` (probe absolute locations first) AND its absence fails fast with an actionable message. Flag any bare `Command::new("name")` / `command: "name"` whose target is not on the launchd minimal PATH and not absolute-resolved, and any disk-read asset no vehicle stages.
+- **Pattern B — fail fast, don't degrade.** A missing dep / `None` cli-dir / `Err` spawn / missing-file / unreachable-process must surface as an immediate, descriptive error at spawn or boot ("X not found at <path> — <feature> unavailable"), NOT a `log!`-and-proceed, a silent stub, or an unbounded wait. Flag any resolution that returns `None`/`Err` then proceeds anyway, any health check that reports healthy while a required surface is broken, and any "is the env var set?" check that never verifies the path actually exists.
+
+If the diff edits `RESOURCE_NAMES` or a staging/service/spawn-env path, also confirm the change is mirrored across ALL delivery vehicles (dmg, headless, install service) and the `desktop.rs` ↔ `service.sh` env contract — they must not drift. Validate flagged items in Phase 3 and fix real ones in Phase 4 like any other finding.
+
 ## Phase 3: Validate Findings
+
+### Join the Codex review (if launched in Phase 1)
+
+If you launched a background Codex review in Phase 1, join it now — poll its status using the literal companion path and job id you captured there:
+
+```bash
+node "<codex-companion.mjs path>" status <job-id> --json
+```
+
+- **Completed:** fold Codex's findings into the validation set below — treat each finding exactly like one from the other reviewers (confirm against source, fix real 🔴 in Phase 4, discard false positives, log recurring dismissals to `docs/code-review-priors.md`). Codex frequently returns "no actionable bugs" — record that outcome and move on.
+- **Still running:** give it a bounded wait — poll until it completes or until ~5 minutes have elapsed *since it was launched in Phase 1* (usually it is already done, since Phases 1–2 ran in parallel with it).
+- **Timed out / failed / unavailable / plugin not installed:** it is advisory — note "Codex review: unavailable (advisory) — proceeding" and continue. NEVER block the marker or stall the turn on Codex. (If a prior iteration's Codex job is still running when a new one launches, you may abandon the stale one.)
+
+Then validate every finding (Codex's included) per the rest of this phase.
+
+### Validate every finding
 
 Once all three angles are done (parallel subagents joined, or — for Codex / any agent without subagents — your own three inline passes complete), validate each issue found. **Per the same subagents-are-optional rule:** Claude Code launches a parallel validation subagent per finding; Codex / any agent without a Task tool validates each finding **inline and sequentially** in this same session. Either way the validator must:
 - Read the relevant source files (not just the diff)

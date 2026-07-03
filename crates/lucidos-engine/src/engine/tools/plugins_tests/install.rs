@@ -402,7 +402,7 @@ fn setup_thread_request_is_a_subthread_bound_to_the_advertised_id() {
     // the thread and paired a Device origin with ActorMode::Agent, panicking
     // make_message_received). The bound id is what the frontend navigates to.
     let tid = uuid::Uuid::new_v4();
-    let req = build_setup_thread_request(tid, "Super Slides", "0.3.1", "Wire up the API key.");
+    let req = build_setup_thread_request(tid, "Super Slides");
     match req {
         crate::engine::thread_queue::ThreadQueueRequest::SubThread {
             child_thread_id,
@@ -414,9 +414,14 @@ fn setup_thread_request_is_a_subthread_bound_to_the_advertised_id() {
             assert_eq!(child_thread_id, tid, "must bind the advertised setup_thread_id");
             assert_eq!(title.as_deref(), Some("Set up Super Slides"));
             assert!(pre_emitted_origin.is_none());
+            // The seed is the SHORT, user-facing line only — the how-to lives in
+            // system-knowhow/plugin-setup and the author's setup text is
+            // referenced from the PluginInstalled event, so neither the
+            // meta-instructions nor the author text may leak into the bubble.
+            assert_eq!(prompt, "Set up the newly installed Super Slides plugin.");
             assert!(
-                prompt.contains("Wire up the API key.") && prompt.contains("v0.3.1"),
-                "prompt must carry the verbatim setup text + version, got: {prompt:?}"
+                !prompt.contains("send_notification") && !prompt.contains("Walk the user"),
+                "seed must not embed the agent meta-instructions, got: {prompt:?}"
             );
         }
         other => panic!("setup thread must be a SubThread, got: {other:?}"),

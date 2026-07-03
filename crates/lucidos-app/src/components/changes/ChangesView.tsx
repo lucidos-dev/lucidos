@@ -9,7 +9,7 @@ import type { Change } from '../../api/client';
 import { formatTimeAgo } from '../../utils/formatTime';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
-import { ListSkeleton } from '../shared/ListSkeleton';
+import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 
 /** Render a change description, preserving line breaks. */
@@ -21,6 +21,65 @@ function ChangeDescription({ description }: { description: string }) {
         <Fragment key={i}>{line}{i < lines.length - 1 && <br />}</Fragment>
       ))}
     </span>
+  );
+}
+
+interface ChangeRowProps {
+  change: Change;
+  busy: boolean;
+  threadActive: boolean;
+  onOpen: () => void;
+  onDiff: () => void;
+  onDiscard: () => void;
+  onApply: () => void;
+}
+
+/** Self-skeletonizing pending change row: rendered with no props inside a
+ *  SkeletonProvider (`<ChangeRow />`) it draws itself as a loading placeholder
+ *  via the Sk* leaves; with real props it renders normally. Props are optional
+ *  only to support the skeleton call; real call sites pass them all. */
+function ChangeRow({ change, busy, threadActive, onOpen, onDiff, onDiscard, onApply }: Partial<ChangeRowProps>) {
+  const sk = useSkeleton();
+  const activeTip = 'The coding agent is still working on this thread — wait for it to finish';
+  const clickable = !sk && !!change?.thread_id;
+  return (
+    <div
+      class={`list-row change-row${clickable ? ' clickable' : ''}`}
+      onClick={clickable ? onOpen : undefined}
+    >
+      <div class="list-row-info">
+        {(sk || change?.thread_title) && (
+          <SkText class="list-row-label" w="11rem">{change?.thread_title}</SkText>
+        )}
+        {sk ? (
+          <SkText class="title change-description" w="18rem" />
+        ) : (
+          <ChangeDescription description={change!.description} />
+        )}
+        <SkText class="list-row-details" w="7rem">
+          {change && (
+            <>
+              {change.file_count} file{change.file_count !== 1 ? 's' : ''}
+              {change.requires_restart && ' · Requires engine restart'}
+              {!change.hardened && ' · Not hardened'}
+            </>
+          )}
+        </SkText>
+      </div>
+      <div class="list-row-actions">
+        <SkBlock w="3rem" h="2rem" round>
+          <button class="action-btn" onClick={(e) => { e.stopPropagation(); onDiff?.(); }}>Diff</button>
+        </SkBlock>
+        <SkBlock w="4.25rem" h="2rem" round>
+          <button class="action-btn action-btn-danger" disabled={busy || threadActive} data-tooltip={threadActive ? activeTip : undefined} onClick={(e) => { e.stopPropagation(); onDiscard?.(); }}>Discard</button>
+        </SkBlock>
+        <SkBlock w="3.75rem" h="2rem" round>
+          <button class="action-btn action-btn-confirm" disabled={busy || threadActive} data-tooltip={threadActive ? activeTip : (change?.requires_restart ? 'Engine restart required for these changes to be applied correctly. You will be prompted to restart' : undefined)} onClick={(e) => { e.stopPropagation(); onApply?.(); }}>
+            {busy ? 'Applying...' : (change?.requires_restart ? 'Apply*' : 'Apply')}
+          </button>
+        </SkBlock>
+      </div>
+    </div>
   );
 }
 
@@ -95,7 +154,7 @@ export function ChangesView() {
 
   return (
     <div class="panel-content">
-      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton fill />}>
+      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf fill containerClass="list-rows" row={() => <ChangeRow />} />}>
         {bothLoaded ? (() => {
           const pending = pendingLoadable.data;
           const applied = appliedLoadable.data;
@@ -119,30 +178,17 @@ export function ChangesView() {
             // doing so races (or yanks the worktree from) the live coding-agent
             // session. The server refuses it too (guard_change_action).
             const threadActive = !!change.thread_active;
-            const activeTip = 'The coding agent is still working on this thread — wait for it to finish';
             return (
-              <div
-                class={`list-row change-row${change.thread_id ? ' clickable' : ''}`}
+              <ChangeRow
                 key={change.id}
-                onClick={change.thread_id ? () => openChangeThread(change) : undefined}
-              >
-                <div class="list-row-info">
-                  {change.thread_title && <span class="list-row-label">{change.thread_title}</span>}
-                  <ChangeDescription description={change.description} />
-                  <span class="list-row-details">
-                    {change.file_count} file{change.file_count !== 1 ? 's' : ''}
-                    {change.requires_restart && ' · Requires engine restart'}
-                    {!change.hardened && ' · Not hardened'}
-                  </span>
-                </div>
-                <div class="list-row-actions">
-                  <button class="action-btn" onClick={(e) => { e.stopPropagation(); void viewChangeDiff(change); }}>Diff</button>
-                  <button class="action-btn action-btn-danger" disabled={busy || threadActive} data-tooltip={threadActive ? activeTip : undefined} onClick={(e) => { e.stopPropagation(); guardedAction(change.id, discardSingleChange); }}>Discard</button>
-                  <button class="action-btn action-btn-confirm" disabled={busy || threadActive} data-tooltip={threadActive ? activeTip : (change.requires_restart ? 'Engine restart required for these changes to be applied correctly. You will be prompted to restart' : undefined)} onClick={(e) => { e.stopPropagation(); guardedAction(change.id, applySingleChange); }}>
-                    {busy ? 'Applying...' : 'Apply'}
-                  </button>
-                </div>
-              </div>
+                change={change}
+                busy={busy}
+                threadActive={threadActive}
+                onOpen={() => openChangeThread(change)}
+                onDiff={() => void viewChangeDiff(change)}
+                onDiscard={() => guardedAction(change.id, discardSingleChange)}
+                onApply={() => guardedAction(change.id, applySingleChange)}
+              />
             );
           })}
           {applied.length > 0 && (

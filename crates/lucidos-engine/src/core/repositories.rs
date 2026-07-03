@@ -59,6 +59,10 @@ impl RepositoryStore {
     ///  2. the same git history already registered at a *different* path (same
     ///     deterministic id) — the id-keyed `ON CONFLICT` moves it to `path`.
     ///
+    /// A transaction-scoped advisory lock on the path serializes concurrent
+    /// registrations of the same path, so the collapse is atomic even when two
+    /// callers derive different ids for one path (see the lock comment below).
+    ///
     /// Result: exactly one row, keyed by the deterministic id, at the current path.
     pub async fn add(
         pool: &PgPool,
@@ -69,6 +73,20 @@ impl RepositoryStore {
     ) -> Result<Repository, sqlx::Error> {
         let id = deterministic_id(root_commit_sha, path);
         let mut tx = pool.begin().await?;
+        // Serialize concurrent registrations of the SAME path. The collapse
+        // below is keyed on the deterministic `id`, but `path` carries its own
+        // UNIQUE constraint that the id arbiter does not cover. Two concurrent
+        // registrations that derive DIFFERENT ids for one path race between the
+        // DELETE and the INSERT and collide on `path` — surfacing as a spurious
+        // 409. That happens whenever the id varies for a path: e.g. one caller
+        // resolves the root-commit sha while another transiently falls back to
+        // the path-derived id because `root_commit_sha` returned None under
+        // concurrent git load. A transaction-scoped advisory lock on the path
+        // makes the whole collapse atomic per path; distinct paths never block.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(path)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM repositories WHERE path = $1 AND id <> $2")
             .bind(path)
             .bind(id)
@@ -243,6 +261,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1, "collapsed to one row");
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn add_is_concurrency_safe_for_same_path_with_divergent_ids() {
+        // Regression: concurrent registrations of the SAME path that derive
+        // DIFFERENT deterministic ids (one resolves a root-commit sha, the
+        // other falls back to the path id when `root_commit_sha` transiently
+        // returns None under concurrent git load) must converge to a single
+        // row — not collide on the `path` UNIQUE constraint and surface a
+        // spurious 409. Reproduces the e2e api `repo_files_test` flake where
+        // ~12 parallel tests register the e2e workspace path at once.
+        let (pool, db) = setup_test_db().await;
+        let path = "/tmp/concurrent-repo";
+
+        let mut handles = Vec::new();
+        for i in 0..24 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                // Alternate between a stable sha-derived id and the path-fallback
+                // id so the two id families compete for the same `path`.
+                let sha = if i % 2 == 0 { Some("cafef00d") } else { None };
+                RepositoryStore::add(&pool, &format!("name-{i}"), path, None, sha).await
+            }));
+        }
+        for h in handles {
+            h.await
+                .expect("task panicked")
+                .expect("concurrent add of the same path must not error");
+        }
+
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM repositories WHERE path = $1")
+            .bind(path)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "exactly one row at the path after concurrent adds");
+
         teardown_test_db(&db).await;
     }
 

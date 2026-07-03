@@ -12,7 +12,7 @@
 # every workspace container exited.
 #
 # Why a DEDICATED container (`lucidos-pg-test`), not a workspace's PG:
-#   - tests CREATE/DROP databases; pointing them at the personal/dev workspace
+#   - tests CREATE/DROP databases; pointing them at a dev workspace's
 #     PG would mutate that instance and couple test runs to a running workspace.
 #   - isolation is by name + port + image; nothing else touches this container.
 #
@@ -180,9 +180,9 @@ cd "$PROJECT_DIR"
 # "unbound variable" error in bash 3.2 (macOS default). The +-form expands to
 # nothing when empty and to the quoted elements otherwise.
 if [ "$FULL" = "1" ]; then
-    echo "[test] cargo test -p lucidos-engine (full crate)"
-    cargo test -p lucidos-engine ${PASSTHRU[@]+"${PASSTHRU[@]}"}
+    echo "[test] cargo test --locked -p lucidos-engine (full crate)"
+    cargo test --locked -p lucidos-engine ${PASSTHRU[@]+"${PASSTHRU[@]}"}
 else
-    echo "[test] cargo test -p lucidos-engine --lib"
-    cargo test -p lucidos-engine --lib ${PASSTHRU[@]+"${PASSTHRU[@]}"}
+    echo "[test] cargo test --locked -p lucidos-engine --lib"
+    cargo test --locked -p lucidos-engine --lib ${PASSTHRU[@]+"${PASSTHRU[@]}"}
 fi

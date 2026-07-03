@@ -196,6 +196,9 @@ impl ExternalWatchdog {
                         elapsed_ms: now_ms.saturating_sub(last_ms),
                         external_terminal: s.external_terminal_emitted.clone(),
                         idle_notify: s.idle_notify.clone(),
+                        agent_cancel: s.agent_cancel.clone(),
+                        last_event_at: s.last_event_at.clone(),
+                        snapshot_last_ms: last_ms,
                         needs_running_check,
                     })
                 })
@@ -228,31 +231,77 @@ impl ExternalWatchdog {
             }
             candidates = keep;
         }
-        let stuck = candidates;
-
-        if stuck.is_empty() {
+        if candidates.is_empty() {
             return;
         }
 
-        // `external_terminal_emitted=true` is the same suppression flag
-        // `abort_in_flight_for_restart` uses — without it, the wedged
-        // in-loop's eventual safety-net would emit a duplicate
-        // ResponseAborted on top of our ContinuationRequested.
+        self.recover_stuck(candidates).await;
+    }
+
+    /// The mutate + emit half of a tick. Split out from [`tick`] so tests can
+    /// advance a session's `last_event_at` between the snapshot and this call to
+    /// exercise the liveness re-check.
+    ///
+    /// For each candidate that is STILL stale (no fresh event since the
+    /// snapshot): cancel the session's `agent_cancel` token, set the
+    /// terminal-suppression flag, notify idle waiters, drop the entry, and emit
+    /// `ContinuationRequested`. Cancelling `agent_cancel` is the fix for the
+    /// 2026-07-02 double-process bug — it is the same token the in-loop watchdog
+    /// fires, so firing it from here reaches the (independent, non-wedged)
+    /// `driver_task`, which runs its reap-safe `graceful_kill_child_process_group`
+    /// teardown. Without it the wedged loop never cancels, the old subprocess
+    /// survives, and the `--resume` spawns a second concurrent agent on the same
+    /// worktree. `external_terminal_emitted=true` is the same suppression flag
+    /// `abort_in_flight_for_restart` uses — without it the wedged in-loop's
+    /// eventual safety-net would emit a duplicate `ResponseAborted` on top of our
+    /// `ContinuationRequested`.
+    ///
+    /// A candidate that produced a fresh event since the snapshot has recovered
+    /// on its own — it is left ENTIRELY alone (no cancel, no kill, no drop, no
+    /// resume), so the watchdog never terminates a live, progressing session.
+    async fn recover_stuck(&self, candidates: Vec<StuckSession>) {
+        let mut to_emit: Vec<StuckSession> = Vec::with_capacity(candidates.len());
         {
             let mut sessions = self.agent_sessions.lock().await;
-            for s in &stuck {
-                s.external_terminal
+            for c in candidates {
+                // Liveness re-check: a `last_event_at` newer than the snapshot
+                // means a fresh event arrived, i.e. the session recovered on its
+                // own (un-wedged, or the slow `.await` returned). Never
+                // cancel/kill a live, progressing session — skip it.
+                let current_last_ms = c
+                    .last_event_at
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if current_last_ms > c.snapshot_last_ms {
+                    log!(
+                        "[ExternalWatchdog] thread={} produced a fresh event since the snapshot (recovered) — leaving it alone",
+                        c.thread_id,
+                    );
+                    continue;
+                }
+                // Order matters: set the suppression flag BEFORE cancelling.
+                // `agent_cancel.cancel()` can wake the driver_task / run_session
+                // teardown on another worker, and that path checks
+                // `external_terminal_already_emitted` before emitting its own
+                // `ResponseAborted`. If the flag were still false in that window
+                // it would emit a duplicate terminal on top of our
+                // `ContinuationRequested`. The Release store before the (itself
+                // synchronizing) `cancel()` guarantees any observer of the
+                // cancellation also sees the flag set.
+                c.external_terminal
                     .store(true, std::sync::atomic::Ordering::Release);
-                s.idle_notify.notify_waiters();
-                sessions.remove(&s.thread_id);
+                c.agent_cancel.cancel();
+                c.idle_notify.notify_waiters();
+                sessions.remove(&c.thread_id);
+                to_emit.push(c);
             }
         }
 
-        for s in stuck {
+        for s in to_emit {
             log!(
                 "[ExternalWatchdog] thread={} stuck for {}s (limit={}min) — \
                  in-loop watchdog never fired (likely wedged event handler); \
-                 dropping session entry + emitting ContinuationRequested for auto-resume",
+                 cancelling the coding-agent subprocess + dropping session entry \
+                 + emitting ContinuationRequested for auto-resume",
                 s.thread_id,
                 s.elapsed_ms / 1000,
                 self.limit_ms / 60_000,
@@ -277,6 +326,15 @@ struct StuckSession {
     elapsed_ms: i64,
     external_terminal: Arc<std::sync::atomic::AtomicBool>,
     idle_notify: Arc<tokio::sync::Notify>,
+    /// Clone of the session's `agent_cancel` — cancelled on recovery so the
+    /// driver_task tears down the (possibly wedged) subprocess's process group.
+    agent_cancel: tokio_util::sync::CancellationToken,
+    /// Live handle to the session's `last_event_at`, re-read in the mutate pass
+    /// for the liveness guard (an advance since the snapshot = recovered).
+    last_event_at: Arc<std::sync::atomic::AtomicI64>,
+    /// `last_event_at` captured in the snapshot pass. A larger value at mutate
+    /// time means a fresh event arrived, so the session recovered on its own.
+    snapshot_last_ms: i64,
     /// `true` for `ResumeIfRunning` candidates — recover only after a
     /// `thread_is_running` re-check. `false` for unconditional `Resume`.
     needs_running_check: bool,

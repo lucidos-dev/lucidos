@@ -20,7 +20,7 @@ The notification `tap` field changed from a four-string union to a discriminated
 | Old (string) | New (object) |
 |---|---|
 | `tap: 'modal'` | `tap: { kind: 'modal' }` |
-| `tap: 'none'` | `tap: { kind: 'none' }` |
+| `tap: 'none'` | `tap: { kind: 'modal' }` (the passive `none` kind was retired — every notification is openable; `docs/plans/2026-07-02-remove-notification-tap-none.md`) |
 | `tap: 'open_app'` (with sibling `app_id: 'X'` on the same call) | `tap: { kind: 'navigate', to: { target: 'app', app_id: 'X' } }` |
 | `tap: 'open_thread'` (with sibling `thread_id: 'T'`, optional `event_id: 'E'`) | `tap: { kind: 'navigate', to: { target: 'thread', id: 'T', event_id: 'E' } }` |
 

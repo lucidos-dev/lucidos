@@ -227,6 +227,9 @@ pub(super) async fn apply_change(
         "This change can't be applied in the thread's current state",
     )
     .await?;
+    // Apply-time reconcile of orphaned sibling pending changes is handled inside
+    // `apply_change` itself (gated on a real Applied transition), so it covers
+    // this handler, the no-live apply_now path, and the Apply-All driver uniformly.
     match state.engine.apply_change(id, actor).await {
         Ok(result) => {
             broadcast_changes(&state).await;

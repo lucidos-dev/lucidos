@@ -34,10 +34,10 @@ h1, h2, h3, h4, h5, h6 {
     white-space: normal;
 }
 
-h1 { font-size: 1.125rem; }
-h2 { font-size: 1rem; }
-h3 { font-size: 0.875rem; }
-h4, h5, h6 { font-size: 0.8125rem; }
+h1 { font-size: var(--font-size-2xl); }
+h2 { font-size: var(--font-size-xl); }
+h3 { font-size: var(--font-size-lg); }
+h4, h5, h6 { font-size: var(--font-size-md); }
 
 /* Shared segmented control — used for all toggle button groups */
 .segmented-control {
@@ -53,7 +53,7 @@ h4, h5, h6 { font-size: 0.8125rem; }
     border: none;
     color: var(--text-muted);
     cursor: pointer;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     font-family: var(--font-ui);
     font-weight: 400;
     padding: 0.3125rem 0.75rem;
@@ -71,6 +71,14 @@ h4, h5, h6 { font-size: 0.8125rem; }
     background: var(--bg-secondary);
     color: var(--text-primary);
     font-weight: 600;
+}
+
+.segmented-btn:focus-visible {
+    /* Our shared accent ring — replaces the browser's default thin outline.
+       Transparent outline is the forced-colors fallback (box-shadow is stripped). */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+    position: relative;
 }
 
 /* Utility classes */
@@ -97,7 +105,7 @@ h4, h5, h6 { font-size: 0.8125rem; }
 /* Shared label — small uppercase badge used across the app */
 .label {
     display: inline-block;
-    font-size: 0.5625rem;
+    font-size: var(--font-size-3xs);
     text-transform: uppercase;
     letter-spacing: 0.03125rem;
     padding: 0.0625rem 0.3125rem;
@@ -113,7 +121,7 @@ h4, h5, h6 { font-size: 0.8125rem; }
 
 /* Shared title — used across modals, list rows, panels */
 .title {
-    font-size: 0.875rem;
+    font-size: var(--font-size-lg);
     font-weight: 500;
     color: var(--text-primary);
     font-family: inherit;
@@ -172,7 +180,7 @@ h4, h5, h6 { font-size: 0.8125rem; }
     min-width: 3.5rem;
     padding: 0.25rem 0.625rem;
     border-radius: 0.25rem;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     font-family: var(--font-ui);
     font-weight: 500;
     white-space: nowrap;
@@ -264,7 +272,7 @@ html:not([data-theme="light"]) .action-btn-confirm {
     display: flex;
     align-items: center;
     gap: 0.75rem;
-    padding: 0.5rem 1rem;
+    padding: var(--space-sm) var(--space-lg);
     cursor: pointer;
     transition: background var(--duration-fast);
 }
@@ -276,14 +284,14 @@ html:not([data-theme="light"]) .action-btn-confirm {
 }
 
 .list-row-add-icon {
-    font-size: 1.125rem;
+    font-size: var(--font-size-2xl);
     color: var(--text-muted);
     width: 1.5rem;
     text-align: center;
 }
 
 .list-row-add-label {
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     color: var(--text-secondary);
     font-family: var(--font-ui);
 }
@@ -294,7 +302,11 @@ html:not([data-theme="light"]) .action-btn-confirm {
     align-items: flex-start;
     flex-wrap: wrap;
     gap: 0.75rem;
-    padding: 0.5rem 1rem;
+    /* --space-lg (1rem) is the shared content-pane horizontal gutter — every
+       list-family view (apps, plugins, triggers, changes, thread queue, …) lines
+       its rows up here. Also served to app iframes via /api/v1/sdk-iframe.css,
+       which defines the same --space-* scale. */
+    padding: var(--space-sm) var(--space-lg);
     transition: background var(--duration-fast);
 }
 
@@ -307,7 +319,7 @@ html:not([data-theme="light"]) .action-btn-confirm {
 .list-section-title {
     position: relative;
     padding: 0.375rem 1rem;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
@@ -332,7 +344,7 @@ html:not([data-theme="light"]) .action-btn-confirm {
 
 .list-row-label {
     display: block;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     color: var(--text-secondary);
     margin-bottom: 0.125rem;
     overflow: hidden;
@@ -343,7 +355,7 @@ html:not([data-theme="light"]) .action-btn-confirm {
 .list-row-details {
     display: flex;
     gap: 0.75rem;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     color: var(--text-secondary);
     margin-bottom: 0.25rem;
     flex-wrap: wrap;
@@ -364,7 +376,7 @@ html:not([data-theme="light"]) .action-btn-confirm {
 }
 
 .list-row-date {
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
 }
 
@@ -414,9 +426,10 @@ html:not([data-theme="light"]) .action-btn-confirm {
 /* Native list markers (disc / decimal) — no custom ::before bullet. Native
  * markers make the "number AND bullet" double-marking structurally impossible:
  * a nested <ol> under a <ul> shows decimal only, because each list level owns
- * its own marker. `::marker` just tints them to match the muted host look. */
+ * its own marker. `::marker` matches the body text color so bullets and numbers
+ * read as clearly as the list content, not as washed-out muted glyphs. */
 .markdown-content li::marker {
-    color: var(--text-muted);
+    color: var(--text-primary);
 }
 
 .markdown-content .table-scroll-wrapper {
@@ -427,7 +440,7 @@ html:not([data-theme="light"]) .action-btn-confirm {
 .markdown-content table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
 }
 
 .markdown-content th,
@@ -476,7 +489,7 @@ html:not([data-theme="light"]) .action-btn-confirm {
     background: var(--bg-tertiary);
     padding: 0.125rem 0.375rem;
     border-radius: 0.1875rem;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--accent);
     overflow-wrap: break-word;
     word-break: break-word;
@@ -522,7 +535,7 @@ html:not([data-theme="light"]) .action-btn-confirm {
 
 .progress-label {
     display: block;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     margin-top: 0.25rem;
 }
@@ -538,6 +551,6 @@ html:not([data-theme="light"]) .action-btn-confirm {
     text-align: center;
     padding: 2.5rem 1.5rem;
     color: var(--text-muted);
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     line-height: 1.5;
 }

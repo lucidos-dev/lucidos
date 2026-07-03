@@ -117,6 +117,38 @@ pub(crate) const ASK_USER_QUESTION_RULE: &str = "ASKING THE USER QUESTIONS:\n\
      under 2 minutes — drain with `bash_output(task_id, wait_secs=60)` \
      instead. Wake questions are for genuinely unbounded waits.";
 
+/// Stops the chat agent from CLAIMING it performed an action it never actually
+/// invoked the tool for — the single most common way the agent lies to the
+/// user. The observed failure (testing-notifications thread, 2026-06-30): the
+/// user said "again" four times; the agent called `send_notification` on the
+/// first two and then, seeing the two identical prior `ToolUse:
+/// send_notification` entries sitting in its context, just wrote "Sent another"
+/// for the last two WITHOUT calling the tool — so no notification went out, but
+/// the user was told it did. The CRITICAL RULES block already says "never claim
+/// you did X unless the tool returned success", but it was scoped to
+/// `write_file`/`edit_file`, so the model didn't apply it to other action
+/// tools. This rule generalizes it and names the repeat-request trap directly.
+/// Logged as a model-tolerance measure in `docs/temporary-measures.md`.
+pub(crate) const REPEATED_ACTION_RULE: &str = "DOING IT AGAIN — A REPEAT \
+     REQUEST NEEDS A FRESH TOOL CALL:\n\
+     When the user asks you to repeat an action — \"again\", \"once more\", \
+     \"do it again\", \"resend\", \"send another\", \"one more\" — you MUST \
+     invoke the tool again IN THE CURRENT TURN before you confirm it. An \
+     identical earlier tool call (and its result) already sitting in this \
+     conversation is a record of a PREVIOUS turn — it does NOT mean the action \
+     happened this time. This is the single most common way to mislead the \
+     user: the model pattern-matches on a prior `send_notification` / \
+     `send_email` / `events emit` (or any action tool) in its context, the \
+     user says \"again\", and it writes \"Sent another\" / \"Done\" WITHOUT \
+     actually calling the tool — so the notification / email / event never \
+     goes out, but the user was told it did.\n\
+     The rule: NEVER write a confirmation of an action (\"sent\", \"created\", \
+     \"updated\", \"emitted\", \"deleted\", \"done\", \"sent again\", \
+     \"another one's on its way\") unless the matching tool call returned a \
+     success result IN THIS turn. If you did not call the tool this turn, you \
+     did not do it — call it now. This holds for every state-changing tool, \
+     not just file writes.";
+
 impl LucidosEngine {
     /// Build the full chat system prompt for this turn plus the mandatory
     /// missing-preference keys and whether an image provider is available
@@ -394,6 +426,13 @@ the knowhow, follow its guidance (ask whatever it says to ask), then create.
 Skip the load_knowhow call if you already loaded the same knowhow earlier
 in this thread — its content is still in your context.
 
+SETTING UP A NEWLY-INSTALLED PLUGIN — LOAD KNOWHOW FIRST:
+When the request is to set up a newly-installed plugin (e.g. "Set up the
+newly installed X plugin"), FIRST call load_knowhow on
+`system-knowhow/plugin-setup` and follow it — it tells you how to find the
+plugin author's setup instructions, plan the steps, and complete them with
+the user. Skip the load if you already loaded it earlier in this thread.
+
 ACTION FIRST - NO CLARIFICATION LOOPS:
 - JUST DO IT. If the user asks for something, DO IT immediately. Don't ask clarifying questions.
 - "This week" = since Monday of the current week. "Last 7 days" = last 7 days. Figure it out.
@@ -513,7 +552,7 @@ When you modify a file that the user has open (shown in FOCUSED WINDOW context):
 FILE REFERENCES:
 - Always use the full path when mentioning files (e.g., "artifacts/notes.md", not just "notes.md")
 - Full paths become clickable links in the UI — bare filenames do not
-- For apps, mention the app name — it becomes a clickable link that opens the app window
+- For apps, a bare prose mention of an app name does NOT auto-link, so link every app you name that the user can open: use a markdown link with the `app:<id>` scheme — `[Habit Tracker](app:habit-tracker)` — so it's one click to open. Make this the default whenever you refer to an app; NOT linking should be a rare exception (e.g. an app that doesn't exist yet).
 - For UI panels (notifications inbox, apps list, triggers list, changes, files, settings), use a markdown link to the bare panel name: `[Notifications](notifications)`, `[Triggers](triggers)`, `[Settings](settings)`. Accepts the `data/` prefix too — `[Notifications](data/notifications)` works the same way.
 - Apps and other plugins are downloaded from the **Plugins** panel (uncheck its "Installed only" filter to browse and install from marketplaces). When the user asks where to get/download/install apps, point them there with a `[Plugins](app-store)` link (the `app-store` target opens the Plugins panel). Do NOT call it the "App Store" or a "Store" — those names are retired.
 
@@ -560,18 +599,21 @@ IMPORTANT — spawn threads sparingly:
 - Each child thread costs tokens and time. Fewer, well-scoped threads beat many small ones.
 
 CRITICAL RULES:
-1. NEVER say "I've updated/created X" unless write_file/edit_file returned a success response
+1. NEVER claim you performed an action — "sent", "created", "updated", "emitted", "deleted", "done" — unless the matching tool (write_file/edit_file, send_notification, send_email, events emit, etc.) returned a success response IN THE CURRENT TURN. This covers every state-changing tool, not just file writes. See DOING IT AGAIN below for the repeat-request trap.
 2. When a request requires a tool action, use the tool instead of describing a future plan
 3. For SPECIFIC DATA lookups (numbers, IDs, dates): ALWAYS read the file, don't guess from summaries
 4. NEVER show code in responses unless the user explicitly asks for code
 5. MULTIPLE FILES: When asked to create N files, call write_file N times IN THE SAME RESPONSE
 
-VERIFICATION: Before saying "done", check that write_file returned "Created:" or "Updated:" — if not, you didn't actually do it!"#;
+VERIFICATION: Before saying "done", check that the tool returned success THIS turn (e.g. write_file returned "Created:"/"Updated:", send_notification returned "Notification sent.") — if it didn't run this turn, you didn't actually do it!
+
+__REPEATED_ACTION_RULE__"#;
 
         let system_prompt_base = system_prompt_base
             .replace("__ENGINE_RESTART_RULE__", ENGINE_RESTART_RULE)
             .replace("__APPLY_VERIFY_RULE__", APPLY_VERIFY_RULE)
             .replace("__ASK_USER_QUESTION_RULE__", ASK_USER_QUESTION_RULE)
+            .replace("__REPEATED_ACTION_RULE__", REPEATED_ACTION_RULE)
             .replace(
                 "__MAX_TOOL_CALLS__",
                 &crate::engine::agentic_loop::MAX_ITERATIONS.to_string(),
@@ -587,10 +629,13 @@ VERIFICATION: Before saying "done", check that write_file returned "Created:" or
         let api_port = std::env::var("LUCIDOS_API_PORT").unwrap_or_else(|_| "3000".to_string());
         let frontend_url = if let Some(origin) = self.frontend_origin.lock().unwrap().as_ref() {
             origin.clone()
-        } else if let Ok(vite_port) = std::env::var("VITE_PORT") {
-            format!("http://localhost:{}", vite_port)
         } else {
-            format!("http://localhost:{}", api_port)
+            // Fallback when no request origin has been observed yet: the engine
+            // serves the frontend itself, so its own TLS setting decides the
+            // scheme (never hardcode http/https — see the intra-host scheme rule).
+            let scheme = crate::net_config::tls_scheme();
+            let port = std::env::var("VITE_PORT").unwrap_or_else(|_| api_port.clone());
+            format!("{}://localhost:{}", scheme, port)
         };
         let system_prompt = format!("{}\n\nThe Lucidos client the user is talking to you from is at {}. To see App UIs, use capture_app_ui — never browser_open.",
             system_prompt, frontend_url);

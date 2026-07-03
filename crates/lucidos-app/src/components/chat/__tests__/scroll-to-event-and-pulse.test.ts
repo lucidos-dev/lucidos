@@ -1,6 +1,25 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, scrollToBottom, scrolledUp, isHeaderPinnedForScroll } from '../scrollState';
+import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, scrollToBottom, scrolledUp, isHeaderPinnedForScroll, setActiveScrollElement } from '../scrollState';
+import { hasNavFocus, clearNavFocus, NAV_FOCUS_FADE_MS } from '../../shared/focusMarker';
+
+/** The deep-link now scrolls via the shared animateScroll engine (a rAF tween
+ *  writing scrollTop on the active container), NOT native scrollIntoView. Tests
+ *  that assert the landing register this fake container and advance fake timers.
+ *  Its getBoundingClientRect top is 0, so an element whose rect top is
+ *  `absTop − container.scrollTop` (see makeTargetEl) yields a STABLE target of
+ *  `absTop`, and the tween lands scrollTop exactly there. */
+function makeContainer(scrollTop = 0) {
+  return {
+    parentElement: null,
+    scrollTop,
+    scrollHeight: 10000,
+    clientHeight: 800,
+    getBoundingClientRect: () => ({ width: 400, height: 800, top: 0, bottom: 800, left: 0, right: 400 }),
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  } as any;
+}
 
 type MOCallback = (records: MutationRecord[], observer: MutationObserver) => void;
 const moObservations: Array<{ target: any; options: any }> = [];
@@ -21,6 +40,7 @@ function installFakeDom(opts: { threadContents?: any[]; dataEventMatches?: any[]
     documentQSA: (globalThis.document as any).querySelectorAll,
     MutationObserver: (globalThis as any).MutationObserver,
     CSS: (globalThis as any).CSS,
+    getComputedStyle: (globalThis as any).getComputedStyle,
   };
 
   (globalThis.document as any).body = fakeBody;
@@ -33,18 +53,27 @@ function installFakeDom(opts: { threadContents?: any[]; dataEventMatches?: any[]
   };
   (globalThis as any).MutationObserver = FakeMutationObserver;
   (globalThis as any).CSS = { escape: (s: string) => s };
+  // smoothScrollToElement reads the target's scroll-margin-top; the fake targets
+  // aren't real Elements, so stub a zero margin (real getComputedStyle throws on
+  // a plain object).
+  (globalThis as any).getComputedStyle = () => ({ scrollMarginTop: '0px' });
 
   return () => {
     (globalThis.document as any).body = orig.documentBody;
     (globalThis.document as any).querySelectorAll = orig.documentQSA;
     (globalThis as any).MutationObserver = orig.MutationObserver;
     (globalThis as any).CSS = orig.CSS;
+    (globalThis as any).getComputedStyle = orig.getComputedStyle;
   };
 }
 
 beforeEach(() => {
   moObservations.length = 0;
   lastMoCallback = null;
+  // Reset module-level deep-link claim state so a held claim (a sync resolve now
+  // holds it across the smooth-scroll settle; an unresolved async path holds it
+  // until its deadline) can't leak into the next test.
+  clearPendingEventScroll();
 });
 
 describe('scrollToEventAndPulse — MutationObserver setup', () => {
@@ -162,30 +191,33 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
   // thread that is NOT already focused used to land at the thread bottom
   // instead of the event. Focusing an unfocused thread lazily loads its
   // events; the scroll-to-bottom that fires on the eventsLoaded false→true
-  // transition (ThreadView + useAutoScroll) overrode scrollIntoView the
+  // transition (ThreadView + useAutoScroll) overrode the deep-link scroll the
   // moment the events rendered. The fix exposes a "pending event scroll"
   // flag those callers consult to defer until scrollToEventAndPulse lands.
   let restore: (() => void) | null = null;
+  let container: any;
 
   beforeEach(() => {
     vi.useFakeTimers();
+    container = makeContainer();
+    setActiveScrollElement(container);
   });
   afterEach(() => {
     vi.clearAllTimers();
     vi.useRealTimers();
+    setActiveScrollElement(null);
     restore?.();
     restore = null;
   });
 
   /** A DOM element that passes isElementVisible (non-zero rect, no clipping
-   *  ancestor) and records whether it was scrolled into view. */
-  function makeVisibleEl() {
+   *  ancestor). Its rect top is `absTop − container.scrollTop`, so the animateScroll
+   *  tween lands container.scrollTop exactly at `absTop`. */
+  function makeVisibleEl(absTop = 3000) {
     const el: any = {
       parentElement: null,
-      getBoundingClientRect: () => ({ width: 200, height: 200, top: 10, bottom: 210, left: 0, right: 200 }),
+      getBoundingClientRect: () => ({ width: 200, height: 200, top: absTop - container.scrollTop, bottom: absTop - container.scrollTop + 200, left: 0, right: 200 }),
       classList: { add: () => {}, remove: () => {} },
-      scrollIntoView: () => { el._scrolledIntoView = true; },
-      _scrolledIntoView: false,
     };
     return el;
   }
@@ -199,20 +231,67 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
     lastMoCallback?.(records, {} as MutationObserver);
   }
 
-  it('resolves synchronously when the event is already in the DOM (focused-thread path) — never leaves a pending flag', () => {
+  it('resolves synchronously when the event is already in the DOM (focused-thread path) — HOLDS the claim across the smooth-scroll settle, then releases', () => {
     const visibleEl = makeVisibleEl();
     restore = installFakeDom({ dataEventMatches: [visibleEl] });
     scrolledUp.value = false;
 
     scrollToEventAndPulse('e-7');
 
-    expect(visibleEl._scrolledIntoView).toBe(true);
-    expect(hasPendingEventScroll()).toBe(false);
+    // The claim is NOT released synchronously — the deep-link tween is still
+    // settling, and a competing scroll (panel close, iOS viewport reflow)
+    // in that window would override the landing. It's held until scrollend / the
+    // fallback timer so every auto-scroll path keeps deferring across the scroll.
+    expect(hasPendingEventScroll()).toBe(true);
     // Parked on a mid-thread event → pinned so the next render's auto-scroll
     // defers instead of snapping back to the bottom.
     expect(scrolledUp.value).toBe(true);
     // Resolved before ever observing — no need to wait for lazily-loaded events.
     expect(moObservations).toHaveLength(0);
+
+    // The rAF tween runs and lands scrollTop on the event's position. 800ms is
+    // past the tween's duration (≤ SCROLL_MAX_MS) but before the claim fallback.
+    vi.advanceTimersByTime(800);
+    expect(container.scrollTop).toBe(3000);
+    expect(hasPendingEventScroll()).toBe(true); // claim still held
+
+    // Fallback timer fires (no scrollend in jsdom) → claim released.
+    vi.advanceTimersByTime(300); // total 1100, past SCROLL_SETTLE_FALLBACK_MS (1000)
+    expect(hasPendingEventScroll()).toBe(false);
+  });
+
+  it('an AUTOMATIC scroll-to-bottom during the lazy load does NOT clear the claim, and the target still resolves + pulses when it renders (cross-thread/unfocused path)', () => {
+    restore = installFakeDom({}); // target not in the DOM yet (unfocused thread)
+    scrolledUp.value = false;
+
+    scrollToEventAndPulse('e-7');
+    expect(hasPendingEventScroll()).toBe(true);
+    expect(moObservations).toHaveLength(1);
+
+    // The eventsLoaded false→true transition fires the lazy-load auto-scroll
+    // WHILE the deep-link is still waiting for its target to render. As an
+    // automatic scroll it must DEFER to the claim — not clear it (the regression:
+    // clearing here un-guarded every other auto-scroll path and landed the user
+    // at the bottom). Repeated fires during a slow load must all be no-ops.
+    scrollToBottom({ auto: true });
+    scrollToBottom({ auto: true });
+    expect(hasPendingEventScroll()).toBe(true); // claim survived the auto-scrolls
+
+    // Events finally render: the target card appears and is visible.
+    const visibleEl = makeVisibleEl();
+    (globalThis.document as any).querySelectorAll = (sel: string) =>
+      sel.startsWith('[data-event-id') ? [visibleEl] : [];
+    fireMutation([makeTargetNode()]);
+
+    // The deep-link still lands on (and pins) the event — the auto-scrolls never
+    // stole the target.
+    vi.advanceTimersByTime(800); // run the tween
+    expect(container.scrollTop).toBe(3000);
+    expect(scrolledUp.value).toBe(true);
+    expect(hasPendingEventScroll()).toBe(true); // held until the deadline
+
+    vi.advanceTimersByTime(5000); // past EVENT_RESOLVE_DEADLINE_MS (4000)
+    expect(hasPendingEventScroll()).toBe(false);
   });
 
   it('stays pending while the lazily-loaded event has not rendered (unfocused-thread path), scrolls + pins on resolve, and HOLDS the claim until the deadline', () => {
@@ -221,7 +300,7 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
 
     scrollToEventAndPulse('e-7');
     // This is the flag ThreadView/useAutoScroll consult to defer their
-    // scroll-to-bottom so it can't override the upcoming scrollIntoView.
+    // scroll-to-bottom so it can't override the upcoming deep-link scroll.
     expect(hasPendingEventScroll()).toBe(true);
     expect(moObservations).toHaveLength(1);
 
@@ -231,7 +310,8 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
       sel.startsWith('[data-event-id') ? [visibleEl] : [];
     fireMutation([makeTargetNode()]);
 
-    expect(visibleEl._scrolledIntoView).toBe(true);
+    vi.advanceTimersByTime(800); // run the tween → lands on the event
+    expect(container.scrollTop).toBe(3000);
     expect(scrolledUp.value).toBe(true);
     // The claim is HELD past the scroll — the same render that revealed the
     // event also re-fires the events-load effect + a late resize pin, which the
@@ -282,31 +362,33 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
 });
 
 describe('scrollToEventAndPulse — mobile header pin', () => {
-  // Regression: on mobile a deep-link scrollIntoView landed the event behind a
-  // half-hidden app header ("covered a bit"). scrollIntoView ignores the
-  // fixed/sticky chrome, so the landing relies on .chat-exchange's STATIC
-  // scroll-margin-top — which is only exact if the header's visible portion is
-  // deterministic. The scroll therefore (a) reveals the header now and (b) pins
-  // it visible for a short window so the smooth scroll-down can't half-hide it.
+  // Regression: on mobile a deep-link landed the event behind a half-hidden app
+  // header ("covered a bit"). The deep-link scroll lands the event at the
+  // container top minus its STATIC scroll-margin-top — only exact if the header's
+  // visible portion is deterministic. The scroll therefore (a) reveals the header
+  // now and (b) pins it visible for a short window so the smooth scroll-down can't
+  // half-hide it.
   let restore: (() => void) | null = null;
+  let container: any;
 
   beforeEach(() => {
     vi.useFakeTimers();
+    container = makeContainer();
+    setActiveScrollElement(container);
   });
   afterEach(() => {
     vi.clearAllTimers();
     vi.useRealTimers();
+    setActiveScrollElement(null);
     restore?.();
     restore = null;
   });
 
-  function makeVisibleEl() {
+  function makeVisibleEl(absTop = 3000) {
     const el: any = {
       parentElement: null,
-      getBoundingClientRect: () => ({ width: 200, height: 200, top: 10, bottom: 210, left: 0, right: 200 }),
+      getBoundingClientRect: () => ({ width: 200, height: 200, top: absTop - container.scrollTop, bottom: absTop - container.scrollTop + 200, left: 0, right: 200 }),
       classList: { add: () => {}, remove: () => {} },
-      scrollIntoView: () => { el._scrolledIntoView = true; },
-      _scrolledIntoView: false,
     };
     return el;
   }
@@ -322,25 +404,35 @@ describe('scrollToEventAndPulse — mobile header pin', () => {
     expect(isHeaderPinnedForScroll()).toBe(false);
     scrollToEventAndPulse('e-7');
 
-    expect(visibleEl._scrolledIntoView).toBe(true);
+    // Reveal + pin happen synchronously on resolve, before the tween runs.
     expect(revealed).toBe(true);
+    expect(isHeaderPinnedForScroll()).toBe(true);
+
+    // The tween lands on the event within its (< HEADER_PIN_MS) duration, so the
+    // header is still pinned when it arrives.
+    vi.advanceTimersByTime(700); // tween done (≤ SCROLL_MAX_MS), still < HEADER_PIN_MS (800)
+    expect(container.scrollTop).toBe(3000);
     expect(isHeaderPinnedForScroll()).toBe(true);
 
     // Pin is short-lived — it covers the smooth scroll, not the full deep-link
     // claim, so normal hide-on-scroll resumes once the user reads on.
-    vi.advanceTimersByTime(900); // past HEADER_PIN_MS (800)
+    vi.advanceTimersByTime(200); // total 900, past HEADER_PIN_MS (800)
     expect(isHeaderPinnedForScroll()).toBe(false);
 
     document.removeEventListener('reveal-mobile-header', onReveal);
   });
 });
 
-describe('deep-link pulse — scoped to the event, not the response below', () => {
-  // Regression: data-event-id sits on the .chat-exchange wrapper, which holds
-  // BOTH the event (the .initiator-panel — e.g. a question card) AND the agent
-  // response below it. Pulsing the whole wrapper highlighted the response too.
-  // An event deep-link must scope the pulse to the .initiator-panel; a change
-  // deep-link keeps highlighting the whole turn.
+describe('deep-link pulse — scoped to the subject panel, not the whole exchange', () => {
+  // Regression: both data-event-id and data-change-id sit on the .chat-exchange
+  // wrapper, which holds BOTH the .initiator-panel (the user message / event) AND
+  // the .response-panel (the agent response) of the turn. Pulsing the whole
+  // wrapper highlighted both. Each deep-link scopes the pulse to the panel that
+  // holds its subject: an event → .initiator-panel (the event, not the response
+  // below it); a change → .response-panel on a proposing CC turn (where the
+  // ChangeProposed step lives), but .initiator-panel on a resolution card (which
+  // carries the change body, recognised by its initiator-panel-change-* accent
+  // class). A missing panel falls back to the whole target.
   let restore: (() => void) | null = null;
 
   beforeEach(() => { vi.useFakeTimers(); });
@@ -360,52 +452,91 @@ describe('deep-link pulse — scoped to the event, not the response below', () =
     };
   }
 
-  /** An exchange element with a tracked classList and an optional
-   *  `.initiator-panel` child returned by querySelector. */
-  function makeExchangeEl(initiatorPanel: any = null) {
+  /** An exchange element with a tracked classList and optional `.initiator-panel`
+   *  / `.response-panel` children returned by querySelector — the two panels a
+   *  deep-link pulse scopes to. `resolutionCard` makes the initiator match the
+   *  `initiator-panel-change-*` accent probe, so the change picker treats it as a
+   *  resolution card (→ .initiator-panel) instead of a proposing turn
+   *  (→ .response-panel). No active scroll container is registered in this block,
+   *  so the deep-link tween is a no-op here — these tests assert only the
+   *  pulse-marker scoping. */
+  function makeExchangeEl(
+    { initiator = null, response = null, resolutionCard = false }:
+      { initiator?: any; response?: any; resolutionCard?: boolean } = {},
+  ) {
     const el: any = {
       parentElement: null,
       getBoundingClientRect: () => ({ width: 200, height: 200, top: 10, bottom: 210, left: 0, right: 200 }),
       classList: makeClassList(),
-      querySelector: (sel: string) => (sel === '.initiator-panel' ? initiatorPanel : null),
-      scrollIntoView: () => {},
+      querySelector: (sel: string) => {
+        // The change picker probes for the resolution-card accent class first.
+        if (sel.includes('initiator-panel-change-')) return resolutionCard ? initiator : null;
+        if (sel === '.initiator-panel') return initiator;
+        if (sel === '.response-panel') return response;
+        return null;
+      },
     };
     return el;
   }
 
-  it('event deep-link pulses the .initiator-panel, leaving the .chat-exchange wrapper unpulsed', () => {
+  it('event deep-link marks the .initiator-panel, leaving the .chat-exchange wrapper unmarked', () => {
     const initiatorPanel = { classList: makeClassList() };
-    const exchangeEl = makeExchangeEl(initiatorPanel);
+    const exchangeEl = makeExchangeEl({ initiator: initiatorPanel });
     restore = installFakeDom({ dataEventMatches: [exchangeEl] });
 
     scrollToEventAndPulse('e-7');
 
-    expect(initiatorPanel.classList._classes.has('event-pulse')).toBe(true);
-    expect(exchangeEl.classList._classes.has('event-pulse')).toBe(false);
-
-    // Removed when the pulse window elapses — off the same element it landed on.
-    vi.advanceTimersByTime(1800); // EVENT_PULSE_MS
-    expect(initiatorPanel.classList._classes.has('event-pulse')).toBe(false);
+    expect(initiatorPanel.classList._classes.has('nav-focus-stuck')).toBe(true);
+    expect(exchangeEl.classList._classes.has('nav-focus-stuck')).toBe(false);
   });
 
   it('event deep-link falls back to the whole exchange when no .initiator-panel is found', () => {
-    const exchangeEl = makeExchangeEl(null); // querySelector('.initiator-panel') → null
+    const exchangeEl = makeExchangeEl(); // querySelector('.initiator-panel') → null
     restore = installFakeDom({ dataEventMatches: [exchangeEl] });
 
     scrollToEventAndPulse('e-7');
 
-    expect(exchangeEl.classList._classes.has('event-pulse')).toBe(true);
+    expect(exchangeEl.classList._classes.has('nav-focus-stuck')).toBe(true);
   });
 
-  it('change deep-link pulses the whole .chat-exchange turn (not narrowed to the initiator)', () => {
+  it('change deep-link on a proposing turn marks the .response-panel, leaving the initiator + wrapper unmarked', () => {
     const initiatorPanel = { classList: makeClassList() };
-    const exchangeEl = makeExchangeEl(initiatorPanel);
+    const responsePanel = { classList: makeClassList() };
+    const exchangeEl = makeExchangeEl({ initiator: initiatorPanel, response: responsePanel });
     restore = installFakeDom({ dataEventMatches: [exchangeEl] });
 
     scrollToChangeAndPulse('c-1');
 
-    expect(exchangeEl.classList._classes.has('event-pulse')).toBe(true);
-    expect(initiatorPanel.classList._classes.has('event-pulse')).toBe(false);
+    expect(responsePanel.classList._classes.has('nav-focus-stuck')).toBe(true);
+    // NOT the user message that started the turn, NOT the whole exchange wrapper.
+    expect(initiatorPanel.classList._classes.has('nav-focus-stuck')).toBe(false);
+    expect(exchangeEl.classList._classes.has('nav-focus-stuck')).toBe(false);
+  });
+
+  it('change deep-link on a resolution card marks the .initiator-panel (change body), not a folded-in continuation .response-panel', () => {
+    // A ChangeApplied/Discarded/Reverted/Failed card carries the change body in
+    // its .initiator-panel (accent class), and may fold post-apply continuation
+    // work into a .response-panel. The pulse must land on the change body.
+    const initiatorPanel = { classList: makeClassList() };
+    const responsePanel = { classList: makeClassList() };
+    const exchangeEl = makeExchangeEl({ initiator: initiatorPanel, response: responsePanel, resolutionCard: true });
+    restore = installFakeDom({ dataEventMatches: [exchangeEl] });
+
+    scrollToChangeAndPulse('c-1');
+
+    expect(initiatorPanel.classList._classes.has('nav-focus-stuck')).toBe(true);
+    expect(responsePanel.classList._classes.has('nav-focus-stuck')).toBe(false);
+    expect(exchangeEl.classList._classes.has('nav-focus-stuck')).toBe(false);
+  });
+
+  it('change deep-link falls back to the whole exchange when the target panel is absent', () => {
+    // Degenerate proposing turn: no .response-panel to scope to → whole target.
+    const exchangeEl = makeExchangeEl({ initiator: { classList: makeClassList() } });
+    restore = installFakeDom({ dataEventMatches: [exchangeEl] });
+
+    scrollToChangeAndPulse('c-1');
+
+    expect(exchangeEl.classList._classes.has('nav-focus-stuck')).toBe(true);
   });
 });
 
@@ -417,39 +548,138 @@ describe('scrollToChangeAndPulse — resolves to the LAST visible match', () => 
   // applied event" bug. scrollToChangeAndPulse must prefer the last (resolution
   // card); a pending change has only the one (proposing) match.
   let restore: (() => void) | null = null;
-  afterEach(() => { restore?.(); restore = null; });
+  let container: any;
+  beforeEach(() => {
+    vi.useFakeTimers();
+    container = makeContainer();
+    setActiveScrollElement(container);
+  });
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    setActiveScrollElement(null);
+    restore?.();
+    restore = null;
+  });
 
-  function makeVisibleEl(tag: string) {
+  // Each match lands the tween at its own absTop, so the resulting container
+  // scrollTop tells us WHICH match was chosen.
+  function makeVisibleEl(absTop: number) {
     const el: any = {
-      _tag: tag,
       parentElement: null,
-      getBoundingClientRect: () => ({ width: 200, height: 200, top: 10, bottom: 210, left: 0, right: 200 }),
+      getBoundingClientRect: () => ({ width: 200, height: 200, top: absTop - container.scrollTop, bottom: absTop - container.scrollTop + 200, left: 0, right: 200 }),
       classList: { add: () => {}, remove: () => {} },
-      scrollIntoView: () => { el._scrolledIntoView = true; },
-      _scrolledIntoView: false,
     };
     return el;
   }
 
   it('applied change → lands on the resolution card (last), not the proposing turn (first)', () => {
-    const proposingTurn = makeVisibleEl('proposed');
-    const appliedCard = makeVisibleEl('applied');
+    const proposingTurn = makeVisibleEl(1000);
+    const appliedCard = makeVisibleEl(5000);
     // Document order: proposing turn first, resolution card last.
     restore = installFakeDom({ dataEventMatches: [proposingTurn, appliedCard] });
 
     scrollToChangeAndPulse('c-1');
 
-    expect(appliedCard._scrolledIntoView).toBe(true);
-    expect(proposingTurn._scrolledIntoView).toBe(false);
-    expect(hasPendingEventScroll()).toBe(false); // synchronous resolve
+    // The tween lands on the appliedCard's position (5000), not the proposing
+    // turn's (1000) — preferLast picked the resolution card.
+    vi.advanceTimersByTime(800); // past the tween duration (≤ SCROLL_MAX_MS)
+    expect(container.scrollTop).toBe(5000);
+    // Synchronous resolve now holds the claim across the smooth-scroll settle,
+    // then releases on the fallback timer (same contract as the event deep-link).
+    expect(hasPendingEventScroll()).toBe(true);
+    vi.advanceTimersByTime(300); // total 1100, past SCROLL_SETTLE_FALLBACK_MS (1000)
+    expect(hasPendingEventScroll()).toBe(false);
   });
 
   it('pending change → lands on its single (proposing) match', () => {
-    const proposingTurn = makeVisibleEl('proposed');
+    const proposingTurn = makeVisibleEl(2000);
     restore = installFakeDom({ dataEventMatches: [proposingTurn] });
 
     scrollToChangeAndPulse('c-1');
 
-    expect(proposingTurn._scrolledIntoView).toBe(true);
+    vi.advanceTimersByTime(800);
+    expect(container.scrollTop).toBe(2000);
+  });
+});
+
+describe('chat deep-link applies the shared navigation focus marker', () => {
+  // The chat deep-link routes its highlight through the shared focus marker
+  // (components/shared/focusMarker.ts): a fill flash that fades, leaving a sticky
+  // border. The marker's own behaviors (supersede, gesture-clear semantics) are
+  // covered in focusMarker.test.ts; these tests pin the CHAT integration — the
+  // marker is applied on resolve, survives the flash, clears on
+  // clearPendingEventScroll, and (the chat-specific bit) its gesture-clear is
+  // gated on the deep-link claim (settleGuard = hasPendingEventScroll) so the
+  // landing scroll can't self-clear it.
+  let restore: (() => void) | null = null;
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => {
+    clearNavFocus(); // tear down any armed document gesture listeners
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    restore?.();
+    restore = null;
+  });
+
+  /** A visible element with a tracked classList and a querySelector that returns
+   *  null, so scrollToEventAndPulse's `.initiator-panel` lookup falls back to the
+   *  element itself (the marker lands on it). No active scroll container is
+   *  registered here, so the deep-link tween is a no-op — these tests assert only
+   *  the marker lifecycle. */
+  function makeMarkerEl() {
+    const classes = new Set<string>();
+    const el: any = {
+      parentElement: null,
+      offsetWidth: 0,
+      getBoundingClientRect: () => ({ width: 200, height: 200, top: 10, bottom: 210, left: 0, right: 200 }),
+      classList: { _classes: classes, add: (c: string) => classes.add(c), remove: (c: string) => classes.delete(c) },
+      querySelector: () => null,
+    };
+    return el;
+  }
+
+  it('applies the sticky border on resolve (no entrance animation)', () => {
+    const el = makeMarkerEl();
+    restore = installFakeDom({ dataEventMatches: [el] });
+
+    scrollToEventAndPulse('e-7');
+    expect(el.classList._classes.has('nav-focus-stuck')).toBe(true);
+    expect(el.classList._classes.has('nav-focus-fading')).toBe(false);
+    expect(hasNavFocus()).toBe(true);
+  });
+
+  it('clearPendingEventScroll() drops the marker (a plain focus / explicit scroll)', () => {
+    const el = makeMarkerEl();
+    restore = installFakeDom({ dataEventMatches: [el] });
+    scrollToEventAndPulse('e-7');
+    expect(hasNavFocus()).toBe(true);
+
+    clearPendingEventScroll();
+    expect(el.classList._classes.has('nav-focus-stuck')).toBe(false);
+    expect(hasNavFocus()).toBe(false);
+  });
+
+  it('dismissal is gated on the deep-link claim — deferred while held, fades after it settles', () => {
+    const el = makeMarkerEl();
+    restore = installFakeDom({ dataEventMatches: [el] });
+    scrollToEventAndPulse('e-7');
+    expect(hasNavFocus()).toBe(true);
+
+    // Claim still held (the sync resolve holds it across the smooth-scroll settle)
+    // → an action is the programmatic landing scroll, not the user, so it's ignored.
+    document.dispatchEvent(new Event('wheel'));
+    expect(hasNavFocus()).toBe(true);
+    expect(el.classList._classes.has('nav-focus-fading')).toBe(false);
+
+    vi.advanceTimersByTime(1100); // past SCROLL_SETTLE_FALLBACK_MS (1000) → claim released
+    expect(hasPendingEventScroll()).toBe(false);
+
+    // Now an action is the user engaging → marker fades out, then is removed.
+    document.dispatchEvent(new Event('wheel'));
+    expect(el.classList._classes.has('nav-focus-fading')).toBe(true);
+    vi.advanceTimersByTime(NAV_FOCUS_FADE_MS);
+    expect(el.classList._classes.has('nav-focus-stuck')).toBe(false);
+    expect(hasNavFocus()).toBe(false);
   });
 });

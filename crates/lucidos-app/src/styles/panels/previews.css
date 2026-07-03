@@ -64,7 +64,7 @@
 
 .file-preview-code {
     font-family: var(--font-ui);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     line-height: 1.5;
     white-space: pre-wrap;
     word-wrap: break-word;
@@ -91,7 +91,7 @@
     resize: none;
     box-sizing: border-box;
     font-family: var(--font-ui);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     line-height: 1.5;
     tab-size: 2;
     padding: 0.5rem 0.625rem;
@@ -122,19 +122,19 @@
 }
 
 .slides-pv-deck-title {
-    font-size: 1.25rem;
+    font-size: var(--font-size-3xl);
     font-weight: 700;
     color: var(--text-primary);
 }
 
 .slides-pv-deck-subtitle {
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     color: var(--text-secondary);
     margin-top: 0.25rem;
 }
 
 .slides-pv-deck-count {
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     margin-top: 0.375rem;
 }
@@ -165,19 +165,19 @@
     border-radius: 0.25rem;
     background: var(--bg-tertiary);
     color: var(--text-muted);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     flex-shrink: 0;
 }
 
 .slides-pv-slide-title {
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
 }
 
 .slides-pv-hero-badge {
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
@@ -188,7 +188,7 @@
 }
 
 .slides-pv-section-badge {
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     font-weight: 500;
     padding: 0.125rem 0.375rem;
     border-radius: 0.1875rem;
@@ -211,7 +211,7 @@
 }
 
 .slides-pv-tag {
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
@@ -229,14 +229,14 @@
 .slides-pv-tag[data-color="rose"] { color: #f43f5e; background: color-mix(in srgb, #f43f5e 15%, transparent); }
 
 .slides-pv-header-title {
-    font-size: 0.875rem;
+    font-size: var(--font-size-lg);
     font-weight: 700;
     color: var(--text-primary);
     margin-top: 0.375rem;
 }
 
 .slides-pv-header-subtitle {
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     margin-top: 0.125rem;
     line-height: 1.4;
@@ -244,13 +244,13 @@
 
 /* HTML content blocks */
 .slides-pv-html {
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     line-height: 1.5;
 }
 
 .slides-pv-html h3 {
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
     margin-bottom: 0.25rem;
@@ -262,7 +262,7 @@
 
 .slides-pv-html code {
     font-family: var(--font-ui);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     background: var(--bg-tertiary);
     padding: 0.0625rem 0.25rem;
     border-radius: 0.1875rem;
@@ -270,7 +270,7 @@
 
 /* Lists */
 .slides-pv-list {
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     line-height: 1.5;
     padding-left: 1rem;
@@ -287,13 +287,13 @@
 
 /* Icon */
 .slides-pv-icon {
-    font-size: 1.125rem;
+    font-size: var(--font-size-2xl);
     margin-bottom: 0.25rem;
 }
 
 /* Insight callout */
 .slides-pv-insight {
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     line-height: 1.5;
     color: var(--text-secondary);
     border-left: 0.125rem solid var(--accent);
@@ -363,12 +363,12 @@
     background: var(--bg-tertiary);
     border-radius: 0.25rem;
     padding: 0.25rem 0.5rem;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     color: var(--text-primary);
 }
 
 .slides-pv-pipeline-icon {
-    font-size: 0.875rem;
+    font-size: var(--font-size-lg);
 }
 
 .slides-pv-pipeline-label {
@@ -378,7 +378,7 @@
 /* Tree (code structure) */
 .slides-pv-tree {
     font-family: var(--font-ui);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     line-height: 1.5;
     background: var(--bg-tertiary);
     border-radius: 0.25rem;
@@ -398,7 +398,7 @@
 }
 
 .slides-pv-chip {
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     padding: 0.125rem 0.375rem;
     border-radius: 0.75rem;
     background: var(--bg-tertiary);
@@ -417,7 +417,7 @@
 
 .slides-pv-es-event {
     font-family: var(--font-ui);
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     padding: 0.125rem 0.375rem;
     border-radius: 0.1875rem;
     background: color-mix(in srgb, #a78bfa 15%, transparent);
@@ -426,7 +426,7 @@
 
 .slides-pv-es-arrow {
     color: var(--text-muted);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
 }
 
 /* Takeaway items */
@@ -451,19 +451,19 @@
     border-radius: 50%;
     background: color-mix(in srgb, var(--accent) 15%, transparent);
     color: var(--accent);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     font-weight: 700;
     flex-shrink: 0;
 }
 
 .slides-pv-takeaway-title {
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
 }
 
 .slides-pv-takeaway-body {
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     line-height: 1.4;
     margin-top: 0.125rem;
@@ -472,7 +472,7 @@
 /* Badge */
 .slides-pv-badge {
     display: inline-block;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     letter-spacing: 0.05em;
     text-transform: uppercase;
@@ -485,7 +485,7 @@
 
 /* VS label */
 .slides-pv-vs-label {
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     color: var(--text-muted);
     text-transform: uppercase;
@@ -539,7 +539,7 @@
     width: 100%;
     max-width: 30rem;
     padding: 0.125rem 0.5rem;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     font-family: var(--font-ui);
     background: var(--bg-primary);
     border: 1px solid var(--accent);
@@ -565,7 +565,7 @@
 .prompt-box .prompt-textarea {
     width: 100%;
     padding: 0.5rem 1rem;
-    font-size: 0.875rem;
+    font-size: var(--font-size-lg);
     font-family: var(--font-ui);
     -webkit-appearance: none;
     appearance: none;
@@ -606,7 +606,7 @@
     padding: 0.75rem 1rem;
     min-width: 0;
     max-width: min(24rem, calc(100vw - 1rem));
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
 }
 
@@ -617,7 +617,7 @@
 
 .message-route-panel h4 {
     margin: 0 0 0.375rem;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     text-transform: uppercase;
     letter-spacing: 0.03125rem;
     color: var(--text-muted);
@@ -636,8 +636,11 @@
     font-weight: 600;
 }
 
-.message-route-panel .route-row span,
-.message-route-panel .route-row .accent-link {
+/* Direct-child value elements only — a descendant `span` selector would leak
+   flex:1 1 auto onto nested spans (e.g. .route-app-icon / .route-app-name),
+   overriding their `flex: 0 0 auto` and spreading the app icon and name apart. */
+.message-route-panel .route-row > span,
+.message-route-panel .route-row > .accent-link {
     flex: 1 1 auto;
     min-width: 0;
     word-break: break-word;
@@ -649,29 +652,24 @@
 
 .message-route-panel .mono {
     font-family: var(--font-mono);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
 }
 
-.message-route-panel .route-branch {
+.message-route-panel .route-app {
     display: inline-flex;
     align-items: baseline;
-    gap: 0.25rem;
+    gap: 0.5rem;
     flex-wrap: wrap;
 }
 
-.message-route-panel .route-branch-app-icon {
+.message-route-panel .route-app-icon {
     flex: 0 0 auto;
 }
 
-.message-route-panel .route-branch-app-name {
+.message-route-panel .route-app-name {
     flex: 0 0 auto;
     color: var(--text-primary);
     font-weight: 500;
-}
-
-.message-route-panel .route-branch-sep {
-    flex: 0 0 auto;
-    color: var(--text-muted);
 }
 
 .message-route-panel .muted {
@@ -683,7 +681,7 @@
     margin-left: 0.375rem;
     padding: 0.0625rem 0.3125rem;
     border-radius: 0.1875rem;
-    font-size: 0.5625rem;
+    font-size: var(--font-size-3xs);
     text-transform: uppercase;
     background: color-mix(in srgb, var(--accent) 15%, transparent);
     color: var(--accent);
@@ -700,7 +698,7 @@
 
 .message-route-panel .route-explainer p {
     margin: 0.25rem 0 0;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     line-height: 1.4;
 }

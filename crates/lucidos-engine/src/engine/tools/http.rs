@@ -15,7 +15,10 @@ const HTTP_TOOL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// timeout is set in one place and tests can verify the timeout fires against
 /// a hung server without depending on the full tool surface.
 pub(crate) fn build_http_tool_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder().timeout(timeout).build()
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
 }
 
 impl LucidosEngine {
@@ -415,5 +418,62 @@ mod tests {
     #[test]
     fn build_http_tool_client_returns_ok_for_real_timeout() {
         assert!(build_http_tool_client(HTTP_TOOL_REQUEST_TIMEOUT).is_ok());
+    }
+
+    /// `http_request` injects stored credentials before sending. Reqwest's
+    /// default redirect policy only strips sensitive headers on host/port
+    /// changes, so a same-host HTTPS→HTTP downgrade would replay Authorization
+    /// over plaintext. The tool client must never auto-follow after injection;
+    /// callers get the 30x response and can make an explicit second request.
+    #[tokio::test]
+    async fn build_http_tool_client_does_not_follow_redirects_with_authorization() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let seen_target_auth = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen_target_auth_task = seen_target_auth.clone();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = target.accept().await {
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                if req.to_ascii_lowercase().contains("authorization:") {
+                    seen_target_auth_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+
+        let redirector = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirector_addr = redirector.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = redirector.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{}/leak\r\nContent-Length: 0\r\n\r\n",
+                    target_addr
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let client = build_http_tool_client(Duration::from_secs(1)).expect("client builds");
+        let response = client
+            .get(format!("http://{redirector_addr}/start"))
+            .header(reqwest::header::AUTHORIZATION, "Bearer injected-secret")
+            .send()
+            .await
+            .expect("redirect response should be returned");
+
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !seen_target_auth.load(std::sync::atomic::Ordering::SeqCst),
+            "client followed redirect and replayed Authorization"
+        );
     }
 }

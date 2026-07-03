@@ -1,11 +1,15 @@
-/** iOS-PWA liveness diagnostic — heartbeat + startup classification + uncaught-error
- *  breadcrumbs that detect iOS WKWebView content-process crashes (which don't fire
- *  pagehide/beforeunload). Reads as engine.log `[Client/lifecycle]` / `[Client/error]`
- *  lines; grep `"kind":"likely_crash"` to count crash recoveries.
+/** Client-stability debug tooling — a fire-and-forget breadcrumb channel
+ *  (`postClientLog`, shared by many call sites) plus iOS-PWA liveness telemetry:
+ *  a heartbeat + startup classification + uncaught-error breadcrumbs that detect
+ *  iOS WKWebView content-process crashes (which don't fire pagehide/beforeunload).
+ *  Reads as engine.log `[Client/lifecycle]` / `[Client/error]` lines; grep
+ *  `"kind":"likely_crash"` to count crash recoveries.
  *
- *  TEMPORARY MEASURE — pure telemetry, removable once the cause is fixed. Tracked in
- *  docs/temporary-measures.md → "iOS-PWA liveness diagnostic" (parent investigation
- *  `ios-pwa-blackout`), which carries the concrete removal condition. */
+ *  PERMANENT debug tooling (not a temporary measure). Built for the
+ *  `ios-pwa-blackout` investigation (resolved 2026-06-30 — see
+ *  docs/temporary-measures.md), but RETAINED rather than deleted: the breadcrumb
+ *  channel is shared infrastructure and the crash / error telemetry is reusable
+ *  for any future client-stability issue. */
 
 import { focusedThreadId } from '../store/store';
 import { composeDrafts } from '../store/composeDrafts';

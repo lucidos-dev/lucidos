@@ -22,8 +22,51 @@ pub struct FastEmbedProvider {
 
 /// Configured embedding model identifier (env: `LUCIDOS_EMBEDDING_MODEL`).
 /// Falls back to `DEFAULT_MODEL` when unset. See accepted values in `resolve_model`.
-fn model_id_from_env() -> String {
+pub(crate) fn model_id_from_env() -> String {
     std::env::var("LUCIDOS_EMBEDDING_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
+}
+
+/// True when a `FastEmbedProvider::new()` error is a model-download / network
+/// failure (HF unreachable, request timed out, too many retries) rather than a
+/// logic / data bug. Decides two things: whether a real-embedder test may SKIP
+/// (`test_util::shared_embedder`), and whether engine construction may boot
+/// DEGRADED with an empty [`super::EmbedderSlot`] instead of failing — a
+/// packaged first run with no network must still boot (the model retries in
+/// the background), while a corrupt cached model must stay a loud, fatal bug.
+///
+/// The match walks the **entire error source chain**, not just the top
+/// message: `fastembed` wraps the underlying transport error with anyhow
+/// context like `Failed to retrieve onnx/model.onnx` (preserved as a
+/// `.source()`), so the network signal lives one level down. The raw HF
+/// errors look like `request error: <url>: <ureq error>` / `Too many
+/// retries: …`, and the HF host appears in every fetch URL. `failed to
+/// retrieve` is fastembed's own *fetch*-path wrapper — distinct from the
+/// `could not read … file` messages it emits when an already-downloaded file
+/// is corrupt, which we deliberately do NOT match so real corruption still
+/// fails loudly.
+pub fn is_model_fetch_failure(err: &(dyn std::error::Error + Send + Sync)) -> bool {
+    const MARKERS: &[&str] = &[
+        "huggingface",
+        "request error",
+        "network error",
+        "timed out",
+        "timeout",
+        "too many retries",
+        "connection",
+        "failed to lookup",
+        "dns error",
+        "no such host",
+        "failed to retrieve", // fastembed's fetch-path context wrapper
+    ];
+    let mut level: Option<&dyn std::error::Error> = Some(err);
+    while let Some(e) = level {
+        let msg = e.to_string().to_lowercase();
+        if MARKERS.iter().any(|needle| msg.contains(needle)) {
+            return true;
+        }
+        level = e.source();
+    }
+    false
 }
 
 fn resolve_model(
@@ -40,6 +83,27 @@ fn resolve_model(
     }
 }
 
+/// Actionable wrapper for a `TextEmbedding::try_new` failure. `cause` is the
+/// flattened (`{e:#}`) original error chain.
+///
+/// The guidance text deliberately contains NONE of the
+/// [`is_model_fetch_failure`] markers (say "the Hugging Face model hub", never
+/// the `huggingface` token; no "connection"/"timeout"/"download" phrasing that
+/// overlaps a marker): classification must key ONLY on the original cause
+/// baked into `cause`, or every init failure — a corrupt cached model included
+/// — would classify as a fetch failure and boot degraded-with-retries instead
+/// of failing loudly. Pinned by `init_error_message_*` tests below.
+fn init_error_message(id: &str, cause: String) -> Box<dyn std::error::Error + Send + Sync> {
+    let cache = std::env::var("FASTEMBED_CACHE_DIR")
+        .unwrap_or_else(|_| ".fastembed_cache (relative to the workspace)".to_string());
+    format!(
+        "embedding model '{id}' failed to initialize: {cause}. First boot fetches it from the \
+         Hugging Face model hub — check outbound HTTPS (and the system CA bundle), or pre-seed \
+         the model cache ({cache}) from a machine that already has it."
+    )
+    .into()
+}
+
 impl FastEmbedProvider {
     pub fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Self::with_model(&model_id_from_env())
@@ -48,7 +112,15 @@ impl FastEmbedProvider {
     fn with_model(id: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (model, dimensions) = resolve_model(id)?;
         let options = InitOptions::new(model).with_show_download_progress(true);
-        let model = TextEmbedding::try_new(options)?;
+        // A failed init surfaces on the boot path (a fetch-class failure boots
+        // DEGRADED via `EmbedderSlot`; anything else is fatal before HTTP
+        // binds) — make the failure name the model, the cache, and the two
+        // remedies instead of surfacing a bare hf-hub transport error.
+        // `{e:#}` (anyhow alternate) flattens the WHOLE cause chain into the
+        // text: this wrap turns the error into a plain string, and
+        // `is_model_fetch_failure` reads the network markers from it.
+        let model = TextEmbedding::try_new(options)
+            .map_err(|e| init_error_message(id, format!("{e:#}")))?;
 
         Ok(Self {
             model: Arc::new(std::sync::Mutex::new(model)),
@@ -109,6 +181,41 @@ mod tests {
     fn test_resolve_model_known_ids() {
         assert_eq!(resolve_model(MODEL_BGE_SMALL_EN).unwrap().1, 384);
         assert_eq!(resolve_model(MODEL_MULTILINGUAL_E5_SMALL).unwrap().1, 384);
+    }
+
+    /// The init wrapper's own guidance text must not trip the fetch
+    /// classifier: a corrupt cached model ("could not read … file") wrapped by
+    /// `init_error_message` has to stay NON-fetch, or it boots
+    /// degraded-with-retries (and skips real-embedder tests) instead of
+    /// failing loudly. Regression for the 2026-07-01 merge, where the wrapper
+    /// said "huggingface.co" and made EVERY init failure classify as fetch.
+    #[test]
+    fn init_error_message_keeps_corrupt_model_non_fetch() {
+        let err = init_error_message(
+            DEFAULT_MODEL,
+            "could not read model.onnx file: invalid protobuf".to_string(),
+        );
+        assert!(
+            !is_model_fetch_failure(err.as_ref()),
+            "wrapper guidance text must not carry fetch markers: {err}"
+        );
+    }
+
+    /// The inverse direction: a genuine transport failure keeps classifying as
+    /// fetch THROUGH the wrapper, because `{e:#}` bakes the original cause
+    /// (request error / hf URL) into the message.
+    #[test]
+    fn init_error_message_keeps_transport_failure_fetch_class() {
+        let err = init_error_message(
+            DEFAULT_MODEL,
+            "Failed to retrieve onnx/model.onnx: request error: \
+             https://huggingface.co/…: connection refused"
+                .to_string(),
+        );
+        assert!(
+            is_model_fetch_failure(err.as_ref()),
+            "the flattened original cause must still classify as fetch: {err}"
+        );
     }
 
     #[test]

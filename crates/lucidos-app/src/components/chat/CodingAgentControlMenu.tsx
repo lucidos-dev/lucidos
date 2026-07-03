@@ -1,7 +1,9 @@
 import { Fragment } from 'preact';
 import { useSignal, useSignalEffect, signal } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
-import { showToast, codingAgentSessionVersion, codingAgentPendingModel, codingAgentPendingReasoningEffort, selectedScope, selectedCodingAgent, scopeToRepoId, engineRestarting } from '../../store/store';
+import { showToast, codingAgentSessionVersion, codingAgentPendingModel, codingAgentPendingReasoningEffort, scopeToRepoId, engineRestarting } from '../../store/store';
+import { resolveScope, resolveCodingAgent, getComposeSelectionOverride } from '../../store/composeSelections';
+import { updateComposeSelection } from '../../store/actions/compose';
 import { sendCodingAgentControl } from '../../store/actions/chat-claude-code';
 import { sendMessage } from '../../store/actions/chat';
 import { fetchCodingAgentCommands, type CodingAgentCommandDef, type CodingAgentCommandsResponse, type CodingAgentModelValue, type CodingAgentReasoningEffort } from '../../api/client';
@@ -44,10 +46,16 @@ type ListItem =
 
 interface Props {
   threadId?: string;
+  /** The focused COMPOSING draft's id, set only while composing (mutually
+   *  exclusive with `threadId`, which is the active-session id). When present the
+   *  model/effort picks + skill scope come from THIS draft's per-draft override
+   *  (`composeSelections`) instead of the global pending signals / picker, so a
+   *  pick on one draft can't leak to another. */
+  composeThreadId?: string;
   codingAgent?: CodingAgent | null;
 }
 
-export function CodingAgentControlMenu({ threadId, codingAgent }: Props) {
+export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent }: Props) {
   const menuRef = useRef<HTMLDivElement>(null);
   const filterRef = useRef<HTMLInputElement>(null);
   const optionsListRef = useRef<HTMLDivElement>(null);
@@ -65,8 +73,23 @@ export function CodingAgentControlMenu({ threadId, codingAgent }: Props) {
   const hasActiveSession = useSignal(persistedHasActiveSession.peek());
   const filter = useSignal('');
   const highlightIndex = useSignal(-1);
-  const resolvedCodingAgent = codingAgent ?? (threadId ? 'claude-code' : selectedCodingAgent.value);
+  // Active threads pass `threadId`; the compose view (a focused draft OR the
+  // fresh no-draft view) does not — so `!threadId` IS "compose context". In
+  // compose, model/effort picks live per-draft (`composeThreadId`) or, before a
+  // draft exists, in the PENDING slot (`composeThreadId` undefined → resolvers
+  // route to pending). On an active thread they live in the global pending
+  // signals (reconciled per-thread by loadCommands).
+  const inCompose = !threadId;
+  const resolvedCodingAgent = codingAgent ?? (threadId ? 'claude-code' : resolveCodingAgent(composeThreadId));
   const isClaudeCode = resolvedCodingAgent === 'claude-code';
+  // null here = "no pick" → display falls through to the backend's current value.
+  const draftOverride = inCompose ? getComposeSelectionOverride(composeThreadId) : null;
+  const pendingModel: CodingAgentModelValue | null = draftOverride
+    ? (draftOverride.ccModel ?? null)
+    : codingAgentPendingModel.value;
+  const pendingReasoningEffort: CodingAgentReasoningEffort | null = draftOverride
+    ? (draftOverride.ccReasoningEffort ?? null)
+    : codingAgentPendingReasoningEffort.value;
   const menuLabel = isClaudeCode ? 'Claude Code' : 'Codex';
   const effectiveBuiltinCommands = isClaudeCode ? builtinCommands.value : [];
   const effectiveSkillCommands = isClaudeCode ? skillCommands.value : [];
@@ -90,8 +113,8 @@ export function CodingAgentControlMenu({ threadId, codingAgent }: Props) {
     // they'll appear once the live CC session loads its own command list).
     // `scopeToRepoId` returns the external repo UUID or undefined; passing
     // `''` to the backend resolves to the default "Lucidos" repo, which is
-    // the right fallback for both Lucidos and App.
-    const repoId = threadId ? undefined : (scopeToRepoId(selectedScope.value) ?? '');
+    // the right fallback for both Lucidos and App. Compose scope is per-draft.
+    const repoId = threadId ? undefined : (scopeToRepoId(resolveScope(composeThreadId)) ?? '');
     // Compose view: the backend picker decides which control menu (CC model
     // list vs Codex model list) the server returns. Thread-bound menus
     // resolve the backend server-side from thread_summaries.
@@ -207,9 +230,11 @@ export function CodingAgentControlMenu({ threadId, codingAgent }: Props) {
   // scope's skills don't flash before the new fetch resolves. Thread-bound
   // menus are bound to the thread's repo and ignore this signal.
   useSignalEffect(() => {
-    // Reading the signals here is what subscribes this effect.
-    selectedScope.value;
-    selectedCodingAgent.value;
+    // Reading the resolved per-draft scope/agent here is what subscribes this
+    // effect — it re-fires when this draft's target/backend override changes (or
+    // the global default, when there is no draft).
+    resolveScope(composeThreadId);
+    resolveCodingAgent(composeThreadId);
     if (threadId) return;
     persistedControlCommands.value = null;
     persistedBuiltinCommands.value = null;
@@ -317,9 +342,16 @@ export function CodingAgentControlMenu({ threadId, codingAgent }: Props) {
    *  the next refresh. */
   async function selectOption(cmd: CodingAgentCommandDef, value: string, label: string) {
     if (cmd.subtype === 'set_model') {
-      codingAgentPendingModel.value = value === 'default' ? null : value as CodingAgentModelValue;
+      const next = value === 'default' ? null : value as CodingAgentModelValue;
+      // Compose → per-draft override (persisted via the debounced compose PUT),
+      // or the PENDING slot before a draft exists; active thread → the global
+      // pending signal. Never leaks across drafts and never writes a global from compose.
+      if (inCompose) updateComposeSelection(composeThreadId ?? null, { ccModel: next });
+      else codingAgentPendingModel.value = next;
     } else if (cmd.subtype === 'set_reasoning_effort') {
-      codingAgentPendingReasoningEffort.value = value as CodingAgentReasoningEffort;
+      const next = value as CodingAgentReasoningEffort;
+      if (inCompose) updateComposeSelection(composeThreadId ?? null, { ccReasoningEffort: next });
+      else codingAgentPendingReasoningEffort.value = next;
     }
 
     if (!threadId || !hasActiveSession.value) {
@@ -348,8 +380,8 @@ export function CodingAgentControlMenu({ threadId, codingAgent }: Props) {
    *  Uses backend-returned per-thread values or pending overrides. No cross-thread leaking. */
   function currentValueLabel(subtype: string): string | null {
     const values: Record<string, string | null> = {
-      set_model: codingAgentPendingModel.value ?? currentModel.value,
-      set_reasoning_effort: codingAgentPendingReasoningEffort.value ?? currentReasoningEffort.value,
+      set_model: pendingModel ?? currentModel.value,
+      set_reasoning_effort: pendingReasoningEffort ?? currentReasoningEffort.value,
     };
     const val = values[subtype];
     if (!val) return null;
@@ -519,8 +551,8 @@ export function CodingAgentControlMenu({ threadId, codingAgent }: Props) {
               {(() => {
                 const isModelCmd = cmd.subtype === 'set_model';
                 const isEffortCmd = cmd.subtype === 'set_reasoning_effort';
-                const effectiveModel = codingAgentPendingModel.value ?? currentModel.value;
-                const effectiveEffort = codingAgentPendingReasoningEffort.value ?? currentReasoningEffort.value;
+                const effectiveModel = pendingModel ?? currentModel.value;
+                const effectiveEffort = pendingReasoningEffort ?? currentReasoningEffort.value;
                 return cmd.params[0].options!.map((opt, i) => {
                 const isCurrent = (isModelCmd && opt.value !== 'default' && opt.value === effectiveModel)
                   || (isEffortCmd && opt.value === effectiveEffort);

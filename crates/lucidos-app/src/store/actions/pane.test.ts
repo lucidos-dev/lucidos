@@ -203,7 +203,7 @@ describe('toggleThreads', () => {
     focusedPane.value = 'drawer';
     toggleThreads();
     expect(threadDrawerOpen.value).toBe(false);
-    // A hidden pane must not stay the focused pane (would strand the focus wash).
+    // A hidden pane must not stay the focused pane (would strand keyboard focus).
     expect(focusedPane.value).toBe('thread');
   });
 });

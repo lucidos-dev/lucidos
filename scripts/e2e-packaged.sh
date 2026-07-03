@@ -74,9 +74,14 @@ if [ "$REBUILD" = "1" ] || [ -z "$APP" ]; then
     APP="$(find_app)"
 fi
 [ -n "$APP" ] || fail "no .app found under $BUNDLE_MACOS"
-APP_BIN="$APP/Contents/MacOS/Lucidos"
+# The main binary's name depends on the tauri-cli version (productName vs the
+# crate name, e.g. `Lucidos` vs `lucidos-app`) — resolve it from the bundle's
+# own Info.plist instead of hardcoding one convention.
+APP_EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist" 2>/dev/null || true)"
+[ -n "$APP_EXEC" ] || fail "could not read CFBundleExecutable from $APP/Contents/Info.plist"
+APP_BIN="$APP/Contents/MacOS/$APP_EXEC"
 [ -x "$APP_BIN" ] || fail "bundle is missing its executable at $APP_BIN"
-log "using app bundle: $APP"
+log "using app bundle: $APP (executable: $APP_EXEC)"
 
 # ── Isolated temp HOME + free port + seeded fastembed cache ───────────────────
 TMP_HOME="$(mktemp -d -t lucidos-pkg-e2e)"
@@ -148,14 +153,25 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ── Launch the bundle's headless service role ─────────────────────────────────
-# Scrub the dev workspace's Postgres/Lucidos env so the inherited CC-session
-# values can't poison the packaged EMBEDDED path (spawn_gateway sets the gateway
-# env itself; DATABASE_URL / PG* would otherwise leak into the spawned engine).
-# Override only HOME (isolation) and LUCIDOS_ENGINE_PORT (the free port).
-env -u DATABASE_URL -u PGHOST -u PGPORT -u PGUSER -u PGPASSWORD -u PGDATABASE \
-    -u LUCIDOS_WORKSPACE -u LUCIDOS_STATIC_DIR -u LUCIDOS_SDK_DIR \
-    -u LUCIDOS_GATEWAY_DATA -u LUCIDOS_API_PORT -u LUCIDOS_ENGINE_BIN \
-    -u LUCIDOS_HOST_PID -u LUCIDOS_FRONTEND_PID \
+# Scrub EVERY inherited Lucidos/Postgres env var so a dev-workspace or
+# CC-session environment can't poison the packaged posture. This must be a
+# prefix scrub, not an enumerated list: the earlier explicit -u list missed
+# LUCIDOS_TLS_CERT/KEY + LUCIDOS_GATEWAY_ENGINE_LOOPBACK (exported by the dev
+# engine into its subprocesses, incl. the nightly trigger's shell), which made
+# the packaged gateway serve HTTPS on the test port while the assertions
+# curl'ed http — "gateway health never returned 200". Override only HOME
+# (isolation) and LUCIDOS_ENGINE_PORT (the free port).
+SCRUB_ENV=()
+while IFS='=' read -r _name _; do
+    case "$_name" in
+        LUCIDOS_*|DATABASE_URL|PGHOST|PGPORT|PGUSER|PGPASSWORD|PGDATABASE)
+            SCRUB_ENV+=(-u "$_name") ;;
+    esac
+done < <(env)
+# ${arr[@]+"${arr[@]}"} — macOS ships bash 3.2, where expanding an EMPTY
+# array under `set -u` is an "unbound variable" error (a clean terminal with
+# no LUCIDOS_*/PG* vars hits exactly that); the +-expansion idiom skips it.
+env ${SCRUB_ENV[@]+"${SCRUB_ENV[@]}"} \
     HOME="$TMP_HOME" LUCIDOS_ENGINE_PORT="$PORT" \
     "$APP_BIN" --service >"$SVC_LOG" 2>&1 &
 SVC_PID=$!
@@ -227,6 +243,44 @@ log "PASS: workspace app shell served with slug base href"
 [ -f "$APP_DATA/pgdata/PG_VERSION" ] \
     || fail "embedded Postgres cluster not provisioned (no pgdata/PG_VERSION)"
 log "PASS: embedded Postgres cluster on disk"
+
+# ── 8. Notification/app-shell serving chain through the gateway ───────────────
+# These are the packaged surfaces dev e2e never exercises from a staged bundle:
+# a mis-staged Resources/{frontend,sdk} regresses silently otherwise.
+
+# 8a. The JS SDK is served and is NOT the fallback stub (a mis-staged sdk/
+# makes sdk.rs serve a console.error stub — apps lose window.lucidos.*).
+SDK_JS="$(curl -s "$BASE/$SLUG/api/v1/sdk.js")"
+printf '%s' "$SDK_JS" | grep -q 'lucidos' \
+    || fail "sdk.js not served through the gateway"
+printf '%s' "$SDK_JS" | grep -qi 'SDK bundle not found' \
+    && fail "sdk.js is the fallback STUB — Resources/sdk mis-staged"
+log "PASS: sdk.js served (not the stub)"
+
+# 8b. The service worker is served as JS with a stamped (non-placeholder)
+# BUILD_ID — an unstamped or missing sw.js kills PWA install + web push.
+SW_STATUS="$(http_status "$BASE/$SLUG/sw.js")"
+[ "$SW_STATUS" = "200" ] || fail "sw.js did not return 200 (got $SW_STATUS)"
+curl -s -D - -o /dev/null "$BASE/$SLUG/sw.js" | grep -iq '^content-type:.*javascript' \
+    || fail "sw.js served with a non-JS content type (SW registration would fail)"
+SW_JS="$(curl -s "$BASE/$SLUG/sw.js")"
+printf '%s' "$SW_JS" | grep -q "BUILD_ID" \
+    || fail "sw.js has no BUILD_ID marker at all"
+printf '%s' "$SW_JS" | grep -q "__LUCIDOS_BUILD_ID__" \
+    && fail "sw.js BUILD_ID is the unstamped placeholder — frontend staged from an unstamped build"
+log "PASS: sw.js served as JS with a stamped BUILD_ID"
+
+# 8c. The PWA manifest is served (404 breaks installability on every device).
+[ "$(http_status "$BASE/$SLUG/manifest.json")" = "200" ] \
+    || fail "manifest.json did not return 200"
+log "PASS: manifest.json served"
+
+# 8d. The web-push VAPID key endpoint answers with a key (push subscription
+# bootstrap for browser/PWA clients over the Tailscale https path).
+VAPID="$(curl -s "$BASE/$SLUG/api/v1/push/vapid-key")"
+printf '%s' "$VAPID" | tr -d ' \t\n' | grep -q '"public_key":"' \
+    || fail "push/vapid-key missing public_key: $VAPID"
+log "PASS: VAPID public key served"
 
 PASSED=1
 # cleanup (EXIT trap) stops the service, verifies a clean shutdown, and reports.

@@ -83,13 +83,8 @@ impl ModelStore {
         let row: Option<ModelRow> =
             sqlx::query_as(&format!("SELECT {SELECT_COLS} FROM models WHERE id = $1"))
                 .bind(id)
-                .fetch_one(pool)
-                .await
-                .map(Some)
-                .or_else(|e| match e {
-                    sqlx::Error::RowNotFound => Ok(None),
-                    other => Err(other),
-                })?;
+                .fetch_optional(pool)
+                .await?;
         Ok(row.map(row_to_model))
     }
 

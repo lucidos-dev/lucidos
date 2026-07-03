@@ -7,42 +7,58 @@ import {
 } from '../../store/actions/triggers';
 import { formatShortDate, formatShortTime } from '../../utils/formatTime';
 import { describeCron } from '../../utils/describeCron';
+import { useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 
 interface Props {
   trigger: TriggerInfo;
 }
 
-export function TriggerItem({ trigger }: Props) {
-  const lastRunDate = trigger.last_run ? new Date(trigger.last_run) : null;
+/** Self-skeletonizing trigger row: rendered with no trigger inside a
+ *  SkeletonProvider (`<TriggerItem />`) it draws itself as a loading placeholder
+ *  via the Sk* leaves (title + status/type/run chips + a last-run line); with a
+ *  real trigger it renders normally. The prop is optional only to support the
+ *  skeleton call; real call sites pass it. */
+export function TriggerItem({ trigger }: Partial<Props>) {
+  const sk = useSkeleton();
+  const lastRunDate = trigger?.last_run ? new Date(trigger.last_run) : null;
   const lastRunStr = lastRunDate ? `${formatShortDate(lastRunDate)} ${formatShortTime(lastRunDate)}` : null;
-  const triggerType = deriveTriggerType(trigger);
-  const noMoreRuns = hasNoMoreRuns(trigger);
+  const triggerType = trigger ? deriveTriggerType(trigger) : 'schedule';
+  const noMoreRuns = trigger ? hasNoMoreRuns(trigger) : false;
 
   return (
-    <div class={`list-row trigger-row clickable${trigger.paused ? ' trigger-disabled' : ''}`} onClick={() => openEditTrigger(trigger.id)}>
+    <div
+      class={`list-row trigger-row${sk ? '' : ' clickable'}${trigger?.paused ? ' trigger-disabled' : ''}`}
+      onClick={sk ? undefined : () => { if (trigger) openEditTrigger(trigger.id); }}
+    >
       <div class="list-row-info">
-        <div class="title list-row-name">{trigger.name}</div>
+        <SkText class="title list-row-name" as="div" w="9rem">{trigger?.name}</SkText>
         <div class="list-row-details">
-          {noMoreRuns ? (
-            <span class="trigger-no-more-runs">No more runs</span>
-          ) : (
-            <span class={trigger.paused ? 'trigger-paused' : 'trigger-enabled'}>
-              {trigger.paused ? 'Paused' : 'Active'}
+          <SkBlock w="3rem" h="1.25rem" round>
+            {noMoreRuns ? (
+              <span class="trigger-no-more-runs">No more runs</span>
+            ) : (
+              <span class={trigger?.paused ? 'trigger-paused' : 'trigger-enabled'}>
+                {trigger?.paused ? 'Paused' : 'Active'}
+              </span>
+            )}
+          </SkBlock>
+          <SkBlock w="4rem" h="1.25rem" round>
+            <span class={`label trigger-type-${triggerType}`}>
+              {triggerType === 'hybrid' ? 'Hybrid' : triggerType === 'event' ? 'Event' : 'Schedule'}
             </span>
-          )}
-          <span class={`label trigger-type-${triggerType}`}>
-            {triggerType === 'hybrid' ? 'Hybrid' : triggerType === 'event' ? 'Event' : 'Schedule'}
-          </span>
-          <span class="label">
-            {trigger.run.type === 'script' ? 'script' : 'LLM'}
-          </span>
-          {trigger.plugin_id && (
+          </SkBlock>
+          <SkBlock w="2.5rem" h="1.25rem" round>
+            <span class="label">
+              {trigger?.run.type === 'script' ? 'script' : 'LLM'}
+            </span>
+          </SkBlock>
+          {trigger?.plugin_id && (
             <span class="label trigger-plugin-chip" data-tooltip={`Installed by the "${trigger.plugin_id}" plugin`}>
               from {trigger.plugin_id}
             </span>
           )}
         </div>
-        {trigger.cron_expressions.length > 0 && (
+        {trigger && trigger.cron_expressions.length > 0 && (
           <ul class="trigger-cron-list">
             {trigger.cron_expressions.map((expr, i) => (
               <li key={i} class="trigger-cron-item">
@@ -52,7 +68,7 @@ export function TriggerItem({ trigger }: Props) {
             ))}
           </ul>
         )}
-        {trigger.on && trigger.on.length > 0 && (
+        {trigger?.on && trigger.on.length > 0 && (
           <ul class="trigger-event-list">
             {trigger.on.map((sub, i) => (
               <li key={i} class="trigger-event-info">
@@ -64,23 +80,34 @@ export function TriggerItem({ trigger }: Props) {
             ))}
           </ul>
         )}
-        {lastRunStr && (
-          <div class="list-row-date">Last run {lastRunStr}</div>
+        {(sk || lastRunStr) && (
+          <div class="list-row-date trigger-last-run">
+            <SkText as="span" w="8rem">{lastRunStr && `Last run ${lastRunStr}`}</SkText>
+            {trigger?.last_run_status && (
+              <span class={`trigger-run-status trigger-run-status-${trigger.last_run_status}`}>
+                {trigger.last_run_status === 'ok' ? 'OK' : 'Failed'}
+              </span>
+            )}
+          </div>
         )}
       </div>
       <div class="list-row-actions">
-        <button
-          class="action-btn action-btn-danger"
-          onClick={(e) => { e.stopPropagation(); void deleteTrigger(trigger.id, trigger.name); }}
-        >
-          Delete
-        </button>
-        <button
-          class="action-btn"
-          onClick={(e) => { e.stopPropagation(); void toggleTrigger(trigger.id, !trigger.paused); }}
-        >
-          {trigger.paused ? 'Resume' : 'Pause'}
-        </button>
+        <SkBlock w="3.75rem" h="2rem" round>
+          <button
+            class="action-btn action-btn-danger"
+            onClick={(e) => { e.stopPropagation(); if (trigger) void deleteTrigger(trigger.id, trigger.name); }}
+          >
+            Delete
+          </button>
+        </SkBlock>
+        <SkBlock w="3.75rem" h="2rem" round>
+          <button
+            class="action-btn"
+            onClick={(e) => { e.stopPropagation(); if (trigger) void toggleTrigger(trigger.id, !trigger.paused); }}
+          >
+            {trigger?.paused ? 'Resume' : 'Pause'}
+          </button>
+        </SkBlock>
       </div>
     </div>
   );

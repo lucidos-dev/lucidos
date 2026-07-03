@@ -6,8 +6,14 @@ import { registerDevice as apiRegisterDevice, listDevices as apiListDevices, ren
 import { showToast, showConfirm } from '../store';
 import { errorDetail } from '../../utils/errorDetail';
 import { isTauri, registrationUserAgent } from '../../utils/platform';
+import { getOrCreateDeviceId } from '../../utils/tauri';
+import { generateUuid } from '../../utils/uuid';
 
 const DEVICE_ID_KEY = 'lucidos-device-id';
+
+/** Upper bound on the native-store reconcile so a wedged IPC can't hold the boot
+ *  splash — past it, boot proceeds on the existing localStorage value. */
+const NATIVE_DEVICE_ID_TIMEOUT_MS = 1500;
 
 export const devices = signal<Loadable<DeviceInfo[]>>({ status: 'not-loaded' });
 
@@ -16,10 +22,83 @@ export const devices = signal<Loadable<DeviceInfo[]>>({ status: 'not-loaded' });
 export function getDeviceId(): string {
   let id = localStorage.getItem(DEVICE_ID_KEY);
   if (!id) {
-    id = crypto.randomUUID();
+    id = generateUuid();
     localStorage.setItem(DEVICE_ID_KEY, id);
   }
   return id;
+}
+
+/**
+ * Desktop-only: reconcile the per-workspace device id with the durable NATIVE store
+ * (a JSON file in the App Support dir) so it survives a DMG reinstall. The
+ * WKWebView's `localStorage` is re-bucketed by a new bundle's code signature, which
+ * is why the packaged app used to register a brand-new device on every update.
+ *
+ * Must run BEFORE the first API call — the device id rides every request as
+ * `x-lucidos-device-id`, so the synchronous `getDeviceId()` must already return the
+ * durable id, not a fresh UUID that would register a spurious device.
+ *
+ * Candidate = the existing `localStorage` id if present (so an already-installed user
+ * keeps their current id with zero churn), else a freshly minted UUID. When storage
+ * is empty (a reinstall re-buckets it) we seed the candidate SYNCHRONOUSLY before the
+ * await: if the native call is ever slow enough that boot proceeds first (the
+ * timeout path in `reconcileDesktopDeviceId`), a concurrent synchronous
+ * `getDeviceId()` then returns this same id instead of minting a *different*
+ * throwaway UUID and registering a spurious device. The native store returns the
+ * stored id for the slug when one exists; we upgrade storage to it only when it
+ * differs from the candidate already there. Best-effort: any failure leaves the
+ * seeded/existing value in place and resolves, so boot is never blocked.
+ *
+ * Pure/injectable (deps passed in) so it's unit-testable without `window`/Tauri.
+ */
+export async function reconcileDeviceIdWithNativeStore(deps: {
+  workspace: string;
+  getOrCreate: (workspace: string, candidate: string) => Promise<string>;
+  storage: Pick<Storage, 'getItem' | 'setItem'>;
+  randomUUID: () => string;
+}): Promise<void> {
+  const { workspace, getOrCreate, storage, randomUUID } = deps;
+  try {
+    const existing = storage.getItem(DEVICE_ID_KEY);
+    const candidate = existing ?? randomUUID();
+    if (existing === null) {
+      // Seed before the await so `getDeviceId()` can't mint a divergent id mid-boot.
+      storage.setItem(DEVICE_ID_KEY, candidate);
+    }
+    const durable = await getOrCreate(workspace, candidate);
+    if (durable && durable !== candidate) {
+      storage.setItem(DEVICE_ID_KEY, durable);
+    }
+  } catch (e) {
+    // Best-effort: a hostile/slow/failed storage or native store must never block
+    // boot (this whole body, incl. the seed, is guarded so it can't reject the
+    // awaited boot path). The app falls back to the seeded/existing localStorage id,
+    // exactly as before this durability layer existed.
+    console.warn('[Devices] native device-id reconcile failed; using localStorage', e);
+  }
+}
+
+/**
+ * Production entry for the reconcile above: wires the real Tauri command +
+ * `localStorage` + `crypto`, bounded by a timeout so a wedged IPC can't hold the
+ * boot splash. Call only when isTauri() and a workspace slug is known.
+ */
+export async function reconcileDesktopDeviceId(workspace: string): Promise<void> {
+  const reconcile = reconcileDeviceIdWithNativeStore({
+    workspace,
+    getOrCreate: getOrCreateDeviceId,
+    storage: localStorage,
+    randomUUID: () => generateUuid(),
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      console.warn('[Devices] native device-id reconcile timed out; using localStorage');
+      resolve();
+    }, NATIVE_DEVICE_ID_TIMEOUT_MS);
+  });
+  await Promise.race([reconcile, timeout]);
+  if (timer) clearTimeout(timer);
 }
 
 /** Register this device with the backend on startup */

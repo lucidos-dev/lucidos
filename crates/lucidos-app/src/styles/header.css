@@ -14,7 +14,7 @@
        own colors. */
     background: var(--accent);
     color: white;
-    font-size: 0.5625rem;
+    font-size: var(--font-size-3xs);
     font-weight: bold;
     border-radius: 0.5625rem;
     min-width: 0.875rem;

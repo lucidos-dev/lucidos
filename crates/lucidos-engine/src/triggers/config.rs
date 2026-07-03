@@ -39,6 +39,37 @@ fn supported_extensions_display() -> String {
         .join(", ")
 }
 
+/// Outcome of a trigger's most recent completed firing. Surfaced on the
+/// trigger row (OK / failed) so a threadless (script) trigger's health is
+/// visible without opening its event stream. Wire values are `"ok"` /
+/// `"failed"`; `None` on the config means "never run / legacy" (a
+/// pre-status-field `TriggerExecuted` event carries no outcome).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TriggerRunStatus {
+    Ok,
+    Failed,
+}
+
+impl TriggerRunStatus {
+    /// Map a run outcome (`execute_user_task`'s `Result`) to a status.
+    pub fn from_success(success: bool) -> Self {
+        if success {
+            Self::Ok
+        } else {
+            Self::Failed
+        }
+    }
+
+    /// Wire string used in the `TriggerExecuted` payload and the trigger-list API.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// What a trigger executes — either an LLM intent or a deterministic script.
 /// The tagged union enforces mutual exclusivity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -122,6 +153,12 @@ pub struct TriggerConfig {
     pub on: Vec<EventSubscription>,
     pub paused: bool,
     pub last_run: Option<DateTime<Utc>>,
+    /// Outcome of the most recent completed firing (OK / failed). `None` until
+    /// the trigger has run at least once under an engine that records status
+    /// (legacy `TriggerExecuted` events carry no outcome → stays `None`).
+    /// Set in memory by `record_trigger_executed` and rebuilt from the
+    /// `TriggerExecuted` payload on boot (see `replay.rs`), mirroring `last_run`.
+    pub last_run_status: Option<TriggerRunStatus>,
     /// Directory name of the app that owns this trigger (e.g. `"trigger-workflow"`),
     /// stamped onto `NotificationCreated.app_id` so the popover can deep-link to
     /// the app. None for standalone triggers. For script triggers under
@@ -308,6 +345,7 @@ impl TriggerConfig {
             on,
             paused,
             last_run: None,
+            last_run_status: None,
             app_id,
             go_to_review,
             group_id,

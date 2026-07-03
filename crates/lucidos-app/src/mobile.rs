@@ -24,15 +24,18 @@ use std::process::Command;
 
 use crate::desktop::engine_port;
 
-/// Where the connect URLs point. `lan_url` / Tailscale fields are `None` when
-/// not detectable (no LAN address, Tailscale absent, etc.).
+/// Where the connect URLs point. `lan_ip` / Tailscale fields are `None` when
+/// not detectable (no LAN address, Tailscale absent, etc.). The LAN *URL* is
+/// deliberately not pre-built here: whether a LAN address is reachable at all
+/// depends on the gateway's network bind (loopback-only by default in
+/// packaged), which the frontend reads from `GET /api/v1/network-config` and
+/// combines with `lan_ip` + `port` (see `MobileAccessPage.tsx::lanRowState`).
 #[derive(Serialize)]
 pub struct ConnectInfo {
     /// The stable gateway port the URLs use.
     pub port: u16,
     pub localhost_url: String,
     pub lan_ip: Option<String>,
-    pub lan_url: Option<String>,
     pub tailscale: TailscaleInfo,
 }
 
@@ -53,13 +56,10 @@ pub struct TailscaleInfo {
 #[tauri::command]
 pub fn get_connect_info() -> ConnectInfo {
     let port = engine_port();
-    let lan_ip = detect_lan_ip();
-    let lan_url = lan_ip.as_ref().map(|ip| format!("http://{ip}:{port}"));
     ConnectInfo {
         port,
         localhost_url: format!("http://localhost:{port}"),
-        lan_ip,
-        lan_url,
+        lan_ip: detect_lan_ip(),
         tailscale: tailscale_status(),
     }
 }

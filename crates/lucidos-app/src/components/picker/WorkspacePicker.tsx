@@ -21,6 +21,7 @@ import { useEffect, useRef } from 'preact/hooks';
 import type { Loadable } from '../../store/types';
 import { Overlay } from '../shared/Overlay';
 import { LoadingFade } from '../shared/LoadingFade';
+import { SkeletonProvider, SkText, SkBlock } from '../shared/Skeleton';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { dismissBootSplash } from '../../utils/bootSplash';
 import { isTauri } from '../../utils/platform';
@@ -95,7 +96,7 @@ const RESTORE_PHASE_LABELS: Record<string, string> = {
 /** Quick-fill names offered in the create form while the name field is empty —
  *  the first-run "name your first workspace" nudge. Clicking one fills the
  *  (editable) field; the user still confirms with Create. */
-export const WORKSPACE_NAME_SUGGESTIONS = ['personal', 'work'] as const;
+export const WORKSPACE_NAME_SUGGESTIONS = ['home', 'team'] as const;
 
 /* ── Inline icons (kept local so the picker stays self-contained) ─────────── */
 
@@ -211,24 +212,29 @@ function TrashIcon() {
   );
 }
 
-/** Brand-matched loading placeholder for the workspace list — shimmer rows that
- *  mirror the real row's three-cell layout (dot · name · actions) so the
- *  skeleton→list handoff doesn't reflow. Kept local + self-contained like the
- *  rest of the picker; decorative → aria-hidden. Shown immediately while the
- *  list loads and crossfaded into it via `<LoadingFade>`. */
+/** Loading placeholder for the workspace list — renders the real
+ *  `ws-picker-row` / `ws-picker-open` markup inside a `SkeletonProvider`, so the
+ *  shimmer cells (dot · name · action) mirror the loaded row by construction and
+ *  use the shared `.sk-bar` vocabulary (no bespoke skel classes to drift). The
+ *  skeleton→list handoff doesn't reflow; decorative → aria-hidden; crossfaded in
+ *  via `<LoadingFade>`. */
 function PickerSkeleton({ rows = 3 }: { rows?: number }) {
   return (
-    <ul class="ws-picker-list ws-picker-skel" aria-hidden="true">
-      {Array.from({ length: rows }, (_, i) => (
-        <li class="ws-picker-row" key={i}>
-          <div class="ws-picker-open">
-            <span class="ws-picker-skel-dot" />
-            <span class="ws-picker-skel-name" />
-            <span class="ws-picker-skel-action" />
-          </div>
-        </li>
-      ))}
-    </ul>
+    <SkeletonProvider>
+      <ul class="ws-picker-list" aria-hidden="true">
+        {Array.from({ length: rows }, (_, i) => (
+          <li class="ws-picker-row" key={i}>
+            <div class="ws-picker-open">
+              <SkBlock w="0.625rem" h="0.625rem" circle />
+              <SkText class="ws-picker-name" w="9rem" />
+              <div class="ws-picker-actions">
+                <SkBlock w="2rem" h="2rem" round />
+              </div>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </SkeletonProvider>
   );
 }
 
@@ -465,7 +471,7 @@ export function WorkspacePicker() {
   // First run: when the picker loads with zero workspaces, open the create form
   // so the user names their first workspace right away — instead of the passive
   // "No workspaces yet" dead-end (and instead of a pre-made `default`). The field
-  // stays empty and editable; the suggestion chips ("personal" / "work") offer a
+  // stays empty and editable; the suggestion chips ("home" / "team") offer a
   // one-click fill. Runs once; a manual Cancel then stays cancelled.
   const firstRunPrompted = useSignal(false);
   useEffect(() => {
@@ -653,64 +659,76 @@ export function WorkspacePicker() {
               How this machine's Lucidos is reachable. The gateway fronts every
               workspace; engines can follow it or bind per-workspace.
             </p>
-            <div class="ws-picker-net-modes" role="radiogroup" aria-label="Gateway bind">
-              {(
-                [
-                  ['loopback', 'Loopback only'],
-                  ['address', 'Tailnet / IP'],
-                  ['all', 'All interfaces'],
-                ] as [BindMode, string][]
-              ).map(([m, label]) => (
-                <button
-                  key={m}
-                  type="button"
-                  role="radio"
-                  aria-checked={gwMode.value === m}
-                  class={`ws-picker-net-mode${gwMode.value === m ? ' active' : ''}`}
-                  onClick={() => (gwMode.value = m)}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-            {gwMode.value === 'address' && (
-              <>
+            {/* The form STRUCTURE renders immediately at a constant height; only
+                the config-dependent VALUES (active bind, toggle state, the
+                address field) wait for the load. So the popover never resizes on
+                load for the loopback/all cases — the jank the user hit when a
+                skeleton of a different height swapped to the form. While loading,
+                the value-bearing controls dim + go inert (no wrong default shown,
+                since nothing is marked active until the config lands); the static
+                explanatory text below renders right away and pins the height. */}
+            <div class={`ws-picker-net-controls${networkConfig.value ? '' : ' is-loading'}`} aria-busy={!networkConfig.value}>
+              <div class="ws-picker-net-modes" role="radiogroup" aria-label="Gateway bind">
+                {(
+                  [
+                    ['loopback', 'Loopback only'],
+                    ['address', 'Tailnet / IP'],
+                    ['all', 'All interfaces'],
+                  ] as [BindMode, string][]
+                ).map(([m, label]) => (
+                  <button
+                    key={m}
+                    type="button"
+                    role="radio"
+                    aria-checked={!!networkConfig.value && gwMode.value === m}
+                    class={`ws-picker-net-mode${networkConfig.value && gwMode.value === m ? ' active' : ''}`}
+                    disabled={busy.value || !networkConfig.value}
+                    onClick={() => (gwMode.value = m)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {networkConfig.value && gwMode.value === 'address' && (
+                <>
+                  <input
+                    class="ws-picker-input"
+                    type="text"
+                    placeholder={networkConfig.value?.detected_tailscale_ip ?? '100.x.y.z'}
+                    value={gwAddress.value}
+                    aria-invalid={gwAddress.value.trim() !== '' && !isValidIp(gwAddress.value)}
+                    aria-label="Gateway bind IP address"
+                    onInput={(e) => (gwAddress.value = (e.target as HTMLInputElement).value)}
+                  />
+                  {gwAddress.value.trim() !== '' && !isValidIp(gwAddress.value) ? (
+                    <span class="ws-picker-net-error">Not a valid IP address.</span>
+                  ) : networkConfig.value?.detected_tailscale_ip ? (
+                    <span class="ws-picker-net-hint">
+                      Detected Tailscale:{' '}
+                      <button
+                        type="button"
+                        class="ws-picker-net-detected"
+                        title="Use this address"
+                        onClick={fillDetectedTailscaleIp}
+                      >
+                        {networkConfig.value.detected_tailscale_ip}
+                      </button>
+                    </span>
+                  ) : (
+                    <span class="ws-picker-net-hint">Your Tailscale 100.x address, or a LAN IP.</span>
+                  )}
+                </>
+              )}
+              <label class="ws-picker-net-toggle">
                 <input
-                  class="ws-picker-input"
-                  type="text"
-                  placeholder={networkConfig.value?.detected_tailscale_ip ?? '100.x.y.z'}
-                  value={gwAddress.value}
-                  aria-invalid={gwAddress.value.trim() !== '' && !isValidIp(gwAddress.value)}
-                  aria-label="Gateway bind IP address"
-                  onInput={(e) => (gwAddress.value = (e.target as HTMLInputElement).value)}
+                  type="checkbox"
+                  checked={!!networkConfig.value && gwInherit.value}
+                  disabled={!networkConfig.value}
+                  onChange={(e) => (gwInherit.value = (e.target as HTMLInputElement).checked)}
                 />
-                {gwAddress.value.trim() !== '' && !isValidIp(gwAddress.value) ? (
-                  <span class="ws-picker-net-error">Not a valid IP address.</span>
-                ) : networkConfig.value?.detected_tailscale_ip ? (
-                  <span class="ws-picker-net-hint">
-                    Detected Tailscale:{' '}
-                    <button
-                      type="button"
-                      class="ws-picker-net-detected"
-                      title="Use this address"
-                      onClick={fillDetectedTailscaleIp}
-                    >
-                      {networkConfig.value.detected_tailscale_ip}
-                    </button>
-                  </span>
-                ) : (
-                  <span class="ws-picker-net-hint">Your Tailscale 100.x address, or a LAN IP.</span>
-                )}
-              </>
-            )}
-            <label class="ws-picker-net-toggle">
-              <input
-                type="checkbox"
-                checked={gwInherit.value}
-                onChange={(e) => (gwInherit.value = (e.target as HTMLInputElement).checked)}
-              />
-              <span>Engines inherit gateway bind</span>
-            </label>
+                <span>Engines inherit gateway bind</span>
+              </label>
+            </div>
             <p class="ws-picker-net-hint">
               When off, each workspace sets its own engine bind in its Settings →
               Network access.

@@ -471,6 +471,15 @@ async fn cancel_chat_with_pending_question_resolves_card_as_canceled() {
         .await
         .expect("cancel request failed");
     assert_eq!(resp.status().as_u16(), 200, "chat cancel should return 200");
+    // Resolving the pending question card IS a status-changing effect, so the
+    // honest response must report `canceled: true` — the client keeps its
+    // optimistic "canceling" state (the card resolution is the incoming event)
+    // rather than treating the click as a stale no-op.
+    let body: serde_json::Value = resp.json().await.expect("cancel response must be JSON");
+    assert_eq!(
+        body["canceled"], true,
+        "cancel that resolved a pending question must report canceled=true"
+    );
 
     // Poll for the auto-canceled answer (5s — same budget as the freeform
     // routing above; the emit path is a single DB round-trip).
@@ -501,5 +510,57 @@ async fn cancel_chat_with_pending_question_resolves_card_as_canceled() {
         canceled_kind.as_deref(),
         Some("Canceled"),
         "cancel must resolve the pending question with AnswerKind::Canceled"
+    );
+}
+
+/// The uncancelable-thread wedge fix: a Stop click on a chat thread that has
+/// nothing to cancel (idle, no pending question, no live turn) must report
+/// `{"canceled": false}` — a bodyless/`true` 200 leaves the client's optimistic
+/// "canceling" flag stuck, disabling the button while the thread keeps going.
+/// It must NOT fabricate a terminal event on an already-idle thread.
+#[tokio::test]
+async fn cancel_chat_idle_thread_reports_not_canceled() {
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+
+    let thread_id = Uuid::new_v4();
+    // Idle chat thread, no pending question, no live session.
+    seed_chat_thread_summary(&pool, thread_id, "idle").await;
+
+    let before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(0);
+
+    let resp = client
+        .post(format!(
+            "{}/api/v1/chat/cancel?thread_id={}",
+            base_url(),
+            thread_id
+        ))
+        .send()
+        .await
+        .expect("cancel request failed");
+    assert_eq!(resp.status().as_u16(), 200, "chat cancel should return 200");
+    let body: serde_json::Value = resp.json().await.expect("cancel response must be JSON");
+    assert_eq!(
+        body["canceled"], false,
+        "cancel on an idle thread with nothing to cancel must report canceled=false so the client re-syncs"
+    );
+
+    // No junk terminal event fabricated on an already-idle thread.
+    let after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(0);
+    assert_eq!(
+        after, before,
+        "a no-op cancel must not emit any event on an idle thread"
     );
 }

@@ -56,12 +56,10 @@ describe('refreshChangesState backfills restart_groups from API', () => {
       { threadId: 't2', threadTitle: 'Update scheduler', commits: ['refactor: x'] },
     ]);
 
-    // The toast itself stays generic — the per-thread breakdown lives in the
-    // ControlPanel restart confirm dialog. Backfill must still populate the
-    // groups signal so the dialog has data to show.
-    const toast = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
-    expect(toast).toBeTruthy();
-    expect(toast!.message).toBe('Engine restart required to apply changes.');
+    // No toast is surfaced — the engine "New version available" toast is owned by
+    // the poll (engine-update.ts) once the rebuild is `ready`. Backfill's job is to
+    // populate the groups signal so the restart confirm dialog has data to show.
+    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)).toBeFalsy();
   });
 
   it('clears restartGroups when API returns empty restart_groups', async () => {

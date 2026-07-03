@@ -74,6 +74,7 @@ fn make_session(last_event_at_ms: i64) -> AgentSession {
         question_resume_pending: false,
         tools_in_flight: Arc::new(AtomicI32::new(0)),
         coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        agent_cancel: tokio_util::sync::CancellationToken::new(),
     }
 }
 
@@ -102,10 +103,9 @@ async fn tick_fires_for_stuck_session_emits_continuation_requested_and_drops_ent
     let thread_id = Uuid::new_v4();
     seed_cc_thread(&bus, thread_id).await;
     let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    sessions
-        .lock()
-        .await
-        .insert(thread_id, make_session(stale_for(limit_ms)));
+    let session = make_session(stale_for(limit_ms));
+    let cancel = session.agent_cancel.clone();
+    sessions.lock().await.insert(thread_id, session);
 
     let watchdog =
         ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
@@ -119,6 +119,11 @@ async fn tick_fires_for_stuck_session_emits_continuation_requested_and_drops_ent
     assert!(
         !sessions.lock().await.contains_key(&thread_id),
         "stuck session's entry must be removed so spawn dispatcher can boot a fresh --resume"
+    );
+    assert!(
+        cancel.is_cancelled(),
+        "recovering a stuck session must cancel agent_cancel so the driver_task tears \
+         down the subprocess — otherwise the --resume spawns a second concurrent agent"
     );
 
     pool.close().await;
@@ -136,10 +141,9 @@ async fn tick_leaves_healthy_session_alone() {
     seed_cc_thread(&bus, thread_id).await;
     let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     // Last event 1 s ago — far inside 10-min limit.
-    sessions
-        .lock()
-        .await
-        .insert(thread_id, make_session(now_epoch_millis() - 1000));
+    let session = make_session(now_epoch_millis() - 1000);
+    let cancel = session.agent_cancel.clone();
+    sessions.lock().await.insert(thread_id, session);
 
     let watchdog =
         ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
@@ -147,6 +151,10 @@ async fn tick_leaves_healthy_session_alone() {
 
     assert_eq!(count_continuation_requests(&pool, thread_id).await, 0);
     assert!(sessions.lock().await.contains_key(&thread_id));
+    assert!(
+        !cancel.is_cancelled(),
+        "a healthy (Skip) session must never have its subprocess cancelled"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -393,6 +401,68 @@ async fn tick_flips_external_terminal_emitted_before_dropping_stuck_session() {
     assert!(
         flag.load(std::sync::atomic::Ordering::Acquire),
         "tick must set external_terminal_emitted=true to suppress the wedged in-loop's safety-net abort"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The liveness guard: a session that produced a fresh event *after* the
+/// snapshot (its `last_event_at` advanced past `snapshot_last_ms`) has recovered
+/// on its own — `recover_stuck` must leave it ENTIRELY alone: no token cancel
+/// (so a live, progressing subprocess is never killed), no entry drop, and no
+/// `ContinuationRequested`. Exercised at the `recover_stuck` seam so the
+/// snapshot→mutate liveness window is deterministic.
+#[tokio::test]
+async fn recover_stuck_skips_session_that_recovered_since_snapshot() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let limit_ms = 50;
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+
+    // Was stale when the snapshot ran…
+    let snapshot_last_ms = stale_for(limit_ms);
+    let session = make_session(snapshot_last_ms);
+    let cancel = session.agent_cancel.clone();
+    let last_event_at = session.last_event_at.clone();
+    let external_terminal = session.external_terminal_emitted.clone();
+    let idle_notify = session.idle_notify.clone();
+    let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    sessions.lock().await.insert(thread_id, session);
+
+    // …but a fresh event arrives before the mutate pass — the session recovered.
+    last_event_at.store(now_epoch_millis(), std::sync::atomic::Ordering::Relaxed);
+
+    let candidate = super::StuckSession {
+        thread_id,
+        elapsed_ms: 0,
+        external_terminal,
+        idle_notify,
+        agent_cancel: cancel.clone(),
+        last_event_at,
+        snapshot_last_ms,
+        needs_running_check: false,
+    };
+
+    let watchdog =
+        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
+    watchdog.recover_stuck(vec![candidate]).await;
+
+    assert!(
+        !cancel.is_cancelled(),
+        "a session that recovered since the snapshot must NOT be cancelled/killed"
+    );
+    assert!(
+        sessions.lock().await.contains_key(&thread_id),
+        "a recovered session's entry must be left intact (not dropped)"
+    );
+    assert_eq!(
+        count_continuation_requests(&pool, thread_id).await,
+        0,
+        "a recovered session must not be resumed (no duplicate --resume)"
     );
 
     pool.close().await;

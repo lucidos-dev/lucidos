@@ -3,6 +3,7 @@ import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oau
 import { devices, getDeviceId, loadDevices, updateDeviceName, toggleDevicePush, removeDevice } from '../../store/actions/devices';
 import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentInAppBrowser, setInAppBrowser, type Theme, type FontFamily } from '../../store/actions/preferences';
 import { openScaleModal } from '../shared/scaleModalState';
+import { applyNavFocus } from '../shared/focusMarker';
 import { formatDateTime, formatShortDateWithYear } from '../../utils/formatTime';
 import { loadOAuthAccounts, disconnectOAuthAccount, grantOAuthScope } from '../../store/actions/oauth';
 import { initPushSubscription } from '../../store/actions/push';
@@ -30,7 +31,7 @@ import { loadRepositories } from '../../store/actions/chat';
 import { API, mutatingFetch, throwIfNotOk } from '../../api/client';
 import { DirectoryPicker } from './DirectoryPicker';
 import { LoadableError } from '../shared/LoadableError';
-import { ListSkeleton } from '../shared/ListSkeleton';
+import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { focusFirstFocusableWithin } from '../layout/paneFocus';
@@ -150,27 +151,36 @@ function parseUserAgent(ua: string | null): string {
   return `${browser} on ${os}`;
 }
 
+/** Self-skeletonizing device row: rendered with no props inside a
+ *  SkeletonProvider (`<DeviceRow />`) it draws itself as a loading placeholder
+ *  via the Sk* leaves; with real props it renders normally. The `editing` state
+ *  lives in the parent (`editingId`/`setEditingId`) so the skeleton call passes
+ *  nothing. Props are optional only to support that call; real call sites pass
+ *  them all. */
 function DeviceRow({ device, editingId, setEditingId }: {
-  device: DeviceInfo;
-  editingId: string | null;
-  setEditingId: (id: string | null) => void;
+  device?: DeviceInfo;
+  editingId?: string | null;
+  setEditingId?: (id: string | null) => void;
 }) {
+  const sk = useSkeleton();
   const [editValue, setEditValue] = useState('');
   const currentDeviceId = getDeviceId();
-  const isCurrent = device.id === currentDeviceId;
-  const displayName = device.name || device.id;
-  const editing = editingId === device.id;
+  const isCurrent = !sk && device?.id === currentDeviceId;
+  const displayName = device?.name || device?.id || '';
+  const editing = !sk && device != null && editingId === device.id;
   const inputRef = useCallback((el: HTMLInputElement | null) => {
     if (el) { el.focus(); el.select(); }
   }, []);
 
   function startEditing() {
+    if (!device) return;
     setEditValue(device.name || displayName);
-    setEditingId(device.id);
+    setEditingId?.(device.id);
   }
 
   function saveEdit() {
-    setEditingId(null);
+    if (!device) return;
+    setEditingId?.(null);
     const trimmed = editValue.trim();
     const newName = (trimmed && trimmed !== device.id) ? trimmed : null;
     if (newName !== device.name) {
@@ -179,16 +189,20 @@ function DeviceRow({ device, editingId, setEditingId }: {
   }
 
   function cancelEdit() {
-    setEditingId(null);
+    setEditingId?.(null);
   }
 
+  // Web push can only be enabled from the target device itself — a browser can
+  // only create its own `pushManager.subscribe()`, never another device's. So
+  // enabling push for a non-current device is impossible; the toggle is disabled
+  // in that state (see below) rather than firing an error on click. Disabling
+  // push remotely (and Remove) stays allowed.
+  const enableBlocked = !sk && !isCurrent && !device?.push_enabled;
+
   async function handleTogglePush() {
+    if (!device) return;
     const newEnabled = !device.push_enabled;
     if (newEnabled) {
-      if (!isCurrent) {
-        showToast('Enable push from that device', 'error');
-        return;
-      }
       const ok = await initPushSubscription();
       if (!ok) return;
     }
@@ -199,7 +213,9 @@ function DeviceRow({ device, editingId, setEditingId }: {
     <div class={`list-row ${isCurrent ? 'device-current' : ''}`}>
       <div class="list-row-info">
         <div class="title list-row-name">
-          {editing ? (
+          {sk ? (
+            <SkText class="device-name" w="9rem" />
+          ) : editing ? (
             <input
               class="device-name-input"
               type="text"
@@ -217,32 +233,42 @@ function DeviceRow({ device, editingId, setEditingId }: {
           )}
           {isCurrent && <span class="device-badge">This device</span>}
         </div>
-        <div class="list-row-details">
-          <span>{parseUserAgent(device.user_agent)}</span>
+        <SkText class="list-row-details" as="div" w="14rem">
+          <span>{parseUserAgent(device?.user_agent ?? null)}</span>
           {' \u00b7 '}
-          <span data-tooltip={formatDateTime(new Date(device.last_seen_at))}>
-            {formatTimeAgo(new Date(device.last_seen_at))}
-          </span>
-        </div>
+          {device && (
+            <span data-tooltip={formatDateTime(new Date(device.last_seen_at))}>
+              {formatTimeAgo(new Date(device.last_seen_at))}
+            </span>
+          )}
+        </SkText>
       </div>
       <div class="list-row-actions">
-        <span class={`device-push-label${device.push_enabled ? '' : ' push-disabled'}`}>Push</span>
-        <label class="toggle-switch">
-          <input
-            type="checkbox"
-            checked={device.push_enabled}
-            onChange={handleTogglePush}
-          />
-          <span class="toggle-slider" />
-        </label>
-        {isCurrent ? (
-          <span class="action-btn" style="visibility: hidden">Remove</span>
-        ) : (
-          <button
-            class="action-btn action-btn-danger"
-            onClick={() => void removeDevice(device.id)}
-          >Remove</button>
-        )}
+        {!sk && <span class={`device-push-label${device?.push_enabled ? '' : ' push-disabled'}`}>Push</span>}
+        <SkBlock w="2.25rem" h="1.25rem" round>
+          <label
+            class={`toggle-switch${enableBlocked ? ' toggle-switch-disabled' : ''}`}
+            data-tooltip={enableBlocked ? 'Open Lucidos on that device to enable push' : undefined}
+          >
+            <input
+              type="checkbox"
+              checked={device?.push_enabled}
+              disabled={enableBlocked}
+              onChange={handleTogglePush}
+            />
+            <span class="toggle-slider" />
+          </label>
+        </SkBlock>
+        <SkBlock w="4.5rem" h="2rem" round>
+          {isCurrent ? (
+            <span class="action-btn" style="visibility: hidden">Remove</span>
+          ) : (
+            <button
+              class="action-btn action-btn-danger"
+              onClick={() => { if (device) void removeDevice(device.id); }}
+            >Remove</button>
+          )}
+        </SkBlock>
       </div>
     </div>
   );
@@ -343,6 +369,7 @@ function AddRepositoryForm() {
 
 const VERTEX_REGIONS = [
   { value: 'global', label: 'global' },
+  { value: 'eu', label: 'eu (multi-region)' },
   { value: 'europe-west1', label: 'europe-west1 (Belgium)' },
   { value: 'europe-west4', label: 'europe-west4 (Netherlands)' },
   { value: 'europe-west9', label: 'europe-west9 (Paris)' },
@@ -443,14 +470,22 @@ export function SettingsView() {
     const el = document.querySelector<HTMLElement>(`[data-search-anchor="${target}"]`);
     if (el) {
       el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      el.classList.remove('settings-search-highlight');
-      void el.offsetWidth; // force reflow so the animation re-triggers on repeat clicks
-      el.classList.add('settings-search-highlight');
+      // The anchor can sit on a settings row, a row LABEL span, or a section
+      // title. Land the focus marker on the enclosing .settings-row when there is
+      // one so the sticky border wraps the whole row (its CSS gives it a uniform
+      // gap on all four sides — a bare label span can't take the marker's vertical
+      // margin trick); a section-title anchor (no enclosing row) keeps the marker
+      // on itself, where it's already padded uniformly.
+      const markEl = (el.closest('.settings-row') as HTMLElement | null) ?? el;
+      // Shared navigation focus marker — a sticky border that fades out on the
+      // user's next action (components/shared/focusMarker.ts). Same look as chat
+      // + plugins.
+      applyNavFocus(markEl);
       // Land keyboard focus on the targeted row's control (e.g. the Language
       // dropdown) so a Search Everywhere jump lands focus on the setting itself,
       // not the panel's first control. No-op for a section-title anchor with no
       // focusable child; desktop-only (see focusFirstFocusableWithin).
-      focusFirstFocusableWithin(el);
+      focusFirstFocusableWithin(markEl);
     }
     settingsScrollTarget.value = null;
   }, [settingsScrollTarget.value, settingsSubview.value]);
@@ -580,7 +615,7 @@ export function SettingsView() {
     }
     return (
       <div class="list-rows">
-        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf containerClass="list-rows" row={() => <DeviceRow />} />}>
           {loadable.status === 'loaded'
             ? (() => {
                 if (loadable.data.length === 0) {

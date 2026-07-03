@@ -30,7 +30,7 @@
     /* The dropdown chevron is tiny by default — bump it on mobile so it reads as
      * a clear affordance next to the larger touch-target trigger text. */
     .dropdown-chevron {
-        font-size: 0.8125rem;
+        font-size: var(--font-size-md);
     }
 }
 
@@ -98,7 +98,7 @@
 
 .drawer-item {
     padding: 0.875rem 1.5rem 0.875rem max(2.5rem, env(safe-area-inset-left, 0px));
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     color: var(--text-secondary);
     cursor: pointer;
     min-height: 2.75rem;
@@ -125,7 +125,7 @@
     /* Blue notification accent, matching the base .badge. */
     background: var(--accent);
     color: var(--text-on-accent);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     border-radius: 0.5625rem;
     min-width: 1.25rem;
@@ -174,7 +174,12 @@
     }
 
     .prompt-box .prompt-textarea {
-        font-size: 0.9rem; /* 0.9 × 18px mobile base = 16.2px — above 16px iOS zoom threshold */
+        /* Intentionally a LITERAL, not a --font-size-* token: this must compute
+           to >=16px so focusing it doesn't trigger iOS Safari's input zoom, and
+           the mobile root is 18px (var(--user-ui-scale, 112.5%) above). 0.9rem ×
+           18px = 16.2px clears the threshold; the nearest token (--font-size-lg,
+           0.875rem = 15.75px here) would fall below it. Leave as 0.9rem. */
+        font-size: 0.9rem;
         min-height: 2.25rem; /* Accommodate clear-button height in prompt row */
         -webkit-user-select: text;
         user-select: text;
@@ -238,10 +243,6 @@
         align-items: flex-start;
     }
 
-    .thread-row-right {
-        align-self: flex-start;
-    }
-
     .list-row-url {
         max-width: calc(100vw - 4.5rem);
     }
@@ -295,8 +296,11 @@
 
     .dropdown-panel-toolbar {
         flex-shrink: 0;
-        padding-left: max(0.75rem, env(safe-area-inset-left, 0px));
-        padding-right: max(0.75rem, env(safe-area-inset-right, 0px));
+        /* Keep the --space-lg (1rem) content-pane gutter on mobile too (so the
+           toggle stays aligned with the .notification-item rows), widened only
+           where the notch's safe-area inset exceeds it. */
+        padding-left: max(var(--space-lg), env(safe-area-inset-left, 0px));
+        padding-right: max(var(--space-lg), env(safe-area-inset-right, 0px));
     }
 
     .confirm-dialog {
@@ -376,18 +380,49 @@
         position: relative;
     }
 
-    /* Left-aligned title — flows in the flex row */
+    /* TRUE-centered on the row's middle (like the pane dots + the desktop
+       header) — absolute so it sits on the viewport axis regardless of the
+       leading (hamburger + nav / filter) and trailing (actions) cluster widths,
+       NOT midway between them (an in-flow title centers between the clusters, so
+       it drifts off the viewport middle whenever the two clusters differ in
+       width — the off-center look this replaces). A symmetric `max-width` reserve
+       keeps the centered box clear of BOTH clusters: at its widest the box spans
+       (reserve/2) in from each edge, so a long title clamps + ellipsizes with its
+       left edge just past the widest leading cluster (~5rem) instead of crossing
+       it. pointer-events:none passes taps through to the clusters beneath (the
+       brand's visible children + the content title re-enable them below). The
+       single trailing .pane-header-spacer (flex:1) pins the clusters to the row
+       edges; search-active hides all non-searchbar children via the
+       .mobile-header-row rule below. */
     .mobile-header-title {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        max-width: calc(100% - 10.5rem);
+        text-align: center;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-        min-width: 0;
-        margin-left: 0.125rem;
+        pointer-events: none;
     }
 
-    /* Brand label doesn't need truncation — allow badge to overflow */
+    .mobile-header-title > * {
+        pointer-events: auto;
+    }
+
+    /* Brand: keep overflow visible so the update badge (a relative, upward-nudged
+       dot over "Lucidos") isn't clipped. Bound the inner label to the centered
+       box so a long workspace name TRUNCATES within it (the .workspace-name-label
+       already ellipsizes) rather than spilling past the box over the leading
+       icons — the brand's own no-overlap guarantee. */
     .pane-header-brand.mobile-header-title {
         overflow: visible;
+    }
+
+    .pane-header-brand.mobile-header-title .pane-header-brand-label {
+        max-width: 100%;
+        min-width: 0;
     }
 
     /* Mobile header slot — square so hamburger/nav/search line up. Drawer
@@ -429,16 +464,9 @@
         gap: 0.25rem;
     }
 
-    /* Cross-header title alignment: the thread (brand) and content headers lead
-       with a hamburger + nav slot before their title; the threads header leads
-       with the single Filter button. Reserve a fixed leading width on the Filter
-       button's slot so the "Threads" title starts at the same x as "Lucidos" /
-       the content title (the three mobile headers stack as you swipe, so their
-       titles must line up). The lone Filter button packs to the left edge; the
-       reserved width parks the freed space toward the title. */
-    .mobile-threads-header .view-selector-slot {
-        width: 5.75rem;
-    }
+    /* The threads Filter button just packs to the left edge; the title is
+       absolutely centered on the row middle (see .mobile-header-title), so the
+       titles line up across panes with no fixed leading-width reservation. */
 
     .mobile-nav-slot .content-back-btn,
     .mobile-nav-slot .content-forward-btn,
@@ -447,10 +475,29 @@
         height: 1.75rem;
     }
 
+    /* The absolutely-centered title is pointer-events:none, so lift the content
+       action cluster into its own stacking context: if a long content title
+       reaches under these icons, they still paint over it AND win the tap (the
+       content title below re-enables pointer events for its tap tooltip, so
+       without this a long title could intercept an action). */
+    .mobile-header-row .content-header-actions {
+        position: relative;
+        z-index: 1;
+    }
+
     .mobile-content-title {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
+        /* Reserve a bit more than the base title: the content header's trailing
+           cluster (refresh/open/fullscreen/notifications, plus file toggles) is
+           the widest, so cap the centered title tighter to keep it clear of those
+           icons in the common cases. Inherits overflow/ellipsis from
+           .mobile-header-title. */
+        max-width: calc(100% - 12rem);
+        /* Bare text node (no element child for `.mobile-header-title > *` to
+           re-enable), so re-enable pointer events here — the tap tooltip
+           (data-tooltip-tap) reveals the full truncated title. Safe: the action
+           cluster is lifted above it (z-index above), so it can't intercept an
+           action tap even if a long title reaches under the icons. */
+        pointer-events: auto;
     }
 
     /* Hide desktop content title on mobile */
@@ -494,7 +541,7 @@
            desktop threads search in shell.css's brand-blue header block). */
         color: var(--header-fg);
         caret-color: var(--header-fg);
-        font-size: 0.875rem;
+        font-size: var(--font-size-lg);
         font-family: var(--font-ui);
         min-width: 0;
     }
@@ -572,7 +619,10 @@
         top: 100%;
         left: 0;
         right: 0;
-        height: 1rem;
+        /* --mobile-title-fade (base.css) — shared with the mobile .chat-exchange
+           scroll-margin-top (chat/response.css) so a navigated turn lands clear
+           of this band. */
+        height: var(--mobile-title-fade);
         background: linear-gradient(to bottom, var(--bg-primary), transparent);
         opacity: 0;
         transition: opacity 0.2s ease;
@@ -705,19 +755,21 @@
     }
 
     /* The ::before spacer replaces padding-top, so zero out the base padding-top
-       on .thread-content (which has padding: 0.5rem 0.75rem 4rem in chat.css).
-       Also reduce padding-bottom: the 4rem is for the desktop floating bottom bar
-       that overlays the scroll area. On mobile the prompt/buttons sit below the
-       scroll container in normal flex flow, so only a small bottom margin is needed.
-       .thread-content must stay display:block — Safari ignores scrollTo on
-       flex-column + overflow-y:auto elements. */
+       on .thread-content (the base rule reserves top room past the desktop fade
+       mask, which mobile doesn't have — the sticky title covers the top instead).
+       padding-bottom keeps the base's prompt-fade clearance (below). .thread-content
+       must stay display:block — Safari ignores scrollTo on flex-column +
+       overflow-y:auto elements. */
     .mobile-swipe-pane .thread-content-wrap {
         display: flex;
         flex-direction: column;
     }
     .mobile-swipe-pane .thread-content {
         padding-top: 0;
-        padding-bottom: 0.75rem;
+        /* Matches the desktop base rule: reserve room past the prompt dissolve
+           (--prompt-fade) plus the focus-marker reach (--nav-focus-reach) so the
+           last turn's .nav-focus-stuck border clears the fade. */
+        padding-bottom: calc(var(--prompt-fade) + var(--nav-focus-reach));
         position: relative;
         flex: 1;
         min-height: 0;
@@ -901,11 +953,20 @@
         opacity: 0.3;
         cursor: pointer;
         -webkit-tap-highlight-color: transparent;
+        /* The active dot "blooms on like a light": on activate the dot ITSELF
+           swaps muted→fill, gains the glow, and brightens, so all three
+           properties transition together (0.33s ease-out) to make the body + soft
+           glow rise together into the steady glow rather than snapping on. */
+        transition: opacity 0.33s ease-out, background 0.33s ease-out,
+                    box-shadow 0.33s ease-out;
     }
 
+    /* Active dot wears the per-theme active-pane fill + neon bloom
+       (--focus-pill-* in base.css) and blooms in over 0.33s ease-out. */
     .mobile-dot.active {
         opacity: 1;
-        background: var(--header-fg, var(--accent));
+        background: var(--focus-pill-bg);
+        box-shadow: var(--focus-pill-glow);
     }
 }
 
@@ -997,7 +1058,7 @@
 
     .landscape-lock p {
         margin: 0;
-        font-size: 1rem;
+        font-size: var(--font-size-xl);
         color: var(--text-secondary);
     }
 }

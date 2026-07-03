@@ -96,6 +96,65 @@ fn filter_request_headers_drops_stripped_keeps_others() {
     assert!(!out.contains_key("referer"));
     }
 
+    // ---- Browser-origin guard ---------------------------------------------
+
+    #[test]
+    fn browser_proxy_guard_allows_non_browser_clients() {
+        assert!(browser_proxy_request_allowed(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn browser_proxy_guard_allows_same_origin_browser_requests() {
+        let h = hm(&[
+            ("Host", "localhost:5251"),
+            ("Origin", "http://localhost:5251"),
+            ("Sec-Fetch-Site", "same-origin"),
+        ]);
+        assert!(browser_proxy_request_allowed(&h));
+    }
+
+    #[test]
+    fn browser_proxy_guard_rejects_cross_site_fetch_metadata() {
+        let h = hm(&[
+            ("Host", "localhost:5251"),
+            ("Origin", "https://evil.example"),
+            ("Sec-Fetch-Site", "cross-site"),
+        ]);
+        assert!(!browser_proxy_request_allowed(&h));
+    }
+
+    #[test]
+    fn browser_proxy_guard_rejects_foreign_origin_without_fetch_metadata() {
+        // Older browsers may omit Sec-Fetch-* but still send Origin on POSTs.
+        // A hostile page can issue the request even though CORS prevents reading
+        // the response, so Origin must still match Host for credentialed proxy
+        // routes.
+        let h = hm(&[
+            ("Host", "localhost:5251"),
+            ("Origin", "https://evil.example"),
+        ]);
+        assert!(!browser_proxy_request_allowed(&h));
+    }
+
+    #[test]
+    fn browser_proxy_guard_rejects_same_site_but_not_same_origin() {
+        let h = hm(&[
+            ("Host", "localhost:5251"),
+            ("Origin", "http://localhost:5252"),
+            ("Sec-Fetch-Site", "same-site"),
+        ]);
+        assert!(!browser_proxy_request_allowed(&h));
+    }
+
+    #[test]
+    fn origin_authority_matches_host_normalizes_default_ports() {
+        assert!(origin_authority_matches_host("https://localhost", "localhost:443"));
+        assert!(origin_authority_matches_host("https://localhost", "localhost"));
+        assert!(origin_authority_matches_host("http://LOCALHOST:80", "localhost:80"));
+        assert!(origin_authority_matches_host("http://LOCALHOST:80", "localhost"));
+        assert!(!origin_authority_matches_host("https://localhost", "localhost:444"));
+    }
+
     // Auth header building (Bearer/ApiKey/Basic) moved to AuthLayer impls
     // — see proxy_static_layers tests for equivalent coverage.
 
@@ -583,7 +642,7 @@ async fn upstream_does_not_see_stripped_headers() {
     assert!(!observed.iter().any(|n| n.eq_ignore_ascii_case("cookie")));
     assert!(!observed.iter().any(|n| n.eq_ignore_ascii_case("origin")));
     assert!(!observed.iter().any(|n| n.eq_ignore_ascii_case("referer")));
-        assert!(observed.iter().any(|n| n.eq_ignore_ascii_case("x-keep-me")));
+    assert!(observed.iter().any(|n| n.eq_ignore_ascii_case("x-keep-me")));
 }
 
 #[tokio::test]

@@ -190,7 +190,7 @@ describe('lucidos.ui.toast', () => {
     const ret = ui.toast('Saved', 'success', { durationMs: 2000, dismissable: false });
     expect(ret).toBeUndefined();
     expect(postMessage).toHaveBeenCalledWith(
-      { type: 'lucidos:ui:toast', payload: { message: 'Saved', type: 'success', durationMs: 2000, dismissable: false } },
+      { type: 'lucidos:ui:toast', payload: { message: 'Saved', type: 'success', durationMs: 2000, dismissable: false, key: undefined } },
       '*',
     );
   });
@@ -198,9 +198,21 @@ describe('lucidos.ui.toast', () => {
   it('defaults type to info and leaves opts undefined when omitted', () => {
     ui.toast('Heads up');
     expect(postMessage).toHaveBeenCalledWith(
-      { type: 'lucidos:ui:toast', payload: { message: 'Heads up', type: 'info', durationMs: undefined, dismissable: undefined } },
+      { type: 'lucidos:ui:toast', payload: { message: 'Heads up', type: 'info', durationMs: undefined, dismissable: undefined, key: undefined } },
       '*',
     );
+  });
+
+  it('forwards opts.key for in-place replacement when provided', () => {
+    ui.toast('Opening from Drive…', 'info', { key: 'drive-open' });
+    expect(postMessage.mock.calls[0][0].payload.key).toBe('drive-open');
+  });
+
+  it('leaves key undefined in the payload when omitted or empty', () => {
+    ui.toast('No key here');
+    expect(postMessage.mock.calls[0][0].payload.key).toBeUndefined();
+    ui.toast('Empty key', 'info', { key: '' });
+    expect(postMessage.mock.calls[1][0].payload.key).toBeUndefined();
   });
 
   it('degrades an unknown type to info rather than failing', () => {

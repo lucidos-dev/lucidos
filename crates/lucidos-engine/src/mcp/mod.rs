@@ -65,6 +65,9 @@ impl McpManager {
                 Ok(format!(
                     "MCP server '{}' is registered but failed to connect: {}. \
                      Make sure the server command is correct and any required application (e.g. Blender) is running. \
+                     If the command was not found, give an absolute path to it or install its \
+                     interpreter (node/npx/uvx/python) in a standard location — a packaged build \
+                     searches only a minimal PATH plus the common install dirs. \
                      Use start_mcp_server to try again.",
                     name, e
                 ))

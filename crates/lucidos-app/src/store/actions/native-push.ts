@@ -133,16 +133,29 @@ async function showNativeBanner(payload: NativePushRequestedPayload): Promise<vo
  *  DURABLE delivery: the deep link is NOT read off the live event payload. The
  *  Rust delegate stashes every tapped deep link and emits
  *  `native-notification-tapped` only as a wake signal; we DRAIN the stash
- *  (`takePendingNativeTaps`) on BOTH this startup path (cold) and each signal
- *  (warm). This is the fix for taps lost when the page wasn't listening at emit
- *  time — webview reloaded / suspended-while-trayed / client relaunched — which
- *  Tauri does not replay. The Rust drain is atomic, so every tap routes exactly
- *  once across both paths and never re-fires on a later reload. Tauri-only;
- *  returns an unlisten. Call once at startup. See notifications.rs +
+ *  (`takePendingNativeTaps`) on FOUR triggers — startup (cold), the live signal
+ *  (warm), and the window regaining focus / visibility. This is the fix for taps
+ *  lost when the page wasn't listening at emit time — webview reloaded /
+ *  suspended-while-trayed / client relaunched — which Tauri does not replay.
+ *
+ *  Why focus/visibility matter: a native banner only shows while the page is
+ *  INACTIVE (handleNativePushRequested gates on isPageActive), so a banner tap
+ *  ALWAYS lands on a backgrounded/hidden — often JS-throttled — WKWebView.
+ *  `show_main_window` then SHOWS the existing window WITHOUT reloading, so the
+ *  startup cold drain never re-runs, and the warm `app.emit` is a fire-and-forget
+ *  eval that WebKit can drop onto a just-resumed webview. The `focus` /
+ *  `visibilitychange` events WebKit dispatches IN the webview when the window is
+ *  brought forward are eval-independent, so they reliably catch the stash the
+ *  warm signal missed (the "tap focuses the window but never deep-links" bug).
+ *  The Rust drain is atomic, so every tap routes exactly once across all triggers
+ *  and never re-fires on a later reload. Tauri-only; returns an unlisten that
+ *  removes every trigger. Call once at startup. See notifications.rs +
  *  system-knowhow/notifications.md §4. */
 export async function setupNativePushTapRouting(): Promise<() => void> {
   if (!isTauri()) return () => {};
-  const drainAndDispatch = async (source: 'signal' | 'startup'): Promise<void> => {
+  const drainAndDispatch = async (
+    source: 'signal' | 'startup' | 'focus' | 'visibility',
+  ): Promise<void> => {
     try {
       const taps = await takePendingNativeTaps();
       if (taps.length > 0) {
@@ -160,13 +173,45 @@ export async function setupNativePushTapRouting(): Promise<() => void> {
       console.warn('[NativePush] Failed to drain pending taps:', err);
     }
   };
-  const unlisten = await listen('native-notification-tapped', () => {
-    void drainAndDispatch('signal');
-  });
-  // Cold path: route any tap that arrived before this listener was registered —
-  // the exact race the durable Rust-side stash exists for. Runs after the
-  // listener is wired so a tap landing mid-setup is covered by whichever drain
-  // wins (the atomic take guarantees it isn't dispatched twice).
+
+  const cleanups: Array<() => void> = [];
+
+  // Reliable, eval-independent triggers: WebKit fires `focus` when the window
+  // becomes key and `visibilitychange` when it un-occludes — both happen when a
+  // banner tap brings the window forward. Registered BEFORE the warm listener so
+  // a `listen` failure can't strand them.
+  const onFocus = (): void => {
+    void drainAndDispatch('focus');
+  };
+  const onVisibility = (): void => {
+    if (document.visibilityState === 'visible') void drainAndDispatch('visibility');
+  };
+  window.addEventListener('focus', onFocus);
+  document.addEventListener('visibilitychange', onVisibility);
+  cleanups.push(() => window.removeEventListener('focus', onFocus));
+  cleanups.push(() => document.removeEventListener('visibilitychange', onVisibility));
+
+  // Warm path: the live wake signal. Best-effort — its eval can be dropped on a
+  // suspended/just-resumed webview (the case the focus/visibility drains cover),
+  // so a registration failure must not prevent those drains or the startup drain.
+  try {
+    const unlisten = await listen('native-notification-tapped', () => {
+      void drainAndDispatch('signal');
+    });
+    cleanups.push(unlisten);
+  } catch (err) {
+    // Telemetry carve-out (.claude/rules/frontend.md): listener registration runs
+    // at startup with no user intent; the focus/visibility drains still deliver.
+    console.warn('[NativePush] Failed to register native tap listener:', err);
+  }
+
+  // Cold path: route any tap that arrived before this ran — the exact race the
+  // durable Rust-side stash exists for. Runs after the triggers are wired so a
+  // tap landing mid-setup is covered by whichever drain wins (the atomic take
+  // guarantees it isn't dispatched twice).
   void drainAndDispatch('startup');
-  return unlisten;
+
+  return () => {
+    for (const cleanup of cleanups) cleanup();
+  };
 }

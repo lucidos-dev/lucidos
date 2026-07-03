@@ -14,27 +14,22 @@ use crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON;
 
 use super::extract_thread_uuid;
 
-/// Reject a thread mutation when the availability selector doesn't currently
-/// grant `action` (server-side mirror of the UI gate via
-/// `available_thread_actions_for`). 409 with a user-facing message.
-async fn guard_thread_action(
+/// Read `is_saved` for a thread. `None` = the thread isn't in the projection.
+/// Drives the idempotent save/unsave short-circuit below.
+async fn thread_is_saved(
     state: &AppState,
     thread_id: Uuid,
-    action: crate::engine::thread_lifecycle::Action,
-    reject_msg: &str,
-) -> Result<(), (StatusCode, String)> {
-    let actions = super::available_thread_actions_for(&state.pool, thread_id)
+) -> Result<Option<bool>, (StatusCode, String)> {
+    sqlx::query_scalar("SELECT is_saved FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .fetch_optional(&state.pool)
         .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to read thread state: {e}"),
             )
-        })?;
-    if !actions.contains(&action) {
-        return Err((StatusCode::CONFLICT, reject_msg.to_string()));
-    }
-    Ok(())
+        })
 }
 
 #[derive(Deserialize)]
@@ -89,15 +84,17 @@ pub(in crate::api) async fn save_thread(
     Json(request): Json<serde_json::Value>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let thread_uuid = extract_thread_uuid(&request)?;
-    // Defense in depth: only Save the thread if the availability selector grants
-    // it (same `available_thread_actions` the UI derives the button from).
-    guard_thread_action(
-        &state,
-        thread_uuid,
-        crate::engine::thread_lifecycle::Action::Save,
-        "Thread cannot be saved in its current state",
-    )
-    .await?;
+    // Idempotent: saving an already-saved thread is a 200 no-op, not a 409.
+    // A duplicate / racing `/threads/save` (e.g. an iOS PWA double-submit)
+    // otherwise reaches here after the first request flipped is_saved=TRUE —
+    // `available_thread_actions` then offers only Unsave, so the stale Save
+    // 409'd, and the client's error handler reverted the (correct) optimistic
+    // pin + toasted a spurious "Thread cannot be saved" error.
+    match thread_is_saved(&state, thread_uuid).await? {
+        None => return Err((StatusCode::NOT_FOUND, "Thread not found".to_string())),
+        Some(true) => return Ok(StatusCode::OK),
+        Some(false) => {}
+    }
     let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
     state
@@ -141,13 +138,13 @@ pub(in crate::api) async fn unsave_thread(
     Json(request): Json<serde_json::Value>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let thread_uuid = extract_thread_uuid(&request)?;
-    guard_thread_action(
-        &state,
-        thread_uuid,
-        crate::engine::thread_lifecycle::Action::Unsave,
-        "Thread is not currently saved",
-    )
-    .await?;
+    // Idempotent mirror of save: unsaving an already-unsaved thread is a 200
+    // no-op, not a 409.
+    match thread_is_saved(&state, thread_uuid).await? {
+        None => return Err((StatusCode::NOT_FOUND, "Thread not found".to_string())),
+        Some(false) => return Ok(StatusCode::OK),
+        Some(true) => {}
+    }
     let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
     state

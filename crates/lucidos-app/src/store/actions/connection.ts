@@ -1,4 +1,4 @@
-import { connectionStatus, dismissToast, showToast, toasts, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, TOAST_AUTO_DISMISS_MS } from '../store';
+import { connectionStatus, dismissToast, showToast, toasts, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS } from '../store';
 import { checkHealth, API_BASE } from '../../api/client';
 import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearForcedRetries } from './thread-loading';
@@ -370,24 +370,26 @@ export async function checkConnection(): Promise<boolean> {
       // The restart finished — drop the in-flight marker so a later reload won't
       // restore a stale progress toast (restoreRestartToast in chat-changes.ts).
       clearRestartInFlight();
+      // Restart done — clear the engine "switch pending / available" signals so
+      // the reload-glyph badge reflects the fresh engine immediately; the version
+      // poll re-affirms the true state right after (an outdated release re-sets
+      // restartRequired), so an optimistic clear is safe.
+      restartRequired.value = false;
+      engineVersionReady.value = false;
       dismissToast('restart-required');
-      // Plain, benign confirmation with NO Refresh action. After a pure
-      // engine-only (Rust) restart the loaded client bundle is byte-identical to
-      // what's served — client and engine are in sync — so a refresh here is a
-      // no-op nag. The refresh prompt is owned SOLELY by the honest
-      // client-staleness check (syncClientUpdateFromBuild below): it surfaces the
-      // "New version available" Refresh toast only when the served BUILD_ID
-      // actually differs from the loaded one. So when a restart ALSO rebuilt the
-      // client (mixed change), the user still gets told to refresh — via that
-      // toast, which (now that this one carries no action) is no longer
-      // suppressed by hasRefreshToast.
+      // Plain, benign confirmation with NO action. The client Refresh prompt is
+      // owned SOLELY by the honest client-staleness check
+      // (syncClientUpdateFromBuild below). The switched-to engine now serves its
+      // OWN pinned client (api/frontend_snapshot.rs), so on a mixed change that
+      // served BUILD_ID differs from the still-loaded bundle → the check surfaces
+      // the Refresh toast + badge together (badge ⟺ toast). A pure engine-only
+      // restart leaves the served client byte-identical, so nothing surfaces (a
+      // refresh would be a no-op nag).
       showToast('Engine restarted', 'success', {
         autoDismissMs: TOAST_AUTO_DISMISS_MS,
       });
-      // Light the update badge / surface the refresh toast only if the frontend
-      // bundle ACTUALLY rebuilt (BUILD_ID changed), not for every restart — an
-      // engine-only change bumps the engine but leaves the bundle untouched. The
-      // build-watch rebuild lands a few seconds after the restart, so the
+      // Re-check client staleness now that the new engine serves its pinned
+      // client. The build-watch rebuild may land a few seconds later, so the
       // scheduled SW nudges (scheduleServiceWorkerUpdateChecks, fired from the
       // ChangeApplied arm) re-run this check too; this catches a rebuild that
       // already completed.

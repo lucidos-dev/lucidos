@@ -7,7 +7,12 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: 0.375rem 1rem 0.375rem 0.625rem;
+    /* Shares the content-pane --space-lg (1rem) horizontal gutter, so the
+       top-left segmented toggle sits directly above the .notification-item rows
+       (also --space-lg) in one vertical line — and matches every other list
+       content-pane view. See the "content-pane padding" rule in
+       .claude/rules/frontend.md. */
+    padding: var(--space-md) var(--space-lg) var(--space-sm);
 }
 
 .mark-all-read {
@@ -15,7 +20,7 @@
     border: none;
     color: var(--accent);
     cursor: pointer;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     font-family: var(--font-ui);
 }
 
@@ -32,7 +37,10 @@
 .notification-item {
     display: block;
     width: 100%;
-    padding: 0.75rem 1rem;
+    /* --space-lg (1rem) horizontal gutter shared across content-pane views; the
+       taller --space-md vertical is intentional for these 3-line rows (title +
+       summary + time). */
+    padding: var(--space-md) var(--space-lg);
     border: none;
     background: none;
     color: inherit;
@@ -81,11 +89,11 @@
 }
 
 .notification-title .trigger-icon {
-    font-size: 0.875rem;
+    font-size: var(--font-size-lg);
 }
 
 .notification-summary {
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     color: var(--text-secondary);
     line-height: 1.4;
     display: -webkit-box;
@@ -95,17 +103,17 @@
 }
 
 .notification-time {
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     margin-top: 0.375rem;
 }
 
 /* Loading more indicator at bottom of notification list */
 .dropdown-panel-loading-more {
-    padding: 0.625rem 1rem;
+    padding: var(--space-sm) var(--space-lg);
     text-align: center;
     color: var(--text-muted);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     font-family: var(--font-ui);
 }
 
@@ -127,13 +135,13 @@
     display: flex;
     align-items: center;
     gap: 0.75rem;
-    padding: 0.75rem 1rem 0;
+    padding: var(--space-md) var(--space-lg) 0;
 }
 
 .notification-detail-date {
     flex: 1;
     text-align: center;
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
 }
 
@@ -141,8 +149,8 @@
  * markdown body below it (both at 1rem horizontal padding); wraps multi-line. */
 .notification-detail-title {
     margin: 0;
-    padding: 0.5rem 1rem 0;
-    font-size: 0.875rem;
+    padding: var(--space-sm) var(--space-lg) 0;
+    font-size: var(--font-size-lg);
     font-weight: 600;
     line-height: 1.3;
     color: var(--text-primary);
@@ -205,8 +213,8 @@
 
 /* Markdown rules inherited from .markdown-content in global.css */
 .notification-detail-body {
-    padding: 1rem;
-    font-size: 0.8125rem;
+    padding: var(--space-lg);
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     line-height: 1.5;
     min-width: 0;
@@ -214,7 +222,7 @@
 
 .notification-detail-body th,
 .notification-detail-body td {
-    padding: 0.5rem 0.75rem;
+    padding: var(--space-sm) var(--space-md);
 }
 
 .notification-detail-body a.app-link {
@@ -233,7 +241,7 @@
     display: flex;
     justify-content: center;
     gap: 0.5rem;
-    padding: 0.75rem 1rem;
+    padding: var(--space-md) var(--space-lg);
 }
 
 /* Content views */
@@ -263,7 +271,7 @@
 }
 
 .files-hint {
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
 }
 
@@ -274,7 +282,7 @@
     display: inline-flex;
     align-items: center;
     margin-left: auto;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     border: 1px dashed var(--border-color);
     border-radius: 0.375rem;
@@ -299,7 +307,7 @@
 .files-toolbar-btn {
     background: none;
     border: 1px solid var(--border-color);
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     font-family: var(--font-ui);
     font-weight: 600;
     color: var(--text-secondary);
@@ -353,7 +361,7 @@
 
 .dropdown-section-header {
     padding: 0.25rem 0.5rem;
-    font-size: 0.7rem;
+    font-size: var(--font-size-xs);
     text-transform: uppercase;
     letter-spacing: 0.05em;
     color: var(--text-secondary);
@@ -366,14 +374,14 @@
 
 .change-option-meta {
     display: block;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
 }
 
 /* --- Change badges --- */
 
 .change-badge {
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     font-weight: 700;
     padding: 0 0.25rem;
     border-radius: 0.125rem;
@@ -430,7 +438,7 @@
  * instead of a silent collapse into the no-sidebar layout. */
 .repo-preview-sidebar-state {
     padding: 1rem;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
 }
 
@@ -446,7 +454,7 @@
 
 .diff-view {
     font-family: var(--font-mono);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     overflow-x: hidden;
     overflow-y: auto;
 }
@@ -552,6 +560,10 @@
     background: var(--accent-yellow);
 }
 
+.diff-strip-removed {
+    background: var(--accent-red);
+}
+
 /* Full-width background tint that paints across the merged region — covers
    the vertical margin gaps between adjacent marked siblings (paragraphs,
    list items) which the per-element backgrounds can't reach. */
@@ -569,28 +581,47 @@
     background: color-mix(in srgb, var(--accent-yellow) 10%, transparent);
 }
 
-.rendered-diff-deletions {
-    margin-bottom: 1rem;
-    border: 1px solid var(--border-color);
-    border-radius: 0.375rem;
-    background: color-mix(in srgb, var(--accent-red) 8%, var(--bg-secondary));
+.diff-bg-removed {
+    background: color-mix(in srgb, var(--accent-red) 10%, transparent);
 }
 
-.rendered-diff-deletions > summary {
-    padding: 0.5rem 0.75rem;
-    cursor: pointer;
-    font-size: 0.8125rem;
-    color: var(--accent-red);
-    user-select: none;
+/* Removed lines are injected inline at their original position (a top-level
+   sibling of the rendered markdown), so the change-strip overlay paints the red
+   bar/tint just like added/changed. */
+.diff-rendered-removed {
+    margin: 0.5rem 0;
 }
 
-.rendered-diff-deletions > pre {
+/* The <pre> carries only the raw old-file text — it must stay transparent so the
+   red overlay tint shows through, overriding `.markdown-content pre`'s grey
+   code-block background (hence the descendant selector for specificity). */
+.diff-rendered-removed .diff-removed-lines {
     margin: 0;
-    padding: 0.5rem 0.75rem;
+    padding: 0.125rem 0;
+    background: none;
+    border-radius: 0;
     font-family: var(--font-mono);
-    font-size: 0.75rem;
+    font-size: var(--font-size-md);
+    line-height: 1.5;
     white-space: pre-wrap;
+    word-break: break-word;
     color: var(--text-secondary);
+}
+
+/* Collapsed region between hunks — the rendered diff shows only the changed
+   blocks (plus git's context lines); each run of omitted unchanged content
+   renders as this gap marker. The "Show full file" toggle renders the whole
+   document instead. */
+.diff-rendered-gap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.5rem 0;
+    color: var(--text-muted);
+    font-size: var(--font-size-xl);
+    line-height: 1;
+    letter-spacing: 0.25em;
+    user-select: none;
 }
 
 /* Element-level marker classes carry no background — the overlay layer
@@ -604,7 +635,7 @@
     display: inline-flex;
     gap: 0.375rem;
     font-family: var(--font-mono);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     font-weight: 600;
     flex-shrink: 0;
 }
@@ -662,9 +693,26 @@
 
 /* --- Repo file content --- */
 
+/* Whole-file / file-preview content inset. Matches the rendered diff
+   (.rendered-diff above), so switching between the diff and the full file keeps
+   the same gutter. `.repo-file-rendered` wraps the rendered (markdown / csv /
+   svg) views; `.repo-file-content` is the line-numbered source view. */
 .repo-file-content {
     overflow: auto;
     height: 100%;
+    padding: 1rem 1.25rem;
+    box-sizing: border-box;
+}
+
+.repo-file-rendered {
+    padding: 1rem 1.25rem;
+}
+
+/* Image/media variant: a definite height so a contained image's max-height:100%
+   still fits the pane once the padding wrapper is in place. */
+.repo-file-rendered-media {
+    height: 100%;
+    box-sizing: border-box;
 }
 
 /* --- File search modal --- */
@@ -720,7 +768,7 @@
     border: none;
     outline: none;
     color: var(--text-primary);
-    font-size: 0.875rem;
+    font-size: var(--font-size-lg);
     font-family: var(--font-ui);
 }
 
@@ -742,7 +790,7 @@
     padding: 1.5rem;
     text-align: center;
     color: var(--text-muted);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     font-family: var(--font-ui);
 }
 
@@ -791,7 +839,7 @@
 }
 
 .file-search-result-name {
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     white-space: nowrap;
     overflow: hidden;
@@ -799,7 +847,7 @@
 }
 
 .file-search-result-path {
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     white-space: nowrap;
     overflow: hidden;
@@ -807,7 +855,7 @@
 }
 
 .file-search-source-badge {
-    font-size: 0.5625rem;
+    font-size: var(--font-size-3xs);
     font-weight: 700;
     padding: 0 0.25rem;
     border-radius: 0.125rem;
@@ -831,9 +879,10 @@
        off at a hard edge. Base rule (all viewports) — mobile keeps only its
        layout-specific overrides. Previously this lived in the mobile-only
        @media block, so the fade rendered on iOS Safari but not on desktop
-       Chrome/Safari. Tuned gradient-dominant (small 0.5rem solid offset, longer
-       1rem blur) to read as gently as the title-header fade rather than a hard
-       bg band. */
+       Chrome/Safari. Tuned gradient-dominant (small solid offset, longer blur)
+       to read as gently as the title-header fade rather than a hard bg band.
+       Its upward reach (|offset| + blur = 1rem) is --prompt-fade (base.css); the
+       transcript's bottom padding tracks that var, so keep them matched. */
     background: var(--bg-primary);
-    box-shadow: 0 -0.5rem 1rem 0 var(--bg-primary);
+    box-shadow: 0 -0.375rem 0.625rem 0 var(--bg-primary);
 }

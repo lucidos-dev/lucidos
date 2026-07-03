@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { engineRestarting, toasts } from '../store';
+import { engineRestarting, toasts, showToast, NEW_VERSION_TOAST_KEY } from '../store';
 import { ApiError } from '../../api/client';
 
 const RESTART_TOAST_KEY = 'restart-required';
@@ -35,6 +35,24 @@ describe('initiateEngineRestart surfaces spawn failures', () => {
     expect(toast!.message).toContain(reason);
   });
 
+  it('dismisses the "New version available" switch toast so the progress toast is the single surface', async () => {
+    // Regression: clicking "Switch to new version" stacked "Starting new version…"
+    // on top of the still-visible "New version available." toast (two toasts at
+    // once). The switch must replace that surface, not add to it.
+    showToast('New version available.', 'info', {
+      key: NEW_VERSION_TOAST_KEY,
+      action: { label: 'Switch to new version', onClick: () => {} },
+    });
+    expect(toasts.value.some(t => t.key === NEW_VERSION_TOAST_KEY)).toBe(true);
+    mockRestartEngine.mockResolvedValueOnce(undefined);
+
+    await initiateEngineRestart();
+
+    expect(toasts.value.some(t => t.key === NEW_VERSION_TOAST_KEY)).toBe(false);
+    const progress = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
+    expect(progress!.message).toBe('Starting new version…');
+  });
+
   it('keeps restarting flag set when restart API succeeds', async () => {
     mockRestartEngine.mockResolvedValueOnce(undefined);
 
@@ -46,7 +64,7 @@ describe('initiateEngineRestart surfaces spawn failures', () => {
     // Dev (non-packaged) starts on the build phase, with a spinner to signal
     // ongoing work. It stays dismissible — the UI is no longer deactivated
     // during a restart, so the status banner is just a hint the user can close.
-    expect(toast!.message).toBe('Building the new version…');
+    expect(toast!.message).toBe('Starting new version…');
     expect(toast!.spinning).toBe(true);
     expect(toast!.dismissable).not.toBe(false);
   });

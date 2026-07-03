@@ -40,22 +40,38 @@ pub fn report(phase: &str) {
     };
     let phase = phase.to_string();
     handle.spawn(async move {
-        let url =
-            format!("http://127.0.0.1:{port}/~/api/v1/control/workspaces/{id}/boot-phase");
+        // Loopback call to the co-located gateway; accept its self-signed dev
+        // cert and bypass any ambient proxy — the same posture as the
+        // Apply-restart callback (`api/history.rs::restart_via_gateway`).
         let client = match reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
+            .no_proxy()
+            .danger_accept_invalid_certs(true)
             .build()
         {
             Ok(c) => c,
             Err(_) => return,
         };
+        // Scheme via `net_config::peer_scheme_order` (never hardcoded — the dev
+        // gateway serves TLS, packaged serves plain http): resolved scheme
+        // first, the other protocol as fallback so a mismatch still reports.
+        //
         // Best-effort: the gateway's own health probe is the source of truth for
         // readiness; a dropped phase report only costs a slightly less specific
         // splash label, and the next phase (or the healthy probe) supersedes it.
-        let _ = client
-            .post(&url)
-            .json(&serde_json::json!({ "phase": phase }))
-            .send()
-            .await;
+        for scheme in crate::net_config::peer_scheme_order() {
+            let url = format!(
+                "{scheme}://127.0.0.1:{port}/~/api/v1/control/workspaces/{id}/boot-phase"
+            );
+            if client
+                .post(&url)
+                .json(&serde_json::json!({ "phase": phase }))
+                .send()
+                .await
+                .is_ok()
+            {
+                return; // reached the gateway (any response) — done
+            }
+        }
     });
 }

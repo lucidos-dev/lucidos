@@ -70,6 +70,7 @@ import {
 } from './composeDestination';
 import { applyDestination } from './actions/compose';
 import { getDraft, setDraft, _resetComposeDraftsForTesting } from './composeDrafts';
+import { getComposeSelectionOverride, pendingComposeSelection, resolveScope, _resetComposeSelectionsForTesting } from './composeSelections';
 import { makeOptimisticThreadState } from './thread-events';
 
 function putThread(id: string, state: 'composing' | 'active'): void {
@@ -91,6 +92,7 @@ beforeEach(() => {
   inputMode.value = { type: 'do' };
   selectedScope.value = { kind: 'lucidos' };
   _resetComposeDraftsForTesting();
+  _resetComposeSelectionsForTesting();
 });
 
 describe('option value encoding round-trips', () => {
@@ -128,7 +130,7 @@ describe('destinationFromState', () => {
 });
 
 describe('applyDestination', () => {
-  it('coding target sets inputMode, scope, and the composing draft mode', () => {
+  it('coding target on a composing draft sets inputMode + the draft mode + the per-draft scope AND the last-used seed, without leaking to other drafts', () => {
     const id = 'dest-coding';
     putThread(id, 'composing');
     setDraft(id, { text: 'fix it', image_hashes: [], mode: 'lucidos' });
@@ -136,7 +138,14 @@ describe('applyDestination', () => {
     applyDestination(id, { kind: 'coding', scope: { kind: 'app', appId: 'a1' } });
 
     expect(inputMode.value).toEqual({ type: 'coding_agent' });
+    // The target is stored on THIS draft's override…
+    expect(getComposeSelectionOverride(id).scope).toEqual({ kind: 'app', appId: 'a1' });
+    // …and mirrored to the localStorage last-used seed so the NEXT new draft
+    // starts from it. This is leak-safe: an EXISTING draft resolves its OWN scope
+    // (or the fixed {lucidos} default), never the shared selectedScope — so this
+    // pick does not move another draft (the original per-draft bug).
     expect(selectedScope.value).toEqual({ kind: 'app', appId: 'a1' });
+    expect(resolveScope('other-draft')).toEqual({ kind: 'lucidos' });
     expect(getDraft(id).mode).toBe('claude_code');
   });
 
@@ -155,11 +164,19 @@ describe('applyDestination', () => {
     expect(getDraft(id).mode).toBe('lucidos');
   });
 
-  it('no focused thread updates only the global signals', () => {
-    applyDestination(null, { kind: 'coding', scope: { kind: 'lucidos' } });
+  it('no focused thread writes the pending slot AND the last-used scope seed, without leaking to existing drafts', () => {
+    // selectedScope starts at {lucidos} (beforeEach). Pick a DIFFERENT target so
+    // the writes are distinguishable.
+    applyDestination(null, { kind: 'coding', scope: { kind: 'app', appId: 'a1' } });
 
     expect(inputMode.value).toEqual({ type: 'coding_agent' });
-    expect(selectedScope.value).toEqual({ kind: 'lucidos' });
+    // Pending slot captured the target (transferred onto the draft at creation)…
+    expect(pendingComposeSelection.value.scope).toEqual({ kind: 'app', appId: 'a1' });
+    // …and the localStorage last-used seed is updated so the fresh compose view
+    // and the next new draft start from it. Leak-safe: an EXISTING draft resolves
+    // its own scope (fixed default here), never this seed.
+    expect(selectedScope.value).toEqual({ kind: 'app', appId: 'a1' });
+    expect(resolveScope('existing-draft')).toEqual({ kind: 'lucidos' });
     expect(getDraft(null).mode).toBe(null);
   });
 
@@ -178,12 +195,12 @@ describe('applyDestination', () => {
     // option — applyDestination must not rewrite signals (subscriber
     // re-renders) or re-patch the draft (debounced PUT + SSE fan-out).
     applyDestination(null, { kind: 'coding', scope: { kind: 'app', appId: 'a1' } });
-    const scopeBefore = selectedScope.value;
+    const pendingBefore = pendingComposeSelection.value;
     const modeBefore = inputMode.value;
 
     applyDestination(null, { kind: 'coding', scope: { kind: 'app', appId: 'a1' } });
 
-    expect(selectedScope.value).toBe(scopeBefore);
+    expect(pendingComposeSelection.value).toBe(pendingBefore);
     expect(inputMode.value).toBe(modeBefore);
   });
 

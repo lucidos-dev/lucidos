@@ -1,11 +1,11 @@
 import { useRef } from 'preact/hooks';
 import type { CodingAgent } from '../../api/types';
-import { repositories, selectedScope, selectedCodingAgent, appsList, enginePackaged } from '../../store/store';
+import { repositories, appsList, enginePackaged } from '../../store/store';
+import { resolveScope, resolveCodingAgent } from '../../store/composeSelections';
 import { loadApps } from '../../store/actions/apps';
 import { loadRepositories } from '../../store/actions/chat';
-import { applyDestination, type ComposeMode } from '../../store/actions/compose';
+import { applyDestination, updateComposeSelection, type ComposeMode } from '../../store/actions/compose';
 import { switchMenuItem, openSettingsSubview } from '../../store/actions/menu';
-import { setCodingAgentDefault } from '../../store/actions/preferences';
 import {
   destinationFromState,
   destinationToOptionValue,
@@ -27,7 +27,7 @@ type DestinationSelectionDeps = {
 };
 
 type CodingAgentSelectionDeps = {
-  setCodingAgentDefault: typeof setCodingAgentDefault;
+  patchSelection: typeof updateComposeSelection;
   focusPrompt: () => void;
 };
 
@@ -56,13 +56,20 @@ export function handleComposeDestinationSelection(
 }
 
 export function handleComposeCodingAgentSelection(
+  threadId: string | null,
   value: string,
   deps: CodingAgentSelectionDeps = {
-    setCodingAgentDefault,
+    patchSelection: updateComposeSelection,
     focusPrompt: focusPromptNow,
   },
 ): void {
-  void deps.setCodingAgentDefault(value as CodingAgent);
+  // Per-draft when a draft is focused (persisted via the debounced compose PUT);
+  // PENDING when none exists yet (`updateComposeSelection(null, …)` routes to the
+  // pending slot, transferred onto the draft at creation). NEVER the account
+  // default — editing a draft (or the fresh compose view) must not write
+  // `coding_agent_default` or leak to other drafts. `coding_agent_default` is a
+  // fixed seed (from the pref, default Claude Code) — no UI to change it.
+  deps.patchSelection(threadId, { codingAgent: value as CodingAgent });
   deps.focusPrompt();
 }
 
@@ -98,7 +105,9 @@ export function ComposeDestinationRow({ threadId, toggleMode, fading }: {
   // channel would otherwise recompute `dest` mid-fade and visibly swap the
   // label/chip/caption of a row that's on its way out.
   const lastDestRef = useRef<ComposeDestination>({ kind: 'lucidos-agent' });
-  let dest = destinationFromState(toggleMode, selectedScope.value);
+  // Per-draft target: resolve THIS draft's scope override (falls back to the
+  // global default), so switching one draft's target never changes another's.
+  let dest = destinationFromState(toggleMode, resolveScope(threadId));
   if (fading) dest = lastDestRef.current;
   else lastDestRef.current = dest;
 
@@ -137,6 +146,10 @@ export function ComposeDestinationRow({ threadId, toggleMode, fading }: {
           }}
           class="compose-destination-picker"
           restoreFocusOnSelect={false}
+          // The trigger already shows the current destination; the last-used
+          // target is irrelevant when picking a fresh one, so don't mark it in
+          // the list (it would only compete with the arrow-key focus row).
+          markCurrent={false}
         />
         {dest.kind === 'coding' && (
           <Dropdown
@@ -144,10 +157,11 @@ export function ComposeDestinationRow({ threadId, toggleMode, fading }: {
               { value: 'claude-code', label: 'Claude Code' },
               { value: 'codex', label: 'Codex' },
             ]}
-            value={selectedCodingAgent.value}
-            onChange={(v) => { handleComposeCodingAgentSelection(v); }}
+            value={resolveCodingAgent(threadId)}
+            onChange={(v) => { handleComposeCodingAgentSelection(threadId, v); }}
             class="compose-coding-agent-chip"
             restoreFocusOnSelect={false}
+            markCurrent={false}
           />
         )}
       </div>

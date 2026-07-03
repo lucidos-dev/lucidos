@@ -93,6 +93,7 @@ fn start_merge_and_get_prompt_signature_and_prompt_match() {
         "main",
         None,
         Some("Some description"),
+        false,
     );
     // Sanity: builder returns a non-trivial merge prompt — guards against
     // a silent change that makes both sides return `""`.

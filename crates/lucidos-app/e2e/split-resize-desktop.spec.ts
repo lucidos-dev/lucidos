@@ -228,10 +228,11 @@ test.describe('Split layout — free drag with deferred snap', () => {
     const startWidth = await threadPaneWidth(page); // ~512 at ratio 0.4 / 1280
     expect(startWidth).toBeLessThan(700);
 
-    // x=200 lands in the brand-label's empty flex space (past the
-    // collapsed-thread-actions at ~8–172px, left of the centered brand text) —
-    // a non-interactive header gap on the thread side, so onHeaderDblClick
-    // maximizes the thread pane.
+    // x=200 lands on a non-interactive header gap on the thread side — past the
+    // collapsed-thread-actions (~8–124px, 3 buttons) and left of the centered
+    // brand text (the brand-label is an absolutely-centered pointer-events:none
+    // box that passes the click through) — so onHeaderDblClick maximizes the
+    // thread pane.
     await page.locator('.app-header').dblclick({ position: { x: 200, y: 20 } });
 
     // The pane width must pass through an intermediate value during the

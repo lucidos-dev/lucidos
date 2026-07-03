@@ -4,8 +4,51 @@ import { toggleFolder, buildFolderTree, openFilePreview } from '../../store/acti
 import type { FolderNode } from '../../store/actions/artifacts';
 import { FileTypeIcon, FolderIcon } from '../../utils/fileIcons';
 import { loadedOr } from '../../store/types';
+import { SkText, SkBlock } from '../shared/Skeleton';
 
 type FileEntry = { name: string; path: string };
+
+/** One placeholder tree row mirroring the real `.folder-item` / `.file-item`
+ *  node markup (icon box + name) with shimmer leaves, indented like a real node.
+ *  Used only inside a SkeletonProvider (via {@link folderTreeSkeletonRow}). */
+function TreeRowSkeleton({ kind, indent }: { kind: 'folder' | 'file'; indent: number }) {
+  if (kind === 'folder') {
+    return (
+      <div class="folder-item" style={{ paddingLeft: `${indent}rem` }}>
+        <div class="folder-header">
+          <SkBlock w="0.6rem" h="0.6rem" round />
+          <SkBlock w="1rem" h="1rem" round />
+          <SkText class="folder-name" w="7rem" />
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div class="file-item" style={{ paddingLeft: `${indent + 1.25}rem` }}>
+      <SkBlock w="1rem" h="1rem" round />
+      <SkText class="file-name" w="9rem" />
+    </div>
+  );
+}
+
+/** A representative folder/file shape, cycled by row index so the tree skeleton
+ *  shows real nesting (folders + indented files) instead of a flat run of bars —
+ *  the tree's true shape is unknown before load, so this stands in for it. */
+const TREE_SKELETON_PATTERN: { kind: 'folder' | 'file'; indent: number }[] = [
+  { kind: 'folder', indent: 0 },
+  { kind: 'file', indent: 1 },
+  { kind: 'file', indent: 1 },
+  { kind: 'folder', indent: 0 },
+  { kind: 'file', indent: 1 },
+  { kind: 'file', indent: 0 },
+];
+
+/** Row thunk for `<ListSkeletonOf row={folderTreeSkeletonRow} />` — mirrors the
+ *  FolderTree / TreeNode layout while artifacts (or the repo file tree) load. */
+export function folderTreeSkeletonRow(i: number) {
+  const node = TREE_SKELETON_PATTERN[i % TREE_SKELETON_PATTERN.length];
+  return <TreeRowSkeleton kind={node.kind} indent={node.indent} />;
+}
 
 export function FolderTree() {
   const paths = loadedOr(artifacts.value, []);

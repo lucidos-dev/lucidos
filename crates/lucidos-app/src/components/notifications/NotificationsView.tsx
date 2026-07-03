@@ -13,11 +13,11 @@ import {
 } from '../../store/actions/notifications';
 import { stripHtml } from '../../utils/escapeHtml';
 import { formatTimeAgo, formatNotificationDate } from '../../utils/formatTime';
-import { loadedOr } from '../../store/types';
+import { loadedOr, type Notification } from '../../store/types';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
-import { ListSkeleton } from '../shared/ListSkeleton';
+import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 
 export function NotificationsView() {
@@ -82,35 +82,18 @@ export function NotificationsView() {
       {loadable.status === 'failed' ? (
         <LoadableError noun="notifications" error={loadable.error} />
       ) : (
-        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton fill />}>
+        <LoadingFade
+          showSkeleton={showLoading}
+          skeleton={<ListSkeletonOf fill row={() => <NotificationRow />} />}
+        >
           {loadable.status === 'loaded' ? (
             items.length === 0 ? (
               <div class="empty-state">{emptyMessage}</div>
             ) : (
               <>
-                {items.map((n) => {
-                  const date = new Date(n.created_at);
-                  const timeAgo = formatTimeAgo(date);
-                  const dateStr = formatNotificationDate(date);
-                  return (
-                    <button
-                      key={n.id}
-                      class={`notification-item ${n.read ? '' : 'unread'}`}
-                      onClick={() => void viewNotification(n.id)}
-                    >
-                      <div class="title notification-title">
-                        <span class="trigger-icon">📋</span>
-                        {n.title}
-                      </div>
-                      <div class="notification-summary">
-                        {stripHtml(renderMarkdown(n.message))}
-                      </div>
-                      <div class="notification-time">
-                        {timeAgo} · {dateStr}
-                      </div>
-                    </button>
-                  );
-                })}
+                {items.map((n) => (
+                  <NotificationRow key={n.id} n={n} />
+                ))}
                 {hasMore && (
                   <div
                     ref={sentinelRef}
@@ -126,5 +109,41 @@ export function NotificationsView() {
         </LoadingFade>
       )}
     </div>
+  );
+}
+
+/** Self-skeletonizing notification row: rendered with no props inside a
+ *  SkeletonProvider (`<NotificationRow />`) it draws itself as a loading
+ *  placeholder via the Sk* leaves; with a real `n` it renders normally. The
+ *  prop is optional only to support the skeleton call; the real call site
+ *  passes it. In skeleton mode it renders a non-interactive `<div>` (no click
+ *  handler), mirroring the three lines (emoji + title, summary, time). */
+function NotificationRow({ n }: { n?: Notification }) {
+  const sk = useSkeleton();
+  const date = n ? new Date(n.created_at) : null;
+  const timeAgo = date ? formatTimeAgo(date) : '';
+  const dateStr = date ? formatNotificationDate(date) : '';
+  const className = `notification-item ${sk || n?.read ? '' : 'unread'}`;
+  const body = (
+    <>
+      <div class="title notification-title">
+        <SkBlock w="1rem" h="1rem" circle>
+          <span class="trigger-icon">📋</span>
+        </SkBlock>
+        <SkText w="9rem">{n?.title}</SkText>
+      </div>
+      <SkText class="notification-summary" as="div" w="16rem">
+        {n ? stripHtml(renderMarkdown(n.message)) : ''}
+      </SkText>
+      <SkText class="notification-time" as="div" w="6rem">
+        {timeAgo} · {dateStr}
+      </SkText>
+    </>
+  );
+  if (sk) return <div class={className}>{body}</div>;
+  return (
+    <button class={className} onClick={() => n && void viewNotification(n.id)}>
+      {body}
+    </button>
   );
 }

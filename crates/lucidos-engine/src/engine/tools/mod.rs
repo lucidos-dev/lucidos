@@ -379,7 +379,7 @@ impl LucidosEngine {
             Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
                 format!(
                     "Error: invalid tap {} — expected an object like \
-                     {{\"kind\":\"modal\"}}, {{\"kind\":\"none\"}}, or \
+                     {{\"kind\":\"modal\"}} or \
                      {{\"kind\":\"navigate\",\"to\":{{\"target\":\"app\",\"app_id\":\"...\"}}}}. \
                      Parse error: {}",
                     v, e

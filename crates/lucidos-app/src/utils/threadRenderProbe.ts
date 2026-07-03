@@ -26,9 +26,12 @@
  *    - `genuinely-empty`  — no content events at all (a legit empty / draft thread,
  *      not a bug). Callers skip the breadcrumb for this class.
  *
- *  TEMPORARY MEASURE — pure telemetry, removable once the cause is fixed. Tracked
- *  in docs/temporary-measures.md → "Thread-render blank-body probe" (parent
- *  investigation `ios-pwa-blackout`), which carries the concrete removal condition. */
+ *  PERMANENT debug tooling (not a temporary measure). Built for the
+ *  `ios-pwa-blackout` investigation (resolved 2026-06-30 — blank body = compositor
+ *  paint loss, fixed by the `forceIOSRepaint*` hardening; see
+ *  docs/temporary-measures.md), and RETAINED to confirm a future blank-render
+ *  regression. The most symptom-specific of the client probes, but tiny and silent
+ *  when idle. */
 
 import { postClientLog } from './liveness';
 import { isIOSPwa } from './platform';

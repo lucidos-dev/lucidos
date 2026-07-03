@@ -1,30 +1,32 @@
 import type { ComponentChildren } from 'preact';
-import { useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
+import { useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'preact/hooks';
 import { memo } from 'preact/compat';
-import { signal } from '@preact/signals';
-import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerView, setDrawerView, selectedCodingAgent, selectedScope, repositories } from '../../store/store';
+import { signal, useSignalEffect } from '@preact/signals';
+import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerView, setDrawerView, repositories, focusedPane } from '../../store/store';
+import { resolveScope, resolveCodingAgent } from '../../store/composeSelections';
 import { composeDraftContextName } from '../../store/composeDestination';
 import { threadPassesChannelFilter } from '../../store/threadFilter';
-import { navigateToPane, focusPane } from '../../store/actions/pane';
+import { focusPane } from '../../store/actions/pane';
 import { focusThread } from '../../store/actions/threads';
 import { loadOlderThreads, reloadAfterFilterChange, ensureThreadInMap, loadThreadEvents } from '../../store/actions/thread-loading';
 import { ThreadStatusIcon, resolveVisualStatus, type VisualStatus } from '../shared/ThreadStatusIcon';
 import { PinThreadButton } from '../shared/PinThreadButton';
 import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
-import { ListSkeleton } from '../shared/ListSkeleton';
+import { DraftOverflowMenu } from '../shared/DraftOverflowMenu';
+import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import type { ThreadState, ThreadStatus } from '../../store/thread-events';
 import { getDraft } from '../../store/composeDrafts';
 import type { DisplaySection } from '../../generated/thread-lifecycle';
 import { formatThreadChannelLabel } from '../../utils/formatChannel';
-import { draftRowTooltip, threadContextName, type ThreadContextFields } from './threadRowInfo';
+import { threadContextName, type ThreadContextFields } from './threadRowInfo';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { useFlipTransitions } from '../../hooks/useFlipAnimation';
 import { useDelayedLoading, useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { PANE_TRANSITION_MS } from '../layout/splitHelpers';
 import { useScrollMemory } from '../../hooks/useScrollMemory';
-import { isMobile } from '../../utils/viewport';
+import { getRemPx } from '../../utils/dom';
 import type { ThreadSearchResult } from '../../api/threads';
 import { PinIcon, InboxIcon, ArchiveIcon, DraftsIcon, AttentionIcon, RunningIcon } from '../shared/icons';
 import type { ComponentType } from 'preact';
@@ -68,8 +70,8 @@ export function isThreadRowTarget(target: EventTarget | null): boolean {
  *  on its chrome (section headers, empty space, scrollbar). A click on a thread
  *  row is exempt: that click focuses a *thread*, which focuses the thread pane
  *  (the prompt input's `onFocus` → `focusPane('thread')`). Pre-focusing the
- *  drawer here would glide the header focus wash to the drawer and then straight
- *  back to the thread on the same click. */
+ *  drawer here would move the focused pane to the drawer and then straight back
+ *  to the thread on the same click. */
 export function handleDrawerPointerDown(target: EventTarget | null): void {
     if (isThreadRowTarget(target)) return;
     focusPane('drawer');
@@ -111,6 +113,14 @@ export function nodeKey(node: DrawerNavNode): string {
     return node.kind === 'section' ? sectionNavKey(node.sectionKey) : node.id;
 }
 
+/** Stable DOM id for a nav node, used as the drawer container's
+ *  `aria-activedescendant` target and on each row / section header. Namespaced so
+ *  it can't collide with ids elsewhere; `null` (no highlight) → `undefined` so the
+ *  attribute is omitted. Pure — exported for unit testing. */
+export function navKeyDomId(key: string | null): string | undefined {
+    return key ? `drawer-nav-${key}` : undefined;
+}
+
 /** Flat (depth-0, no-section, no-family) nodes for the alternate views — ←/→ are
  *  inert on these; only ↑/↓/Enter apply. */
 function flatThreadNodes(ids: readonly string[]): DrawerNavNode[] {
@@ -142,6 +152,40 @@ export function selectHighlighted() {
         if (match) void ensureThreadInMap(match);
     }
     focusThread(id);
+}
+
+/** Open the highlighted thread row's overflow (⋯) menu — the keyboard route to
+ *  every per-row action (pin/unpin, archive, copy, download, info), since the
+ *  inline row buttons are `tabindex=-1` (mouse-only) so the drawer stays a single
+ *  tab stop. Driven by the customizable `openThreadActions` shortcut. No-op unless
+ *  the drawer is focused and a THREAD (not a section header) is highlighted. Opens
+ *  the menu by clicking its trigger, located the same way the highlight scroller
+ *  finds rows (`[data-thread-nav]`); the menu's Overlay then owns focus/Escape. */
+export function openHighlightedThreadActions(): void {
+    if (focusedPane.value !== 'drawer') return;
+    const key = highlightedKey.value;
+    if (!key || isSectionNavKey(key)) return;
+    const trigger = document.querySelector<HTMLElement>(
+        `[data-thread-nav="${key}"] button[aria-haspopup="menu"]`,
+    );
+    trigger?.click();
+}
+
+/** Collapse/expand the FOCUSED thread's own sub-thread family — the keyboard
+ *  counterpart to clicking that row's disclosure chevron, but keyed off the open
+ *  (focused) thread rather than the drawer-highlighted row, so it works from any
+ *  pane without first moving focus into the drawer. Unlike the drawer's ←/→ tree
+ *  nav it NEVER climbs to a parent: it always toggles the focused thread's own
+ *  family, so collapsing it hides that thread's entire descendant subtree (direct
+ *  sub-threads and theirs). No-op when no thread is focused or the focused thread
+ *  has no sub-threads (nothing to toggle). Driven by the `toggleSubthreads`
+ *  shortcut. */
+export function toggleFocusedThreadFamily(): void {
+    const id = focusedThreadId.value;
+    if (!id) return;
+    const thread = threadMap.value.get(id);
+    if (!thread || thread.meta.totalChildrenCount <= 0) return;
+    toggleFamilyCollapse(id);
 }
 
 /** Live collapse state for the pure ←/→ decision functions. */
@@ -339,9 +383,26 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
     // Search overrides the selected view; otherwise the selector decides.
     const activeView = isSearching ? 'search' : view;
 
+    const drawerRef = useRef<HTMLDivElement>(null);
     const listRef = useRef<HTMLDivElement>(null);
     // Don't restore while in an alternate view — saved offset is for the full list.
     useScrollMemory(listRef, 'lucidos-scroll-thread-drawer', { paused: activeView !== 'all' });
+
+    // Keep the container's `aria-activedescendant` in lockstep with the keyboard
+    // highlight WITHOUT re-rendering the list. The drawer is a single focusable
+    // (role="tree", tabindex=0); the active row is pointed to by id rather than
+    // moving DOM focus per row (the aria-activedescendant model — see the plan).
+    // Setting the attribute imperatively in a signal effect preserves the drawer's
+    // per-row render budget: reading `highlightedKey` in the component body would
+    // re-run ThreadList on every ↑/↓, the storm DrawerSectionTitle/ThreadRow were
+    // split out to avoid. Rows + section headers carry matching `navKeyDomId` ids.
+    useSignalEffect(() => {
+        const id = navKeyDomId(highlightedKey.value);
+        const el = drawerRef.current;
+        if (!el) return;
+        if (id) el.setAttribute('aria-activedescendant', id);
+        else el.removeAttribute('aria-activedescendant');
+    });
 
     const handleKeyDown = useCallback((e: KeyboardEvent) => {
         // List-nav owns only un-modified arrows/Enter. Any chord with a primary
@@ -374,11 +435,16 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
     }, [activeView]);
 
     return (
-        <div class={`thread-drawer${visible ? '' : ' thread-drawer-collapsed'}`}
+        <div ref={drawerRef}
+             class={`thread-drawer${visible ? '' : ' thread-drawer-collapsed'}`}
              style={visible ? { width: `${threadDrawerWidth.value}px` } : undefined}
              onKeyDown={handleKeyDown}
              onPointerDown={(e) => handleDrawerPointerDown(e.target)}
-             tabIndex={-1}>
+             role="tree"
+             aria-label="Threads"
+             // The single tab stop — but only while open. A collapsed drawer
+             // (width 0) must not be a phantom tab stop, so it drops to -1.
+             tabIndex={visible ? 0 : -1}>
             <div class="thread-drawer-list" ref={listRef}>
                 {renderContent && (
                     activeView === 'search' ? <SearchResults />
@@ -795,9 +861,11 @@ function DrawerSectionTitle({ sectionKey, title, Icon, count, hasRunning, collap
     const highlighted = highlightedKey.value === sectionNavKey(sectionKey);
     return (
         <div class={`list-section-title list-section-title-collapsible${collapsed ? ' collapsed' : ''}${highlighted ? ' list-section-title-highlighted' : ''}`}
+             id={navKeyDomId(sectionNavKey(sectionKey))}
              data-flip-id={sectionNavKey(sectionKey)}
              onClick={() => toggleSectionCollapse(sectionKey)}
-             role="button"
+             role="treeitem"
+             aria-selected={highlighted}
              aria-expanded={!collapsed}>
             <DrawerSectionHeader Icon={Icon} title={title} hasRunning={hasRunning} />
             {/* Thread count rides in a badge only while the section is
@@ -807,34 +875,115 @@ function DrawerSectionTitle({ sectionKey, title, Icon, count, hasRunning, collap
     );
 }
 
-export function ComposingThreadRow({ thread, depth = 0, onAfterClick }: { thread: ThreadState; depth?: number; onAfterClick?: () => void }) {
+/** The repo / app / trigger name chip. A long name WRAPS inside the chip's
+ *  CSS `max-width` (see `.thread-row-context` in drawer.css), but a constrained
+ *  box sits at its constraint, not at the widest resulting line — so a name that
+ *  wraps to e.g. "JOBS DATA" / "AQUARIUM" leaves dead space to the right of the
+ *  shorter line. Pure CSS can't shrink a box to the longest line of *wrapped*
+ *  text (the line breaks depend on the width we'd be deriving from them), so we
+ *  measure the rendered line boxes and pin the chip to its widest line. A
+ *  single-line name needs no measurement — flex `align-items: flex-end` +
+ *  fit-content already hugs it (max-content < max-width), so we leave it alone.
+ *
+ *  Four things make the pin robust to WHEN it runs, to transforms, and to UI
+ *  scale — the chip may only ever SHRINK below max-width, never below a word:
+ *
+ *  1. Measure at the chip's own `max-width`, NOT its live rendered width.
+ *     `.thread-row` is `.list-row` (flex-wrap) and the drawer animates its own
+ *     width (`transition: width` on open, plus resize-divider drags), so
+ *     measuring the LIVE box while the chip laid out mid-transition (drawer still
+ *     animating open from width 0, or the right column momentarily wrapped narrow)
+ *     would read a transient TINY box and pin the name into single-word /
+ *     broken-word lines. The chip's `flex-shrink: 0` column never squeezes it
+ *     below `max-width` at rest, so the max-width wrap IS the rest-state wrap:
+ *     forcing the measurement to that width makes the pin independent of the
+ *     animation frame (every word fits within max-width, so the widest wrapped
+ *     line is always ≥ the widest word).
+ *
+ *  2. Divide the measured line widths by the element's own scale factor
+ *     (visual `getBoundingClientRect` width ÷ layout `offsetWidth`).
+ *     `getClientRects` returns TRANSFORM-scaled geometry, so a FLIP row animation
+ *     (the wrapper animates `scale(0.95 → 1.03)` on mount / reorder) mid-measure
+ *     would shrink every line and pin a hair too narrow — the intermittent
+ *     "AQUARIU / M" break. Un-scaling recovers the true line widths at any frame.
+ *
+ *  3. Pin the width in `rem` (px ÷ root font-size), NOT `px`. The chip's
+ *     font-size and padding are rem-based, so a rem width tracks the text when the
+ *     user changes UI scale (root font-size) WITHOUT a reload or a re-measure. A
+ *     px pin goes stale on a scale change (too narrow scaling up → words break;
+ *     too wide scaling down → dead space) until a reload re-measures.
+ *
+ *  4. Safety net: if the pin somehow raised the wrapped line count (a corrupted
+ *     measurement we didn't anticipate), drop the pin and fall back to the
+ *     max-width box — dead space, never a broken word. Line COUNT is
+ *     transform-invariant, so this check holds even mid-animation.
+ *
+ *  Verified in Chromium across the full UI-scale matrix and every FLIP scale
+ *  (0.7 → 1.03): no word break and no dead space in any cell. */
+function ContextChip({ name }: { name: string }) {
+    const ref = useRef<HTMLSpanElement>(null);
+    useLayoutEffect(() => {
+        const el = ref.current;
+        if (!el) return;
+        const cs = getComputedStyle(el);
+        // (1) Force the wrap to the chip's max-width, not the transient live width,
+        // so the measurement reproduces the rest state regardless of the drawer's
+        // current open/resize animation frame. Fall back to natural width only if
+        // max-width is somehow not a length (e.g. overridden to `none`).
+        const maxW = parseFloat(cs.maxWidth);
+        el.style.width = Number.isFinite(maxW) && maxW > 0 ? `${maxW}px` : '';
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        const rects = range.getClientRects();
+        const naturalLines = rects.length;
+        if (naturalLines <= 1) { el.style.width = ''; return; } // single line — hug via fit-content
+        // (2) Un-scale: getClientRects is transform-scaled, so divide by this
+        // element's own scale (visual ÷ layout width) to recover true line widths
+        // even while a FLIP `scale(...)` animation runs on an ancestor.
+        const scaleX = el.offsetWidth > 0 ? el.getBoundingClientRect().width / el.offsetWidth : 1;
+        let maxLine = 0;
+        for (let i = 0; i < rects.length; i++) maxLine = Math.max(maxLine, rects[i].width / scaleX);
+        // box-sizing is border-box app-wide (base.css), so the pinned width must
+        // include the chip's own padding + border; the rects cover text only.
+        const chrome = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight)
+            + parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth);
+        // (3) +1px absorbs sub-pixel rounding so the widest line never re-wraps.
+        // Pin in rem (px / root-font-size) so the width tracks the text across UI scale.
+        el.style.width = `${(Math.ceil(maxLine) + chrome + 1) / getRemPx()}rem`;
+        // (4) Safety net: if the pin increased the line count, a word may have
+        // broken — revert to the max-width box (dead space beats a broken word).
+        range.selectNodeContents(el);
+        if (range.getClientRects().length > naturalLines) el.style.width = '';
+    }, [name]);
+    return <span ref={ref} class="label thread-row-context">{name}</span>;
+}
+
+export function ComposingThreadRow({ thread, depth = 0 }: { thread: ThreadState; depth?: number }) {
     const isFocused = focusedThreadId.value === thread.meta.id;
     const isHighlighted = highlightedKey.value === thread.meta.id;
     const classes = ['list-row', 'thread-row', 'compose-draft-row'];
     if (isFocused) classes.push('thread-row-focused');
     if (isHighlighted) classes.push('thread-row-highlighted');
-    // A coding draft hasn't bound a backend yet — it spawns with the device's
-    // current `selectedCodingAgent` at send time (see sendCompose), so the tag
-    // reflects that pick (Codex vs Claude Code) rather than always "Claude Code".
-    // A plain chat draft is a Lucidos thread — `formatThreadChannelLabel('chat')`
-    // reads "Lucidos Agent", the same tag started chat threads wear.
+    // A coding draft hasn't bound a backend yet — it spawns with THIS draft's
+    // resolved backend at send time (see sendCompose), so the tag reflects that
+    // draft's pick (Codex vs Claude Code) rather than always "Claude Code" or a
+    // global another draft changed. A plain chat draft is a Lucidos thread —
+    // `formatThreadChannelLabel('chat')` reads "Lucidos Agent", the same tag
+    // started chat threads wear.
     const draftMode = getDraft(thread.meta.id).mode;
     const modeLabel = draftMode === 'claude_code'
-        ? formatThreadChannelLabel('claude_code', selectedCodingAgent.value)
+        ? formatThreadChannelLabel('claude_code', resolveCodingAgent(thread.meta.id))
         : formatThreadChannelLabel('chat');
     // The repo/app chip mirrors started threads. A coding draft hasn't bound its
-    // meta yet, so it reads the device-global `selectedScope` (the same value
+    // meta yet, so it reads THIS draft's per-draft scope override (the same value
     // `sendCompose` would bind) rather than `meta.repoName`/`codingAgentKind`.
     const reposLoadable = repositories.value;
+    const draftScope = resolveScope(thread.meta.id);
     const contextName = composeDraftContextName(
         draftMode,
-        selectedScope.value,
+        draftScope,
         reposLoadable.status === 'loaded' ? reposLoadable.data : [],
     );
-    // Same structured hover/long-press tooltip started rows carry, built from the
-    // draft's live compose mode/scope (its meta isn't bound to a backend yet).
-    const tooltipTitle = threadDisplayTitle(thread);
-    const tooltipRows = JSON.stringify(draftRowTooltip(draftMode, selectedScope.value, contextName, thread.meta.createdAt));
     const createdLabel = formatCreatedTimestamp(thread.meta.createdAt);
 
     return (
@@ -842,26 +991,40 @@ export function ComposingThreadRow({ thread, depth = 0, onAfterClick }: { thread
             {/* Dot lives on the wrapper (outside the row's nested clip-path) so it
                 holds a fixed left column at every depth — matching ThreadRowContent. */}
             <ThreadStatusIcon status="idle" />
+            {/* The draft's structured details (Status / Type / Created) live behind
+                the ⋯ menu's Info item now, not a row tooltip — see DraftOverflowMenu. */}
             <div class={classes.join(' ')}
+                 id={navKeyDomId(thread.meta.id)}
                  data-thread-nav={thread.meta.id}
-                 data-tooltip-rows={tooltipRows}
-                 data-tooltip-title={tooltipTitle}
-                 data-tooltip-longpress=""
-                 onClick={() => {
-                     focusThread(thread.meta.id);
-                     onAfterClick?.();
-                     if (isMobile()) navigateToPane('thread');
-                 }}>
+                 role="treeitem"
+                 aria-selected={isHighlighted}
+                 // focusThread reveals the thread pane itself (revealThreadPane
+                 // handles the mobile swipe + desktop pane-group focus).
+                 onClick={() => focusThread(thread.meta.id)}>
                 <div class="thread-row-left">
                     <span class="thread-row-title-row">
                         <span class="thread-row-title">{threadDisplayTitle(thread)}</span>
-                        <span class="draft-indicator" data-tooltip="Has unsent draft">Draft</span>
+                        <span class="draft-indicator">Draft</span>
                     </span>
                     {createdLabel && <span class="thread-row-created">{createdLabel}</span>}
                 </div>
                 <div class="thread-row-right">
                     {modeLabel && <span class="label message-channel-tag">{modeLabel}</span>}
-                    {contextName && <span class="label thread-row-context">{contextName}</span>}
+                    {contextName && <ContextChip name={contextName} />}
+                    <span class="thread-row-actions">
+                        {/* Mouse-only (tabIndex=-1): the drawer is a single tab stop;
+                            the keyboard reaches draft actions via the ⋯ menu shortcut. */}
+                        <DraftOverflowMenu
+                            threadId={thread.meta.id}
+                            mode={draftMode}
+                            scope={draftScope}
+                            contextName={contextName}
+                            createdAt={thread.meta.createdAt}
+                            stopPropagation
+                            extraClass="thread-row-action"
+                            tabIndex={-1}
+                        />
+                    </span>
                 </div>
             </div>
         </div>
@@ -923,9 +1086,10 @@ interface ThreadRowContentProps {
     onClick: () => void;
 }
 
-function ThreadRowContentImpl(props: ThreadRowContentProps) {
+function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
+    const sk = useSkeleton();
     const depth = props.depth ?? 0;
-    const hasFamily = !!props.collapsible && props.totalChildren > 0;
+    const hasFamily = !!props.collapsible && (props.totalChildren ?? 0) > 0;
 
     const classes = ['list-row', 'thread-row'];
     if (props.isFocused) classes.push('thread-row-focused');
@@ -967,7 +1131,7 @@ function ThreadRowContentImpl(props: ThreadRowContentProps) {
     // Every thread carries a channel tag now (chat reads "Lucidos Agent"); the
     // guard stays so a future empty label (or an unknown channel) doesn't paint
     // an empty bordered chip.
-    const channelLabel = formatThreadChannelLabel(props.channel, props.codingAgent);
+    const channelLabel = props.channel ? formatThreadChannelLabel(props.channel, props.codingAgent) : null;
 
     // The status dot is the wrapper's child, not the row's, so it stays in a
     // fixed left column at every depth — anchored to the un-indented wrapper
@@ -976,9 +1140,16 @@ function ThreadRowContentImpl(props: ThreadRowContentProps) {
         <div class={wrapClasses.join(' ')}
              style={depthStyle(depth)}
              {...(props.flipId ? { 'data-flip-id': props.flipId } : {})}>
-            <ThreadStatusIcon status={props.visualStatus} />
+            <ThreadStatusIcon status={sk ? null : (props.visualStatus ?? null)} />
             <div class={classes.join(' ')}
+                 id={props.id ? navKeyDomId(props.id) : undefined}
                  data-thread-nav={props.id}
+                 // Tree-item semantics for the single-focus model: the drawer
+                 // container (role="tree", tabindex=0) points its
+                 // `aria-activedescendant` at the highlighted row's id; the row
+                 // itself never takes DOM focus. Omitted on skeleton rows (no id).
+                 role={props.id ? 'treeitem' : undefined}
+                 aria-selected={props.id ? (props.isHighlighted ?? false) : undefined}
                  // The thread's structured details (Status / You / Agent / Type /
                  // Exchanges / Started) live behind the ⋯ menu's Info item now,
                  // not a row tooltip — see ThreadOverflowMenu.
@@ -988,12 +1159,16 @@ function ThreadRowContentImpl(props: ThreadRowContentProps) {
                  // loadThreadEvents is idempotent (no-op if already loading/loaded,
                  // or if this row isn't in threadMap yet — e.g. a search hit), so a
                  // canceled press just warms the cache and the tap never double-fetches.
-                 onPointerDown={() => void loadThreadEvents(props.id)}
-                 onClick={props.onClick}>
+                 onPointerDown={sk ? undefined : () => { if (props.id) void loadThreadEvents(props.id); }}
+                 onClick={sk ? undefined : props.onClick}>
                 {hasFamily && (
                     <button
                         type="button"
                         class="family-disclosure"
+                        // Mouse-only: the drawer is a single tab stop, so per-row
+                        // controls leave the Tab order. Keyboard collapses/expands
+                        // the family via ←/→ on the highlighted row instead.
+                        tabIndex={-1}
                         onClick={toggleFamily}
                         onKeyDown={(e) => {
                             // The drawer container's keydown handler intercepts
@@ -1028,22 +1203,29 @@ function ThreadRowContentImpl(props: ThreadRowContentProps) {
                 )}
                 <div class="thread-row-left">
                     <span class="thread-row-title-row">
-                        <span class="thread-row-title">{props.title}</span>
+                        <SkText class="thread-row-title" w="11rem">{props.title}</SkText>
                         {props.hasDraft && <span class="draft-indicator" data-tooltip="Has unsent draft">Draft</span>}
                     </span>
-                    {props.createdLabel && <span class="thread-row-created">{props.createdLabel}</span>}
+                    {(sk || props.createdLabel) && <SkText class="thread-row-created" w="5rem">{props.createdLabel}</SkText>}
                 </div>
                 <div class="thread-row-right">
-                    {channelLabel && (
+                    {sk ? (
+                        <SkBlock w="4.5rem" h="1.15rem" round />
+                    ) : channelLabel ? (
                         <span
                             class={`label message-channel-tag${props.channel === 'error_unknown_channel' ? ' channel-error' : ''}`}
                         >{channelLabel}</span>
+                    ) : null}
+                    {!sk && props.contextName && <ContextChip name={props.contextName} />}
+                    {!sk && props.id && (
+                        <span class="thread-row-actions">
+                            {/* Mouse-only (tabIndex=-1): the drawer is a single tab
+                                stop. The keyboard reaches every row action through
+                                the ⋯ menu via the "Open thread actions" shortcut. */}
+                            <PinThreadButton threadId={props.id} saved={props.isSaved ?? false} stopPropagation extraClass="thread-row-action" tabIndex={-1} />
+                            <ThreadOverflowMenu threadId={props.id} title={props.title ?? ''} stopPropagation extraClass="thread-row-action" tabIndex={-1} />
+                        </span>
                     )}
-                    {props.contextName && <span class="label thread-row-context">{props.contextName}</span>}
-                    <span class="thread-row-actions">
-                        <PinThreadButton threadId={props.id} saved={props.isSaved} stopPropagation extraClass="thread-row-action" />
-                        <ThreadOverflowMenu threadId={props.id} title={props.title} stopPropagation extraClass="thread-row-action" />
-                    </span>
                 </div>
             </div>
         </div>
@@ -1082,7 +1264,7 @@ const ThreadRowContent = memo(ThreadRowContentImpl, (prev, next) =>
 // Reading composeDrafts here would fan a re-render to every visible ThreadRow
 // per keystroke — the lag this signal was added to prevent.
 
-export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isResponsibleChild, enableFamilyToggle, onAfterClick }: {
+export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isResponsibleChild, enableFamilyToggle }: {
     threadId: string;
     status: ThreadStatus;
     depth?: number;
@@ -1092,7 +1274,6 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
      *  sub-threads. Only the nested ThreadList sets it — search / drafts render
      *  flat lists where collapsing nothing visible would be a no-op. */
     enableFamilyToggle?: boolean;
-    onAfterClick?: () => void;
 }) {
     // Signal reads stay here so each row's subscription set is narrow: the
     // row re-renders on threadMap / focusedThreadId / highlightedKey /
@@ -1143,7 +1324,7 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
             collapsible={hasFamily}
             isCollapsed={isCollapsed}
             onToggleFamily={() => toggleFamilyCollapse(meta.id)}
-            onClick={() => { focusThread(meta.id); onAfterClick?.(); }}
+            onClick={() => focusThread(meta.id)}
         />
     );
 }
@@ -1300,7 +1481,7 @@ function SearchResults() {
     }
 
     return (
-        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf row={() => <ThreadRowContent />} />}>
             {loadable.status === 'loaded' ? (
                 loadable.data.length === 0 ? (
                     <div class="empty-state">No threads found</div>

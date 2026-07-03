@@ -1,8 +1,8 @@
 import { useEffect } from 'preact/hooks';
 import { unfocusThread } from '../store/actions/threads';
 import { focusPromptNow } from '../components/chat/promptFocus';
-import { searchEverywhereOpen, focusedPane } from '../store/store';
-import { isTextInput } from '../utils/dom';
+import { searchEverywhereOpen, focusedPane, toggleExchangeCollapsed, toggleInitiatorCollapsed } from '../store/store';
+import { isTextInput, isThreadTranscript } from '../utils/dom';
 import { dismissTopOverlay, overlayStack } from '../store/overlayStack';
 import { runCloseCascade } from '../store/actions/threadActions';
 import { matchShortcut } from '../store/actions/keybindings';
@@ -16,15 +16,48 @@ import {
   focusOrToggleThreadDrawer, toggleMaximizeFocusedPaneGroup,
   stepThreadPaneWidth, stepThreadDrawerWidth, resetPaneLayout,
 } from '../store/actions/pane';
-import { seedDrawerHighlight } from '../components/drawer/ThreadDrawer';
-import { handlePaneTab } from '../components/layout/paneFocus';
+import { seedDrawerHighlight, openHighlightedThreadActions, toggleFocusedThreadFamily } from '../components/drawer/ThreadDrawer';
+import { handlePaneTab, reconcilePaneFocus } from '../components/layout/paneFocus';
 import { historyBack, historyForward } from '../store/actions/focused-pane-history';
+import { stepThreadTurn, parseNavigatedTurn, preserveOnToggle } from '../components/chat/scrollState';
+import { navFocusElement, applyNavFocus } from '../components/shared/focusMarker';
 
 function startNewThread() {
   unfocusThread();
   requestAnimationFrame(() => {
     focusPromptNow();
   });
+}
+
+/** Toggle the expand/collapse of the turn currently carrying the navigation focus
+ *  marker — the ⌘↑/⌘↓-highlighted `.chat-exchange`. The Enter counterpart to
+ *  clicking a turn's response/initiator header: it folds the response body when the
+ *  turn has one, else the initiator panel (a response-less divider / change turn).
+ *  Preserves scroll position across the height change (`preserveOnToggle`, matching
+ *  the header-click path) and RE-ASSERTS the marker so it survives the Enter
+ *  keydown's clear (the marker fades on any keydown) and repeated Enter presses stay
+ *  visible and reversible. Lives here (not in `scrollState`) so `scrollState` stays
+ *  free of the heavy `store` import — see `parseNavigatedTurn`'s doc. Returns false
+ *  (leaving the keystroke unconsumed) when no turn is marked, the marker is on a
+ *  non-turn element (a settings / plugin landing), or the turn is not collapsible. */
+function toggleNavigatedTurnCollapsed(): boolean {
+  const el = navFocusElement();
+  if (!el || typeof el.matches !== 'function' || !el.matches('.chat-exchange')) return false;
+  const parsed = parseNavigatedTurn(
+    el.dataset.threadId ?? null,
+    el.dataset.userSeq ?? null,
+    el.dataset.collapseKind ?? null,
+  );
+  if (!parsed) return false;
+  preserveOnToggle();
+  if (parsed.kind === 'response') toggleExchangeCollapsed(parsed.threadId, parsed.userSeq);
+  else toggleInitiatorCollapsed(parsed.threadId, parsed.userSeq);
+  // Re-stick the marker: this runs from the Enter keydown's bubble phase, after
+  // focusMarker's capture-phase keydown listener has already armed the fade-out, so
+  // re-applying cancels that fade and keeps the highlight on the turn for the next
+  // toggle. A later scroll / click / other keypress still fades it normally.
+  applyNavFocus(el);
+  return true;
 }
 
 /** What each registry shortcut does when its (current, possibly-customized)
@@ -35,8 +68,20 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
   newThread: startNewThread,
   closeThread: () => void runCloseCascade(),
   searchEverywhere: () => { searchEverywhereOpen.value = !searchEverywhereOpen.value; },
+  // Context-gated: no-ops unless the thread drawer is focused with a thread row
+  // highlighted, then opens that row's ⋯ menu (the keyboard route to per-row
+  // actions, since the drawer is a single tab stop).
+  openThreadActions: openHighlightedThreadActions,
+  // Toggles the OPEN (focused) thread's sub-thread family in the drawer — works
+  // from any pane (no drawer-focus gate); no-op when the focused thread has no
+  // sub-threads.
+  toggleSubthreads: toggleFocusedThreadFamily,
   historyBack: () => historyBack(),
   historyForward: () => historyForward(),
+  // Step the transcript one turn (a .chat-exchange) up/down and land focus in the
+  // scrollable transcript so continuous Arrow/Page scrolling follows.
+  prevThreadTurn: () => stepThreadTurn(-1),
+  nextThreadTurn: () => stepThreadTurn(1),
   toggleThreadDrawer: () => { if (focusOrToggleThreadDrawer()) seedDrawerHighlight(); },
   toggleThreadPane,
   toggleContentPane,
@@ -86,7 +131,11 @@ type ChordLike = Pick<KeyboardEvent, 'metaKey' | 'ctrlKey' | 'shiftKey' | 'altKe
  *  while up, so typing must search the dropdown (its auto-focused filter), never
  *  leak into the prompt textarea behind the inert UI. Also false on mobile, for
  *  IME composition, when a text input already has focus, with a modifier held,
- *  or for non-printable keys. Pure — exported for unit testing. */
+ *  or for non-printable keys. One extra carve-out: a Space press whose target is
+ *  the focusable transcript region — Space is a printable key, but there it must
+ *  page the transcript down (native scroll of the focused container), not insert a
+ *  space into the prompt. Other printables inside the transcript still type-to-
+ *  focus (start typing → compose). Pure — exported for unit testing. */
 export function shouldTypeToFocusPrompt(
   e: Pick<KeyboardEvent, 'isComposing' | 'metaKey' | 'ctrlKey' | 'altKey' | 'key' | 'target'>,
   opts: { mobile: boolean; overlayOpen: boolean },
@@ -96,7 +145,8 @@ export function shouldTypeToFocusPrompt(
     && !e.isComposing
     && !isTextInput(e.target)
     && !e.metaKey && !e.ctrlKey && !e.altKey
-    && e.key.length === 1;
+    && e.key.length === 1
+    && !(e.key === ' ' && isThreadTranscript(e.target));
 }
 
 /** Classify a chord forwarded from an app iframe (its keydowns never reach the
@@ -132,6 +182,39 @@ export function dispatchForwardedChord(chord: ChordLike): void {
   }
 }
 
+/** Run a real keydown captured INSIDE a same-origin content-pane preview iframe
+ *  (file / HTML / diff previews) against the host shortcut registry. Unlike app
+ *  iframes — which load the SDK and forward chords up via postMessage
+ *  (`dispatchForwardedChord`) — preview iframes run no SDK, so their keydowns
+ *  never reach the host: the shell's shortcuts silently die while focus is in the
+ *  preview, AND the chord falls through to Chrome's own default for the combo
+ *  (e.g. ⌘⇧↵ opens the page context menu). The preview document is same-origin,
+ *  so the host can listen on it directly (`bridgePreviewIframeShortcuts`) and —
+ *  having the real event here — `preventDefault()` the browser default, which the
+ *  postMessage forward path cannot do. Because the keydown lives in the content
+ *  pane, the focused pane IS content; reconcile `focusedPane` before dispatching
+ *  so the pane toggles read the right state (same reason as the forwarded path).
+ *  A non-shortcut chord (plain Enter on a link, normal typing) is left untouched
+ *  so the preview keeps its own behavior. Returns true when it consumed the
+ *  event. Exported for testing. */
+export function dispatchPreviewIframeShortcut(e: KeyboardEvent): boolean {
+  const id = matchShortcut(e);
+  if (id) {
+    e.preventDefault();
+    focusedPane.value = 'content';
+    SHORTCUT_ACTIONS[id]();
+    return true;
+  }
+  if (e.key === 'Escape') {
+    // activeElement is the host <iframe> (focus is inside it) — not a text input,
+    // so the policy dismisses any open host overlay and otherwise no-ops.
+    const result = dispatchEscape(document.activeElement);
+    if (result === 'dismissed' || result === 'blurred') e.preventDefault();
+    return result !== 'noop';
+  }
+  return false;
+}
+
 export function useKeyboardShortcuts(): void {
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
@@ -145,6 +228,23 @@ export function useKeyboardShortcuts(): void {
       if (id) {
         e.preventDefault();
         SHORTCUT_ACTIONS[id]();
+        return;
+      }
+
+      // Enter, while the transcript scroll region ITSELF is focused (as ⌘↑/⌘↓
+      // turn-nav leaves it), toggles the expand/collapse of the highlighted
+      // (nav-focus-marked) turn. Gated on `.thread-content` being the direct target
+      // so a focused link/button inside a response keeps its native Enter, and the
+      // prompt textarea keeps Enter-to-send. ⌘⇧Enter (maximizePaneGroup) is already
+      // claimed by the registry above; only unmodified Enter reaches here. Consumes
+      // the key only when a turn was actually toggled.
+      if (
+        e.key === 'Enter' &&
+        !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey &&
+        (e.target as HTMLElement | null)?.matches?.('.thread-content') &&
+        toggleNavigatedTurnCollapsed()
+      ) {
+        e.preventDefault();
         return;
       }
 
@@ -188,6 +288,12 @@ export function useKeyboardShortcuts(): void {
         e.stopPropagation();
       } else if (result === 'blurred') {
         e.preventDefault();
+        // Escape blurred a text input (e.g. the prompt) → focus went to <body>.
+        // Pull it back onto the focused pane's scroll surface so the Arrow/Page
+        // keys keep scrolling that pane (the prompt → transcript case the user
+        // hits after Escaping the message box). Gentle: skips a compose thread
+        // with no transcript, so it never silently re-grabs the just-blurred prompt.
+        reconcilePaneFocus(focusedPane.value);
       }
       // 'self-managed' / 'noop' fall through untouched: the focused element's
       // own keydown Escape handler gets the event (and may preventDefault).

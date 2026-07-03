@@ -94,9 +94,14 @@ impl LucidosEngine {
             ),
         }
 
+        // Prepend the bundled PG client dir (packaged: <resources>/postgres/bin)
+        // to the script PATH so the advertised bare `psql -c '…'` resolves; it's
+        // not on the launchd minimal PATH. Unset in dev (docker PG on PATH).
+        let pg_bin_dir = std::env::var_os("LUCIDOS_PG_BIN_DIR").map(std::path::PathBuf::from);
         env_vars.extend(workspace_script_env_vars(
             self.workspace_path(),
             lucidos_cli_dir(),
+            pg_bin_dir.as_deref(),
         ));
 
         // PG* env so spawned scripts can run `psql -c '…'` bare. Keeps the

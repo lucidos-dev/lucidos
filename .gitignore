@@ -1,5 +1,8 @@
 # Build artifacts
 /target/
+# Ad-hoc compiled binary at the repo root (a one-off debug build accidentally
+# auto-committed). Compiled binaries never belong in source.
+/test_url_generation
 # Per-signer build dirs and the copied artifact next to each signer's
 # Cargo.toml. Built by `signers/build-all.sh`; never checked in.
 signers/*/target/

@@ -17,7 +17,23 @@
  * focused-textarea guards.
  */
 
-import { threadMap, focusedThreadId, inputMode, showToast, setFocusedThread, selectedScope, selectedCodingAgent, resetCodingAgentPendingPreferences, type Scope } from '../store';
+import { threadMap, focusedThreadId, inputMode, showToast, showConfirm, setFocusedThread, selectedScope, type Scope } from '../store';
+import { generateUuid } from '../../utils/uuid';
+import {
+  getComposeSelectionOverride,
+  patchComposeSelection,
+  clearComposeSelection,
+  seedComposeSelection,
+  takePendingComposeSelection,
+  setComposeSelectionFromServer,
+  resolveScope,
+  resolveCodingAgent,
+  resolveModel,
+  resolveReasoningEffort,
+  resolveCcModel,
+  resolveCcReasoningEffort,
+  type ComposeSelectionOverride,
+} from '../composeSelections';
 import type { ComposeDestination } from '../composeDestination';
 import { makeOptimisticThreadState, type ThreadMeta } from '../thread-events';
 import { clearDraft, composeDrafts, draftIsEmpty, getDraft, patchDraft, setDraft, type ComposeDraft } from '../composeDrafts';
@@ -26,6 +42,7 @@ import { errorDetail } from '../../utils/errorDetail';
 import { sendMessage } from './chat';
 import type { ChatContext } from './chatContext';
 import { markHashesAsSent } from '../../components/chat/pastedImages';
+import { requestPromptOverrideSync } from '../../components/chat/promptValueSync';
 import { pushThreadNavState, removeThreadNavEntries } from './thread-navigation';
 
 export type ComposeMode = 'lucidos' | 'claude_code';
@@ -51,14 +68,38 @@ export function applyDestination(threadId: string | null, d: ComposeDestination)
   if (inputMode.value.type !== modeType) {
     inputMode.value = mode === 'claude_code' ? { type: 'coding_agent' } : { type: 'do' };
   }
-  if (d.kind === 'coding' && !scopeEquals(selectedScope.value, d.scope)) {
-    selectedScope.value = d.scope;
+  // Compose target: a focused composing draft (threadId), or the PENDING slot
+  // for the not-yet-created draft (threadId null). An active thread has no
+  // compose picker — ignore it defensively.
+  const composing = !threadId || threadMap.value.get(threadId)?.meta.state === 'composing';
+  if (!composing) return;
+  // Per-draft (or pending) target. `patchComposeSelection(null, …)` routes to the
+  // pending slot.
+  if (d.kind === 'coding') {
+    // Update the localStorage last-used scope seed (persisted by effects.ts) so
+    // the NEXT new draft / the fresh compose view starts from this target. This
+    // is leak-safe: `resolveScope` reads `selectedScope` ONLY for the no-draft
+    // compose view — an existing draft resolves its OWN stored scope — so this
+    // write can't move another draft (the bug the per-draft design fixed).
+    if (!scopeEquals(selectedScope.value, d.scope)) {
+      selectedScope.value = d.scope;
+    }
+    const current = getComposeSelectionOverride(threadId).scope;
+    if (!current || !scopeEquals(current, d.scope)) {
+      patchComposeSelection(threadId, { scope: d.scope });
+      // A scope change with no accompanying mode change wouldn't otherwise fire a
+      // compose PUT — persist the per-draft scope, and mark locally-edited so a
+      // stale loadAllThreads snapshot can't revert it (mirrors updateComposeSelection).
+      if (threadId) {
+        markLocallyEdited(threadId);
+        schedulePush(threadId);
+      }
+    }
   }
-  if (!threadId) return;
-  const thread = threadMap.value.get(threadId);
-  if (thread?.meta.state !== 'composing') return;
-  // null draft.mode is a real change: the patch locks the pick server-side.
-  if (getDraft(threadId).mode !== mode) {
+  // Only a real composing draft has a per-draft mode to lock; the pending
+  // draft's mode is seeded from `inputMode` at creation. null draft.mode is a
+  // real change: the patch locks the pick server-side.
+  if (threadId && getDraft(threadId).mode !== mode) {
     updateCompose(threadId, { mode });
   }
 }
@@ -159,6 +200,26 @@ export function updateCompose(threadId: string, patch: ComposePatch): void {
   schedulePush(threadId);
 }
 
+/** Single entry point for a per-draft dropdown selection change (model,
+ *  reasoning, coding agent, coding-agent model/effort). A real `threadId`
+ *  patches the keyed override, marks the thread locally-edited (so a stale
+ *  loadAllThreads snapshot can't revert the pick — same guard as text), and
+ *  schedules the debounced compose PUT that carries the selection to the DB. A
+ *  `null`/`undefined` id (fresh compose, no draft yet) writes only the pending
+ *  slot; it's transferred + persisted when the draft is created. Scope has its
+ *  own entry point (`applyDestination`) because it also updates the localStorage
+ *  last-used seed. */
+export function updateComposeSelection(
+  threadId: string | null,
+  patch: ComposeSelectionOverride,
+): void {
+  patchComposeSelection(threadId, patch);
+  if (threadId) {
+    markLocallyEdited(threadId);
+    schedulePush(threadId);
+  }
+}
+
 /** Apply an SSE ThreadComposeChanged from a peer device. Caller must check
  *  origin_device_id, pendingComposePuts, and focused-textarea guards before
  *  invoking. Replaces the draft wholesale — SSE carries the full snapshot.
@@ -166,7 +227,14 @@ export function updateCompose(threadId: string, patch: ComposePatch): void {
  *  entry; empty payloads clear the entry instead of inflating the Map. */
 export function applyRemoteCompose(
   threadId: string,
-  fields: { text: string; image_hashes: string[]; mode: ComposeMode | null },
+  fields: {
+    text: string;
+    image_hashes: string[];
+    mode: ComposeMode | null;
+    /** The draft's DB-backed per-draft selection (`ThreadComposeChanged.selection`),
+     *  hydrated into `composeSelections` so a peer's dropdown change syncs in. */
+    selection?: ComposeSelectionOverride | null;
+  },
 ): void {
   if (!threadMap.value.has(threadId)) return;
   if (fields.text === '' && fields.image_hashes.length === 0 && fields.mode === null) {
@@ -180,11 +248,14 @@ export function applyRemoteCompose(
     // docs/plans/2026-06-28-drafts-sse-empty-clear-guard.md). Gate on
     // hasLocalDraftEdit so a server-ORIGINATED draft (never edited here) is
     // still clearable by a genuine peer clear; the kept draft is local-view only.
+    // The same guard covers the selection — a locally-edited draft keeps its picks.
     if (hasLocalDraftEdit(threadId)) return;
     clearDraft(threadId);
+    setComposeSelectionFromServer(threadId, fields.selection);
     return;
   }
-  setDraft(threadId, fields);
+  setDraft(threadId, { text: fields.text, image_hashes: fields.image_hashes, mode: fields.mode });
+  setComposeSelectionFromServer(threadId, fields.selection);
 }
 
 /** Patch one thread's meta with whichever fields are set, returning a new
@@ -249,6 +320,13 @@ async function pushNow(threadId: string): Promise<void> {
     const wireHashes: string[] | null = imageHashesUnchanged(threadId, draft.image_hashes)
       ? null
       : [...draft.image_hashes];
+    // Persist the draft's per-draft dropdown selection alongside text/images/mode
+    // so a reload rehydrates it. `undefined` (no local selection) omits the field
+    // → backend COALESCE preserves. A present selection replaces the stored one;
+    // re-sending the same object on a plain keystroke PUT is a harmless no-op.
+    const selectionOverride = getComposeSelectionOverride(threadId);
+    const selectionForPut: ComposeSelectionOverride | undefined =
+      Object.keys(selectionOverride).length > 0 ? selectionOverride : undefined;
     await putComposeOnThread(
       threadId,
       draft.text,
@@ -256,6 +334,7 @@ async function pushNow(threadId: string): Promise<void> {
       // Mode is only meaningful for composing threads — once active, the
       // channel field is authoritative and the server rejects mode changes.
       thread.meta.state === 'composing' ? draft.mode : null,
+      selectionForPut,
     );
     if (wireHashes !== null) {
       lastSyncedImageHashes.set(threadId, wireHashes);
@@ -338,8 +417,16 @@ export async function awaitThreadStarted(threadId: string): Promise<void> {
 export function ensureFocusedComposeThread(): string {
   let id = focusedThreadId.value;
   if (id) return id;
-  id = crypto.randomUUID();
+  id = generateUuid();
   setFocusedThread(id);
+  // Seed THIS new draft's own stored selection: eager-copy the localStorage
+  // last-used scope so the draft carries a scope in its OWN override (resolveScope
+  // no longer falls back to the shared `selectedScope` for a real draft — that's
+  // the leak guard, so the new draft must own its scope), overlaid with any
+  // fresh-compose picks from the pending slot (a pending scope pick wins). Other
+  // fields stay unset and resolve to their account defaults. The seeded selection
+  // is persisted by the first keystroke's compose PUT (pushNow includes it).
+  seedComposeSelection(id, { scope: selectedScope.value, ...takePendingComposeSelection() });
   // Inlined instead of focusThread() — focusThread also fires scrollToBottom,
   // loadThreadEvents, and (on mobile) navigateToPane, none of which the
   // draft path wants.
@@ -364,16 +451,52 @@ export function ensureFocusedComposeThread(): string {
   return id;
 }
 
-/** Prefill the compose input with a starter prompt (the new-workspace
- *  suggestion chips). Lazily focuses/creates a composing thread, then writes
- *  the text through the normal debounced compose path so it syncs to the
- *  textarea and persists like any typed draft. Does NOT send — the user
- *  reviews/edits, picks a destination, and hits Send themselves. Returns the
- *  thread id the text landed on. */
+/** Prefill the compose input with a starter prompt (the welcome suggestions).
+ *  Lazily focuses/creates a composing thread, then writes the text through the
+ *  normal debounced compose path so it syncs to the textarea and persists like
+ *  any typed draft. Replaces the WHOLE input — text AND any attached images —
+ *  so the starter lands cleanly; a lingering attachment would otherwise ride
+ *  along with the unrelated suggestion (`image_hashes: []` is a no-op on a
+ *  brand-new draft). Does NOT send — the user reviews/edits, picks a
+ *  destination, and hits Send themselves. Returns the thread id the text
+ *  landed on. */
 export function prefillCompose(text: string): string {
   const threadId = ensureFocusedComposeThread();
-  updateCompose(threadId, { text });
+  updateCompose(threadId, { text, image_hashes: [] });
   return threadId;
+}
+
+/** Apply a welcome-message starter suggestion to the compose input.
+ *
+ *  Starter suggestions are conversational, so the destination is forced to the
+ *  Lucidos Agent (a coding-agent draft flips back to chat). The suggestion
+ *  REPLACES the focused draft's whole input — text AND any attached images (via
+ *  `prefillCompose`) — so if a non-empty draft is already in progress, confirm the
+ *  override first (a click must never silently blow away typed text or attachments;
+ *  declining keeps the draft untouched). The override is force-synced
+ *  into the textarea via `requestPromptOverrideSync` because the normal
+ *  compose→textarea sync skips a focused, non-empty input to protect in-flight
+ *  typing — without the force the draft signal (and the drawer row) would update
+ *  but the visible prompt would stay stale.
+ *
+ *  Returns true when the suggestion was applied, false when the user declined the
+ *  override. Does NOT send — the user reviews/edits and hits Send themselves. */
+export async function applySuggestion(text: string): Promise<boolean> {
+  const existingId = focusedThreadId.value;
+  if (existingId && !draftIsEmpty(getDraft(existingId))) {
+    const ok = await showConfirm(
+      'You have a draft in progress. Replace it with this suggestion?',
+      'Replace',
+      { title: 'Replace draft?', cancelLabel: 'Keep my draft' },
+    );
+    if (!ok) return false;
+  }
+  // Target the Lucidos Agent. Set BEFORE prefill so a brand-new draft is born on
+  // the chat channel, and so an existing coding-agent draft flips back to chat.
+  applyDestination(focusedThreadId.value, { kind: 'lucidos-agent' });
+  prefillCompose(text);
+  requestPromptOverrideSync();
+  return true;
 }
 
 /** Discard a composing thread. Optimistic state→discarded for instant
@@ -389,6 +512,9 @@ export async function discardCompose(threadId: string): Promise<void> {
   const restoreDraft = snapshotDraft(threadId);
   mutateThreadMeta(threadId, { state: 'discarded' });
   clearDraft(threadId);
+  // Drop the per-draft dropdown overrides too — a discarded draft is gone, and a
+  // stray entry would seed a future draft that happens to reuse the id.
+  clearComposeSelection(threadId);
   lastSyncedImageHashes.delete(threadId);
   // Pair with the push in ensureFocusedComposeThread — Back/Forward must not
   // restore a discarded thread whose events would 404.
@@ -433,21 +559,24 @@ export async function sendCompose(
 
   cancelPendingPush(threadId);
   // Bind here so sendMessage doesn't have to detect first-send vs follow-up
-  // (see frontend.md "Drafts Are Threads"). selectedScope may drift afterward.
-  // Channel is locked from `opts.useCodingAgent` (which the caller resolved
-  // via effectiveSendMode) rather than the existing meta.channel: the latter
-  // was stamped at first-keystroke time from `currentComposeMode()` and goes
-  // stale the moment the user toggles. Without this lock, sendMessage reads
-  // the stale channel, ignores the explicit useCodingAgent option, and routes
-  // a coding-agent send through the Lucidos Agent (or vice versa).
-  const scope = selectedScope.value;
+  // (see frontend.md "Drafts Are Threads"). Every dropdown value is resolved
+  // from THIS draft's per-draft override (composeSelections), falling back to
+  // the current global default — never read straight off a global signal that
+  // another draft may have changed. Channel is locked from `opts.useCodingAgent`
+  // (which the caller resolved via effectiveSendMode) rather than the existing
+  // meta.channel: the latter was stamped at first-keystroke time from
+  // `currentComposeMode()` and goes stale the moment the user toggles. Without
+  // this lock, sendMessage reads the stale channel, ignores the explicit
+  // useCodingAgent option, and routes a coding-agent send through the Lucidos
+  // Agent (or vice versa).
+  const scope = resolveScope(threadId);
   const boundRepoId = opts.useCodingAgent && scope.kind === 'external' ? scope.repoId : undefined;
   const boundCodingAgentKind = opts.useCodingAgent ? scope.kind : undefined;
   const boundCodingAgentFolder = opts.useCodingAgent && scope.kind === 'app'
     ? `data/apps/${scope.appId}`
     : undefined;
   const boundChannel: ThreadMeta['channel'] = opts.useCodingAgent ? 'claude_code' : 'chat';
-  const boundCodingAgent = opts.useCodingAgent ? selectedCodingAgent.value : undefined;
+  const boundCodingAgent = opts.useCodingAgent ? resolveCodingAgent(threadId) : undefined;
   mutateThreadMeta(threadId, {
     state: 'active',
     channel: boundChannel,
@@ -456,6 +585,15 @@ export async function sendCompose(
     codingAgentFolder: boundCodingAgentFolder,
     codingAgent: boundCodingAgent,
   });
+  // Resolve the per-draft model/effort picks and pass them to sendMessage so the
+  // send uses THIS draft's selection, not a global another draft may have
+  // changed. The Lucidos Agent path uses model/reasoningEffort; the coding-agent
+  // path uses ccModel/ccReasoningEffort. sendMessage falls back to the globals
+  // when an override is absent (raw-new sends + follow-ups keep the old path).
+  const modelOverride = resolveModel(threadId);
+  const reasoningEffortOverride = resolveReasoningEffort(threadId);
+  const ccModelOverride = resolveCcModel(threadId);
+  const ccReasoningEffortOverride = resolveCcReasoningEffort(threadId);
   // Must run before the draft clear — see `markHashesAsSent`.
   if (wireHashes.length > 0) markHashesAsSent(wireHashes);
   clearDraft(threadId);
@@ -468,16 +606,17 @@ export async function sendCompose(
       context: opts.context,
       threadId,
       focus: shouldFocus,
+      modelOverride,
+      reasoningEffortOverride,
+      ccModelOverride,
+      ccReasoningEffortOverride,
     });
-    // A compose-view CC model/effort pick is a one-shot intent: it has now been
-    // carried into this spawn's chat body (chat.ts reads ccPending* there), so
-    // consume it. Without this, the pending pick — a module signal only reset by
-    // focusThread/unfocusThread, neither of which the compose→send path hits
-    // (setFocusedThread above is the low-level setter) — rides onto every
-    // subsequent new thread, overriding the user's ~/.claude effortLevel default
-    // with a stale value. Follow-ups (sendFollowup) deliberately don't clear
-    // here: their pending is reconciled per-thread by CodingAgentControlMenu.loadCommands.
-    resetCodingAgentPendingPreferences();
+    // A compose-view pick is a one-shot intent: it has now been carried into this
+    // spawn's chat body, so consume the draft's per-draft selection. Without this
+    // the override would linger in `composeSelections` for a thread that is no
+    // longer composing. Follow-ups (sendFollowup) don't go through here — an
+    // active thread has no compose selection entry.
+    clearComposeSelection(threadId);
   } catch (err) {
     // Roll back state. Restore text/images only if the user hasn't started
     // typing into the now-empty textarea — overwriting fresh keystrokes
@@ -528,11 +667,17 @@ function flushAllPending(): void {
     const thread = threadMap.value.get(threadId);
     if (!thread) continue;
     const draft = getDraft(threadId);
+    // Include the per-draft selection so a dropdown pick made within the debounce
+    // window right before tab close isn't lost — parity with the text/images flush.
+    // Omit when empty so the backend COALESCE preserves the stored value.
+    const selectionOverride = getComposeSelectionOverride(threadId);
+    const selectionForFlush = Object.keys(selectionOverride).length > 0 ? selectionOverride : undefined;
     // Always emit the full array on tab close — hashes are tiny.
     const body = JSON.stringify({
       text: draft.text,
       image_hashes: draft.image_hashes,
       mode: thread.meta.state === 'composing' ? draft.mode : null,
+      selection: selectionForFlush,
     });
     if (body.length > 64 * 1024) {
       // Telemetry carve-out (.claude/rules/frontend.md): the tab is unloading,

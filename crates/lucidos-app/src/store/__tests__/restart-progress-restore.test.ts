@@ -36,8 +36,8 @@ const { checkConnection } = await import('../actions/connection');
 const RESTART_TOAST_KEY = 'restart-required';
 const STARTED_AT = '2026-06-28T06:00:00Z';
 const RESTARTED_AT = '2026-06-28T07:00:00Z';
-const BUILD_MESSAGE = 'Building the new version…';
-const SWAP_MESSAGE = 'Starting and swapping to new engine…';
+const BUILD_MESSAGE = 'Starting new version…';
+const SWAP_MESSAGE = 'Starting new version…';
 
 function loadedHealth(overrides: Record<string, unknown> = {}) {
   return {
@@ -163,18 +163,19 @@ describe('restart progress toast survives a reload (in-flight marker)', () => {
     expect(engineRestarting.value).toBe(true);
   });
 
-  it('cold start with only a PENDING restart (no in-flight marker) restores the warning, not progress', () => {
-    // No in-flight marker — a restart is merely pending, not underway. The
-    // pre-restart warning (with its Restart action) is correct here.
+  it('cold start with only a PENDING restart (no in-flight marker) restores state, not a toast', () => {
+    // No in-flight marker — a restart is merely pending, not underway. There is no
+    // pre-switch toast anymore; restore re-arms restartRequired so the
+    // control-panel badge + restart confirm dialog reappear. The engine "New
+    // version available → Switch" toast is owned by the poll (engine-update.ts).
     localStorage.setItem(RESTART_LS_KEY, 'true');
     engineRestarting.value = false;
     toasts.value = [];
 
     restoreRestartToast();
 
-    const toast = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
-    expect(toast!.type).toBe('warning');
-    expect(toast!.action).toBeTruthy();
+    expect(restartRequired.value).toBe(true);
+    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)).toBeFalsy();
     expect(engineRestarting.value).toBe(false);
   });
 });

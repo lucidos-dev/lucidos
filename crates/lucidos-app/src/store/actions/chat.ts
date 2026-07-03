@@ -1,7 +1,5 @@
 import {
   threadsLoaded,
-  currentModel,
-  reasoningEffort,
   panelUrl,
   panelTitle,
   showToast,
@@ -19,14 +17,17 @@ import {
 } from '../store';
 import type { ChatContext } from './chatContext';
 import type { ChatRequestBody } from '../../api/types';
-import { submitChat, cancelChat, stopClaudeCode, isTransportError, removeQueuedMessage as removeQueuedMessageRequest } from '../../api/client';
+import { submitChat, cancelChat, stopClaudeCode, isTransportError, removeQueuedMessage as removeQueuedMessageRequest, type CodingAgentModelValue, type CodingAgentReasoningEffort } from '../../api/client';
 import { getUnreachableEngineMsg } from './connection';
 import { getDeviceId } from './devices';
+import { generateUuid } from '../../utils/uuid';
 import { handleEvent, makeOptimisticThreadState, type StoredEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
+import { getThreadModelOverride, clearThreadModelOverride } from '../threadModelSelections';
 import { pushThreadNavState, removeThreadNavEntries } from './thread-navigation';
 import { revealThreadPane } from './pane';
 import { scrollToBottom } from '../../components/chat/scrollState';
+import { setCanceledQuestion, setCanceledWhileAwaiting } from '../../components/chat/prompt-input-helpers';
 import { refreshThreadEvents } from './thread-loading';
 import { markThreadRerenderStart } from '../../utils/threadOpenMarks';
 import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
@@ -225,10 +226,25 @@ export { loadRepositories } from './repositoriesLoader';
 export async function sendMessage(
   message: string,
   imageHashes?: string[],
-  options?: { useCodingAgent?: boolean; context?: ChatContext | null; threadId?: string; focus?: boolean },
+  options?: {
+    useCodingAgent?: boolean;
+    context?: ChatContext | null;
+    threadId?: string;
+    focus?: boolean;
+    // Per-draft selection carried from `sendCompose` (compose first-send). When
+    // present these win over the global signals; when absent (raw-new sends +
+    // follow-ups) the globals below are used, preserving the old behavior. The
+    // Lucidos Agent path uses model/reasoningEffort; the coding-agent path uses
+    // ccModel/ccReasoningEffort. `undefined` = not supplied (fall back);
+    // `ccModel: null` = the explicit "default" pick (omit cc_model).
+    modelOverride?: string;
+    reasoningEffortOverride?: string;
+    ccModelOverride?: CodingAgentModelValue | null;
+    ccReasoningEffortOverride?: CodingAgentReasoningEffort | null;
+  },
 ): Promise<void> {
   threadsLoaded.value = true;
-  const eventId = crypto.randomUUID();
+  const eventId = generateUuid();
   const explicitThreadId = options?.threadId;
   const shouldFocus = options?.focus ?? true;
   const isNewThread = explicitThreadId === undefined && focusedThreadId.value === null;
@@ -267,13 +283,20 @@ export async function sendMessage(
   const body: ChatRequestBody = {
     message,
     mode: 'human',
-    model: currentModel.value,
+    // Per-thread memory: send an explicit model ONLY when there's an override —
+    // a compose first-send (`modelOverride`) or this thread's pending pick.
+    // Otherwise omit it so the backend reuses the thread's last recorded model
+    // (`resolve_chat_overrides_for_thread`), falling back to the account default
+    // for a brand-new thread. Sending `currentModel` here was the bug: it forced
+    // the global default onto every follow-up.
+    model: options?.modelOverride ?? getThreadModelOverride(threadId).model,
     device_id: getDeviceId(),
-    // reasoning_effort is set below: chat threads use the chat preference,
-    // CC threads only set it when the user has a pending pick. CC follow-ups
-    // without a pending pick must NOT carry the chat default — the backend
-    // resolves from the prior session / CodingAgentSettingsChanged events,
-    // and a stray default here overrides that with the unrelated chat value.
+    // reasoning_effort is set below: chat threads send it only when there's an
+    // override or a per-thread pick (else the backend reuses the thread's last
+    // effort); CC threads only set it when the user has a pending pick. Neither
+    // may carry a stray default — for chat that would re-break per-thread memory,
+    // and for CC the backend resolves from the prior session /
+    // CodingAgentSettingsChanged events.
     event_id: eventId,
     thread_id: threadId,
     ...(options?.context ?? {}),
@@ -318,30 +341,39 @@ export async function sendMessage(
     } else if (threadBeforeSend.meta.repoId) {
       body.repo_id = threadBeforeSend.meta.repoId;
     }
-    // Apply pending CC preferences (set from compose view before session start).
-    // Don't clear pending here — they stay visible in the UI until
-    // loadCommands() confirms the session adopted them (matched value via
-    // current_reasoning_effort / current_model). Clearing early causes a
-    // race: loadCommands() fires before the session exists, gets stale cache
-    // values, and with pending gone the UI shows the previous session's
-    // effort/model instead of the user's selection.
-    // Consumption: a compose first-send spawn is one-shot — sendCompose clears
-    // the pick after this await so it can't leak onto the next new thread.
-    // Follow-ups keep the pick until loadCommands reconciles it per-thread.
-    if (codingAgentPendingModel.value !== null) {
-      body.cc_model = codingAgentPendingModel.value;
+    // Apply the CC model/effort pick. A compose first-send passes the DRAFT's
+    // resolved override (per-draft; `undefined` never reaches here from
+    // sendCompose — it resolves to a value or null); raw-new sends + follow-ups
+    // pass nothing, so we fall back to the global `codingAgentPending*` (the
+    // active-thread control menu's per-thread pending, reconciled by
+    // loadCommands). `null` = the explicit "default" pick → omit cc_model so the
+    // backend resolves its own default. For an active follow-up we deliberately
+    // do NOT clear the global pending here — it stays visible until
+    // loadCommands() confirms the session adopted it (matched value), avoiding
+    // the race where a stale in-flight fetch clears the user's pick.
+    const ccModel = options?.ccModelOverride !== undefined
+      ? options.ccModelOverride
+      : codingAgentPendingModel.value;
+    if (ccModel !== null) {
+      body.cc_model = ccModel;
     }
-    if (codingAgentPendingReasoningEffort.value !== null) {
-      body.reasoning_effort = codingAgentPendingReasoningEffort.value;
+    const ccEffort = options?.ccReasoningEffortOverride !== undefined
+      ? options.ccReasoningEffortOverride
+      : codingAgentPendingReasoningEffort.value;
+    if (ccEffort !== null) {
+      body.reasoning_effort = ccEffort;
     }
-    // No CC pending and a CC thread → omit reasoning_effort entirely so the
+    // No CC pick and a CC thread → omit reasoning_effort entirely so the
     // backend falls through cc_reasoning_effort → prev_effort (live session)
     // → event_effort (CodingAgentSettingsChanged) → cc_default. The chat
     // default ('high') is a chat preference, not a CC preference, and would
     // wrongly override the prior session's effort on a follow-up after the
     // user already picked something else mid-session.
   } else {
-    body.reasoning_effort = reasoningEffort.value;
+    // Chat thread: an explicit override or this thread's pending pick; otherwise
+    // omit so the backend reuses the thread's last effort (?? account default).
+    const effort = options?.reasoningEffortOverride ?? getThreadModelOverride(threadId).reasoningEffort;
+    if (effort) body.reasoning_effort = effort;
   }
 
   // CC ignores url_context; only send for non-CC threads. Content extraction is
@@ -365,6 +397,10 @@ export async function sendMessage(
   try {
     await submitChat(body);
     schedulePendingCleanup(threadId, eventId);
+    // The pick (if any) is now stamped on the sent message and becomes the
+    // thread's remembered value; drop the ephemeral pending override so future
+    // resolves come from the thread's events (no-op for CC / no pick).
+    clearThreadModelOverride(threadId);
   } catch (error: unknown) {
     if (isTransportError(error)) {
       // Engine unreachable. Render the user's message as a failed in-thread
@@ -410,42 +446,62 @@ export async function sendMessage(
   }
 }
 
+/** Outcome of a Cancel/Stop click:
+ *   - 'canceled' — the server canceled live work (or settled a stuck
+ *     projection); a terminal event is on its way over SSE.
+ *   - 'noop'     — the server had nothing to cancel (`{"canceled": false}`);
+ *     the client's optimistic "canceling" state is stale and must be
+ *     reconciled by re-syncing the thread.
+ *   - 'failed'   — the API call itself failed (a toast was already shown). */
+export type CancelOutcome = 'canceled' | 'noop' | 'failed';
+
 /**
  * Cancel a thread's in-flight exchange. Routes to the chat or CC endpoint
  * based on thread channel. Pinning the threadId at call time matters: the
  * user can switch focus between clicking Cancel and the API resolving, and
  * we must not cancel the wrong thread.
- * Returns false if the API call failed — caller resets optimistic UI.
  */
-export async function cancelCurrentExchange(threadId?: string): Promise<boolean> {
+export async function cancelCurrentExchange(threadId?: string): Promise<CancelOutcome> {
   const tid = threadId ?? focusedThreadId.value ?? undefined;
   try {
     const thread = tid ? threadMap.value.get(tid) : undefined;
-    if (thread?.meta.channel === 'claude_code') {
-      await stopClaudeCode(undefined, tid);
-    } else {
-      await cancelChat(tid);
-    }
-    return true;
+    const canceled = thread?.meta.channel === 'claude_code'
+      ? await stopClaudeCode(undefined, tid)
+      : await cancelChat(tid);
+    return canceled ? 'canceled' : 'noop';
   } catch (err) {
     showToast(`Failed to cancel: ${errorDetail(err)}`, 'error');
-    return false;
+    return 'failed';
   }
 }
 
 /**
  * Set the optimistic "canceling" flag for a thread, fire the cancel API, and
- * roll back the flag on failure. Cleared on success by PromptInput's
- * status-transition effect once the thread leaves active status.
+ * reconcile the flag by outcome:
+ *   - 'canceled': keep the flag — PromptInput's status-transition effect
+ *     (`shouldClearCanceling`) releases it once the thread leaves mid-turn.
+ *   - 'noop': the server had nothing to cancel, so no terminal event will ever
+ *     arrive to release the flag — the exact wedge that leaves Cancel disabled
+ *     while the thread visibly keeps going. Release the flag now AND re-sync the
+ *     thread (`refreshThreadEvents`) so any terminal event the client missed
+ *     (e.g. a `ResponseCanceled` broadcast the page raced on load) lands and the
+ *     status snaps to truth.
+ *   - 'failed': roll the flag back so the user can retry (toast already shown).
  */
 export async function handleCancelExchange(threadId: string): Promise<void> {
   const next = new Set(cancelingThreadIds.value);
   next.add(threadId);
   cancelingThreadIds.value = next;
-  const ok = await cancelCurrentExchange(threadId);
-  if (!ok) {
-    const rollback = new Set(cancelingThreadIds.value);
-    rollback.delete(threadId);
-    cancelingThreadIds.value = rollback;
+  const outcome = await cancelCurrentExchange(threadId);
+  if (outcome === 'canceled') return;
+  const rollback = new Set(cancelingThreadIds.value);
+  rollback.delete(threadId);
+  cancelingThreadIds.value = rollback;
+  setCanceledQuestion(threadId, undefined);
+  setCanceledWhileAwaiting(threadId, false);
+  if (outcome === 'noop') {
+    // Stale view: re-read events + currentAggregate so the missed terminal
+    // event lands and the thread stops looking mid-turn.
+    void refreshThreadEvents(threadId).catch(() => {});
   }
 }

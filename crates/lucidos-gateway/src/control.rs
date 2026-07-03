@@ -20,6 +20,11 @@ use serde_json::{json, Value};
 pub fn router() -> Router<GatewayState> {
     Router::new()
         .route("/workspaces", get(list).post(create))
+        // Fresh aggregate unread total across running workspaces, computed on
+        // demand. The desktop dock badge reads this on its nudge (and periodic
+        // tick) so a just-read notification reflects immediately, rather than
+        // waiting for the supervise loop's cached `last_unread` to catch up.
+        .route("/unread-total", get(unread_total))
         // Restore a local backup archive into a new workspace (picker upload).
         // The body is a multipart upload of a potentially multi-GB `.enc`, so the
         // default 2 MB extractor limit is lifted for this route only.
@@ -221,6 +226,13 @@ struct DeleteBody {
 
 async fn list(State(state): State<GatewayState>) -> Json<Value> {
     Json(json!({ "workspaces": state.list_status().await }))
+}
+
+/// Fresh aggregate unread total across running workspaces (see
+/// [`GatewayState::fresh_unread_total`]). Read by the Tauri desktop dock-badge
+/// loop on its nudge + periodic tick.
+async fn unread_total(State(state): State<GatewayState>) -> Json<Value> {
+    Json(json!({ "total": state.fresh_unread_total().await }))
 }
 
 async fn create(

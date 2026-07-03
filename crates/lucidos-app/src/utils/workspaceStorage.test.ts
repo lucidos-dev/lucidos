@@ -74,7 +74,7 @@ describe('pure helpers', () => {
     expect(isGlobalKey('lucidos-font-family')).toBe(false);
     expect(isGlobalKey('lucidos-ui-scale')).toBe(false);
     expect(isGlobalKey('lucidos-animation-speed-slider')).toBe(false);
-    expect(isGlobalKey('lucidos-sw-update-dismissed')).toBe(false);
+    expect(isGlobalKey('lucidos-notifications-filter')).toBe(false);
     expect(isGlobalKey('lucidos-chunk-reload-at')).toBe(false);
     expect(isGlobalKey('lucidos-focused-thread')).toBe(false);
   });

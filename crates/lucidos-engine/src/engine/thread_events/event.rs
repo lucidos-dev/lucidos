@@ -750,6 +750,17 @@ pub enum ThreadEvent {
         coding_agent: CodingAgent,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cc_session_id: Option<String>,
+        /// Absolute `CLAUDE_CONFIG_DIR` the session was created under, stamped
+        /// alongside `cc_session_id` at the Init emit — the authoritative
+        /// session↔config-dir pairing. CC keys each session's transcript on this
+        /// dir (`$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`), so a follow-up
+        /// resume re-injects it (see `lookup_pinned_cc_config_dir` +
+        /// `SpawnArgs::claude_config_dir`) so a mid-flight user toggle of the env
+        /// var can't strand the session (dev/bf997e21). `None` on legacy rows,
+        /// on the pre-Init settings emit, and on mid-session settings-only emits
+        /// (model/effort/permission changes) — the Init emit is the carrier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_config_dir: Option<String>,
     },
 
     // Mid-flight injection — a user correction OR a system message (e.g. parent

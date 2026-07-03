@@ -565,6 +565,192 @@ async fn default_local_branch_cache_separates_per_repo_root() {
     );
 }
 
+/// The reported external-repo bug: an external repo whose default branch is
+/// neither `main` nor `master` (e.g. `develop`) and whose canonical branch was
+/// never checked out locally — the coding-agent worktree branched straight off
+/// `origin/develop`. `default_local_branch` can't find a *local* default and
+/// falls through to the hardcoded `"main"` guess; since `origin/main` doesn't
+/// exist either, `default_diff_base` returned bare `main` and the Diff button's
+/// `main...<branch>` range died with `fatal: unknown revision 'main'`.
+///
+/// `default_diff_base` must fall back to `origin/<default>` (the ref the branch
+/// was actually cut from — its true fork point), so the diff range resolves.
+#[tokio::test]
+async fn default_diff_base_falls_back_to_origin_when_local_default_branch_missing() {
+    // A "remote" whose default branch is `develop`, seeded with one commit.
+    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote = remote_tmp.path().to_path_buf();
+    let _ = git_cmd(&["init", "-q", "--bare", "-b", "develop"], &remote).await;
+
+    let seed_tmp = tempfile::tempdir().unwrap();
+    let seed = seed_tmp.path().to_path_buf();
+    let _ = git_cmd(&["init", "-q", "-b", "develop"], &seed).await;
+    tokio::fs::write(seed.join("base.txt"), "base\n").await.unwrap();
+    let _ = git_cmd(&["add", "."], &seed).await;
+    let _ = git_cmd(&["commit", "-q", "-m", "base"], &seed).await;
+    let _ = git_cmd(&["remote", "add", "origin", remote.to_str().unwrap()], &seed).await;
+    let _ = git_cmd(&["push", "-q", "origin", "develop"], &seed).await;
+
+    // The repo-under-test: has `origin` + `origin/HEAD` -> origin/develop, but
+    // NO local `develop` branch (never checked out).
+    let repo_tmp = tempfile::tempdir().unwrap();
+    let repo = repo_tmp.path().to_path_buf();
+    let _ = git_cmd(&["init", "-q"], &repo).await;
+    let _ = git_cmd(&["remote", "add", "origin", remote.to_str().unwrap()], &repo).await;
+    let _ = git_cmd(&["fetch", "-q", "origin"], &repo).await;
+    let o = git_cmd(&["remote", "set-head", "origin", "-a"], &repo).await.unwrap();
+    assert!(
+        o.status.success(),
+        "remote set-head -a failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // The CC worktree branch forks straight off origin/develop (mirrors
+    // `resolve_worktree_base` for an external repo) and adds a commit — WITHOUT
+    // ever creating a local `develop` branch.
+    let branch = "claude-code/20260701-083109-27b2c5";
+    let _ = git_cmd(&["checkout", "-q", "-b", branch, "origin/develop"], &repo).await;
+    tokio::fs::write(repo.join("feature.txt"), "feature\n").await.unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-q", "-m", "cc work"], &repo).await;
+
+    // Precondition: there is genuinely no local `develop`/`main`/`master` to
+    // diff against — the hardcoded `main` fallback is a phantom ref here.
+    for phantom in ["develop", "main", "master"] {
+        assert!(
+            !git_cmd(&["rev-parse", "--verify", "--quiet", phantom], &repo)
+                .await
+                .unwrap()
+                .status
+                .success(),
+            "precondition: local `{phantom}` must not exist"
+        );
+    }
+
+    let base = default_diff_base(&repo).await;
+    assert_eq!(
+        base, "origin/develop",
+        "must fall back to origin/<default> when the local default branch is absent, got `{base}`"
+    );
+
+    // The user-visible symptom: the three-dot diff range must resolve (this is
+    // the exact command the Diff button runs).
+    let range = format!("{base}...{branch}");
+    let diff = git_cmd(&["diff", &range, "--no-color"], &repo).await.unwrap();
+    assert!(
+        diff.status.success(),
+        "diff range `{range}` must resolve, got: {}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&diff.stdout).contains("feature.txt"),
+        "diff must show the branch's authored file"
+    );
+}
+
+/// Belt-and-suspenders: a repo with NO `origin` remote whose default branch is
+/// neither `main` nor `master` (e.g. `trunk`). `default_local_branch` still
+/// hands back the `"main"` guess, and there's no `origin/<default>` to fall back
+/// to — so `default_diff_base` must degrade to the primary worktree's tip commit
+/// (a ref that always resolves) rather than erroring the diff with a phantom
+/// `main`.
+#[tokio::test]
+async fn default_diff_base_falls_back_to_primary_worktree_head_when_no_default_resolves() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().to_path_buf();
+    let _ = git_cmd(&["init", "-q", "-b", "trunk"], &repo).await;
+    tokio::fs::write(repo.join("base.txt"), "base\n").await.unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-q", "-m", "base"], &repo).await;
+
+    // CC branch off HEAD (mirrors an external repo with no `origin`), add work,
+    // then return the primary checkout to `trunk` so the diff base != branch tip.
+    let branch = "claude-code/20260701-090000-abcdef";
+    let _ = git_cmd(&["checkout", "-q", "-b", branch], &repo).await;
+    tokio::fs::write(repo.join("feature.txt"), "feature\n").await.unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-q", "-m", "cc work"], &repo).await;
+    let _ = git_cmd(&["checkout", "-q", "trunk"], &repo).await;
+
+    let base = default_diff_base(&repo).await;
+    assert!(
+        git_cmd(&["rev-parse", "--verify", "--quiet", &base], &repo)
+            .await
+            .unwrap()
+            .status
+            .success(),
+        "default_diff_base must return a ref that resolves, got `{base}`"
+    );
+
+    let range = format!("{base}...{branch}");
+    let diff = git_cmd(&["diff", &range, "--no-color"], &repo).await.unwrap();
+    assert!(
+        diff.status.success(),
+        "diff range `{range}` must resolve, got: {}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&diff.stdout).contains("feature.txt"),
+        "diff must show the branch's authored file"
+    );
+}
+
+/// Regression guard for the empty-diff trap: when `default_diff_base` runs
+/// inside a LINKED coding-agent worktree (as `diff_via_worktree` calls it) for a
+/// no-origin, non-main/master-default repo, the last-resort base must NOT be the
+/// worktree's own `HEAD` — that is the thread's branch, so `HEAD...HEAD` renders
+/// an empty diff even though the branch has real changes. It must resolve to the
+/// PRIMARY worktree's tip so the branch's work shows up.
+#[tokio::test]
+async fn default_diff_base_in_linked_worktree_never_uses_own_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().to_path_buf();
+    let _ = git_cmd(&["init", "-q", "-b", "trunk"], &repo).await;
+    tokio::fs::write(repo.join("base.txt"), "base\n").await.unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-q", "-m", "base"], &repo).await;
+
+    // Linked worktree on a CC branch off trunk (mirrors an external-repo spawn
+    // with no origin), with an authored commit.
+    let branch = "claude-code/20260701-091500-fedcba";
+    let wt_dir = tempfile::tempdir().unwrap();
+    let wt_path = wt_dir.path().join("wt");
+    let out = git_cmd(
+        &["worktree", "add", "-b", branch, wt_path.to_str().unwrap(), "trunk"],
+        &repo,
+    )
+    .await
+    .unwrap();
+    assert!(
+        out.status.success(),
+        "worktree add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    tokio::fs::write(wt_path.join("feature.txt"), "feature\n").await.unwrap();
+    let _ = git_cmd(&["add", "."], &wt_path).await;
+    let _ = git_cmd(&["commit", "-q", "-m", "cc work"], &wt_path).await;
+
+    // Resolve the base FROM the worktree, exactly as diff_via_worktree does.
+    let base = default_diff_base(&wt_path).await;
+    assert_ne!(
+        base, "HEAD",
+        "base must not be the worktree's own HEAD (would diff the branch against itself)"
+    );
+
+    let range = format!("{base}...HEAD");
+    let diff = git_cmd(&["diff", &range, "--no-color"], &wt_path).await.unwrap();
+    assert!(
+        diff.status.success(),
+        "diff range `{range}` must resolve, got: {}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&diff.stdout).contains("feature.txt"),
+        "the linked worktree's authored file must appear in the diff — an empty \
+         diff means the base collapsed onto the branch's own HEAD"
+    );
+}
+
 #[test]
 fn files_have_client_update_mixed_files() {
     // If any frontend file is present, returns true

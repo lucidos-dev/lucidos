@@ -24,7 +24,10 @@ function makeVapidKey(): string {
 }
 
 /** Install a `granted`-permission Notification + PushManager stub on globalThis,
- *  matching what the production flow probes for before subscribing. */
+ *  matching what the production flow probes for before subscribing. The fake
+ *  origin is https://lucidos.test (see beforeEach), so declare the secure
+ *  context a real browser would grant it — initPushSubscription's
+ *  pushUnsupportedReasonHere() gate checks window.isSecureContext first. */
 function installPermissionStubs() {
   (globalThis as unknown as { Notification: typeof Notification }).Notification = Object.assign(
     function () { /* stub */ } as unknown as typeof Notification,
@@ -34,6 +37,7 @@ function installPermissionStubs() {
     },
   ) as typeof Notification;
   (globalThis as unknown as { PushManager: object }).PushManager = function () { /* stub */ };
+  Object.defineProperty(window, 'isSecureContext', { value: true, configurable: true });
 }
 
 describe('push.ts uses api/client helpers (not raw fetch)', () => {
@@ -155,5 +159,46 @@ describe('push.ts uses api/client helpers (not raw fetch)', () => {
     expect(subscribePost!.body).toContain('self-heal');
     const subscribePayload = JSON.parse(subscribePost!.body!) as Record<string, string>;
     expect(subscribePayload.scope_url).toBe('https://lucidos.test/');
+  });
+});
+
+describe('pushUnsupportedReason', () => {
+  const ALL_OK = {
+    secureContext: true,
+    hasServiceWorker: true,
+    hasPushManager: true,
+    hasNotification: true,
+  };
+
+  it('returns null when the context fully supports push', async () => {
+    const { pushUnsupportedReason } = await import('./push');
+    expect(pushUnsupportedReason(ALL_OK)).toBeNull();
+  });
+
+  it('insecure origin wins over missing APIs and names the fix, not the browser', async () => {
+    // Chrome hides navigator.serviceWorker entirely on insecure origins, so
+    // this exact combination is what a packaged install over http://<host>
+    // reports — the message must blame the origin and point at https/localhost.
+    const { pushUnsupportedReason } = await import('./push');
+    const reason = pushUnsupportedReason({
+      secureContext: false,
+      hasServiceWorker: false,
+      hasPushManager: false,
+      hasNotification: true,
+    });
+    expect(reason).toMatch(/secure origin/i);
+    expect(reason).toMatch(/https/);
+    expect(reason).not.toMatch(/not supported in this browser/i);
+  });
+
+  it('missing service worker / PushManager on a secure origin → browser support message', async () => {
+    const { pushUnsupportedReason } = await import('./push');
+    expect(pushUnsupportedReason({ ...ALL_OK, hasServiceWorker: false })).toMatch(/not supported in this browser/i);
+    expect(pushUnsupportedReason({ ...ALL_OK, hasPushManager: false })).toMatch(/not supported in this browser/i);
+  });
+
+  it('missing Notification API → notifications support message', async () => {
+    const { pushUnsupportedReason } = await import('./push');
+    expect(pushUnsupportedReason({ ...ALL_OK, hasNotification: false })).toMatch(/notifications are not supported/i);
   });
 });

@@ -20,7 +20,7 @@ import { getEventToggleState, getCollapsedVisibleEvents, splitEventSections, has
 import { statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated } from '../../store/exchange-status';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
-import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget } from '../../utils/linkifyPaths';
+import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef } from '../../utils/linkifyPaths';
 import { handleNavigationRequest } from '../../store/actions/thread-sync';
 import { ChangeBody, CheckpointCard, ContinueButton, FileList, GeneratedImage, InitiatorPanel, InlineStep, MarkdownBlock, ResponsePanel, ResumeNoteBody, UserMessageBody, changeAccent, changeActions, describeExecutor } from './chat-exchange-parts';
 import { TrashIcon } from '../shared/icons';
@@ -203,6 +203,22 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
         e.preventDefault();
         handleNavigationRequest({ target: navName });
         return;
+      }
+      // A bare app-id/name href like `habit-tracker` — the LLM writes
+      // `[Habit Tracker](habit-tracker)` by analogy to `[Notifications](notifications)`.
+      // Not caught by extractAppIdFromHref (no apps/ prefix, no app: scheme);
+      // resolve it against the loaded apps list by id OR name. Runs AFTER nav so
+      // reserved panel names still route to their panel. Without this the browser
+      // navigates to the relative href, the SPA fallback serves the shell, and
+      // the whole workspace reloads (the "Opening workspace" splash on iOS PWA).
+      const bareRef = extractBareAppRef(rawHref);
+      if (bareRef) {
+        const app = apps.find((a) => a.id === bareRef || a.name === bareRef);
+        if (app) {
+          e.preventDefault();
+          openApp(app);
+          return;
+        }
       }
       // A `file://` URL or an absolute filesystem path (a staged release .dmg
       // under ~/…/.lucidos/release-worktrees/, an /Applications/… folder, …) —
@@ -440,8 +456,16 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     });
   }
 
+  // Identity for keyboard turn-nav's Enter toggle (see
+  // scrollState.toggleNavigatedTurnCollapsed): which collapse store the ⌘↑/⌘↓-
+  // highlighted turn folds. Response body wins; a response-less divider/change turn
+  // falls back to its initiator panel; absent when neither is collapsible so Enter
+  // is a no-op there.
+  const collapseKind = canCollapse ? 'response' : canCollapseInitiator ? 'initiator' : undefined;
+
   return (
-    <div class="chat-exchange" ref={rootRef} data-event-id={exchange.userEvent._eventId} data-change-id={changeId || undefined}>
+    <div class="chat-exchange" ref={rootRef} data-event-id={exchange.userEvent._eventId} data-change-id={changeId || undefined}
+         data-thread-id={threadId} data-user-seq={exchange.userSeq} data-collapse-kind={collapseKind}>
       <InitiatorPanel
         initiator={isQueuedUserMessage
           ? { ...initiator, status: queuedStatus }

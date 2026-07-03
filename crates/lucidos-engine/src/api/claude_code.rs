@@ -44,7 +44,7 @@ pub(super) async fn claude_code_stop(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<StopQuery>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Json<super::CancelResponse>, StatusCode> {
     let thread_id = super::parse_optional_uuid(query.thread_id.as_deref())?;
     // Stamp the user actor so any ChangeApplied / ChangeApplyFailed emitted by
     // the stale-session fallback (stop?apply=true on a thread whose CC
@@ -53,15 +53,18 @@ pub(super) async fn claude_code_stop(
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
     // Resolve any pending question card before CC ends — otherwise its answer
-    // buttons would dangle after the session goes away.
-    if let Some(tid) = thread_id {
+    // buttons would dangle after the session goes away. A resolved card counts
+    // toward `canceled`: it IS a status-changing event the client will receive.
+    let question_resolved = if let Some(tid) = thread_id {
         crate::engine::agent_question::resolve_pending_question_as_canceled(
             &state.engine,
             tid,
             actor.clone(),
         )
-        .await;
-    }
+        .await
+    } else {
+        false
+    };
 
     // Cancel (Stop) = Esc: route a real `UserStop` through CC's native interrupt
     // so the turn is interrupted but the session stays resumable — the next
@@ -70,19 +73,33 @@ pub(super) async fn claude_code_stop(
     // (`ChangeApplied` / `ChangeDiscarded`) and must hard-stop, not interrupt.
     use crate::engine::claude_code::{StopReason, SESSION_ALREADY_WAITING};
     let reason = query.reason();
-    let result = match reason {
-        StopReason::UserStop => state.engine.interrupt_agent(thread_id, actor).await,
-        other => state.engine.stop_agent(other, thread_id, actor).await,
-    };
-    match result {
-        Ok(_) => Ok(StatusCode::OK),
-        // Cancel click racing an already-finished turn — nothing to interrupt.
-        // Matches the prior `stop_agent` no-op on an idle session.
-        Err(e) if e.to_string() == SESSION_ALREADY_WAITING => Ok(StatusCode::OK),
-        Err(e) => {
-            crate::log!("[API] claude_code_stop ({:?}) failed: {}", reason, e);
-            Err(StatusCode::NOT_FOUND)
-        }
+    match reason {
+        // `canceled = false` means nothing was interruptible — the client's
+        // optimistic "canceling" state is stale and it must re-sync.
+        StopReason::UserStop => match state.engine.interrupt_agent(thread_id, actor).await {
+            Ok(interrupted) => Ok(Json(super::CancelResponse {
+                canceled: question_resolved || interrupted,
+            })),
+            // Cancel click racing an already-finished turn — nothing to
+            // interrupt. Report `canceled` = whether the question card resolved
+            // (the only status-changing effect this click could have had).
+            Err(e) if e.to_string() == SESSION_ALREADY_WAITING => Ok(Json(super::CancelResponse {
+                canceled: question_resolved,
+            })),
+            Err(e) => {
+                crate::log!("[API] claude_code_stop ({:?}) failed: {}", reason, e);
+                Err(StatusCode::NOT_FOUND)
+            }
+        },
+        // Apply / Discard: the terminator is `ChangeApplied` / `ChangeDiscarded`,
+        // and callers don't read `canceled` — report `true` on success.
+        other => match state.engine.stop_agent(other, thread_id, actor).await {
+            Ok(()) => Ok(Json(super::CancelResponse { canceled: true })),
+            Err(e) => {
+                crate::log!("[API] claude_code_stop ({:?}) failed: {}", reason, e);
+                Err(StatusCode::NOT_FOUND)
+            }
+        },
     }
 }
 
@@ -270,9 +287,51 @@ pub(super) async fn claude_code_interrupt(
 }
 
 
+/// Response of `GET /api/v1/coding-agents/binaries` — effective CLI binary
+/// resolution per coding agent, for the Settings → System → Coding agents surface.
+/// Live detection (see `runtime::detect_agent_binary`); the override itself is
+/// the `coding_agent_*_path` preference written via `PUT /api/v1/preferences`.
+#[derive(Serialize)]
+pub(super) struct AgentBinariesResponse {
+    claude_code: crate::runtime::AgentBinaryStatus,
+    codex: crate::runtime::AgentBinaryStatus,
+}
+
+pub(super) async fn coding_agent_binaries(
+    State(state): State<AppState>,
+) -> Result<Json<AgentBinariesResponse>, (StatusCode, String)> {
+    let read_override = |key: &'static str| {
+        let pool = state.pool.clone();
+        async move {
+            crate::core::PreferenceStore::get(&pool, key)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to read {key}: {e}"),
+                    )
+                })
+                .map(|v| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+        }
+    };
+    let claude_override = read_override(crate::core::PREF_CODING_AGENT_CLAUDE_PATH).await?;
+    let codex_override = read_override(crate::core::PREF_CODING_AGENT_CODEX_PATH).await?;
+    Ok(Json(AgentBinariesResponse {
+        claude_code: crate::runtime::detect_agent_binary(
+            crate::runtime::CodingAgent::ClaudeCode,
+            claude_override.as_deref(),
+        ),
+        codex: crate::runtime::detect_agent_binary(
+            crate::runtime::CodingAgent::Codex,
+            codex_override.as_deref(),
+        ),
+    }))
+}
+
 /// Routes for the `/claude-code/*` surface.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
+        .route("/coding-agents/binaries", get(coding_agent_binaries))
         .route("/claude-code/stop", post(claude_code_stop))
         .route(
             "/claude-code/interrupt",

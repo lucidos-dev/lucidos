@@ -33,7 +33,7 @@ pub(crate) use prompts::build_merge_prompt;
 pub(crate) use reconstruct::prepend_reconstruction;
 pub(crate) use resume::{
     change_description_fallback, latest_originating_event_id, lookup_latest_cc_session_id,
-    CC_ORIGINATING_EVENT_TYPES, CHAT_ORIGINATING_EVENT_TYPES,
+    lookup_pinned_cc_config_dir, CC_ORIGINATING_EVENT_TYPES, CHAT_ORIGINATING_EVENT_TYPES,
 };
 
 // Test-only re-exports — non-test callers reach these via super::* inside agent_session.

@@ -21,20 +21,107 @@ On a clean macOS or Linux machine:
 curl -fsSL https://raw.githubusercontent.com/lucidos-dev/lucidos/main/install.sh | sh
 ```
 
-This bootstraps the toolchain (Rust, Node, Docker, build deps), clones the repo
-to `~/lucidos`, starts PostgreSQL + the engine + the frontend, and prints the
-local URL to open (default <http://localhost:5173>). It is idempotent — safe to
-re-run; it reuses an existing checkout, build, and workspace.
+By **default** the installer DOWNLOADS the prebuilt headless runtime for your
+platform — the engine, the gateway, the frontend, and a relocatable PostgreSQL 18
++ pgvector, all bundled — verifies its `sha256` checksum, extracts it under
+`~/.lucidos/runtime/`, and **registers the bundled gateway as an always-on user
+service** (a launchd LaunchAgent on macOS, a systemd `--user` unit on Linux) so it
+survives terminal-close + reboot and restarts on failure — the gateway provisions
+the embedded Postgres and supervises the engine, the same model as the macOS
+`.app`. No Docker, no Rust/Node, no clone, no compile. First run is seconds, not
+minutes. It opens at <http://localhost:5252>. Pass `--no-service` to run it in the
+foreground instead (Ctrl-C to stop).
 
-> **First run compiles from source.** Lucidos ships no prebuilt binaries or
-> container images yet, so the first launch builds the Rust engine from source —
-> typically **10–20+ minutes** on a clean machine. Subsequent runs reuse the
-> build and start in seconds.
+> **No prebuilt release is published yet**, so the default download will **404
+> today**. The runtime tarballs are produced by CI but are not yet attached to a
+> GitHub Release. Until they are, use one of the two working paths below:
+>
+> - **Build from source** (the original behavior):
+>   ```bash
+>   curl -fsSL https://raw.githubusercontent.com/lucidos-dev/lucidos/main/install.sh | sh -s -- --dev
+>   ```
+>   `--dev` (alias `--source`, or `LUCIDOS_FROM_SOURCE=1`) bootstraps the
+>   toolchain (Rust, Node, Docker, build deps), clones the repo to `~/lucidos`,
+>   compiles the engine from source (a **release** build, typically **10–20+
+>   minutes** on a clean machine; `LUCIDOS_DEBUG_BUILD=1` for a faster debug
+>   build), and starts the stack via `scripts/run.sh`.
+> - **Install a tarball you built yourself** with
+>   [`scripts/build-headless.sh`](scripts/build-headless.sh):
+>   ```bash
+>   ./install.sh --from-tarball /path/to/lucidos-<version>-<triple>.tar.gz
+>   ```
+>   It verifies the adjacent `.sha256` (fail-closed on mismatch), extracts, and
+>   launches — fully offline.
 
-**Pick your LLM provider** (optional). With no credentials the installer boots
-in `mock` mode so the UI still comes up; configure a real provider in
-**Settings → Providers** afterwards. To wire one up at install time, pass it
-through the pipe:
+The installer is idempotent — safe to re-run. The download/tarball paths skip an
+already-extracted runtime for the same version unless you pass `--force`; `--dev`
+reuses an existing checkout, build, and workspace.
+
+**Linux prerequisites.** The prebuilt Linux tarballs are built against the
+Ubuntu 22.04 baseline, so they run on glibc 2.35+ distros (Ubuntu 22.04+,
+Debian 12+, RHEL/Rocky/Alma 9+, Fedora 36+). The installer runs the extracted
+gateway once and refuses older hosts at install time with a clear message —
+build from source there instead (`--dev`). Two host packages are expected at
+runtime and warned about when missing: `git` (coding-agent threads + repository
+features) and `ca-certificates` (outbound TLS: LLM providers, the
+embedding-model download, web push). `python3` is optional (script tooling).
+
+**Remote access & push notifications.** The gateway listens on **localhost
+only** by default (the secure posture) and serves plain HTTP. Browsers grant
+service workers — and with them **push notifications + PWA install** — only on
+a *secure origin* (https or localhost), so to use Lucidos from other devices:
+
+- `ssh -L 5252:localhost:5252 <host>`, then open <http://localhost:5252> — the
+  full app including push, zero config (localhost is a secure context).
+- `tailscale serve --bg 5252` — trusted HTTPS on your tailnet.
+- Or expose it directly:
+  `./install.sh --bind all --tls-cert <cert.pem> --tls-key <key.pem>`.
+  `--bind` writes the machine-global `~/.lucidos/network.toml` (the same knob
+  as the picker's Settings → Network access); the TLS pair makes the gateway
+  serve https (push needs a certificate your browsers trust). A bare
+  `--bind all` without TLS serves the app over `http://<host>` — usable, but
+  browsers will not grant push/PWA there.
+
+**Always-on service & multiple gateways.** The default install registers a
+**user-level service** named after the instance — on macOS a launchd LaunchAgent
+`com.lucidos.gateway.<name>` at `~/Library/LaunchAgents/`, on Linux a systemd
+`--user` unit `lucidos-gateway-<name>.service` at `~/.config/systemd/user/`
+(`RunAtLoad`/`KeepAlive` ≈ `Restart=always`; logs at `<prefix>/<name>/logs/` on
+macOS, or `journalctl --user -u lucidos-gateway-<name>` on Linux). On Linux it
+also runs `loginctl enable-linger` (best-effort, may prompt for `sudo`) so the
+service survives logout/reboot. **No supported service manager** (e.g. a container
+without a user systemd session) → it degrades to a foreground launch with a clear
+message. You can run **several gateways side by side** as named *instances* that
+share the one downloaded runtime but each get their own data dir
+(`<prefix>/<name>/`), service, and port:
+
+```bash
+./install.sh                         # the 'default' instance (auto-picks a free port if 5252 is taken)
+./install.sh --name test --port 5300 # a second, independent gateway
+./install.sh --name test --port 5400 # move 'test' to a new port (the port is a mutable property)
+```
+
+The instance name is the stable identity; the **port is a property you can
+change** on a re-run. This is how a terminal install coexists with a dev gateway
+and the packaged `.app`.
+
+**Manage / uninstall.** List instances, then stop + remove one (or all). Data is
+**kept** unless you pass `--purge`:
+
+```bash
+./install.sh --list                   # or: ./uninstall.sh --list
+./uninstall.sh --name test            # stop + unregister 'test'; KEEP its data
+./uninstall.sh --name test --purge    # also delete its data dir
+./uninstall.sh --all --purge          # remove every instance + the shared runtime
+```
+
+`./install.sh --uninstall [--name <name>] [--all] [--purge]` is the same thing
+(it delegates to `uninstall.sh`).
+
+**Pick your LLM provider** (optional). With no credentials the runtime boots into
+a clear no-provider onboarding state (`--dev` boots in `mock` mode); configure a
+real provider in **Settings → Providers** afterwards. To wire one up at install
+time, pass it through the pipe:
 
 ```bash
 # OpenAI (GPT models)
@@ -44,11 +131,23 @@ curl -fsSL https://raw.githubusercontent.com/lucidos-dev/lucidos/main/install.sh
 curl -fsSL https://raw.githubusercontent.com/lucidos-dev/lucidos/main/install.sh | VERTEX_PROJECT_ID=my-gcp-project sh
 ```
 
-Other knobs (all optional environment variables): `LUCIDOS_HOME` (clone
-location, default `~/lucidos`), `LUCIDOS_WORKSPACE` (workspace dir, default
-`~/workspaces/lucidos`), `LUCIDOS_REF` (branch/tag to check out),
-`LUCIDOS_RELEASE_BUILD=1` (release engine build), `LUCIDOS_SKIP_DEPS=1` (skip
-dependency bootstrap). Once the domain lands this will also be served from
+Knobs (all optional; flags or environment variables — see `install.sh --help`):
+
+| | |
+|---|---|
+| `--name` / `LUCIDOS_INSTANCE` | instance name (default `default`); its data lives at `<prefix>/<name>/` |
+| `--version` / `LUCIDOS_VERSION` | version to download (default: the repo `RELEASE` when run from a checkout, else a baked default) |
+| `--base-url` / `LUCIDOS_RELEASE_BASE_URL` | where `lucidos-<version>-<triple>.tar.gz` + `.sha256` live (default: the GitHub Releases path for `v<version>`) |
+| `--prefix` / `LUCIDOS_PREFIX` | install prefix (default `~/.lucidos`); the **shared** runtime extracts to `<prefix>/runtime/lucidos-<version>-<triple>/` |
+| `--port` / `LUCIDOS_PORT` | the instance's gateway port (default `5252`; a new instance auto-picks a free port if it's taken). Pinning it sets/changes that instance's port |
+| `--no-service` / `LUCIDOS_NO_SERVICE=1` | run in the foreground instead of registering a service |
+| `--force` / `LUCIDOS_FORCE=1` | re-download / re-extract the runtime even if already installed |
+| `--no-launch` / `LUCIDOS_NO_LAUNCH=1` | install without starting the gateway |
+| `--uninstall` / `--list` / `--all` / `--purge` | manage instances (see above); `--purge` also deletes data |
+| `LUCIDOS_GATEWAY_DATA` | override the instance data dir (registry + embedded Postgres; default `<prefix>/<name>`) |
+| `--dev`-only | `LUCIDOS_HOME` (clone dir, default `~/lucidos`), `LUCIDOS_WORKSPACE`, `LUCIDOS_REF`, `LUCIDOS_DEBUG_BUILD`, `LUCIDOS_SKIP_DEPS` |
+
+Once the domain lands the installer will also be served from
 `https://lucidos.dev/install.sh`.
 
 Prefer to drive the setup yourself? The manual path is below.
@@ -115,7 +214,7 @@ Env var beats `lucidos.toml`. Both still collision-walk forward if the chosen ba
 | `LUCIDOS_MODEL` | `claude-opus-4-8@default` | LLM model name |
 | `VERTEX_PROJECT_ID` | — | GCP project (for `claude-*`/`gemini-*`) |
 | `VERTEX_REGION` | `europe-west1` | Vertex AI region |
-| `OPENAI_API_KEY` | — | OpenAI key (for `gpt-*` models) |
+| `OPENAI_API_KEY` | — | OpenAI key (for `gpt-*` models). Fallback below a stored `openai` credential; if unset too, the engine auto-detects a key from the Codex CLI's `${CODEX_HOME:-~/.codex}/auth.json` (`apikey` login only). |
 
 **Per-workspace environment variables:** beyond the global `.env` the engine loads at startup, each workspace can define its own non-secret environment variables in **Settings → System → Environment variables** (DB-backed). The engine injects them as real env vars into every subprocess it spawns — `run_bash`, `run_python`, scheduled scripts, triggers, and coding-agent sessions — alongside `CRED_*`/`OAUTH_*`. Use them for per-workspace identity (e.g. `GH_CONFIG_DIR` / `GIT_SSH_COMMAND` so `gh` / `git push` authenticate as the right account). Changes take effect on the next subprocess — no restart. They are non-secret (real secrets belong in credentials). The legacy `<workspace>/data/.env` file is migrated into this store on startup and removed.
 

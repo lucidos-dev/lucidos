@@ -98,7 +98,8 @@ Use `showToast(message, type)` for notifications and `await showConfirm(message,
 
 ## Rules
 
-1. **All sizes in `rem`** — all padding, margin, gap, width, height, min/max sizes, positioning, border-radius, font-size, line-height, translateX/Y, and icon sizes must use `rem` (divide px by 16). Only `1px` borders/outlines, `0px` in `env()` fallbacks, `@media` breakpoints, and `box-shadow` blur/spread may use `px`.
+1. **All sizes in `rem`** — all padding, margin, gap, width, height, min/max sizes, positioning, border-radius, line-height, translateX/Y, and icon sizes must use `rem` (divide px by 16). Only `1px` borders/outlines, `0px` in `env()` fallbacks, `@media` breakpoints, and `box-shadow` blur/spread may use `px`.
+   - **`font-size` specifically must use a `--font-size-*` token, not a raw `rem`** — the closed type scale is `--font-size-{3xs,2xs,xs,sm,md,lg,xl,2xl,3xl,display}` (defined in `styles/global/base.css`, mirrored into the engine's `api/sdk_iframe.css` for app iframes). A raw `font-size: N rem` literal is a drift finding — snap to the nearest token. `em` / percentage / `inherit` / `var(--user-ui-scale)` font-sizes are legitimate and stay literal (deliberately relative / the root scale), as is a value **deliberately pinned to a computed-px threshold** (e.g. the mobile prompt textarea's `0.9rem`, kept ≥16px to avoid iOS input zoom) — such a literal must carry a comment saying why it isn't a token.
 2. **All icon buttons need `aria-label`** — if the button has no visible text, add `aria-label`.
 3. **No hardcoded colors** — use CSS variables. Exception: `#fff` / `rgba(255,255,255,*)` on translucent overlays over image content.
 4. **No dead code** — delete unused styles, don't comment them out.

@@ -36,20 +36,47 @@ export function PluginUninstallPanel() {
 
   const totalKnown = req.files_present.length + req.files_missing.length;
 
+  // Rendered twice — once top-right in the header, once at the bottom — so the
+  // Cancel/Confirm pair is reachable without scrolling past a long file list.
+  // A function (not a shared vnode) so each mount is a fresh element.
+  const renderActions = (extraClass = '') => (
+    <div class={`plugin-install-actions${extraClass ? ` ${extraClass}` : ''}`}>
+      <button
+        type="button"
+        class="action-btn"
+        onClick={handleCancel}
+        disabled={busy}
+      >
+        Cancel
+      </button>
+      <button
+        type="button"
+        class="action-btn action-btn-danger"
+        onClick={handleConfirm}
+        disabled={busy}
+      >
+        {req.files_present.length === 0 ? 'Clear install record' : 'Confirm uninstall'}
+      </button>
+    </div>
+  );
+
   return (
     <div class="inline-form">
       <div class="plugin-install-panel">
-        <header class="plugin-install-header">
-          <h2>Uninstall plugin</h2>
-          <div class="plugin-install-title-row">
-            <span class="plugin-install-name">{req.plugin_name}</span>
-            <span class="plugin-install-version">v{req.plugin_version}</span>
+        <header class="plugin-install-header plugin-install-header-row">
+          <div class="plugin-install-header-text">
+            <h2>Uninstall plugin</h2>
+            <div class="plugin-install-title-row">
+              <span class="plugin-install-name">{req.plugin_name}</span>
+              <span class="plugin-install-version">v{req.plugin_version}</span>
+            </div>
+            <p class="plugin-install-description">
+              {req.files_present.length === 0
+                ? `All ${totalKnown} recorded files are already gone — this just clears the install record.`
+                : `Removes ${req.files_present.length} file${req.files_present.length === 1 ? '' : 's'} from your workspace.`}
+            </p>
           </div>
-          <p class="plugin-install-description">
-            {req.files_present.length === 0
-              ? `All ${totalKnown} recorded files are already gone — this just clears the install record.`
-              : `Removes ${req.files_present.length} file${req.files_present.length === 1 ? '' : 's'} from your workspace.`}
-          </p>
+          {renderActions('plugin-install-actions-top')}
         </header>
 
         {req.files_present.length > 0 && (
@@ -83,24 +110,7 @@ export function PluginUninstallPanel() {
           </section>
         )}
 
-        <div class="plugin-install-actions">
-          <button
-            type="button"
-            class="action-btn"
-            onClick={handleCancel}
-            disabled={busy}
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            class="action-btn action-btn-danger"
-            onClick={handleConfirm}
-            disabled={busy}
-          >
-            {req.files_present.length === 0 ? 'Clear install record' : 'Confirm uninstall'}
-          </button>
-        </div>
+        {renderActions()}
       </div>
     </div>
   );

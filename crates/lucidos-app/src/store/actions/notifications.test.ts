@@ -26,6 +26,18 @@ vi.mock('../../api/client', () => ({
 vi.mock('./pane', () => ({ revealContentPane: vi.fn() }));
 vi.mock('./navigation', () => ({ pushNavState: vi.fn(), replaceNavState: vi.fn() }));
 
+// The dock-badge nudge is a desktop-only side effect of handleNotificationSSE.
+// Override just isTauri (default off) + the nudge so we can assert the gate;
+// keep the rest of each module real (the store import chain uses them).
+vi.mock('../../utils/platform', async (importActual) => ({
+  ...(await importActual<typeof import('../../utils/platform')>()),
+  isTauri: vi.fn(() => false),
+}));
+vi.mock('../../utils/tauri', async (importActual) => ({
+  ...(await importActual<typeof import('../../utils/tauri')>()),
+  nudgeDockBadge: vi.fn(),
+}));
+
 const {
   handleNotificationSSE,
   loadUnreadNotifications,
@@ -37,6 +49,8 @@ const {
   resetViewDedup,
 } = await import('./notifications');
 const { getNotifications, getNotification, markNotificationRead, markAllNotificationsRead } = await import('../../api/client');
+const { isTauri } = await import('../../utils/platform');
+const { nudgeDockBadge } = await import('../../utils/tauri');
 
 type Mock = ReturnType<typeof vi.fn>;
 type NotifResponse = { notifications: Notification[]; unread_count: number; has_more: boolean };
@@ -117,6 +131,24 @@ describe('handleNotificationSSE', () => {
 
     // Should not reload — still 'loaded' with original data
     expect(notifications.value.status).toBe('loaded');
+  });
+
+  it('nudges the native dock badge under Tauri (instant desktop badge update)', () => {
+    (isTauri as Mock).mockReturnValue(true);
+    (nudgeDockBadge as Mock).mockClear();
+
+    handleNotificationSSE();
+
+    expect(nudgeDockBadge).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT nudge the dock badge off Tauri (browser / PWA)', () => {
+    (isTauri as Mock).mockReturnValue(false);
+    (nudgeDockBadge as Mock).mockClear();
+
+    handleNotificationSSE();
+
+    expect(nudgeDockBadge).not.toHaveBeenCalled();
   });
 });
 

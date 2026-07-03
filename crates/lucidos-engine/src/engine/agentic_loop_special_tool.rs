@@ -369,7 +369,9 @@ impl LucidosEngine {
                     relation.spawn_linkage(thread_id, tool_called_event_id);
 
                 // `folder` is the new canonical parameter; `repo` is the
-                // deprecated alias kept for one release. Passing both is an
+                // deprecated alias kept for one release (temporary measure —
+                // registered in docs/temporary-measures.md § "`repo` → `folder`
+                // deprecated alias on `run_coding_agent`"). Passing both is an
                 // error so callers don't silently get the resolution of one
                 // when they meant the other.
                 let folder_param = tool_args

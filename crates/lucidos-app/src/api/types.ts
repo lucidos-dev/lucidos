@@ -126,6 +126,27 @@ export interface NetworkConfigResponse {
   detected_tailscale_ip: string | null;
 }
 
+/** One coding agent's effective CLI binary resolution — mirrors the engine
+ *  `runtime::AgentBinaryStatus`. Live detection: `override` = the
+ *  `coding_agent_*_path` preference, `detected` = probe-list hit, `path` =
+ *  bare PATH lookup, `not-found` = nothing resolves. `valid` is false when a
+ *  set override doesn't point at an executable (a spawn would fail with
+ *  `error`). */
+export interface AgentBinaryStatus {
+  path: string | null;
+  source: 'override' | 'detected' | 'path' | 'not-found';
+  valid: boolean;
+  error?: string;
+}
+
+/** GET /api/v1/coding-agents/binaries — per-agent binary resolution for
+ *  Settings → System → Coding agents. Mirrors the engine
+ *  `AgentBinariesResponse`. */
+export interface AgentBinariesResponse {
+  claude_code: AgentBinaryStatus;
+  codex: AgentBinaryStatus;
+}
+
 /** A chat model in the DB-backed registry (Settings → Models). Mirrors the
  *  engine `core::models::Model`. `provider` is the backend that serves it
  *  ('vertex' | 'anthropic' | 'openai' | 'openrouter' | 'local'); `source` is

@@ -77,13 +77,18 @@ describe('resolveThreadActions', () => {
     expect(actions.find((a) => a.kind === 'discard')).toMatchObject({ category: 'close', label: 'Discard' });
   });
 
-  it('Apply label becomes "Apply & Restart" when the change requires restart', () => {
+  it('Apply gets a compact "Apply*" marker for a restart-requiring change (restart is the separate switch)', () => {
     setThread(makeThreadState('t1', {
       meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentProposed: true },
     }));
     changes.value = { status: 'loaded', data: [pendingChangeRow('t1', { requires_restart: true })] };
     const apply = resolveThreadActions('t1').find((a) => a.kind === 'apply');
-    expect(apply?.label).toBe('Apply & Restart');
+    // Apply is always non-disruptive now — the "Apply & Restart" dual label
+    // stays retired. requiresRestart surfaces as a compact "Apply*" marker plus
+    // the tooltip (the new engine version builds in the background; the user
+    // switches to it separately).
+    expect(apply?.label).toBe('Apply*');
+    expect(apply?.tooltip).toContain('new engine version');
   });
 
   it('external-repo CC swaps the change layer for Archive', () => {

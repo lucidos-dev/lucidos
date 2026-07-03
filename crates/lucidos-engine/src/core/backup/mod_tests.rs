@@ -62,6 +62,34 @@ fn apply_pg_env_errors_on_malformed_url() {
     assert!(apply_pg_env(&mut cmd, "not a url").is_err());
 }
 
+#[test]
+fn resolve_pg_tool_path_bare_name_without_bin_dir() {
+    // dev/docker: no LUCIDOS_PG_BIN_DIR → bare name for a PATH lookup.
+    let p = resolve_pg_tool_path("pg_dump", None).expect("bare name resolves");
+    assert_eq!(p, std::path::PathBuf::from("pg_dump"));
+}
+
+#[test]
+fn resolve_pg_tool_path_absolute_when_bin_dir_present() {
+    // packaged: resolves to <bin_dir>/<name> when the binary actually exists.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("pg_dump"), b"").unwrap();
+    let p = resolve_pg_tool_path("pg_dump", Some(dir.path())).expect("resolves");
+    assert_eq!(p, dir.path().join("pg_dump"));
+}
+
+#[test]
+fn resolve_pg_tool_path_fails_fast_when_bundled_binary_missing() {
+    // packaged but mis-staged: LUCIDOS_PG_BIN_DIR set, binary absent → a
+    // descriptive, path-bearing error (not a cryptic ENOENT mid-backup).
+    let dir = tempfile::tempdir().unwrap();
+    let err = resolve_pg_tool_path("pg_dump", Some(dir.path()))
+        .expect_err("missing bundled binary must error");
+    let msg = err.to_string();
+    assert!(msg.contains("pg_dump"), "names the tool: {msg}");
+    assert!(msg.contains(dir.path().to_str().unwrap()), "names the path: {msg}");
+}
+
 /// `is_cross_version_set` strips SET statements for parameters that exist in
 /// newer PG versions but not older ones (e.g. `transaction_timeout` from PG 17).
 /// Normal SET statements (e.g. `SET statement_timeout`) must pass through.

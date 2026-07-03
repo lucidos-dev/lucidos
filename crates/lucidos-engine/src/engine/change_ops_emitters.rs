@@ -383,7 +383,18 @@ impl LucidosEngine {
     ) -> String {
         self.emit_merge_conflict_detected(thread_id, change_id, files)
             .await;
-        crate::engine::agent_session::build_merge_prompt(target_branch, body_intro, description)
+        // App threads get an app-appropriate merge prompt (no `/harden`, no
+        // Lucidos-source test suites). Resolved here from the thread so every
+        // merge call site (in-session apply, Tier-2/Tier-3 spawn) inherits it.
+        let is_app = crate::engine::change_ops::load_apply_kind_context(&self.pool, Some(thread_id))
+            .await
+            .is_app();
+        crate::engine::agent_session::build_merge_prompt(
+            target_branch,
+            body_intro,
+            description,
+            is_app,
+        )
     }
 }
 

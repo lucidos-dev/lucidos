@@ -26,6 +26,7 @@ fn config(slug: &str, run: TriggerRun) -> TriggerConfig {
         on: vec![],
         paused: false,
         last_run: None,
+        last_run_status: None,
         app_id: None,
         go_to_review: false,
         group_id: None,

@@ -19,6 +19,20 @@ impl LucidosEngine {
             incomplete,
         } = input;
 
+        // Reconcile the "a coding-agent thread has at most one pending change"
+        // invariant BEFORE proposing on this branch: discard any pending change
+        // the thread still holds on a DIFFERENT branch (e.g. a merge-conflict
+        // recovery re-ran on a fresh branch). Doing this *before* the
+        // `ChangeProposed` emit below is load-bearing — `ChangeDiscarded` runs
+        // `CcFlagRule::ClearAll`, so discarding after the propose would wipe the
+        // `coding_agent_proposed` flag this proposal is about to set. Same-branch
+        // multi-change is preserved (keep = same branch). See
+        // docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md.
+        self.discard_pending_for_thread_except(thread_id, origin.clone(), |c| {
+            c.branch_name == branch_name
+        })
+        .await;
+
         // If a pending change already exists for this branch, reuse its
         // change_id and re-emit `ChangeProposed`. The `needs_emit` guard
         // short-circuits when no field changed — without it, every CC

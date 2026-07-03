@@ -132,6 +132,13 @@ fn boot_window_stalled(elapsed: Option<Duration>) -> bool {
     elapsed.is_some_and(|e| e >= BOOT_ESCAPE_BUDGET)
 }
 
+/// Sum per-workspace unread counts into the aggregate dock-badge total. A `None`
+/// (engine unreachable / count unknown) contributes 0 — matching the picker's
+/// "running workspaces only, no misleading zero" rule. Pure so it's unit-tested.
+fn sum_unread(counts: impl IntoIterator<Item = Option<u64>>) -> u64 {
+    counts.into_iter().flatten().sum()
+}
+
 /// Shared, cheaply-cloneable gateway handle.
 #[derive(Clone)]
 pub struct GatewayState {
@@ -339,6 +346,39 @@ impl GatewayState {
             }
         }
         out
+    }
+
+    /// Fresh aggregate unread total across running workspaces — computed ON DEMAND
+    /// by a concurrent count fan-out over healthy engines, NOT the cached
+    /// `last_unread` the supervise loop maintains. Drives the desktop dock badge's
+    /// instant update when a notification is read: at nudge time the supervise loop
+    /// has not yet re-probed the active engine, so its cached `last_unread` still
+    /// shows the pre-read count — a live fetch reflects the drop immediately. A
+    /// stopped/unhealthy workspace contributes 0 (same "running workspaces only"
+    /// semantics as the cached path; ADR 0014 §1 — the gateway holds no DB handle,
+    /// so the only count path is HTTP-polling running engines).
+    pub async fn fresh_unread_total(&self) -> u64 {
+        // Snapshot the stack handles, then read each briefly for (health, port) —
+        // mirrors `list_status`'s lock discipline so a supervisor probe holding a
+        // stack mutex never stalls this read across the whole map.
+        let stacks: HashMap<String, Arc<AsyncMutex<StackRuntime>>> =
+            self.inner.stacks.lock().await.clone();
+        let mut ports = Vec::with_capacity(stacks.len());
+        for stack in stacks.values() {
+            let s = stack.lock().await;
+            if s.health == Health::Healthy {
+                ports.push(s.ws.port);
+            }
+        }
+        let scheme = self.engine_scheme();
+        let client = &self.inner.health_client;
+        let counts = futures::future::join_all(
+            ports
+                .iter()
+                .map(|&port| async move { stack::fetch_unread_count(client, scheme, port).await }),
+        )
+        .await;
+        sum_unread(counts)
     }
 
     // ── Self-update (reload onto a rebuilt binary) ─────────────────────────────
@@ -1459,6 +1499,74 @@ fn stop_engine_process(s: &mut StackRuntime) {
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
+/// Validate `LUCIDOS_ENGINE_BIN` points at a real, executable regular file.
+/// Boot only used to check the var was *set*; a missing / corrupt / non-exec /
+/// quarantined engine binary then surfaced as a per-workspace `spawn` Err that
+/// left the workspace URL meta-refreshing the boot splash until the escape
+/// budget. Fail fast at boot with a path-bearing reason instead.
+fn validate_engine_bin(path: &Path) -> Result<(), BoxError> {
+    let meta = std::fs::metadata(path).map_err(|e| {
+        format!(
+            "LUCIDOS_ENGINE_BIN does not exist: {} ({e})",
+            path.display()
+        )
+    })?;
+    if !meta.is_file() {
+        return Err(format!("LUCIDOS_ENGINE_BIN is not a regular file: {}", path.display()).into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Err(format!("LUCIDOS_ENGINE_BIN is not executable: {}", path.display()).into());
+        }
+    }
+    Ok(())
+}
+
+/// Validate / resolve `LUCIDOS_STATIC_DIR` (the picker frontend). When set, its
+/// `index.html` must exist — otherwise the picker 404/500s while
+/// `/~/api/v1/health` still returns 200, so the packaged service supervises a
+/// gateway that can't render its own picker (the user gets a blank error with no
+/// actionable reason). When unset under a packaged build it's a fatal
+/// misconfiguration; in dev (not packaged) an absent static dir is allowed
+/// (`None` → the picker route reports "no frontend configured").
+fn resolve_static_dir(dir: Option<PathBuf>, packaged: bool) -> Result<Option<PathBuf>, BoxError> {
+    match dir {
+        Some(dir) => {
+            let index = dir.join("index.html");
+            if !index.is_file() {
+                // Packaged: a missing index.html is a real staging defect — fail
+                // fast. Dev: the gateway boots BEFORE the frontend build
+                // (`web-dev.sh` runs `start_gateway` then `start_vite`), so
+                // `dist/index.html` legitimately may not exist yet on a cold
+                // start; the picker 404s until the build-watch produces it. Warn,
+                // don't abort — aborting would wedge dev gateway startup.
+                if packaged {
+                    return Err(format!(
+                        "LUCIDOS_STATIC_DIR is set to {} but {} is missing — the picker frontend \
+                         is not staged",
+                        dir.display(),
+                        index.display()
+                    )
+                    .into());
+                }
+                crate::log!(
+                    "[Gateway] LUCIDOS_STATIC_DIR {} has no index.html yet — picker unavailable \
+                     until the frontend build completes",
+                    dir.display()
+                );
+            }
+            Ok(Some(dir))
+        }
+        None if packaged => Err(
+            "LUCIDOS_STATIC_DIR must be set in a packaged build (the picker frontend resource)"
+                .into(),
+        ),
+        None => Ok(None),
+    }
+}
+
 /// `lucidos-gateway` entry point.
 pub async fn run() -> Result<(), BoxError> {
     rustls::crypto::aws_lc_rs::default_provider()
@@ -1474,10 +1582,28 @@ pub async fn run() -> Result<(), BoxError> {
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(DEFAULT_GATEWAY_PORT);
+    // Packaged desktop runtime sets `LUCIDOS_PACKAGED=1` (mirrors its
+    // `LUCIDOS_BOOT_WITHOUT_PROVIDER=1`); dev leaves it unset. Drives the picker's
+    // dev-only self-reload control gating AND the fatal-when-packaged static-dir
+    // check below. Resolved here (before the resource validation) so both use it.
+    let packaged = matches!(
+        std::env::var("LUCIDOS_PACKAGED").unwrap_or_default().trim(),
+        "1" | "true" | "yes" | "on"
+    );
+
+    // Validate the resources the gateway REQUIRES at boot — exist + executable,
+    // not merely "the env var is set". A mis-staged / quarantined / app-translocated
+    // binary or a picker-less static dir otherwise surfaces as a per-workspace
+    // spawn Err that meta-refreshes the boot splash forever, or a healthy gateway
+    // that can't render its own picker. Fail fast with a path-bearing reason.
     let engine_bin = std::env::var_os("LUCIDOS_ENGINE_BIN")
         .map(PathBuf::from)
         .ok_or("LUCIDOS_ENGINE_BIN must point at the lucidos-engine binary")?;
-    let static_dir = std::env::var_os("LUCIDOS_STATIC_DIR").map(PathBuf::from);
+    validate_engine_bin(&engine_bin)?;
+    let static_dir = resolve_static_dir(
+        std::env::var_os("LUCIDOS_STATIC_DIR").map(PathBuf::from),
+        packaged,
+    )?;
     // Engines bind loopback-only by default (packaged security posture); dev sets
     // `LUCIDOS_GATEWAY_ENGINE_LOOPBACK=0` so the engine is reachable directly on
     // its user-facing port too (ADR 0014 "Dev runtime topology").
@@ -1507,14 +1633,6 @@ pub async fn run() -> Result<(), BoxError> {
         network.gateway_bind.as_deref(),
     );
     let pg_backend = PgBackend::from_env()?;
-    // Packaged desktop runtime sets `LUCIDOS_PACKAGED=1` (mirrors its
-    // `LUCIDOS_BOOT_WITHOUT_PROVIDER=1`); dev leaves it unset. Drives the picker's
-    // dev-only self-reload control gating.
-    let packaged = matches!(
-        std::env::var("LUCIDOS_PACKAGED").unwrap_or_default().trim(),
-        "1" | "true" | "yes" | "on"
-    );
-
     crate::log!("[Gateway] Lucidos workspace gateway starting...");
     crate::log!("[Gateway] app-data: {}", app_data.display());
     crate::log!("[Gateway] registry: {}", registry_path.display());
@@ -2056,6 +2174,85 @@ mod tests {
     use super::*;
 
     #[test]
+    fn validate_engine_bin_errors_on_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("lucidos-engine");
+        let err = validate_engine_bin(&missing).expect_err("missing engine must error");
+        let msg = err.to_string();
+        assert!(msg.contains("does not exist"), "{msg}");
+        assert!(msg.contains(missing.to_str().unwrap()), "names the path: {msg}");
+    }
+
+    #[test]
+    fn validate_engine_bin_errors_on_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = validate_engine_bin(dir.path()).expect_err("a dir is not a regular file");
+        assert!(err.to_string().contains("not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_engine_bin_errors_on_non_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("lucidos-engine");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = validate_engine_bin(&bin).expect_err("non-exec must error");
+        assert!(err.to_string().contains("not executable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_engine_bin_accepts_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("lucidos-engine");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(validate_engine_bin(&bin).is_ok());
+    }
+
+    #[test]
+    fn resolve_static_dir_requires_index_html_when_packaged() {
+        let dir = tempfile::tempdir().unwrap();
+        // packaged + dir exists but no index.html → fatal, naming the path.
+        let err = resolve_static_dir(Some(dir.path().to_path_buf()), true)
+            .expect_err("missing index.html must error when packaged");
+        assert!(err.to_string().contains("index.html"), "{err}");
+    }
+
+    #[test]
+    fn resolve_static_dir_tolerates_missing_index_in_dev() {
+        // Dev boots the gateway before the frontend build, so a missing
+        // index.html must NOT abort — it returns the dir and warns.
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_static_dir(Some(dir.path().to_path_buf()), false)
+            .expect("dev with no index.html yet must not abort");
+        assert_eq!(resolved.as_deref(), Some(dir.path()));
+    }
+
+    #[test]
+    fn resolve_static_dir_accepts_dir_with_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), b"<html>").unwrap();
+        let resolved = resolve_static_dir(Some(dir.path().to_path_buf()), true).unwrap();
+        assert_eq!(resolved.as_deref(), Some(dir.path()));
+    }
+
+    #[test]
+    fn resolve_static_dir_unset_is_fatal_when_packaged_but_ok_in_dev() {
+        assert!(
+            resolve_static_dir(None, true).is_err(),
+            "packaged build with no static dir must fail fast"
+        );
+        assert!(
+            matches!(resolve_static_dir(None, false), Ok(None)),
+            "dev with no static dir is allowed (picker reports 'no frontend configured')"
+        );
+    }
+
+    #[test]
     fn inject_base_href_inserts_after_head() {
         let html =
             "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>x</body></html>";
@@ -2183,6 +2380,16 @@ mod tests {
         // At/past budget → escape to the manual "Back to workspaces" page.
         assert!(boot_window_stalled(Some(BOOT_ESCAPE_BUDGET)));
         assert!(boot_window_stalled(Some(BOOT_ESCAPE_BUDGET + Duration::from_secs(60))));
+    }
+
+    #[test]
+    fn sum_unread_skips_unknown_counts() {
+        // Empty / all-unknown → 0 (no running workspace contributes a badge).
+        assert_eq!(sum_unread(Vec::<Option<u64>>::new()), 0);
+        assert_eq!(sum_unread([None, None]), 0);
+        // A stopped/unreachable workspace (None) contributes 0, not a stale value.
+        assert_eq!(sum_unread([Some(3), None, Some(4)]), 7);
+        assert_eq!(sum_unread([Some(0), Some(2)]), 2);
     }
 
     /// Installing from `http(s)://host:<gateway-port>/<workspace>/` must also stay in the

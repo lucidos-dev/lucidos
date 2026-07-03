@@ -164,6 +164,18 @@ pub const LUCIDOS_RELEASE_DIRTY: bool = match option_env!("LUCIDOS_RELEASE_DIRTY
     None => false,
 };
 
+/// Deterministic-per-source id of this engine binary, baked by `build.rs` (git
+/// short SHA + a hash of any uncommitted engine-source diff; a source-tree hash
+/// when git is unavailable). Mirrors the gateway's `GATEWAY_BUILD_ID`. A running
+/// engine compares this against the on-disk binary's `--build-id` to tell whether
+/// a newer version has been built — the dev "new version available" signal (see
+/// `docs/plans/2026-07-01-new-engine-version-switch-flow.md`). `option_env!` so a
+/// build that somehow skipped the stamp still compiles (empty → never "newer").
+pub const ENGINE_BUILD_ID: &str = match option_env!("ENGINE_BUILD_ID") {
+    Some(s) => s,
+    None => "",
+};
+
 #[cfg(test)]
 pub(crate) mod test_util {
     use crate::memory::EmbeddingProvider;
@@ -182,46 +194,12 @@ pub(crate) mod test_util {
         FetchUnavailable(String),
     }
 
-    /// True when a `FastEmbedProvider::new()` error is a model-download /
-    /// network failure (HF unreachable, request timed out, too many retries)
-    /// rather than a logic / data bug. Only this class of failure is allowed to
-    /// skip a real-embedder test.
-    ///
-    /// The match walks the **entire error source chain**, not just the top
-    /// message: `fastembed` wraps the underlying transport error with anyhow
-    /// context like `Failed to retrieve onnx/model.onnx` (preserved as a
-    /// `.source()`), so the network signal lives one level down. The raw HF
-    /// errors look like `request error: <url>: <ureq error>` / `Too many
-    /// retries: …`, and the HF host appears in every fetch URL. `failed to
-    /// retrieve` is fastembed's own *fetch*-path wrapper — distinct from the
-    /// `could not read … file` messages it emits when an already-downloaded file
-    /// is corrupt, which we deliberately do NOT match so real corruption still
-    /// fails loudly.
+    /// Only a model-download / network failure is allowed to skip a
+    /// real-embedder test — the same classifier that lets engine construction
+    /// boot degraded on a cold-cache offline first run. Single source of
+    /// truth: `memory::fastembed::is_model_fetch_failure`.
     #[cfg(feature = "real-embedder-tests")]
-    fn is_model_fetch_failure(err: &(dyn std::error::Error + Send + Sync)) -> bool {
-        const MARKERS: &[&str] = &[
-            "huggingface",
-            "request error",
-            "network error",
-            "timed out",
-            "timeout",
-            "too many retries",
-            "connection",
-            "failed to lookup",
-            "dns error",
-            "no such host",
-            "failed to retrieve", // fastembed's fetch-path context wrapper
-        ];
-        let mut level: Option<&dyn std::error::Error> = Some(err);
-        while let Some(e) = level {
-            let msg = e.to_string().to_lowercase();
-            if MARKERS.iter().any(|needle| msg.contains(needle)) {
-                return true;
-            }
-            level = e.source();
-        }
-        false
-    }
+    use crate::memory::fastembed::is_model_fetch_failure;
 
     /// Shared FastEmbedProvider across all real-embedder test modules.
     ///

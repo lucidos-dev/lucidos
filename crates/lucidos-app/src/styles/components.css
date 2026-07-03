@@ -58,31 +58,16 @@
     }
 }
 
-/* List loading skeleton (ListSkeleton.tsx) — generic shimmer rows used as the
-   default loading visual for known-shape list content, instead of a centered
-   spinner. Reuses the global `shimmer` keyframes (drawer.css). Gate it behind
-   useDelayedLoading (300ms delay) and crossfade it via LoadingFade. */
-.list-skeleton {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-    padding: 0.5rem 0;
-}
-
-/* Full-pane variant (ListSkeleton fill). The component pins an inline pixel
-   height to the available content-pane height and renders one extra row; this
-   clips the trailing partial row so the run fills the pane exactly instead of
-   leaving a void below. The 1rem horizontal padding matches `.list-row`'s inset
-   so the shimmer bars don't run edge-to-edge in views whose pane has no padding
-   of its own. */
-.list-skeleton--fill {
-    padding: 0.5rem 1rem;
-    overflow: hidden;
-}
-
-.list-skeleton-row {
-    height: 2.75rem;
-    border-radius: 0.5rem;
+/* Self-skeletonizing primitives (components/shared/Skeleton.tsx). The Sk* leaves
+   render a `.sk-bar` shimmer placeholder when inside a SkeletonProvider, so a row
+   draws itself as its own loading placeholder (mirrors the real layout by
+   construction). Reuses the global `shimmer` keyframes (drawer.css). Host-only —
+   these classes live in the host bundle and are never served to apps. */
+.sk-bar {
+    display: inline-block;
+    width: 100%;
+    height: 0.85em;
+    border-radius: 0.375rem;
     background: linear-gradient(
         90deg,
         var(--bg-tertiary) 25%,
@@ -91,10 +76,28 @@
     );
     background-size: 200% 100%;
     animation: shimmer 1.5s infinite;
+    vertical-align: middle;
+}
+
+.sk-circle {
+    border-radius: 50%;
+}
+
+.sk-round {
+    border-radius: 0.5rem;
+}
+
+/* Full-pane self-skeletonizing run (ListSkeletonOf fill): the component pins an
+   inline pixel height to the available content-pane height and renders one extra
+   row, clipped here so the run fills the pane exactly with no void below. The
+   row spacing/inset comes from the real list's `containerClass`, so no padding
+   is added here (unlike `.list-skeleton--fill`, which had no real container). */
+.sk-fill {
+    overflow: hidden;
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .list-skeleton-row {
+    .sk-bar {
         animation: none;
     }
 }
@@ -119,14 +122,14 @@
 
 .confirm-title {
     color: var(--text-primary);
-    font-size: 1rem;
+    font-size: var(--font-size-lg);
     font-weight: 600;
     margin: 0 0 0.75rem;
 }
 
 .confirm-message {
     color: var(--text-primary);
-    font-size: 0.875rem;
+    font-size: var(--font-size-md);
     line-height: 1.5;
     margin-bottom: 1.25rem;
 }
@@ -139,7 +142,7 @@
     margin-bottom: 1.25rem;
     padding: 0.5rem 0.625rem;
     font-family: inherit;
-    font-size: 0.875rem;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     background: var(--bg-primary);
     border: 1px solid var(--border-color);
@@ -173,7 +176,7 @@
 
 .confirm-details {
     margin: 0 0 1.25rem;
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     line-height: 1.5;
     color: var(--text-secondary);
     overflow-y: auto;
@@ -228,7 +231,7 @@
     padding: 0.375rem 0.75rem;
     border-radius: 0.25rem;
     border: none;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     font-family: var(--font-ui);
     font-weight: 600;
     cursor: pointer;
@@ -270,9 +273,10 @@
     }
 }
 
-/* Toast notifications — positioned below header, centered across the full
-   Lucidos width (the whole viewport) on every breakpoint, not just the chat
-   pane. --z-toast sits above .ui-blocking-overlay so the restart toast stays
+/* Toast notifications — positioned below header. The container spans the full
+   width; each toast is then centered over the pane it was born under (desktop
+   block below). Mobile shows one pane at a time, so the full width is correct
+   there. --z-toast sits above .ui-blocking-overlay so the restart toast stays
    visible when the dim overlay covers the header. */
 .toast-container {
     position: fixed;
@@ -285,6 +289,45 @@
     align-items: center;
     gap: 0.5rem;
     pointer-events: none;
+}
+
+/* Desktop: pin each toast over the pane that was focused WHEN IT APPEARED
+   (data-toast-pane, frozen on the toast in showToast) — a later focus change
+   never moves it. The container centers each toast at the viewport middle;
+   --toast-shift then nudges it to its pane's center, and max-width keeps it
+   inside that pane. Both are computed from the shared header geometry vars in
+   shell.css (--co drawer width, --ddo drawer-divider offset, --divider-x split
+   position). .toast already has position:relative (for its close-X), so `left`
+   applies directly. */
+@media (min-width: 769px) {
+    .toast {
+        left: var(--toast-shift, 0px);
+    }
+
+    /* Thread-pane geometry (center = midpoint of [drawer edge, split divider]).
+       Applies to thread-pinned toasts AND — when the content pane has collapsed
+       — to content-pinned toasts, since the thread pane is then the only
+       survivor. Using the thread geometry (not a blunt viewport center) keeps
+       the toast over the surviving pane even with the drawer still open: a
+       collapsed CONTENT pane does not hide the drawer, so --co/--ddo still
+       offset the thread pane's left edge. The collapse selector is more specific,
+       so it wins over the content rule below for that toast. */
+    .toast[data-toast-pane="thread"],
+    :root[data-content-collapsed] .toast[data-toast-pane="content"] {
+        --toast-shift: calc((var(--co) + var(--ddo) + var(--divider-x)) / 2 - 50%);
+        max-width: min(30rem, calc(var(--divider-x) - var(--co) - var(--ddo) - 2rem));
+    }
+
+    /* Content-pane geometry (center = midpoint of [divider right edge, viewport
+       right]). Applies to content-pinned toasts AND — when the thread pane has
+       collapsed — to thread-pinned toasts (content is then the only survivor;
+       collapsing the thread pane also hides the drawer, so --co → 0 and this
+       spans the full width). */
+    .toast[data-toast-pane="content"],
+    :root[data-thread-collapsed] .toast[data-toast-pane="thread"] {
+        --toast-shift: calc((var(--divider-x) + var(--divider-width) + 100%) / 2 - 50%);
+        max-width: min(30rem, calc(100% - var(--divider-x) - var(--divider-width) - 2rem));
+    }
 }
 
 .toast {
@@ -306,12 +349,19 @@
        when the keyboard pushes the visual viewport up. */
     max-height: calc(var(--app-height, 100dvh) - 6rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
     color: var(--text-primary);
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     width: calc(100% - 2rem);
     max-width: 30rem;
     box-shadow: var(--shadow-md);
     pointer-events: auto;
-    animation: toast-in 0.2s ease;
+    /* Entry animation. Kept in lockstep with the JS reflow (FLIP) that slides
+       the toasts BELOW a newly-inserted one down to make room — see
+       REFLOW_DURATION_MS / REFLOW_EASING in Toast.tsx. Same duration + easing so
+       the incoming toast and the push-down it causes move together instead of
+       one snapping while the other glides. The 0.26s here is the 1x default;
+       Toast.tsx overrides `animation-duration` inline so both halves also scale
+       together with the diagnostic animation-speed slider (speedMultiplier). */
+    animation: toast-in 0.26s cubic-bezier(0.22, 0, 0, 1);
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
@@ -369,9 +419,30 @@
     }
 }
 
+/* Linkified URLs inside a toast message (heading, section titles, bullets).
+   `overflow-wrap: anywhere` lets a long URL break within the toast instead of
+   overflowing its fixed max-width. */
+.toast-message a,
+.toast-section-title a,
+.toast-bullets a {
+    color: var(--accent);
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+    text-underline-offset: 0.125rem;
+    overflow-wrap: anywhere;
+}
+
+@media (hover: hover) {
+    .toast-message a:hover,
+    .toast-section-title a:hover,
+    .toast-bullets a:hover {
+        text-decoration-color: var(--accent);
+    }
+}
+
 .toast-bullets {
     margin: 0.25rem 0 0;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     line-height: 1.4;
 }
 
@@ -380,7 +451,7 @@
 }
 
 .toast-section-title {
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
 }
@@ -517,7 +588,7 @@ html[data-theme="light"] .toast-warning { --toast-accent: #caa53d; }
     padding: 1rem 1.75rem;
     border-radius: 0.5rem;
     box-shadow: var(--shadow-lg);
-    font-size: 1rem;
+    font-size: var(--font-size-xl);
     font-weight: 500;
     pointer-events: none;
     z-index: 1001;
@@ -534,7 +605,7 @@ html[data-theme="light"] .toast-warning { --toast-accent: #caa53d; }
 
 /* Folder tree navigation */
 .folder-tree {
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     margin-top: 0;
 }
 
@@ -560,7 +631,7 @@ html[data-theme="light"] .toast-warning { --toast-accent: #caa53d; }
 }
 
 .folder-arrow {
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     color: var(--text-muted);
     width: 0.75rem;
 }
@@ -579,7 +650,7 @@ html[data-theme="light"] .toast-warning { --toast-accent: #caa53d; }
 
 .folder-count {
     color: var(--text-muted);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
 }
 
 .folder-contents {
@@ -763,7 +834,7 @@ html[data-theme="light"] .toast-warning { --toast-accent: #caa53d; }
     left: 50%;
     transform: translateX(-50%);
     color: var(--text-on-accent);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     background: rgba(0, 0, 0, 0.6);
     padding: 0.1875rem 0.5rem;
     border-radius: 0.625rem;

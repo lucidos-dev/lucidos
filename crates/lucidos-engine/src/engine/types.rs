@@ -216,11 +216,12 @@ pub enum StopReason {
 
 /// State for a single active coding-agent session.
 ///
-/// **Single agent per thread.** The owning HashMap is keyed by `Uuid` (thread_id)
-/// alone, so a thread can only host one live agent backend at a time. When a
-/// second backend (Codex) is wired in, this constraint must be relaxed —
-/// re-key as `(Uuid, CodingAgent)` and store `agent_kind: CodingAgent` on this
-/// struct so callers can disambiguate.
+/// **Single agent per thread — deliberate.** The owning HashMap is keyed by
+/// `Uuid` (thread_id) alone, so a thread hosts at most one live agent session.
+/// This holds with both backends wired in (Claude Code + Codex): a thread's
+/// backend is locked at its first session (`thread_summaries.coding_agent`;
+/// `validate_thread_continuity` rejects a mismatched follow-up with 409), and
+/// the session records its backend in [`AgentSession::coding_agent`].
 pub struct AgentSession {
     pub msg_tx: tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
     pub is_waiting: bool,
@@ -355,6 +356,19 @@ pub struct AgentSession {
     /// interrupts the running turn (see the Codex interrupt-and-redirect path
     /// in `chat::process`).
     pub coding_agent: crate::runtime::CodingAgent,
+    /// Clone of `run_session`'s `agent_cancel` `CancellationToken` — the lever
+    /// that tears the coding-agent subprocess down. `run_session` and its
+    /// in-loop watchdog / stale-resume paths already hold the original and
+    /// cancel it directly; this clone exists so the **external watchdog**
+    /// (`external_watchdog::tick`), which lives OUTSIDE the per-thread loop and
+    /// only sees this map, can cancel it too. Cancelling it makes the
+    /// independent `driver_task` run its reap-safe `graceful_kill_child_process_group`
+    /// teardown — the only pid-recycle-safe way to kill a child whose owning
+    /// `run_session` `select!` has wedged (without it, an externally-recovered
+    /// thread leaves the original subprocess alive, so the `--resume` spawns a
+    /// second concurrent agent on the same worktree — the 2026-07-02
+    /// demo-director double-process bug).
+    pub agent_cancel: tokio_util::sync::CancellationToken,
 }
 
 impl AgentSession {

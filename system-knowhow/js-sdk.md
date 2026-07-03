@@ -73,7 +73,7 @@ deliberately override it, and then use `var(--font-ui)`. As a safety net,
 intuitive guess still resolves to the user's font instead of silently dropping to a
 hardcoded fallback) — but `--font-ui` is the name to write.
 
-The spacing, radius, motion, and icon scales are theme-independent and have
+The spacing, radius, motion, icon, and type scales are theme-independent and have
 fixed values — **use the token, not a magic number, and never a `px` fallback
 that disagrees with the real value** (`var(--space-xl, 28px)` is a latent bug —
 `--space-xl` is `1.5rem` = 24px). When you include `sdk-iframe.css` these are
@@ -88,6 +88,18 @@ always defined, so a fallback is dead noise at best:
 | `--space-xl` | `1.5rem` (24px) | | `--icon-size-md` | `1rem` (16px) |
 | `--duration-fast` | `0.15s` | | `--icon-size-lg` | `1.25rem` (20px) |
 | `--duration-normal` | `0.2s` | | `--duration-slow` | `0.3s` |
+
+**Type scale — `--font-size-*`.** The sanctioned font sizes; the host shell and
+this SDK stylesheet both size text from these, so use the token instead of a raw
+`rem`. All `rem`, so every step scales with the user's UI-scale preference.
+
+| Token | Value | Role | | Token | Value | Role |
+|---|---|---|---|---|---|---|
+| `--font-size-3xs` | `0.5625rem` (9px) | micro-label / tiny badge | | `--font-size-lg` | `0.875rem` (14px) | emphasis |
+| `--font-size-2xs` | `0.625rem` (10px) | dots, micro-meta | | `--font-size-xl` | `1rem` (16px) | section heading |
+| `--font-size-xs` | `0.6875rem` (11px) | dense metadata | | `--font-size-2xl` | `1.125rem` (18px) | larger heading |
+| `--font-size-sm` | `0.75rem` (12px) | labels, secondary | | `--font-size-3xl` | `1.25rem` (20px) | large heading |
+| `--font-size-md` | `0.8125rem` (13px) | body default | | `--font-size-display` | `2.25rem` (36px) | hero |
 
 ```css
 .card {
@@ -108,10 +120,12 @@ scale with it.** An app that sizes text, padding, gaps, and radii in `px`
 renders at a fixed size and silently ignores the user's font-size setting — the
 single most common "the app doesn't respect my font size" bug. Size everything
 in `rem` (divide px by 16: 14px → `0.875rem`, 24px → `1.5rem`), and prefer the
-`--space-*` / `--radius-*` tokens above for spacing and corners. Match Lucidos's
-type scale — body text ≈ `0.8125rem`–`0.875rem`, small/meta ≈ `0.6875rem`,
-headings via the `h1`–`h6` defaults `sdk-iframe.css` already ships. (`1px`
-borders are the one acceptable `px` exception, same as the host shell.)
+`--space-*` / `--radius-*` tokens above for spacing and corners. For text, prefer
+the `--font-size-*` type-scale tokens over a raw `rem` — body text is
+`--font-size-md` (13px), small/meta `--font-size-xs` (11px), emphasis
+`--font-size-lg` (14px), headings `--font-size-xl`+ (or the `h1`–`h6` defaults
+`sdk-iframe.css` already ships). (`1px` borders are the one acceptable `px`
+exception, same as the host shell.)
 
 ### Component classes
 
@@ -462,6 +476,9 @@ interface Trigger {
   timezone: string;
   paused: boolean;
   last_run?: string;
+  // Outcome of the most recent completed firing. Absent until the trigger has
+  // run once under an engine that records status (legacy runs → timestamp only).
+  last_run_status?: 'ok' | 'failed';
   next_run?: string;
   run: TriggerRun;
   // Event subscriptions. Empty for schedule-only triggers; the engine omits
@@ -630,14 +647,13 @@ interface NavigateUi {
   prompt?: string;
 }
 
-/** What a notification tap does. `modal` opens the inbox modal showing the
- *  message body. `none` marks the row read with no navigation (passive
- *  pushes — "OAuth completed"). `navigate` delegates to the same router the
- *  `navigate_ui` LLM tool uses; `to` is its arg shape. Every kind marks the
- *  source notification read on tap. */
+/** What a notification tap does. `modal` (default) opens the inbox detail
+ *  showing the message body. `navigate` delegates to the same router the
+ *  `navigate_ui` LLM tool uses; `to` is its arg shape. Both mark the source
+ *  notification read on tap. Every notification is openable — the old passive
+ *  `none` kind is retired; a historical `{kind:'none'}` is coerced to `modal`. */
 type Tap =
   | { kind: 'modal' }
-  | { kind: 'none' }
   | { kind: 'navigate'; to: NavigateUi };
 
 interface Notification {
@@ -672,7 +688,10 @@ interface NotificationListResult {
 The SDK only exposes `list` / `markRead` / `markAllRead` for reading the inbox. Creating a notification from app code goes through the engine HTTP API directly (`POST /api/v1/notifications` — same wire shape the `lucidos notify` CLI and the `send_notification` LLM tool produce):
 
 ```js
-// Default: open the inbox modal showing the message body.
+// Default: open the inbox detail showing the message body. Use this for any
+// info-only notification too ("OAuth completed", "Build succeeded") — every
+// notification is openable; there is no separate passive kind. For ephemeral
+// status that should NOT land in the inbox at all, use a plain `showToast`.
 await fetch('/api/v1/notifications', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
@@ -680,18 +699,6 @@ await fetch('/api/v1/notifications', {
     title: 'Daily summary',
     message: 'Here is your summary…',
     tap: { kind: 'modal' },
-  }),
-});
-
-// Passive: mark read on display, no navigation. Use for "OAuth completed",
-// "Build succeeded" — the push IS the message.
-await fetch('/api/v1/notifications', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    title: 'OAuth completed',
-    message: 'Google account connected.',
-    tap: { kind: 'none' },
   }),
 });
 
@@ -935,6 +942,10 @@ interface ToastOptions {
   durationMs?: number;
   /** false = hide the close (X) button. Default true. */
   dismissable?: boolean;
+  /** Stable key for in-place replacement. A later toast with the same key
+   *  updates the existing toast (message/type/etc.) instead of stacking a new
+   *  one — e.g. an 'Opening…' toast becoming 'Opened'. */
+  key?: string;
 }
 ```
 
@@ -949,6 +960,10 @@ from an app.
 lucidos.ui.toast('Saved', 'success');
 lucidos.ui.toast('Could not reach the server', 'error');
 lucidos.ui.toast('Working on it…', 'info', { durationMs: 2000 });
+
+// Collapse a two-step status into one toast that updates in place:
+lucidos.ui.toast('Opening from Drive…', 'info', { key: 'drive-open' });
+lucidos.ui.toast('Opened "Q3 deck"', 'success', { key: 'drive-open' });
 ```
 
 ### Prompts

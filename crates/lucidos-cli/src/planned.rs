@@ -164,7 +164,7 @@ pub(crate) fn query_state(ws: &Workspace) -> Result<PlannedState, BoxError> {
     Ok(PlannedState::parse(state))
 }
 
-/// Print `PRESENT` or `MISSING` for the current branch to stdout.
+/// Print `SATISFIED`, `PROPOSED`, or `MISSING` for the current branch to stdout.
 pub(crate) fn cmd_state(ws: &Workspace) -> Result<(), BoxError> {
     let state = query_state(ws)?;
     println!("{}", state.as_str());

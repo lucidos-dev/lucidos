@@ -1,6 +1,7 @@
 import type { App, MarketplacePlugin } from '../../store/types';
 import { isAppPinned, togglePinApp } from '../../store/actions/pinnedApps';
 import { PinIcon } from '../shared/icons';
+import { useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 
 /** Marketplace provenance for an installed app, resolved from the plugin
  *  catalog: which marketplace it came from and whether a newer version is
@@ -22,13 +23,18 @@ interface AppRowProps {
   onUpdate?: () => void;
 }
 
-export function AppRow({ app, onOpen, onEdit, onDelete, pluginInfo, onUpdate }: AppRowProps) {
-  const pinned = isAppPinned(app.id);
+/** Self-skeletonizing row: rendered with no props inside a SkeletonProvider
+ *  (`<AppRow />`) it draws itself as a loading placeholder via the Sk* leaves;
+ *  with real props it renders normally. Props are optional only to support the
+ *  skeleton call; real call sites pass them all. */
+export function AppRow({ app, onOpen, onEdit, onDelete, pluginInfo, onUpdate }: Partial<AppRowProps>) {
+  const sk = useSkeleton();
+  const pinned = app ? isAppPinned(app.id) : false;
   return (
-    <div class="list-row app-row clickable" onClick={onOpen}>
+    <div class={`list-row app-row${sk ? '' : ' clickable'}`} onClick={sk ? undefined : onOpen}>
       <div class="list-row-info">
         <div class="app-row-title-line">
-          <span class="title list-row-name">{app.name}</span>
+          <SkText class="title list-row-name" w="9rem">{app?.name}</SkText>
           {pluginInfo && (
             <span class="app-marketplace-chip" data-tooltip={`Installed from ${pluginInfo.marketplaceName}`}>
               {pluginInfo.marketplaceName}
@@ -38,23 +44,29 @@ export function AppRow({ app, onOpen, onEdit, onDelete, pluginInfo, onUpdate }: 
             <span class="app-update-chip">Update available</span>
           )}
         </div>
-        {app.description && (
-          <div class="list-row-details">{app.description}</div>
+        {(sk || app?.description) && (
+          <SkText class="list-row-details" as="div" w="16rem">{app?.description}</SkText>
         )}
       </div>
       <div class="list-row-actions">
         {pluginInfo?.updateAvailable && onUpdate && (
           <button class="action-btn" onClick={(e) => { e.stopPropagation(); onUpdate(); }}>Update</button>
         )}
-        <button
-          class={`icon-btn ${pinned ? 'pinned' : ''}`}
-          onClick={(e) => { e.stopPropagation(); togglePinApp(app.id); }}
-          aria-label={pinned ? 'Unpin from menu' : 'Pin to menu'}
-        >
-          <PinIcon filled={pinned} />
-        </button>
-        <button class="action-btn" onClick={(e) => { e.stopPropagation(); onEdit(); }}>Edit</button>
-        <button class="action-btn action-btn-danger" onClick={(e) => { e.stopPropagation(); onDelete(); }}>Delete</button>
+        <SkBlock w="2rem" h="2rem" round>
+          <button
+            class={`icon-btn ${pinned ? 'pinned' : ''}`}
+            onClick={(e) => { e.stopPropagation(); if (app) togglePinApp(app.id); }}
+            aria-label={pinned ? 'Unpin from menu' : 'Pin to menu'}
+          >
+            <PinIcon filled={pinned} />
+          </button>
+        </SkBlock>
+        <SkBlock w="3rem" h="2rem" round>
+          <button class="action-btn" onClick={(e) => { e.stopPropagation(); onEdit?.(); }}>Edit</button>
+        </SkBlock>
+        <SkBlock w="3.75rem" h="2rem" round>
+          <button class="action-btn action-btn-danger" onClick={(e) => { e.stopPropagation(); onDelete?.(); }}>Delete</button>
+        </SkBlock>
       </div>
     </div>
   );

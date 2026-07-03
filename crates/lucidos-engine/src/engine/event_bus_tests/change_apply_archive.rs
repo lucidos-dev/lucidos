@@ -658,6 +658,247 @@ async fn supersede_is_noop_when_no_pending_permission() {
     teardown_test_db(&db_name).await;
 }
 
+/// Live permission answer: a `CodingAgentPermissionResolved` while the thread is
+/// genuinely parked (`waiting_for_user_answer`) MUST resume it to `running` —
+/// the in-memory MCP waiter is alive and about to continue. Guards against the
+/// non-resurrecting fix over-reaching and breaking the normal Allow-click resume.
+#[tokio::test]
+async fn permission_resolution_resumes_waiting_thread() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/live-resume", None).await;
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentPermissionRequest {
+            request_id: "req-live".into(),
+            tool_use_id: "tu-live".into(),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+            summary: "Bash ls".into(),
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "waiting_for_user_answer", "request parks the thread");
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentPermissionResolved {
+            request_id: "req-live".into(),
+            allowed: true,
+            reason: None,
+            persist_scope: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        status, "running",
+        "resolving a live (waiting) card must resume the session to running"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The zombie-`running` bug: a permission card left dangling by a cleanly-idled
+/// session (e.g. a workflow whose parallel subagent's card outlived the main
+/// turn), tapped later. The stale `CodingAgentPermissionResolved` must NOT
+/// resurrect the idle thread into a dead `running` with no live session — it may
+/// only flip to `running` from `waiting_for_user_answer`.
+#[tokio::test]
+async fn permission_resolution_does_not_resurrect_idle_thread() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/zombie", None).await;
+
+    // Card raised, then the session idles WITHOUT the card being answered.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentPermissionRequest {
+            request_id: "req-zombie".into(),
+            tool_use_id: "tu-zombie".into(),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({"command": "sed -n '1,10p' x"}),
+            summary: "Bash sed".into(),
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+    emit_cc_idle(&bus, thread_id, false, None).await;
+
+    let status_after_idle: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        status_after_idle, "idle",
+        "a no-changes idle after a pending card leaves the thread idle"
+    );
+
+    // Hours later the user taps the still-rendered card → a stale Resolved.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentPermissionResolved {
+            request_id: "req-zombie".into(),
+            allowed: true,
+            reason: None,
+            persist_scope: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    let status_after_resolve: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        status_after_resolve, "idle",
+        "a stale permission resolution must NOT resurrect the idle thread to running"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// `resolve_pending_permissions_as_session_ended` (called from
+/// `emit_coding_agent_idled`) must clear a dangling card at the turn boundary:
+/// emit a paired `CodingAgentPermissionResolved { allowed: false }` with the
+/// session-ended reason, fan a deny out to the still-blocked in-memory waiter,
+/// and leave the thread `idle` (the non-resurrecting projection means clearing
+/// the card can't zombie it).
+#[tokio::test]
+async fn idle_sweep_clears_pending_permission_without_resurrecting() {
+    use crate::engine::cc_permission::{
+        resolve_pending_permissions_as_session_ended, PermissionEntry, PermissionState,
+        SESSION_ENDED_REASON,
+    };
+    use std::sync::Mutex;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/idle-sweep", None).await;
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentPermissionRequest {
+            request_id: "req-idle".into(),
+            tool_use_id: "tu-idle".into(),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({"command": "sed x"}),
+            summary: "Bash sed".into(),
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+    emit_cc_idle(&bus, thread_id, false, None).await;
+
+    // Seed a live in-memory waiter so we can assert the deny fan-out reaches the
+    // still-blocked MCP handler (as it would for a dangling parallel-subagent
+    // card whose subprocess hasn't torn down yet).
+    let pending = Mutex::new(PermissionState::default());
+    let mut rx = {
+        let mut state = pending.lock().unwrap();
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        let key = (thread_id, "Bash".to_string(), "{\"command\":\"sed x\"}".to_string());
+        state.by_dedup_key.insert(
+            key.clone(),
+            PermissionEntry {
+                thread_id,
+                request_id: "req-idle".into(),
+                tool_name: "Bash".into(),
+                input: serde_json::json!({"command": "sed x"}),
+                tx,
+            },
+        );
+        state.by_request_id.insert("req-idle".into(), key);
+        rx
+    };
+
+    resolve_pending_permissions_as_session_ended(&pool, &bus, &pending, thread_id, None).await;
+
+    assert_eq!(
+        rx.recv().await.ok(),
+        Some(false),
+        "the still-blocked MCP waiter must be unblocked with a deny"
+    );
+
+    let (resolved_count, allowed, reason): (i64, Option<bool>, Option<String>) = sqlx::query_as(
+        "SELECT COUNT(*), \
+                bool_and((payload->>'allowed')::bool), \
+                max(payload->>'reason') \
+         FROM events \
+         WHERE event_type = 'CodingAgentPermissionResolved' \
+           AND payload->>'request_id' = 'req-idle'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(resolved_count, 1, "exactly one Resolved for the dangling card");
+    assert_eq!(allowed, Some(false), "the idle sweep resolves as a deny");
+    assert_eq!(reason.as_deref(), Some(SESSION_ENDED_REASON));
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        status, "idle",
+        "clearing the card at idle must leave the thread idle, not running"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// Validates the legacy orphan-waiting startup sweep in main.rs:325. Since
 /// Option B (`STATUS_FROM_PROPOSED_CHANGE = 'idle'`) the production path no
 /// longer parks CC threads in `'waiting'` — this sweep is now exclusively a

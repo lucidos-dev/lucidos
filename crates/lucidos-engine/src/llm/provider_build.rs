@@ -73,14 +73,16 @@ pub enum ProviderBuildOutcome {
 /// Resolve the direct (OpenAI-wire + Anthropic) providers from credentials +
 /// env. `pool == None` means the DB is unavailable (a degraded boot) — the env
 /// fallbacks (`OPENAI_API_KEY`, `LUCIDOS_OPENROUTER_API_KEY`,
-/// `LUCIDOS_LOCAL_*`) still apply, but stored credentials and the
-/// `local_base_url` preference can't be read (so no direct Anthropic).
-/// Returns `(openai, anthropic, openrouter, local)`; each degrades to `None` on
-/// any read/build error so the engine still comes up on its other providers.
+/// `LUCIDOS_LOCAL_*`) and the Codex-detected OpenAI key still apply, but stored
+/// credentials and the `local_base_url` preference can't be read (so no direct
+/// Anthropic). Returns `(openai, anthropic, openrouter, local)`; each degrades
+/// to `None` on any read/build error so the engine still comes up on its other
+/// providers.
 async fn resolve_direct_providers(
     pool: Option<&PgPool>,
     default_model: &str,
     openai_env_key: Option<String>,
+    openai_codex_key: Option<String>,
 ) -> (
     Option<OpenAiProvider>,
     Option<AnthropicProvider>,
@@ -88,8 +90,8 @@ async fn resolve_direct_providers(
     Option<OpenAiProvider>,
 ) {
     let Some(pool) = pool else {
-        // No DB access, but the env-var fallbacks must still work.
-        let openai = build_openai_provider(None, openai_env_key, default_model);
+        // No DB access, but the env-var + Codex fallbacks must still work.
+        let openai = build_openai_provider(None, openai_env_key, openai_codex_key, default_model);
         let openrouter = build_openrouter_provider(
             None,
             std::env::var("LUCIDOS_OPENROUTER_API_KEY").ok(),
@@ -140,7 +142,12 @@ async fn resolve_direct_providers(
             None
         }
     };
-    let openai = build_openai_provider(openai_credential, openai_env_key, default_model);
+    let openai = build_openai_provider(
+        openai_credential,
+        openai_env_key,
+        openai_codex_key,
+        default_model,
+    );
 
     // OpenRouter: a stored `openrouter` credential wins; otherwise the env fallback.
     let openrouter_credential = match CredentialStore::get(pool, "openrouter").await {
@@ -223,8 +230,12 @@ pub async fn build_active_provider(
     };
 
     let openai_env_key = std::env::var("OPENAI_API_KEY").ok();
+    // Lowest-precedence OpenAI key: auto-detected from the Codex CLI's auth file
+    // (apikey login), the parallel of Vertex reading the gcloud ADC file. Read
+    // fresh each build (boot + credential-subscriber hot-swap); never persisted.
+    let openai_codex_key = crate::llm::openai::codex_detect::load();
     let (openai, anthropic, openrouter, local) =
-        resolve_direct_providers(pool, &ctx.default_model, openai_env_key).await;
+        resolve_direct_providers(pool, &ctx.default_model, openai_env_key, openai_codex_key).await;
 
     let selection = select_provider(ProviderSelectionInputs {
         model_is_mock: false,
@@ -264,13 +275,15 @@ pub async fn build_active_provider(
 /// Build the direct-OpenAI provider from a resolved key, logging where the key
 /// came from and degrading to `None` (rather than aborting) if the reqwest
 /// client can't be built. Shared by both branches of [`resolve_direct_providers`]
-/// so the DB-up and DB-down paths honor the `OPENAI_API_KEY` fallback identically.
+/// so the DB-up and DB-down paths honor the `OPENAI_API_KEY` and Codex-CLI
+/// fallbacks identically.
 fn build_openai_provider(
     credential: Option<(AuthType, String)>,
     env_key: Option<String>,
+    codex_key: Option<String>,
     default_model: &str,
 ) -> Option<OpenAiProvider> {
-    match resolve_openai_api_key(credential, env_key) {
+    match resolve_openai_api_key(credential, env_key, codex_key) {
         Some((key, source)) => {
             crate::log!("[Startup] OpenAI provider configured (key from {})", source);
             OpenAiProvider::new(key, default_model.to_string())
@@ -392,17 +405,23 @@ mod tests {
         }
     }
 
-    /// Whether ambient provider env vars (`OPENAI_API_KEY`, OpenRouter, local)
-    /// could pre-configure a provider in this process. The OpenAI/OpenRouter/
-    /// local builders honor env fallbacks, so on a dev shell that has them set
-    /// the "no provider configured" assertions below are not meaningful — the
-    /// `anthropic`-credential transition (env-independent) still is. (Anthropic
-    /// has no env fallback in `resolve_direct_providers`.)
+    /// Whether an ambient provider source could pre-configure a provider in this
+    /// process: the OpenAI / OpenRouter / local env fallbacks, OR a Codex CLI
+    /// `apikey` login on disk (`${CODEX_HOME:-~/.codex}/auth.json`), which the
+    /// OpenAI builder now honors as its lowest-precedence fallback. On a dev
+    /// shell or CI runner that has any of these, the "no provider configured"
+    /// assertions below are not meaningful — the `anthropic`-credential
+    /// transition (env- and file-independent) still is. (Anthropic has no env
+    /// fallback in `resolve_direct_providers`.) The Codex source must be included
+    /// here, not just the env vars: a developer logged into Codex would otherwise
+    /// see `build_active_provider` return `Real` while this gate reported false,
+    /// breaking the `Unconfigured`/`FailFast` assertions.
     fn ambient_provider_env() -> bool {
         std::env::var("OPENAI_API_KEY").is_ok()
             || std::env::var("LUCIDOS_OPENROUTER_API_KEY").is_ok()
             || std::env::var("LUCIDOS_LOCAL_BASE_URL").is_ok()
             || std::env::var("LUCIDOS_LOCAL_API_KEY").is_ok()
+            || crate::llm::openai::codex_detect::load().is_some()
     }
 
     /// The core fix: with the boot-without-provider gate on, no credentials →

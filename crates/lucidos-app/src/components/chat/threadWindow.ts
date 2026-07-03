@@ -37,3 +37,19 @@ export function hasMoreAbove(total: number, renderCount: number): boolean {
 export function expandRenderCount(total: number, renderCount: number): number {
   return Math.min(total, renderCount + WINDOW_STEP);
 }
+
+/** Whether a "scroll to top" must render the FULL thread before scrolling.
+ *
+ *  The transcript is windowed — only a trailing slice is in the DOM — so a plain
+ *  smooth `scrollTo(top:0)` only reaches the top of that slice. Worse, as the
+ *  smooth scroll nears the top it trips the scroll-up window-expand (see
+ *  ThreadView's onScroll), which prepends a chunk and re-anchors the viewport,
+ *  stalling the scroll partway. The user then had to click the chevron once per
+ *  chunk to crawl to the genuine top (the "needed N clicks" bug). When older
+ *  exchanges remain above the window, the chevron renders everything first (set
+ *  renderCount = Infinity) and only then scrolls — landing at the true top in one
+ *  action. Equivalent to hasMoreAbove, named for the scroll-to-top contract that
+ *  depends on it. */
+export function scrollToTopNeedsRenderAll(total: number, renderCount: number): boolean {
+  return hasMoreAbove(total, renderCount);
+}

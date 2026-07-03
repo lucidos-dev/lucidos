@@ -2,7 +2,7 @@ import { useEffect, useState } from 'preact/hooks';
 import { marketplaceCatalog } from '../../store/store';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
-import { ListSkeleton } from '../shared/ListSkeleton';
+import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import {
   addPluginMarketplaceAction,
@@ -10,6 +10,40 @@ import {
   removePluginMarketplaceAction,
 } from '../../store/actions/plugin-marketplaces';
 import { AddOfficialMarketplaceButton } from '../plugins/AddOfficialMarketplaceButton';
+import type { PluginMarketplace } from '../../store/types';
+
+/** Self-skeletonizing marketplace row: rendered with no props inside a
+ *  SkeletonProvider (`<MarketplaceRow />`) it draws itself as a loading
+ *  placeholder via the Sk* leaves; with a real `marketplace` it renders normally.
+ *  Props are optional only to support the skeleton call. */
+function MarketplaceRow({ marketplace }: { marketplace?: PluginMarketplace }) {
+  const sk = useSkeleton();
+  return (
+    <div class="list-row app-store-marketplace-row">
+      <div class="list-row-info">
+        <SkText class="title list-row-name" as="div" w="9rem">{marketplace?.name}</SkText>
+        {sk ? (
+          <SkText class="app-store-source-value" as="div" w="16rem" />
+        ) : (
+          <code class="app-store-source-value" data-tooltip={marketplace?.source}>
+            {marketplace?.source}
+          </code>
+        )}
+      </div>
+      <div class="list-row-actions">
+        <SkBlock w="4.5rem" h="2rem" round>
+          <button
+            class="action-btn action-btn-danger"
+            type="button"
+            onClick={() => { if (marketplace) void removePluginMarketplaceAction(marketplace.id); }}
+          >
+            Remove
+          </button>
+        </SkBlock>
+      </div>
+    </div>
+  );
+}
 
 /** Settings → Marketplaces. Add/remove the git repositories (plugin
  *  marketplaces) the Store scans for installable plugins. Moved here out of the
@@ -70,7 +104,7 @@ export function MarketplacesSection() {
       {loadable.status === 'failed' ? (
         <LoadableError noun="marketplaces" error={loadable.error} />
       ) : (
-        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf count={2} containerClass="list-rows app-store-marketplaces" row={() => <MarketplaceRow />} />}>
           {loadable.status === 'loaded' ? (
             loadable.data.marketplaces.length === 0 ? (
               <div class="app-store-empty-suggest app-store-empty-suggest-settings">
@@ -80,23 +114,7 @@ export function MarketplacesSection() {
             ) : (
               <div class="list-rows app-store-marketplaces">
                 {loadable.data.marketplaces.map((marketplace) => (
-                  <div class="list-row app-store-marketplace-row" key={marketplace.id}>
-                    <div class="list-row-info">
-                      <div class="title list-row-name">{marketplace.name}</div>
-                      <code class="app-store-source-value" data-tooltip={marketplace.source}>
-                        {marketplace.source}
-                      </code>
-                    </div>
-                    <div class="list-row-actions">
-                      <button
-                        class="action-btn action-btn-danger"
-                        type="button"
-                        onClick={() => void removePluginMarketplaceAction(marketplace.id)}
-                      >
-                        Remove
-                      </button>
-                    </div>
-                  </div>
+                  <MarketplaceRow key={marketplace.id} marketplace={marketplace} />
                 ))}
               </div>
             )

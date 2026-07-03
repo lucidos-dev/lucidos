@@ -287,6 +287,11 @@ impl MemoryExtractor {
         // Parse via Value first — LLMs sometimes emit duplicate keys (e.g. "topic"
         // twice), which serde's derived Deserialize rejects but Value handles
         // with last-wins semantics.
+        // TEMPORARY MEASURE — model-tolerance (removable; see
+        // docs/temporary-measures.md § "Duplicate-key tolerant memory-extraction
+        // parse", governed by .claude/rules/temporary-measures.md). Drop the
+        // intermediate Value step and deserialize Vec<ExtractedFact> directly once
+        // extraction responses reliably contain no duplicate keys.
         let value: serde_json::Value = serde_json::from_str(&cleaned).map_err(|e| {
             format!(
                 "[Memory] Failed to parse extraction JSON: {} | raw: {}",

@@ -702,3 +702,193 @@ async fn slow_path_change_applied_carries_stashed_apply_actor() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+/// Propose-time reconcile (Invariants 1 & 2) at the projection level.
+///
+/// A coding-agent thread had a pending change on branch A (a merge-conflict
+/// re-run left it orphaned). When `propose_change` proposes on a NEW branch B,
+/// it enforces "≤1 pending change per thread" by discarding A's pending change
+/// BEFORE emitting the new `ChangeProposed`. This models that exact sequence and
+/// locks the two guarantees:
+///   1. Only branch B's change is left pending — the orphan is gone, so the
+///      frontend's `hasPendingChanges` no longer suppresses Archive.
+///   2. `coding_agent_proposed` is TRUE afterwards — the discard's `ClearAll`
+///      runs BEFORE the propose's `SetChanges`, so the flag reflects the new
+///      change (the ordering the source guard below pins in `propose_change`).
+///
+/// This is the exact stuck state from thread `a4d52fd0` — two pending change
+/// rows across branches, one applied, one orphaned pending — reduced to its
+/// projection contract. See
+/// docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md.
+#[tokio::test]
+async fn propose_time_reconcile_keeps_single_pending_and_proposed_flag() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    // Old branch A: a pending change (the orphan-to-be).
+    let change_a = seed_pending_change(&bus, thread_id, "claude-code/old-A").await;
+
+    // New branch B proposal. `propose_change` reconciles FIRST — (a) discard the
+    // stale other-branch change …
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ChangeDiscarded {
+            change_id: change_a.to_string(),
+            actor: None,
+            path: String::new(),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    // … (b) THEN emit the new branch's ChangeProposed.
+    let change_b = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ChangeProposed {
+            change_id: change_b.to_string(),
+            description: Some("Fix v2".into()),
+            files: vec!["src/main.rs".into()],
+            requires_restart: false,
+            origin: None,
+            commit_sha: None,
+            branch_name: "claude-code/new-B".into(),
+            repo_root: "/tmp".into(),
+            hardened: false,
+            incomplete: false,
+            path: String::new(),
+            diff: String::new(),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    // Invariant 1: exactly one pending change, on the new branch.
+    let pending: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, branch_name FROM changes WHERE thread_id = $1 AND status = 'pending' \
+         ORDER BY created_at",
+    )
+    .bind(thread_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "only the new-branch change may remain pending — the orphan blocks Archive; got {:?}",
+        pending
+    );
+    assert_eq!(pending[0].0, change_b, "the surviving pending change is branch B's");
+    assert_eq!(pending[0].1, "claude-code/new-B");
+
+    // The orphan is discarded (not lingering as pending).
+    let a_status: String = sqlx::query_scalar("SELECT status FROM changes WHERE id = $1")
+        .bind(change_a)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(a_status, "discarded", "the stale branch-A change must be discarded");
+
+    // Invariant 2: coding_agent_proposed reflects the NEW change (discard-before-propose).
+    let proposed: bool =
+        sqlx::query_scalar("SELECT coding_agent_proposed FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        proposed,
+        "coding_agent_proposed must be TRUE after a cross-branch propose — the sibling \
+         discard's ClearAll must run BEFORE the new ChangeProposed's SetChanges"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Source-order guard for the propose-time reconcile ORDERING (Invariant 2).
+///
+/// `propose_change` cannot be exercised through a live `LucidosEngine` (nothing
+/// in the crate builds one outside `main.rs`), so — as with the merge-helper
+/// signature test — we pin the load-bearing property structurally: the sibling
+/// reconcile call must appear BEFORE the `ChangeProposed` emit. If a refactor
+/// reorders them, `ChangeDiscarded`'s `ClearAll` would wipe the
+/// `coding_agent_proposed` flag the proposal just set, re-introducing the
+/// "applied but no Apply button / no Archive" class of bug.
+#[test]
+fn propose_change_reconciles_stale_branches_before_change_proposed_emit() {
+    let src = include_str!("../change_ops/propose.rs");
+    let discard_pos = src
+        .find("discard_pending_for_thread_except")
+        .expect("propose_change must reconcile stale other-branch pending changes");
+    let proposed_pos = src
+        .find("ThreadEvent::ChangeProposed")
+        .expect("propose_change must still emit ChangeProposed");
+    assert!(
+        discard_pos < proposed_pos,
+        "the sibling reconcile must run BEFORE the ChangeProposed emit — otherwise \
+         ChangeDiscarded's ClearAll wipes the coding_agent_proposed flag this proposal sets. \
+         See docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md"
+    );
+}
+
+/// Guard where the apply-time net (`discard_orphaned_pending_siblings`) lives.
+///
+/// It belongs inside `apply_change` — gated on a real `ApplyStatus::Applied`
+/// transition — so every caller (HTTP handler, the no-live `apply_now` fast /
+/// stale paths, the Apply-All driver, the post-hardening re-entry) reconciles
+/// uniformly and correctly. It must ALSO live in `apply_now_success` (the live
+/// in-place merge path bypasses `apply_change`). It must NOT be scattered into
+/// the HTTP handler (an ungated call there discarded a newer sibling on a `Noop`
+/// re-apply — data loss) and must NOT be wired into the shared
+/// `emit_change_applied` (the external-repo archive loop calls that per pending
+/// change, so reconciling there would double-terminate siblings).
+#[test]
+fn apply_time_reconcile_lives_in_apply_change_gated_not_in_handler_or_emitter() {
+    let apply = include_str!("../change_ops/apply.rs");
+    assert!(
+        apply.contains("discard_orphaned_pending_siblings"),
+        "apply_change must reconcile orphaned sibling pending changes on a successful apply"
+    );
+    assert!(
+        apply.contains("ApplyStatus::Applied"),
+        "the apply-time reconcile must be gated on ApplyStatus::Applied — reconciling on \
+         Noop/Hardening/Conflict discards newer sibling work (data loss)"
+    );
+    let apply_now = include_str!("../agent_session/apply_now.rs");
+    assert!(
+        apply_now.contains("discard_orphaned_pending_siblings"),
+        "apply_now_success (live in-place merge) must reconcile orphaned siblings — it bypasses apply_change"
+    );
+    let http = include_str!("../../api/changes.rs");
+    assert!(
+        !http.contains("discard_orphaned_pending_siblings"),
+        "the HTTP apply_change handler must NOT reconcile directly — apply_change does it, gated on Applied"
+    );
+    let emitters = include_str!("../change_ops_emitters.rs");
+    assert!(
+        !emitters.contains("discard_orphaned_pending_siblings"),
+        "emit_change_applied must NOT reconcile siblings — it is shared with the external-repo \
+         archive loop, which applies multiple pending changes per thread in sequence"
+    );
+}
+
+/// Guard that `discard_change` feeds the Apply-All driver a terminal signal.
+///
+/// When the sibling reconcile (or a concurrent user discard) drops a change that
+/// is a live Apply-All batch member, the driver must be told so the batch
+/// advances. Otherwise it spawns `apply_change` on the now-`discarded` row, which
+/// returns `Err` with no terminal event — the batch never completes and the
+/// "Applying changes…" toast sticks forever. Symmetric to `emit_change_applied`'s
+/// `notify_apply_all(Applied …)` (a no-op for non-members).
+#[test]
+fn discard_change_notifies_apply_all_driver_so_batch_advances() {
+    let discard = include_str!("../change_ops/discard.rs");
+    assert!(
+        discard.contains("notify_apply_all") && discard.contains("DISCARDED_MEMBER_REASON"),
+        "discard_change must notify the Apply-All driver (Failed / DISCARDED_MEMBER_REASON) so a \
+         batch member discarded mid-batch advances the batch instead of stalling it"
+    );
+}

@@ -389,7 +389,10 @@ fn ask_user_question_schema_parses_with_cc_parser() {
 /// The `tap` param in the `send_notification` tool schema is a structured
 /// `{kind, to?}` object (not an enum-of-strings) — see the locked plan-mode
 /// design. Verify the schema's `tap` property advertises type=object and the
-/// three `kind` values in its description so the LLM emits valid taps.
+/// two supported `kind` values in its description so the LLM emits valid taps.
+/// (The passive `none` kind was retired —
+/// docs/plans/2026-07-02-remove-notification-tap-none.md — so the schema must
+/// NOT advertise it.)
 #[test]
 fn send_notification_schema_tap_documents_object_shape() {
     let tool = get_notification_tool();
@@ -407,13 +410,17 @@ fn send_notification_schema_tap_documents_object_shape() {
         .get("description")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    for kind in ["modal", "none", "navigate"] {
+    for kind in ["modal", "navigate"] {
         assert!(
             desc.contains(kind),
             "tap description must mention the `{}` kind so the LLM knows it's valid: got {}",
             kind, desc
         );
     }
+    assert!(
+        !desc.contains("\"none\""),
+        "tap description must NOT advertise the retired `none` kind: got {desc}"
+    );
 }
 
 /// The delivery semantics (notifications.md §2/§4) must be in the tool
@@ -452,14 +459,18 @@ fn tap_modal_round_trips_as_kind_object() {
 }
 
 #[test]
-fn tap_none_round_trips_as_kind_object() {
+fn tap_legacy_none_coerces_to_modal() {
+    // `Tap::None` was retired (docs/plans/2026-07-02-remove-notification-tap-none.md).
+    // Historical `{"kind":"none"}` event/row payloads must still deserialize — as
+    // Modal — so a projection rebuild never fails or re-emits a `none` row.
     use crate::scheduler::notifications::Tap;
 
-    let serialized = serde_json::to_value(Tap::None).expect("serialize");
-    assert_eq!(serialized, serde_json::json!({"kind": "none"}));
-
     let parsed: Tap = serde_json::from_value(serde_json::json!({"kind": "none"})).expect("parse");
-    assert_eq!(parsed, Tap::None);
+    assert_eq!(parsed, Tap::Modal);
+    assert_eq!(
+        serde_json::to_value(&parsed).expect("serialize"),
+        serde_json::json!({"kind": "modal"})
+    );
 }
 
 /// `list_changes` / `apply_change` consolidated into the grouped `changes`

@@ -7,7 +7,7 @@ import {
 } from '../../store/actions/environmentVariables';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
-import { ListSkeleton } from '../shared/ListSkeleton';
+import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import type { EnvironmentVariable } from '../../api/types';
 
@@ -78,18 +78,25 @@ function AddEnvVarForm() {
   );
 }
 
-/** A single env var row with inline edit, mirroring DeviceRow / repositoriesSection. */
-function EnvVarRow({ envVar }: { envVar: EnvironmentVariable }) {
+/** A single env var row with inline edit, mirroring DeviceRow / repositoriesSection.
+ *  Self-skeletonizing: rendered with no props inside a SkeletonProvider
+ *  (`<EnvVarRow />`) it draws the DISPLAY mode as a loading placeholder via the
+ *  Sk* leaves; with a real `envVar` it renders normally. Props are optional only
+ *  to support the skeleton call. */
+function EnvVarRow({ envVar }: { envVar?: EnvironmentVariable }) {
+  const sk = useSkeleton();
   const [editing, setEditing] = useState(false);
-  const [value, setValue] = useState(envVar.value);
+  const [value, setValue] = useState(envVar?.value ?? '');
   const [saving, setSaving] = useState(false);
 
   function startEditing() {
+    if (!envVar) return;
     setValue(envVar.value);
     setEditing(true);
   }
 
   async function saveEdit() {
+    if (!envVar) return;
     setSaving(true);
     try {
       const ok = await submitEnvVar(envVar.name, value, true);
@@ -99,11 +106,11 @@ function EnvVarRow({ envVar }: { envVar: EnvironmentVariable }) {
     }
   }
 
-  if (editing) {
+  if (!sk && editing) {
     return (
       <div class="list-row">
         <div class="list-row-info" style={{ gap: '0.5rem' }}>
-          <div class="title">{envVar.name}</div>
+          <div class="title">{envVar?.name}</div>
           <input
             class="device-name-input"
             type="text"
@@ -126,14 +133,18 @@ function EnvVarRow({ envVar }: { envVar: EnvironmentVariable }) {
   return (
     <div class="list-row">
       <div class="list-row-info">
-        <div class="title">{envVar.name}</div>
-        <div class="list-row-details">{envVar.value}</div>
+        <SkText class="title" as="div" w="9rem">{envVar?.name}</SkText>
+        <SkText class="list-row-details" as="div" w="14rem">{envVar?.value}</SkText>
       </div>
       <div class="list-row-actions">
-        <button class="action-btn" onClick={startEditing}>Edit</button>
-        <button class="action-btn action-btn-danger" onClick={() => void deleteEnvironmentVariable(envVar.name)}>
-          Delete
-        </button>
+        <SkBlock w="3rem" h="2rem" round>
+          <button class="action-btn" onClick={startEditing}>Edit</button>
+        </SkBlock>
+        <SkBlock w="3.75rem" h="2rem" round>
+          <button class="action-btn action-btn-danger" onClick={() => { if (envVar) void deleteEnvironmentVariable(envVar.name); }}>
+            Delete
+          </button>
+        </SkBlock>
       </div>
     </div>
   );
@@ -159,7 +170,7 @@ export function EnvironmentVariablesPage() {
 
   return (
     <div class="settings-section">
-      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton />}>
+      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf containerClass="list-rows" row={() => <EnvVarRow />} />}>
         {loadable.status === 'loaded' ? (
           <>
             <p class="settings-section-desc">

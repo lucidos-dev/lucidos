@@ -16,13 +16,12 @@ import type { Page } from './fixtures';
  *
  * Verifies the WaitingBanner Diff affordance reacts to `coding_agent_has_diff`
  * flips driven by the projection. Diff SHOWS only when there is a diff — no diff
- * means no Diff affordance at all (not a greyed/disabled one). Note the Diff
- * affordance lives inside the change-action split button's caret menu whenever
- * the thread has a pending change (an Apply action), so `diffVisible()` opens the
- * menu to look; with no Apply it's a top-level button.
+ * means no Diff affordance at all (not a greyed/disabled one). Diff is always a
+ * standalone top-level button (never folded into the Apply/Discard split menu),
+ * so `diffVisible()` just checks for that button.
  *
  *   - CC thread, no diff     → Diff hidden.
- *   - ChangeProposed lands   → projection flips coding_agent_has_diff=TRUE → SSE → Diff appears (in the caret menu).
+ *   - ChangeProposed lands   → projection flips coding_agent_has_diff=TRUE → SSE → Diff appears (standalone button).
  *   - ChangeApplied lands    → projection flips coding_agent_has_diff=FALSE → SSE → Diff disappears.
  *
  * The seed step uses `POST /api/v1/internal/seed-change-for-test`, which emits
@@ -34,25 +33,13 @@ import type { Page } from './fixtures';
  * `ChangeApplied` through the EventBus on success.
  */
 
-/** Whether the Diff affordance is currently available, across both banner
- *  shapes. When the thread has a pending change the banner is a split button and
- *  Diff lives in the caret menu (open it to look, then close it again); when
- *  there is no Apply action (e.g. an idle CC thread with a diff but no pending
- *  change) Diff is a top-level button. Used inside `expect.poll` so it converges
- *  as SSE settles the projection. */
+/** Whether the Diff affordance is currently available. Diff is always a
+ *  standalone top-level button in the banner (never folded into the Apply/Discard
+ *  split menu), so this is a single top-level check. Used inside `expect.poll` so
+ *  it converges as SSE settles the projection. */
 async function diffVisible(page: Page): Promise<boolean> {
-  const direct = page.locator('.thread-action-buttons:visible button:has-text("Diff")').first();
-  if (await direct.isVisible().catch(() => false)) return true;
-  const caret = page.locator('.thread-action-buttons:visible .split-button-caret').first();
-  if (!(await caret.isVisible().catch(() => false))) return false;
-  await caret.click();
-  const inMenu = await page.locator('.split-button-menu:visible button:has-text("Diff")').first()
-    .isVisible({ timeout: 1_000 }).catch(() => false);
-  // Leave the menu closed so the next poll iteration starts from a clean state.
-  await page.keyboard.press('Escape').catch(() => {});
-  await page.locator('.split-button-menu:visible').first()
-    .waitFor({ state: 'hidden', timeout: 1_000 }).catch(() => {});
-  return inMenu;
+  return page.locator('.thread-action-buttons:visible button:has-text("Diff")').first()
+    .isVisible().catch(() => false);
 }
 
 /** Seed a CC thread in the 'waiting' state with NO changes (so initial
@@ -166,9 +153,9 @@ test.describe('WaitingBanner Diff button reacts to coding_agent_has_diff', () =>
       });
 
       // SSE delivers the new aggregate → coding_agent_has_diff=TRUE → the Diff
-      // affordance appears (now inside the split button's caret menu, since the
-      // pending change brings an Apply action). Generous timeout to cover slow
-      // CI without masking flakes.
+      // affordance appears (a standalone top-level button, alongside the
+      // Apply/Discard split button). Generous timeout to cover slow CI without
+      // masking flakes.
       await expect.poll(() => diffVisible(page), { timeout: 10_000 }).toBe(true);
     } finally {
       cleanupCCThread(threadId, changeId, branch, file);

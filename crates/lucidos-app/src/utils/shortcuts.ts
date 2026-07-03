@@ -8,8 +8,12 @@ export type ShortcutId =
   | 'newThread'
   | 'closeThread'
   | 'searchEverywhere'
+  | 'openThreadActions'
+  | 'toggleSubthreads'
   | 'historyBack'
   | 'historyForward'
+  | 'prevThreadTurn'
+  | 'nextThreadTurn'
   | 'toggleThreadDrawer'
   | 'toggleThreadPane'
   | 'toggleContentPane'
@@ -51,8 +55,12 @@ export const SHORTCUT_DEFS: readonly ShortcutDef[] = [
   { id: 'newThread', label: 'New thread', category: 'Navigation', defaultBinding: B(true, true, false, 'o') },
   { id: 'closeThread', label: 'Close thread (cascade)', category: 'Navigation', defaultBinding: B(true, true, false, 'w') },
   { id: 'searchEverywhere', label: 'Search everywhere', category: 'Navigation', defaultBinding: B(true, true, false, 's') },
+  { id: 'openThreadActions', label: 'Open thread actions (highlighted drawer row)', category: 'Navigation', defaultBinding: B(true, true, false, 'm') },
+  { id: 'toggleSubthreads', label: 'Expand or collapse sub-threads (focused thread)', category: 'Navigation', defaultBinding: B(true, true, false, 'e') },
   { id: 'historyBack', label: 'Back (focused pane)', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowDown') },
   { id: 'historyForward', label: 'Forward (focused pane)', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowUp') },
+  { id: 'prevThreadTurn', label: 'Previous turn (conversation)', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowUp') },
+  { id: 'nextThreadTurn', label: 'Next turn (conversation)', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowDown') },
   { id: 'toggleThreadDrawer', label: 'Show or hide thread drawer', category: 'Panes', defaultBinding: B(true, true, false, '1') },
   { id: 'toggleThreadPane', label: 'Focus or hide thread pane', category: 'Panes', defaultBinding: B(true, true, false, '2') },
   { id: 'toggleContentPane', label: 'Focus or hide content pane', category: 'Panes', defaultBinding: B(true, true, false, '3') },

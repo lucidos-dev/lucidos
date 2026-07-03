@@ -9,7 +9,7 @@
     border: 1px solid var(--border-color);
     border-radius: 0.375rem;
     background: var(--bg-primary);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
 }
 
 .backup-health-line {
@@ -30,12 +30,12 @@
 
 .backup-health-muted {
     color: var(--text-muted);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
 }
 
 /* Severity tints — a subtle accent wash over the card surface, with the neutral
-   border kept (matches the rest of Lucidos's inline notices, e.g.
-   .rendered-diff-deletions). No heavy colored border. */
+   border kept (matches the rest of Lucidos's inline notices). No heavy colored
+   border. */
 
 /* No recent good backup, but the last run didn't fail — a soft warning. */
 .backup-health-card[data-state="stale"] {
@@ -56,5 +56,5 @@
 /* "View backups folder" deep link under the provider row. */
 .backup-folder-link-row {
     margin-bottom: 0.75rem;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
 }

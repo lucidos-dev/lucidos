@@ -2,7 +2,9 @@ import { Fragment } from 'preact';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { marked } from 'marked';
 import type { Token, Tokens } from 'marked';
-import '../../utils/markedConfig';
+// escapeHtmlAttr is a DOM-free escaper; importing it also runs markedConfig's
+// marked.use(...) side effects (previously a bare side-effect import).
+import { escapeHtmlAttr } from '../../utils/markedConfig';
 import type { DiffFile } from '../../store/store';
 import { getChangeFileContent, getRepoFileContent } from '../../api/client';
 import type { Loadable } from '../../store/types';
@@ -23,6 +25,11 @@ interface Props {
 type BlockStatus = 'unchanged' | 'added' | 'changed';
 
 interface LineRun { start: number; end: number }
+
+/** A consecutive block of removed lines, anchored to the new-file line it sat
+ *  before. `anchor` is the new-file line number the removed block precedes — the
+ *  block renders just above the rendered content at that position. */
+export interface DeletionRun { anchor: number; lines: string[] }
 
 const STRIP_LIST_OPEN = /^\s*<(ul|ol)[^>]*>/;
 const STRIP_LIST_CLOSE = /<\/(ul|ol)>\s*$/;
@@ -47,6 +54,23 @@ export function additionRuns(file: DiffFile): LineRun[] {
       }
     }
     if (runStart !== null) runs.push({ start: runStart, end: newLine - 1 });
+  }
+  return runs;
+}
+
+/** The new-file line ranges the hunks span — changed lines plus the context
+ *  lines git already included around each hunk. Used to scope the rendered diff
+ *  to just the changed regions (mirroring the raw `DiffView`, which only shows
+ *  hunks); content outside any hunk is collapsed into a gap marker. The "Show
+ *  full file" toggle is the way to see the whole document. */
+export function hunkCoverage(file: DiffFile): LineRun[] {
+  const runs: LineRun[] = [];
+  for (const hunk of file.hunks) {
+    // new_count counts context + additions (deletions occupy no new-file line),
+    // so [new_start, new_start + new_count - 1] is the hunk's new-file extent.
+    if (hunk.new_count > 0) {
+      runs.push({ start: hunk.new_start, end: hunk.new_start + hunk.new_count - 1 });
+    }
   }
   return runs;
 }
@@ -84,7 +108,6 @@ function statusClass(s: BlockStatus): string {
 }
 
 function isList(t: Token): t is Tokens.List { return t.type === 'list'; }
-function isBlockquote(t: Token): t is Tokens.Blockquote { return t.type === 'blockquote'; }
 
 function addLiClass(html: string, cls: string): string {
   // Merge into an existing class attribute (e.g. marked's task-list-item) so
@@ -125,27 +148,85 @@ function renderListWithItemMarking(list: Tokens.List, listStartLine: number, run
   return `<${tag}${startAttr}>${lis.join('')}</${tag}>`;
 }
 
-export function renderDiffMarked(content: string, runs: LineRun[]): string {
+// A removed block is raw old-file content (not rendered as markdown — it no
+// longer exists in the new file). It's a top-level sibling, so the change-strip
+// overlay can find it by class and paint a red bar/tint at the panel edge.
+function renderRemovedBlock(lines: string[]): string {
+  const body = lines.map(escapeHtmlAttr).join('\n');
+  return `<div class="diff-rendered-removed"><pre class="diff-removed-lines">${body}</pre></div>`;
+}
+
+/** Renders the post-change markdown with change marks. When `coverage` is
+ *  provided (the hunks' new-file extents), only tokens overlapping a covered
+ *  range are rendered — the rest of the document is collapsed into a single gap
+ *  marker per omitted run, so the rich diff shows just the changes rather than
+ *  the whole file. Pass `null` (the default) to render the entire document. */
+export function renderDiffMarked(
+  content: string,
+  runs: LineRun[],
+  dels: DeletionRun[] = [],
+  coverage: LineRun[] | null = null,
+): string {
   const tokens = marked.lexer(content);
+  const sortedDels = [...dels].sort((a, b) => a.anchor - b.anchor);
   const parts: string[] = [];
   let line = 1;
+  let di = 0;
+  // A non-space token outside `coverage` was skipped since the last rendered
+  // part — flushed as one gap marker before the next rendered part.
+  let pendingGap = false;
+
+  const isCovered = (start: number, end: number): boolean => {
+    if (!coverage) return true;
+    return coverage.some(c => !(c.end < start || c.start > end));
+  };
+
+  const flushGap = () => {
+    if (pendingGap) {
+      parts.push('<div class="diff-rendered-gap" aria-hidden="true">⋯</div>');
+      pendingGap = false;
+    }
+  };
+
+  // Flush every removed block anchored before `lineExclusive`, so a deletion
+  // renders just above the first token at-or-after its original position. A
+  // deletion is rendered content, so it closes any pending gap first.
+  const flushDelsBefore = (lineExclusive: number) => {
+    while (di < sortedDels.length && sortedDels[di].anchor < lineExclusive) {
+      flushGap();
+      parts.push(renderRemovedBlock(sortedDels[di].lines));
+      di++;
+    }
+  };
 
   for (const tok of tokens) {
     const newlines = rawNewlines(tok.raw ?? '');
     const start = line;
     const end = tokenEndLine(start, newlines);
+    flushDelsBefore(start + 1);
 
+    // Blank-line `space` tokens are never content and never a gap on their own.
+    if (tok.type === 'space') {
+      line += newlines;
+      continue;
+    }
+
+    // Outside the hunk coverage → omit, marking a gap for the next flush.
+    if (!isCovered(start, end)) {
+      pendingGap = true;
+      line += newlines;
+      continue;
+    }
+
+    flushGap();
     if (isList(tok)) {
+      // Lists are marked per-item; every other block (paragraph, heading,
+      // blockquote, code) renders whole and is marked as a unit.
       const html = renderListWithItemMarking(tok, start, runs);
       const status = classifyRange(start, end, runs);
       const wrapClass = status === 'added' ? 'diff-rendered-block-added' : '';
       parts.push(wrapClass ? `<div class="${wrapClass}">${html}</div>` : html);
-    } else if (isBlockquote(tok)) {
-      const status = classifyRange(start, end, runs);
-      const html = marked.parser([tok]);
-      const cls = statusClass(status);
-      parts.push(cls ? `<div class="${cls}">${html}</div>` : html);
-    } else if (tok.type !== 'space') {
+    } else {
       const status = classifyRange(start, end, runs);
       const html = marked.parser([tok]);
       const cls = statusClass(status);
@@ -155,20 +236,37 @@ export function renderDiffMarked(content: string, runs: LineRun[]): string {
     line += newlines;
   }
 
+  // Deletions past the last token (e.g. trailing lines removed at EOF).
+  flushDelsBefore(Infinity);
+  // Trailing omitted content below the last change.
+  flushGap();
+
   return parts.join('');
 }
 
-function deletionLines(file: DiffFile): string[] {
-  const out: string[] = [];
+export function deletionRuns(file: DiffFile): DeletionRun[] {
+  const runs: DeletionRun[] = [];
   for (const hunk of file.hunks) {
+    let newLine = hunk.new_start;
+    let current: string[] | null = null;
+    let anchor = newLine;
     for (const line of hunk.lines) {
-      if (line.type === 'deletion') out.push(line.content);
+      if (line.type === 'deletion') {
+        if (current === null) { current = []; anchor = newLine; }
+        current.push(line.content);
+      } else {
+        if (current !== null) { runs.push({ anchor, lines: current }); current = null; }
+        // context + addition both advance the new-file line counter; a deletion
+        // does not (it has no line in the new file).
+        newLine++;
+      }
     }
+    if (current !== null) runs.push({ anchor, lines: current });
   }
-  return out;
+  return runs;
 }
 
-interface Strip { top: number; height: number; variant: 'added' | 'changed' }
+interface Strip { top: number; height: number; variant: 'added' | 'changed' | 'removed' }
 
 export function RenderedDiff({ file, changeId, repoId, gitRef }: Props) {
   const [content, setContent] = useState<Loadable<string>>({ status: 'not-loaded' });
@@ -190,12 +288,15 @@ export function RenderedDiff({ file, changeId, repoId, gitRef }: Props) {
   }, [changeId, repoId, gitRef, file.path]);
 
   const runs = useMemo(() => additionRuns(file), [file]);
-  const deletions = useMemo(() => deletionLines(file), [file]);
+  const dels = useMemo(() => deletionRuns(file), [file]);
+  // Scope the rendered diff to the hunks (changed lines + git's context) — the
+  // "Show full file" toggle is the way to see the whole document.
+  const coverage = useMemo(() => hunkCoverage(file), [file]);
 
   const html = useMemo(() => {
     if (content.status !== 'loaded') return null;
-    return renderDiffMarked(content.data, runs);
-  }, [content, runs]);
+    return renderDiffMarked(content.data, runs, dels, coverage);
+  }, [content, runs, dels, coverage]);
 
   // Strips render in a separate overlay layer so they reach the panel edge
   // regardless of where the marked element sits in the indentation hierarchy
@@ -210,14 +311,16 @@ export function RenderedDiff({ file, changeId, repoId, gitRef }: Props) {
       const containerRect = container.getBoundingClientRect();
       const raw: Strip[] = [];
       const markedEls = contentEl.querySelectorAll<HTMLElement>(
-        '.diff-rendered-added, .diff-rendered-changed, .diff-rendered-block-added',
+        '.diff-rendered-added, .diff-rendered-changed, .diff-rendered-block-added, .diff-rendered-removed',
       );
       for (const el of Array.from(markedEls)) {
         const r = el.getBoundingClientRect();
         raw.push({
           top: r.top - containerRect.top + container.scrollTop,
           height: r.height,
-          variant: el.classList.contains('diff-rendered-changed') ? 'changed' : 'added',
+          variant: el.classList.contains('diff-rendered-removed') ? 'removed'
+            : el.classList.contains('diff-rendered-changed') ? 'changed'
+            : 'added',
         });
       }
       // Merge strips that touch or are nearly adjacent. Without this, paragraph /
@@ -255,12 +358,6 @@ export function RenderedDiff({ file, changeId, repoId, gitRef }: Props) {
 
   return (
     <div class="rendered-diff" ref={containerRef}>
-      {deletions.length > 0 && (
-        <details class="rendered-diff-deletions">
-          <summary>−{deletions.length} removed line{deletions.length === 1 ? '' : 's'}</summary>
-          <pre>{deletions.join('\n')}</pre>
-        </details>
-      )}
       <div class="diff-strip-layer" aria-hidden="true">
         {strips.map((s, i) => {
           const style = `top:${s.top}px;height:${s.height}px`;

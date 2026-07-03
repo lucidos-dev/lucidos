@@ -289,7 +289,7 @@ fn parse_stream_event_emits_liveness() {
 // watchdog contract is unchanged.
 #[test]
 fn parse_stream_event_extracts_thinking_delta_and_keeps_liveness() {
-    let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","text":"Let me reason"}}}"#;
+    let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me reason"}}}"#;
     let events = parse_line(line);
     match &events[..] {
         [AgentEvent::Thought { text }, AgentEvent::StreamActivity] => {
@@ -299,11 +299,26 @@ fn parse_stream_event_extracts_thinking_delta_and_keeps_liveness() {
     }
 }
 
+// Regression: the reasoning text rides on `delta.thinking`, not `delta.text`
+// (only `text_delta` uses `text`). A `thinking_delta` carrying ONLY a `text`
+// field must NOT yield a Thought — reading `text` here was the original bug that
+// dropped every thought.
+#[test]
+fn parse_stream_event_thinking_delta_ignores_text_field() {
+    let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","text":"wrong field"}}}"#;
+    let events = parse_line(line);
+    assert!(
+        matches!(&events[..], [AgentEvent::StreamActivity]),
+        "a thinking_delta with only a `text` field must yield liveness only, got {:?}",
+        events
+    );
+}
+
 // An empty thinking delta must not emit a Thought (no empty "Thinking" steps),
 // but the liveness ping is still emitted.
 #[test]
 fn parse_stream_event_empty_thinking_delta_is_liveness_only() {
-    let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","text":""}}}"#;
+    let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}}"#;
     let events = parse_line(line);
     assert!(
         matches!(&events[..], [AgentEvent::StreamActivity]),
@@ -407,26 +422,114 @@ fn parse_result_success_with_subtype_has_no_error() {
 }
 
 /// CC sometimes emits `is_error: true` with `subtype: "success"` and no
-/// `errors[]` (observed when an upstream API drop happens after CC has
-/// streamed an "API Error: Unable to connect" message and decided the
-/// conversation succeeded structurally). The previous parser fell back to the
-/// `subtype` string, surfacing the literal text "success" as the error in
-/// `ResponseFailed.error` — which renders to the user as
-/// `[ERROR] **Error:** success`. Filter "success" out of the subtype fallback
-/// so the user sees something honest instead.
+/// `errors[]` — a self-contradictory terminal signal. Observed on BOTH a
+/// genuinely completed turn that streamed a full response and committed work,
+/// AND on an upstream API drop that streamed an "API Error: …" message before
+/// CC decided the conversation succeeded structurally. With no `errors[]` and
+/// the non-informative `success` subtype there is nothing actionable to report.
+/// The parser must return `error: None` — NOT a fabricated "Unknown error" —
+/// so `classify_result` classifies on the turn's real content instead of
+/// flipping an otherwise-successful turn to `Failed` (the "Event stream error /
+/// Unknown error" false-failure on the OPUS Brand Title Badge Updates thread).
+/// A turn that produced no content still fails, via the empty-response branch.
 #[test]
-fn parse_result_is_error_with_success_subtype_does_not_surface_success() {
+fn parse_result_is_error_with_success_subtype_yields_no_error() {
     let line = r#"{"type":"result","subtype":"success","is_error":true,"result":"","duration_ms":100}"#;
     let events = parse_line(line);
     match &events[0] {
         AgentEvent::Result { error, .. } => {
-            let err = error
-                .as_deref()
-                .expect("is_error: true must produce Some(error)");
-            assert_ne!(
-                err, "success",
-                "`success` is the no-error sentinel — surfacing it as the failure \
-                 reason renders to the user as `[ERROR] **Error:** success`"
+            assert!(
+                error.is_none(),
+                "is_error:true + subtype:success + no errors[] carries no usable \
+                 failure reason — must be None so a successful turn isn't flipped \
+                 to Failed with a fabricated 'Unknown error'; got {:?}",
+                error
+            );
+        }
+        other => panic!("Expected Result, got {:?}", other),
+    }
+}
+
+/// The load-bearing case behind the fix above: a turn that produced a real
+/// final message but whose `result` message still carried the contradictory
+/// `is_error: true` + `subtype: "success"`. `error` must be `None` so the turn
+/// classifies as `Generated` and the streamed answer + proposed change are not
+/// buried under a red error dot.
+#[test]
+fn parse_result_is_error_with_success_subtype_and_text_yields_no_error() {
+    let line = r#"{"type":"result","subtype":"success","is_error":true,"result":"Done — changes committed.","duration_ms":100}"#;
+    let events = parse_line(line);
+    match &events[0] {
+        AgentEvent::Result { text, error, .. } => {
+            assert_eq!(text, "Done — changes committed.");
+            assert!(
+                error.is_none(),
+                "a successful turn with real output must not carry an error; got {:?}",
+                error
+            );
+        }
+        other => panic!("Expected Result, got {:?}", other),
+    }
+}
+
+/// The genuine-drop counterpart of the fix: an upstream API drop that CC still
+/// labels `subtype: "success"` (with `is_error: true`, no `errors[]`) surfaces
+/// its "API Error: …" message as the final result text. That IS an actionable
+/// failure, so `error` must be preserved (the real text, not a generic "Unknown
+/// error") and the turn stays `Failed` — a successful turn's result text never
+/// *starts* with the `API Error` prefix, so this cannot re-flag a real success.
+#[test]
+fn parse_result_is_error_success_subtype_preserves_api_error_result_text() {
+    let line = r#"{"type":"result","subtype":"success","is_error":true,"result":"API Error: Stream idle timeout - partial response received","duration_ms":100}"#;
+    let events = parse_line(line);
+    match &events[0] {
+        AgentEvent::Result { error, .. } => {
+            assert_eq!(
+                error.as_deref(),
+                Some("API Error: Stream idle timeout - partial response received"),
+                "a genuine upstream drop (result text starts with `API Error`) must \
+                 stay Failed with the real error text"
+            );
+        }
+        other => panic!("Expected Result, got {:?}", other),
+    }
+}
+
+/// Guard the tightness of the discriminator: a genuinely successful turn whose
+/// result text merely *mentions* "api error" mid-sentence (not a leading `API
+/// Error` prefix) must NOT be re-flagged as Failed — that would reintroduce the
+/// exact false-failure the fix removes.
+#[test]
+fn parse_result_is_error_success_subtype_ignores_incidental_api_error_mention() {
+    let line = r#"{"type":"result","subtype":"success","is_error":true,"result":"Fixed the api error handling in client.ts.","duration_ms":100}"#;
+    let events = parse_line(line);
+    match &events[0] {
+        AgentEvent::Result { error, .. } => {
+            assert!(
+                error.is_none(),
+                "an incidental mid-sentence 'api error' mention is not CC's error \
+                 message — must stay None; got {:?}",
+                error
+            );
+        }
+        other => panic!("Expected Result, got {:?}", other),
+    }
+}
+
+/// An absent subtype is likewise non-actionable: `is_error: true` with neither
+/// `errors[]` nor a subtype gives no failure reason, so `error` must be `None`
+/// (the empty-response branch still catches a genuinely output-less turn).
+#[test]
+fn parse_result_is_error_with_no_subtype_and_no_errors_yields_no_error() {
+    let line = r#"{"type":"result","is_error":true,"result":"","duration_ms":100}"#;
+    let events = parse_line(line);
+    match &events[0] {
+        AgentEvent::Result { error, .. } => {
+            assert!(
+                error.is_none(),
+                "is_error:true with no subtype and no errors[] carries no usable \
+                 reason — must be None; got {:?}",
+                error
             );
         }
         other => panic!("Expected Result, got {:?}", other),

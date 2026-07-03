@@ -260,11 +260,15 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
       on = built;
     }
 
+    // go_to_review / side_effect_grant only apply to the intent path — a script
+    // trigger ignores both, so persist their inert defaults rather than stale
+    // form state carried over from an intent → script switch.
+    const isIntent = run.type === 'intent';
     await submitTrigger({
       name, run, cronExpressions: finalCrons, triggerId: editingId,
-      on, showEvent, goToReview,
+      on, showEvent, goToReview: isIntent ? goToReview : false,
       groupId: groupId || null,
-      sideEffectGrant,
+      sideEffectGrant: isIntent ? sideEffectGrant : [],
     });
   }
 
@@ -560,43 +564,61 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                 onInput={(e) => setScriptPath((e.target as HTMLInputElement).value)}
                 placeholder="e.g. oura/run.py"
               />
+              {/* Script triggers are threadless — there's no run thread to open —
+                  so point at how to observe them. Only when editing an existing
+                  trigger (a brand-new one has no runs yet). */}
+              {editingId && (
+                <div class="form-hint">
+                  Each run is recorded as events, and the trigger's row shows the last run's OK/failed status.
+                  For more on this trigger's runs — what it found, when, why a run failed — ask the
+                  Lucidos Agent (e.g. “what has {existingTrigger?.name || 'this trigger'} been finding?”)
+                  or build an app on its events.
+                </div>
+              )}
             </div>
           )}
 
-          <div class="form-group">
-            <label class="form-checkbox-row">
-              <input
-                type="checkbox"
-                checked={goToReview}
-                onChange={(e) => setGoToReview((e.target as HTMLInputElement).checked)}
-              />
-              <span>Send to Review on completion</span>
-            </label>
-            <div class="form-hint">
-              By default, runs land in Archive. Turn this on for triggers whose output you're meant to read — daily summaries, alerts, scheduled reports.
-            </div>
-          </div>
-
-          <div class="form-group">
-            <label>Allowed side-effects</label>
-            <div class="form-checkbox-list">
-              {SIDE_EFFECT_CATEGORIES.map((cat) => (
-                <label class="form-checkbox-row" key={cat.value}>
+          {/* Both controls are consumed only on the intent (LLM) trigger path;
+              the script path never reads go_to_review or side_effect_grant. Hide
+              them in script mode so they can't imply behavior that never runs. */}
+          {runType === 'intent' && (
+            <>
+              <div class="form-group">
+                <label class="form-checkbox-row">
                   <input
                     type="checkbox"
-                    checked={sideEffectGrant.includes(cat.value)}
-                    onChange={(e) =>
-                      toggleSideEffect(cat.value, (e.target as HTMLInputElement).checked)
-                    }
+                    checked={goToReview}
+                    onChange={(e) => setGoToReview((e.target as HTMLInputElement).checked)}
                   />
-                  <span>{cat.label}</span>
+                  <span>Send to Review on completion</span>
                 </label>
-              ))}
-            </div>
-            <div class="form-hint">
-              Only used when Command Safety is on (Settings → Permissions). This trigger runs unattended, so it can't be asked to approve a risky command. Grant only the irreversible side-effects its intent genuinely needs — anything else is blocked and the run fails. Leave all off if it only reads, computes, or writes inside the workspace.
-            </div>
-          </div>
+                <div class="form-hint">
+                  By default, runs land in Archive. Turn this on for triggers whose output you're meant to read — daily summaries, alerts, scheduled reports.
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label>Allowed side-effects</label>
+                <div class="form-checkbox-list">
+                  {SIDE_EFFECT_CATEGORIES.map((cat) => (
+                    <label class="form-checkbox-row" key={cat.value}>
+                      <input
+                        type="checkbox"
+                        checked={sideEffectGrant.includes(cat.value)}
+                        onChange={(e) =>
+                          toggleSideEffect(cat.value, (e.target as HTMLInputElement).checked)
+                        }
+                      />
+                      <span>{cat.label}</span>
+                    </label>
+                  ))}
+                </div>
+                <div class="form-hint">
+                  Only used when Command Safety is on (Settings → Permissions). This trigger runs unattended, so it can't be asked to approve a risky command. Grant only the irreversible side-effects its intent genuinely needs — anything else is blocked and the run fails. Leave all off if it only reads, computes, or writes inside the workspace.
+                </div>
+              </div>
+            </>
+          )}
 
           <div class="form-actions">
             <button

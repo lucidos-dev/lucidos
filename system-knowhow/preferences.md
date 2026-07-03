@@ -68,6 +68,8 @@ globally does nothing on a device that has its own `theme=light` override. Use
 | `mobile_header_sticky` | global | `true` \| `false` | `true` | Keep the mobile header always visible. |
 | `welcome_suggestions_dismissed` | global | `true` \| `false` | `false` | Hide the new-workspace welcome message. Set `false` to SHOW it again. |
 | `coding_agent_default` | global | `claude-code` \| `codex` | `claude-code` | Default coding agent the compose picker pre-selects. |
+| `coding_agent_claude_path` | global | absolute path | (auto-detected) | Path to the `claude` CLI for Claude Code threads. Unset = auto-detect (`~/.local/bin`, `~/.claude/local`, Homebrew, PATH). A set path that doesn't resolve fails the spawn naming this key — never a silent fallback. |
+| `coding_agent_codex_path` | global | absolute path | (auto-detected) | Path to the `codex` CLI for Codex threads. Unset = auto-detect (`~/.local/bin`, Homebrew, PATH). A set path that doesn't resolve fails the spawn naming this key — never a silent fallback. |
 | `backup_schedule` | global | 6-field cron (in the user's timezone) or `off` | `off` | Automatic backup schedule. E.g. `0 0 3 * * *` = daily 03:00, `0 0 3 * * 0` = weekly Sun 03:00, `0 0 */12 * * *` = every 12h. Fires in the user's `timezone`. Requires `backup_provider` set + connected. |
 | `backup_provider` | global | `google_drive` \| `dropbox` | (unset) | Cloud destination. The account must be connected in Settings → System → Backup (OAuth) before a scheduled backup can upload. |
 | `backup_retention` | global | number 1–50 | `5` | How many recent backups to keep; older ones are pruned after each successful backup. |
@@ -96,6 +98,14 @@ surface):
   Network access, never via `set_preference`. Takes effect on the next engine
   restart. (The machine-global gateway bind + the engine-inherit toggle live in
   `~/.lucidos/network.toml`, not here.)
+- `engine_switch_dismissed_build`, `client_refresh_dismissed_build` — internal UI
+  state, not settings. Each holds the build id the user deferred a "new version"
+  toast for — the on-disk engine binary build id (the *Switch to new version*
+  toast) and the served client build id (the *refresh to sync* toast),
+  respectively. Workspace-global (`device_id IS NULL`) so a dismiss on one device
+  defers the toast on every device; a genuinely newer build (a different id)
+  re-surfaces it everywhere. Managed by the version-update toasts, never via
+  `set_preference`.
 
 > Keep this file in lockstep with `core/preference_catalog.rs` — a `cargo test`
 > sync test fails if a catalog key is missing here (see

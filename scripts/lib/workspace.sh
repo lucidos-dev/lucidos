@@ -27,6 +27,13 @@ parse_dev_args() {
     BUILD=""
     RELEASE=""
     ENGINE_ONLY=""
+    # Build-only mode: rebuild the on-disk engine binary in the background WITHOUT
+    # killing or respawning the running engine. Used by the Apply-triggered
+    # background rebuild that powers the "new version available" surface (the
+    # engine spawns `web-dev.sh --engine-build`; the disruptive switch happens
+    # separately, via the /restart control call). See
+    # docs/plans/2026-07-01-new-engine-version-switch-flow.md.
+    ENGINE_BUILD_ONLY=""
     FOLLOW_LOG=""
     # The engine serves the built dist/ DIRECTLY (ADR 0014) — `vite build --watch`
     # rebuilds it on source change; the SW caches bundled /assets/* so an iOS PWA
@@ -41,6 +48,7 @@ parse_dev_args() {
             -f|--follow) FOLLOW_LOG="1"; shift ;;
             --built) BUILT="1"; shift ;;   # accepted for back-compat; always built now
             --engine-only) ENGINE_ONLY="1"; BUILD="1"; shift ;;
+            --engine-build) ENGINE_BUILD_ONLY="1"; BUILD="1"; shift ;;
             -h|--help)
                 echo "Usage: $SCRIPT_NAME -w <workspace> [OPTIONS]"
                 echo ""
@@ -1344,11 +1352,11 @@ build_or_find_engine() {
         # lucidos-gateway (ADR 0014) is the standalone front the dev launcher
         # spawns; build it alongside the engine + cli.
         if [ -n "$RELEASE" ]; then
-            cargo build -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli --release
+            cargo build --locked -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli --release
             ENGINE_BIN="$PROJECT_DIR/target/release/lucidos-engine"
             GATEWAY_BIN="$PROJECT_DIR/target/release/lucidos-gateway"
         else
-            cargo build -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli
+            cargo build --locked -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli
             ENGINE_BIN="$PROJECT_DIR/target/debug/lucidos-engine"
             GATEWAY_BIN="$PROJECT_DIR/target/debug/lucidos-gateway"
         fi
@@ -2022,26 +2030,33 @@ ensure_npm_deps() {
         local active
         active="$(running_frontend_workspaces_in_project "$PROJECT_DIR")"
         if [ -n "$active" ]; then
-            # An engine-only restart (CC Apply) deliberately keeps the running
-            # frontend alive — kill_stale_processes skips the Vite + build-watch
-            # teardown when ENGINE_ONLY is set, so this restart never killed it.
-            # Installing now would corrupt that frontend's shared node_modules,
-            # but aborting (exit 1) would leave the workspace with NO engine at
-            # all — build_sdk runs before the ENGINE_ONLY early-exit in
-            # web-dev.sh, so a hard-fail here kills the whole restart. So in
-            # ENGINE_ONLY mode we skip the install, keep the existing (working)
-            # node_modules, and let the engine come up; the deferred deps land on
-            # the next full frontend restart (the stamp is intentionally left
-            # un-updated so that restart re-detects the change). Outside
-            # ENGINE_ONLY this is a genuine conflict — a second workspace launch
-            # against shared deps — so hard-fail and tell the user to stop it.
-            if [ -n "${ENGINE_ONLY:-}" ]; then
+            # Two non-disruptive paths deliberately keep the running frontend
+            # alive and so MUST NOT touch its shared node_modules:
+            #   • --engine-only (CC Apply switch): kill_stale_processes skips the
+            #     Vite + build-watch teardown when ENGINE_ONLY is set, so the
+            #     restart never killed it.
+            #   • --engine-build (Apply background rebuild): just compiles the new
+            #     on-disk binary and exits — no restart, no teardown at all.
+            # For BOTH, build_sdk runs (before the ENGINE_ONLY early-exit in
+            # web-dev.sh, and unconditionally on the --engine-build path), so a
+            # hard-fail (exit 1) here kills the whole build/restart: an engine-only
+            # restart would leave the workspace with NO engine, and a background
+            # rebuild would report "New engine version failed to build" even though
+            # the engine binary compiled fine. So we skip the install, keep the
+            # existing (working) node_modules, and let it proceed; the deferred deps
+            # land on the next full frontend restart (the stamp is intentionally
+            # left un-updated so that restart re-detects the change). Outside these
+            # two paths a running frontend IS a genuine conflict — a second
+            # workspace launch against shared deps — so hard-fail and say so.
+            if [ -n "${ENGINE_ONLY:-}" ] || [ -n "${ENGINE_BUILD_ONLY:-}" ]; then
                 echo "" >&2
                 echo "WARNING: $label changed ($needs_install) but a frontend in this checkout is running for:" >&2
                 while IFS= read -r ws; do
                     [ -n "$ws" ] && echo "  - $ws" >&2
                 done <<< "$active"
-                echo "Skipping install to keep that frontend alive; the engine will still restart." >&2
+                local skip_ctx="engine restart"
+                [ -n "${ENGINE_BUILD_ONLY:-}" ] && skip_ctx="background build"
+                echo "Skipping install to keep that frontend alive; the $skip_ctx will still proceed." >&2
                 echo "Run a full restart (./scripts/stop.sh -w <name> then ./scripts/web-dev.sh -w <name>) to pick up the new dependencies." >&2
                 echo "" >&2
                 return 0
@@ -2058,7 +2073,16 @@ ensure_npm_deps() {
             exit 1
         fi
         echo "Installing $label ($needs_install)..."
-        (cd "$dir" && npm install)
+        # `npm ci` (not `npm install`) so the install is strict + deterministic:
+        # it installs exactly the committed lockfile, verifies integrity hashes,
+        # and ERRORS on any manifest↔lock drift instead of silently rewriting the
+        # lock. Run from the workspace root (install_root) — npm workspaces hoist
+        # deps there, and `npm ci` resolves the whole tree from the root lockfile.
+        # Only reached when deps genuinely changed AND no frontend is running
+        # (guarded above), so the wipe-and-reinstall `npm ci` does is safe here.
+        # A deliberate dep change is `npm install <pkg>` run by hand (updates the
+        # lock); this automated path just restores that frozen state.
+        (cd "$install_root" && npm ci)
         # Record what we just installed so the next check compares content.
         _deps_fingerprint "$install_root" > "$stamp" 2>/dev/null || true
     fi
@@ -2089,7 +2113,44 @@ build_sdk() {
 # start_vite), so a CC Apply leaves the running build-watch untouched.
 start_vite() {
     ensure_frontend_deps
-    start_frontend_built
+    # End-user launchers (scripts/run.sh) set LUCIDOS_FRONTEND_ONESHOT=1: an
+    # installed user never edits source, so build dist/ ONCE and leave no
+    # long-lived watcher behind. Every dev caller leaves it unset and gets the
+    # checkout-level `vite build --watch` singleton exactly as before — this
+    # branch is the ONLY behavioural difference between run.sh and web-dev.sh.
+    if [ -n "${LUCIDOS_FRONTEND_ONESHOT:-}" ]; then
+        build_frontend_oneshot
+    else
+        start_frontend_built
+    fi
+}
+
+# ── build_frontend_oneshot ──────────────────────────────────────────────
+# End-user (scripts/run.sh) frontend build: produce the served dist/ with a
+# SINGLE `vite build` and leave NO long-lived watcher behind (an installed user
+# never edits source). The engine serves dist/ directly via LUCIDOS_STATIC_DIR
+# (ADR 0014), exactly like the dev path — only the "keep rebuilding on change"
+# watcher is dropped. Mirrors the one-shot build scripts/lib/e2e.sh uses.
+#
+# Always rebuilds: run.sh passes -b on every launch (so a `git pull` + restart
+# picks up new source), and a fresh `vite build` here is sub-second. Writes NO
+# frontend.pid — there is no process to ref-count, so release_frontend_marker /
+# teardown_shared_build_watch_if_idle stay no-ops for this path (they no-op when
+# the marker files are absent).
+build_frontend_oneshot() {
+    echo "Building frontend (one-shot vite build)..."
+    # Drop the atomic-publish scratch dirs a prior `vite build --watch` may have
+    # left in this checkout; a plain `vite build` (no LUCIDOS_ATOMIC_DIST) empties
+    # and writes dist/ itself, so dist/ is left for vite to manage.
+    rm -rf "$FRONTEND_DIR/dist.staging" "$FRONTEND_DIR/dist.prev"
+    (cd "$FRONTEND_DIR" && npx vite build) || {
+        echo "ERROR: frontend build failed" >&2
+        exit 1
+    }
+    if [ ! -f "$FRONTEND_DIR/dist/index.html" ]; then
+        echo "ERROR: vite build did not produce $FRONTEND_DIR/dist/index.html" >&2
+        exit 1
+    fi
 }
 
 # Built frontend: the build-watch (dev-build-watch.mjs) runs a clean `vite build`

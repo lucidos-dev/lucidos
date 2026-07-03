@@ -9,7 +9,7 @@ use super::agent_runtime::{
     AgentEvent, AgentInput, AgentRuntime, CodingAgent, ControlRequest, RunningAgent, SpawnArgs,
 };
 use super::lucidos_cli::{
-    ensure_workspace_bin_symlink, install_lucidos_cli_skill, lucidos_cli_dir,
+    ensure_workspace_bin_symlink, install_lucidos_cli_skill, lucidos_cli_dir, LUCIDOS_BIN_NAME,
     LUCIDOS_CLI_SKILL_REL_PATH,
 };
 use super::spawn_env::{apply_lucidos_env, drain_stderr};
@@ -213,12 +213,24 @@ impl AgentRuntime for ClaudeCodeRuntime {
         cancel: CancellationToken,
     ) -> Result<RunningAgent, Box<dyn std::error::Error + Send + Sync>> {
         let cli_dir = lucidos_cli_dir();
-        if cli_dir.is_none() {
-            crate::log!(
-                "[ClaudeCode] lucidos CLI binary not found near current_exe — \
-                 spawned Claude Code sessions won't have the `lucidos` command on PATH \
-                 (build with `cargo build -p lucidos-cli`)"
-            );
+        // The CC permission-prompt MCP server runs `lucidos mcp-permission-server`.
+        // Resolve that binary up front and FAIL FAST with a descriptive error if
+        // it's missing — otherwise CC starts, the MCP server silently fails to
+        // load ("Available MCP tools: none"), and the first tool call dies
+        // mid-stream with a cryptic "permission-prompt-tool not found" abort. A
+        // packaged build that ships `lucidos-engine` but forgets the sibling
+        // `lucidos` CLI hits exactly that — see
+        // docs/plans/2026-06-30-packaged-app-bundle-lucidos-cli-and-failfast.md.
+        resolve_lucidos_binary(cli_dir)?;
+        // A user-configured `claude` path must point at a real executable —
+        // fail the spawn naming the setting rather than silently probing past
+        // a typo (see `spawn_env::resolve_binary_override`).
+        if let Some(path) = args.binary_override {
+            super::spawn_env::resolve_binary_override(
+                path,
+                "Claude Code (`claude`)",
+                "coding_agent_claude_path",
+            )?;
         }
         if let Err(e) = install_lucidos_cli_skill(args.worktree_path, cli_dir) {
             crate::log!(
@@ -288,26 +300,82 @@ impl AgentRuntime for ClaudeCodeRuntime {
     }
 }
 
-/// Resolve the `claude` executable for spawn. The CC native installer (the
-/// canonical install since 2026-01) symlinks `$HOME/.local/bin/claude` at the
-/// active version, but a launchd-, IDE-, or any non-interactive-shell-launched
-/// engine inherits a PATH that omits `~/.local/bin`. A bare
-/// `Command::new("claude")` then ENOENTs even though the binary is installed —
-/// surfacing as "Failed to start Claude Code: No such file or directory".
+/// Resolve the `claude` executable for spawn: the user-configured override
+/// (already validated by the spawn path — see
+/// `spawn_env::resolve_binary_override`) wins outright; otherwise probe the
+/// common install locations; otherwise fall back to a bare PATH lookup.
 ///
-/// Prefer the native-installer path when it exists; otherwise return bare
-/// `"claude"` so `Command::spawn` does its own PATH lookup (handles users who
-/// installed via Homebrew, npm, a custom symlink, etc.). `home` is injected to
-/// keep the function pure and testable; production callers pass
+/// Why probing: the CC native installer (the canonical install since 2026-01)
+/// symlinks `$HOME/.local/bin/claude` at the active version, but a launchd-,
+/// IDE-, or any non-interactive-shell-launched engine inherits a PATH that
+/// omits `~/.local/bin` — a bare `Command::new("claude")` then ENOENTs even
+/// though the binary is installed, surfacing as "Failed to start Claude Code:
+/// No such file or directory". The probe list mirrors `resolve_codex_binary`:
+/// native installer first, the older `~/.claude/local` install, then the
+/// Homebrew prefixes. Bare `"claude"` last so `Command::spawn` does its own
+/// PATH lookup for everything else (npm globals, custom symlinks). `home` is
+/// injected to keep the function pure and testable; production callers pass
 /// `std::env::var_os("HOME")`.
-fn resolve_claude_binary(home: Option<&Path>) -> std::ffi::OsString {
+pub(crate) fn resolve_claude_binary(home: Option<&Path>, override_path: Option<&Path>) -> std::ffi::OsString {
+    if let Some(p) = override_path {
+        return p.as_os_str().to_os_string();
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(home) = home {
-        let native = home.join(".local/bin/claude");
-        if native.exists() {
-            return native.into_os_string();
+        candidates.push(home.join(".local/bin/claude"));
+        candidates.push(home.join(".claude/local/claude"));
+    }
+    candidates.push(PathBuf::from("/opt/homebrew/bin/claude"));
+    candidates.push(PathBuf::from("/usr/local/bin/claude"));
+    for c in candidates {
+        if c.exists() {
+            return c.into_os_string();
         }
     }
     std::ffi::OsString::from("claude")
+}
+
+/// Resolve the absolute path to the `lucidos` CLI binary that backs the CC
+/// permission-prompt MCP server (`lucidos mcp-permission-server`).
+///
+/// Prefer the bundled binary next to the engine (`cli_dir`, found by
+/// `find_lucidos_cli_dir`); fall back to a `PATH` lookup for installs where
+/// `lucidos` lives elsewhere on `PATH`. Returns a descriptive `Err` when the
+/// binary is reachable from neither — converting what used to be a silent
+/// "Available MCP tools: none" mid-stream abort into an immediate, actionable
+/// spawn failure. The most common cause is a packaged build that bundles
+/// `lucidos-engine` but forgets the sibling `lucidos` CLI.
+///
+/// `path_env` is injected to keep the lookup pure and testable; the public
+/// wrapper passes `std::env::var_os("PATH")`.
+fn resolve_lucidos_binary_in(
+    cli_dir: Option<&Path>,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(dir) = cli_dir {
+        let candidate = dir.join(LUCIDOS_BIN_NAME);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    if let Some(found) =
+        super::spawn_env::find_on_path(std::ffi::OsStr::new(LUCIDOS_BIN_NAME), path_env)
+    {
+        return Ok(found);
+    }
+    Err(format!(
+        "the bundled `{bin}` CLI (required for the Claude Code permission-prompt \
+         MCP server) was not found next to the engine binary nor on PATH — a \
+         packaged build must ship `{bin}` alongside `lucidos-engine`",
+        bin = LUCIDOS_BIN_NAME
+    )
+    .into())
+}
+
+fn resolve_lucidos_binary(
+    cli_dir: Option<&Path>,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    resolve_lucidos_binary_in(cli_dir, std::env::var_os("PATH").as_deref())
 }
 
 /// Build the `claude` Command with all flags and env vars. Extracted so unit
@@ -315,7 +383,7 @@ fn resolve_claude_binary(home: Option<&Path>) -> std::ffi::OsString {
 /// containing the `lucidos` binary, prepended to PATH; pass `None` to skip.
 fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process::Command {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let claude_bin = resolve_claude_binary(home.as_deref());
+    let claude_bin = resolve_claude_binary(home.as_deref(), args.binary_override.map(Path::new));
     let mut cmd = tokio::process::Command::new(claude_bin);
     if let Some(sid) = args.resume_session_id {
         cmd.arg("--print").arg("--resume").arg(sid);
@@ -333,7 +401,7 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
         .arg("--permission-prompt-tool")
         .arg("mcp__lucidos_perm__approve")
         .arg("--mcp-config")
-        .arg(permission_mcp_config_json())
+        .arg(permission_mcp_config_json(cli_dir))
         .arg("--strict-mcp-config")
         .arg("--settings")
         .arg(crate::engine::cc_settings::cc_settings_path_for_workspace(
@@ -371,6 +439,17 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     // PG*, subprocess origin, spawn metadata, RUSTC_WRAPPER, PATH) — shared
     // with every other AgentRuntime via `spawn_env::apply_lucidos_env`.
     apply_lucidos_env(&mut cmd, args, cli_dir, "ClaudeCode");
+    // Pin the session's CLAUDE_CONFIG_DIR on a RESUME. CC stores each session's
+    // transcript at `$CLAUDE_CONFIG_DIR/projects/<escaped-cwd>/<sid>.jsonl`, so a
+    // `--resume <sid>` MUST run under the exact config dir the session was created
+    // in — otherwise CC can't find it and returns "No conversation found with
+    // session ID". Set AFTER `apply_lucidos_env` (which applied any user-managed
+    // `CLAUDE_CONFIG_DIR` first) so this engine-owned pin wins: a live user toggle
+    // of the env var then can't strand an in-flight thread's resume (dev/bf997e21).
+    // `None` for a fresh session — leaves the user's value / CC's default in place.
+    if let Some(dir) = args.claude_config_dir {
+        cmd.env("CLAUDE_CONFIG_DIR", dir);
+    }
     // Root-cause fix for the stray-SIGTERM truncation bug: give CC its OWN
     // process group so a group-wide signal to the engine never reaches it.
     // The engine ignores SIGTERM but CC's Node runtime does not (exit=143).
@@ -410,11 +489,21 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
 /// Build the `--mcp-config` JSON for the lucidos permission server. CC spawns
 /// `lucidos mcp-permission-server` over stdio; the server reads `LUCIDOS_THREAD_ID`
 /// + `LUCIDOS_WORKSPACE` from the inherited env to resolve the engine endpoint.
-fn permission_mcp_config_json() -> String {
+///
+/// `command` is the ABSOLUTE path to the resolved `lucidos` binary
+/// (`resolve_lucidos_binary`), not the bare name — so the MCP server doesn't
+/// depend on the engine's modified `PATH` surviving the engine → `claude` (Node)
+/// → MCP-server spawn chain. `spawn()` has already `?`-checked the same
+/// resolution and failed fast, so the bare-name fallback here is unreachable in
+/// practice; it only keeps this builder infallible.
+fn permission_mcp_config_json(cli_dir: Option<&Path>) -> String {
+    let command = resolve_lucidos_binary(cli_dir)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| LUCIDOS_BIN_NAME.to_string());
     serde_json::json!({
         "mcpServers": {
             "lucidos_perm": {
-                "command": "lucidos",
+                "command": command,
                 "args": ["mcp-permission-server"]
             }
         }

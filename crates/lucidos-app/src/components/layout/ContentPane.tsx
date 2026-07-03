@@ -46,7 +46,17 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
 
   return (
     <div class="content-pane">
-      <div class={`content-pane-body${isAppUi ? ' has-app-ui' : ''}`} ref={bodyRef}>
+      {/* Focusable scroll region (mirrors `.thread-content`): when the focused-pane
+          marker moves onto the content pane, `reconcilePaneFocus` lands DOM focus here so
+          native Arrow/Page/Home/End keys scroll it. `tabIndex=0` + role/label keep
+          the scrollable region keyboard-reachable and discoverable. */}
+      <div
+        class={`content-pane-body${isAppUi ? ' has-app-ui' : ''}`}
+        ref={bodyRef}
+        tabIndex={0}
+        role="region"
+        aria-label="Content pane"
+      >
 
         {overlay?.type === 'form' && <InlineForm />}
         {overlay?.type === 'app-ui' && <AppUiInline layout={layout} />}

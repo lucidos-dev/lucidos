@@ -1,9 +1,15 @@
 import { useSignal } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
-import { currentModel, reasoningEffort, chatModels, showToast } from '../../store/store';
+import { chatModels, showToast } from '../../store/store';
+import { resolveModel, resolveReasoningEffort } from '../../store/composeSelections';
+import {
+  resolveActiveThreadModel,
+  resolveActiveThreadReasoningEffort,
+  patchThreadModelOverride,
+} from '../../store/threadModelSelections';
+import { updateComposeSelection } from '../../store/actions/compose';
 import { chatModelOptions, loadChatModels } from '../../store/actions/models';
-import { availableReasoningLevels } from '../../store/models';
-import { setCurrentModel, setReasoningEffort } from '../../store/actions/preferences';
+import { availableReasoningLevels, clampReasoningEffort } from '../../store/models';
 import { LUCIDOS_AGENT_LABEL, displayModelName } from '../../store/thread-events';
 import { LucidosMark } from '../shared/LucidosMark';
 import { Overlay } from '../shared/Overlay';
@@ -31,14 +37,25 @@ export function selectedOptionIndex(options: Array<{ value: string }>, currentVa
  *  compose destination is the Lucidos Agent, in the same slot the coding-agent
  *  control button occupies for Claude Code / Codex.
  *
- *  Unlike CC's per-thread model/effort (carried on the thread via
- *  CodingAgentSettingsChanged events + pending overrides), the Lucidos Agent
- *  model and reasoning are the GLOBAL chat preferences (`chat_model` /
- *  `chat_reasoning_effort`, surfaced via the `currentModel` / `reasoningEffort`
- *  signals and also editable in Settings → Models). Selecting here drives those
- *  same preferences, so the chat send path (`sendMessage`, which reads the live
- *  signals) and Settings stay in lockstep — no pending-override dance needed. */
-export function LucidosControlMenu() {
+ *  The Lucidos Agent's model + reasoning are remembered PER THREAD (like CC's,
+ *  but derived from the model/effort the backend stamps on each MessageReceived
+ *  rather than CodingAgentSettingsChanged events). On an ACTIVE thread the picker
+ *  reads `resolveActiveThreadModel`/`resolveActiveThreadReasoningEffort` (this
+ *  thread's pending pick ?? its last message ?? the account default) and a pick
+ *  writes THIS thread's pending override (`threadModelSelections`) — it does NOT
+ *  touch the account preference, so it never leaks to other threads. The account
+ *  default (`chat_model` / `chat_reasoning_effort`) is set in Settings → Models
+ *  and is the fallback for a brand-new thread.
+ *
+ *  In the COMPOSE view, the pick is per-draft instead: it reads/writes THIS
+ *  draft's override in `composeSelections` (or the PENDING slot before a draft
+ *  exists — `threadId` undefined on the fresh compose view) and never touches
+ *  the account preference, so changing the model on one draft can't change
+ *  another draft or the saved default (draft-only). The draft's pick is carried
+ *  into the send by `sendCompose`. `composeContext` is true for both a focused
+ *  composing draft and the fresh no-draft compose view. */
+export function LucidosControlMenu({ threadId, composeContext }: { threadId?: string; composeContext?: boolean }) {
+  const perDraft = !!composeContext;
   const menuRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const open = useSignal(false);
@@ -63,10 +80,16 @@ export function LucidosControlMenu() {
   useEffect(() => close, []);
 
   const modelOptions = chatModelOptions();
-  const effortOptions = availableReasoningLevels(currentModel.value);
-  const currentModelLabel = displayModelName(currentModel.value);
+  // Composing draft → THIS draft's override (?? account default); active thread →
+  // this thread's pending pick ?? its last message ?? the account default.
+  const modelValue = perDraft ? resolveModel(threadId) : resolveActiveThreadModel(threadId);
+  const effortValue = perDraft
+    ? resolveReasoningEffort(threadId)
+    : resolveActiveThreadReasoningEffort(threadId);
+  const effortOptions = availableReasoningLevels(modelValue);
+  const currentModelLabel = displayModelName(modelValue);
   const currentEffortLabel =
-    effortOptions.find((l) => l.value === reasoningEffort.value)?.label ?? reasoningEffort.value;
+    effortOptions.find((l) => l.value === effortValue)?.label ?? effortValue;
 
   const rootItems = [
     { key: 'model' as const, label: 'Model', current: currentModelLabel },
@@ -89,19 +112,34 @@ export function LucidosControlMenu() {
   /** Drill into a sub-menu, pre-highlighting the currently-selected option. */
   function enterView(next: 'model' | 'effort') {
     const opts = next === 'model' ? modelOptions : effortOptions;
-    const cur = next === 'model' ? currentModel.value : reasoningEffort.value;
+    const cur = next === 'model' ? modelValue : effortValue;
     view.value = next;
     highlightIndex.value = selectedOptionIndex(opts, cur);
   }
 
   function pickModel(value: string, label: string) {
-    void setCurrentModel(value);
+    // Keep the effort valid for the newly picked model, whichever store we write.
+    const clamped = clampReasoningEffort(effortValue, value);
+    const patch = clamped !== effortValue ? { model: value, reasoningEffort: clamped } : { model: value };
+    if (perDraft) {
+      // Per-draft override (persisted via the debounced compose PUT), or the
+      // PENDING slot before a draft exists — never the account preference.
+      updateComposeSelection(threadId ?? null, patch);
+    } else if (threadId) {
+      // Active thread: THIS thread's pending pick only — never the account
+      // preference (the account default lives in Settings → Models).
+      patchThreadModelOverride(threadId, patch);
+    }
     showToast(`Model: ${label}`, 'success');
     close();
   }
 
   function pickEffort(value: string, label: string) {
-    void setReasoningEffort(value);
+    if (perDraft) {
+      updateComposeSelection(threadId ?? null, { reasoningEffort: value });
+    } else if (threadId) {
+      patchThreadModelOverride(threadId, { reasoningEffort: value });
+    }
     showToast(`Reasoning: ${label}`, 'success');
     close();
   }
@@ -231,9 +269,9 @@ export function LucidosControlMenu() {
               ))}
             </div>
           ) : view.value === 'model' ? (
-            renderOptions('Model', modelOptions, currentModel.value, pickModel)
+            renderOptions('Model', modelOptions, modelValue, pickModel)
           ) : (
-            renderOptions('Reasoning', effortOptions, reasoningEffort.value, pickEffort)
+            renderOptions('Reasoning', effortOptions, effortValue, pickEffort)
           )}
       </Overlay>
     </div>

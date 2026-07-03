@@ -228,6 +228,24 @@ pub const CATALOG: &[PrefSpec] = &[
         description: "Default coding agent the compose destination picker pre-selects for coding targets.",
         side_effect: PrefSideEffect::None,
     },
+    PrefSpec {
+        key: "coding_agent_claude_path",
+        label: "Claude Code binary path",
+        scope: PrefScope::Global,
+        value: PrefValue::Text,
+        default: "(auto-detected)",
+        description: "Absolute path to the `claude` CLI used for Claude Code threads. Leave unset to auto-detect (~/.local/bin, ~/.claude/local, Homebrew, PATH). A set path that doesn't exist fails the spawn with an error naming this setting — it never silently falls back.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
+        key: "coding_agent_codex_path",
+        label: "Codex binary path",
+        scope: PrefScope::Global,
+        value: PrefValue::Text,
+        default: "(auto-detected)",
+        description: "Absolute path to the `codex` CLI used for Codex threads. Leave unset to auto-detect (~/.local/bin, Homebrew, PATH). A set path that doesn't exist fails the spawn with an error naming this setting — it never silently falls back.",
+        side_effect: PrefSideEffect::None,
+    },
     // ---- Appearance (device-scoped) ----
     PrefSpec {
         key: "theme",
@@ -310,6 +328,8 @@ pub const INTERNAL_KEYS: &[(&str, &str)] = &[
     ("backup_last_run", "internal backup state, not a setting"),
     ("keybindings", "keyboard shortcuts are managed in Settings → Keyboard Shortcuts"),
     ("network_bind", "the per-workspace engine network bind (loopback / all interfaces / a specific tailnet IP) — a security setting changed in Settings → System → Network access, not via set_preference"),
+    ("engine_switch_dismissed_build", "internal UI state — the on-disk engine build id the user deferred the 'Switch to new version' toast for (workspace-global so a dismiss defers on every device); managed by the version-update toast, not a setting"),
+    ("client_refresh_dismissed_build", "internal UI state — the served client build id the user deferred the 'refresh to sync' toast for (workspace-global so a dismiss defers on every device); managed by the version-update toast, not a setting"),
 ];
 
 /// Find the catalog spec for an agent-settable key.

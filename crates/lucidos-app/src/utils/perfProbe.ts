@@ -1,6 +1,6 @@
 /**
- * TEMP diagnostic — locate the main-thread blocker behind the "button/drawer
- * clicks slow to register" lag in the dev workspace. Three observers:
+ * Perf debug tooling — locate the main-thread blocker behind any "button/drawer
+ * clicks slow to register" interaction lag. Three observers:
  *  - Event Timing: each slow interaction split into input / handler / render,
  *    plus the target element.
  *  - Long Animation Frames (Chrome): names the script (invoker + source) that
@@ -10,8 +10,13 @@
  *
  * Quiet by default — only logs at/above the thresholds, so a snappy workspace
  * stays silent. No `import.meta.env.DEV` gate: `web-dev.sh`
- * serves a production-style `vite build` where DEV is false. REMOVE once the
- * cause is found.
+ * serves a production-style `vite build` where DEV is false.
+ *
+ * PERMANENT debug tooling (not a temporary measure). Built for the `click-lag`
+ * investigation (resolved 2026-06-30 — see docs/temporary-measures.md), but
+ * RETAINED rather than deleted: it is fully general perf instrumentation that
+ * surfaces any future interaction lag, registered always and silent below its
+ * thresholds, so no reactivation is needed.
  */
 
 const INTERACTION_LOG_MS = 100;

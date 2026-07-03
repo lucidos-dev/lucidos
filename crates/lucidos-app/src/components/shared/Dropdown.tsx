@@ -32,6 +32,13 @@ interface DropdownProps {
    *  Callers that synchronously focus a follow-up input from onChange can opt
    *  out so the trigger does not steal focus back. */
   restoreFocusOnSelect?: boolean;
+  /** Mark the option matching `value` as the current selection (a subtle dot —
+   *  see `.dropdown-option.active`). Default `true` for dropdowns that reflect a
+   *  persisted current setting. Set `false` where the value is a transient
+   *  "last used" choice that's about to be replaced (the compose destination +
+   *  coding-agent pickers) — there, marking it just competes with the arrow-key
+   *  `.focused` highlight and tells the user nothing useful. */
+  markCurrent?: boolean;
 }
 
 /** Filter options by a case-insensitive label substring. Empty query → the full
@@ -80,6 +87,7 @@ export function Dropdown({
   class: className,
   freeText,
   restoreFocusOnSelect = true,
+  markCurrent = true,
 }: DropdownProps) {
   // Anchor element when open, null when closed. `useAnchoredPosition` reacts
   // to anchor changes via its effect deps — no separate `open` flag needed.
@@ -359,7 +367,7 @@ export function Dropdown({
               // `danger` suppresses the header look (uppercase/letter-spacing)
               // even when the row is also `disabled` — an error row is prose,
               // not a section heading.
-              class={`dropdown-option${o.value === value ? ' active' : ''}${i === focusedIndex ? ' focused' : ''}${o.disabled && !o.danger ? ' dropdown-option-header' : ''}${o.danger ? ' dropdown-option-danger' : ''}`}
+              class={`dropdown-option${markCurrent && o.value === value ? ' active' : ''}${i === focusedIndex ? ' focused' : ''}${o.disabled && !o.danger ? ' dropdown-option-header' : ''}${o.danger ? ' dropdown-option-danger' : ''}`}
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => {
                 if (o.disabled) return;

@@ -61,13 +61,30 @@ pub async fn run_handshake_script(
     if crate::api::is_path_traversal(script_rel_path) {
         return Err(RunError::NotFound(script_rel_path.to_string()));
     }
-    let script_abs = workspace_path.join(script_rel_path);
-    if !script_abs.exists() {
-        // The pre-check gives a clean "script not found" error before we
-        // pay for spawning python3 only to have it print a confusing
-        // "can't open file" message — common cause is a typo in apis.json.
-        return Err(RunError::NotFound(script_abs.display().to_string()));
-    }
+    // Resolve the script relative to `data/` first — that's where all
+    // user-authored, git-tracked workspace content lives, and what the
+    // auth-handshake docs document (a file at `data/scripts/auth/<foo>.py`
+    // referenced in apis.json as `"script": "scripts/auth/<foo>.py"`). Fall
+    // back to the workspace root for back-compat with scripts placed there
+    // before this fix (temporary measure — see docs/temporary-measures.md,
+    // "script_handshake workspace-root script fallback"). The traversal
+    // guard above already ran on the raw relative value, so both joins stay
+    // inside the workspace tree.
+    let data_abs = workspace_path.join("data").join(script_rel_path);
+    let script_abs = if data_abs.exists() {
+        data_abs
+    } else {
+        let root_abs = workspace_path.join(script_rel_path);
+        if root_abs.exists() {
+            root_abs
+        } else {
+            // Neither location has it. Report the documented `data/`-relative
+            // path so the operator knows where to put the script — a clean
+            // error before we pay to spawn python3 only to have it print a
+            // confusing "can't open file" (common cause: a typo in apis.json).
+            return Err(RunError::NotFound(data_abs.display().to_string()));
+        }
+    };
     // Collect the secret env values (CRED_*/OAUTH_*) so any that the script
     // echoes to stderr (a traceback dumping os.environ, a debug print) is
     // scrubbed out of the error we surface to the caller / logs — a script's
@@ -142,6 +159,16 @@ mod tests {
         format!("scripts/auth/{}", name)
     }
 
+    /// Writes a script at the git-tracked `data/scripts/auth/` location and
+    /// returns the same `scripts/auth/<name>` relative value the config uses
+    /// (the engine prepends `data/` when resolving).
+    fn write_data_script(tmp: &FsPath, name: &str, body: &str) -> String {
+        let dir = tmp.join("data/scripts/auth");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), body).unwrap();
+        format!("scripts/auth/{}", name)
+    }
+
     #[tokio::test]
     async fn happy_path_returns_headers_and_expiry() {
         let tmp = tempfile::tempdir().unwrap();
@@ -161,6 +188,51 @@ print(json.dumps({"headers": {"Authorization": "Bearer abc", "X-Client-Id": "xyz
         let names: Vec<&str> = out.headers.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"authorization"));
         assert!(names.contains(&"x-client-id"));
+    }
+
+    #[tokio::test]
+    async fn data_relative_script_is_found() {
+        // The documented + git-tracked location: file at
+        // `data/scripts/auth/<foo>.py`, config value `scripts/auth/<foo>.py`.
+        // Before the fix this resolved to the workspace root and 404'd.
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = write_data_script(
+            tmp.path(),
+            "data-loc.py",
+            r#"import json; print(json.dumps({"headers": {"X-Where": "data"}, "expires_in": 60}))"#,
+        );
+        let out = run_handshake_script(tmp.path(), &rel, vec![])
+            .await
+            .unwrap();
+        let names: Vec<&str> = out.headers.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"x-where"), "data/-relative script should run");
+    }
+
+    #[tokio::test]
+    async fn data_relative_preferred_over_workspace_root() {
+        // When the same relative path exists in BOTH `data/` and the
+        // workspace root, `data/` (git-tracked) wins.
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = "scripts/auth/both.py";
+        write_data_script(
+            tmp.path(),
+            "both.py",
+            r#"import json; print(json.dumps({"headers": {"X-Src": "data"}, "expires_in": 60}))"#,
+        );
+        write_script(
+            tmp.path(),
+            "both.py",
+            r#"import json; print(json.dumps({"headers": {"X-Src": "root"}, "expires_in": 60}))"#,
+        );
+        let out = run_handshake_script(tmp.path(), rel, vec![])
+            .await
+            .unwrap();
+        let src = out
+            .headers
+            .iter()
+            .find(|(n, _)| n.as_str() == "x-src")
+            .map(|(_, v)| v.to_str().unwrap());
+        assert_eq!(src, Some("data"), "data/ location must take precedence");
     }
 
     #[tokio::test]

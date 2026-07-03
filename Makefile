@@ -9,15 +9,15 @@ build:
 
 # Build locally (for development)
 build-local:
-	cargo build -p lucidos-engine -p lucidos-cli
+	cargo build --locked -p lucidos-engine -p lucidos-cli
 
 # Run all checks
 check: lint
-	cargo check
+	cargo check --locked
 
 # Run clippy linter
 lint:
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --locked --all-targets -- -D warnings
 
 # Auto-fix linting issues
 fix:
@@ -53,11 +53,11 @@ start:
 
 # Stop Lucidos Docker container
 stop:
-	./scripts/stop.sh
+	./scripts/stop.sh -w $(WORKSPACE)
 
 # Restart Lucidos Docker container
 restart:
-	./scripts/restart.sh
+	./scripts/restart.sh -w $(WORKSPACE)
 
 # Check status
 status:
@@ -74,10 +74,10 @@ run:
 # Run locally without Docker (for development)
 run-local:
 	rm -rf test-workspace/data test-workspace/.lucidos
-	LUCIDOS_WORKSPACE=./test-workspace cargo run -p lucidos-engine
+	LUCIDOS_WORKSPACE=./test-workspace cargo run --locked -p lucidos-engine
 
 # Build and run fresh
 fresh: build
-	./scripts/stop.sh || true
+	./scripts/stop.sh -w $(WORKSPACE) || true
 	rm -rf $(WORKSPACE)/data $(WORKSPACE)/.lucidos
 	LUCIDOS_WORKSPACE=$(WORKSPACE) ./scripts/start.sh

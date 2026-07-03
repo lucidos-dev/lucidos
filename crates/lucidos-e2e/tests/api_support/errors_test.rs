@@ -3,8 +3,10 @@ use crate::support::{base_url, http_client};
 #[tokio::test]
 async fn unknown_route_returns_non_json() {
     let client = http_client();
-    // Unknown /api routes fall through to the Vite SPA proxy, returning HTML.
-    // Verify the response is NOT valid JSON (it's the SPA fallback, not an API response).
+    // Unknown /api routes fall through to the engine's static `dist/` serving
+    // (ADR 0014 — there is no Vite in the serving path), returning the SPA shell
+    // HTML. Verify the response is NOT valid JSON (it's the SPA fallback, not an
+    // API response).
     let url = format!("{}/api/v1/nonexistent-endpoint", base_url());
 
     let resp = client.get(&url).send().await.expect("Request failed");

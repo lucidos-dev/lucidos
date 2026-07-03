@@ -9,16 +9,18 @@ use uuid::Uuid;
 ///
 /// Discriminated union — `kind` selects the variant. `Modal` (default) opens
 /// the inbox modal so the user reads the message and chooses what to do next.
-/// `None` is the passive variant — no destination; the row marks itself read
-/// the moment the user could see it (in-app toast shown, OR OS push tapped
-/// which lands on the PWA home with no deep-link nav). `Navigate` delegates
-/// to the same target/sub-field router the `navigate_ui` LLM tool uses, so
-/// any UI surface reachable by `navigate_ui` is reachable by a notification
-/// tap with no per-target wrapper variant.
+/// `Navigate` delegates to the same target/sub-field router the `navigate_ui`
+/// LLM tool uses, so any UI surface reachable by `navigate_ui` is reachable by
+/// a notification tap with no per-target wrapper variant. Every notification is
+/// openable — there is no passive/button-less kind.
+///
+/// The old passive `None` kind (`{"kind":"none"}`) is RETIRED: nothing produces
+/// it anymore, and the custom `Deserialize` below coerces any historical
+/// `{"kind":"none"}` event/row to `Modal` (see that impl for why it can't just
+/// be deleted). Removed by `docs/plans/2026-07-02-remove-notification-tap-none.md`.
 ///
 /// Wire shape (JSON):
 /// - `{"kind":"modal"}`
-/// - `{"kind":"none"}`
 /// - `{"kind":"navigate","to":{"target":"app","app_id":"habit-tracker"}}`
 ///
 /// Required sub-fields on `NavigateUi.to` (e.g. `app_id` for `target=app`,
@@ -32,7 +34,9 @@ use uuid::Uuid;
 /// strings (`"modal"` / `"open_app"` / `"open_thread"` / `"none"`) are
 /// rejected by serde with a clear "missing field 'kind'" error — surfacing
 /// as `400 Bad Request` on the HTTP `notifications` POST and as a
-/// `send_notification` LLM tool error on bad LLM output.
+/// `send_notification` LLM tool error on bad LLM output. (The retired
+/// `{"kind":"none"}` OBJECT is the one exception — coerced to `Modal`, not
+/// rejected; the bare string `"none"` is still rejected.)
 ///
 /// Workspaces that still have triggers or apps emitting the old strings
 /// must migrate them via `system-knowhow/migrate-tap-shape.md` (detected by
@@ -44,13 +48,44 @@ use uuid::Uuid;
 /// A force projection rebuild on a pre-migration workspace will fail loudly,
 /// at which point the workspace owner runs `migrate-tap-shape.md` and
 /// rebuilds.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Tap {
     #[default]
     Modal,
-    None,
     Navigate { to: NavigateUi },
+}
+
+// Custom Deserialize (not derived) so the RETIRED `{"kind":"none"}` kind coerces
+// to `Modal` rather than erroring. `Tap::None` (the old passive kind) was removed
+// so every notification is openable — but immutable `NotificationCreated` event
+// payloads, and any `notifications` rows a projection rebuild replays, still carry
+// `{"kind":"none"}` forever. So the read boundary MUST tolerate it. This is
+// PERMANENT old-data tolerance (a parser for a legacy wire shape), NOT a temporary
+// measure — so it carries no `docs/temporary-measures.md` row.
+//
+// It delegates to a private derived helper that keeps serde's full strictness:
+// legacy bare strings ("modal"/"none"/"open_thread") and unknown object kinds are
+// still rejected loudly (the migrate-tap-shape guard). ONLY the well-formed
+// `{"kind":"none"}` object is coerced — to `Modal`, which then re-serializes as
+// `{"kind":"modal"}`, so a rebuilt row never re-emits `none`.
+impl<'de> Deserialize<'de> for Tap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum TapWire {
+            Modal,
+            None,
+            Navigate { to: NavigateUi },
+        }
+        Ok(match TapWire::deserialize(deserializer)? {
+            TapWire::Modal | TapWire::None => Tap::Modal,
+            TapWire::Navigate { to } => Tap::Navigate { to },
+        })
+    }
 }
 
 /// Navigation payload — mirrors the `navigate_ui` LLM tool arg shape. Used
@@ -430,12 +465,6 @@ mod tests {
     }
 
     #[test]
-    fn tap_none_serializes_with_kind_only() {
-        let v = serde_json::to_value(Tap::None).unwrap();
-        assert_eq!(v, serde_json::json!({"kind": "none"}));
-    }
-
-    #[test]
     fn tap_navigate_thread_with_id_and_event_id() {
         let t = Tap::Navigate {
             to: NavigateUi {
@@ -491,9 +520,17 @@ mod tests {
     }
 
     #[test]
-    fn tap_deserialize_none() {
+    fn tap_deserialize_none_coerces_to_modal() {
+        // The retired `{"kind":"none"}` kind is no longer produced, but historical
+        // NotificationCreated events + notifications rows still carry it. It must
+        // deserialize (as Modal) and re-serialize as `{"kind":"modal"}`, so a
+        // projection rebuild never re-emits `none`.
         let t: Tap = serde_json::from_value(serde_json::json!({"kind": "none"})).unwrap();
-        assert_eq!(t, Tap::None);
+        assert_eq!(t, Tap::Modal);
+        assert_eq!(
+            serde_json::to_value(&t).unwrap(),
+            serde_json::json!({"kind": "modal"})
+        );
     }
 
     #[test]
@@ -552,6 +589,18 @@ mod tests {
     }
 
     #[test]
+    fn tap_rejects_legacy_bare_string_none_but_coerces_the_object() {
+        // The retired `none` OBJECT (`{"kind":"none"}`) is coerced to Modal (see
+        // tap_deserialize_none_coerces_to_modal), but the legacy BARE STRING
+        // `"none"` must still be rejected loudly (the migrate-tap-shape guard) —
+        // the two must never be conflated.
+        let bare: Result<Tap, _> = serde_json::from_str("\"none\"");
+        assert!(bare.is_err(), "expected legacy bare-string `\"none\"` to be rejected");
+        let obj: Tap = serde_json::from_str(r#"{"kind":"none"}"#).unwrap();
+        assert_eq!(obj, Tap::Modal, "the `{{kind:none}}` object must coerce to Modal");
+    }
+
+    #[test]
     fn tap_rejects_unknown_kind() {
         let r: Result<Tap, _> = serde_json::from_str(r#"{"kind":"open_anywhere"}"#);
         assert!(r.is_err());
@@ -563,10 +612,6 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Tap::Modal).unwrap(),
             r#"{"kind":"modal"}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&Tap::None).unwrap(),
-            r#"{"kind":"none"}"#
         );
     }
 

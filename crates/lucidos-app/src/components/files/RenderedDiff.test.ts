@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { renderDiffMarked, additionRuns } from './RenderedDiff';
-import type { DiffFile } from '../../store/store';
+import { renderDiffMarked, additionRuns, deletionRuns, hunkCoverage } from './RenderedDiff';
+import type { DiffFile, DiffLine } from '../../store/store';
 
 function additionAt(start: number, count: number): DiffFile {
   return {
@@ -12,6 +12,26 @@ function additionAt(start: number, count: number): DiffFile {
       new_start: start,
       new_count: count,
       lines: Array.from({ length: count }, () => ({ type: 'addition' as const, content: 'x' })),
+    }],
+  };
+}
+
+type LineSpec = ['c' | '+' | '-', string];
+
+function fileFromLines(newStart: number, lines: LineSpec[]): DiffFile {
+  const diffLines: DiffLine[] = lines.map(([t, content]) => ({
+    type: t === '+' ? 'addition' : t === '-' ? 'deletion' : 'context',
+    content,
+  }));
+  return {
+    path: 'x.md',
+    status: 'modified',
+    hunks: [{
+      old_start: 1,
+      old_count: diffLines.filter(l => l.type !== 'addition').length,
+      new_start: newStart,
+      new_count: diffLines.filter(l => l.type !== 'deletion').length,
+      lines: diffLines,
     }],
   };
 }
@@ -80,5 +100,150 @@ Para two.
     const html = renderDiffMarked(content, runs);
     expect(html).not.toContain('diff-rendered-added');
     expect(html).not.toContain('diff-rendered-changed');
+  });
+});
+
+describe('deletionRuns', () => {
+  it('anchors a removed run to the new-file line it precedes', () => {
+    const file = fileFromLines(1, [
+      ['c', '# Title'],
+      ['c', ''],
+      ['c', 'Para A.'],
+      ['c', ''],
+      ['-', 'Old para.'],
+      ['-', ''],
+      ['c', 'Para B.'],
+    ]);
+    expect(deletionRuns(file)).toEqual([{ anchor: 5, lines: ['Old para.', ''] }]);
+  });
+
+  it('groups consecutive deletions and splits separate runs', () => {
+    const file = fileFromLines(1, [
+      ['-', 'gone top'],   // before new line 1
+      ['c', 'keep'],       // new line 1
+      ['+', 'new'],        // new line 2
+      ['-', 'gone mid'],   // before new line 3
+      ['c', 'tail'],       // new line 3
+    ]);
+    expect(deletionRuns(file)).toEqual([
+      { anchor: 1, lines: ['gone top'] },
+      { anchor: 3, lines: ['gone mid'] },
+    ]);
+  });
+});
+
+describe('hunkCoverage', () => {
+  it('returns each hunk new-file extent and skips zero-new-count hunks', () => {
+    const file: DiffFile = {
+      path: 'x.md',
+      status: 'modified',
+      hunks: [
+        { old_start: 1, old_count: 3, new_start: 5, new_count: 5, lines: [] },
+        { old_start: 20, old_count: 1, new_start: 22, new_count: 0, lines: [] },
+      ],
+    };
+    expect(hunkCoverage(file)).toEqual([{ start: 5, end: 9 }]);
+  });
+});
+
+describe('renderDiffMarked coverage scoping', () => {
+  // Single-line blocks separated by single blank lines, so line N is literally
+  // the Nth line (matches the line-tracking the other tests rely on).
+  const content = `# Title
+
+Intro para.
+
+## Section A
+
+Changed para.
+
+## Section B
+
+Unchanged tail.
+`;
+
+  it('renders the whole document when no coverage is given', () => {
+    const html = renderDiffMarked(content, [], []);
+    expect(html).toContain('Title');
+    expect(html).toContain('Intro para.');
+    expect(html).toContain('Unchanged tail.');
+    expect(html).not.toContain('diff-rendered-gap');
+  });
+
+  it('omits blocks outside the hunk coverage and collapses them into gaps', () => {
+    // Cover only lines 5-9 (## Section A … ## Section B).
+    const html = renderDiffMarked(content, [], [], [{ start: 5, end: 9 }]);
+    expect(html).toContain('Section A');
+    expect(html).toContain('Changed para.');
+    expect(html).toContain('Section B');
+    // Leading (Title, Intro) and trailing (tail) content is omitted.
+    expect(html).not.toContain('Title');
+    expect(html).not.toContain('Intro para.');
+    expect(html).not.toContain('Unchanged tail.');
+    // One leading gap + one trailing gap.
+    expect(html.match(/diff-rendered-gap/g)).toHaveLength(2);
+  });
+
+  it('keeps an inline deletion when scoped, with the leading gap above it', () => {
+    // A deletion anchored at line 7 (before "Changed para."), inside coverage.
+    const dels = [{ anchor: 7, lines: ['Removed old line.'] }];
+    const html = renderDiffMarked(content, [], dels, [{ start: 5, end: 9 }]);
+    expect(html).toContain('diff-rendered-removed');
+    expect(html).toContain('Removed old line.');
+    expect(html).toContain('Section A');
+    expect(html).toContain('Changed para.');
+    // The omitted leading content (Title, Intro) collapses to one gap above the
+    // rendered region — so the gap precedes the inline removed block.
+    expect(html).toContain('diff-rendered-gap');
+    const gap = html.indexOf('diff-rendered-gap');
+    const removed = html.indexOf('diff-rendered-removed');
+    expect(gap).toBeLessThan(removed);
+  });
+});
+
+describe('renderDiffMarked deletion placement', () => {
+  it('renders a removed run inline at its original position, not at the top', () => {
+    const content = `# Title
+
+Para A.
+
+Para B.
+`;
+    const file = fileFromLines(1, [
+      ['c', '# Title'],
+      ['c', ''],
+      ['c', 'Para A.'],
+      ['c', ''],
+      ['-', 'Old para.'],
+      ['-', ''],
+      ['c', 'Para B.'],
+    ]);
+    const html = renderDiffMarked(content, additionRuns(file), deletionRuns(file));
+    expect(html).toContain('diff-rendered-removed');
+    // The removed text lands between Para A and Para B — not hoisted to the top.
+    const del = html.indexOf('Old para.');
+    expect(del).toBeGreaterThan(html.indexOf('Para A'));
+    expect(del).toBeLessThan(html.indexOf('Para B'));
+  });
+
+  it('renders end-of-file deletions after all content', () => {
+    const content = `Only line.\n`;
+    const file = fileFromLines(1, [
+      ['c', 'Only line.'],
+      ['-', 'trailing gone'],
+    ]);
+    const html = renderDiffMarked(content, additionRuns(file), deletionRuns(file));
+    expect(html.indexOf('Only line')).toBeLessThan(html.indexOf('trailing gone'));
+  });
+
+  it('HTML-escapes removed line content', () => {
+    const content = `Kept.\n`;
+    const file = fileFromLines(1, [
+      ['-', '<script>alert(1)</script>'],
+      ['c', 'Kept.'],
+    ]);
+    const html = renderDiffMarked(content, additionRuns(file), deletionRuns(file));
+    expect(html).toContain('&lt;script&gt;');
+    expect(html).not.toContain('<script>');
   });
 });

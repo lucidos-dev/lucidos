@@ -331,6 +331,57 @@ the Concerns rollup.
   Safari, and a Playwright chromium are all left alone, plus the cap/match knobs
   and the start/stop lifecycle.
 
+### Host-load backpressure guard — refuse to launch onto a saturated host
+
+The reaper and the single-writer lock above cover *concurrent* and *runaway
+per-process* memory, but neither looks at **system load** before starting. On
+2026-07-01 an EXTERNAL macOS daemon (`triald` → `mobileassetd`
+purgeable-CacheDelete loop, misfiring at `targetingPurgeAmount:0` with 549 GB free
+— a known Tahoe daemon bug, **not** ours) pinned an 18-core box at load ~96. The
+nightly e2e step then launched its Playwright browser swarm (WebKit + Chromium)
+**on top of** the already-pegged host; the browsers wedged ("failed localhost
+commit"), the machine became unresponsive (the user could not even log in), and it
+had to be hard-rebooted. We can't fix the daemon — but the e2e tooling piled heavy
+work on unconditionally. `scripts/lib/host_load_guard.sh` is the missing guard.
+
+- **What it does.** Before the browser swarm spawns it samples the **1-minute load
+  average** portably (`uname -s` → macOS `sysctl -n vm.loadavg` + `sysctl -n
+  hw.ncpu`; Linux `/proc/loadavg` field 1 + `nproc`/`getconf _NPROCESSORS_ONLN`)
+  and computes `load1 / ncpu` via `awk` (float-exact — `27/18 = 1.5` is NOT over a
+  `1.5` cap; `27.1/18` is). Ratio ≤ cap → return 0 immediately (a healthy host
+  pays one sample). Ratio > cap → **wait-and-back-off**, polling every
+  `HOST_LOAD_POLL_SECS` with a log line each cycle until the ratio drops under cap
+  (return 0) or `HOST_LOAD_MAX_WAIT_SECS` is exceeded.
+- **Saturated → distinct exit code 75.** If the host is still over-ratio after the
+  wait cap, `wait_for_host_load` returns `HOST_LOAD_SATURATED_EXIT` (**75**, the
+  `EX_TEMPFAIL` sysexits convention) with a "still saturated … refusing to launch"
+  message — distinguishable from an ordinary test failure (`1`) so the nightly
+  orchestrator can recognize a backpressure abort.
+- **Knobs.** `HOST_LOAD_MAX_RATIO` (default `1.5` — load may reach 1.5× the core
+  count before we back off), `HOST_LOAD_POLL_SECS` (default `15`),
+  `HOST_LOAD_MAX_WAIT_SECS` (default `300`), and `HOST_LOAD_GUARD_DISABLE=1` to
+  make it a no-op (escape hatch for CI where load is meaningless). Tests inject
+  readings via `HOST_LOAD_OVERRIDE` / `HOST_NCPU_OVERRIDE`.
+- **Fails open.** If it can't MEASURE the host (unknown OS, unreadable load,
+  `ncpu` empty/zero/non-numeric) it logs and returns 0 — a guard that can't measure
+  must never block or crash the suite (same posture as the reaper's "no `ps` →
+  don't start"). `awk` never divides by zero.
+- **Wiring.** Invoked **once**, in `scripts/e2e-browser.sh`, right after
+  `setup_e2e_session` (e2e lock held) and before `start_webkit_reaper` / any
+  Playwright spawn — the single chokepoint that covers BOTH the standalone browser
+  run and the umbrella `scripts/e2e.sh` nightly (`e2e-browser.sh` runs under both).
+  On a saturated abort the exit-trap chain releases the e2e lock (no stale lock)
+  and exit 75 propagates. It is **not** added to `scripts/e2e-api.sh` (lightweight,
+  not the pile-up risk) and deliberately not invoked a second time in `e2e.sh`
+  (that would double the wait in the nightly and read staler load than gating right
+  before the swarm).
+- **Test.** `scripts/lib/host_load_guard_test.sh` (run directly, no harness — same
+  convention as `webkit_reaper_test.sh`) covers: under-threshold → immediate 0;
+  sustained over-cap → 75 after a tiny wait cap (with a bounded-elapsed no-hang
+  check); over-cap that recovers mid-wait → 0; `HOST_LOAD_GUARD_DISABLE=1` → 0;
+  float-compare exactness at the `1.5`/`1.0` boundary; and empty/zero/non-numeric
+  `ncpu` failing open with no divide-by-zero.
+
 ## Test Coverage
 
 ### Browser E2E (16 tests)

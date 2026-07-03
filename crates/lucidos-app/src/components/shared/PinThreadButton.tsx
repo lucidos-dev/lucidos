@@ -10,15 +10,20 @@ import { PinIcon } from './icons';
  *
  *  `stopPropagation` is for hosts whose container has its own click handler (the
  *  drawer row's focus-thread `onClick`) — the toggle must not also trigger it. */
-export function PinThreadButton({ threadId, saved, stopPropagation, extraClass }: {
+export function PinThreadButton({ threadId, saved, stopPropagation, extraClass, tabIndex }: {
   threadId: string;
   saved: boolean;
   stopPropagation?: boolean;
   extraClass?: string;
+  /** `-1` removes it from the Tab order (the drawer row's mouse-only use, where
+   *  the drawer is a single tab stop). Default undefined → natively tabbable
+   *  (the thread-title headers). */
+  tabIndex?: number;
 }) {
   return (
     <button
       type="button"
+      tabIndex={tabIndex}
       class={`icon-btn header-icon pin-thread-btn${saved ? ' active' : ''}${extraClass ? ` ${extraClass}` : ''}`}
       onClick={(e) => {
         if (stopPropagation) e.stopPropagation();

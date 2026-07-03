@@ -88,7 +88,10 @@ impl OAuthLookup for DbOAuthLookup {
 pub struct ScriptHandshakeLayer {
     namespace: String,
     proxy_name: String,
-    credential: String,
+    /// Optional: the credential whose `CRED_<NAME>*` env vars are injected
+    /// before the script runs. `None` = inject no credential env vars (the
+    /// script obtains its secret by other means).
+    credential: Option<String>,
     script_rel_path: String,
     oauth_providers: Vec<String>,
     pool: PgPool,
@@ -105,7 +108,7 @@ impl ScriptHandshakeLayer {
     pub fn new(
         namespace: String,
         proxy_name: String,
-        credential: String,
+        credential: Option<String>,
         script_rel_path: String,
         oauth_providers: Vec<String>,
         pool: PgPool,
@@ -157,8 +160,17 @@ impl ScriptHandshakeLayer {
                 .await?
         };
 
-        let cred = fetch_required_credential(&self.pool, &self.credential).await?;
-        let mut env_vars = crate::core::credentials::credential_env_vars(vec![cred]);
+        // Inject `CRED_<NAME>*` only when a credential is configured. When
+        // it's absent the script sources its secret elsewhere (OS keychain,
+        // OAuth-only exchange) — run it with no credential env vars from this
+        // layer, and don't error on the missing credential.
+        let mut env_vars = match &self.credential {
+            Some(name) => {
+                let cred = fetch_required_credential(&self.pool, name).await?;
+                crate::core::credentials::credential_env_vars(vec![cred])
+            }
+            None => Vec::new(),
+        };
         env_vars.extend(oauth::account_env_vars(oauth_accounts));
 
         match run_handshake_script(&self.workspace_path, &self.script_rel_path, env_vars).await {
@@ -308,7 +320,7 @@ mod tests {
         ScriptHandshakeLayer::new(
             namespace.into(),
             "proxy".into(),
-            "cred".into(),
+            Some("cred".into()),
             "scripts/x.sh".into(),
             oauth_providers,
             lazy_pool(),
@@ -480,7 +492,7 @@ print(json.dumps({
             let layer = ScriptHandshakeLayer::new(
                 "script_handshake".into(),
                 "proxy".into(),
-                "testsvc".into(),
+                Some("testsvc".into()),
                 "scripts/auth/echo.py".into(),
                 Vec::new(),
                 pool.clone(),
@@ -529,6 +541,68 @@ print(json.dumps({
 
         pool.close().await;
         teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn credential_none_runs_script_without_injecting_cred_env_vars() {
+        // A script_handshake layer with no configured credential must run the
+        // script (returning its headers) and inject NO `CRED_*` env vars — the
+        // script sources its secret elsewhere. It must not error on the absent
+        // credential, and must not touch the credential store (so a lazy pool
+        // pointed at an unreachable DB is fine — it's never queried).
+        //
+        // The script lives under `data/scripts/auth/` while the config value is
+        // `scripts/auth/echo.py`, so this also exercises the `data/`-relative
+        // path resolution end-to-end through the layer.
+        const ECHO_SCRIPT: &str = r#"
+import os, json
+print(json.dumps({
+    "headers": {
+        "x-auth":      "ok",
+        "x-cred-seen": os.environ.get("CRED_TESTSVC", "absent"),
+    },
+    "expires_in": 60,
+}))
+"#;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("data/scripts/auth")).unwrap();
+        std::fs::write(tmp.path().join("data/scripts/auth/echo.py"), ECHO_SCRIPT).unwrap();
+
+        let layer = ScriptHandshakeLayer::new(
+            "script_handshake".into(),
+            "proxy".into(),
+            None,
+            "scripts/auth/echo.py".into(),
+            Vec::new(),
+            lazy_pool(),
+            Arc::new(tmp.path().to_path_buf()),
+            Arc::new(ProxyTokenCache::new()),
+            Arc::new(PanicLookup),
+        );
+
+        let body = Bytes::new();
+        let prior = HashMap::new();
+        let input = input_for(&body, "https://example.test/x", &prior);
+        let mutation = layer
+            .apply(&input)
+            .await
+            .unwrap_or_else(|(code, msg)| panic!("credential-less handshake failed: {code} {msg}"));
+
+        let headers: HashMap<&str, &str> = mutation
+            .add_headers
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            headers.get("x-auth").copied(),
+            Some("ok"),
+            "script should still run and return its headers"
+        );
+        assert_eq!(
+            headers.get("x-cred-seen").copied(),
+            Some("absent"),
+            "no CRED_* env var should be injected when credential is None"
+        );
     }
 
     #[tokio::test]

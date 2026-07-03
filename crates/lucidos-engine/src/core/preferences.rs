@@ -1,5 +1,6 @@
 use sqlx::PgPool;
 use std::collections::HashMap;
+use uuid::Uuid;
 
 // Background model preference keys
 pub const PREF_MODEL_TITLE: &str = "model_title";
@@ -19,6 +20,13 @@ pub const DEFAULT_COMMAND_JUDGE_MODEL: &str = "claude-haiku-4-5";
 // Chat preference keys (also written by frontend Settings UI)
 pub const PREF_CHAT_MODEL: &str = "chat_model";
 pub const PREF_CHAT_REASONING_EFFORT: &str = "chat_reasoning_effort";
+
+// Coding-agent binary path overrides (also written by frontend Settings UI).
+// Unset = auto-detect (probe list → PATH); a set path wins outright and a
+// wrong one fails the spawn naming the key (see
+// `runtime::spawn_env::resolve_binary_override`).
+pub const PREF_CODING_AGENT_CLAUDE_PATH: &str = "coding_agent_claude_path";
+pub const PREF_CODING_AGENT_CODEX_PATH: &str = "coding_agent_codex_path";
 
 /// Default chat model when neither user preference nor `LUCIDOS_MODEL` env is set.
 /// Mirrored on the frontend in `crates/lucidos-app/src/store/models.ts`.
@@ -289,23 +297,92 @@ impl PreferenceStore {
         (model, effort)
     }
 
-    /// Resolve the (model, effort) pair stamped on a chat exchange when the
-    /// caller didn't fully specify them. Caller-provided values take
-    /// precedence; missing values fall back to the user's chat preferences.
-    /// Skips the DB read entirely when both are already set.
-    pub async fn resolve_chat_overrides(
+    /// Read the model + reasoning effort a thread last ran with — the values
+    /// stamped on the thread's most recent `MessageReceived` that carried them.
+    /// This is the per-thread memory: a follow-up with no explicit override
+    /// reuses these instead of snapping back to the account default. Resolved
+    /// per field independently (a legacy message with only one set still
+    /// contributes that field), newest-first by `sequence`.
+    ///
+    /// `exclude_event_id` drops the in-flight turn's own `MessageReceived` when
+    /// it was pre-emitted upstream (`pre_emitted_origin` == `events.id`), so we
+    /// never read the current turn as its own "previous" value. DB errors are
+    /// logged and treated as "no record" — callers fall through to preferences.
+    pub async fn last_thread_chat_settings(
         pool: &PgPool,
+        thread_id: Uuid,
+        exclude_event_id: Option<Uuid>,
+    ) -> (Option<String>, Option<String>) {
+        // `MessageReceived` thread-event payloads are flat (see
+        // `ThreadEvent::to_payload`), so `payload->>'model'` reads the field
+        // directly. `aggregate_id` is text; bind the thread id as its string.
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            r#"
+            SELECT
+              (SELECT payload->>'model'
+                 FROM events
+                WHERE aggregate_id = $1
+                  AND event_type = 'MessageReceived'
+                  AND payload->>'model' IS NOT NULL
+                  AND payload->>'model' <> ''
+                  AND ($2::uuid IS NULL OR id <> $2)
+                ORDER BY sequence DESC
+                LIMIT 1) AS model,
+              (SELECT payload->>'reasoning_effort'
+                 FROM events
+                WHERE aggregate_id = $1
+                  AND event_type = 'MessageReceived'
+                  AND payload->>'reasoning_effort' IS NOT NULL
+                  AND payload->>'reasoning_effort' <> ''
+                  AND ($2::uuid IS NULL OR id <> $2)
+                ORDER BY sequence DESC
+                LIMIT 1) AS effort
+            "#,
+        )
+        .bind(thread_id.to_string())
+        .bind(exclude_event_id)
+        .fetch_one(pool)
+        .await;
+        match row {
+            Ok((model, effort)) => (model, effort),
+            Err(e) => {
+                log!(
+                    "[Preferences] Failed to read last thread chat settings for {}: {}",
+                    thread_id,
+                    e
+                );
+                (None, None)
+            }
+        }
+    }
+
+    /// Resolve the (model, effort) pair stamped on a chat exchange when the
+    /// caller didn't fully specify them, honoring per-thread memory. Order per
+    /// field: explicit caller override → the thread's last recorded value →
+    /// the user's account chat preference. Skips each DB read it doesn't need.
+    pub async fn resolve_chat_overrides_for_thread(
+        pool: &PgPool,
+        thread_id: Option<Uuid>,
+        exclude_event_id: Option<Uuid>,
         model_override: Option<String>,
         effort_override: Option<String>,
     ) -> (Option<String>, Option<String>) {
         if model_override.is_some() && effort_override.is_some() {
             return (model_override, effort_override);
         }
+        // Per-thread memory: reuse what this thread last ran with. Only worth a
+        // query for a follow-up (a new thread has no prior message).
+        let (thread_model, thread_effort) = match thread_id {
+            Some(tid) => Self::last_thread_chat_settings(pool, tid, exclude_event_id).await,
+            None => (None, None),
+        };
+        let model = model_override.or(thread_model);
+        let effort = effort_override.or(thread_effort);
+        if model.is_some() && effort.is_some() {
+            return (model, effort);
+        }
         let (pref_model, pref_effort) = Self::user_chat_settings(pool).await;
-        (
-            model_override.or(pref_model),
-            effort_override.or(pref_effort),
-        )
+        (model.or(pref_model), effort.or(pref_effort))
     }
 }
 
@@ -407,12 +484,14 @@ mod tests {
             .unwrap();
     }
 
+    // The thread-less resolution path (thread_id = None): caller override →
+    // account preference, no per-thread lookup.
     #[tokio::test]
     async fn resolve_chat_overrides_falls_back_to_prefs_when_none() {
         let (pool, db_name) = setup_test_db().await;
         seed_chat_prefs(&pool, "claude-opus-4-7[1m]", "xhigh").await;
         let (model, effort) =
-            PreferenceStore::resolve_chat_overrides(&pool, None, None).await;
+            PreferenceStore::resolve_chat_overrides_for_thread(&pool, None, None, None, None).await;
         assert_eq!(model.as_deref(), Some("claude-opus-4-7[1m]"));
         assert_eq!(effort.as_deref(), Some("xhigh"));
         pool.close().await;
@@ -423,8 +502,10 @@ mod tests {
     async fn resolve_chat_overrides_keeps_explicit_caller_values() {
         let (pool, db_name) = setup_test_db().await;
         seed_chat_prefs(&pool, "claude-opus-4-7[1m]", "xhigh").await;
-        let (model, effort) = PreferenceStore::resolve_chat_overrides(
+        let (model, effort) = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
+            None,
+            None,
             Some("claude-sonnet-4-6".to_string()),
             Some("medium".to_string()),
         )
@@ -439,8 +520,10 @@ mod tests {
     async fn resolve_chat_overrides_mixes_caller_and_prefs() {
         let (pool, db_name) = setup_test_db().await;
         seed_chat_prefs(&pool, "claude-opus-4-7[1m]", "xhigh").await;
-        let (model, effort) = PreferenceStore::resolve_chat_overrides(
+        let (model, effort) = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
+            None,
+            None,
             Some("claude-sonnet-4-6".to_string()),
             None,
         )
@@ -455,9 +538,159 @@ mod tests {
     async fn resolve_chat_overrides_returns_none_when_no_caller_no_prefs() {
         let (pool, db_name) = setup_test_db().await;
         let (model, effort) =
-            PreferenceStore::resolve_chat_overrides(&pool, None, None).await;
+            PreferenceStore::resolve_chat_overrides_for_thread(&pool, None, None, None, None).await;
         assert_eq!(model, None);
         assert_eq!(effort, None);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    // --- Per-thread model/effort memory
+    // (docs/plans/2026-07-03-per-thread-model-memory.md) ---
+
+    /// Insert a flat `MessageReceived` events row the way `ThreadEvent::to_payload`
+    /// serializes it (model/effort at the top level), so the resolution query is
+    /// tested against the real payload shape. Returns the event id (`events.id`).
+    async fn insert_message_received(
+        pool: &PgPool,
+        thread_id: Uuid,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        let mut payload = serde_json::json!({ "text": "hi", "mode": "human" });
+        if let Some(m) = model {
+            payload["model"] = serde_json::json!(m);
+        }
+        if let Some(e) = effort {
+            payload["reasoning_effort"] = serde_json::json!(e);
+        }
+        sqlx::query(
+            "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+             VALUES ($1, $2, $3, $4, $5, now(), $6)",
+        )
+        .bind(id)
+        .bind("thread")
+        .bind(thread_id.to_string())
+        .bind("MessageReceived")
+        .bind(payload)
+        .bind(thread_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn last_thread_chat_settings_returns_most_recent_recorded() {
+        let (pool, db_name) = setup_test_db().await;
+        let tid = Uuid::new_v4();
+        insert_message_received(&pool, tid, Some("model-old"), Some("low")).await;
+        insert_message_received(&pool, tid, Some("model-new"), Some("high")).await;
+        let (model, effort) = PreferenceStore::last_thread_chat_settings(&pool, tid, None).await;
+        assert_eq!(model.as_deref(), Some("model-new"));
+        assert_eq!(effort.as_deref(), Some("high"));
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn last_thread_chat_settings_none_for_thread_without_records() {
+        let (pool, db_name) = setup_test_db().await;
+        let (model, effort) =
+            PreferenceStore::last_thread_chat_settings(&pool, Uuid::new_v4(), None).await;
+        assert_eq!(model, None);
+        assert_eq!(effort, None);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn last_thread_chat_settings_resolves_each_field_independently() {
+        // A newer message carrying only a model must NOT erase an older effort —
+        // each field is the latest non-empty value on its own.
+        let (pool, db_name) = setup_test_db().await;
+        let tid = Uuid::new_v4();
+        insert_message_received(&pool, tid, Some("model-a"), Some("high")).await;
+        insert_message_received(&pool, tid, Some("model-b"), None).await;
+        let (model, effort) = PreferenceStore::last_thread_chat_settings(&pool, tid, None).await;
+        assert_eq!(model.as_deref(), Some("model-b"));
+        assert_eq!(effort.as_deref(), Some("high"));
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn last_thread_chat_settings_excludes_in_flight_event() {
+        // The current turn's own MessageReceived (pre-emitted upstream) must not
+        // be read as its own "previous" value.
+        let (pool, db_name) = setup_test_db().await;
+        let tid = Uuid::new_v4();
+        insert_message_received(&pool, tid, Some("prior-model"), Some("low")).await;
+        let current = insert_message_received(&pool, tid, Some("current-model"), Some("high")).await;
+        let (model, effort) =
+            PreferenceStore::last_thread_chat_settings(&pool, tid, Some(current)).await;
+        assert_eq!(model.as_deref(), Some("prior-model"));
+        assert_eq!(effort.as_deref(), Some("low"));
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_for_thread_reuses_thread_value_over_preference() {
+        let (pool, db_name) = setup_test_db().await;
+        seed_chat_prefs(&pool, "pref-model", "pref-effort").await;
+        let tid = Uuid::new_v4();
+        insert_message_received(&pool, tid, Some("thread-model"), Some("thread-effort")).await;
+        let (model, effort) =
+            PreferenceStore::resolve_chat_overrides_for_thread(&pool, Some(tid), None, None, None)
+                .await;
+        assert_eq!(model.as_deref(), Some("thread-model"));
+        assert_eq!(effort.as_deref(), Some("thread-effort"));
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_for_thread_explicit_override_beats_thread_memory() {
+        let (pool, db_name) = setup_test_db().await;
+        let tid = Uuid::new_v4();
+        insert_message_received(&pool, tid, Some("thread-model"), Some("thread-effort")).await;
+        // Override the model only → effort still comes from the thread (per field).
+        let (model, effort) = PreferenceStore::resolve_chat_overrides_for_thread(
+            &pool,
+            Some(tid),
+            None,
+            Some("override-model".to_string()),
+            None,
+        )
+        .await;
+        assert_eq!(model.as_deref(), Some("override-model"));
+        assert_eq!(effort.as_deref(), Some("thread-effort"));
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_for_thread_falls_back_to_preference_without_thread_record() {
+        let (pool, db_name) = setup_test_db().await;
+        seed_chat_prefs(&pool, "pref-model", "pref-effort").await;
+        // A brand-new thread (no messages) → account preference.
+        let (model, effort) = PreferenceStore::resolve_chat_overrides_for_thread(
+            &pool,
+            Some(Uuid::new_v4()),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(model.as_deref(), Some("pref-model"));
+        assert_eq!(effort.as_deref(), Some("pref-effort"));
+        // Thread-less resolve behaves the same (caller override → preference).
+        let (m2, e2) =
+            PreferenceStore::resolve_chat_overrides_for_thread(&pool, None, None, None, None).await;
+        assert_eq!(m2.as_deref(), Some("pref-model"));
+        assert_eq!(e2.as_deref(), Some("pref-effort"));
         pool.close().await;
         teardown_test_db(&db_name).await;
     }

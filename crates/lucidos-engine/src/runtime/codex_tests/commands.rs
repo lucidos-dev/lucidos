@@ -277,14 +277,32 @@ fn resolve_codex_binary_prefers_local_bin() {
     std::fs::create_dir_all(&local_bin).expect("create .local/bin");
     let codex_path = local_bin.join("codex");
     std::fs::write(&codex_path, b"#!/bin/sh\n").expect("write stub");
-    let resolved = resolve_codex_binary(Some(tmp.path()));
+    let resolved = resolve_codex_binary(Some(tmp.path()), None);
     assert_eq!(resolved, codex_path.as_os_str());
+}
+
+#[test]
+fn resolve_codex_binary_override_wins_over_probes() {
+    // A user-configured path (coding_agent_codex_path) beats every probe —
+    // even when the ~/.local/bin install exists.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let local_bin = tmp.path().join(".local").join("bin");
+    std::fs::create_dir_all(&local_bin).expect("create .local/bin");
+    std::fs::write(local_bin.join("codex"), b"#!/bin/sh\n").expect("write stub");
+    let override_path = tmp.path().join("custom-codex");
+
+    let resolved = resolve_codex_binary(Some(tmp.path()), Some(&override_path));
+    assert_eq!(
+        resolved,
+        override_path.as_os_str(),
+        "a configured binary path must win over the probe list"
+    );
 }
 
 #[test]
 fn resolve_codex_binary_falls_back_to_bare_name() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let resolved = resolve_codex_binary(Some(tmp.path()));
+    let resolved = resolve_codex_binary(Some(tmp.path()), None);
     // May resolve to a system install (homebrew) when present on the test
     // host; otherwise the bare name. Either way it must be non-empty and not
     // point inside the empty temp home.

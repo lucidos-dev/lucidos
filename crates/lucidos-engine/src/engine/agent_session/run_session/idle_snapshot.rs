@@ -22,6 +22,24 @@ impl LucidosEngine {
             Some(p) => external_edits::git_head_sha(p).await,
             None => None,
         };
+        // Clear any permission card still dangling at this turn boundary. A live
+        // card blocks the turn (so idle can't fire during a genuine wait); by
+        // the time we idle the session is done and any unresolved
+        // `CodingAgentPermissionRequest` is orphaned — e.g. a workflow whose
+        // parallel subagent's card outlived the main turn. Without this the card
+        // sits clickable on a finished thread, and a later click resurrected the
+        // thread into a dead `running` (fixed alongside the non-resurrecting
+        // resolution projection —
+        // `docs/plans/2026-07-02-cc-permission-card-zombie-running.md`). Engine-
+        // driven, so no user actor. No-op when nothing is pending.
+        crate::engine::cc_permission::resolve_pending_permissions_as_session_ended(
+            self.pool(),
+            &self.event_bus,
+            &self.pending_cc_permission,
+            thread_id,
+            None,
+        )
+        .await;
         self.event_bus
             .emit_or_log(
                 crate::engine::event_bus::BusEvent::Thread {

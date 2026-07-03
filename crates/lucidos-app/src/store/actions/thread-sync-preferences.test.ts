@@ -35,7 +35,10 @@ vi.mock('../thread-events', () => ({
 }));
 vi.mock('./notifications', () => ({ handleNotificationSSE: vi.fn() }));
 vi.mock('./chat-changes', () => ({ addRestartGroup: vi.fn() }));
-vi.mock('./preferences', () => ({ loadPreferences: vi.fn() }));
+// loadPreferences is async — the PreferencesChanged arm chains a client-update
+// re-derive off it, so the mock must resolve a Promise.
+vi.mock('./preferences', () => ({ loadPreferences: vi.fn(() => Promise.resolve()) }));
+vi.mock('./client-update', () => ({ syncClientUpdateFromBuild: vi.fn() }));
 vi.mock('./artifacts', () => ({
   loadArtifacts: vi.fn(),
   openFilePreview: vi.fn(),
@@ -65,27 +68,38 @@ vi.mock('./thread-loading', () => ({
 
 const { handleGlobalEvent } = await import('./thread-sync');
 const { loadPreferences } = await import('./preferences');
+const { syncClientUpdateFromBuild } = await import('./client-update');
 
 describe('handleGlobalEvent — preference events refresh the preferences cache', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('PreferencesChanged reloads preferences', () => {
+  it('PreferencesChanged reloads preferences AND re-derives the client-update surface', async () => {
     handleGlobalEvent('PreferencesChanged', {});
     expect(loadPreferences).toHaveBeenCalledTimes(1);
+    // A peer may have dismissed the client-refresh toast globally; the re-derive
+    // hides it on this device too. Chained off loadPreferences → runs on a
+    // microtask, so wait for it.
+    await vi.waitFor(() => expect(syncClientUpdateFromBuild).toHaveBeenCalledTimes(1));
   });
 
   // set_language / set_timezone emit LanguageSet / TimezoneSet but NOT
   // PreferencesChanged — without these arms the cached locale/timezone goes
   // stale until reload.
-  it('LanguageSet reloads preferences', () => {
+  it('LanguageSet reloads preferences (no client-update re-derive)', async () => {
     handleGlobalEvent('LanguageSet', { language: 'nb' });
     expect(loadPreferences).toHaveBeenCalledTimes(1);
+    // The client-update re-derive is PreferencesChanged-only — a locale change
+    // carries no dismissed-build change, so it must not fire a needless sw.js fetch.
+    await Promise.resolve();
+    expect(syncClientUpdateFromBuild).not.toHaveBeenCalled();
   });
 
-  it('TimezoneSet reloads preferences', () => {
+  it('TimezoneSet reloads preferences (no client-update re-derive)', async () => {
     handleGlobalEvent('TimezoneSet', { timezone: 'Europe/Oslo' });
     expect(loadPreferences).toHaveBeenCalledTimes(1);
+    await Promise.resolve();
+    expect(syncClientUpdateFromBuild).not.toHaveBeenCalled();
   });
 });

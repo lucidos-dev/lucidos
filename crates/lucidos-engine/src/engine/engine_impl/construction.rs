@@ -437,9 +437,17 @@ impl LucidosEngine {
 
         // The long pole on a first-ever open: this downloads the embedding model
         // (hundreds of MB) that powers vector memory, before HTTP binds. Narrate
-        // it on the boot splash.
+        // it on the boot splash. A FETCH failure (offline / HF blocked — the
+        // packaged first-run case) must NOT kill the boot: the engine comes up
+        // with memory features degraded (every embed errors descriptively — see
+        // `memory::EmbedderSlot`) and `spawn_embedder_retry_if_degraded`
+        // installs the model in the background once the network allows. Any
+        // OTHER init error (corrupt cached model, bad config) stays fatal — a
+        // real bug must fail loudly, not boot a silently memory-less engine.
         crate::boot_report::report(crate::boot_report::DOWNLOADING_MEMORY_MODEL);
-        let embedder = Arc::new(FastEmbedProvider::new()?);
+        let embedder = crate::memory::embedder_slot::slot_from_init(
+            crate::memory::FastEmbedProvider::new(),
+        )?;
 
         let browser_runtime = BrowserRuntime::new(workspace_path.clone(), pool.clone());
 
@@ -455,9 +463,10 @@ impl LucidosEngine {
         BrowserLogins::init_schema(&pool).await?;
 
         // Resolve the OpenAI key once: a stored `openai` credential (Settings →
-        // Providers) is preferred, with the OPENAI_API_KEY launch env var as the
-        // fallback. Used for the image provider and for routing `gpt-*`
-        // background-task models through the MemoryExtractor.
+        // Providers) is preferred, then the OPENAI_API_KEY launch env var, then a
+        // key auto-detected from the Codex CLI's auth file (apikey login) as the
+        // lowest-precedence fallback. Used for the image provider and for routing
+        // `gpt-*` background-task models through the MemoryExtractor.
         let openai_credential = match CredentialStore::get(&pool, "openai").await {
             Ok(Some(cred)) => Some((cred.auth_type, cred.auth_value)),
             Ok(None) => None,
@@ -469,6 +478,7 @@ impl LucidosEngine {
         let openai_api_key = crate::llm::resolve_openai_api_key(
             openai_credential,
             std::env::var("OPENAI_API_KEY").ok(),
+            crate::llm::openai::codex_detect::load(),
         )
         .map(|(key, _source)| key);
 
@@ -506,14 +516,18 @@ impl LucidosEngine {
         };
 
         // Gated on memory_index because it owns the schema; without it
-        // memory_entries may not exist.
+        // memory_entries may not exist. Skipped on a degraded (empty-slot)
+        // boot — every batch would just error EMBEDDER_UNAVAILABLE; the
+        // background retry runs the same sweep after installing the model.
         if let Some(index) = memory_index.clone() {
-            let embedder = embedder.clone();
-            tokio::spawn(async move {
-                if let Err(e) = crate::memory::reembed::reembed_stale(&index, embedder).await {
-                    log!(@Memory, "Re-embed task failed: {}", e);
-                }
-            });
+            if embedder.is_ready() {
+                let embedder = embedder.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::memory::reembed::reembed_stale(&index, embedder).await {
+                        log!(@Memory, "Re-embed task failed: {}", e);
+                    }
+                });
+            }
         }
 
         // Load user profile from artifacts, or use empty if doesn't exist
@@ -806,6 +820,18 @@ impl LucidosEngine {
             cancel_rebuild: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             backup_in_progress: AtomicBool::new(false),
+            build_state: std::sync::RwLock::new(crate::engine::engine_version::BuildState::Idle),
+            update_check: std::sync::Mutex::new(Default::default()),
+            source_behind_cache: std::sync::Mutex::new(Default::default()),
+            self_heal_state: std::sync::Mutex::new(Default::default()),
+            build_task: std::sync::Mutex::new(None),
+            build_generation: std::sync::atomic::AtomicU64::new(0),
+            served_frontend: std::sync::OnceLock::new(),
+            served_frontend_source: std::sync::OnceLock::new(),
+            frontend_refresh_generation: std::sync::atomic::AtomicU64::new(0),
+            frontend_refresh_task: std::sync::Mutex::new(None),
+            restart_actor: std::sync::Mutex::new(None),
+            pending_switch_resumes: std::sync::Mutex::new(Vec::new()),
             active_threads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             thread_completion: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cc_commands_cache: tokio::sync::RwLock::new(Self::load_cc_commands_cache(

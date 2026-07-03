@@ -133,11 +133,20 @@ impl LucidosEngine {
     ///
     /// Unlike `stop_agent`, interrupt is always a real Cancel/Stop click — the
     /// frontend offers no "interrupt for Apply/Discard/Archive" path.
+    ///
+    /// Returns `Ok(true)` when a live turn was interrupted, an in-process loop
+    /// canceled, or a stuck `running` projection settled — i.e. a terminal event
+    /// is on its way. `Ok(false)` when nothing was interruptible (the settle
+    /// found no stuck projection, or — for the thread-id-less variant — every
+    /// session was already waiting). The handler folds this into the
+    /// `{"canceled": bool}` response so the client can self-heal a stale view.
+    /// The `SESSION_ALREADY_WAITING` `Err` is preserved for the single-thread
+    /// idle-session race so the stop handler keeps its no-op-200 mapping.
     pub async fn interrupt_agent(
         &self,
         thread_id: Option<Uuid>,
         actor: Option<MessageOrigin>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let mut guard = self.agent_sessions.lock().await;
 
         if let Some(tid) = thread_id {
@@ -150,25 +159,26 @@ impl LucidosEngine {
                 // with the originating device (the popover's Device row).
                 session.cancel_actor = actor;
                 session.interrupt.notify_one();
-                Ok(())
+                Ok(true)
             } else {
                 drop(guard);
                 if self.cancel_thread(tid, actor.clone()) {
-                    return Ok(());
+                    return Ok(true);
                 }
-                settle_stuck_running_thread(&self.pool, &self.event_bus, tid, actor).await?;
-                Ok(())
+                settle_stuck_running_thread(&self.pool, &self.event_bus, tid, actor).await
             }
         } else {
             if guard.is_empty() {
                 return Err("No Claude Code process is running".into());
             }
+            let mut any = false;
             for session in guard.values() {
                 if !session.is_waiting {
                     session.interrupt.notify_one();
+                    any = true;
                 }
             }
-            Ok(())
+            Ok(any)
         }
     }
 

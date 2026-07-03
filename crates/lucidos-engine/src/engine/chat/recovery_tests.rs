@@ -209,6 +209,46 @@ async fn orphan_threads_query_skips_archived_thread() {
 }
 
 #[tokio::test]
+async fn orphan_threads_query_excludes_threads_owned_by_cc_recovery() {
+    // `recover_orphaned_worktrees` runs first and returns the set of
+    // coding-agent threads it is resuming/settling; `main.rs` passes that set as
+    // `exclude_thread_ids` so the chat orphan sweep does NOT emit a duplicate
+    // `ResponseAborted` on a thread CC recovery already owns (which — combined
+    // with the startup-lease serialization — is what stops the chat sweep from
+    // aborting an in-flight CC thread out from under its auto-resume). This pins
+    // the `exclude_thread_ids` bind: an excluded orphan is filtered out, an
+    // otherwise-identical control orphan is still returned.
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let cc_owned_id = Uuid::new_v4();
+    emit_orphan_turn(&bus, cc_owned_id).await;
+
+    let control_id = Uuid::new_v4();
+    emit_orphan_turn(&bus, control_id).await;
+
+    let rows: Vec<OrphanThreadRow> = sqlx::query_as(ORPHAN_THREADS_SQL)
+        .bind(vec![cc_owned_id])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let returned: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
+    assert!(
+        returned.contains(&control_id),
+        "a non-excluded orphan must still be returned — got {:?}",
+        returned
+    );
+    assert!(
+        !returned.contains(&cc_owned_id),
+        "an orphan in exclude_thread_ids (owned by CC recovery) must NOT be returned — got {:?}",
+        returned
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
 async fn orphan_tool_calls_query_skips_archived_thread() {
     // Mirror the orphan-thread test for the inner-tool-layer sweep: a
     // synthetic `ToolResult` for an archived thread would bump

@@ -156,6 +156,56 @@ pub fn validate_bind_input(value: &str) -> Result<(), String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wire scheme (http vs https) — the SINGLE source of truth.
+// ---------------------------------------------------------------------------
+//
+// A Lucidos process serves TLS iff BOTH `LUCIDOS_TLS_CERT` and `LUCIDOS_TLS_KEY`
+// point at non-empty paths (dev keeps the certs; the packaged gateway strips
+// them — see `crates/lucidos-gateway/src/stack.rs` + `crates/lucidos-app/src/
+// desktop.rs`). Every caller that needs the scheme — the engine's own listener
+// (`main.rs`), the gateway-restart callback (`api/history.rs`), and ANY FUTURE
+// intra-host caller — MUST resolve it through [`tls_scheme`] / [`tls_scheme_from`]
+// (or the constants below), never by re-deriving from `LUCIDOS_TLS_*` inline.
+// A plain-`http` call to a TLS listener is what surfaced as "gateway restart
+// request failed: error sending request for url".
+
+/// Plain-HTTP scheme literal.
+pub const SCHEME_HTTP: &str = "http";
+/// TLS scheme literal.
+pub const SCHEME_HTTPS: &str = "https";
+
+/// Pure protocol resolution: [`SCHEME_HTTPS`] when both cert and key are present
+/// and non-empty, else [`SCHEME_HTTP`]. The one place the http/https decision is
+/// made.
+pub fn tls_scheme_from(cert: Option<&str>, key: Option<&str>) -> &'static str {
+    match (cert, key) {
+        (Some(c), Some(k)) if !c.trim().is_empty() && !k.trim().is_empty() => SCHEME_HTTPS,
+        _ => SCHEME_HTTP,
+    }
+}
+
+/// [`tls_scheme_from`] reading `LUCIDOS_TLS_CERT` / `LUCIDOS_TLS_KEY` from the
+/// process environment — the scheme THIS process serves on its port.
+pub fn tls_scheme() -> &'static str {
+    tls_scheme_from(
+        std::env::var("LUCIDOS_TLS_CERT").ok().as_deref(),
+        std::env::var("LUCIDOS_TLS_KEY").ok().as_deref(),
+    )
+}
+
+/// The scheme order for a resilient intra-host call to a PEER Lucidos process
+/// (e.g. the engine → gateway restart callback). The peer's scheme normally
+/// matches ours (both derive it the same way), but this returns the resolved
+/// scheme FIRST and the other protocol SECOND so a mismatch still connects —
+/// i.e. it supports both protocols by construction. Reads the process env.
+pub fn peer_scheme_order() -> [&'static str; 2] {
+    match tls_scheme() {
+        SCHEME_HTTPS => [SCHEME_HTTPS, SCHEME_HTTP],
+        _ => [SCHEME_HTTP, SCHEME_HTTPS],
+    }
+}
+
 /// Resolve the engine bind. See the module doc for the precedence. Pure — the
 /// caller supplies env values, the parsed `network.toml`, and (when not
 /// inheriting) this workspace's `network_bind` preference.
@@ -403,6 +453,19 @@ mod tests {
         assert!(validate_bind_input("nope").is_err());
         assert!(validate_bind_input("100.999.0.1").is_err());
         assert!(validate_bind_input("").is_err());
+    }
+
+    #[test]
+    fn tls_scheme_from_requires_both_nonempty() {
+        // https only when BOTH cert and key are present and non-empty.
+        assert_eq!(tls_scheme_from(Some("/c.pem"), Some("/k.pem")), SCHEME_HTTPS);
+        // Missing either → http (the packaged-gateway posture, TLS stripped).
+        assert_eq!(tls_scheme_from(None, Some("/k.pem")), SCHEME_HTTP);
+        assert_eq!(tls_scheme_from(Some("/c.pem"), None), SCHEME_HTTP);
+        assert_eq!(tls_scheme_from(None, None), SCHEME_HTTP);
+        // Set-but-empty (or whitespace) is not TLS.
+        assert_eq!(tls_scheme_from(Some(""), Some("/k.pem")), SCHEME_HTTP);
+        assert_eq!(tls_scheme_from(Some("/c.pem"), Some("  ")), SCHEME_HTTP);
     }
 
     #[test]

@@ -82,6 +82,14 @@ pub const ANSWERED_AFTER_IDLE_REASON: &str = "answered_after_idle";
 /// user gets an automatic `--resume` without having to click Continue.
 pub const AUTO_RECOVERY_AFTER_HANG_REASON: &str = "auto_recovery_after_hang";
 
+/// Tag stamped on `ContinuationRequested.reason` when recovery auto-resumes an
+/// in-flight coding-agent thread after a **user-initiated** *Switch to new
+/// version* (detected by a device-attributed teardown `ResponseAborted`). A crash
+/// leaves no such boundary → the thread gets the manual "Continue" affordance
+/// instead, so work that may have crashed the engine can't loop. Opens a
+/// "Resumed" boundary exchange like the other automatic-resume reasons.
+pub const AUTO_RESUME_AFTER_SWITCH_REASON: &str = "auto_resume_after_switch";
+
 /// Should the SpawnConsumer's `Continue` handler emit `ContinuationStarted`
 /// for a `ContinuationRequested` carrying this `reason`?
 ///
@@ -101,7 +109,9 @@ pub const AUTO_RECOVERY_AFTER_HANG_REASON: &str = "auto_recovery_after_hang";
 pub fn continue_should_open_resume_exchange(reason: Option<&str>) -> bool {
     matches!(
         reason,
-        Some(USER_CLICKED_CONTINUE_REASON) | Some(AUTO_RECOVERY_AFTER_HANG_REASON)
+        Some(USER_CLICKED_CONTINUE_REASON)
+            | Some(AUTO_RECOVERY_AFTER_HANG_REASON)
+            | Some(AUTO_RESUME_AFTER_SWITCH_REASON)
     )
 }
 
@@ -124,19 +134,22 @@ pub fn continue_should_open_resume_exchange(reason: Option<&str>) -> bool {
 /// stdin precondition.
 pub const CONTINUE_RESUME_USER_MESSAGE: &str = "Continue from where you left off.";
 
-/// Remove a stale worktree directory and delete its branch.
-/// Best-effort — failures are silently ignored since the worktree
-/// will just be skipped again on next restart.
-pub(crate) async fn cleanup_stale_worktree(wt_path: &Path, branch_name: &str, repo_root: &Path) {
-    let Some(wt_str) = wt_path.to_str() else {
-        log!(
-            "[Recovery] cleanup_stale_worktree skipped (non-UTF8 path): {}",
-            wt_path.display()
-        );
-        return;
-    };
-    let _ = git_cmd(&["worktree", "remove", "--force", wt_str], repo_root).await;
-    let _ = git_cmd(&["branch", "-D", branch_name], repo_root).await;
+/// Remove a stale (duplicate-recovery) worktree, deleting its branch ONLY when
+/// fully merged (no unique commits). NEVER force-deletes a branch that still
+/// holds work: this is the duplicate-branch recovery path (two branches map to
+/// one thread from stale-resume retries), and the duplicate's unique commits
+/// must survive. Delegates to the cron's safe helper — which keeps a branch with
+/// unique commits (and keeps on error, conservative).
+///
+/// 2026-07-02: replaced an unconditional `git worktree remove --force` +
+/// `branch -D` that could silently lose a duplicate branch's commits, per the
+/// "never delete a possibly-useful worktree/branch" invariant.
+/// Best-effort — a failure just means the worktree is skipped again next restart.
+pub(crate) async fn cleanup_stale_worktree(wt_path: &Path) {
+    let _ = crate::engine::worktree_cleanup::remove_worktree_and_optionally_delete_branch(
+        wt_path, None,
+    )
+    .await;
 }
 
 /// Resolve which thread an orphaned `claude-code/*` worktree (found by the

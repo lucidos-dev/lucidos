@@ -24,10 +24,14 @@ impl LucidosEngine {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Pre-shutdown abort emission for `/api/v1/restart`. Walks the in-flight
-    /// chat AND CC threads and emits the boundary events with a user-attributed
-    /// `actor` so the post-restart timeline reads "You restarted" instead of
-    /// "⚙ System restarted".
+    /// Teardown-time boundary emission for the *Switch to new version* flow.
+    /// Called from `main.rs::shutdown_signal` at ACTUAL engine teardown (the
+    /// SIGUSR1 graceful shutdown), NOT at switch-request time — so nothing shows
+    /// "Switched/Aborted" while the old engine is still alive through a dev
+    /// rebuild. Walks the in-flight chat AND CC threads and emits the boundary
+    /// events with the `actor` the switch handler stashed (via
+    /// `take_restart_actor`): a device actor → "You restarted"; `None` (bare
+    /// stop.sh / external SIGUSR1) → "⚙ System restarted".
     ///
     /// For chat threads: emits `ResponseAborted { actor: <actor> }` with
     /// `request_event_id` pointing to the originating MessageReceived/

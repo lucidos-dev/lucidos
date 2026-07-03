@@ -26,7 +26,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
-import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget } from '../../../utils/linkifyPaths';
+import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef } from '../../../utils/linkifyPaths';
 import { renderMarkdown } from '../../../utils/renderMarkdown';
 import type { App } from '../../../store/types';
 
@@ -127,6 +127,11 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
       e.preventDefault();
       cb.navigate({ target: navName });
       return;
+    }
+    const bareRef = extractBareAppRef(href);
+    if (bareRef) {
+      const a = apps.find(x => x.id === bareRef || x.name === bareRef);
+      if (a) { e.preventDefault(); cb.openApp(a); return; }
     }
     const localFile = extractLocalFileTarget(href);
     if (localFile) {
@@ -229,6 +234,63 @@ describe('chat link click — the bug-report scenario', () => {
     runHandleLinkClick(e, APPS, cb);
     expect(cb.openApp).not.toHaveBeenCalled();
     expect(e.defaultPrevented).toBe(false);
+  });
+
+  // ---------------------------------------------------------------------------
+  // bare app-id/name href — the reported bug. The LLM wrote a link with the app
+  // id as a bare relative href — `[Habit Tracker](habit-tracker)`, no apps/ prefix,
+  // no app: scheme — mirroring `[Notifications](notifications)`. Left alone the
+  // browser navigates to the relative href and the SPA fallback reloads the whole
+  // workspace (the "Opening workspace" splash on iOS PWA).
+  // ---------------------------------------------------------------------------
+
+  it.each([
+    'work-tracker',      // bare id
+    '/work-tracker',     // leading slash
+    'work-tracker/',     // trailing slash
+    'work-tracker?v=2',  // query
+    'work-tracker#top',  // fragment
+  ])('BARE app-id href %s → openApp', (href) => {
+    const e = mkEvent(mkAnchor(href));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.openApp).toHaveBeenCalledWith(APPS[0]);
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it('BARE app-NAME href, percent-encoded (Habit%20Tracker) → openApp', () => {
+    // Markdown renders a spaced destination encoded, so the real DOM href is
+    // `Habit%20Tracker`; extractBareAppRef decodes it back to the raw name.
+    const e = mkEvent(mkAnchor('Habit%20Tracker'));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.openApp).toHaveBeenCalledWith(APPS[1]);
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it('does NOT intercept a bare href that names no known app', () => {
+    const e = mkEvent(mkAnchor('README'));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.openApp).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(false);
+  });
+
+  it('a bare href that is a nav panel name routes to the panel, not a bare app', () => {
+    // nav check runs before the bare-app-ref branch, so `notifications` keeps
+    // routing to its panel even though it's a bare single-segment href.
+    const e = mkEvent(mkAnchor('notifications'));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.navigate).toHaveBeenCalledWith({ target: 'notifications' });
+    expect(cb.openApp).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it('END-TO-END: render → linkify rewrites the bare app-id href (reported bug shape)', () => {
+    const md = 'Open [Lucidos Work](work-tracker) for details.';
+    const html = linkifyPaths(renderMarkdown(md), [], APPS);
+    expect(html).toContain('href="#"');
+    expect(html).toContain('class="app-link"');
+    expect(html).toContain('data-app-id="work-tracker"');
+    expect(html).toContain('>Lucidos Work</a>');
+    expect(html).not.toContain('href="work-tracker"');
   });
 
   it('END-TO-END: render → linkify pipeline yields the .app-link the click expects', () => {
@@ -428,10 +490,11 @@ describe('chat link click — handler structure pin', () => {
     expect(body).toMatch(sequence);
   });
 
-  it('handleLinkClick uses extractAppIdFromHref, extractNavTargetFromHref, and extractLocalFileTarget in the fallback branch', () => {
-    expect(chatExchangeSource).toMatch(/import.*extractAppIdFromHref.*extractNavTargetFromHref.*extractLocalFileTarget.*from.*linkifyPaths/);
+  it('handleLinkClick uses extractAppIdFromHref, extractNavTargetFromHref, extractBareAppRef, and extractLocalFileTarget in the fallback branch', () => {
+    expect(chatExchangeSource).toMatch(/import.*extractAppIdFromHref.*extractNavTargetFromHref.*extractLocalFileTarget.*extractBareAppRef.*from.*linkifyPaths/);
     expect(chatExchangeSource).toMatch(/extractAppIdFromHref\(rawHref\)/);
     expect(chatExchangeSource).toMatch(/extractNavTargetFromHref\(rawHref\)/);
+    expect(chatExchangeSource).toMatch(/extractBareAppRef\(rawHref\)/);
     expect(chatExchangeSource).toMatch(/extractLocalFileTarget\(rawHref\)/);
   });
 
@@ -445,15 +508,19 @@ describe('chat link click — handler structure pin', () => {
     expect(body).toContain('e.preventDefault()');
   });
 
-  it('the OS-open branch runs AFTER the app/nav extractors so workspace routes win', () => {
-    // extractLocalFileTarget must appear after both extractAppIdFromHref and
-    // extractNavTargetFromHref in the source, or an absolute /apps/… or
-    // /notifications href could be handed to the OS instead of routed in-app.
+  it('the fallback extractors run in order: app → nav → bare-app-ref → OS-open', () => {
+    // extractLocalFileTarget must appear after the app/nav extractors, or an
+    // absolute /apps/… or /notifications href could be handed to the OS instead
+    // of routed in-app. extractBareAppRef must run AFTER nav so a reserved panel
+    // name (`notifications`) keeps routing to its panel, and BEFORE the OS-open
+    // so a bare app-id href never falls through to the disk opener.
     const appIdx = chatExchangeSource.indexOf('extractAppIdFromHref(rawHref)');
     const navIdx = chatExchangeSource.indexOf('extractNavTargetFromHref(rawHref)');
+    const bareIdx = chatExchangeSource.indexOf('extractBareAppRef(rawHref)');
     const fileIdx = chatExchangeSource.indexOf('extractLocalFileTarget(rawHref)');
     expect(appIdx).toBeGreaterThanOrEqual(0);
     expect(navIdx).toBeGreaterThan(appIdx);
-    expect(fileIdx).toBeGreaterThan(navIdx);
+    expect(bareIdx).toBeGreaterThan(navIdx);
+    expect(fileIdx).toBeGreaterThan(bareIdx);
   });
 });

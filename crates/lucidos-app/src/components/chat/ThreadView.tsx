@@ -13,8 +13,8 @@ import { PinThreadButton } from '../shared/PinThreadButton';
 import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
 import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
 import { computeExchanges, hasContentEvents } from '../../store/thread-events';
-import { awayFromBottom, notAtTop, scrollToBottom, scrolledUp, hasPendingEventScroll, deepLinkRenderAll } from './scrollState';
-import { INITIAL_WINDOW, computeRenderFromIndex, hasMoreAbove, expandRenderCount, WINDOW_EXPAND_MARGIN_PX } from './threadWindow';
+import { awayFromBottom, notAtTop, scrollToBottom, scrollToBottomAnimated, scrollToTop, scrolledUp, hasPendingEventScroll, deepLinkRenderAll } from './scrollState';
+import { INITIAL_WINDOW, computeRenderFromIndex, hasMoreAbove, expandRenderCount, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll } from './threadWindow';
 import { useScrollMemory, hasSavedScroll, threadScrollKey } from '../../hooks/useScrollMemory';
 import { useDelayedFlag, useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { ThreadSkeleton } from './ThreadSkeleton';
@@ -395,6 +395,10 @@ export function ThreadView() {
     // below can restore scrollTop and keep the viewport anchored (prepending
     // older exchanges grows the content upward).
     const pendingExpandRef = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
+    // Set by the up-chevron when it renders the full thread before scrolling to
+    // the genuine top — consumed by the layout effect that performs the jump once
+    // the expanded list commits. See onScrollUp below.
+    const pendingScrollTopRef = useRef(false);
 
     // Eligible for slide-in? revealOnFocus checked in the layout effect only
     // to avoid subscribing the render to the signal (prevents extra re-renders).
@@ -563,15 +567,18 @@ export function ThreadView() {
             // loop would otherwise overwrite the restore set by useScrollMemory.
             // The saved key only holds a value when the user was scrolled up
             // (shouldSave: () => scrolledUp.value), so at-bottom defers here.
-            // Skip too while a notification deep-link owns the scroll. Its claim
-            // is held until scrollToEventAndPulse's deadline (not released the
-            // instant it lands), so it also covers the re-fire this effect does
-            // when `hasExchanges` flips 0→true a beat after the deep-link
-            // resolves. Deliberately NOT gated on scrolledUp: this effect's own
-            // purpose is to recover the at-bottom snap on a slow load where a
-            // ResizeObserver fire escalated scrolledUp=true (see the comment
-            // above) — a scrolledUp gate would defeat that recovery.
-            if (eventsLoaded && !hasSavedScroll(savedScrollKey) && !hasPendingEventScroll()) scrollToBottom();
+            // This is THE lazy-load auto-scroll: it fires on the eventsLoaded
+            // false→true transition that an UNfocused-thread deep-link triggers.
+            // It goes through scrollToBottom({ auto: true }) so the call DEFERS to
+            // an in-flight notification deep-link claim instead of clearing it —
+            // the claim is held until scrollToEventAndPulse's deadline (or, for an
+            // already-focused thread, until the smooth scroll settles), so this
+            // covers the re-fire when `hasExchanges` flips 0→true a beat after the
+            // deep-link resolves. Deliberately NOT gated on scrolledUp: this
+            // effect's own purpose is to recover the at-bottom snap on a slow load
+            // where a ResizeObserver fire escalated scrolledUp=true — a scrolledUp
+            // gate would defeat that recovery.
+            if (eventsLoaded && !hasSavedScroll(savedScrollKey)) scrollToBottom({ auto: true });
             // Burst (not a single toggle): this is the open path's ONLY repaint
             // for an idle thread — once content is in the DOM no eventsBump tick
             // re-fires the streaming throttle, and the thread may never go to
@@ -753,6 +760,17 @@ export function ThreadView() {
         el.scrollTop = pend.prevScrollTop + (el.scrollHeight - pend.prevScrollHeight);
     }, [renderFromIndex]);
 
+    // After the up-chevron renders the full thread (set renderCount = Infinity),
+    // jump to the genuine top once the expanded list commits. scrollToTop() forces
+    // _resizeMode='ignore' first, so the huge render-all ResizeObserver grow can't
+    // hit onResize's scroll-mode branch and pin us back to the bottom. Runs before
+    // paint so the user never sees the intermediate position.
+    useLayoutEffect(() => {
+        if (!pendingScrollTopRef.current) return;
+        pendingScrollTopRef.current = false;
+        scrollToTop();
+    }, [renderFromIndex]);
+
     if (!threadId) return null;
 
     if (!eventThread) {
@@ -804,7 +822,10 @@ export function ThreadView() {
                 </span>
             </div>
             <div class="thread-content-wrap">
-                <div class="thread-content visible" ref={areaRef}>
+                {/* tabindex makes the transcript a keyboard-focusable scroll
+                    region: once focused (via Tab or the ⌘↑/⌘↓ turn shortcuts) the
+                    native Arrow/PageUp/PageDown/Home/End/Space keys scroll it. */}
+                <div class="thread-content visible" ref={areaRef} tabIndex={0} role="region" aria-label="Conversation transcript">
                     <MobileThreadTitleBar />
 
                     {exchanges.length === 0 ? (
@@ -817,8 +838,23 @@ export function ThreadView() {
                 <ScrollControls
                     showUp={isNotAtTop}
                     showDown={isUp}
-                    onScrollUp={() => areaRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}
-                    onScrollDown={scrollToBottom}
+                    onScrollUp={() => {
+                        const current = threadId ? (renderCountByThread.get(threadId) ?? INITIAL_WINDOW) : INITIAL_WINDOW;
+                        // Windowed thread with older exchanges still above the
+                        // rendered tail: render the FULL thread first, then jump to
+                        // the true top once it commits (see the layout effect above).
+                        // Without render-all the top of the rendered tail isn't the
+                        // top of the thread, and the scroll-up window-expand re-anchors
+                        // the viewport partway (the "needed N clicks" bug).
+                        if (threadId && scrollToTopNeedsRenderAll(exchangesLenRef.current, current)) {
+                            pendingScrollTopRef.current = true;
+                            renderCountByThread.set(threadId, Infinity);
+                            bumpWin(n => n + 1);
+                        } else {
+                            scrollToTop();
+                        }
+                    }}
+                    onScrollDown={scrollToBottomAnimated}
                 />
             </div>
         </div>

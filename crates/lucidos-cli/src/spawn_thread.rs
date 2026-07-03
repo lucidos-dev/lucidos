@@ -75,6 +75,11 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     // deprecated alias for `--relation child` (warn once on stderr); otherwise
     // default to `top` so existing cross-workspace recipes keep their
     // fire-and-forget behavior.
+    // TEMPORARY MEASURE — sunset deprecation (removable; see
+    // docs/temporary-measures.md § "lucidos spawn-thread --parent deprecated
+    // alias", governed by .claude/rules/temporary-measures.md). Remove the
+    // `--parent` arm one release after the warning shipped, once callers have
+    // migrated to `--relation child`.
     let relation = match (args.relation, args.parent) {
         (Some(r), _) => r,
         (None, true) => {

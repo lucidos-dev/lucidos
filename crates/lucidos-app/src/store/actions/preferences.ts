@@ -451,21 +451,13 @@ export function setBackgroundModel(key: BackgroundModelKey, model: string): Prom
 
 // --- Compose destination (coding-agent chip + hand-off hint) ---
 
-/** Last-used coding agent for the compose destination picker's chip.
- *  Workspace-scoped (not device-scoped) so the pick follows the user across
- *  devices. Default Claude Code — same as the engine's NULL fallback. */
+/** The account default coding agent — the SEED for a fresh compose's backend
+ *  chip (via `selectedCodingAgent`, set at `loadPreferences`). Workspace-scoped
+ *  (not device-scoped). Default Claude Code — same as the engine's NULL fallback.
+ *  Compose picks are per-draft (see `composeSelections`) and deliberately do NOT
+ *  write this back (draft-only), so there is no `setCodingAgentDefault`. */
 export function currentCodingAgentDefault(): CodingAgent {
   return currentPreference('coding_agent_default', ['claude-code', 'codex'], 'claude-code');
-}
-
-export function setCodingAgentDefault(agent: CodingAgent): Promise<void> {
-  // The Dropdown fires onChange on every click, including the already-selected
-  // option — skip the no-op so a re-pick doesn't PUT + fan out
-  // PreferencesChanged for an unchanged value.
-  if (selectedCodingAgent.value === agent) return Promise.resolve();
-  return savePreference('coding_agent_default', agent, () => {
-    selectedCodingAgent.value = agent;
-  });
 }
 
 // --- New-workspace welcome + starter suggestions ---

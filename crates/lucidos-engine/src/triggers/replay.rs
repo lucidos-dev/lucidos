@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use super::config::TriggerConfig;
+use super::config::{TriggerConfig, TriggerRunStatus};
 
 /// A raw event row used for replaying trigger lifecycle events.
 pub struct TriggerEventRow {
@@ -52,7 +52,24 @@ pub fn replay_trigger_events(events: Vec<TriggerEventRow>) -> HashMap<String, Tr
                     config.paused = true;
                 }
             }
-            "TriggerExecuted" | "TriggerStarted" | "ScheduledTriggerStarted" => {
+            "TriggerExecuted" => {
+                if let Some(config) = triggers.get_mut(&trigger_id) {
+                    config.last_run = Some(row.created);
+                    // The `status` field rides the payload as of the last-run-status
+                    // change. A legacy `TriggerExecuted` without it leaves
+                    // `last_run_status` untouched (→ None, "timestamp only"); an
+                    // unknown/forward-compat value is ignored rather than wedging.
+                    match row.payload.get("status").and_then(|v| v.as_str()) {
+                        Some("ok") => config.last_run_status = Some(TriggerRunStatus::Ok),
+                        Some("failed") => config.last_run_status = Some(TriggerRunStatus::Failed),
+                        _ => {}
+                    }
+                }
+            }
+            "TriggerStarted" | "ScheduledTriggerStarted" => {
+                // Pre-run marker (LLM trigger thread start): stamps the run time
+                // but carries no outcome — the trailing `TriggerExecuted` sets the
+                // status. Leave `last_run_status` as-is here.
                 if let Some(config) = triggers.get_mut(&trigger_id) {
                     config.last_run = Some(row.created);
                 }
@@ -187,6 +204,62 @@ mod tests {
         let triggers = replay_trigger_events(events);
         let t = triggers.get("t1").unwrap();
         assert!(t.last_run.is_some());
+    }
+
+    #[test]
+    fn replay_executed_with_status_sets_last_run_status() {
+        // A `TriggerExecuted` carrying the outcome rebuilds both the timestamp
+        // and the OK/failed status — so a threadless trigger's health survives a
+        // restart the same way `last_run` does.
+        let events = vec![
+            make_event("TriggerCreated", created_payload("t1", "Probe")),
+            make_event(
+                "TriggerExecuted",
+                json!({ "trigger_id": "t1", "last_run": "2026-07-01T08:00:00Z", "status": "failed" }),
+            ),
+        ];
+        let triggers = replay_trigger_events(events);
+        let t = triggers.get("t1").unwrap();
+        assert!(t.last_run.is_some());
+        assert_eq!(t.last_run_status, Some(TriggerRunStatus::Failed));
+
+        // And the success case.
+        let ok = replay_trigger_events(vec![
+            make_event("TriggerCreated", created_payload("t2", "Probe 2")),
+            make_event(
+                "TriggerExecuted",
+                json!({ "trigger_id": "t2", "status": "ok" }),
+            ),
+        ]);
+        assert_eq!(
+            ok.get("t2").unwrap().last_run_status,
+            Some(TriggerRunStatus::Ok)
+        );
+    }
+
+    #[test]
+    fn replay_legacy_executed_without_status_leaves_status_none() {
+        // A pre-status-field `TriggerExecuted` still sets `last_run` but carries
+        // no outcome — the row degrades to "timestamp only", never a wrong status.
+        let events = vec![
+            make_event("TriggerCreated", created_payload("t1", "Probe")),
+            make_event("TriggerExecuted", json!({ "trigger_id": "t1" })),
+        ];
+        let triggers = replay_trigger_events(events);
+        let t = triggers.get("t1").unwrap();
+        assert!(t.last_run.is_some());
+        assert_eq!(t.last_run_status, None);
+    }
+
+    #[test]
+    fn replay_created_defaults_status_none() {
+        // A trigger that has never fired has no last-run status.
+        let events = vec![make_event(
+            "TriggerCreated",
+            created_payload("t1", "Never run"),
+        )];
+        let t = replay_trigger_events(events);
+        assert_eq!(t.get("t1").unwrap().last_run_status, None);
     }
 
     #[test]

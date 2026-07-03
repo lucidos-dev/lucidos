@@ -82,7 +82,7 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
   document.documentElement.toggleAttribute('data-thread-collapsed', threadCollapsed);
   document.documentElement.toggleAttribute('data-content-collapsed', contentCollapsed);
   document.documentElement.toggleAttribute('data-thread-drawer-open', drawerVisible);
-  // Drives the accent line under the focused pane's header region (shell.css).
+  // Drives the header wash over the focused pane's header segment (shell.css).
   document.documentElement.setAttribute('data-focused-pane', focusedPane.value);
 
   return (

@@ -2,9 +2,11 @@
 
 The macOS desktop app is a **self-contained** Tauri bundle: it ships PostgreSQL +
 pgvector, the standalone `lucidos-gateway` binary, the `lucidos-engine` binary,
-the JS SDK, and the built frontend inside the `.app`, so an end user
-double-clicks the `.dmg`, drags Lucidos to Applications, and launches — no
-terminal, no Docker, no dev tools. It auto-updates from GitHub Releases.
+the `lucidos` CLI binary (backs the coding-agent permission/question MCP servers,
+the CC hooks, and chat-script `lucidos …` calls), the JS SDK, and the built
+frontend inside the `.app`, so an end user double-clicks the `.dmg`, drags
+Lucidos to Applications, and launches — no terminal, no Docker, no dev tools. It
+auto-updates from GitHub Releases.
 
 Architecture and the *why* behind each choice: [ADR 0012](adr/0012-self-contained-desktop-app.md),
 refined by [ADR 0014](adr/0014-multi-workspace-redesign.md).
@@ -25,8 +27,10 @@ window). On boot it:
 2. spawns the bundled `lucidos-gateway` on the **stable** port (default `5252`)
    with `LUCIDOS_GATEWAY_DATA`, `LUCIDOS_GATEWAY_PG_BACKEND=embedded`,
    `LUCIDOS_PG_BIN_DIR`, `LUCIDOS_PG_LIB_DIR`, `LUCIDOS_ENGINE_BIN`,
-   `LUCIDOS_STATIC_DIR`, `LUCIDOS_SDK_DIR`, `FASTEMBED_CACHE_DIR`, and
-   `LUCIDOS_BOOT_WITHOUT_PROVIDER=1`,
+   `LUCIDOS_CLI_BIN` (the staged `lucidos` CLI the engine resolves for the
+   coding-agent permission/question MCP servers, CC hooks, and chat-script
+   `lucidos …` calls), `LUCIDOS_STATIC_DIR`, `LUCIDOS_SDK_DIR`,
+   `FASTEMBED_CACHE_DIR`, and `LUCIDOS_BOOT_WITHOUT_PROVIDER=1`,
 3. the gateway creates/loads the workspace registry (first run finds it empty and
    creates no workspace — the smart root then serves the picker so the user names
    their first one), provisions embedded Postgres for workspaces that need it, and
@@ -300,6 +304,60 @@ Engine Statelessness).
 - **Fallbacks** when Tailscale isn't wanted: the mkcert local-CA route (LAN-only,
   README documents iOS trust) for PWA/push, or plain HTTP on LAN (browser only —
   no service worker / push, and unauthenticated LAN exposure).
+
+## Packaged runtime environment (dev ≠ launchd) — audit fixes 2026-07-01
+
+The packaged service runs under launchd with the bare system
+`PATH=/usr/bin:/bin:/usr/sbin:/sbin` and none of the dev terminal's
+environment. The 2026-07-01 DMG audit
+(`docs/plans/2026-07-01-dmg-install-audit-fixes.md`) closed the gaps that
+class of difference caused:
+
+- **User-install PATH resolution.** The engine prepends the common
+  user-install bin dirs (`/opt/homebrew/bin`, `/usr/local/bin`,
+  `~/.local/bin`, `~/.npm-global/bin`) to its own process PATH at boot
+  (`core::user_path::augment_process_path`, called from `main.rs` before the
+  preflights), deduplicated and order-preserving, so every child —
+  `claude`/`codex` fallbacks, `#!/usr/bin/env node` shims, chat bash/python
+  tools, stdio MCP servers, Homebrew `git`, the `tailscale` CLI — resolves
+  the same tools a dev shell would. On a dev PATH the dirs are already
+  present, so it's a no-op by construction.
+- **Agent binary resolution = override → probe → PATH.** `resolve_claude_binary`
+  probes `~/.local/bin/claude`, `~/.claude/local/claude`, and the Homebrew
+  prefixes (parity with codex) before the bare PATH lookup. The
+  `coding_agent_claude_path` / `coding_agent_codex_path` preferences
+  (Settings → System → Coding agents) win outright when set, and an invalid
+  configured path FAILS the spawn naming the setting.
+  `GET /api/v1/coding-agents/binaries` reports the live per-agent resolution
+  (override / detected / path / not-found) for that Settings section — only
+  explicit overrides persist; detection is recomputed per request so a brew
+  upgrade self-heals.
+- **Bare `psql` works in coding-agent sessions.** `spawn_env::apply_lucidos_env`
+  prepends `LUCIDOS_PG_BIN_DIR` (the bundled relocatable PG's `bin/`) to the
+  subprocess PATH, matching what `workspace_script_env_vars` already did for
+  chat/scheduled scripts — the advertised `psql -c '…'` contract holds in
+  packaged CC/Codex threads.
+- **Mobile Access shows only reachable URLs.** The "Local network" row derives
+  from the configured gateway bind (`GET /api/v1/network-config`): loopback
+  (the packaged default) shows guidance linking Settings → Network access
+  instead of a dead `http://<lan-ip>` URL; `all` shows the detected LAN URL;
+  a specific-IP bind shows that IP. Plain-HTTP rows carry the "no PWA/push"
+  caveat — Tailscale (`serve`, https) remains the push-capable remote path.
+- **First boot survives an offline embedding-model download.** Engine
+  construction no longer dies when the ~465 MB HuggingFace fetch fails: a
+  fetch-class failure boots with `memory::EmbedderSlot` empty (memory
+  search/extraction/semantic thread search error descriptively), and
+  `spawn_embedder_retry_if_degraded` retries with capped backoff, installing
+  the model + running the re-embed sweep without a restart (notification
+  after repeated failure and on recovery). Corrupt-model / config errors stay
+  fatal. The model caches in `<app-data>/fastembed/`, which survives app
+  updates — the download is once per machine, which is also why the model is
+  NOT bundled into the DMG (it would ~triple every updater download for a
+  file that never changes).
+- **Smoke coverage.** `scripts/e2e-packaged.sh` now also asserts the
+  notification/app-shell serving chain through the gateway proxy: non-stub
+  `sdk.js`, `sw.js` served as JS with a stamped `BUILD_ID`, `manifest.json`,
+  and the `push/vapid-key` endpoint.
 
 ## Status / remaining
 

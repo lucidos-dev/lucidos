@@ -56,9 +56,12 @@ describe('MobileDotIndicator — always visible', () => {
 });
 
 describe('MobileDotIndicator — header contrast', () => {
-  it('uses header foreground tokens for inactive and active dots', () => {
+  it('uses the header foreground token for inactive dots and the active-pane tokens for the active dot', () => {
     expect(ruleBody('.mobile-dot')).toMatch(/background:\s*var\(--header-fg-muted,\s*var\(--text-muted\)\)/);
-    expect(ruleBody('.mobile-dot.active')).toMatch(/background:\s*var\(--header-fg,\s*var\(--accent\)\)/);
+    // Active dot wears the per-theme active-pane fill + glow (base.css
+    // --focus-pill-*).
+    expect(ruleBody('.mobile-dot.active')).toMatch(/background:\s*var\(--focus-pill-bg\)/);
+    expect(ruleBody('.mobile-dot.active')).toMatch(/box-shadow:\s*var\(--focus-pill-glow\)/);
   });
 });
 

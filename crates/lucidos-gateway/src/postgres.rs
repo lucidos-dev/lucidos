@@ -57,11 +57,55 @@ impl PgBackend {
                 let lib = std::env::var_os("LUCIDOS_PG_LIB_DIR")
                     .map(PathBuf::from)
                     .ok_or("LUCIDOS_PG_LIB_DIR required for embedded Postgres backend")?;
+                // The vars being SET is not enough — a mis-staged / quarantined
+                // `postgres/` resource makes the first `<bin>/postgres --version`
+                // (or `initdb`) fail with a raw `os error 2` (no path), which then
+                // surfaces as the boot-splash hang. Validate the bundled tree
+                // exists here so the failure is a path-bearing boot error instead.
+                validate_embedded_pg_dirs(&bin, &lib)?;
                 Ok(PgBackend::Embedded { bin, lib })
             }
             other => Err(format!("unknown LUCIDOS_GATEWAY_PG_BACKEND '{other}'").into()),
         }
     }
+}
+
+/// Validate the bundled relocatable-PostgreSQL tree referenced by
+/// `LUCIDOS_PG_BIN_DIR` (`<postgres>/bin`) + `LUCIDOS_PG_LIB_DIR`
+/// (`<postgres>/lib`): the `postgres` server binary must exist, `lib` must be a
+/// dir, and the sibling `share/` (the bootstrap `postgres.bki`, timezone data,
+/// and config templates `initdb` resolves via `bin/../share`) must exist —
+/// otherwise first-ever `initdb` fails with PG's opaque "could not find … share".
+/// Path-bearing errors so a packaging regression is diagnosable from the boot log.
+fn validate_embedded_pg_dirs(bin: &Path, lib: &Path) -> Result<(), BoxError> {
+    let postgres = bin.join("postgres");
+    if !postgres.is_file() {
+        return Err(format!(
+            "bundled Postgres server binary not found at {} (LUCIDOS_PG_BIN_DIR)",
+            postgres.display()
+        )
+        .into());
+    }
+    if !lib.is_dir() {
+        return Err(format!(
+            "bundled Postgres lib dir not found at {} (LUCIDOS_PG_LIB_DIR)",
+            lib.display()
+        )
+        .into());
+    }
+    // `share/` is resolved relative to the binary (`bin/../share`); the bundle
+    // stages bin/lib/share together, so derive it from the bin dir's parent.
+    if let Some(share) = bin.parent().map(|p| p.join("share")) {
+        if !share.is_dir() {
+            return Err(format!(
+                "bundled Postgres share dir not found at {} (relocatable PG needs bin/../share \
+                 for initdb)",
+                share.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// A handle to a provisioned workspace database, used on workspace delete.
@@ -1033,6 +1077,51 @@ fn parse_host_port(url: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a fake relocatable-PG tree (bin/postgres, lib/, share/) under a temp
+    /// dir; returns (root, bin, lib).
+    fn fake_pg_tree() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        let lib = root.path().join("lib");
+        let share = root.path().join("share");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::create_dir_all(&share).unwrap();
+        std::fs::write(bin.join("postgres"), b"").unwrap();
+        (root, bin, lib)
+    }
+
+    #[test]
+    fn validate_embedded_pg_dirs_accepts_a_complete_tree() {
+        let (_root, bin, lib) = fake_pg_tree();
+        assert!(validate_embedded_pg_dirs(&bin, &lib).is_ok());
+    }
+
+    #[test]
+    fn validate_embedded_pg_dirs_rejects_missing_server_binary() {
+        let (_root, bin, lib) = fake_pg_tree();
+        std::fs::remove_file(bin.join("postgres")).unwrap();
+        let err = validate_embedded_pg_dirs(&bin, &lib).expect_err("missing postgres must error");
+        assert!(err.to_string().contains("postgres"), "{err}");
+    }
+
+    #[test]
+    fn validate_embedded_pg_dirs_rejects_missing_lib() {
+        let (_root, bin, lib) = fake_pg_tree();
+        std::fs::remove_dir_all(&lib).unwrap();
+        let err = validate_embedded_pg_dirs(&bin, &lib).expect_err("missing lib must error");
+        assert!(err.to_string().contains("lib"), "{err}");
+    }
+
+    #[test]
+    fn validate_embedded_pg_dirs_rejects_missing_share() {
+        // The relocatable-PG share/ dependency (#11): initdb resolves bin/../share.
+        let (root, bin, lib) = fake_pg_tree();
+        std::fs::remove_dir_all(root.path().join("share")).unwrap();
+        let err = validate_embedded_pg_dirs(&bin, &lib).expect_err("missing share must error");
+        assert!(err.to_string().contains("share"), "{err}");
+    }
 
     #[test]
     fn parse_host_port_variants() {

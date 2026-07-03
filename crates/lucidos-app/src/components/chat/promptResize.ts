@@ -57,6 +57,64 @@ export function resizeTextarea(el: HTMLTextAreaElement): boolean {
   return applyHeight(el, el.scrollHeight, prevHeight, curLen);
 }
 
+/** Cancels the in-flight height animation on a given textarea, if any. Keyed by
+ *  element so a rapid second switch can tear the first animation's listener +
+ *  timer down before starting its own — otherwise the stale `finish` would fire
+ *  later and snap the box back to the previous switch's target height. */
+const pendingHeightAnim = new WeakMap<HTMLTextAreaElement, () => void>();
+
+/** Smoothly animate a textarea's height from a previous inline height to the one
+ *  it currently rests at. The caller must have ALREADY applied the final height
+ *  (e.g. via {@link resizeTextarea}) before calling — we read `el.style.height`
+ *  as the target, invert to `fromHeight`, then transition back. Used for the
+ *  draft→draft compose switch so the box eases to the new draft's size instead of
+ *  snapping. Both endpoints are CSS `height` strings (not offsetHeight), so the
+ *  interpolation is box-sizing-agnostic and lands exactly where resizeTextarea
+ *  left it. No-op if the height didn't change. */
+export function animateTextareaHeightFrom(el: HTMLTextAreaElement, fromHeight: string): void {
+  // A switch mid-animation supersedes the previous one — tear it down first so
+  // its listener/timer can't later clobber this run's target height.
+  pendingHeightAnim.get(el)?.();
+
+  const target = el.style.height;
+  if (!target || !fromHeight || target === fromHeight) return;
+
+  el.style.transition = 'none';
+  el.style.height = fromHeight;
+  void el.offsetHeight; // commit the start height before transitioning
+
+  let timer: ReturnType<typeof setTimeout>;
+  let raf1: number | undefined;
+  let raf2: number | undefined;
+  const cancel = () => {
+    clearTimeout(timer);
+    // Cancel the pending frames too — a same-frame re-switch calls cancel()
+    // before raf1 fires, so without this the stale inner rAF would still add a
+    // finish listener that never gets removed.
+    if (raf1 !== undefined) cancelAnimationFrame(raf1);
+    if (raf2 !== undefined) cancelAnimationFrame(raf2);
+    el.removeEventListener('transitionend', finish);
+    el.style.transition = '';
+    pendingHeightAnim.delete(el);
+  };
+  const finish = (e?: TransitionEvent) => {
+    if (e && (e.target !== el || e.propertyName !== 'height')) return;
+    cancel();
+    el.style.height = target;
+  };
+  pendingHeightAnim.set(el, cancel);
+
+  raf1 = requestAnimationFrame(() => {
+    raf2 = requestAnimationFrame(() => {
+      el.addEventListener('transitionend', finish);
+      el.style.transition = 'height 0.3s ease';
+      el.style.height = target;
+    });
+  });
+  // Safety net if transitionend never fires (e.g. tab hidden mid-switch).
+  timer = setTimeout(finish, 400);
+}
+
 /** Re-measure when root font metrics change (UI scale, font family, font load).
  *  resizeTextarea() sets height in px — goes stale when root font-size changes
  *  (e.g. after loadPreferences applies the user's UI scale on page reload). */

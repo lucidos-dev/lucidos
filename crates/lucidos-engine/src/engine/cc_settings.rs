@@ -1,10 +1,12 @@
 //! Generates `<workspace>/.lucidos/cc-settings.json` — the config CC reads via
 //! `--settings` to discover our `PreToolUse` hook on `AskUserQuestion`. The
 //! hook invokes `lucidos ask-user-question-hook` (a sibling subcommand on the
-//! same `lucidos-cli` binary the engine already prepends to CC's PATH for
-//! the MCP permission server). Keeps the JSON shape literal; no per-spawn
-//! interpolation. See `claude_code::permission_mcp_config_json` for the same
-//! pattern.
+//! same `lucidos` CLI binary the engine already prepends to CC's PATH for the
+//! MCP permission server — resolved via `LUCIDOS_CLI_BIN` in a packaged build,
+//! the exe sibling-walk in dev; see `lucidos_cli::resolve_cli_dir`, and the
+//! fail-fast in `ClaudeCodeRuntime::spawn` when the CLI can't be resolved).
+//! Keeps the JSON shape literal; no per-spawn interpolation. See
+//! `claude_code::permission_mcp_config_json` for the same pattern.
 
 use std::path::{Path, PathBuf};
 

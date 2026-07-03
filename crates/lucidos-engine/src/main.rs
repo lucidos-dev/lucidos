@@ -74,6 +74,18 @@ async fn shutdown_signal(
     // set much later (scheduler.shutdown()), too late to gate these events.
     engine.mark_shutting_down();
 
+    // Emit the boundary "Switched to new version" / abort events NOW, at real
+    // teardown — never at switch-request time, so nothing shows "Switched/Aborted"
+    // while the old engine is still alive through a dev rebuild. Reads the actor
+    // the switch handler stashed: a device actor → "You" attribution + recovery
+    // auto-resumes in-flight coding-agent threads; `None` (a bare stop.sh /
+    // external SIGUSR1, or a crash — which never reaches this path) → System
+    // attribution + manual Continue. Runs BEFORE the session sweeps below so its
+    // `external_terminal_emitted` flags suppress their duplicate emits.
+    engine
+        .abort_in_flight_for_restart(engine.take_restart_actor())
+        .await;
+
     // Gracefully stop coding-agent sessions — interrupts active work,
     // waits for CodingAgentIdled events (which persist cc_session_id),
     // then cancels remaining sessions. Must happen before HTTP shutdown
@@ -142,6 +154,69 @@ fn raise_fd_limit() {
     }
 }
 
+/// One-time `git --version` boot preflight.
+///
+/// `git` is a hard dependency of the coding-agent / Apply / worktree flow
+/// (`git_ops` drives ~89 bare `git` call sites) but NOT of chat. So a missing or
+/// broken `git` must surface as a loud, actionable warning at boot — NOT a fatal
+/// exit: aborting would brick a chat-only packaged install on a Mac with no
+/// Xcode Command Line Tools and respawn-loop it under launchd (the boot-splash
+/// hang this audit explicitly avoids). Without this the failure only appears deep
+/// in an apply/commit as a cryptic `git … failed`. On the launchd minimal PATH
+/// `/usr/bin/git` is the Command-Line-Tools shim, which ENOENTs when CLT isn't
+/// installed.
+fn git_preflight() {
+    match std::process::Command::new("git").arg("--version").output() {
+        Ok(out) if out.status.success() => {
+            log!(
+                "[Startup] git: {}",
+                String::from_utf8_lossy(&out.stdout).trim()
+            );
+        }
+        Ok(out) => log!(
+            "[Startup] WARNING: `git --version` exited {} — coding agents, Apply, and repo \
+             operations will fail. On macOS install the Command Line Tools: `xcode-select --install`",
+            out.status
+        ),
+        Err(e) => log!(
+            "[Startup] WARNING: `git` not found ({e}) — coding agents, Apply, and repo \
+             operations will fail. On macOS install the Command Line Tools: `xcode-select --install`"
+        ),
+    }
+}
+
+/// One-time `python3 --version` boot preflight — `git_preflight`'s sibling.
+///
+/// `python3` backs the `run_python` tool (venv creation spawns a bare
+/// `python3`, see `runtime/python.rs`) but nothing else, so — like git — a
+/// missing interpreter must be a loud, actionable boot warning, never a fatal
+/// exit. On the launchd minimal PATH `/usr/bin/python3` is the
+/// Command-Line-Tools shim, which errors when CLT isn't installed; without
+/// this preflight that only surfaced as a cryptic venv-creation failure on the
+/// first `run_python` call.
+fn python_preflight() {
+    match std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            log!(
+                "[Startup] python3: {}",
+                String::from_utf8_lossy(&out.stdout).trim()
+            );
+        }
+        Ok(out) => log!(
+            "[Startup] WARNING: `python3 --version` exited {} — the run_python tool will fail. \
+             On macOS install the Command Line Tools: `xcode-select --install`",
+            out.status
+        ),
+        Err(e) => log!(
+            "[Startup] WARNING: `python3` not found ({e}) — the run_python tool will fail. \
+             On macOS install the Command Line Tools: `xcode-select --install`"
+        ),
+    }
+}
+
 /// Worker-thread stack size for the Tokio runtime.
 ///
 /// The engine polls deeply-nested async chains on a single worker thread. A
@@ -183,6 +258,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             lucidos_engine::LUCIDOS_RELEASE,
             env!("CARGO_PKG_VERSION"),
         );
+        return Ok(());
+    }
+
+    // Print the baked ENGINE_BUILD_ID and exit. A running engine forks the on-disk
+    // binary with this flag to compare build ids (the dev "new version available"
+    // check — mirrors `lucidos-gateway --build-id`). Bare `println!`: machine-read
+    // stdout, so no `log!` prefix.
+    if std::env::args().skip(1).any(|a| a == "--build-id") {
+        println!("{}", lucidos_engine::ENGINE_BUILD_ID);
         return Ok(());
     }
 
@@ -290,6 +374,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let sid = unsafe { libc::getsid(0) };
         log!("[Startup] ppid={} pgid={} sid={}", ppid, pgid, sid);
     }
+
+    // Prepend the common user-install bin dirs (Homebrew, ~/.local/bin, npm)
+    // to the process PATH before anything spawns or probes tools. A packaged
+    // engine (launchd LaunchAgent / systemd --user / the .app) inherits the
+    // service manager's minimal PATH, which would ENOENT bare-name tools —
+    // `claude`/`codex` fallbacks, chat bash/python shell-outs, MCP servers —
+    // that resolve fine in a dev shell. No-op on a dev PATH (dedupe).
+    lucidos_engine::core::user_path::augment_process_path();
+
+    git_preflight();
+    python_preflight();
 
     // Use local workspace for development, /workspace for Docker
     let workspace_path = std::env::var("LUCIDOS_WORKSPACE")
@@ -483,10 +578,37 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared_engine.set_self_arc(&shared_engine);
     shared_engine.start_parent_callback_listener();
     shared_engine.start_apply_all_driver();
+    // A first boot whose embedding-model download failed (offline packaged
+    // install) came up with memory degraded — keep retrying in the background
+    // and install the model without a restart. No-op on a normal boot.
+    shared_engine.spawn_embedder_retry_if_degraded();
 
     // Construction is done (migrations + embedder); the recovery sweeps below run
     // before the HTTP server binds, so narrate them on the boot splash.
     lucidos_engine::boot_report::report(lucidos_engine::boot_report::RECOVERING);
+
+    // Acquire the engine startup lease BEFORE any reset/recovery below. A respawn
+    // is not atomic — the gateway spawns this engine before the previous one has
+    // exited (`respawn_stack` reaps the old child in a detached task) — so without
+    // this the recovery sweeps would run against a DB the old engine is still
+    // mutating: reading state before its device-attributed switch-abort boundary
+    // lands (auto-resume misfires → manual Continue) and before its interrupted
+    // Claude Code subprocesses finish draining (their late no-actor activity
+    // events re-project threads to a phantom `running`). The lease is a
+    // per-database advisory lock the previous engine holds until its process
+    // exits (graceful: through its abort + CC-drain steps; crash: released
+    // instantly when its connection dies), so this call blocks until the
+    // predecessor is gone and recovery runs against a quiescent DB. Held as a
+    // `run()` local for this engine's entire lifetime — dropped only when `run()`
+    // returns (after our own graceful shutdown), releasing it for OUR successor.
+    // Fail-open + bounded (see `startup_lease`): a hung predecessor degrades to
+    // today's behavior rather than wedging boot. See
+    // `docs/plans/2026-07-01-engine-startup-lease-recovery-race.md`.
+    let _startup_lease = lucidos_engine::engine::startup_lease::acquire_startup_lease(
+        &database_url,
+        lucidos_engine::engine::startup_lease::DEFAULT_MAX_WAIT,
+    )
+    .await;
 
     // If the bash supervisor dropped a respawn sidecar (the previous engine
     // pid died unexpectedly), emit one EngineSupervisorRespawned event so
@@ -733,6 +855,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     shared_engine.start_spawn_request_consumer(spawn_request_rx);
 
+    // Auto-resume the coding-agent threads recovery flagged for a user-initiated
+    // Switch to new version. Emitted HERE — after the dispatcher subscribed above —
+    // because recovery ran before the dispatcher existed, so a ContinuationRequested
+    // emitted during recovery would be missed. Crash-interrupted threads were NOT
+    // queued (they keep the manual Continue affordance), so this never re-runs work
+    // that may have crashed the engine.
+    shared_engine.resume_pending_switches().await;
+
     // Start the external watchdog. Scans agent_sessions every 30 s from
     // outside any per-thread `select!` — catches the May-2026 "stuck for
     // 68 min" failure mode where the in-loop watchdog was starved by a
@@ -786,6 +916,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         scheduler.clone(),
         started_at,
     );
+    // Dev-only: periodically advance this engine's served-frontend snapshot to the
+    // checkout-shared `dist/` when INV-A-safe, so a PEER workspace picks up another
+    // workspace's frontend-only Apply without a manual restart (the applying engine
+    // only advances its OWN snapshot). Spawned after `create_router` so the served
+    // handle (`init_served_frontend`) is registered before the first tick. No-op in
+    // packaged / headless. See
+    // `docs/plans/2026-07-03-cross-workspace-frontend-only-refresh.md`.
+    let _served_frontend_sync = shared_engine.spawn_served_frontend_sync();
     let api_port = std::env::var("LUCIDOS_API_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
@@ -845,18 +983,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         scheduler,
     ));
 
-    // Detect TLS certs — if present, serve HTTPS with HTTP/2
+    // Detect TLS certs — if present, serve HTTPS with HTTP/2. The http/https
+    // decision is resolved in ONE place (`net_config::tls_scheme_from`); the
+    // `if let` below only loads the cert paths that decision implies.
     let tls_cert = std::env::var("LUCIDOS_TLS_CERT").ok();
     let tls_key = std::env::var("LUCIDOS_TLS_KEY").ok();
+    let scheme = net_config::tls_scheme_from(tls_cert.as_deref(), tls_key.as_deref());
 
     // Serve every resolved address concurrently, sharing the one graceful-shutdown
     // `Handle` so a single shutdown stops all sockets. A bind failure on any
     // address fails fast (same as the prior single-bind semantics).
-    if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
+    if scheme == net_config::SCHEME_HTTPS {
+        // `tls_scheme_from` returned https ⇒ both paths are present and non-empty.
+        let (cert_path, key_path) = (tls_cert.unwrap_or_default(), tls_key.unwrap_or_default());
         let tls_config =
             axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path).await?;
         log!(
-            "[Startup] API server listening on https://{}  (HTTP/2 + TLS, {})",
+            "[Startup] API server listening on {}://{}  (HTTP/2 + TLS, {})",
+            scheme,
             addr,
             bind_label
         );
@@ -868,7 +1012,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await?;
     } else {
         log!(
-            "[Startup] API server listening on http://{}  ({})",
+            "[Startup] API server listening on {}://{}  ({})",
+            scheme,
             addr,
             bind_label
         );

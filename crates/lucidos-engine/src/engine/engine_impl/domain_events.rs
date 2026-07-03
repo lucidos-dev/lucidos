@@ -64,14 +64,23 @@ impl LucidosEngine {
             .await
     }
 
-    /// Update a trigger's `last_run` in memory and persist a `TriggerExecuted`
-    /// event via EventBus. Used by both cron and event-based trigger execution.
-    pub async fn record_trigger_executed(&self, trigger_id: &str) {
+    /// Update a trigger's `last_run` + `last_run_status` in memory and persist a
+    /// `TriggerExecuted` event via EventBus. Used by both cron and event-based
+    /// trigger execution. `status` is the outcome of the firing (the run's
+    /// `Result`) so a threadless (script) trigger's OK/failed state is visible
+    /// on its panel row; it rides the payload so `replay.rs` rebuilds it on boot
+    /// exactly as it does `last_run`.
+    pub async fn record_trigger_executed(
+        &self,
+        trigger_id: &str,
+        status: crate::triggers::TriggerRunStatus,
+    ) {
         let now = chrono::Utc::now();
         {
             let mut configs = self.trigger_configs.write().unwrap();
             if let Some(c) = configs.get_mut(trigger_id) {
                 c.last_run = Some(now);
+                c.last_run_status = Some(status);
             }
         }
         if let Err(e) = self
@@ -82,6 +91,7 @@ impl LucidosEngine {
                     payload: serde_json::json!({
                         "trigger_id": trigger_id,
                         "last_run": now.to_rfc3339(),
+                        "status": status.as_str(),
                     }),
                 },
             ))

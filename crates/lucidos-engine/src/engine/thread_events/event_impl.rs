@@ -79,8 +79,10 @@ impl ThreadEvent {
             permission_mode: perm,
             coding_agent,
             // Settings-only emit (user changed model/effort/permission mid-session).
-            // The session id is pinned by the Init-time emit; see the variant doc.
+            // The session id AND config dir are pinned by the Init-time emit; see
+            // the variant doc.
             cc_session_id: None,
+            claude_config_dir: None,
         })
     }
 

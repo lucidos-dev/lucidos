@@ -15,9 +15,16 @@ export function ConnectionStatus() {
     const brand = brandLabel?.closest('.pane-header-brand') as HTMLElement | null;
     const row = brand?.parentElement;
     if (!brandLabel || !brand || !row) return;
-    // Mobile: brand shares row width with .pane-header-spacer. Desktop: brand
-    // has fixed width and no spacer sibling, so spacer.clientWidth defaults to 0.
-    const spacer = row.querySelector(':scope > .pane-header-spacer') as HTMLElement | null;
+    // The brand shares the row with .pane-header-spacer(s). On MOBILE the brand
+    // is absolutely centered (shrink-to-content), so brandLabel.clientWidth has
+    // no slack past the text — the trailing spacer holds the row's free width and
+    // IS the room the name can occupy, so it must be summed in (dropping it
+    // latched the name hidden — the "workspace name gone" bug). On DESKTOP the
+    // brand-label is a fixed-width centered box with its own slack and there are
+    // no spacer siblings, so the sum is 0.
+    const spacers = Array.from(
+      row.querySelectorAll(':scope > .pane-header-spacer'),
+    ) as HTMLElement[];
 
     // Mirrors .workspace-name-label margin-left in panels.css. is-hidden zeros
     // it (so hiding frees the gap), so the live computed margin can't be read
@@ -35,10 +42,13 @@ export function ConnectionStatus() {
         const cs = getComputedStyle(child);
         nonWorkspace += child.scrollWidth + (parseFloat(cs.marginLeft) || 0) + (parseFloat(cs.marginRight) || 0);
       }
-      // brandLabel.clientWidth is the usable area inside brand (skips brand's
-      // padding-left for the collapsed-thread-actions overlap on desktop).
-      // Spacer slack only applies on mobile, where brand and spacer share row width.
-      const available = brandLabel.clientWidth + (spacer?.clientWidth || 0);
+      // brandLabel.clientWidth is the usable area inside the label; the trailing
+      // spacer's width is the extra room the name can grow into on mobile (0 on
+      // desktop). A long name is kept from spilling over the leading icons not by
+      // this budget but by the bounded .pane-header-brand-label (mobile.css),
+      // which ellipsis-truncates .workspace-name-label within the centered box.
+      const available =
+        brandLabel.clientWidth + spacers.reduce((n, s) => n + s.clientWidth, 0);
       // 0.5px tolerance for subpixel rounding.
       setHidden(nonWorkspace + wsMarginPx > available + 0.5);
     };

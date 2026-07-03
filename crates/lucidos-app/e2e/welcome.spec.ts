@@ -55,8 +55,8 @@ test.describe('Welcome surface', () => {
     const welcome = page.locator('.welcome-message:visible').first();
     await expect(welcome).toBeVisible({ timeout: 10_000 });
 
-    // The carousel suggestion is a button — clicking it prefills the prompt via
-    // prefillCompose so the user can edit/send, rather than read-only copy.
+    // The carousel suggestion is a button — clicking it drops the text into the
+    // prompt via applySuggestion so the user can edit/send, rather than read-only copy.
     const suggestion = page.locator('.welcome-carousel-item:visible').first();
     await expect(suggestion).toBeVisible();
     const text = (await suggestion.innerText()).trim();
@@ -68,6 +68,44 @@ test.describe('Welcome surface', () => {
     // welcome stays (no exchange yet) and the text matches the suggestion.
     const input = await waitForVisibleInput(page, 10_000);
     await expect.poll(async () => (await input.inputValue()).trim(), { timeout: 5_000 }).toBe(text);
+    await expect(welcome).toBeVisible();
+  });
+
+  test('draft in progress: clicking a suggestion confirms, then overrides the prompt text', async ({ page }) => {
+    await navigateToApp(page);
+
+    const welcome = page.locator('.welcome-message:visible').first();
+    await expect(welcome).toBeVisible({ timeout: 10_000 });
+
+    // Start typing a draft first — the override must not silently blow it away.
+    const input = await waitForVisibleInput(page, 10_000);
+    await input.click();
+    await input.fill('my own half-typed idea');
+    await expect.poll(async () => (await input.inputValue()).trim()).toBe('my own half-typed idea');
+
+    const suggestion = page.locator('.welcome-carousel-item:visible').first();
+    const suggestionText = (await suggestion.innerText()).trim();
+    expect(suggestionText.length).toBeGreaterThan(0);
+
+    // Click 1: a confirm guards the override. Declining keeps the draft.
+    await suggestion.click();
+    const dialog = page.locator('.confirm-dialog');
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
+    await dialog.getByRole('button', { name: 'Keep my draft' }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect.poll(async () => (await input.inputValue()).trim()).toBe('my own half-typed idea');
+
+    // Click 2: accepting overrides the prompt text. This is the bug guard — the
+    // draft/drawer updated but the visible prompt stayed stale before the fix
+    // (the sync skips a focused, non-empty textarea to protect in-flight typing).
+    await suggestion.click();
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
+    await dialog.getByRole('button', { name: 'Replace' }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect
+      .poll(async () => (await input.inputValue()).trim(), { timeout: 5_000 })
+      .toBe(suggestionText);
+    // Still a draft (not sent) — the welcome stays.
     await expect(welcome).toBeVisible();
   });
 

@@ -46,25 +46,16 @@ impl VertexProvider {
         loop {
             attempt += 1;
 
-            let resp = match self
+            let builder = self
                 .streaming_client
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", access_token))
                 .header("Content-Type", "application/json")
-                .json(&request)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    if attempt <= crate::llm::MAX_RETRIES {
-                        let delay = crate::llm::retry_delay(attempt, 1);
-                        crate::llm::log_retry(model, &format!("Network error: {:?}", e), attempt, delay);
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                    return Err(crate::llm::with_retry_context(e, attempt).into());
-                }
+                .json(&request);
+            let resp = match crate::llm::send_streaming_request(builder, model, attempt).await {
+                crate::llm::StreamSend::Got(r) => r,
+                crate::llm::StreamSend::Retry => continue,
+                crate::llm::StreamSend::Failed(e) => return Err(e),
             };
 
             let status = resp.status();

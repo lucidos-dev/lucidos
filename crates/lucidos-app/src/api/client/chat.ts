@@ -53,10 +53,27 @@ export async function submitChat(body: ChatRequestBody): Promise<{ event_id: str
   return res.json();
 }
 
-export async function cancelChat(threadId?: string): Promise<void> {
+/** Parse a `{"canceled": bool}` cancel/stop response. A missing or unparsable
+ *  body (older engine, or any 200 with no JSON) defaults to `true` — the
+ *  pre-body behavior, where every 200 meant "canceled" — so a legacy engine
+ *  never triggers the stale-state heal path. `false` means the server had
+ *  nothing to cancel: the caller's view is stale and it should re-sync. */
+async function parseCanceled(res: Response): Promise<boolean> {
+  const body = await res.json().catch(() => null);
+  if (body && typeof body === 'object' && typeof (body as { canceled?: unknown }).canceled === 'boolean') {
+    return (body as { canceled: boolean }).canceled;
+  }
+  return true;
+}
+
+/** Cancel a running Lucidos Agent (chat) turn. Returns whether the server
+ *  actually canceled something: `false` when nothing was running (the client's
+ *  optimistic "canceling" state is stale and must be reconciled). */
+export async function cancelChat(threadId?: string): Promise<boolean> {
   const params = threadId ? `?thread_id=${encodeURIComponent(threadId)}` : '';
   const res = await mutatingFetchIdempotent(`${API}/chat/cancel${params}`, { method: 'POST' });
   await throwIfNotOk(res);
+  return parseCanceled(res);
 }
 
 export async function removeQueuedMessage(threadId: string, messageId: string): Promise<void> {
@@ -154,8 +171,14 @@ export async function fetchCodingAgentCommands(
  *
  * Archive uses a different endpoint (`POST /api/v1/threads/archive`) which sets
  * `StopReason::Archive` so `ThreadArchived` is the terminator.
+ *
+ * Returns whether the server actually stopped something. A default (no
+ * apply/discard) Stop that races an already-finished turn returns `false` — the
+ * client's optimistic "canceling" state is stale and must be reconciled. Apply
+ * / Discard always report `true` (their terminator is `ChangeApplied` /
+ * `ChangeDiscarded`, and callers don't read the return).
  */
-export async function stopClaudeCode(apply?: boolean, threadId?: string, discard?: boolean): Promise<void> {
+export async function stopClaudeCode(apply?: boolean, threadId?: string, discard?: boolean): Promise<boolean> {
   const params = new URLSearchParams();
   if (apply) params.set('apply', 'true');
   if (discard) params.set('discard', 'true');
@@ -166,6 +189,7 @@ export async function stopClaudeCode(apply?: boolean, threadId?: string, discard
   // reject with TypeError("Load failed"), forcing the user to click again.
   const res = await mutatingFetchIdempotent(url, { method: 'POST' });
   await throwIfNotOk(res);
+  return parseCanceled(res);
 }
 
 export async function discardCCChanges(threadId: string): Promise<void> {

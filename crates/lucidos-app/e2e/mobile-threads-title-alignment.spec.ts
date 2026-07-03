@@ -1,52 +1,116 @@
 /**
- * The "Threads" title in MobileThreadsHeader must start at the same x-position
- * as the "Lucidos" title in MobileThreadHeader, and must not ellipsis-truncate
- * within the constrained mobile header row.
+ * Mobile header titles are TRUE-centered on the row middle (like the desktop
+ * header and the pane dots), NOT centered between the leading/trailing icon
+ * clusters — an in-flow between-clusters title drifts off the row middle whenever
+ * the two clusters differ in width, which reads as "off-center".
+ *
+ * They must also never overlap the leading icon cluster: a title wide enough to
+ * reach it clamps + ellipsizes so its left edge stays past the icons (guaranteed
+ * structurally by the absolute centering + a symmetric max-width reserve; the
+ * brand's long workspace name truncates within the centered box). This guards
+ * both the off-center regression (flanking-spacer centering) and the original
+ * overlap regression (a title spilling over the hamburger/nav).
  */
 import { test, expect, Page } from './fixtures';
 import { assertHealthy, navigateToApp, openThreadDrawer } from './helpers';
 
-interface TitleMetrics { left: number; clientWidth: number; scrollWidth: number }
-
-async function getTitleMetrics(page: Page, headerSelector: string, text: string): Promise<TitleMetrics | null> {
-  return page.evaluate(({ sel, txt }) => {
-    const els = document.querySelectorAll(`${sel} .pane-header-title`);
-    for (const el of els) {
-      const rect = el.getBoundingClientRect();
-      if (rect.width > 0 && (el.textContent ?? '').trim() === txt) {
-        const html = el as HTMLElement;
-        return { left: rect.left, clientWidth: html.clientWidth, scrollWidth: html.scrollWidth };
-      }
-    }
-    return null;
-  }, { sel: headerSelector, txt: text });
+interface Metrics {
+  center: number;
+  rowCenter: number;
+  left: number;
+  leadingRight: number;
+  clientWidth: number;
+  scrollWidth: number;
 }
 
-test.describe('Mobile threads title alignment', () => {
+/** Measure a header's centered title against its own row and its leading icon
+ *  cluster. `leadingSel` is the rightmost in-flow leading element. Returns null
+ *  if the header, its row, the title, or the leading element isn't visible. */
+async function measure(
+  page: Page,
+  headerSel: string,
+  titleSel: string,
+  leadingSel: string,
+  text?: string,
+): Promise<Metrics | null> {
+  return page.evaluate(({ headerSel, titleSel, leadingSel, text }) => {
+    const header = document.querySelector(headerSel) as HTMLElement | null;
+    if (!header || header.getBoundingClientRect().width === 0) return null;
+    const row = header.querySelector('.mobile-header-row') as HTMLElement | null;
+    const leading = header.querySelector(leadingSel) as HTMLElement | null;
+    if (!row || !leading || leading.getBoundingClientRect().width === 0) return null;
+    const rowRect = row.getBoundingClientRect();
+    for (const el of header.querySelectorAll(titleSel)) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0) continue;
+      if (text != null && (el.textContent ?? '').trim() !== text) continue;
+      const h = el as HTMLElement;
+      return {
+        center: rect.left + rect.width / 2,
+        rowCenter: rowRect.left + rowRect.width / 2,
+        left: rect.left,
+        leadingRight: leading.getBoundingClientRect().right,
+        clientWidth: h.clientWidth,
+        scrollWidth: h.scrollWidth,
+      };
+    }
+    return null;
+  }, { headerSel, titleSel, leadingSel, text });
+}
+
+test.describe('Mobile header titles are centered and clear of the leading icons', () => {
   test.use({ viewport: { width: 375, height: 812 } });
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
   });
 
-  test('Threads title aligns with Lucidos title and is not truncated', async ({ page }) => {
+  test('titles sit on the row middle and never overlap the leading cluster', async ({ page }) => {
     await navigateToApp(page);
 
-    const lucidos = await getTitleMetrics(page, '.mobile-thread-header', 'Lucidos');
-    expect(lucidos, 'Lucidos title not found').not.toBeNull();
+    // Thread (brand) header: the brand is centered on the row middle and its left
+    // edge stays past the hamburger + nav cluster.
+    const brand = await measure(page, '.mobile-thread-header', '.pane-header-brand', '.mobile-nav-slot');
+    expect(brand, 'brand / nav slot not found').not.toBeNull();
+    expect(
+      Math.abs(brand!.center - brand!.rowCenter),
+      `brand center=${brand!.center} vs row center=${brand!.rowCenter}`,
+    ).toBeLessThan(2.5);
+    expect(
+      brand!.left,
+      `brand left=${brand!.left} overlaps nav right=${brand!.leadingRight}`,
+    ).toBeGreaterThanOrEqual(brand!.leadingRight - 0.5);
 
+    // The workspace name must stay VISIBLE in the brand — the absolute-centered
+    // brand is shrink-to-content, so the name-hide budget must include the
+    // trailing spacer's slack; dropping it latched the name hidden (regression).
+    // (Skips only if this workspace has no name to render.)
+    const wsName = await page.evaluate(() => {
+      const el = document.querySelector('.mobile-thread-header .workspace-name-label') as HTMLElement | null;
+      if (!el) return null;
+      return { hidden: el.classList.contains('is-hidden'), clientWidth: el.clientWidth };
+    });
+    if (wsName) {
+      expect(wsName.hidden, 'workspace name is .is-hidden in the brand').toBe(false);
+      expect(wsName.clientWidth, 'workspace name has zero width in the brand').toBeGreaterThan(0);
+    }
+
+    // Threads header: "Threads" is centered on the row middle, not truncated, and
+    // clear of the Filter control.
     await openThreadDrawer(page);
-    const threads = await getTitleMetrics(page, '.mobile-threads-header', 'Threads');
-    expect(threads, 'Threads title not found').not.toBeNull();
-
-    // Subpixel rounding tolerance.
-    expect(Math.abs(threads!.left - lucidos!.left),
-      `Threads title left=${threads!.left} vs Lucidos title left=${lucidos!.left}`)
-      .toBeLessThan(1);
-
-    // clientWidth < scrollWidth would mean the title is ellipsis-truncated.
-    expect(threads!.clientWidth,
-      `Threads title is truncated (clientWidth=${threads!.clientWidth} < scrollWidth=${threads!.scrollWidth})`)
-      .toBeGreaterThanOrEqual(threads!.scrollWidth);
+    const threads = await measure(page, '.mobile-threads-header', '.pane-header-title', '.view-selector-slot', 'Threads');
+    expect(threads, 'Threads title / filter slot not found').not.toBeNull();
+    expect(
+      Math.abs(threads!.center - threads!.rowCenter),
+      `Threads center=${threads!.center} vs row center=${threads!.rowCenter}`,
+    ).toBeLessThan(2.5);
+    expect(
+      threads!.left,
+      `Threads title left=${threads!.left} overlaps filter right=${threads!.leadingRight}`,
+    ).toBeGreaterThanOrEqual(threads!.leadingRight - 0.5);
+    expect(
+      threads!.clientWidth,
+      `Threads title truncated (clientWidth=${threads!.clientWidth} < scrollWidth=${threads!.scrollWidth})`,
+    ).toBeGreaterThanOrEqual(threads!.scrollWidth);
   });
 });

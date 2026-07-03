@@ -12,6 +12,7 @@ mod command_checkpoint;
 mod command_permission;
 mod data_api;
 mod disk_usage;
+pub(crate) mod frontend_snapshot;
 pub(crate) mod error;
 mod history;
 mod images;
@@ -84,7 +85,7 @@ use crate::core::{
     OAuthAccountInfo, SessionMessage, Step,
 };
 use crate::engine::{CaptureResult, LucidosEngine};
-use crate::memory::{FastEmbedProvider, PgVectorIndex};
+use crate::memory::{EmbedderSlot, PgVectorIndex};
 use crate::scheduler::{Notification, PushSubscription, SchedulerManager};
 
 pub(crate) use error::ApiError;
@@ -181,7 +182,7 @@ pub struct AppState {
     pub engine: SharedEngine,
     pub pool: PgPool,
     pub event_store: EventStore,
-    pub embedder: Arc<FastEmbedProvider>,
+    pub embedder: Arc<EmbedderSlot>,
     pub memory_index: Option<PgVectorIndex>,
     pub workspace_path: PathBuf,
     pub app_manager: Arc<AppManager>,
@@ -454,6 +455,18 @@ pub struct ChatRequest {
 pub struct ChatResponse {
     pub response: String,
     pub steps: Vec<Step>,
+}
+
+/// Body of `POST /api/v1/chat/cancel` and the default (Stop) mode of
+/// `POST /api/v1/claude-code/stop`. `canceled = true` when the call canceled
+/// live work, settled a stuck `running` projection, or cancel-stamped a pending
+/// question — i.e. a status-changing event is on its way over SSE. `false` when
+/// the server had nothing to cancel: the client's optimistic "canceling" state
+/// is stale and it must re-sync the thread (the uncancelable-thread wedge fix).
+/// HTTP status stays 200 either way — the bool is additive.
+#[derive(Serialize)]
+pub struct CancelResponse {
+    pub canceled: bool,
 }
 
 #[derive(Serialize)]
@@ -884,7 +897,7 @@ pub fn create_router(
     engine: SharedEngine,
     pool: PgPool,
     event_store: EventStore,
-    embedder: Arc<FastEmbedProvider>,
+    embedder: Arc<EmbedderSlot>,
     memory_index: Option<PgVectorIndex>,
     workspace_path: PathBuf,
     scheduler: Arc<tokio::sync::Mutex<SchedulerManager>>,
@@ -893,6 +906,27 @@ pub fn create_router(
     // Initialize AppManager
     let app_manager =
         Arc::new(AppManager::new(&workspace_path).expect("Failed to initialize AppManager"));
+
+    // Resolve + pin the served frontend (dev) BEFORE `engine` is moved into
+    // `AppState`. The served dir lives behind a swappable handle so a
+    // frontend-only Apply can re-snapshot `dist/` and advance what we serve
+    // in-process (no respawn) — see `frontend_snapshot` + `engine::frontend_refresh`.
+    // `None` when there's no `LUCIDOS_STATIC_DIR` (headless API-only).
+    let served_frontend_handle: Option<Arc<std::sync::RwLock<PathBuf>>> =
+        std::env::var_os("LUCIDOS_STATIC_DIR").map(|static_dir| {
+            // Dev pins a private snapshot of `dist/` so the running engine only
+            // ever serves the client it was built against — never a newer,
+            // possibly incompatible client (incl. on a hard reload). Packaged
+            // serves the bundled Resources dir unchanged. See `frontend_snapshot`.
+            let source = PathBuf::from(&static_dir);
+            let served = frontend_snapshot::resolve_served_dir(source.clone(), &workspace_path);
+            let handle = Arc::new(std::sync::RwLock::new(served));
+            // Register the handle + source on the engine so a frontend-only Apply
+            // can swap it. No-op registration in packaged (the engine's refresh
+            // path gates on `!is_packaged()` and never swaps).
+            engine.init_served_frontend(handle.clone(), source);
+            handle
+        });
 
     let state = AppState {
         engine,
@@ -991,10 +1025,13 @@ pub fn create_router(
     // asset refs resolve back through the gateway to this workspace. With no
     // header (direct hit / `LUCIDOS_NO_GATEWAY`) the base is `/`, identical to
     // before. No LUCIDOS_STATIC_DIR → keep the default 404 (headless API-only).
-    let router = if let Some(static_dir) = std::env::var_os("LUCIDOS_STATIC_DIR") {
-        let static_dir = PathBuf::from(static_dir);
+    // The served dir was resolved + pinned above (`served_frontend_handle`); read
+    // the CURRENT snapshot per request so a frontend-only Apply that swapped in a
+    // newer, engine-compatible generation is picked up without a respawn.
+    let router = if let Some(handle) = served_frontend_handle {
         router.fallback(move |req: axum::extract::Request| {
-            serve_frontend(static_dir.clone(), req)
+            let static_dir = handle.read().unwrap().clone();
+            serve_frontend(static_dir, req)
         })
     } else {
         router

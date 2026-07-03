@@ -358,14 +358,14 @@ pub(crate) struct NotifyArgs {
     /// should open that app to act on it — same rule the LLM tool follows.
     #[arg(long = "app-id")]
     pub(crate) app_id: Option<String>,
-    /// Where a tap should land. `modal` (default) opens the inbox modal;
-    /// `none` is passive (no destination, marks read on display); `navigate`
-    /// deep-links via the same router `navigate_ui` uses — the CLI infers
-    /// the target from the other flags (presence of `--thread-id` →
+    /// Where a tap should land. `modal` (default) opens the inbox detail —
+    /// use it for info-only notifications too, every notification is openable;
+    /// `navigate` deep-links via the same router `navigate_ui` uses — the CLI
+    /// infers the target from the other flags (presence of `--thread-id` →
     /// navigate-to-thread carrying `--event-id` if set; otherwise presence
     /// of `--app-id` → navigate-to-app). Scripts needing fuller control over
     /// the navigate target should POST `/api/v1/notifications` directly with
-    /// a structured `tap` body.
+    /// a structured `tap` body. (The passive `none` kind was retired.)
     #[arg(long, value_enum)]
     pub(crate) tap: Option<notify::CliTap>,
     /// Thread the notification originated from. With `--tap navigate` and no
@@ -521,6 +521,8 @@ pub(crate) struct SpawnThreadArgs {
     pub(crate) relation: Option<CliRelation>,
     /// DEPRECATED — alias for `--relation child`. Same-workspace
     /// parent-with-callback spawn. Will be removed in a future release.
+    // TEMPORARY MEASURE — sunset deprecation; tracked in
+    // docs/temporary-measures.md § "lucidos spawn-thread --parent deprecated alias".
     #[arg(long)]
     pub(crate) parent: bool,
     /// Use `http://` instead of `https://`. Test-only. Hidden from --help.

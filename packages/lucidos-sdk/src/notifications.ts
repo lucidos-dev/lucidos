@@ -28,14 +28,14 @@ export interface NavigateUi {
   prompt?: string;
 }
 
-/** What a notification tap does. `modal` opens the inbox modal showing the
- *  notification body. `none` marks the row read with no navigation (passive
- *  pushes — "OAuth completed"). `navigate` delegates to the same router the
- *  `navigate_ui` LLM tool uses; `to` is its arg shape. Every kind marks the
- *  source notification read on tap. */
+/** What a notification tap does. `modal` (default) opens the inbox detail
+ *  showing the notification body. `navigate` delegates to the same router the
+ *  `navigate_ui` LLM tool uses; `to` is its arg shape. Both mark the source
+ *  notification read on tap. Every notification is openable — the old passive
+ *  `none` kind was retired (docs/plans/2026-07-02-remove-notification-tap-none.md);
+ *  historical `{kind:'none'}` payloads are coerced to `modal`. */
 export type Tap =
   | { kind: 'modal' }
-  | { kind: 'none' }
   | { kind: 'navigate'; to: NavigateUi };
 
 export interface Notification {

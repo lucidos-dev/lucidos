@@ -72,6 +72,12 @@ pub const DEFAULT_ENGINE_PORT: u16 = 5252;
 /// (migrations + embedding-model warmup can be slow on a fresh workspace).
 const ENGINE_HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// One health-poll cycle in the client's start-and-navigate loop ([`launch`]):
+/// how long to wait for `/~/api/v1/health` before re-ensuring the service and
+/// polling again. The loop NEVER gives up, so this only bounds how often a
+/// crashed/idle service is re-kickstarted while the window waits.
+const HEALTH_ENSURE_CYCLE: Duration = Duration::from_secs(30);
+
 /// How often the desktop process refreshes the dock-icon badge from the gateway's
 /// aggregate unread total (macOS only). Independent of the webview's own polling
 /// so the badge is correct whichever page (picker or a workspace) is loaded.
@@ -83,6 +89,11 @@ const ENGINE_RESOURCE_NAME: &str = "lucidos-engine";
 const FRONTEND_RESOURCE_NAME: &str = "frontend";
 const SDK_RESOURCE_NAME: &str = "sdk";
 const POSTGRES_RESOURCE_NAME: &str = "postgres";
+/// The `lucidos` CLI binary (cargo package `lucidos-cli` → bin `lucidos`),
+/// staged flat next to the engine. Backs the coding-agent permission/question
+/// MCP servers, the CC hooks, and chat-script `lucidos …` calls; the engine
+/// resolves it by absolute path via `LUCIDOS_CLI_BIN` (set in `spawn_gateway`).
+const CLI_RESOURCE_NAME: &str = "lucidos";
 
 /// Set by the service's SIGTERM/SIGINT handler (launchd sends SIGTERM on
 /// `bootout` / `kickstart -k`). The supervise loop observes it and tears the
@@ -213,6 +224,7 @@ fn resource_dir_for_exe(exe: &Path) -> io::Result<PathBuf> {
 struct BundledResources {
     gateway_bin: PathBuf,
     engine_bin: PathBuf,
+    cli_bin: PathBuf,
     frontend: PathBuf,
     sdk: PathBuf,
     pg_bin: PathBuf,
@@ -224,6 +236,7 @@ fn bundled_resources(resources: &Path) -> BundledResources {
     BundledResources {
         gateway_bin: resources.join(GATEWAY_RESOURCE_NAME),
         engine_bin: resources.join(ENGINE_RESOURCE_NAME),
+        cli_bin: resources.join(CLI_RESOURCE_NAME),
         frontend: resources.join(FRONTEND_RESOURCE_NAME),
         sdk: resources.join(SDK_RESOURCE_NAME),
         pg_bin: postgres.join("bin"),
@@ -283,18 +296,28 @@ pub fn engine_port() -> u16 {
 /// gateway. No-op in development. Runs the (possibly slow) ensure-and-wait on a
 /// background thread so the window paints immediately; the window is navigated
 /// to the gateway URL once it is healthy.
-pub fn launch(app: &AppHandle) {
+pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
     if tauri::is_dev() {
+        // No dock-badge thread in dev (unbundled; dev uses the browser) — drop the
+        // receiver so the managed sender's `send` is a harmless no-op.
+        drop(nudge_rx);
         return;
     }
 
-    // Dock-icon badge: poll the gateway's aggregate unread total (across running
-    // workspaces) and mirror it onto the app icon. Its own thread — independent
-    // of the service/health/navigate flow below and of whichever page the webview
-    // shows — so the desktop badge always reflects the TOTAL, not just the active
+    // Dock-icon badge: mirror the gateway's aggregate unread total (across running
+    // workspaces) onto the app icon. Its own thread — independent of the
+    // service/health/navigate flow below and of whichever page the webview shows —
+    // so the desktop badge always reflects the TOTAL, not just the active
     // workspace. macOS only (the dock tile is a macOS concept). The AppKit write
     // is marshalled to the main thread; the fetch tolerates the gateway not being
     // up yet (returns None until it answers).
+    //
+    // Event-driven AND polled: the loop recomputes the instant it's NUDGED (the
+    // active workspace's webview signals `nudge_dock_badge` when a notification SSE
+    // arrives — read in-app or from another device) so the badge updates without
+    // waiting for the next tick; the periodic `DOCK_BADGE_POLL_INTERVAL` tick is
+    // the safety net that also catches BACKGROUND-workspace changes (whose SSE this
+    // webview never sees).
     #[cfg(target_os = "macos")]
     {
         let handle = app.clone();
@@ -304,18 +327,34 @@ pub fn launch(app: &AppHandle) {
             loop {
                 if let Some(total) = fetch_unread_total(port) {
                     // Only touch AppKit when the value actually changed — avoids a
-                    // main-thread hop every 5s when nothing moved.
+                    // main-thread hop when nothing moved.
                     if last != Some(total) {
                         last = Some(total);
+                        let h = handle.clone();
                         let _ = handle.run_on_main_thread(move || {
-                            crate::notifications::set_dock_badge(total);
+                            // Routes to the Dock badge (Regular) or the menu-bar
+                            // tray title (menu-bar-only Accessory) per activation state.
+                            crate::apply_unread_indicator(&h, total);
                         });
                     }
                 }
-                std::thread::sleep(DOCK_BADGE_POLL_INTERVAL);
+                // Wait for the next tick OR a nudge, whichever comes first. Drain
+                // any extra queued nudges so a flurry of notification SSEs in quick
+                // succession (e.g. the create-then-auto-read pair, or several
+                // arriving at once) collapses to one recompute. A dropped sender
+                // (Disconnected) degrades to a plain timed poll.
+                match nudge_rx.recv_timeout(DOCK_BADGE_POLL_INTERVAL) {
+                    Ok(()) => while nudge_rx.try_recv().is_ok() {},
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        std::thread::sleep(DOCK_BADGE_POLL_INTERVAL);
+                    }
+                }
             }
         });
     }
+    #[cfg(not(target_os = "macos"))]
+    drop(nudge_rx); // dock badge is macOS-only; no consumer elsewhere
 
     let handle = app.clone();
     std::thread::spawn(move || {
@@ -328,17 +367,27 @@ pub fn launch(app: &AppHandle) {
         };
         let port = resolve_engine_port(&app_data);
 
-        // Best-effort: install the LaunchAgent (if missing/stale) and start it.
-        // Even if this fails, the service may already be running from login, so
-        // fall through to the health wait regardless.
-        if let Err(e) = ensure_service_installed_and_running(&app_data) {
-            eprintln!("[desktop] ensure service running failed: {e}");
-        }
-
-        if !wait_for_health(port, ENGINE_HEALTH_TIMEOUT) {
-            // The window stays on the bundled splash; surface the failure in logs.
-            eprintln!("[desktop] gateway did not become healthy on port {port} within the timeout");
-            return;
+        // Keep the service up and navigate the window the moment the gateway is
+        // healthy — NEVER permanently give up. A slow post-forced-shutdown start
+        // (Postgres WAL crash recovery + embedding warmup) or a transient
+        // crash-respawn can exceed a single wait; retrying + re-ensuring means the
+        // window resolves whenever the service comes up instead of stranding the
+        // user on the bundled "Starting Lucidos…" splash (main.tsx). Each cycle
+        // re-ensures the LaunchAgent with a bare kickstart — a no-op on a
+        // still-starting service, a restart on a crashed/idle one, so it never
+        // interrupts a slow-but-progressing start — then polls health for one
+        // bounded cycle. `wait_for_health` sleeps between attempts, so this can't
+        // busy-loop.
+        loop {
+            if let Err(e) = ensure_service_installed_and_running(&app_data) {
+                eprintln!("[desktop] ensure service running failed: {e}");
+            }
+            if wait_for_health(port, HEALTH_ENSURE_CYCLE) {
+                break;
+            }
+            eprintln!(
+                "[desktop] gateway not healthy yet on port {port}; re-ensuring service and retrying"
+            );
         }
 
         let url = format!("http://localhost:{port}");
@@ -955,6 +1004,11 @@ fn spawn_gateway(resources: &Path, app_data: &Path, port: u16) -> io::Result<Gat
         .env("LUCIDOS_PG_BIN_DIR", &bundle.pg_bin)
         .env("LUCIDOS_PG_LIB_DIR", &bundle.pg_lib)
         .env("LUCIDOS_ENGINE_BIN", &bundle.engine_bin)
+        // Absolute path to the bundled `lucidos` CLI. The engine reads this in
+        // `lucidos_cli_dir()` so the coding-agent permission/question MCP
+        // servers, CC hooks, and chat-script `lucidos …` calls resolve without
+        // relying on a dev-only PATH (the gateway passes its env to engines).
+        .env("LUCIDOS_CLI_BIN", &bundle.cli_bin)
         .env("LUCIDOS_STATIC_DIR", &bundle.frontend)
         .env("LUCIDOS_SDK_DIR", &bundle.sdk)
         .env("FASTEMBED_CACHE_DIR", &fastembed_cache)
@@ -1004,21 +1058,26 @@ fn http_get_body(port: u16, path: &str) -> Option<String> {
     }
 }
 
-/// Sum the unread count across running workspaces from the gateway control API —
-/// the dock-badge total. `None` (no badge change) when the gateway is unreachable
-/// or the body doesn't parse; a workspace with no `unread_count` (stopped /
-/// unhealthy) contributes 0, matching the gateway's running-only aggregation.
+/// The fresh aggregate unread total across running workspaces — the dock-badge
+/// value. `None` (no badge change) when the gateway is unreachable or the body
+/// doesn't parse. Reads the gateway's on-demand `unread-total` control endpoint
+/// (a live count fan-out over running engines) rather than the cached
+/// `last_unread`: at nudge time — right after a read — the supervise loop hasn't
+/// re-probed yet, so the cached aggregate would still show the pre-read count.
+/// Using the fresh endpoint for BOTH the periodic tick and the nudge also avoids
+/// a flicker where a stale tick overwrites a freshly nudged value.
 #[cfg(target_os = "macos")]
 fn fetch_unread_total(port: u16) -> Option<u64> {
-    let body = http_get_body(port, "/~/api/v1/control/workspaces")?;
-    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let workspaces = json.get("workspaces")?.as_array()?;
-    Some(
-        workspaces
-            .iter()
-            .filter_map(|w| w.get("unread_count").and_then(|v| v.as_u64()))
-            .sum(),
-    )
+    let body = http_get_body(port, "/~/api/v1/control/unread-total")?;
+    parse_unread_total(&body)
+}
+
+/// Parse `{ "total": N }` from the `unread-total` endpoint. Pure, so it's
+/// unit-tested. `None` when the body doesn't parse or lacks a numeric `total`.
+#[cfg(target_os = "macos")]
+fn parse_unread_total(body: &str) -> Option<u64> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    json.get("total")?.as_u64()
 }
 
 #[cfg(test)]
@@ -1044,6 +1103,17 @@ mod tests {
         assert!(plist.contains("<key>KeepAlive</key>"));
         // Logs land under the app-data dir, not next to the bundle.
         assert!(plist.contains("Application Support/com.lucidos.app/logs/engine-service.out.log"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_unread_total_reads_total_field() {
+        assert_eq!(parse_unread_total(r#"{"total":7}"#), Some(7));
+        assert_eq!(parse_unread_total(r#"{"total":0}"#), Some(0));
+        // Missing / wrong-typed / unparseable → None (no badge change).
+        assert_eq!(parse_unread_total(r#"{"workspaces":[]}"#), None);
+        assert_eq!(parse_unread_total(r#"{"total":"3"}"#), None);
+        assert_eq!(parse_unread_total("not json"), None);
     }
 
     #[test]

@@ -7,10 +7,10 @@ import {
   setPluginsInstalledOnly,
   pluginScrollTarget,
 } from '../../store/store';
-import type { InstalledPlugin, MarketplacePlugin } from '../../store/types';
-import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import type { InstalledPlugin, Loadable, MarketplacePlugin } from '../../store/types';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
-import { ListSkeleton } from '../shared/ListSkeleton';
+import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { installMarketplacePlugin, refreshPluginCatalog } from '../../store/actions/plugin-marketplaces';
 import { loadInstalledPlugins } from '../../store/actions/plugins';
@@ -20,6 +20,7 @@ import { uninstallMarketplacePlugin } from '../../store/actions/plugin-uninstall
 import { openSettingsSubview, switchMenuItem } from '../../store/actions/menu';
 import { AddOfficialMarketplaceButton } from './AddOfficialMarketplaceButton';
 import { contentLabel } from './pluginContent';
+import { applyNavFocus } from '../shared/focusMarker';
 
 /** Jump to Settings → Marketplaces from anywhere. `switchMenuItem` sets the
  *  Settings panel as the active menu item (resetting the subview to main);
@@ -31,7 +32,6 @@ function openMarketplaceSettings() {
 }
 
 const CATALOG_REFRESH_MS = 5 * 60 * 1000;
-const HIGHLIGHT_CLASS = 'plugin-row-highlight';
 
 function statusLabel(plugin: MarketplacePlugin): string {
   switch (plugin.status) {
@@ -68,6 +68,52 @@ function cardPrimaryAction(plugin: MarketplacePlugin): CardAction {
 
 function fileCountLabel(count: number): string {
   return `${count} ${count === 1 ? 'file' : 'files'}`;
+}
+
+/** Widths of the placeholder pills in the loading skeleton — sized to mirror a
+ *  FULLY-populated category bar (`All` + the ~9 controlled-vocabulary categories,
+ *  see `core/plugins.rs` PLUGIN_CATEGORIES), varied per the real labels'
+ *  approximate widths. The count matters as much as the widths: a populated
+ *  catalog's real bar wraps to ~2 lines in a typical pane (more at a larger UI
+ *  scale), so the skeleton must reserve ~2 lines too — six narrow pills fit on
+ *  one line and let the list jump down a line when the real bar lands. */
+const SKELETON_PILL_WIDTHS = [
+  '2.25rem', // All
+  '6.5rem', // Productivity
+  '4.25rem', // Finance
+  '3.75rem', // Health
+  '7.75rem', // Developer tools
+  '3rem', // Data
+  '7rem', // Communication
+  '5.5rem', // Automation
+  '5rem', // Lifestyle
+  '4.75rem', // Research
+];
+
+/** Loading placeholder that MIRRORS the loaded layout (category-pills bar above
+ *  the list) so the list rows don't jump down when the catalog lands and the
+ *  real `.app-store-category-filter` appears. The pills bar is sized to a fully
+ *  populated catalog (~2 lines, see SKELETON_PILL_WIDTHS) because that is the
+ *  height the real bar settles at — reserving only one line let the rows shift
+ *  down a line on a cold reload once the real (wrapping) bar rendered. A sparse
+ *  catalog now settles UP by at most a line, far less jarring than the old
+ *  always-downward shift; a rare category-less load has no real bar at all and
+ *  still settles up by the whole bar (accepted — the common case is populated).
+ *  Pure/hookless so the unit test can inspect its vnode tree (`ListSkeletonOf`
+ *  stays an uninvoked child). Only ever rendered inside `<LoadingFade>`, whose
+ *  wrapper is already `aria-hidden`, so no aria treatment is needed here.
+ *  Exported for the unit test that pins the no-jump regression. */
+export function StoreTabSkeleton() {
+  return (
+    <div class="app-store">
+      <div class="app-store-category-filter">
+        {SKELETON_PILL_WIDTHS.map((w, i) => (
+          <div class="app-store-category-pill-skeleton" style={{ width: w }} key={i} />
+        ))}
+      </div>
+      <ListSkeletonOf fill containerClass="list-rows app-store-plugins" row={() => <PluginStoreRow />} />
+    </div>
+  );
 }
 
 /** Tooltip for the "Modified" badge: warns that a future update overwrites the
@@ -147,17 +193,42 @@ function buildRows(
   return [...catalog, ...orphans];
 }
 
+/** Whether BOTH plugin data sources have SETTLED (loaded or failed) — the gate
+ *  for releasing the list loading skeleton (see the call site for the why). A
+ *  *failed* source counts as settled so a catalog-scan failure can't hang the
+ *  skeleton. Pure + exported for the unit test. */
+export function pluginRowsSettled(
+  catalog: Loadable<unknown>,
+  installed: Loadable<unknown>,
+): boolean {
+  const settled = (l: Loadable<unknown>) => l.status === 'loaded' || l.status === 'failed';
+  return settled(catalog) && settled(installed);
+}
+
 export function StoreTab() {
   const installedOnly = pluginsInstalledOnly.value;
   const catLoadable = marketplaceCatalog.value;
   const instLoadable = installedPlugins.value;
-  // The source the loading/failed gating keys on flips with the mode: Installed
-  // renders from the installed projection (catalog best-effort, for the update
-  // status), All renders from the catalog (installed list best-effort, for
-  // orphan coverage). Both are fetched on mount, so flipping the toggle never
-  // re-flashes the spinner.
+  // `primary` is the source whose FAILED state we surface and whose `loaded` we
+  // gate the final render on: Installed renders from the installed projection
+  // (catalog best-effort, for the update status), All from the catalog (installed
+  // list best-effort, for orphan coverage). Both are fetched on mount, so
+  // flipping the toggle never re-flashes the spinner.
   const primary = installedOnly ? instLoadable : catLoadable;
-  const showLoading = useDelayedLoading(primary);
+  // The SKELETON, though, must wait for BOTH sources to settle — not just the
+  // mode's primary. In Installed mode the primary is the fast installed
+  // projection (a local disk scan), but the rows are enriched from the catalog
+  // (descriptions, categories, the category-filter bar, the update_available
+  // status), and the catalog scan clones marketplace repos — far slower. Gating
+  // on the fast source alone released the skeleton early, so the list painted
+  // bare orphan rows and then visibly reorganized when the catalog landed. A
+  // failed source counts as settled (best-effort), so a catalog-scan failure
+  // still falls back to orphan rows in Installed mode (and the `primary` failed
+  // branch in All mode) instead of hanging the skeleton forever. On a same-session
+  // revisit both are already `loaded` (setLoadingIfFresh keeps them so), so this
+  // is true and the stale list shows immediately and refreshes in place.
+  const settled = pluginRowsSettled(catLoadable, instLoadable);
+  const showLoading = useDelayedFlag(!settled);
   const [installingSource, setInstallingSource] = useState<string | null>(null);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
 
@@ -182,20 +253,24 @@ export function StoreTab() {
   // (appSearchQuery is a dep) and the scroll then lands.
   useEffect(() => {
     const target = pluginScrollTarget.value;
-    if (!target || primary.status !== 'loaded') return;
+    // Gate on `settled`, not `primary.status` — the rows (and their
+    // `data-plugin-id` anchors) only mount once StoreTabLoaded renders, which now
+    // waits for both sources to settle.
+    if (!target || !settled) return;
     const el = document.querySelector<HTMLElement>(`[data-plugin-id="${CSS.escape(target)}"]`);
     if (el) {
       el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      el.classList.remove(HIGHLIGHT_CLASS);
-      void el.offsetWidth; // force reflow so the pulse re-triggers on repeat taps
-      el.classList.add(HIGHLIGHT_CLASS);
+      // Shared navigation focus marker — a sticky border that fades out on the
+      // user's next action (components/shared/focusMarker.ts). Same look as chat
+      // + settings.
+      applyNavFocus(el);
       pluginScrollTarget.value = null;
     } else if (!appSearchQuery.value.trim()) {
       // Row not in the list and nothing is filtering it out → the plugin is
       // genuinely gone (uninstalled / stale target). Give up so it can't linger.
       pluginScrollTarget.value = null;
     }
-  }, [pluginScrollTarget.value, primary.status, appSearchQuery.value, installedOnly]);
+  }, [pluginScrollTarget.value, settled, appSearchQuery.value, installedOnly]);
 
   async function stageInstall(plugin: MarketplacePlugin) {
     setInstallingSource(plugin.source);
@@ -216,8 +291,12 @@ export function StoreTab() {
 
   return (
     <div class="list-rows">
-      <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton fill />}>
-        {primary.status === 'loaded' ? (
+      <LoadingFade showSkeleton={showLoading} skeleton={<StoreTabSkeleton />}>
+        {/* Render the loaded view only once BOTH sources have settled, so the
+            skeleton shows alone (no bare orphan rows peeking through it) and the
+            first painted content is already in final shape. After the early
+            `failed` return above, `settled` implies the primary is loaded. */}
+        {settled ? (
           <StoreTabLoaded
             installedOnly={installedOnly}
             installingSource={installingSource}
@@ -332,98 +411,129 @@ function StoreTabLoaded({
         </div>
       ) : (
         <div class="list-rows app-store-plugins">
-          {plugins.map((plugin) => {
-        // 'available' is the only not-yet-installed state; 'installed' and
-        // 'update_available' both mean the plugin is on disk → uninstallable.
-        const isInstalled = plugin.status !== 'available';
-        const busy = installingSource === plugin.source;
-        const action = cardPrimaryAction(plugin);
-        let label: string;
-        let onPrimary: (() => void) | undefined;
-        let primaryDisabled = busy;
-        switch (action.kind) {
-          case 'install':
-            label = action.label;
-            onPrimary = () => void stageInstall(plugin);
-            break;
-          case 'setup':
-            label = 'Setup';
-            // focusThread (not …OrBootstrap): the setup thread may be spawned but
-            // not yet materialized as a thread_summaries row (queued in the
-            // Thread Queue), so a bootstrap fetch would 404 → "Thread not found".
-            // focusThread sets focus and lets the row + events stream in over
-            // SSE — same rationale as the confirm-navigation path in
-            // plugin-install.ts. The catalog only surfaces this button for a
-            // present-or-queued setup thread (a gone one resolves to Open).
-            onPrimary = () => focusThread(action.threadId);
-            break;
-          case 'open':
-            label = 'Open';
-            onPrimary = () => void openAppById(action.appId);
-            break;
-          case 'none':
-            label = 'Installed';
-            primaryDisabled = true;
-            break;
-        }
-        return (
-          <div
-            class="list-row app-store-plugin-row"
-            data-plugin-id={plugin.id}
-            key={`${plugin.marketplace_id}-${plugin.id}`}
-          >
-            <div class="list-row-info">
-              <div class="app-store-plugin-title-row">
-                <span class="title list-row-name">{plugin.name}</span>
-                <span class={`app-store-status app-store-status-${plugin.status}`}>
-                  {statusLabel(plugin)}
-                </span>
-                {plugin.modified && (
-                  <span class="app-store-modified-chip" data-tooltip={modifiedTooltip(plugin.modified_paths)}>
-                    Modified
-                  </span>
-                )}
-              </div>
-              {plugin.description && <div class="list-row-details">{plugin.description}</div>}
-              <div class="app-store-plugin-meta">
-                {plugin.marketplace_name && <span>{plugin.marketplace_name}</span>}
-                <span>{fileCountLabel(plugin.files_count)}</span>
-                {plugin.content.map((kind) => (
-                  <span class="app-store-content-chip" key={kind}>
-                    {contentLabel(kind)}
-                  </span>
-                ))}
-                {plugin.categories.map((c) => (
-                  <span class="app-store-category-chip" key={`cat-${c}`}>
-                    {categoryLabel(c)}
-                  </span>
-                ))}
-              </div>
-            </div>
-            <div class="list-row-actions">
-              {isInstalled && (
-                <button
-                  class="action-btn action-btn-danger"
-                  type="button"
-                  onClick={() => void uninstallMarketplacePlugin(plugin)}
-                >
-                  Uninstall
-                </button>
-              )}
-              <button
-                class="action-btn"
-                type="button"
-                disabled={primaryDisabled}
-                onClick={onPrimary}
-              >
-                {busy ? 'Staging' : label}
-              </button>
-            </div>
-          </div>
-        );
-          })}
+          {plugins.map((plugin) => (
+            <PluginStoreRow
+              plugin={plugin}
+              installingSource={installingSource}
+              stageInstall={stageInstall}
+              key={`${plugin.marketplace_id}-${plugin.id}`}
+            />
+          ))}
         </div>
       )}
+    </div>
+  );
+}
+
+interface PluginStoreRowProps {
+  plugin: MarketplacePlugin;
+  installingSource: string | null;
+  stageInstall: (plugin: MarketplacePlugin) => void;
+}
+
+/** Self-skeletonizing plugin catalog row: rendered with no props inside a
+ *  SkeletonProvider (`<PluginStoreRow />`) it draws itself as a loading
+ *  placeholder via the Sk* leaves; with real props it renders the catalog row
+ *  normally. Props are optional only to support the skeleton call; real call
+ *  sites pass them all. */
+function PluginStoreRow({ plugin, installingSource, stageInstall }: Partial<PluginStoreRowProps>) {
+  const sk = useSkeleton();
+  // 'available' is the only not-yet-installed state; 'installed' and
+  // 'update_available' both mean the plugin is on disk → uninstallable.
+  const isInstalled = !!plugin && plugin.status !== 'available';
+  const busy = !!plugin && installingSource === plugin.source;
+  const action = plugin ? cardPrimaryAction(plugin) : { kind: 'none' as const };
+  let label: string;
+  let onPrimary: (() => void) | undefined;
+  let primaryDisabled = busy;
+  switch (action.kind) {
+    case 'install':
+      label = action.label;
+      onPrimary = () => plugin && void stageInstall?.(plugin);
+      break;
+    case 'setup':
+      label = 'Setup';
+      // focusThread (not …OrBootstrap): the setup thread may be spawned but
+      // not yet materialized as a thread_summaries row (queued in the
+      // Thread Queue), so a bootstrap fetch would 404 → "Thread not found".
+      // focusThread sets focus and lets the row + events stream in over
+      // SSE — same rationale as the confirm-navigation path in
+      // plugin-install.ts. The catalog only surfaces this button for a
+      // present-or-queued setup thread (a gone one resolves to Open).
+      onPrimary = () => focusThread(action.threadId);
+      break;
+    case 'open':
+      label = 'Open';
+      onPrimary = () => void openAppById(action.appId);
+      break;
+    case 'none':
+      label = 'Installed';
+      primaryDisabled = true;
+      break;
+  }
+  return (
+    <div
+      class="list-row app-store-plugin-row"
+      data-plugin-id={sk ? undefined : plugin?.id}
+    >
+      <div class="list-row-info">
+        <div class="app-store-plugin-title-row">
+          <SkText class="title list-row-name" w="9rem">{plugin?.name}</SkText>
+          {(sk || plugin) && (
+            <SkBlock w="5rem" h="1rem" round>
+              <span class={`app-store-status app-store-status-${plugin?.status}`}>
+                {plugin && statusLabel(plugin)}
+              </span>
+            </SkBlock>
+          )}
+          {plugin?.modified && (
+            <span class="app-store-modified-chip" data-tooltip={modifiedTooltip(plugin.modified_paths)}>
+              Modified
+            </span>
+          )}
+        </div>
+        {(sk || plugin?.description) && (
+          <SkText class="list-row-details" as="div" w="18rem">{plugin?.description}</SkText>
+        )}
+        <div class="app-store-plugin-meta">
+          {(sk || plugin?.marketplace_name) && (
+            <SkText w="6rem">{plugin?.marketplace_name}</SkText>
+          )}
+          <SkText w="3rem">{plugin && fileCountLabel(plugin.files_count)}</SkText>
+          {sk && <SkBlock w="4rem" h="1rem" round />}
+          {plugin?.content.map((kind) => (
+            <span class="app-store-content-chip" key={kind}>
+              {contentLabel(kind)}
+            </span>
+          ))}
+          {plugin?.categories.map((c) => (
+            <span class="app-store-category-chip" key={`cat-${c}`}>
+              {categoryLabel(c)}
+            </span>
+          ))}
+        </div>
+      </div>
+      <div class="list-row-actions">
+        {isInstalled && (
+          <button
+            class="action-btn action-btn-danger"
+            type="button"
+            onClick={() => plugin && void uninstallMarketplacePlugin(plugin)}
+          >
+            Uninstall
+          </button>
+        )}
+        <SkBlock w="4.5rem" h="2rem" round>
+          <button
+            class="action-btn"
+            type="button"
+            disabled={primaryDisabled}
+            onClick={onPrimary}
+          >
+            {busy ? 'Staging' : label}
+          </button>
+        </SkBlock>
+      </div>
     </div>
   );
 }

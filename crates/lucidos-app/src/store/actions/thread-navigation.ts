@@ -52,23 +52,6 @@ export function removeEntriesById(
   return { stack: newStack, cursor: newCursor };
 }
 
-/** Replace the entry at `cursor` (and drop any forward history) with `entry`.
- *  When the cursor is out of range, falls back to a normal push. */
-export function replaceThreadEntry(
-  stack: ThreadNavEntry[],
-  cursor: number,
-  entry: ThreadNavEntry,
-): { stack: ThreadNavEntry[]; cursor: number } {
-  if (cursor < 0 || cursor >= stack.length) {
-    return pushThreadEntry(stack, cursor, entry) ?? { stack, cursor };
-  }
-  if (entriesEqual(stack[cursor], entry)) {
-    return { stack: stack.slice(0, cursor + 1), cursor };
-  }
-  const newStack = [...stack.slice(0, cursor), entry];
-  return { stack: newStack, cursor: newStack.length - 1 };
-}
-
 const THREAD_NAV_STORAGE_KEY = 'lucidos-thread-nav-history';
 
 const threadNavStack = signal<ThreadNavEntry[]>([]);

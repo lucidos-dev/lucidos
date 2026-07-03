@@ -500,9 +500,8 @@ function renderExecutorSection(
   const ccActive = extras.branch !== undefined || extras.ccSessionId !== undefined;
   const repo = ccActive ? resolveRepoLabel(extras.repoId) : undefined;
   // App coding-agent threads carry their kind on the projection; resolve the
-  // app's icon + display name so the Branch row reads "{icon} {name} ·
-  // claude-code/app/<id>/..." at a glance. The folder's last segment is the
-  // canonical app id.
+  // app's icon + display name so the App row reads "{icon} {name}" above the
+  // Branch row. The folder's last segment is the canonical app id.
   const appInfo = meta.codingAgentKind === 'app' ? resolveAppInfo(meta.codingAgentFolder) : undefined;
 
   return (
@@ -542,19 +541,19 @@ function renderExecutorSection(
           <span class={repo.failed ? 'error-text' : undefined}>{repo.text}</span>
         </div>
       )}
+      {appInfo && extras.branch && (
+        <div class="route-row">
+          <strong>App</strong>
+          <span class="route-app">
+            <span class="route-app-icon" aria-hidden="true">{appInfo.icon}</span>
+            <span class={appInfo.failed ? 'route-app-name error-text' : 'route-app-name'}>{appInfo.name}</span>
+          </span>
+        </div>
+      )}
       {extras.branch && (
         <div class="route-row">
           <strong>Branch</strong>
-          <span class="route-branch">
-            {appInfo && (
-              <>
-                <span class="route-branch-app-icon" aria-hidden="true">{appInfo.icon}</span>
-                <span class={appInfo.failed ? 'route-branch-app-name error-text' : 'route-branch-app-name'}>{appInfo.name}</span>
-                <span class="route-branch-sep" aria-hidden="true">·</span>
-              </>
-            )}
-            <span class="mono">{extras.branch}</span>
-          </span>
+          <span class="mono">{extras.branch}</span>
         </div>
       )}
       {extras.ccSessionId && (
@@ -567,9 +566,9 @@ function renderExecutorSection(
   );
 }
 
-/** App icon + name for the Branch row prefix on app coding-agent threads.
- *  Distinguishes the four `Loadable` states so a failed appsList fetch
- *  doesn't render identically to a loading one (per frontend.md). */
+/** App icon + name for the App row on app coding-agent threads (rendered above
+ *  the Branch row). Distinguishes the four `Loadable` states so a failed
+ *  appsList fetch doesn't render identically to a loading one (per frontend.md). */
 function resolveAppInfo(
   folder: string | undefined,
 ): { icon: string; name: string; failed?: boolean } | undefined {

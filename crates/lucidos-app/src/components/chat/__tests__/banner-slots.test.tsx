@@ -110,15 +110,13 @@ function buttonNodes(node: ComponentChildren): VNode<{ disabled?: boolean }>[] {
 type SplitProps = {
   primary: TaggedAction;
   menuActions: TaggedAction[];
-  showDiff: boolean;
-  threadId: string;
 };
 function splitProps(node: ComponentChildren): SplitProps {
   return (node as VNode<SplitProps>).props;
 }
 
 describe('getBannerSlots', () => {
-  it('actions state with an Apply action collapses into a split button (Diff folds into its menu)', () => {
+  it('actions state with an Apply action keeps Diff standalone; split menu holds only the other actions', () => {
     const slots = getBannerSlots({
       type: 'actions',
       actions: DISCARD_APPLY,
@@ -127,13 +125,27 @@ describe('getBannerSlots', () => {
       showDiff: true,
     });
 
-    // No separate liftable Diff — it folds into the split button's caret menu.
+    // Diff lives permanently outside the Apply/Discard cluster — its own
+    // standalone button in the liftable slot, never folded into the caret menu.
+    expect(buttonLabels(slots.liftable)).toEqual(['Diff']);
+    const props = splitProps(slots.primary);
+    expect(props.primary.kind).toBe('apply');
+    expect(props.menuActions.map((a) => a.kind)).toEqual(['discard']);
+  });
+
+  it('actions state with an Apply action but no diff has an empty liftable slot', () => {
+    const slots = getBannerSlots({
+      type: 'actions',
+      actions: DISCARD_APPLY,
+      threadId: 'tid',
+      isArchiving: false,
+      showDiff: false,
+    });
+
     expect(slots.liftable).toBeNull();
     const props = splitProps(slots.primary);
     expect(props.primary.kind).toBe('apply');
     expect(props.menuActions.map((a) => a.kind)).toEqual(['discard']);
-    expect(props.showDiff).toBe(true);
-    expect(props.threadId).toBe('tid');
   });
 
   it('actions state on a non-CC thread hides the Diff button', () => {
@@ -322,9 +334,9 @@ describe('showDiff is driven by codingAgentHasDiff alone', () => {
     // identity from the historical Change-row Diff buttons: it always asks
     // "show me the diff for this thread's branch", never "show me what this
     // specific Change contained". viewChangeDiff stays for ChatExchange and
-    // ChangesView; the WaitingBanner does not call it anymore. Uses the
-    // no-Apply (liftable Diff) path — when an Apply action is present the Diff
-    // folds into the split-button menu, whose inline onClick is the same call.
+    // ChangesView; the WaitingBanner does not call it anymore. Diff is the
+    // standalone liftable button on every actions path (Apply or not), so this
+    // asserts the single `renderDiffButton` onClick both paths share.
     const slots = getBannerSlots({
       type: 'actions',
       actions: ARCHIVE_ONLY,

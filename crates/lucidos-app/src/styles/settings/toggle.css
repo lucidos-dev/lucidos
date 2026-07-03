@@ -45,6 +45,15 @@
     background-color: var(--accent);
 }
 
+/* Keyboard focus shows our shared accent ring on the visible pill. The real
+   <input> is visually hidden (0×0, opacity 0), so a default outline would land
+   on nothing — match .action-btn / .icon-btn :focus-visible instead. */
+.toggle-switch input:focus-visible + .toggle-slider {
+    /* Transparent outline is the forced-colors fallback (box-shadow is stripped). */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
 /* Disabled (e.g. a child toggle whose parent master is off) — dimmed and
    non-interactive, but still shows its on/off position. */
 .toggle-switch-disabled {
@@ -68,7 +77,7 @@
 
 @media (max-width: 600px) {
     .response-content table {
-        font-size: 0.6875rem;
+        font-size: var(--font-size-xs);
     }
 
     .response-content th,
@@ -76,32 +85,35 @@
         padding: 0.25rem 0.375rem;
     }
 
+    /* A big, solid dot IS the tap target on mobile (2.5em ≈ 40px). The old
+       trick — a 2.75em hit box with a 0.75em transparent border + padding-box
+       background-clip — kept the visible dot a tiny 1.25em, which read as "a
+       small dot with a halo (the transparent ring) around it". A solid thumb has
+       no ring and is easy to grab. box-shadow:none guards against any inherited
+       glow. */
     .scale-modal-slider::-webkit-slider-thumb {
-        /* 2.75em = 44px tap target at the modal's 16px base (iOS minimum).
-           Transparent border keeps the hit box large while the visible
-           thumb stays a compact 1.25em via background-clip. */
-        width: 2.75em;
-        height: 2.75em;
-        border: 0.75em solid transparent;
-        background-clip: padding-box;
-        /* Center thumb on track: -(2.75 - 0.25) / 2 */
-        margin-top: -1.25em;
+        width: 2.5em;
+        height: 2.5em;
+        box-shadow: none;
+        /* Center thumb on track: -(2.5 - 0.25) / 2 */
+        margin-top: -1.125em;
     }
 
     .scale-modal-slider::-moz-range-thumb {
-        width: 2.75em;
-        height: 2.75em;
-        border: 0.75em solid transparent;
-        background-clip: padding-box;
+        width: 2.5em;
+        height: 2.5em;
+        box-shadow: none;
     }
 }
 
+/* Error notice — the red-tinted surface + red bold heading carry the emphasis.
+   No left accent bar (see .claude/rules/frontend.md — left-accent stripes on
+   cards/callouts/notices are forbidden). */
 .exchange-error {
     padding: 0.75rem 1rem;
-    border-left: 0.1875rem solid var(--accent-red);
     background: color-mix(in srgb, var(--accent-red) 8%, transparent);
     color: var(--accent-red);
-    font-size: 0.85rem;
+    font-size: var(--font-size-lg);
 }
 .exchange-error strong {
     display: block;
@@ -112,12 +124,12 @@
     opacity: 0.85;
 }
 
+/* Engine-limit notice — same no-stripe rule as .exchange-error above. */
 .exchange-engine-limit {
     padding: 0.75rem 1rem;
-    border-left: 0.1875rem solid var(--accent-yellow);
     background: color-mix(in srgb, var(--accent-yellow) 8%, transparent);
     color: var(--accent-yellow);
-    font-size: 0.85rem;
+    font-size: var(--font-size-lg);
 }
 .exchange-engine-limit strong {
     display: block;

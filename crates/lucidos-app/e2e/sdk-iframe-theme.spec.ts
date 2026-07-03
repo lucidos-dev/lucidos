@@ -109,9 +109,12 @@ waitForLucidos();
     const js = await res.text();
     // IIFE prologue, with optional whitespace before the brace.
     expect(js).toMatch(/^\(function\(\)\s*\{/);
-    expect(js).toContain('localStorage.getItem("lucidos-theme")');
-    expect(js).toContain('localStorage.getItem("lucidos-font-family")');
-    expect(js).toContain('localStorage.getItem("lucidos-ui-scale")');
+    // Storage keys are workspace-scoped via wsKey() (mirrors workspaceStorage.ts
+    // + sdk/_storage.ts); the engine-side guard in sdk_prefs.rs forbids any raw,
+    // unscoped access, so the served script always wraps the key in wsKey().
+    expect(js).toContain('localStorage.getItem(wsKey("lucidos-theme"))');
+    expect(js).toContain('localStorage.getItem(wsKey("lucidos-font-family"))');
+    expect(js).toContain('localStorage.getItem(wsKey("lucidos-ui-scale"))');
     // `system` defers to matchMedia at execution time so light-OS browsers
     // don't FOUC dark-then-light.
     expect(js).toContain('matchMedia("(prefers-color-scheme: light)")');

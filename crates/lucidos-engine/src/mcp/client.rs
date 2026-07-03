@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
 use super::types::*;
+use crate::core::user_path::augmented_user_path;
 use crate::engine::thread_events::ActorMode;
 
 /// Returns the MCP `client_info.name` value to use for a given actor mode.
@@ -45,13 +47,43 @@ impl McpClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        // Augment PATH with common interpreter / package-manager bin dirs so a
+        // user-configured server like `npx` / `uvx` / `node` resolves even if
+        // the engine's own PATH is a service manager's minimal one (startup
+        // already augments the process PATH via `augment_process_path`; this
+        // per-spawn call keeps the guarantee local and is a deduped no-op
+        // then). Skip when the caller pinned PATH explicitly in `env` (don't
+        // override their choice).
+        if !env.contains_key("PATH") {
+            cmd.env(
+                "PATH",
+                augmented_user_path(
+                    std::env::var_os("PATH"),
+                    std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+                ),
+            );
+        }
+
         for (k, v) in env {
             cmd.env(k, v);
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to spawn MCP server '{}': {}", command, e))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            // A NotFound on a bare (non-absolute) command is almost always the
+            // PATH issue above — name it so the user can fix it, rather than a
+            // bare ENOENT. (`setup_server` carries the same guidance.)
+            if e.kind() == std::io::ErrorKind::NotFound && !command.contains('/') {
+                format!(
+                    "Failed to spawn MCP server '{command}': {e}. '{command}' was not found on \
+                     PATH — a packaged build only searches /usr/bin:/bin:/usr/sbin:/sbin plus \
+                     common install dirs (Homebrew, npm, ~/.local/bin). Use an absolute path to \
+                     the command, or install its interpreter (node/npx/uvx/python) in a standard \
+                     location."
+                )
+            } else {
+                format!("Failed to spawn MCP server '{command}': {e}")
+            }
+        })?;
 
         let stdin = child
             .stdin

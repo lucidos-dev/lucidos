@@ -274,6 +274,10 @@ export interface TriggerInfo {
   timezone: string;
   paused: boolean;
   last_run?: string;
+  /** Outcome of the most recent completed firing. Absent until the trigger has
+   *  run at least once under an engine that records status (legacy runs show the
+   *  `last_run` timestamp only). Surfaced as an OK/failed chip on the row. */
+  last_run_status?: 'ok' | 'failed';
   next_run?: string;
   run: TriggerRun;
   /** Event subscriptions. Engine omits the field when there are none, so
@@ -517,6 +521,19 @@ export interface ToastItem {
    *  the user can't dismiss the toast while the dim restart overlay is still
    *  blocking the UI behind it. Defaults to true (close button shown). */
   dismissable?: boolean;
+  /** true = do NOT auto-focus this toast's button when it appears. Set for
+   *  UNSOLICITED toasts (notification toasts) that pop without a user action —
+   *  stealing keyboard focus mid-typing (and pre-arming a reflexive Enter on
+   *  "OK") would be hostile. The buttons stay Tab-reachable. Solicited action
+   *  toasts (e.g. Apply-All) leave it unset so Enter acts immediately. */
+  noAutofocus?: boolean;
+  /** Desktop pane this toast is centered over, FROZEN to whichever pane was
+   *  focused when the toast first appeared (drawer counts as 'thread'). It never
+   *  changes afterwards — a later focus switch must not make the toast jump
+   *  panes. Set once in `showToast`; a keyed in-place update keeps the original.
+   *  Drives `data-toast-pane` in Toast.tsx (desktop CSS only; ignored on mobile,
+   *  where one pane fills the screen). */
+  pane?: 'thread' | 'content';
 }
 
 // Credential request from SSE (engine needs credentials)

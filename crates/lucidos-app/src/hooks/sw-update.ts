@@ -1,6 +1,9 @@
 import { signal } from '@preact/signals';
 import { CLIENT_BUILD_ID } from 'virtual:build-id';
 import { withBase } from '../utils/basePath';
+import { preferences, showToast } from '../store/store';
+import { setPreference } from '../api/client';
+import { errorDetail } from '../utils/errorDetail';
 
 /** Whether a client refresh is in flight (blocks all user interaction until the
  *  page reloads). Drives the same UiBlockingOverlay as `engineRestarting`, so a
@@ -12,21 +15,57 @@ import { withBase } from '../utils/basePath';
  *  avoid a store ↔ sw-update import cycle. */
 export const clientRefreshing = signal(false);
 
-/** Build-id-aware dismiss for the "New version available" toast.
+/** Build-id-aware, WORKSPACE-GLOBAL dismiss for the two "new version" toasts —
+ *  the client-refresh ("refresh to sync", keyed on the served `/sw.js` BUILD_ID)
+ *  and the engine switch ("Switch to new version", keyed on the on-disk binary
+ *  `version-status.disk_build_id`).
  *
- *  The toast is surfaced by `syncClientUpdateFromBuild` (store/actions/
- *  client-update.ts) — the reliable check that compares the LOADED bundle's
- *  `CLIENT_BUILD_ID` against the served `/sw.js` BUILD_ID. That check re-runs on
- *  every resume, so a plain "dismissed" boolean would either re-nag the user on
- *  the next tab refocus or, if made sticky, permanently swallow a genuinely
- *  NEWER build's toast. So we remember the EXACT served build id the user
- *  dismissed: the toast stays gone for that build, but a different (newer) served
- *  build re-surfaces it.
+ *  Each toast remembers the EXACT build id the user dismissed so it stays gone for
+ *  THAT build but a genuinely newer build re-surfaces it. The dismissal is stored
+ *  as a GLOBAL preference (`device_id IS NULL`) — NOT per-device localStorage —
+ *  because a *Refresh* reloads onto the shared served client and a *Switch*
+ *  restarts the shared engine, so "not now" is a workspace-wide decision:
+ *  dismissing on one device defers the toast on EVERY device. The write fans out
+ *  via the `PreferencesChanged` SSE → `loadPreferences`, and each surface
+ *  re-derives from the reloaded `preferences` signal (the Switch poll every 4s in
+ *  engine-update.ts; the client-refresh re-sync on the `PreferencesChanged` arm in
+ *  thread-sync.ts). The badge stays lit regardless — it's driven by
+ *  readiness/staleness, never by the dismissal — so dismiss defers only the toast.
  *
- *  `noteUpdateBuildId` records which served build the live toast is offering, so
- *  a dismiss that only knows the toast key (the Toast close button →
- *  `dismissToast('update-available')` in store.ts) can still pin the right id. */
-const SW_DISMISSED_KEY = 'lucidos-sw-update-dismissed';
+ *  Durable across reload + cold relaunch (it lives in the DB). Preferences not yet
+ *  loaded read as "not dismissed" so the toast fails OPEN (surfacing is the safe
+ *  default). `note*BuildId` records which build the live toast is offering so a
+ *  dismiss that only knows the toast key (the Toast X → `dismissToast(...)` in
+ *  store.ts) can still pin the right id. */
+
+/** Global preference key: last-dismissed served client `/sw.js` BUILD_ID. */
+const CLIENT_REFRESH_DISMISSED_KEY = 'client_refresh_dismissed_build';
+/** Global preference key: last-dismissed on-disk engine `disk_build_id`. */
+const ENGINE_SWITCH_DISMISSED_KEY = 'engine_switch_dismissed_build';
+
+/** Read a global dismissed-build preference; undefined until preferences load. */
+function dismissedBuild(key: string): string | undefined {
+  return preferences.value.status === 'loaded' ? preferences.value.data[key] : undefined;
+}
+
+/** Write a global dismissed-build preference (workspace-wide — NO device id, so
+ *  the dismiss defers on every device). Inlines `savePreference`'s optimistic
+ *  `preferences` update (so THIS device reflects the dismiss immediately, before
+ *  its own `PreferencesChanged` round-trips) + error toast, deliberately rather
+ *  than importing `store/actions/preferences`: that module reads the `preferences`
+ *  signal at module-init, which — pulled in through the existing store ↔
+ *  hooks/sw-update cycle — would re-enter a half-initialized store. */
+function writeDismissedBuild(key: string, buildId: string): void {
+  if (preferences.value.status === 'loaded') {
+    preferences.value = {
+      status: 'loaded',
+      data: { ...preferences.value.data, [key]: buildId },
+    };
+  }
+  setPreference(key, buildId).catch((e) => {
+    showToast(`Failed to save ${key} preference: ${errorDetail(e)}`, 'error');
+  });
+}
 
 /** The served BUILD_ID the currently-shown update toast is offering. Set by
  *  `surfaceUpdateToast` so `markSwUpdateDismissed` (no-arg, called from the
@@ -39,17 +78,29 @@ export function noteUpdateBuildId(servedBuildId: string): void {
 
 export function markSwUpdateDismissed(): void {
   if (pendingUpdateBuildId === null) return; // nothing to pin
-  try {
-    sessionStorage.setItem(SW_DISMISSED_KEY, pendingUpdateBuildId);
-  } catch { /* sessionStorage unavailable (e.g. opaque origin) */ }
+  writeDismissedBuild(CLIENT_REFRESH_DISMISSED_KEY, pendingUpdateBuildId);
 }
 
 export function wasSwUpdateDismissed(servedBuildId: string): boolean {
-  try {
-    return sessionStorage.getItem(SW_DISMISSED_KEY) === servedBuildId;
-  } catch {
-    return false; // sessionStorage unavailable — surfacing the toast is the safe default
-  }
+  return dismissedBuild(CLIENT_REFRESH_DISMISSED_KEY) === servedBuildId;
+}
+
+/** The on-disk build id the currently-shown Switch toast is offering. Set by the
+ *  version poll so `markSwitchDismissed` (called from the store's keyed dismiss)
+ *  can record THIS build as dismissed. */
+let pendingSwitchBuildId: string | null = null;
+
+export function noteSwitchBuildId(diskBuildId: string): void {
+  pendingSwitchBuildId = diskBuildId;
+}
+
+export function markSwitchDismissed(): void {
+  if (pendingSwitchBuildId === null) return; // nothing to pin
+  writeDismissedBuild(ENGINE_SWITCH_DISMISSED_KEY, pendingSwitchBuildId);
+}
+
+export function wasSwitchDismissed(diskBuildId: string): boolean {
+  return dismissedBuild(ENGINE_SWITCH_DISMISSED_KEY) === diskBuildId;
 }
 
 /** Spread of delays (ms) over which we re-check the service worker for a new
@@ -60,18 +111,22 @@ const SW_UPDATE_CHECK_DELAYS_MS = [3_000, 8_000, 15_000, 30_000];
 /** Nudge the service worker to re-check for a new build after a
  *  frontend-affecting apply.
  *
- *  In `web-dev.sh --built` mode the frontend rebuilds (`vite build --watch`)
- *  over a few seconds after a change is applied. Each rebuild stamps a new
- *  BUILD_ID into sw.js (see vite.config.ts `lucidos-sw-stamp`), so a
- *  `registration.update()` then detects the new worker and fires the "New
- *  version available → Refresh" toast (hooks/useStartup.ts). Without this nudge
- *  the toast would only appear on the next resume or the 5-min SW health probe
- *  — this makes "push Apply → get told when it's ready" prompt and hands-free.
+ *  In `web-dev.sh --built` mode the build-watch republishes `dist/` (a fresh
+ *  `vite build`) over the next few seconds after a change is applied, stamping a
+ *  new BUILD_ID into sw.js (see vite.config.ts `lucidos-sw-stamp`). The engine
+ *  serves a boot-pinned snapshot, so the served sw.js advances once the engine
+ *  re-snapshots: for a **frontend-only** Apply the engine does that in-process
+ *  (`engine::frontend_refresh`), and a mixed change advances it via a Switch.
+ *  Either way `registration.update()` then detects the new worker and fires the
+ *  "New version available → Refresh" toast (hooks/useStartup.ts). Without this
+ *  nudge the toast would only appear on the next resume or the 5-min SW health
+ *  probe — this makes "push Apply → get told when it's ready" prompt and hands-free.
  *
  *  Best-effort and self-recovering: a failed `update()` is ignored because the
  *  next scheduled check, the resume-time `reg.update()`, or a manual reload all
- *  re-surface the new build. No-op in the live dev server (sw.js never changes,
- *  so no update is found) and where service workers are unavailable. */
+ *  re-surface the new build. A no-op when the served sw.js genuinely doesn't
+ *  change (an engine-only apply with no client delta) and where service workers
+ *  are unavailable. */
 export function scheduleServiceWorkerUpdateChecks(): void {
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
   for (const delay of SW_UPDATE_CHECK_DELAYS_MS) {

@@ -1,6 +1,9 @@
 /**
- * Post-process rendered HTML to linkify artifact paths, app names, and bare URLs.
- * Tracks <a> and <code> nesting to avoid nested anchors and linkifying code content.
+ * Post-process rendered HTML to linkify artifact paths and bare URLs, and to
+ * rewrite deliberate app / nav-panel / artifact anchors into click-routed links.
+ * App names are NOT scanned in prose — an app becomes a link only when the LLM
+ * writes an explicit markdown link to it. Tracks <a> and <code> nesting to avoid
+ * nested anchors and linkifying code content.
  */
 
 import { addLinkifyMs } from './renderPhaseTimers';
@@ -278,6 +281,53 @@ export function extractAppIdFromHref(href: string): string | null {
   return null;                                          // sub-file → artifact
 }
 
+/** Extract a BARE app reference from an href — a single path segment with no
+ *  URL scheme and no sub-path, e.g. `habit-tracker` or `Habit Tracker`. The
+ *  caller resolves the returned token against the known app ids/names; this
+ *  function only normalizes the shape and rejects everything that clearly
+ *  isn't a bare reference.
+ *
+ *  Why it exists: the LLM writes `[Habit Tracker](habit-tracker)` — the app id
+ *  (or name) as a bare relative href — by analogy to `[Notifications](notifications)`.
+ *  That href matches NONE of the strict shapes: no `apps/` prefix, no `app:`
+ *  scheme (so `extractAppIdFromHref` declines), and it isn't a nav panel. Left
+ *  alone the browser resolves the relative href against the base href to a
+ *  non-existent route; the engine's SPA fallback then serves the shell and the
+ *  whole workspace reloads (the "Opening workspace" splash — very visible on an
+ *  iOS PWA). Routing the click through `openApp` instead is the fix.
+ *
+ *  Returns null (not a bare candidate) when the href:
+ *    - carries a URL scheme (`http:`, `app:`, `mailto:`, `file:`, …) — `app:<id>`
+ *      is `extractAppIdFromHref`'s job; the rest are real links.
+ *    - has a slash beyond an optional leading/trailing one (`apps/<id>`,
+ *      `foo/bar`) — a sub-path, owned by the app / artifact rewriters.
+ *    - is empty.
+ *
+ *  Accepts an optional `data/`-less single token with a query/fragment
+ *  (`habit-tracker?v=2`, `habit-tracker#top`) — stripped before returning.
+ *
+ *  The returned token is percent-DECODED: markdown renders an app-name
+ *  destination that contains spaces/special chars encoded — `[x](<Habit Tracker>)`
+ *  and `[x](Habit%20Tracker)` both render as `href="Habit%20Tracker"` — so the
+ *  raw href must be decoded back to `Habit Tracker` to match the app name at
+ *  lookup. (App IDs are slugs, so decoding is a no-op for the id case.) */
+export function extractBareAppRef(href: string): string | null {
+  // Any URL scheme disqualifies a bare ref. `app:<id>` is handled upstream by
+  // extractAppIdFromHref; `http(s):`, `mailto:`, `tel:`, `file:` are real links.
+  if (/^[a-z][a-z0-9+.-]*:/i.test(href)) return null;
+  let candidate = href;
+  if (candidate.startsWith('/')) candidate = candidate.slice(1);
+  const queryStart = candidate.search(/[?#]/);
+  if (queryStart !== -1) candidate = candidate.slice(0, queryStart);
+  if (candidate.endsWith('/')) candidate = candidate.slice(0, -1);
+  if (!candidate) return null;
+  if (candidate.includes('/')) return null; // sub-path → not a bare ref
+  // Decode so a percent-encoded app name (`Habit%20Tracker`) matches the raw
+  // name. A malformed escape (a bare `%` not starting a valid sequence) throws
+  // — keep the raw token in that case rather than dropping the ref.
+  try { return decodeURIComponent(candidate); } catch { return candidate; }
+}
+
 /** Mirror of `rewriteArtifactAnchor` for apps. LLMs naturally write
  *  `[Name](apps/<id>/index.html)` to link to an app — pulldown_cmark renders
  *  that as a plain `<a href="apps/<id>/index.html">` which, left alone, lets
@@ -305,7 +355,11 @@ function rewriteAppAnchor(tag: string, appIds: Set<string>): string | null {
  *  These match neither the `app:<id>` / `apps/<id>` shapes (no id) nor a nav
  *  panel (`app` singular isn't one — `apps` plural is), so without recovery they
  *  render as a raw relative `<a href="app">` that the browser resolves against
- *  the gateway base (`/<slug>/`) to `/<slug>/app`, a dead end. */
+ *  the gateway base (`/<slug>/`) to `/<slug>/app`, a dead end.
+ *
+ *  TEMPORARY MEASURE — model-tolerance (removable; see docs/temporary-measures.md
+ *  § "Bare `app` href recovery", governed by .claude/rules/temporary-measures.md).
+ *  Drop once the agent reliably emits `app:<id>` links carrying an id. */
 const BARE_APP_HREF = /^app:?\/?$/i;
 
 /** Plain-text content between an opening `<a>` tag at `openTagIndex` and its
@@ -348,6 +402,30 @@ function rewriteBareAppAnchorByText(
   return stripped.replace(/^<a/i, `<a href="#" class="app-link" data-app-id="${escapedId}"`);
 }
 
+/** Rewrite a bare app-id/name href (see `extractBareAppRef`) to an app-link.
+ *  Resolves the token against BOTH app ids and names — `appTextToId` maps each
+ *  form to its id, so `habit-tracker` and `Habit Tracker` both resolve. Runs AFTER
+ *  the strict `apps/<id>`, nav, and artifact rewriters so a reserved nav panel
+ *  (`apps`, `notifications`, …) or a real artifact path always wins, and this
+ *  only claims an href none of them wanted. Returns null when the href isn't a
+ *  bare ref or names no known app. */
+function rewriteAppAnchorByBareRef(tag: string, appTextToId: Map<string, string>): string | null {
+  const m = tag.match(HREF_ATTR);
+  if (!m) return null;
+  const href = m[1] ?? m[2];
+  if (!href) return null;
+  const token = extractBareAppRef(href);
+  if (!token) return null;
+  const id = appTextToId.get(token);
+  if (!id) return null;
+  const escapedId = id.replace(/"/g, '&quot;');
+  const stripped = tag
+    .replace(HREF_ATTR, '')
+    .replace(CLASS_ATTR, '')
+    .replace(DATA_APP_ID_ATTR, '');
+  return stripped.replace(/^<a/i, `<a href="#" class="app-link" data-app-id="${escapedId}"`);
+}
+
 /** The invariant regex batches + lookups linkify needs for a given (paths, apps)
  *  set. Building these is the bulk of a linkify call, but they don't depend on the
  *  html — so they're built once per (paths, apps) and reused across every block /
@@ -355,7 +433,6 @@ function rewriteBareAppAnchorByText(
 interface CompiledLinkify {
   pathPatterns: RegExp[];
   pathLookup: Map<string, string> | undefined;
-  appPatterns: RegExp[];
   appTextToId: Map<string, string> | undefined;
   appIds: Set<string> | undefined;
 }
@@ -385,23 +462,23 @@ function buildCompiled(
     pathPatterns = buildBatchedPatterns(escaped, (alt) => `(${alt})`);
   }
 
+  // Map each app name AND id to its id so the anchor rewriters can resolve a
+  // deliberate `[X](app:x)` / `[X](habit-tracker)` link the LLM wrote. Bare-text
+  // app-name scanning was removed — an app named in prose is NOT auto-linked (it
+  // was unreliable, a blind `\b(name)\b` match that linkified every mention of a
+  // generically-named app). Apps become links only via an explicit markdown link.
   let appTextToId: Map<string, string> | undefined;
-  let appPatterns: RegExp[] = [];
   let appIds: Set<string> | undefined;
   if (apps.length > 0) {
-    // Match both app names and app IDs (LLMs sometimes use the ID)
     appTextToId = new Map();
     for (const s of apps) {
       if (!appTextToId.has(s.name)) appTextToId.set(s.name, s.id);
       if (s.id !== s.name && !appTextToId.has(s.id)) appTextToId.set(s.id, s.id);
     }
-    const appTexts = [...appTextToId.keys()].sort((a, b) => b.length - a.length);
-    const appEscaped = appTexts.map((t) => t.replace(REGEX_ESCAPE, '\\$&'));
-    appPatterns = buildBatchedPatterns(appEscaped, (alt) => `\\b(${alt})\\b`);
     appIds = new Set(apps.map((s) => s.id));
   }
 
-  return { pathPatterns, pathLookup, appPatterns, appTextToId, appIds };
+  return { pathPatterns, pathLookup, appTextToId, appIds };
 }
 
 // Build the invariant patterns ONCE per (paths, apps) set instead of once per
@@ -442,7 +519,8 @@ export function _resetLinkifyCacheForTesting(): void {
   generation = 0;
 }
 
-/** Post-process rendered HTML to linkify artifact paths, app names, and bare URLs.
+/** Post-process rendered HTML to linkify artifact paths and bare URLs, and rewrite
+ *  deliberate app / nav / artifact anchors (app names are not scanned in prose).
  *  Pure in (html, paths, apps); LRU-cached so a re-render that re-invokes it with
  *  unchanged content is O(1). `opts.cache: false` opts out (used for the live
  *  streaming buffer, whose html changes every token — caching it would only thrash
@@ -486,7 +564,7 @@ export function linkifyPaths(
 }
 
 function applyCompiled(html: string, compiled: CompiledLinkify): string {
-  const { pathPatterns, pathLookup, appPatterns, appTextToId, appIds } = compiled;
+  const { pathPatterns, pathLookup, appTextToId, appIds } = compiled;
   const segments = html.split(/(<[^>]+>)/);
 
   const urlPattern = /https?:\/\/[^\s<>"')\]]+/g;
@@ -522,6 +600,13 @@ function applyCompiled(html: string, compiled: CompiledLinkify): string {
         if (appIds) rewritten = rewriteAppAnchor(segments[i], appIds);
         if (!rewritten) rewritten = rewriteNavAnchor(segments[i]);
         if (!rewritten && pathLookup) rewritten = rewriteArtifactAnchor(segments[i], pathLookup);
+        // A bare app-id/name href — `[Habit Tracker](habit-tracker)` — that the
+        // strict rewriters and nav declined. Resolve it from the HREF against
+        // the known app ids/names. Without this the browser navigates to the
+        // relative href and the SPA fallback reloads the whole workspace.
+        if (!rewritten && appTextToId) {
+          rewritten = rewriteAppAnchorByBareRef(segments[i], appTextToId);
+        }
         // Last resort: a bare `app` href (no id) that the strict rewriters
         // declined and that isn't the `apps` nav panel — resolve from the
         // anchor's visible text. Covers `[Site Publisher](app)`, which would
@@ -538,7 +623,8 @@ function applyCompiled(html: string, compiled: CompiledLinkify): string {
     }
 
     // Text segment — artifact paths are linkified even inside <code> (LLMs wrap paths in backticks).
-    // App names and URLs are skipped inside <code> to avoid mangling code content.
+    // URLs are skipped inside <code> to avoid mangling code content. App names are
+    // NOT scanned in text at all — apps only linkify via an explicit anchor above.
 
     if (insideAnchor === 0 && pathPatterns.length > 0) {
       const matches = collectMatches(segments[i], pathPatterns, (match) => {
@@ -553,19 +639,6 @@ function applyCompiled(html: string, compiled: CompiledLinkify): string {
     }
 
     if (insideCode > 0) continue;
-
-    if (insideAnchor === 0 && appPatterns.length > 0) {
-      const matches = collectMatches(segments[i], appPatterns, (match) => {
-        const id = appTextToId?.get(match);
-        if (!id) return match;
-        const escapedId = id.replace(/"/g, '&quot;');
-        // href="#" — see rewriteArtifactAnchor: iOS Safari/PWA needs href for
-        // tap→click translation; preventDefault in the delegated chat handler
-        // suppresses the scroll-to-top.
-        return `<a href="#" class="app-link" data-app-id="${escapedId}">${match}</a>`;
-      });
-      segments[i] = applyMatches(segments[i], matches);
-    }
 
     if (insideAnchor === 0) {
       urlPattern.lastIndex = 0;

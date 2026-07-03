@@ -6,6 +6,12 @@
 //! "STOP if about to type `<ask_user_question`" — and the model still
 //! emitted it.
 //!
+//! This is a **model-tolerance measure** — tracked in
+//! `docs/temporary-measures.md` §2 under the `model-tool-call-as-text`
+//! investigation (the generic `<invoke>` form of the same leak lives in
+//! [`super::inline_tool_call_repair`]). Remove it when the model stops leaking
+//! the tag.
+//!
 //! Two helpers live here:
 //! - [`detect_inline_ask_user_question`] — pure function the agentic loop
 //!   calls AFTER the LLM returns its final text. If the text contains a

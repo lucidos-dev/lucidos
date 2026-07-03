@@ -128,14 +128,20 @@ pub(super) struct CodexConfig {
     pub(super) env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 }
 
-/// Resolve the `codex` executable. A launchd-, IDE-, or any
-/// non-interactive-shell-launched engine inherits a PATH that can omit the
-/// Homebrew / npm bin dirs where codex lives — a bare `Command::new("codex")`
-/// then ENOENTs even though the CLI is installed. Probe the common install
-/// locations first; fall back to bare `"codex"` so `Command::spawn` does its
-/// own PATH lookup for everything else. `home` is injected to keep the
-/// function pure and testable.
-fn resolve_codex_binary(home: Option<&Path>) -> std::ffi::OsString {
+/// Resolve the `codex` executable: the user-configured override (already
+/// validated by the spawn path — see `spawn_env::resolve_binary_override`)
+/// wins outright; otherwise probe the common install locations; otherwise
+/// fall back to a bare PATH lookup.
+///
+/// Why probing: a launchd-, IDE-, or any non-interactive-shell-launched
+/// engine inherits a PATH that can omit the Homebrew / npm bin dirs where
+/// codex lives — a bare `Command::new("codex")` then ENOENTs even though the
+/// CLI is installed. `home` is injected to keep the function pure and
+/// testable.
+pub(crate) fn resolve_codex_binary(home: Option<&Path>, override_path: Option<&Path>) -> std::ffi::OsString {
+    if let Some(p) = override_path {
+        return p.as_os_str().to_os_string();
+    }
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(home) = home {
         candidates.push(home.join(".local/bin/codex"));
@@ -166,6 +172,16 @@ impl AgentRuntime for CodexRuntime {
     ) -> Result<RunningAgent, Box<dyn std::error::Error + Send + Sync>> {
         let cli_dir = lucidos_cli_dir();
         if cli_dir.is_none() {
+            // Packaged builds stage the CLI (LUCIDOS_CLI_BIN); without it the
+            // `lucidos` permission/question MCP server can't load and the session
+            // errors mid-stream. Fail fast with an actionable Result. Dev/e2e
+            // keep the tolerant log path. Mirrors ClaudeCodeRuntime::spawn.
+            if crate::runtime::is_packaged() {
+                return Err("The Lucidos CLI is required for coding-agent \
+                    permission/question tools but was not found alongside the engine \
+                    (expected LUCIDOS_CLI_BIN or a sibling `lucidos` binary)"
+                    .into());
+            }
             crate::log!(
                 "[Codex] lucidos CLI binary not found near current_exe — \
                  spawned Codex sessions won't have the `lucidos` command on PATH \
@@ -189,9 +205,19 @@ impl AgentRuntime for CodexRuntime {
                 .collect()
         };
 
+        // A user-configured `codex` path must point at a real executable —
+        // fail the spawn naming the setting rather than silently probing past
+        // a typo (see `spawn_env::resolve_binary_override`).
+        if let Some(path) = args.binary_override {
+            super::spawn_env::resolve_binary_override(
+                path,
+                "Codex (`codex`)",
+                "coding_agent_codex_path",
+            )?;
+        }
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let config = CodexConfig {
-            codex_bin: resolve_codex_binary(home.as_deref()),
+            codex_bin: resolve_codex_binary(home.as_deref(), args.binary_override.map(Path::new)),
             worktree_path: args.worktree_path.to_path_buf(),
             system_prompt: args.system_prompt.map(str::to_string),
             model: args.model.map(str::to_string),
@@ -391,6 +417,10 @@ pub const CODEX_ASK_USER_QUESTION_TOOL: &str = "mcp__lucidos__ask_user_question"
 ///   model sees no `ask_user_question` tool.
 /// - `command` is the bare binary name: `apply_lucidos_env` prepends the
 ///   bundled CLI dir to `PATH`, which codex itself uses to find the command.
+///   The dir resolves via `LUCIDOS_CLI_BIN` in a packaged build (the staged
+///   `<resources>/lucidos`) and via the exe sibling-walk in dev — see
+///   `lucidos_cli::resolve_cli_dir`. A packaged build with the CLI unstaged
+///   fails fast at spawn (`is_packaged()` guard), so this never silently 404s.
 pub(super) fn lucidos_mcp_server_config_json(
     env: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> serde_json::Value {

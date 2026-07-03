@@ -128,13 +128,31 @@ fn translate_auth_block(provider_name: &str, auth: &Value) -> Result<Value, Stri
             auth.clone()
         }
         "script_handshake" => {
-            let credential = require_string(provider_name, auth, "credential")?;
             let script = require_string(provider_name, auth, "script")?;
-            json!({
+            let mut obj = json!({
                 "type": "script_handshake",
-                "credential": credential,
                 "script": script,
-            })
+            });
+            // `credential` is optional (a handshake script may source its
+            // secret elsewhere — OS keychain, OAuth-only exchange). Absent or
+            // null → carry nothing through; a string → carry it; a
+            // present-but-non-string value is a malformed config → fail loudly
+            // rather than silently drop it (matches the pipeline deserializer,
+            // which rejects a non-string `credential`).
+            match auth.get("credential") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(credential)) => {
+                    obj.as_object_mut()
+                        .unwrap()
+                        .insert("credential".into(), Value::String(credential.clone()));
+                }
+                Some(_) => {
+                    return Err(format!(
+                        "provider '{provider_name}': auth.credential must be a string"
+                    ))
+                }
+            }
+            obj
         }
         // Deliberate negative guard: `credential_bundle` was removed
         // long before this migration shipped. We refuse it here so an
@@ -359,6 +377,52 @@ mod tests {
         assert_eq!(layer["type"], "script_handshake");
         assert_eq!(layer["credential"], "comfort-cloud");
         assert_eq!(layer["script"], "scripts/auth/comfort-cloud.py");
+    }
+
+    #[test]
+    fn legacy_script_handshake_without_credential_is_translated() {
+        // `credential` is optional for script_handshake — a legacy block that
+        // omits it must migrate cleanly, with no `credential` key in the
+        // pipeline layer (script sources its secret elsewhere).
+        let tmp = tempfile::tempdir().unwrap();
+        write_apis_json(
+            tmp.path(),
+            r#"{"keychain-api": {"base_url": "https://api.example.com", "auth": {
+              "type": "script_handshake",
+              "script": "scripts/auth/keychain-login.py"
+            }}}"#,
+        );
+        migrate_apis_json_if_needed(tmp.path()).unwrap();
+        let migrated = read_apis_json(tmp.path());
+        let layer = &migrated["keychain-api"]["auth"]["pipeline"][0];
+        assert_eq!(layer["type"], "script_handshake");
+        assert_eq!(layer["script"], "scripts/auth/keychain-login.py");
+        assert!(
+            layer.get("credential").is_none(),
+            "no credential key should be emitted when the legacy block omitted it"
+        );
+    }
+
+    #[test]
+    fn legacy_script_handshake_with_non_string_credential_is_rejected() {
+        // A present-but-non-string `credential` is a malformed config — the
+        // migration must fail loudly, not silently drop the field (which would
+        // migrate the layer to a credential-less one that runs the script with
+        // no CRED_* injection).
+        let tmp = tempfile::tempdir().unwrap();
+        write_apis_json(
+            tmp.path(),
+            r#"{"x": {"base_url": "https://x", "auth": {
+              "type": "script_handshake",
+              "credential": 123,
+              "script": "scripts/auth/x.py"
+            }}}"#,
+        );
+        let err = migrate_apis_json_if_needed(tmp.path()).unwrap_err();
+        assert!(
+            err.contains("credential") && err.contains("string"),
+            "error should name the malformed credential field: {err}"
+        );
     }
 
     #[test]

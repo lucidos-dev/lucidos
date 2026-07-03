@@ -12,6 +12,7 @@ import { openFilePreview, refreshFilePreview } from '../../store/actions/artifac
 import { RENDERABLE_EXTS, TEXT_EXTS, IMAGE_EXTS, VIDEO_EXTS, AUDIO_EXTS, isEditableDataFile } from './previewExts';
 import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
+import { bridgePreviewIframeShortcuts } from './previewIframeShortcuts';
 
 // SVG is text (XML) but the data-file preview shows it as an <img> by default —
 // the source view is the opt-in (sourceMode), handled by the TextContent branch.
@@ -48,7 +49,7 @@ export function FilePreviewInline({ path, layout }: Props) {
       <div class="file-preview-content">
         {editing && <FileEditor path={path} url={url} />}
         {!editing && isImageLike(ext) && !(ext === 'svg' && sourceMode) && <img src={url} alt={path} style="max-width:100%;max-height:100%;object-fit:contain;" onClick={() => { if (isMobile()) openImagePopup(url); }} />}
-        {!editing && ext === 'pdf' && <iframe src={url} style="width:100%;height:100%;border:none;" />}
+        {!editing && ext === 'pdf' && <iframe src={url} style="width:100%;height:100%;border:none;" onLoad={(e) => bridgePreviewIframeShortcuts(e.currentTarget)} />}
         {!editing && VIDEO_EXTS.includes(ext) && <video src={url} controls style="max-width:100%;max-height:100%;" />}
         {!editing && AUDIO_EXTS.includes(ext) && <audio src={url} controls style="width:100%;" />}
         {!editing && (TEXT_EXTS.includes(ext) || (ext === 'svg' && sourceMode)) && <TextContent ext={ext} url={url} sourceMode={sourceMode} path={path} />}
@@ -168,7 +169,7 @@ function TextContent({ ext, url, sourceMode, path }: { ext: string; url: string;
     return <pre class="file-preview-code" dangerouslySetInnerHTML={{ __html: syntaxHighlightCode(content, lang) }} />;
   }
 
-  if (ext === 'html' || ext === 'htm') return <iframe srcDoc={content} style="width:100%;height:100%;border:none;background:#fff;" />;
+  if (ext === 'html' || ext === 'htm') return <iframe srcDoc={content} style="width:100%;height:100%;border:none;background:#fff;" onLoad={(e) => bridgePreviewIframeShortcuts(e.currentTarget)} />;
   if (ext === 'md') return <div class="response-content markdown-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }} />;
   if (ext === 'json') {
     try {

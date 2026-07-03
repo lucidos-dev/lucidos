@@ -23,9 +23,11 @@ vi.mock('../../api/threads', () => ({
   fetchThreadEvents: vi.fn().mockResolvedValue([]),
 }));
 
-import { composeEditedAt, discardCompose, ensureFocusedComposeThread, pendingComposePuts, prefillCompose, sendCompose, sendFollowup, updateCompose, applyRemoteCompose } from './compose';
+import { applySuggestion, composeEditedAt, discardCompose, ensureFocusedComposeThread, pendingComposePuts, prefillCompose, sendCompose, sendFollowup, updateCompose, applyRemoteCompose } from './compose';
 import { focusThread, unfocusThread } from './threads';
-import { codingAgentPendingModel, codingAgentPendingReasoningEffort, connectionStatus, focusedThreadId, inputMode, threadMap, FOCUSED_THREAD_KEY, toasts } from '../store';
+import { connectionStatus, confirmState, focusedThreadId, inputMode, threadMap, selectedScope, FOCUSED_THREAD_KEY, toasts } from '../store';
+import { promptOverrideSyncSeq } from '../../components/chat/promptValueSync';
+import { patchComposeSelection, getComposeSelectionOverride, resolveScope, _resetComposeSelectionsForTesting } from '../composeSelections';
 import {
   _resetThreadNavForTesting,
   _threadNavStateForTesting,
@@ -194,6 +196,115 @@ describe('prefillCompose — starter suggestion drop-in', () => {
     const chatCall = mockFetch.mock.calls.find(([url]) =>
       typeof url === 'string' && url.endsWith('/chat/stream'));
     expect(chatCall, 'prefill must not POST a chat message').toBeUndefined();
+  });
+
+  it('replaces the WHOLE input — clears attached images too, not just the text', () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t-1', makeThread({ state: 'composing', composeText: 'old', composeImages: ['iVBORfake'] }));
+    threadMap.value = map;
+    focusedThreadId.value = 't-1';
+
+    prefillCompose('a fresh starter prompt');
+
+    expect(getDraft('t-1').text).toBe('a fresh starter prompt');
+    // Stale attachments must not ride along with the unrelated starter.
+    expect(getDraft('t-1').image_hashes).toEqual([]);
+  });
+});
+
+describe('applySuggestion — welcome starter drop-in', () => {
+  let mockFetch: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockFetch = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    connectionStatus.value = 'connected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    inputMode.value = { type: 'do' };
+    _resetComposeDraftsForTesting();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    connectionStatus.value = 'disconnected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    inputMode.value = { type: 'do' };
+    confirmState.value = { visible: false, message: '', okLabel: 'Delete' };
+    _resetComposeDraftsForTesting();
+    vi.restoreAllMocks();
+  });
+
+  it('no draft in progress: drops the text in and does NOT confirm', async () => {
+    const seqBefore = promptOverrideSyncSeq.value;
+
+    const applied = await applySuggestion('Build me an app that tracks my reading list.');
+
+    expect(applied).toBe(true);
+    // No confirm was raised (no draft to protect).
+    expect(confirmState.value.visible).toBe(false);
+    const id = focusedThreadId.value!;
+    expect(id).toBeTruthy();
+    expect(getDraft(id).text).toBe('Build me an app that tracks my reading list.');
+    // Force-sync ticket bumped so the textarea reflects the override.
+    expect(promptOverrideSyncSeq.value).toBe(seqBefore + 1);
+    // Not sent — prefill is not a send.
+    const chatCall = mockFetch.mock.calls.find(([url]) =>
+      typeof url === 'string' && url.endsWith('/chat/stream'));
+    expect(chatCall, 'applySuggestion must not POST a chat message').toBeUndefined();
+  });
+
+  it('sets the destination to the Lucidos Agent (chat channel)', async () => {
+    // Start on the coding-agent channel with a coding-agent composing draft.
+    inputMode.value = { type: 'coding_agent' };
+    const map = new Map<string, ThreadState>();
+    map.set('cc-1', makeThread({ id: 'cc-1', state: 'composing', channel: 'claude_code', composeMode: 'claude_code' }));
+    threadMap.value = map;
+    focusedThreadId.value = 'cc-1';
+
+    // Empty draft (mode-only) → no confirm.
+    const applied = await applySuggestion('Tell me how to set up Lucidos for mobile access.');
+
+    expect(applied).toBe(true);
+    expect(inputMode.value).toEqual({ type: 'do' });
+    expect(getDraft('cc-1').mode).toBe('lucidos');
+    expect(getDraft('cc-1').text).toBe('Tell me how to set up Lucidos for mobile access.');
+  });
+
+  it('draft in progress + confirm accepted: overrides text AND clears attachments', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t-1', makeThread({ state: 'composing', composeText: 'my own idea', composeImages: ['iVBORfake'] }));
+    threadMap.value = map;
+    focusedThreadId.value = 't-1';
+
+    const p = applySuggestion('Where can I download apps?');
+    // The confirm is raised synchronously (showConfirm's executor runs eagerly).
+    expect(confirmState.value.visible).toBe(true);
+    expect(confirmState.value.okLabel).toBe('Replace');
+    confirmState.value.resolve!(true);
+
+    expect(await p).toBe(true);
+    expect(getDraft('t-1').text).toBe('Where can I download apps?');
+    // "Replace" means the whole draft — stale attachments must not linger.
+    expect(getDraft('t-1').image_hashes).toEqual([]);
+  });
+
+  it('draft in progress + confirm declined: keeps the draft untouched', async () => {
+    const seqBefore = promptOverrideSyncSeq.value;
+    const map = new Map<string, ThreadState>();
+    map.set('t-1', makeThread({ state: 'composing', composeText: 'my own idea' }));
+    threadMap.value = map;
+    focusedThreadId.value = 't-1';
+
+    const p = applySuggestion('Where can I download apps?');
+    expect(confirmState.value.visible).toBe(true);
+    confirmState.value.resolve!(false);
+
+    expect(await p).toBe(false);
+    // Draft untouched, no override sync fired.
+    expect(getDraft('t-1').text).toBe('my own idea');
+    expect(promptOverrideSyncSeq.value).toBe(seqBefore);
   });
 });
 
@@ -665,6 +776,19 @@ describe('ensureFocusedComposeThread persists focusedThreadId across reload', ()
     expect(localStorage.getItem(FOCUSED_THREAD_KEY)).toBe(id);
   });
 
+  it('eager-seeds the new draft\'s OWN scope from the last-used seed (selectedScope)', () => {
+    // The new draft must carry its own scope because resolveScope no longer falls
+    // back to selectedScope for a real draft (the no-leak guard). So a fresh draft
+    // still shows the last-used target — via its own stored override, not the seed.
+    selectedScope.value = { kind: 'app', appId: 'last-used-app' };
+    const id = ensureFocusedComposeThread();
+    expect(getComposeSelectionOverride(id).scope).toEqual({ kind: 'app', appId: 'last-used-app' });
+    expect(resolveScope(id)).toEqual({ kind: 'app', appId: 'last-used-app' });
+    // Changing the seed afterwards must NOT retroactively move this draft.
+    selectedScope.value = { kind: 'lucidos' };
+    expect(resolveScope(id)).toEqual({ kind: 'app', appId: 'last-used-app' });
+  });
+
   it('clears localStorage when discardCompose nulls the focused draft', async () => {
     const id = ensureFocusedComposeThread();
     threadMap.value = new Map(threadMap.value).set(id, makeThread({
@@ -917,14 +1041,12 @@ describe('inputMode is sticky across compose sessions (toggle remembers last pic
 });
 
 /** A CC reasoning-effort (or model) pick made in the compose view is a
- *  ONE-SHOT intent: it must apply to exactly the thread spawned by the next
- *  send, then revert to the default. The pending pick lives in a module
- *  signal; `sendCompose` focuses the freshly-spawned thread via
- *  `setFocusedThread` (NOT `focusThread`), so `resetCodingAgentPendingPreferences`
- *  never ran on this path. Before the fix a single "Max" pick rode onto every
- *  subsequent new thread, silently overriding the user's `~/.claude`
- *  effortLevel default until an unrelated thread-switch/reload reset it. */
-describe('CC pending pick is one-shot per spawned thread (no cross-thread leak)', () => {
+ *  PER-DRAFT intent: it lives on THIS draft's override (`composeSelections`),
+ *  applies to exactly the thread its send spawns, and is cleared afterward. It
+ *  never touches the global `codingAgentPending*` signal (the active-thread
+ *  mechanism), so it can't ride onto another draft or the next new thread —
+ *  the leak this whole feature exists to prevent. */
+describe('CC compose pick is per-draft (no cross-thread leak)', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
   let chatBodies: Array<{ use_coding_agent?: boolean; reasoning_effort?: string; cc_model?: string }>;
 
@@ -942,8 +1064,6 @@ describe('CC pending pick is one-shot per spawned thread (no cross-thread leak)'
     });
     globalThis.fetch = mockFetch as unknown as typeof fetch;
     connectionStatus.value = 'connected';
-    codingAgentPendingReasoningEffort.value = null;
-    codingAgentPendingModel.value = null;
   });
 
   afterEach(() => {
@@ -951,9 +1071,8 @@ describe('CC pending pick is one-shot per spawned thread (no cross-thread leak)'
     connectionStatus.value = 'disconnected';
     focusedThreadId.value = null;
     threadMap.value = new Map();
-    codingAgentPendingReasoningEffort.value = null;
-    codingAgentPendingModel.value = null;
     _resetComposeDraftsForTesting();
+    _resetComposeSelectionsForTesting();
     vi.restoreAllMocks();
   });
 
@@ -964,23 +1083,22 @@ describe('CC pending pick is one-shot per spawned thread (no cross-thread leak)'
     });
   }
 
-  it('clears the pending effort once the spawn has consumed it', async () => {
-    codingAgentPendingReasoningEffort.value = 'max';
+  it('carries the draft effort into the spawn and clears it afterward', async () => {
     threadMap.value = new Map<string, ThreadState>().set('cc-1', composingCcThread('cc-1', 'do a thing'));
     focusedThreadId.value = 'cc-1';
+    patchComposeSelection('cc-1', { ccReasoningEffort: 'max' });
 
     await sendCompose('cc-1', { useCodingAgent: true });
 
     expect(chatBodies).toHaveLength(1);
     expect(chatBodies[0].reasoning_effort).toBe('max'); // the pick reached the spawn
-    expect(codingAgentPendingReasoningEffort.value).toBeNull();   // ...and was consumed
+    expect(getComposeSelectionOverride('cc-1').ccReasoningEffort).toBeUndefined(); // ...and was consumed
   });
 
-  it('does NOT leak the pick onto the next new thread', async () => {
-    codingAgentPendingReasoningEffort.value = 'max';
-
+  it('does NOT leak the pick onto the next new draft', async () => {
     threadMap.value = new Map<string, ThreadState>().set('cc-A', composingCcThread('cc-A', 'first'));
     focusedThreadId.value = 'cc-A';
+    patchComposeSelection('cc-A', { ccReasoningEffort: 'max' });
     await sendCompose('cc-A', { useCodingAgent: true });
 
     // Brand-new compose; the user did NOT pick an effort this time.
@@ -990,18 +1108,18 @@ describe('CC pending pick is one-shot per spawned thread (no cross-thread leak)'
 
     const ccBodies = chatBodies.filter((b) => b.use_coding_agent);
     expect(ccBodies).toHaveLength(2);
-    expect(ccBodies[0].reasoning_effort).toBe('max');     // first thread honored the pick
+    expect(ccBodies[0].reasoning_effort).toBe('max');     // first draft honored its pick
     expect(ccBodies[1].reasoning_effort).toBeUndefined();  // second falls through to the default
   });
 
-  it('also consumes a pending model pick (symmetry with effort)', async () => {
-    codingAgentPendingModel.value = 'opus[1m]';
+  it('carries a draft model pick into the spawn and clears it (symmetry with effort)', async () => {
     threadMap.value = new Map<string, ThreadState>().set('cc-m', composingCcThread('cc-m', 'pick model once'));
     focusedThreadId.value = 'cc-m';
+    patchComposeSelection('cc-m', { ccModel: 'opus[1m]' });
 
     await sendCompose('cc-m', { useCodingAgent: true });
 
     expect(chatBodies[0].cc_model).toBe('opus[1m]');
-    expect(codingAgentPendingModel.value).toBeNull();
+    expect(getComposeSelectionOverride('cc-m').ccModel).toBeUndefined();
   });
 });

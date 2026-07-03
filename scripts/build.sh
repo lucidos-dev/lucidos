@@ -29,7 +29,7 @@ done
 
 if [ -n "$LOCAL" ]; then
     echo "Building Lucidos engine locally..."
-    cargo build -p lucidos-engine -p lucidos-cli --release
+    cargo build --locked -p lucidos-engine -p lucidos-cli --release
     echo ""
     echo "Build complete!"
     echo "Binaries at: target/release/lucidos-engine, target/release/lucidos"

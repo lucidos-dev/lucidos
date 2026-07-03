@@ -418,12 +418,12 @@ describe('Pending change with file_count=0 must not show Apply/Discard', () => {
   });
 });
 
-describe('Apply & Restart label sources requires_restart from pending change', () => {
+describe('Apply* marker sources requires_restart from pending change', () => {
   // Regression: WaitingBanner used to read requiresRestart only from
   // meta.codingAgentRequiresRestart (set by CodingAgentIdled). When a stale or fallback
   // CodingAgentIdled set that flag to false but the actual pending change had
   // requires_restart=true (e.g. recovery hardcoded false, or mid-iteration
-  // transition), the button incorrectly showed "Apply" instead of "Apply & Restart".
+  // transition), the button incorrectly showed a plain "Apply" instead of "Apply*".
   // The change row's own requires_restart is the authoritative file-derived value.
   it('shows requiresRestart when pending change has requires_restart=true even if meta says false', () => {
     const thread = makeCCThread('t1', 'waiting', 'inbox');
@@ -456,9 +456,12 @@ describe('Apply & Restart label sources requires_restart from pending change', (
     expect(state).not.toBeNull();
     expect(state!.type).toBe('actions');
     if (state!.type === 'actions') {
-      // requiresRestart is now carried on the Apply TaggedAction's label.
+      // A restart-requiring change gets the compact "Apply*" marker (restart is
+      // still the separate switch); requiresRestart also surfaces via the Apply
+      // TaggedAction's tooltip.
       const apply = state!.actions.find((a) => a.kind === 'apply');
-      expect(apply?.label).toBe('Apply & Restart');
+      expect(apply?.label).toBe('Apply*');
+      expect(apply?.tooltip).toContain('new engine version');
     }
   });
 
@@ -476,7 +479,8 @@ describe('Apply & Restart label sources requires_restart from pending change', (
     expect(state!.type).toBe('actions');
     if (state!.type === 'actions') {
       const apply = state!.actions.find((a) => a.kind === 'apply');
-      expect(apply?.label).toBe('Apply & Restart');
+      expect(apply?.label).toBe('Apply*');
+      expect(apply?.tooltip).toContain('new engine version');
     }
   });
 });

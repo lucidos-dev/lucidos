@@ -69,6 +69,7 @@ import {
 } from '../store';
 import { sendMessage } from './chat';
 import { sendCompose } from './compose';
+import { patchComposeSelection, _resetComposeSelectionsForTesting } from '../composeSelections';
 import { setDraft, _resetComposeDraftsForTesting } from '../composeDrafts';
 import { submitChat } from '../../api/client';
 import type { ChatRequestBody } from '../../api/types';
@@ -84,6 +85,7 @@ beforeEach(() => {
   connectionStatus.value = 'connected';
   mockedSubmitChat.mockClear();
   _resetComposeDraftsForTesting();
+  _resetComposeSelectionsForTesting();
 });
 
 function lastBody(): ChatRequestBody {
@@ -219,7 +221,11 @@ describe('sendCompose carries dropdown scope through to chat body (real flow)', 
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'claude_code' });
     setDraft(draftId, { text: 'fix it', image_hashes: [], mode: 'claude_code' });
-    selectedScope.value = { kind: 'external', repoId: 'external-repo-uuid' };
+    // The draft carries its OWN scope (set by the picker via applyDestination /
+    // eager-seeded at creation) — the send resolves that, not the shared
+    // selectedScope. selectedScope is deliberately different to prove it.
+    patchComposeSelection(draftId, { scope: { kind: 'external', repoId: 'external-repo-uuid' } });
+    selectedScope.value = { kind: 'lucidos' };
 
     await sendCompose(draftId, { useCodingAgent: true });
 
@@ -236,7 +242,9 @@ describe('sendCompose carries dropdown scope through to chat body (real flow)', 
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'claude_code' });
     setDraft(draftId, { text: 'fix it', image_hashes: [], mode: 'claude_code' });
-    selectedScope.value = { kind: 'app', appId: 'habit-tracker' };
+    // Draft's own scope override — resolved at send, not the shared selectedScope.
+    patchComposeSelection(draftId, { scope: { kind: 'app', appId: 'habit-tracker' } });
+    selectedScope.value = { kind: 'lucidos' };
 
     await sendCompose(draftId, { useCodingAgent: true });
 

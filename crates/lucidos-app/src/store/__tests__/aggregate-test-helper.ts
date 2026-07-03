@@ -6,7 +6,6 @@
 // (engine/thread_lifecycle_tests/tests.rs) remain the source of truth for
 // the rules; this helper is a TS-side mirror, not a duplicate spec.
 import {
-  applyAggregateToMeta,
   handleEvent,
   type ThreadAggregate,
   type ThreadEvent,
@@ -122,7 +121,7 @@ function applyEventRules(agg: ThreadAggregate, event: ThreadEvent | TransientEve
 }
 
 /** Synthesize the post-event aggregate that the backend would compute. */
-export function synthesizeAggregate(
+function synthesizeAggregate(
   meta: ThreadMeta,
   event: ThreadEvent | TransientEvent,
   overrides: Partial<ThreadAggregate> = {},
@@ -156,5 +155,3 @@ export function handleEventWithAgg(
   const agg = synthesizeAggregate(thread.meta, event, overrides);
   return handleEvent(threadMap, threadId, seq, event, created, eventId, agg).applied;
 }
-
-export { applyAggregateToMeta };

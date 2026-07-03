@@ -6,7 +6,7 @@ use super::super::*;
 
 impl LucidosEngine {
     /// Get a reference to the embedder for sharing with read-only handlers
-    pub fn embedder(&self) -> &Arc<FastEmbedProvider> {
+    pub fn embedder(&self) -> &Arc<crate::memory::EmbedderSlot> {
         &self.embedder
     }
 
@@ -370,14 +370,21 @@ impl LucidosEngine {
     /// cancel slot so the agentic-loop cancel arms can attribute the
     /// resulting `ResponseCanceled` events. Pass `None` for engine-internal
     /// cancels (shutdown, restart) — those already emit boundary events
-    /// with explicit actor upstream.
-    pub fn cancel_all_threads(&self, actor: Option<crate::engine::thread_events::MessageOrigin>) {
-        for handle in self.active_threads.lock().unwrap().values() {
+    /// with explicit actor upstream. Returns whether any thread was active
+    /// (so the thread-id-less `cancel_chat` can report an honest `canceled`).
+    pub fn cancel_all_threads(
+        &self,
+        actor: Option<crate::engine::thread_events::MessageOrigin>,
+    ) -> bool {
+        let handles = self.active_threads.lock().unwrap();
+        let any = !handles.is_empty();
+        for handle in handles.values() {
             if let Some(ref a) = actor {
                 *handle.cancel_actor.lock().unwrap() = Some(a.clone());
             }
             handle.token.cancel();
         }
+        any
     }
 
 }

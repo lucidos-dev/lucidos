@@ -40,12 +40,11 @@ use std::time::Duration;
 /// Max retry attempts for LLM API calls (shared across providers).
 pub const MAX_RETRIES: u32 = 3;
 
-/// Map a unified `reasoning_effort` string to the thinking-budget token count
-/// shared by the Claude `budget_tokens` field (Vertex + direct Anthropic) and
-/// the Gemini-3 `thinkingConfig.thinkingBudget`. Unknown values fall back to
-/// the "high" budget — the default each call site picked independently before
-/// this was DRYed up. Provider-neutral, so it lives here rather than in any one
-/// provider module.
+/// Map a unified `reasoning_effort` string to the Claude thinking `budget_tokens`
+/// value (Vertex + direct Anthropic). Unknown values fall back to the "high"
+/// budget — the default each call site picked independently before this was
+/// DRYed up. (Gemini 3.x no longer uses a budget — it maps effort to
+/// `thinkingConfig.thinkingLevel` in `vertex::gemini::gemini_thinking_level`.)
 pub(crate) fn thinking_budget_for_effort(effort: &str) -> u32 {
     match effort {
         "low" => 4096,
@@ -138,6 +137,80 @@ pub fn with_retry_context(err: impl std::fmt::Display, attempts: u32) -> String 
         format!("{} (after {} attempts)", err, attempts)
     } else {
         err.to_string()
+    }
+}
+
+/// Wall-clock budget for the connect + request + response-headers phase of a
+/// streaming LLM call. The streaming *body* is bounded separately by each
+/// provider's per-chunk timeout inside `parse_*_stream`; the `streaming_client`
+/// is deliberately built WITHOUT an overall `.timeout()` so long valid streams
+/// aren't capped — which left THIS pre-stream phase unbounded. A black-holed
+/// connection there (TCP established, but the server never returns response
+/// headers) hung a chat turn forever: `send().await` never resolved, the
+/// agentic loop's `tokio::select!` only races the user's Stop button, so the
+/// response task never returned and the thread sat `running` with no terminal
+/// event. Bounding it converts that hang into a normal retryable network error.
+pub(crate) const STREAM_HEADER_TIMEOUT_SECS: u64 = 120;
+
+/// Outcome of one streaming-request send attempt. Each provider's retry loop
+/// matches on it: `Got` → proceed to read the SSE stream; `Retry` → the helper
+/// already logged + backed off, the caller does `continue`; `Failed` → the
+/// final error after retries are exhausted, the caller returns it.
+pub(crate) enum StreamSend {
+    Got(reqwest::Response),
+    Retry,
+    Failed(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// Send a streaming request with the connect+headers phase bounded by
+/// `STREAM_HEADER_TIMEOUT_SECS`, folding the four streaming providers' identical
+/// network-error retry arm into one place. A transport error OR a header-phase
+/// timeout both retry up to `MAX_RETRIES` (both are network stalls), then fail.
+/// The caller builds the full `RequestBuilder` (URL + headers + body) and reads
+/// the SSE stream itself on `Got` — only the send/retry handling is shared.
+pub(crate) async fn send_streaming_request(
+    builder: reqwest::RequestBuilder,
+    model: &str,
+    attempt: u32,
+) -> StreamSend {
+    send_streaming_request_with_timeout(
+        builder,
+        model,
+        attempt,
+        Duration::from_secs(STREAM_HEADER_TIMEOUT_SECS),
+    )
+    .await
+}
+
+/// Inner implementation with the header-phase timeout injected, so tests can
+/// drive the timeout path deterministically with a tiny budget instead of
+/// waiting `STREAM_HEADER_TIMEOUT_SECS`.
+async fn send_streaming_request_with_timeout(
+    builder: reqwest::RequestBuilder,
+    model: &str,
+    attempt: u32,
+    header_timeout: Duration,
+) -> StreamSend {
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        match tokio::time::timeout(header_timeout, builder.send()).await {
+            Ok(Ok(resp)) => return StreamSend::Got(resp),
+            Ok(Err(e)) => Box::new(e),
+            // Keep "error sending request" + "timed out" in the message so
+            // `is_transient_error` classifies it retryable (suppresses noisy
+            // trigger failure notifications) exactly like a real transport stall.
+            Err(_elapsed) => format!(
+                "error sending request: stream timed out after {:?} waiting for response headers",
+                header_timeout
+            )
+            .into(),
+        };
+    if attempt <= MAX_RETRIES {
+        let delay = retry_delay(attempt, 1);
+        log_retry(model, &format!("Network error: {}", err), attempt, delay);
+        tokio::time::sleep(delay).await;
+        StreamSend::Retry
+    } else {
+        StreamSend::Failed(with_retry_context(err, attempt).into())
     }
 }
 
@@ -259,6 +332,55 @@ mod tests {
         assert_eq!(retry_delay(3, 1), Duration::from_secs(4));
         assert_eq!(retry_delay(1, 2), Duration::from_secs(2));
         assert_eq!(retry_delay(2, 2), Duration::from_secs(4));
+    }
+
+    /// Reproduction for the stuck-thread bug: a streaming send to a black-holed
+    /// endpoint — connection accepted but response headers NEVER sent — must be
+    /// bounded by the header-phase timeout and surface as a retryable network
+    /// error, not hang forever. Without `send_streaming_request_with_timeout`'s
+    /// `tokio::time::timeout` wrap this `await` never returns (the
+    /// `streaming_client` has no `.timeout()`, and the per-chunk stream timeout
+    /// only engages AFTER headers arrive), which is exactly what left a chat
+    /// thread `running` with no terminal event.
+    #[tokio::test]
+    async fn stream_send_header_timeout_does_not_hang() {
+        // Black-hole: accept connections and hold them open, never replying.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream); // keep each socket open + silent
+            }
+        });
+
+        let url = format!("http://{}/", addr);
+        // attempt > MAX_RETRIES so the helper returns Failed immediately (no backoff sleep).
+        let builder = reqwest::Client::new().post(&url).body("{}");
+        let outcome = send_streaming_request_with_timeout(
+            builder,
+            "test-model",
+            MAX_RETRIES + 1,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        match outcome {
+            StreamSend::Failed(e) => {
+                let msg = e.to_string();
+                let lower = msg.to_lowercase();
+                assert!(
+                    lower.contains("timed out") && lower.contains("header"),
+                    "expected a header-phase timeout error, got: {msg}"
+                );
+                assert!(
+                    is_transient_error(&msg),
+                    "a header-phase timeout must classify as transient/retryable so it routes through retry then a clean ResponseFailed, got: {msg}"
+                );
+            }
+            StreamSend::Got(_) => panic!("black-hole endpoint must not return a response"),
+            StreamSend::Retry => panic!("attempt > MAX_RETRIES must Fail, not Retry"),
+        }
     }
 
     #[test]

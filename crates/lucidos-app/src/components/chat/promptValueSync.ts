@@ -1,3 +1,23 @@
+import { signal } from '@preact/signals';
+
+/** One-shot "force the next textarea sync" ticket. A deliberate programmatic
+ *  compose override — a welcome starter suggestion replacing an in-progress
+ *  draft — must reach the textarea even while it is focused + non-empty, which
+ *  `shouldSkipSyncWhileEditing` otherwise blocks to protect in-flight typing.
+ *  Without the bypass the draft signal (and the drawer row) update but the
+ *  visible prompt stays stale — the "not reflected in the prompt text" bug.
+ *  Bumping this counter makes PromptInput's sync effect force the very next sync
+ *  it observes. It is a plain monotonic counter (not the text/thread) so a repeat
+ *  override of the same text still fires. */
+export const promptOverrideSyncSeq = signal(0);
+
+/** Request a one-shot forced textarea sync — call AFTER writing the draft
+ *  (`updateCompose`) so the effect observes both the new text and the bumped
+ *  counter in one render. See {@link promptOverrideSyncSeq}. */
+export function requestPromptOverrideSync(): void {
+  promptOverrideSyncSeq.value += 1;
+}
+
 /** Sync a textarea's value to `text`. Returns true when the DOM changed.
  *
  *  Browsers snap selectionStart/End to the end of the new value on every

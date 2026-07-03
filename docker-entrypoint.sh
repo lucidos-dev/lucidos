@@ -16,7 +16,7 @@ if [ ! -f "$PGDATA/PG_VERSION" ]; then
 
     # Initialize the database
     chown -R postgres:postgres "$PGDATA"
-    sudo -u postgres /usr/lib/postgresql/17/bin/initdb -D "$PGDATA" --auth-local=trust --auth-host=trust
+    sudo -u postgres /usr/lib/postgresql/18/bin/initdb -D "$PGDATA" --auth-local=trust --auth-host=trust
 
     # Configure for local connections only
     echo "listen_addresses = 'localhost'" >> "$PGDATA/postgresql.conf"
@@ -34,12 +34,12 @@ chown postgres:postgres /var/run/postgresql
 
 # Start PostgreSQL
 echo "Starting PostgreSQL..."
-sudo -u postgres /usr/lib/postgresql/17/bin/pg_ctl -D "$PGDATA" -l "$PGDATA/postgresql.log" start
+sudo -u postgres /usr/lib/postgresql/18/bin/pg_ctl -D "$PGDATA" -l "$PGDATA/postgresql.log" start
 
 # Wait for PostgreSQL to be ready
 echo "Waiting for PostgreSQL..."
 for i in {1..30}; do
-    if sudo -u postgres /usr/lib/postgresql/17/bin/pg_isready -q; then
+    if sudo -u postgres /usr/lib/postgresql/18/bin/pg_isready -q; then
         break
     fi
     sleep 1

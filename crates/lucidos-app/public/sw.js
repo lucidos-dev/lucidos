@@ -15,7 +15,7 @@ const SCOPE_PATH = (() => {
 })();
 
 /** Strip the scope prefix from an absolute pathname, yielding a scope-relative
- *  path (always starting with "/"). `/work/api/v1/x` → `/api/v1/x`; `/` → `/`. */
+ *  path (always starting with "/"). `/myws/api/v1/x` → `/api/v1/x`; `/` → `/`. */
 function scopeRelative(path) {
   return path.startsWith(SCOPE_PATH) ? '/' + path.slice(SCOPE_PATH.length) : path;
 }
@@ -518,13 +518,13 @@ self.addEventListener('notificationclick', (event) => {
 
 // True if a top-level Window client belongs to THIS service worker's scope.
 // Behind the workspace gateway several workspaces share one origin
-// (`/personal/`, `/dev/`, …); a push for `/personal` is delivered to the
-// `/personal` SW, but `clients.matchAll({includeUncontrolled:true})` returns
+// (`/myws/`, `/dev/`, …); a push for `/myws` is delivered to the
+// `/myws` SW, but `clients.matchAll({includeUncontrolled:true})` returns
 // EVERY same-origin tab — including an open `/dev` tab. Without this gate
 // routeToDeepLink would focus + postMessage the wrong workspace's tab, whose
 // store has no such thread/app, so the tap "goes nowhere" (the cross-workspace
 // notification-tap bug). Match only same-scope clients; tolerate a missing
-// trailing slash (`/personal` for scope `/personal/`). At the legacy root scope
+// trailing slash (`/myws` for scope `/myws/`). At the legacy root scope
 // (`/`) every same-origin client matches — correct, since there's only one
 // workspace there.
 function clientInScope(clientUrl) {

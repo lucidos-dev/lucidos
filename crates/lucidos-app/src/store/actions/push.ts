@@ -131,6 +131,47 @@ export async function recoverServiceWorker(): Promise<void> {
 }
 
 /**
+ * Why push can NEVER work in this page context, or `null` when it can.
+ * Pure (all inputs injected) — exported for tests; production callers use
+ * `pushUnsupportedReasonHere()`.
+ *
+ * The secure-context check comes first and is the load-bearing one for a
+ * packaged install reached over plain `http://<host>:<port>/`: service workers
+ * and `Notification.requestPermission` exist only in secure contexts (https or
+ * localhost), and Chrome hides `navigator.serviceWorker` entirely there — so
+ * without this check the user got a misleading "not supported in this browser"
+ * for what is really an origin problem they can fix (open over https://, an SSH
+ * tunnel to localhost, or `tailscale serve`).
+ */
+export function pushUnsupportedReason(ctx: {
+  secureContext: boolean;
+  hasServiceWorker: boolean;
+  hasPushManager: boolean;
+  hasNotification: boolean;
+}): string | null {
+  if (!ctx.secureContext) {
+    return 'Push needs a secure origin (https or localhost). Open Lucidos over https://, an SSH tunnel to localhost, or tailscale serve — plain http://<host> cannot register notifications.';
+  }
+  if (!ctx.hasServiceWorker || !ctx.hasPushManager) {
+    return 'Push notifications are not supported in this browser';
+  }
+  if (!ctx.hasNotification) {
+    return 'Notifications are not supported in this browser';
+  }
+  return null;
+}
+
+/** The production wiring of `pushUnsupportedReason` against the live page. */
+export function pushUnsupportedReasonHere(): string | null {
+  return pushUnsupportedReason({
+    secureContext: window.isSecureContext,
+    hasServiceWorker: 'serviceWorker' in navigator,
+    hasPushManager: 'PushManager' in window,
+    hasNotification: 'Notification' in window,
+  });
+}
+
+/**
  * Register the service worker, request notification permission,
  * subscribe to push, and send the subscription to the backend.
  *
@@ -154,13 +195,9 @@ export async function initPushSubscription(): Promise<boolean> {
     return false;
   }
 
-  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
-    showToast('Push notifications are not supported in this browser', 'error');
-    return false;
-  }
-
-  if (!('Notification' in window)) {
-    showToast('Notifications are not supported in this browser', 'error');
+  const unsupported = pushUnsupportedReasonHere();
+  if (unsupported) {
+    showToast(unsupported, 'error');
     return false;
   }
 

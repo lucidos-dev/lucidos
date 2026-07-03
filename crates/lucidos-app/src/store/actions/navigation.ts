@@ -149,6 +149,31 @@ function migrateEntry(raw: Record<string, unknown>): NavEntry {
   };
 }
 
+/** Whether a panel overlay is a transient, request-backed form that must NOT be
+ *  resurrected from the persisted nav stack on reload. These overlays are backed
+ *  by an engine-staged request whose id (a fresh-per-prepare-call UUID) is dead
+ *  the moment the page reloads — restoring the panel would show a stale form
+ *  whose Confirm/Cancel resolves a request that no longer exists. Covers plugin
+ *  install/uninstall, email-confirm, and an *engine-prompted* credential request
+ *  (a `credential` form WITH a `request`). A `credential` form WITHOUT a request
+ *  is a Settings-driven edit of a stored credential and restores normally, as do
+ *  the persistent forms (app-edit, new-app, trigger). Mirrors the url-preview
+ *  suppression guard in `restoreState`. */
+function isTransientForm(overlay: PanelOverlay): boolean {
+  if (overlay?.type !== 'form') return false;
+  const form = overlay.form;
+  switch (form.type) {
+    case 'plugin-install':
+    case 'plugin-uninstall':
+    case 'email-confirm':
+      return true;
+    case 'credential':
+      return form.request != null;
+    default:
+      return false;
+  }
+}
+
 function restoreState(entry: NavEntry): void {
   _restoring = true;
   try {
@@ -162,8 +187,15 @@ function restoreState(entry: NavEntry): void {
     // active path: in Chrome/PWA it uses a broken iframe, and under Tauri the
     // experimental in-app webview is off by default (URLs open in the system
     // browser, so there's no panel to resurrect on reload).
-    const overlay = migrated.overlay?.type === 'url-preview'
-      && (!isTauri() || !currentInAppBrowser())
+    const suppressUrlPreview = migrated.overlay?.type === 'url-preview'
+      && (!isTauri() || !currentInAppBrowser());
+    // Drop any transient, request-backed form overlay (plugin install/uninstall,
+    // email-confirm, engine-prompted credential) — its staged request is dead
+    // after a reload, so resurrecting the panel would show a stale form (see
+    // isTransientForm). Persistent forms (app-edit, new-app, trigger, credential
+    // edit) still restore. Both guards resolve to null so the localStorage side
+    // effects below key off the final overlay value.
+    const overlay = suppressUrlPreview || isTransientForm(migrated.overlay)
       ? null : migrated.overlay;
     panelOverlay.value = overlay;
     if (overlay?.type === 'file-preview') {

@@ -8,7 +8,7 @@ import type { TriggerInfo } from '../../store/types';
 import { TriggerItem } from './TriggerItem';
 import { TriggerGroupHeader } from './TriggerGroupHeader';
 import { LoadableError } from '../shared/LoadableError';
-import { ListSkeleton } from '../shared/ListSkeleton';
+import { ListSkeletonOf } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 
 const UNGROUPED_KEY = '__ungrouped__';
@@ -56,7 +56,7 @@ export function TriggersView() {
   return (
     <div class="content-view active">
       <div class="list-rows">
-        <LoadingFade showSkeleton={showTriggersLoading} skeleton={<ListSkeleton fill />}>
+        <LoadingFade showSkeleton={showTriggersLoading} skeleton={<ListSkeletonOf fill containerClass="trigger-group-section" row={() => <TriggerItem />} />}>
           {triggersLoadable.status === 'loaded' ? (
             <TriggersLoaded
               triggersData={triggersLoadable.data}

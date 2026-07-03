@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use std::time::Duration;
 
 mod chat;
+pub mod codex_detect;
 mod responses;
 
 const CHUNK_TIMEOUT_SECS: u64 = 300;
@@ -38,6 +39,9 @@ pub enum OpenAiKeySource {
     Credential,
     /// The `OPENAI_API_KEY` launch environment variable (the fallback).
     Env,
+    /// Auto-detected from the Codex CLI's `auth.json` (`apikey` login) — the
+    /// lowest-precedence source. See [`codex_detect`].
+    CodexCli,
 }
 
 impl std::fmt::Display for OpenAiKeySource {
@@ -45,23 +49,33 @@ impl std::fmt::Display for OpenAiKeySource {
         f.write_str(match self {
             Self::Credential => "stored credential (Settings → Providers)",
             Self::Env => "OPENAI_API_KEY",
+            Self::CodexCli => "Codex CLI (~/.codex/auth.json)",
         })
     }
 }
 
 /// Resolve the OpenAI API key used to construct [`OpenAiProvider`].
 ///
-/// A usable stored `openai` credential (Settings → Providers) takes precedence
-/// so the engine no longer needs `OPENAI_API_KEY` in its launch environment;
-/// the env var stays as a fallback to preserve existing deployments. Only
+/// Precedence, highest first: a usable stored `openai` credential (Settings →
+/// Providers) › the `OPENAI_API_KEY` launch env var › a key auto-detected from
+/// the Codex CLI's `auth.json` (`codex_key`; see [`codex_detect`]). The stored
+/// credential means the engine no longer needs `OPENAI_API_KEY` in its launch
+/// environment; the env var stays as a fallback to preserve existing
+/// deployments; the Codex key is the lowest-precedence convenience so a machine
+/// already logged into Codex with an API key gets OpenAI models with no extra
+/// config (the parallel of Vertex reading the gcloud ADC file). Only
 /// `api_key` / `bearer` credentials carry a usable OpenAI key — any other
 /// `auth_type` (e.g. a `password` JSON blob) is ignored with a log line and the
-/// resolver falls through to the env var. Blank/whitespace values on either
-/// side are treated as absent. Returns `None` when neither is configured, in
-/// which case OpenAI models surface a clear error from `RoutingProvider`.
+/// resolver falls through. Blank/whitespace values on any source are treated as
+/// absent. Returns `None` when none is configured, in which case OpenAI models
+/// surface a clear error from `RoutingProvider`.
+///
+/// Pure over its inputs (the Codex fs read happens in the caller) so the
+/// precedence stays unit-testable without touching the filesystem.
 pub fn resolve_openai_api_key(
     credential: Option<(AuthType, String)>,
     env_key: Option<String>,
+    codex_key: Option<String>,
 ) -> Option<(String, OpenAiKeySource)> {
     if let Some((auth_type, value)) = credential {
         match auth_type {
@@ -73,7 +87,7 @@ pub fn resolve_openai_api_key(
             }
             other => {
                 log!(
-                    "[Startup] OpenAI credential auth_type {} unsupported (expected api_key or bearer) — ignoring it and falling back to OPENAI_API_KEY",
+                    "[Startup] OpenAI credential auth_type {} unsupported (expected api_key or bearer) — ignoring it and falling back to OPENAI_API_KEY / Codex CLI",
                     other
                 );
             }
@@ -83,6 +97,12 @@ pub fn resolve_openai_api_key(
         let trimmed = value.trim();
         if !trimmed.is_empty() {
             return Some((trimmed.to_string(), OpenAiKeySource::Env));
+        }
+    }
+    if let Some(value) = codex_key {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some((trimmed.to_string(), OpenAiKeySource::CodexCli));
         }
     }
     None
@@ -424,13 +444,15 @@ mod tests {
         assert_eq!(meta.output_tokens, Some(u32::MAX));
     }
 
-    /// A stored `openai` credential wins over the env var so users can configure
-    /// OpenAI entirely from Settings → Providers without OPENAI_API_KEY.
+    /// A stored `openai` credential wins over the env var (and the Codex key) so
+    /// users can configure OpenAI entirely from Settings → Providers without
+    /// OPENAI_API_KEY.
     #[test]
     fn stored_credential_takes_precedence_over_env() {
         let resolved = resolve_openai_api_key(
             Some((AuthType::ApiKey, "sk-stored".to_string())),
             Some("sk-env".to_string()),
+            Some("sk-codex".to_string()),
         );
         assert_eq!(
             resolved,
@@ -438,18 +460,42 @@ mod tests {
         );
     }
 
-    /// With no credential the OPENAI_API_KEY env fallback is preserved.
+    /// With no credential the OPENAI_API_KEY env fallback is preserved, and it
+    /// wins over the Codex key (env is an explicit launch choice).
     #[test]
     fn falls_back_to_env_when_no_credential() {
-        let resolved = resolve_openai_api_key(None, Some("sk-env".to_string()));
+        let resolved =
+            resolve_openai_api_key(None, Some("sk-env".to_string()), Some("sk-codex".to_string()));
         assert_eq!(resolved, Some(("sk-env".to_string(), OpenAiKeySource::Env)));
+    }
+
+    /// The Codex key is used only when neither a credential nor the env var is
+    /// present — the lowest-precedence auto-detected source.
+    #[test]
+    fn falls_back_to_codex_when_no_credential_or_env() {
+        let resolved = resolve_openai_api_key(None, None, Some("sk-codex".to_string()));
+        assert_eq!(
+            resolved,
+            Some(("sk-codex".to_string(), OpenAiKeySource::CodexCli))
+        );
+    }
+
+    /// A blank env key does not shadow a usable Codex key.
+    #[test]
+    fn blank_env_falls_back_to_codex() {
+        let resolved =
+            resolve_openai_api_key(None, Some("   ".to_string()), Some("sk-codex".to_string()));
+        assert_eq!(
+            resolved,
+            Some(("sk-codex".to_string(), OpenAiKeySource::CodexCli))
+        );
     }
 
     /// A `bearer` credential carries a usable OpenAI key just like `api_key`.
     #[test]
     fn bearer_credential_is_accepted() {
         let resolved =
-            resolve_openai_api_key(Some((AuthType::Bearer, "sk-bearer".to_string())), None);
+            resolve_openai_api_key(Some((AuthType::Bearer, "sk-bearer".to_string())), None, None);
         assert_eq!(
             resolved,
             Some(("sk-bearer".to_string(), OpenAiKeySource::Credential))
@@ -464,6 +510,7 @@ mod tests {
         let resolved = resolve_openai_api_key(
             Some((AuthType::Password, r#"{"username":"a","password":"b"}"#.to_string())),
             Some("sk-env".to_string()),
+            None,
         );
         assert_eq!(resolved, Some(("sk-env".to_string(), OpenAiKeySource::Env)));
     }
@@ -475,19 +522,21 @@ mod tests {
         let resolved = resolve_openai_api_key(
             Some((AuthType::ApiKey, "   ".to_string())),
             Some("sk-env".to_string()),
+            None,
         );
         assert_eq!(resolved, Some(("sk-env".to_string(), OpenAiKeySource::Env)));
     }
 
-    /// Neither configured (or both blank) → None, so OpenAI models surface a
-    /// clear "not configured" error instead of constructing a dead provider.
+    /// None configured (or all blank) → None, so OpenAI models surface a clear
+    /// "not configured" error instead of constructing a dead provider.
     #[test]
     fn none_configured_returns_none() {
-        assert_eq!(resolve_openai_api_key(None, None), None);
+        assert_eq!(resolve_openai_api_key(None, None, None), None);
         assert_eq!(
             resolve_openai_api_key(
                 Some((AuthType::ApiKey, String::new())),
-                Some("  ".to_string())
+                Some("  ".to_string()),
+                Some("   ".to_string())
             ),
             None
         );

@@ -1,5 +1,6 @@
 import { API, json, mutatingFetch, throwIfNotOk } from './client';
 import type { ThreadSection, ThreadInitiator, ThreadAggregate } from '../store/thread-events';
+import type { ComposeSelectionOverride } from '../store/composeSelections';
 
 export interface ThreadSummary {
   thread_id: string;
@@ -84,6 +85,11 @@ export interface ThreadSummary {
   compose_images: string[];
   /** User's mode preference while composing. Null once the thread is no longer composing. */
   compose_mode?: 'lucidos' | 'claude_code' | null;
+  /** Per-draft dropdown selections (target/scope, coding agent, Lucidos model +
+   *  reasoning, coding-agent model + reasoning) — the DB-backed authoritative
+   *  store, so a reload rehydrates the draft's picks. A partial override; absent
+   *  fields resolve to the account default. Null/absent = no per-draft picks. */
+  compose_selection?: ComposeSelectionOverride | null;
 }
 
 export interface ThreadsResponse {

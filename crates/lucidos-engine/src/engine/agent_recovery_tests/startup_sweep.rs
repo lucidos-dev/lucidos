@@ -703,5 +703,165 @@ mod settle_orphaned_running_sweep {
     }
 }
 
+// -- Phase D: user-switch vs crash classification -----------------------------
+//
+// `switch_was_user_initiated` is the predicate `recover_orphaned_worktrees` uses
+// to decide auto-resume (a device-attributed teardown `ResponseAborted` proves a
+// real *Switch to new version*) vs the manual Continue affordance (a crash left
+// no such boundary). The startup lease guarantees the predecessor's teardown emit
+// has landed before recovery reads it; these tests pin the classification itself.
+mod switch_classification {
+    use crate::engine::agent_recovery::recovery::switch_was_user_initiated;
+    use crate::engine::event_bus::{BusEvent, EventBus};
+    use crate::engine::thread_events::{
+        AbortCause, ActorMode, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+    };
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    fn device_actor() -> MessageOrigin {
+        MessageOrigin::Device {
+            device_id: "dev-1".into(),
+            label: "My MacBook".into(),
+        }
+    }
+
+    /// A CC user turn — a start event in the predicate's start set, so the abort
+    /// below is genuinely "newer than the last start".
+    async fn seed_cc_start(bus: &EventBus, thread_id: Uuid) {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::MessageReceived {
+                text: "do the thing".into(),
+                user_image_hashes: vec![],
+                device_id: None,
+                device: None,
+                image_description: None,
+                parent_thread_id: None,
+                spawning_event_id: None,
+                mode: ActorMode::Human,
+                model: None,
+                reasoning_effort: None,
+                origin: None,
+            },
+            meta: EventMeta {
+                channel: Some(EventChannel::ClaudeCode),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn abort_with(bus: &EventBus, thread_id: Uuid, actor: Option<MessageOrigin>) {
+        crate::engine::thread_events::emit_response_aborted(
+            bus,
+            thread_id,
+            AbortCause::EngineShutdown,
+            String::new(),
+            vec![],
+            None,
+            None,
+            EventMeta {
+                channel: Some(EventChannel::ClaudeCode),
+                actor,
+                ..EventMeta::NONE
+            },
+            "[test] teardown abort",
+        )
+        .await;
+    }
+
+    /// Distinct `created`/`sequence` ordering — a zero-gap emit pair can collapse
+    /// the sweep's timestamp comparisons (see `recovery_tests::tick`).
+    async fn tick() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    #[tokio::test]
+    async fn device_attributed_abort_is_user_initiated_switch() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        seed_cc_start(&bus, thread_id).await;
+        tick().await;
+        abort_with(&bus, thread_id, Some(device_actor())).await;
+
+        assert!(
+            switch_was_user_initiated(&pool, thread_id).await,
+            "a device-attributed teardown abort newer than the last start means a user Switch → auto-resume"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn system_missing_and_absent_aborts_are_not_a_switch() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+
+        // System actor (crash / bare stop.sh teardown) → not a switch.
+        let sys_thread = Uuid::new_v4();
+        seed_cc_start(&bus, sys_thread).await;
+        tick().await;
+        abort_with(&bus, sys_thread, Some(MessageOrigin::system())).await;
+        assert!(
+            !switch_was_user_initiated(&pool, sys_thread).await,
+            "a system-attributed abort must NOT auto-resume (crash path → manual Continue)"
+        );
+
+        // No actor at all → not a switch.
+        let none_thread = Uuid::new_v4();
+        seed_cc_start(&bus, none_thread).await;
+        tick().await;
+        abort_with(&bus, none_thread, None).await;
+        assert!(
+            !switch_was_user_initiated(&pool, none_thread).await,
+            "an actor-less abort must NOT auto-resume"
+        );
+
+        // No teardown abort at all → nothing to resume.
+        let clean_thread = Uuid::new_v4();
+        seed_cc_start(&bus, clean_thread).await;
+        assert!(
+            !switch_was_user_initiated(&pool, clean_thread).await,
+            "no teardown abort means nothing to resume"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Loop-breaker: a device abort a prior resume already consumed (a newer
+    /// start sits after it) no longer counts — so an auto-resumed session that
+    /// dies again before emitting a lifecycle event falls back to manual
+    /// Continue instead of re-resuming forever.
+    #[tokio::test]
+    async fn device_abort_older_than_latest_start_is_not_a_switch() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+
+        seed_cc_start(&bus, thread_id).await;
+        tick().await;
+        abort_with(&bus, thread_id, Some(device_actor())).await;
+        tick().await;
+        // A newer start (a resume) supersedes the consumed switch-abort. Any
+        // event in the predicate's start set does this; MessageReceived stands in
+        // for ContinuationStarted here.
+        seed_cc_start(&bus, thread_id).await;
+
+        assert!(
+            !switch_was_user_initiated(&pool, thread_id).await,
+            "a device abort older than the latest start has been consumed by a prior resume → no re-resume"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+}
+
 // -- end_stale_waiting_session branch-deletion regression ----------------------
 

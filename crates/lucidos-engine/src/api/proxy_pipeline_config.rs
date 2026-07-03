@@ -33,12 +33,18 @@ pub enum LayerConfig {
         param_name: Option<String>,
     },
     /// Long-lived cache layer: external script returns headers + TTL.
+    /// `credential` is OPTIONAL: when set, the named credential's
+    /// `CRED_<NAME>*` env vars are injected before the script runs; when
+    /// omitted, no credential env vars are injected from this layer — the
+    /// script is expected to source its secret by other means (e.g. reading
+    /// a rotating token from the OS keychain, or an OAuth-only exchange).
     /// `oauth_providers` lists OAuth provider names whose access tokens
     /// (and email, when known) get injected as `OAUTH_<UPPER>_ACCESS_TOKEN`
     /// / `OAUTH_<UPPER>_EMAIL` env vars before the script runs — same name
     /// rule as `engine::tools` subprocess injection. Default empty.
     ScriptHandshake {
-        credential: String,
+        #[serde(default)]
+        credential: Option<String>,
         script: String,
         #[serde(default)]
         oauth_providers: Vec<String>,
@@ -189,8 +195,33 @@ mod tests {
                 script,
                 oauth_providers,
             } => {
-                assert_eq!(credential, "comfort");
+                assert_eq!(credential.as_deref(), Some("comfort"));
                 assert_eq!(script, "scripts/x.py");
+                assert!(oauth_providers.is_empty());
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn pipeline_config_parses_script_handshake_without_credential() {
+        // A handshake script that sources its secret elsewhere (OS keychain,
+        // OAuth-only exchange) may omit `credential` — it must parse as None,
+        // not error with a missing-field failure.
+        let json = r#"{
+            "pipeline": [
+                {"type": "script_handshake", "script": "scripts/auth/keychain-login.py"}
+            ]
+        }"#;
+        let cfg: PipelineConfig = serde_json::from_str(json).unwrap();
+        match &cfg.pipeline[0] {
+            LayerConfig::ScriptHandshake {
+                credential,
+                script,
+                oauth_providers,
+            } => {
+                assert!(credential.is_none(), "omitted credential should be None");
+                assert_eq!(script, "scripts/auth/keychain-login.py");
                 assert!(oauth_providers.is_empty());
             }
             _ => panic!(),
@@ -214,7 +245,7 @@ mod tests {
                 script,
                 oauth_providers,
             } => {
-                assert_eq!(credential, "firebase-key");
+                assert_eq!(credential.as_deref(), Some("firebase-key"));
                 assert_eq!(script, "scripts/auth/firebase.py");
                 assert_eq!(
                     oauth_providers,

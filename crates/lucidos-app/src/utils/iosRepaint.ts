@@ -1,4 +1,6 @@
 import { isIOS } from './platform';
+import { hasPendingEventScroll } from '../components/chat/scrollState';
+import { isUserScrolling } from './scrollActivity';
 
 /** Force iOS Safari / WKWebView to repaint a compositor layer whose backing
  *  texture it has blanked — content is present in the DOM (events loaded,
@@ -20,12 +22,34 @@ import { isIOS } from './platform';
  *       pending layout so the nudged frame paints instead of being swallowed.
  *    3. A real ±1px `scrollTop` nudge on a scrollable element — re-commits the
  *       layer tree exactly as a manual finger-scroll does (the user-confirmed
- *       recovery). The restore yields: it puts `scrollTop` back to the captured
- *       baseline ONLY if our nudge is still the current value, so a concurrent
- *       scroll write — `useScrollMemory`'s saved-position restore on thread open,
- *       `useAutoScroll`'s bottom-pin during streaming — is never clobbered. ±1
- *       stays inside the 80px `scrolledUp` stickiness window AND the 2px chevron
- *       slack (scrollState.ts), so it never trips auto-scroll or the chevron.
+ *       recovery). Two refinements:
+ *       - The nudge is taken ±1 from the LIVE scrollTop at NUDGE time (frame one),
+ *         not from a call-time baseline: during streaming the bottom moves between
+ *         the call and the frame, and a stale baseline would nudge far above the
+ *         grown bottom and latch `scrolledUp` (killing auto-tail). A true ±1 stays
+ *         inside the 80px `scrolledUp` stickiness window AND the 2px chevron slack
+ *         (scrollState.ts), so it never trips auto-scroll or the chevron. The
+ *         restore yields — it puts `scrollTop` back to the value the nudge came
+ *         FROM only if our nudge is still the current value, so a concurrent
+ *         scroll write (`useScrollMemory`'s saved-position restore on thread open,
+ *         `useAutoScroll`'s bottom-pin during streaming) is never clobbered.
+ *       - The scroll-nudge is skipped entirely while a notification deep-link
+ *         scroll claim is in flight (`hasPendingEventScroll()`): the same iOS
+ *         resume signals (visibilitychange/pageshow/focus) that fire this repaint
+ *         also fire when a notification-tap foregrounds the PWA, exactly as
+ *         `scrollToEventAndPulse` is smooth-scrolling to the target event; a nudge
+ *         would fight that landing and drop the user mid/top/bottom. Every other
+ *         auto-scroll path already defers to the claim; this is the last one.
+ *       - The scroll-nudge is ALSO skipped while a user touch-drag / its momentum
+ *         tail is in flight (`isUserScrolling()`): iOS cancels an in-flight
+ *         momentum scroll the instant scrollTop is written, so a nudge ticking on
+ *         a timer (streaming throttle, open burst, settle probe, resume) mid-fling
+ *         stops the scroll dead — the "scrolling randomly stops instead of going
+ *         further when you let go" bug. A live scroll already keeps the compositor
+ *         committing, so the nudge is redundant then anyway. See scrollActivity.ts.
+ *         The decision is frozen at burst start (and reused on supersede) so rAF1
+ *         and rAF2 always agree. The transform round-trip + forced layout read (1 & 2)
+ *         still force the compositor re-commit without touching `scrollTop`.
  *  Plain `translateZ` alone is widely reported as unreliable (it stops flicker but
  *  the repaint can still not land), which matches the field reports this fixes.
  *
@@ -33,22 +57,42 @@ import { isIOS } from './platform';
  *  pending frames AND restores both baselines so a caller can hand it straight
  *  back from a `useEffect`; fire-and-forget callers may ignore it. */
 
-/** Per-element in-flight toggle. Tracks the scheduled frames and the TRUE
- *  baselines (transform + scroll position, captured once on the first call of a
- *  burst) so a superseding call restores cleanly instead of capturing an
- *  intermediate nudge as its baseline. */
+/** Per-element in-flight toggle. Tracks the scheduled frames and the transform
+ *  baseline (captured once on the first call of a burst) plus this toggle's own
+ *  scroll nudge — captured at NUDGE time (raf1) from the LIVE scrollTop, NOT at
+ *  call time — so a superseding call can undo a partial nudge cleanly. */
 interface InFlightToggle {
   raf1: number;
   raf2: number | undefined;
   prev: string;
-  /** Scroll baseline captured ONCE per burst (reused on supersede so the ±1
-   *  nudge can't drift the position by 1px per superseded call). `scrollable`
-   *  gates every scroll write so a non-scrollable element (or an off-iOS no-op)
-   *  never touches `scrollTop`. */
-  prevScrollTop: number;
-  scrollable: boolean;
+  /** "Should we nudge `scrollTop`?" decided ONCE at burst start and reused on
+   *  every superseding call, so rAF1 (nudge) and rAF2 (restore) always agree even
+   *  though `hasPendingEventScroll()` can flip mid-burst — never
+   *  nudge-then-skip-restore or skip-then-restore. False when the element isn't
+   *  scrollable OR a deep-link claim is in flight; gates the scroll write so those
+   *  cases never touch `scrollTop`. */
+  nudgeScroll: boolean;
+  /** The LIVE scrollTop this toggle's raf1 nudged FROM, and the value it nudged
+   *  TO — captured IN raf1 (not at call time) so streaming growth between the call
+   *  and the nudge can't make the nudge stale. `undefined` until raf1 has actually
+   *  nudged (nudgeScroll was true), so `restoreNudge` is a no-op until then. */
+  restoreTop: number | undefined;
+  nudgedTop: number | undefined;
 }
 const inFlight = new WeakMap<object, InFlightToggle>();
+
+/** Undo a toggle's OWN scroll nudge — restore to the value it nudged FROM, iff
+ *  `scrollTop` is still the value it nudged TO. If anything else moved it
+ *  meanwhile (useScrollMemory's saved-position restore on open, useAutoScroll's
+ *  bottom-pin during streaming, a real user scroll), yield and leave it — never
+ *  clobber a concurrent writer. No-op until raf1 has actually nudged. */
+function restoreNudge(el: HTMLElement, entry: InFlightToggle) {
+  // `nudgedTop` is set only when raf1 actually nudged (nudgeScroll was true), so
+  // this is implicitly a no-op for the non-scrollable / deep-link-claim cases.
+  if (entry.nudgedTop !== undefined && el.scrollTop === entry.nudgedTop) {
+    el.scrollTop = entry.restoreTop!;
+  }
+}
 
 export function forceIOSRepaint(el: HTMLElement | null | undefined): (() => void) | undefined {
   if (!el?.isConnected || !isIOS()) return;
@@ -66,37 +110,39 @@ export function forceIOSRepaint(el: HTMLElement | null | undefined): (() => void
   // was recreated. Cancelling the stale frames and rescheduling means a resume
   // repaint always lands.
   const existing = inFlight.get(el);
-  // Capture the baselines ONCE and reuse them for every superseding call in the
-  // burst, so overlapping resume events can't capture an intermediate nudged
-  // value and accumulate `translateZ(0.1px) translateZ(0.1px) …` or drift the
-  // scroll position by 1px per superseded call.
+  // Reuse the transform baseline across a burst so overlapping resume events
+  // can't capture an intermediate nudged value and accumulate
+  // `translateZ(0.1px) translateZ(0.1px) …`. The scroll baseline is NOT carried
+  // over — each toggle re-reads the live scrollTop in raf1 (see below).
   const prev = existing ? existing.prev : el.style.transform;
-  const scrollable = existing ? existing.scrollable : el.scrollHeight > el.clientHeight;
-  const prevScrollTop = existing ? existing.prevScrollTop : el.scrollTop;
-  // The value the nudge will leave behind — direction-safe so it never clamps to
-  // a no-op at either extreme. Derived from the (reused) baseline so a supersede
-  // recomputes the same value.
-  const nudgedScrollTop = prevScrollTop > 0 ? prevScrollTop - 1 : prevScrollTop + 1;
-
-  // Undo our OWN nudge only — restore to the baseline iff `scrollTop` is still the
-  // value we nudged it to. If anything else moved it meanwhile (useScrollMemory's
-  // saved-position restore on open, useAutoScroll's bottom-pin during streaming, a
-  // real user scroll), yield and leave it — never clobber a concurrent writer.
-  const restoreScroll = () => {
-    if (scrollable && el.scrollTop === nudgedScrollTop) el.scrollTop = prevScrollTop;
-  };
+  // Decide ONCE at burst start whether to nudge `scrollTop`, and reuse that
+  // decision on every superseding call so rAF1 and rAF2 always agree (see
+  // InFlightToggle.nudgeScroll). Three gates: the element must be scrollable; no
+  // notification deep-link scroll claim may be in flight — `forceIOSRepaint` fires
+  // on the same iOS resume signals (visibilitychange/pageshow/focus) a
+  // notification-tap foreground triggers, exactly as scrollToEventAndPulse is
+  // smooth-scrolling to the target event, and a ±1px nudge would fight that
+  // landing; AND no user touch-drag / momentum scroll may be in flight
+  // (isUserScrolling) — iOS cancels an in-flight momentum scroll on ANY scrollTop
+  // write, so a nudge ticking on a timer mid-fling stops it dead (the "scrolling
+  // randomly stops when you let go" bug). The transform round-trip + forced layout
+  // read below still repaint regardless.
+  const nudgeScroll = existing
+    ? existing.nudgeScroll
+    : el.scrollHeight > el.clientHeight && !hasPendingEventScroll() && !isUserScrolling();
 
   if (existing) {
     cancelAnimationFrame(existing.raf1);
     if (existing.raf2 !== undefined) cancelAnimationFrame(existing.raf2);
     // Undo any partial nudge so the fresh toggle is a real round-trip from the
     // baseline — re-writing the same value can be coalesced away without forcing
-    // the repaint we're after.
+    // the repaint we're after. Restoring to the prior toggle's nudged-FROM value
+    // means the next raf1 re-reads a clean live position (no 1px-per-burst drift).
     if (el.style.transform !== prev) el.style.transform = prev;
-    restoreScroll();
+    restoreNudge(el, existing);
   }
 
-  const entry: InFlightToggle = { raf1: 0, raf2: undefined, prev, prevScrollTop, scrollable };
+  const entry: InFlightToggle = { raf1: 0, raf2: undefined, prev, nudgeScroll, restoreTop: undefined, nudgedTop: undefined };
   inFlight.set(el, entry);
   // Only clear the slot if it's still ours — a later superseding call may have
   // replaced the entry, and a dropped-then-resumed stale frame must not evict it.
@@ -105,8 +151,33 @@ export function forceIOSRepaint(el: HTMLElement | null | undefined): (() => void
     if (!el.isConnected) { done(); return; }
     el.style.transform = prev ? `${prev} translateZ(0.1px)` : 'translateZ(0.1px)';
     // ±1px scroll nudge — a real scrollTop change forces WKWebView to re-commit
-    // the frozen layer tree, the way a manual scroll recovers the blank.
-    if (scrollable) el.scrollTop = nudgedScrollTop;
+    // the frozen layer tree, the way a manual scroll recovers the blank. Skipped
+    // when a deep-link claim is in flight (folded into `nudgeScroll`) so it can't
+    // fight scrollToEventAndPulse's landing on iOS resume.
+    //
+    // Re-baseline from the LIVE scrollTop HERE (nudge time), not at call time:
+    // during streaming, content grows and useAutoScroll re-pins to the new bottom
+    // BETWEEN the call and this frame. A call-time baseline would nudge to
+    // (oldBottom - 1) — now far above the grown bottom — which scrollState's
+    // onScroll reads as scrolled-up and latches scrolledUp=true, permanently
+    // parking auto-scroll (the auto-tail-broken-on-iOS regression). Reading the
+    // live position keeps the nudge a true ±1, inside the 80px scrolledUp window
+    // AND the 2px chevron slack (scrollState.ts), so it never trips auto-scroll.
+    // Re-check the LIVE scroll state at the write point, not just at burst start:
+    // the callers are timer/data-driven and this write is deferred a frame, so a
+    // fling that begins in the ~16ms between an idle call and this frame would
+    // otherwise be cancelled by the nudge (the burst decision was frozen while
+    // idle). Skipping here leaves `nudgedTop` unset, so the rAF2 restore is a
+    // no-op — rAF1/rAF2 stay consistent (see restoreNudge). The transform +
+    // forced layout read below still repaint regardless.
+    if (nudgeScroll && !isUserScrolling()) {
+      const live = el.scrollTop;
+      // Direction-safe so it never clamps to a no-op at either extreme.
+      const nudged = live > 0 ? live - 1 : live + 1;
+      entry.restoreTop = live;
+      entry.nudgedTop = nudged;
+      el.scrollTop = nudged;
+    }
     // Force a synchronous layout flush so the nudged state actually paints this
     // frame (the documented reliable repaint trigger) rather than being coalesced
     // with the restore on the next frame.
@@ -114,7 +185,7 @@ export function forceIOSRepaint(el: HTMLElement | null | undefined): (() => void
     entry.raf2 = requestAnimationFrame(() => {
       if (el.isConnected) {
         el.style.transform = prev;
-        restoreScroll();
+        restoreNudge(el, entry);
       }
       done();
     });
@@ -125,7 +196,7 @@ export function forceIOSRepaint(el: HTMLElement | null | undefined): (() => void
     // Restore both baselines so an explicit cleanup mid-toggle never leaves a
     // stale nudge behind (which the next call would otherwise read as baseline).
     if (el.style.transform !== prev) el.style.transform = prev;
-    restoreScroll();
+    restoreNudge(el, entry);
     done();
   };
 }

@@ -1,4 +1,7 @@
 import { signal } from '@preact/signals';
+import { prefersReducedMotion } from '../../utils/platform';
+import { isMobile } from '../../utils/viewport';
+import { applyNavFocus, clearNavFocus, navFocusElement } from '../shared/focusMarker';
 
 /** Shared scroll-position signals for the chat area.
  *  ThreadView and CreateThreadView are mounted twice each (desktop SplitLayout
@@ -134,6 +137,213 @@ function resolveTarget(): HTMLElement | null {
  *  viewport transitions — direct scrollTop assignment is more reliable. */
 let _scrollTimer: ReturnType<typeof setTimeout> | null = null;
 
+/** The ONE programmatic-scroll animation, driven by requestAnimationFrame (NOT
+ *  setTimeout): rAF is vsync-aligned so the motion stays smooth and "alive",
+ *  whereas a setTimeout(16) loop races the refresh cycle and stutters — on iOS
+ *  that read as the scroll "dragging / not wanting to move". We assign scrollTop
+ *  DIRECTLY (not `scrollTo({behavior:'smooth'})`/`scrollIntoView`, which iOS
+ *  silently no-ops during viewport transitions, can't be customized, and can't
+ *  reach the post-render-all top).
+ *
+ *  Shared by EVERY navigation that moves the transcript — the up/down chevrons,
+ *  ⌘↑/⌘↓ turn-nav, AND the notification / Changes-panel "navigation to element"
+ *  deep-link (which used to use the browser's native `scrollIntoView` smooth
+ *  scroll — a separate, un-tunable, slower motion). Routing them all through this
+ *  one tween means every jump feels identical, and the deep-link inherits the
+ *  same iOS-reliable direct-scrollTop write + moving-target tracking.
+ *
+ *  The curve is a TIME-BASED easeOutCubic tween over a distance-scaled, clamped
+ *  duration — NOT distance-based exponential smoothing. Exponential smoothing
+ *  (`current += remaining * fraction`) has an UNBOUNDED asymptotic tail: as it
+ *  nears the target every frame moves a tinier amount, the sub-pixel tail rounds
+ *  to alternating 0px/1px steps (the "jank on the slowdown settle"), and a hard
+ *  SNAP_PX cutoff was needed to end it — leaving a small visible jump. A
+ *  fixed-duration eased tween instead:
+ *   - Has a single continuous, controlled deceleration that the easing curve owns
+ *     end-to-end, and lands EXACTLY on the target at t=1 (no snap, no jump).
+ *   - Keeps the responsive feel: easeOutCubic front-loads velocity, so the first
+ *     frame still takes a big step and the scroll reacts instantly to the tap.
+ *   - Has a SETTLE that looks identical at any distance (the easing SHAPE is the
+ *     same whether it scrolled 400px or 20000px — only the speed scales), and is
+ *     frame-rate independent because progress is measured in elapsed ms, not
+ *     per-frame fractions, so it feels identical at 60 and 120 Hz.
+ *   - Is inherently bounded (t reaches 1 within `duration`), so a moving target
+ *     (a streaming thread's growing bottom, re-read each frame) can't loop. */
+// Pace knobs. Tuned to the smooth "navigation to element" feel the deep-link had
+// with native scrollIntoView, but a little quicker at the top end so the old
+// deep-link's "a bit slow" landing sits between it and the snappier chevron.
+// To make every navigation faster, lower SCROLL_MAX_MS and/or SCROLL_PX_PER_MS;
+// slower, raise them.
+const SCROLL_MIN_MS = 240;         // floor so a short scroll still reads as a deliberate glide, not a snap
+const SCROLL_MAX_MS = 760;         // ceiling: keeps a very long scroll brisk (and bounds the tween), a touch gentler than the old snappy 680
+const SCROLL_PX_PER_MS = 6.5;      // distance→duration rate between the floor and ceiling (lower = a more gradual, navigation-like glide)
+const SCROLL_FRAME_MS = 1000 / 60; // nominal-frame head start so the first painted frame already steps (responsive, not a dead frame)
+// easeOutCubic: strong initial velocity, smooth controlled deceleration to a clean stop.
+const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
+
+/** Active chevron-scroll rAF id (animateScroll + the reduced-motion re-assert).
+ *  Mutually exclusive with _scrollTimer (scrollToBottom's pin loop) — each
+ *  direction cancels the other so a down-tap right after an up-tap wins cleanly. */
+let _scrollAnimRaf: number | null = null;
+function cancelScrollAnim() {
+  if (_scrollAnimRaf !== null) { cancelAnimationFrame(_scrollAnimRaf); _scrollAnimRaf = null; }
+}
+
+/** rAF easeOutCubic scroll of the active container toward a target, shared by
+ *  every transcript navigation — the up/down chevrons, ⌘↑/⌘↓ turn-nav, and the
+ *  deep-link "scroll to element" (via smoothScrollToElement below).
+ *
+ *  - `targetOf(el)` is re-read EVERY frame, so a moving target (the bottom of a
+ *    streaming thread) is followed rather than chasing a stale position. The eased
+ *    fraction is applied between the captured `start` and the LIVE target each
+ *    frame (`start + (target - start) * eased`), so a target that grows mid-tween
+ *    is tracked yet the curve still lands cleanly at t=1.
+ *  - `start` is captured on the FIRST frame from the live scrollTop (after the
+ *    render-all scroll-anchoring shift has settled); thereafter the position is a
+ *    pure function of elapsed time, so we never READ scrollTop again (Safari lags
+ *    scrollTop reads mid-animation, which janks), only write it. There is no
+ *    yield-guard, so an explicit chevron tap ALWAYS reaches its target.
+ *  - `duration` scales with the initial distance (clamped to [MIN, MAX]_MS), so a
+ *    short hop and a long haul share the same deceleration SHAPE, just at different
+ *    speeds. The tween ends precisely at the target on the t≥1 frame — no SNAP_PX
+ *    cutoff and no end-jump — then `onDone` runs (the down-chevron hands off to
+ *    scrollToBottom() for live tailing).
+ *  - scrollTop is written FRACTIONAL (no Math.round): on a 2x/3x display the
+ *    sub-pixel position is what makes the slow final approach read as smooth
+ *    instead of stepping integer CSS pixels. */
+function animateScroll(targetOf: (el: HTMLElement) => number, onDone?: () => void) {
+  cancelScrollAnim();
+  let started = false;
+  let start = 0;
+  let startTime = 0;
+  let duration = SCROLL_MIN_MS;
+  const step = (now: number) => {
+    const cur = resolveTarget();
+    if (!cur) { _scrollAnimRaf = null; return; }
+    if (!started) {
+      started = true;
+      start = cur.scrollTop;
+      // Back-date startTime by one nominal frame so the FIRST painted frame already
+      // has a frame's worth of eased progress — reacts instantly to the tap instead
+      // of spending a dead frame at t=0. It's a constant time offset, not a per-frame
+      // fraction, so the deceleration shape stays elapsed-time (frame-rate) based.
+      startTime = now - SCROLL_FRAME_MS;
+      const distance = Math.abs(targetOf(cur) - start);
+      duration = Math.min(SCROLL_MAX_MS, Math.max(SCROLL_MIN_MS, distance / SCROLL_PX_PER_MS));
+    }
+    const target = targetOf(cur);
+    const t = Math.min(1, (now - startTime) / duration);
+    if (t >= 1) {
+      cur.scrollTop = target;
+      _scrollAnimRaf = null;
+      onDone?.();
+      return;
+    }
+    cur.scrollTop = start + (target - start) * easeOutCubic(t);
+    _scrollAnimRaf = requestAnimationFrame(step);
+  };
+  _scrollAnimRaf = requestAnimationFrame(step);
+}
+
+/** Scroll the active container so `el`'s top lands at the container top, minus the
+ *  element's CSS `scroll-margin-top` — the "navigation to element" motion for a
+ *  notification / Changes deep-link.
+ *
+ *  Replaces the browser's native `el.scrollIntoView({ block: 'start', behavior:
+ *  'smooth' })` with the shared animateScroll engine (see its doc), so the
+ *  deep-link and the chevrons scroll identically. `scroll-margin-top` was already
+ *  the deep-link's header/fade clearance under scrollIntoView (defined per
+ *  breakpoint in chat/response.css); we read the resolved px and subtract it so
+ *  the element lands in exactly the same place, just via our own tween.
+ *
+ *  The target is recomputed each frame (animateScroll re-reads `targetOf`), so an
+ *  element still growing as markdown/images render — or the whole transcript
+ *  re-anchoring after a render-all — is tracked, where native scrollIntoView fixed
+ *  its target at call time. Reduced-motion jumps instantly (native smooth ignored
+ *  the preference; the tween honours it, matching scrollToTop). */
+function smoothScrollToElement(el: HTMLElement): void {
+  const marginTop =
+    typeof getComputedStyle === 'function'
+      ? (parseFloat(getComputedStyle(el).scrollMarginTop) || 0)
+      : 0;
+  const targetOf = (c: HTMLElement) =>
+    typeof c.getBoundingClientRect === 'function' && typeof el.getBoundingClientRect === 'function'
+      ? el.getBoundingClientRect().top - c.getBoundingClientRect().top + c.scrollTop - marginTop
+      : 0;
+  if (prefersReducedMotion()) {
+    cancelScrollAnim();
+    const c = resolveTarget();
+    if (c) c.scrollTop = Math.max(0, targetOf(c));
+    return;
+  }
+  animateScroll(targetOf);
+}
+
+/** Smoothly scroll the active chat container to the VERY top — the up-chevron's
+ *  action. Loads three concerns:
+ *
+ *  1. **The render-all grow must not pin to the bottom.** The chevron renders the
+ *     full (windowed) thread before scrolling, firing the .thread-content
+ *     ResizeObserver on a huge content grow. If a recent scrollToBottom() (thread
+ *     open, a sent message) left _resizeMode==='scroll', onResize's scroll-mode
+ *     branch runs `scrollTop = scrollHeight` and slams us to the BOTTOM — the
+ *     intermittent "scroll-to-top lands mid/bottom" flake. Forcing _resizeMode to
+ *     'ignore' (and killing the bottom loop + suppression timer) neutralizes it.
+ *  2. **Real motion, reliable on iOS.** animateScroll writes scrollTop directly
+ *     per rAF frame instead of native smooth scroll, which iOS drops. Reduced-motion
+ *     users get an instant jump (with one re-assert to defeat an iOS no-op / late
+ *     RO settle) — no animation.
+ *  3. **Auto-scroll fought back.** At the top we are definitively scrolled up, so
+ *     set scrolledUp/awayFromBottom accordingly (also keeps the down-chevron on).
+ *
+ *  A manual top jump also supersedes any in-flight notification deep-link claim —
+ *  its suppression would otherwise keep deferring our writes. */
+export function scrollToTop() {
+  clearPendingEventScroll();
+  if (_scrollTimer !== null) { clearTimeout(_scrollTimer); _scrollTimer = null; }
+  _resizeMode = 'ignore';
+  if (_suppressTimer) { clearTimeout(_suppressTimer); _suppressTimer = null; }
+  scrolledUp.value = true;
+  awayFromBottom.value = true;
+
+  const el = resolveTarget();
+  if (!el) return;
+
+  // Reduced motion: jump instantly, with one rAF re-assert to defeat an iOS no-op
+  // / a late render-all ResizeObserver settle.
+  if (prefersReducedMotion()) {
+    cancelScrollAnim();
+    el.scrollTop = 0;
+    _scrollAnimRaf = requestAnimationFrame(() => {
+      const t = resolveTarget();
+      if (t) t.scrollTop = 0;
+      _scrollAnimRaf = null;
+    });
+    return;
+  }
+
+  animateScroll(() => 0);
+}
+
+/** Smoothly scroll the active chat container to the bottom — the down-chevron's
+ *  action. Eases to the (live, re-read each frame) bottom, then hands off to
+ *  scrollToBottom() so live streaming keeps the user pinned ("tailing"). Mirrors
+ *  scrollToTop's iOS-reliable direct-scrollTop animation. Reduced motion skips
+ *  straight to scrollToBottom()'s instant snap + pin. _resizeMode='ignore' during
+ *  the ease so onResize's scroll-mode branch can't instant-pin and skip it. */
+export function scrollToBottomAnimated() {
+  clearPendingEventScroll();
+  if (_scrollTimer !== null) { clearTimeout(_scrollTimer); _scrollTimer = null; }
+  const el = resolveTarget();
+  if (!el || prefersReducedMotion()) { scrollToBottom(); return; }
+  _resizeMode = 'ignore';
+  if (_suppressTimer) { clearTimeout(_suppressTimer); _suppressTimer = null; }
+  // Target the MAX scroll position (scrollHeight − clientHeight), not scrollHeight,
+  // so the ease lands exactly at the bottom instead of clamping flat for the last
+  // clientHeight px. scrollToBottom() in onDone then pins to the live bottom.
+  animateScroll((c) => c.scrollHeight - c.clientHeight, () => scrollToBottom());
+}
+
 /** Reset scrolledUp, immediately scroll the response area to the bottom,
  *  and keep scrolling at frame rate until the suppression window expires.
  *
@@ -146,14 +356,29 @@ let _scrollTimer: ReturnType<typeof setTimeout> | null = null;
  *  the animation. Now we scroll every ~16ms for the full 500ms
  *  suppression window, re-reading scrollHeight each time so layout
  *  changes (keyboard close, content render) are always caught. */
-export function scrollToBottom() {
-  // An explicit go-to-bottom supersedes any in-flight notification deep-link
-  // claim — e.g. answering a deep-linked question (addPendingMessage →
-  // scrollToBottom) within the ~4s claim window should let the streamed
-  // response tail again. Safe because the deep-link's OWN landing never routes
-  // through here: focusThread skips scrollToBottom when targetEventId is set,
+export function scrollToBottom(opts?: { auto?: boolean }) {
+  // An EXPLICIT go-to-bottom (the default — the chevron, sending a message,
+  // answering a deep-linked question) supersedes any in-flight notification
+  // deep-link claim: e.g. answering a deep-linked question (addPendingMessage →
+  // scrollToBottom) within the ~4s claim window should let the streamed response
+  // tail again. Safe because the deep-link's OWN landing never routes through an
+  // explicit call: focusThread skips scrollToBottom when targetEventId is set,
   // and scrollToEventAndPulse never calls it.
-  clearPendingEventScroll();
+  //
+  // An AUTOMATIC go-to-bottom (`auto: true` — the lazy-load `eventsLoaded` snap
+  // that fires when an UNfocused thread's events finally render) must NOT
+  // supersede the claim: it fires during the very load the deep-link is waiting
+  // on. Clearing the claim here would un-guard every other auto-scroll path and
+  // land the user at the bottom instead of the deep-linked event — the
+  // deterministic "cross-thread deep-link doesn't scroll to the event" bug. Defer
+  // to the deep-link entirely; its own resolve owns the scroll target.
+  if (opts?.auto && hasPendingEventScroll()) return;
+  if (!opts?.auto) clearPendingEventScroll();
+  // Cancel any in-flight chevron-scroll animation so a down-scroll started right
+  // after an up-tap isn't dragged back to the top. (The down-chevron's own
+  // animateScroll hands off here via onDone — by then the rAF is already null,
+  // so this is a no-op for that path.)
+  cancelScrollAnim();
   scrolledUp.value = false;
   awayFromBottom.value = false;
   _resizeMode = 'scroll';
@@ -230,6 +455,16 @@ export function preserveAtBottom() {
  *  typing) — settling is left to the subsequent .thread-content
  *  ResizeObserver fire, which catches mode='scroll' in onResize. */
 export function pinToBottomNow() {
+  // Defer to an in-flight notification deep-link. This loop-free pin fires from
+  // the iOS visualViewport reflow / header focusout / tab-return paths — none of
+  // which route through the hasPendingEventScroll() gate the other auto-scroll
+  // callers (onResize, useAutoScroll, useScrollMemory, scrollToBottom) honour.
+  // When the PWA foregrounds on a notification tap, that viewport reflow pin
+  // would slam the freshly-landed event to the bottom a beat after the deep-link
+  // scrolled to it — the deterministic "cross-thread deep-link lands at the
+  // bottom on iOS" bug. The claim is held across the smooth scroll (sync resolve)
+  // and the async load + deadline, so this stays deferred for the whole window.
+  if (hasPendingEventScroll()) return;
   scrolledUp.value = false;
   awayFromBottom.value = false;
   _resizeMode = 'scroll';
@@ -254,9 +489,13 @@ export function pinToBottomNow() {
  *  fires. Both layout copies (desktop + mobile) carry the same attributes, so
  *  we filter to the visible one before scrolling and pulsing — otherwise the
  *  pulse runs invisibly on the hidden copy. */
-const EVENT_PULSE_CLASS = 'event-pulse';
-const EVENT_PULSE_MS = 1800;
 const EVENT_RESOLVE_DEADLINE_MS = 4000;
+/** How long to keep the deep-link claim alive after a SYNCHRONOUS resolve, as a
+ *  fallback for browsers where `scrollend` is unsupported/unreliable (older iOS
+ *  Safari). smoothScrollToElement's tween settles within SCROLL_MAX_MS; this
+ *  generously covers it so competing scrolls keep deferring across the whole
+ *  glide. Released earlier if `scrollend` fires first. */
+const SCROLL_SETTLE_FALLBACK_MS = 1000;
 
 /** The event id a notification deep-link is currently resolving a scroll to,
  *  or null when no deep-link scroll is in flight.
@@ -268,7 +507,7 @@ const EVENT_RESOLVE_DEADLINE_MS = 4000;
  *
  *  Why it exists: focusing an UNfocused thread lazily loads its events, and the
  *  scroll-to-bottom that fires on the `eventsLoaded` false→true transition would
- *  otherwise override scrollToEventAndPulse's scrollIntoView the instant the
+ *  otherwise override scrollToEventAndPulse's scroll the instant the
  *  events render — so the deep-link landed at the bottom instead of the event.
  *  (When the thread is already focused the events are already in the DOM,
  *  tryResolve() succeeds synchronously, and no eventsLoaded transition fires —
@@ -278,21 +517,28 @@ let _pendingEventScrollTarget: string | null = null;
 
 /** True while a notification deep-link is waiting for its target event to
  *  render (or to scroll to it). Auto-scroll-to-bottom callers defer to it so
- *  they don't override the deep-link's scrollIntoView. */
+ *  they don't override the deep-link's scroll. */
 export function hasPendingEventScroll(): boolean {
   return _pendingEventScrollTarget !== null;
 }
 
+/* The deep-link focus marker (the "focus stick") is the shared navigation focus
+ *  marker — see components/shared/focusMarker.ts. scrollToSelectorAndPulse applies
+ *  it on resolve (below), passing `hasPendingEventScroll` as the settle guard so
+ *  this deep-link's own smooth scroll can't self-clear it; clearPendingEventScroll
+ *  clears it. */
+
 /** While true, the mobile hide-on-scroll header stays pinned fully visible (see
- *  useHideOnScroll.onScroll). A deep-link `scrollIntoView` ignores the fixed app
- *  header and the sticky thread-title row, so `.chat-exchange`'s scroll-margin-top
- *  adds them back as a STATIC value — which is only correct if the header's
- *  visible portion is deterministic. Without the pin the smooth scroll-down would
+ *  useHideOnScroll.onScroll). The deep-link scroll lands the element at the
+ *  container top minus its `scroll-margin-top`, which adds the fixed app header
+ *  and sticky thread-title row back as a STATIC value — only correct if the
+ *  header's visible portion is deterministic. Without the pin the smooth scroll would
  *  half-hide the header mid-flight, leaving the landed event partly covered. The
  *  pin is held for a short window covering the smooth scroll, not the full ~4s
  *  deep-link claim, so normal hide-on-scroll resumes the moment the user reads on.
  *  Desktop ignores this — its thread-title header is a sibling above the scroll
- *  container, so scrollIntoView already lands cleanly there. */
+ *  container, so the scroll (offset by the desktop scroll-margin-top) already
+ *  lands cleanly there. */
 let _headerPinnedForScroll = false;
 let _headerPinTimer: ReturnType<typeof setTimeout> | null = null;
 const HEADER_PIN_MS = 800;
@@ -313,12 +559,20 @@ function pinHeaderForScroll(): void {
 }
 
 /** `selector` resolves the SCROLL target (the `.chat-exchange`, which carries
- *  the scroll-margin-top). `pulseChildSelector`, when given, narrows the PULSE
- *  highlight to a descendant of that target — an event deep-link scopes it to
- *  `.initiator-panel` (the event itself) so the highlight stays on the event and
- *  not the agent response rendered below it in the same exchange. Omitted for a
- *  change deep-link, which highlights the whole turn. */
-function scrollToSelectorAndPulse(selector: string, preferLast = false, pulseChildSelector?: string): void {
+ *  the scroll-margin-top). `pulseTarget`, when given, narrows the PULSE highlight
+ *  to a descendant of that target so a sibling panel in the same exchange isn't
+ *  highlighted too — a string is a plain descendant selector (an event deep-link
+ *  scopes it to `.initiator-panel`, the event itself, not the agent response
+ *  below it), while a function picks the descendant PER MATCHED TARGET (a change
+ *  deep-link needs this: the change body sits in `.response-panel` on a proposing
+ *  turn but in `.initiator-panel` on a resolution card — see
+ *  `scrollToChangeAndPulse`). When the chosen descendant is absent the pulse
+ *  falls back to the whole target via `?? target`. */
+function scrollToSelectorAndPulse(
+  selector: string,
+  preferLast = false,
+  pulseTarget?: string | ((target: HTMLElement) => HTMLElement | null),
+): void {
   if (!selector || typeof document === 'undefined' || !document.querySelectorAll) return;
 
   let resolved = false;
@@ -330,7 +584,7 @@ function scrollToSelectorAndPulse(selector: string, preferLast = false, pulseChi
   // NOT released the instant the scroll lands — because the same render that
   // finally shows the event also re-fires ThreadView's events-load effect (on
   // the hasExchanges 0→N flip) and a late ResizeObserver pin, both of which
-  // would snap to the bottom a beat after scrollIntoView. Gating those on the
+  // would snap to the bottom a beat after the deep-link scroll. Gating those on the
   // claim (not on scrolledUp) is what lets the events-load effect keep its
   // separate slow-load scrolledUp recovery.
   _pendingEventScrollTarget = selector;
@@ -360,6 +614,32 @@ function scrollToSelectorAndPulse(selector: string, preferLast = false, pulseChi
       clearTimeout(deadlineTimer);
       deadlineTimer = null;
     }
+  };
+
+  // Hold the claim across the smooth scroll's settle, then release. Used by the
+  // SYNCHRONOUS resolve path (the already-focused thread, whose events are
+  // already in the DOM): releasing the claim the instant smoothScrollToElement is
+  // CALLED is wrong, because the tween lands up to SCROLL_MAX_MS later and a
+  // competing scroll in that window — the in-app panel closing, an iOS
+  // visualViewport reflow — would override the landing and drop the user at the
+  // bottom. Release on the scroll container's `scrollend` (the authoritative
+  // "scroll finished" signal, which our per-frame scrollTop writes still fire when
+  // they stop) or, where that's unsupported, a fallback timer — whichever fires
+  // first. (The async path already holds the claim until its own deadline, which
+  // generously covers the same settle.)
+  const holdClaimUntilScrollSettles = () => {
+    const container = resolveTarget();
+    let settleTimer: ReturnType<typeof setTimeout> | null = null;
+    const finish = () => {
+      if (settleTimer !== null) {
+        clearTimeout(settleTimer);
+        settleTimer = null;
+      }
+      container?.removeEventListener?.('scrollend', finish);
+      releaseClaim();
+    };
+    container?.addEventListener?.('scrollend', finish, { once: true });
+    settleTimer = setTimeout(finish, SCROLL_SETTLE_FALLBACK_MS);
   };
 
   const tryResolve = () => {
@@ -398,23 +678,32 @@ function scrollToSelectorAndPulse(selector: string, preferLast = false, pulseChi
     if (typeof document !== 'undefined' && document.dispatchEvent) {
       document.dispatchEvent(new Event('reveal-mobile-header'));
     }
-    target.scrollIntoView({ block: 'start', behavior: 'smooth' });
-    // Highlight only the event, not the response below it: pulse the requested
-    // descendant when present, else the whole target. (`?.` so the jsdom test
+    smoothScrollToElement(target);
+    // Highlight only the subject panel, not a sibling panel in the same turn:
+    // resolve the requested descendant (string selector, or a per-target picker)
+    // and pulse it when present, else the whole target. (`?.` so the jsdom test
     // fakes that lack querySelector fall back cleanly.)
-    const pulseEl = pulseChildSelector
-      ? (target.querySelector?.(pulseChildSelector) as HTMLElement | null) ?? target
-      : target;
-    pulseEl.classList.add(EVENT_PULSE_CLASS);
-    setTimeout(() => pulseEl.classList.remove(EVENT_PULSE_CLASS), EVENT_PULSE_MS);
+    const pulseChild =
+      typeof pulseTarget === 'string'
+        ? (target.querySelector?.(pulseTarget) as HTMLElement | null)
+        : pulseTarget?.(target) ?? null;
+    const pulseEl = pulseTarget ? pulseChild ?? target : target;
+    // Apply the shared navigation focus marker — a sticky border that stays until
+    // the user takes any action, then fades out. The settle guard defers the
+    // dismissal while THIS deep-link's own smooth scroll is still settling
+    // (hasPendingEventScroll), so the landing scroll can't self-clear the marker.
+    applyNavFocus(pulseEl, { settleGuard: hasPendingEventScroll });
   };
 
   tryResolve();
   if (resolved) {
     // Synchronous resolve — the thread's events were already in the DOM (it was
-    // already focused), so no async load follows and nothing will try to snap to
-    // the bottom. Release the claim immediately; no deadline was scheduled.
-    releaseClaim();
+    // already focused), so no async load follows. Do NOT release the claim
+    // synchronously: the deep-link scroll (smoothScrollToElement) is still
+    // settling, and a competing scroll (in-app panel close, iOS visualViewport
+    // reflow) would override the landing. Hold the claim until the scroll settles
+    // so every auto-scroll path keeps deferring across the smooth scroll.
+    holdClaimUntilScrollSettles();
     return;
   }
 
@@ -441,7 +730,7 @@ function scrollToSelectorAndPulse(selector: string, preferLast = false, pulseChi
   // (e.g. the source event isn't a rendered chat exchange). Either way, stop
   // watching and release the claim. Bookkeeping only — it deliberately does NOT
   // force a scroll-to-bottom: the auto-scroll paths were suppressed during the
-  // wait, so the thread stays where the load (or scrollIntoView) left it. A late
+  // wait, so the thread stays where the load (or the deep-link scroll) left it. A late
   // snap here would yank a user who scrolled to read history during the window.
   deadlineTimer = setTimeout(() => {
     stopWatching();
@@ -464,10 +753,33 @@ export function scrollToEventAndPulse(eventId: string): void {
  *  turn (the `ChangeProposed` rides it as a non-rendered step) and any later
  *  Applied/Reverted resolution card with the same id; `preferLast` resolves to
  *  that resolution card when present, and to the proposing turn for a pending
- *  change (its only match) — so the user lands on the change wherever it sits. */
+ *  change (its only match) — so the user lands on the change wherever it sits.
+ *
+ *  The pulse is scoped to the panel that HOLDS the change, so a sibling panel in
+ *  the same turn isn't highlighted too — and which panel that is depends on the
+ *  card type, so the scope is resolved per matched target:
+ *   - proposing CC turn → `.response-panel` (where the `ChangeProposed` step
+ *     lives), NOT the user message that started the turn;
+ *   - resolution card (ChangeApplied/Discarded/Reverted/Failed) → `.initiator-panel`
+ *     (which carries the change body + Diff/Revert actions), NOT any folded-in
+ *     post-apply continuation work that renders in a `.response-panel`
+ *     (`changePanelHasContinuation` — real thread 76b4ee76). A resolution card is
+ *     recognised by its `initiator-panel-change-*` accent class.
+ *  When the chosen panel is absent (a degenerate exchange missing it, or a test
+ *  DOM fake) the pulse falls back to the whole target via the `?? target` in
+ *  scrollToSelectorAndPulse. */
+const CHANGE_RESOLUTION_INITIATOR =
+  '.initiator-panel-change-applied,.initiator-panel-change-discarded,.initiator-panel-change-reverted,.initiator-panel-change-failed';
 export function scrollToChangeAndPulse(changeId: string): void {
   if (!changeId) return;
-  scrollToSelectorAndPulse(`[data-change-id="${CSS.escape(changeId)}"]`, true);
+  scrollToSelectorAndPulse(
+    `[data-change-id="${CSS.escape(changeId)}"]`,
+    true,
+    (target) =>
+      (target.querySelector?.(CHANGE_RESOLUTION_INITIATOR)
+        ? target.querySelector?.('.initiator-panel')
+        : target.querySelector?.('.response-panel')) as HTMLElement | null,
+  );
 }
 
 /** Cancel any in-flight notification deep-link scroll claim. A plain thread
@@ -476,6 +788,227 @@ export function scrollToChangeAndPulse(changeId: string): void {
 export function clearPendingEventScroll(): void {
   _pendingEventScrollTarget = null;
   deepLinkRenderAll.value = false;
+  // A plain focus / explicit scroll is deliberate engagement elsewhere — drop any
+  // persistent focus marker so it can't leak onto the next thread or linger.
+  clearNavFocus();
+}
+
+/* ── Turn-by-turn keyboard traversal ─────────────────────────────────────────
+ *  The ⌘↑/⌘↓ shortcuts step the transcript one *turn* (a `.chat-exchange`) at a
+ *  time — landing the previous/next turn at the top of the scroll container and
+ *  marking it with the shared navigation focus marker (the same cue a deep-link
+ *  landing uses). Pairs with the focusable `.thread-content` region: a jump also
+ *  moves DOM focus into the container so the native Arrow/Page keys keep scrolling
+ *  from there. */
+const TURN_SELECTOR = '.chat-exchange';
+/** Small slack around the landing line so a re-press of the turn shortcut doesn't
+ *  re-select the just-landed turn (whose top rests on the landing line) and subpixel
+ *  rounding is absorbed. Small and fixed — NOT scaled by the clearance: the gap is
+ *  folded into the reference position (scrollTop + gap in stepThreadTurn), so a
+ *  larger clearance must not widen the "skip" band, or short adjacent turns become
+ *  unreachable by stepping. */
+const TURN_NAV_THRESHOLD_SLACK_PX = 4;
+/** Fallback clearance when the computed `scroll-margin-top` is unavailable (jsdom /
+ *  no layout) — ~0.5rem, the base `--deep-link-focus-gap`. */
+const TURN_NAV_FALLBACK_GAP_PX = 8;
+
+/** Room to leave above a turn landed by keyboard turn-nav — the SAME clearance the
+ *  deep-link / notification navigation gets for free from `.chat-exchange`'s CSS
+ *  `scroll-margin-top` (the top fade band + header stack + focus-border gap; see
+ *  chat/response.css). Turn-nav animates to an explicit scroll position rather than
+ *  via `scrollIntoView`, so `scroll-margin-top` doesn't apply automatically — it
+ *  reads the computed value here so both navigation paths share one source of
+ *  truth for "make room on top". Falls back to a small gap when the computed style
+ *  is unavailable. */
+function turnNavClearancePx(turn: HTMLElement): number {
+  if (typeof getComputedStyle !== 'function') return TURN_NAV_FALLBACK_GAP_PX;
+  const px = parseFloat(getComputedStyle(turn).scrollMarginTop);
+  return Number.isFinite(px) && px > 0 ? px : TURN_NAV_FALLBACK_GAP_PX;
+}
+
+/** Pure pick of the turn to jump to. `tops` are each turn's top in the container's
+ *  scroll coordinate space (ascending, DOM order); `scrollTop` is the current
+ *  position. Forward (direction 1) → the first turn below `scrollTop + threshold`;
+ *  backward (-1) → the last turn above `scrollTop - threshold`. Returns `null` when
+ *  there's nowhere to go (already at the last/first turn). Exported for unit
+ *  testing — the DOM wiring around it (below) is thin. */
+export function pickTurnIndex(
+  tops: number[], scrollTop: number, direction: 1 | -1, threshold: number,
+): number | null {
+  if (tops.length === 0) return null;
+  if (direction === 1) {
+    for (let i = 0; i < tops.length; i++) {
+      if (tops[i] > scrollTop + threshold) return i;
+    }
+    return null;
+  }
+  for (let i = tops.length - 1; i >= 0; i--) {
+    if (tops[i] < scrollTop - threshold) return i;
+  }
+  return null;
+}
+
+/** Pick the turn to move to, preferring a marker anchor over scroll position.
+ *
+ *  When `anchorIdx >= 0` — the nav focus marker sits on a listed turn, which means
+ *  the user has NOT scrolled since the last turn-nav (any real scroll gesture fades
+ *  the marker) — step by INDEX from it (`anchorIdx + direction`). This is what makes
+ *  a cluster of turns sharing a clamped scroll position reachable: after collapsing
+ *  the last turn, the collapsed turn and an appended "Change applied" card both sit
+ *  in the last (no-scroll-room) viewport, where pure scroll-position stepping keys
+ *  off a pinned `scrollTop` and can't distinguish them — so ⌘↓ re-selected the same
+ *  turn (or returned null) and the change card was unreachable.
+ *
+ *  With no anchor (`anchorIdx < 0` — no marker, or it's on a non-turn element) fall
+ *  back to scroll-position stepping via `pickTurnIndex`, which handles the
+ *  first-press-from-the-current-scroll case and the mid-turn "prev snaps to the
+ *  current turn's top" read (both happen precisely when there is no marker). Returns
+ *  null at the list end. Pure — exported for unit testing. */
+export function pickTurnTarget(
+  anchorIdx: number,
+  tops: number[],
+  scrollTop: number,
+  direction: 1 | -1,
+  threshold: number,
+): number | null {
+  if (anchorIdx >= 0) {
+    const next = anchorIdx + direction;
+    return next >= 0 && next < tops.length ? next : null;
+  }
+  return pickTurnIndex(tops, scrollTop, direction, threshold);
+}
+
+/** Scroll the visible transcript one turn in `direction` (-1 previous, 1 next),
+ *  landing it at the top and marking it with the shared navigation focus marker.
+ *  A deliberate jump, so — like `scrollToTop` — it supersedes any in-flight
+ *  deep-link claim and cancels the bottom-pin loop. The position signals
+ *  (scrolledUp / awayFromBottom) are reconciled against the ACTUAL landing target:
+ *  a jump that lands mid-thread marks the user parked (so the next render's
+ *  auto-scroll doesn't snap to the bottom and the down chevron stays visible); a
+ *  jump that lands at the bottom leaves both false (chevron hidden, auto-scroll
+ *  enabled) — otherwise the chevron would stick on when the last turn's clamped
+ *  target can't move the already-bottomed container. No-op when no transcript is
+ *  visible (thread pane collapsed, or the hidden dual-mount copy) or there's no
+ *  turn in `direction`. Desktop moves DOM focus into the (focusable) container so
+ *  the native scroll keys follow the jump. */
+export function stepThreadTurn(direction: 1 | -1): void {
+  const el = resolveTarget();
+  if (!el) return;
+
+  // Land focus in the transcript FIRST so continuous Arrow/Page scrolling follows
+  // — even when there's no turn to jump to in this direction (already at the
+  // last/first turn), pressing the shortcut still parks focus on the scroll region
+  // to keep reading. Desktop only (mobile navigates panes; a chord has no mobile
+  // path). preventScroll so the focus move doesn't fight the animation below.
+  if (!isMobile()) el.focus({ preventScroll: true });
+
+  const turns = Array.from(el.querySelectorAll<HTMLElement>(TURN_SELECTOR)).filter(isElementVisible);
+  if (turns.length === 0) return;
+  // Reuse the deep-link navigation's clearance (.chat-exchange scroll-margin-top);
+  // all turns share the same CSS rule, so read it off the first one.
+  const gap = turnNavClearancePx(turns[0]);
+  const containerTop = el.getBoundingClientRect().top;
+  const tops = turns.map((t) => t.getBoundingClientRect().top - containerTop + el.scrollTop);
+  // A landed turn's top rests on the landing line at `scrollTop + gap`, so "next"
+  // is the first turn whose top is below that line and "prev" the last one above it
+  // — i.e. compare tops against `scrollTop + gap`, which is exactly "this turn's
+  // landing scroll position is forward/backward of the current one". Fold the gap
+  // into the reference here (with only a small slack as the threshold) rather than
+  // widening the threshold by it — a large threshold would make the skip band
+  // ~2×gap and swallow short adjacent turns when stepping.
+  //
+  // When the nav focus marker is on one of these turns, step by INDEX from it
+  // rather than by scroll position (see `pickTurnTarget`). A marker means the user
+  // hasn't scrolled since the last nav (a scroll gesture fades it), so index
+  // stepping is unambiguous — and it's what makes a cluster of turns sharing a
+  // clamped scroll position each reachable: after collapsing the last turn, the
+  // collapsed turn + an appended "Change applied" card sit together in the last
+  // (no-scroll-room) viewport, where pure scroll-position stepping keys off a
+  // pinned scrollTop and re-selects the same turn, so the change card was
+  // unreachable. `closest('.chat-exchange')` also anchors a deep-link marker that
+  // landed on an inner `.initiator-panel`; a marker outside the transcript (a
+  // settings / plugin landing) isn't in `turns` → -1 → the scroll-based fallback.
+  const markedTurn = navFocusElement()?.closest?.(TURN_SELECTOR) as HTMLElement | null;
+  const anchorIdx = markedTurn ? turns.indexOf(markedTurn) : -1;
+  const idx = pickTurnTarget(anchorIdx, tops, el.scrollTop + gap, direction, TURN_NAV_THRESHOLD_SLACK_PX);
+  if (idx === null) return; // at the end in this direction — focus moved, nothing to jump to
+  const turn = turns[idx];
+
+  // We ARE jumping now. A deliberate jump, so — like scrollToTop — supersede any
+  // in-flight deep-link claim and cancel the bottom-pin loop.
+  clearPendingEventScroll();
+  if (_scrollTimer !== null) { clearTimeout(_scrollTimer); _scrollTimer = null; }
+  _resizeMode = 'ignore';
+  if (_suppressTimer) { clearTimeout(_suppressTimer); _suppressTimer = null; }
+
+  // Absolute target scrollTop that puts the turn's top `gap` px below the container
+  // top. Re-read each frame (via animateScroll) so a layout shift during streaming
+  // is tracked; the term is stable as scrollTop changes because the turn's viewport
+  // top moves by the same amount.
+  const targetOf = (c: HTMLElement) =>
+    typeof c.getBoundingClientRect === 'function'
+      ? turn.getBoundingClientRect().top - c.getBoundingClientRect().top + c.scrollTop - gap
+      : 0;
+
+  // Reconcile the position signals against the ACTUAL landing target instead of
+  // hardcoding "parked mid-thread". The last turn (and any turn near the end) has a
+  // landing target at/beyond maxScroll, so the browser clamps the scroll to the
+  // bottom — and when we're ALREADY at the bottom the clamped write doesn't move the
+  // container, so no scroll event fires and onScroll never reconciles the chevron.
+  // Hardcoding awayFromBottom=true there left the down chevron stuck on ("appears
+  // the second time you click down arrow"). Landing at the bottom means NOT parked:
+  // hide the chevron (awayFromBottom=false) and leave auto-scroll enabled
+  // (scrolledUp=false). Anywhere above the bottom, mark the user parked so the next
+  // render's auto-scroll doesn't snap down and the chevron stays visible. (2px slack
+  // mirrors isVisuallyAtBottom.)
+  const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+  const landsAtBottom = targetOf(el) >= maxScroll - 2;
+  scrolledUp.value = !landsAtBottom;
+  awayFromBottom.value = !landsAtBottom;
+
+  // Mark the landed turn with the shared navigation focus marker (flash + a
+  // border that sticks until the user's next scroll gesture). clearPendingEventScroll
+  // above already cleared any prior marker via clearNavFocus, so this is a clean
+  // supersede; no settleGuard — the animateScroll below is programmatic (emits no
+  // wheel/touch/keydown), so it can't self-clear, and a real user scroll should.
+  applyNavFocus(turn);
+
+  if (prefersReducedMotion()) {
+    cancelScrollAnim();
+    el.scrollTop = Math.max(0, targetOf(el));
+    return;
+  }
+  animateScroll(targetOf);
+}
+
+/** Which collapse store a `.chat-exchange` toggle targets: `response` folds the
+ *  response body (`collapsedExchanges`), `initiator` folds the initiator panel
+ *  (`collapsedInitiators`) — the fallback for a response-less divider / change turn.
+ *  Both stores key on `${threadId}:${userSeq}`. */
+export type TurnCollapseKind = 'response' | 'initiator';
+
+/** Pure decode of a navigated `.chat-exchange`'s collapse identity from its data
+ *  attributes (`data-thread-id`, `data-user-seq`, `data-collapse-kind`). Returns the
+ *  target thread id, exchange sequence, and which panel to toggle — or null when the
+ *  attributes are missing / malformed / the turn is not collapsible. Exported and
+ *  DOM-free for unit testing, mirroring `pickTurnIndex`. The store-touching
+ *  orchestration that consumes this (`toggleNavigatedTurnCollapsed`) lives in
+ *  `hooks/useKeyboardShortcuts.ts` — this module stays free of the heavy `store`
+ *  import so lean importers (`promptFocus` → `scrollState`) don't drag in
+ *  `store`'s module-load side effects (`basePath`'s DOM read). */
+export function parseNavigatedTurn(
+  threadId: string | null,
+  userSeqAttr: string | null,
+  kind: string | null,
+): { threadId: string; userSeq: number; kind: TurnCollapseKind } | null {
+  if (!threadId) return null;
+  if (kind !== 'response' && kind !== 'initiator') return null;
+  // Reject a missing / blank attribute explicitly: `Number(null)` and `Number('')`
+  // both coerce to 0 (a valid integer), which would let an unstamped turn parse.
+  if (userSeqAttr === null || userSeqAttr.trim() === '') return null;
+  const userSeq = Number(userSeqAttr);
+  if (!Number.isInteger(userSeq)) return null;
+  return { threadId, userSeq, kind };
 }
 
 /** True when the chat exchange with the given `data-event-id` is currently

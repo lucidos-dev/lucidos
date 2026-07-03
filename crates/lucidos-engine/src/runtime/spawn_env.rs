@@ -15,7 +15,7 @@ use std::path::Path;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::agent_runtime::SpawnArgs;
-use super::lucidos_cli::path_with_prefix;
+use super::lucidos_cli::path_with_prefixes;
 
 /// Stamp the agent-independent Lucidos env contract onto `cmd`.
 ///
@@ -33,7 +33,11 @@ use super::lucidos_cli::path_with_prefix;
 ///   metadata consumed by `lucidos spawn-thread` and `cc-stop-reminder`.
 /// - `RUSTC_WRAPPER` — sccache when present on PATH, explicitly empty
 ///   otherwise (see `sccache_on_path` for why empty ≠ unset).
-/// - `PATH` prefixed with the `lucidos` CLI dir when one was found.
+/// - `PATH` prefixed with the `lucidos` CLI dir when one was found, AND the
+///   bundled Postgres bin dir (`LUCIDOS_PG_BIN_DIR`) when set — a packaged
+///   build's `psql` lives there, not on the service manager's minimal PATH,
+///   and the `PG*` vars above advertise that bare `psql -c '…'` works.
+///   Mirrors `workspace_script_env_vars` (chat bash/python tools).
 pub(super) fn apply_lucidos_env(
     cmd: &mut tokio::process::Command,
     args: &SpawnArgs<'_>,
@@ -92,16 +96,78 @@ pub(super) fn apply_lucidos_env(
     } else {
         cmd.env("RUSTC_WRAPPER", "");
     }
-    if let Some(cli_dir) = cli_dir {
-        match path_with_prefix(cli_dir) {
+    let prefixes = agent_path_prefixes(
+        cli_dir,
+        std::env::var_os("LUCIDOS_PG_BIN_DIR").map(std::path::PathBuf::from),
+    );
+    if !prefixes.is_empty() {
+        match path_with_prefixes(&prefixes) {
             Ok(p) => {
                 cmd.env("PATH", p);
             }
             Err(e) => {
-                crate::log!("[{}] failed to join PATH for lucidos CLI: {}", log_label, e);
+                crate::log!("[{}] failed to join PATH for agent child: {}", log_label, e);
             }
         }
     }
+}
+
+/// The dirs to prepend to an agent child's PATH: the `lucidos` CLI dir first
+/// (so `lucidos …` resolves — its position is load-bearing for the workspace
+/// symlink contract), then the bundled Postgres bin dir when the packaged env
+/// provides one that exists (so the advertised bare `psql -c '…'` resolves —
+/// mirrors `workspace_script_env_vars` for chat bash/python tools). In dev
+/// `LUCIDOS_PG_BIN_DIR` is unset ⇒ no PG entry, unchanged behavior. Split from
+/// `apply_lucidos_env` so the decision is unit-testable without process env.
+fn agent_path_prefixes(
+    cli_dir: Option<&Path>,
+    pg_bin_dir: Option<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    let mut prefixes: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(cli_dir) = cli_dir {
+        prefixes.push(cli_dir.to_path_buf());
+    }
+    if let Some(pg_bin) = pg_bin_dir {
+        if pg_bin.is_dir() {
+            prefixes.push(pg_bin);
+        }
+    }
+    prefixes
+}
+
+/// Resolve a user-configured agent binary path (`SpawnArgs::binary_override`)
+/// to a spawnable path, FAILING with an error that names the preference when
+/// the path doesn't resolve to an executable file. A configured-but-wrong path
+/// must surface to the user — silently falling back to probing would mask the
+/// typo and spawn a different binary than the one they asked for.
+pub(super) fn resolve_binary_override(
+    path: &str,
+    agent_label: &str,
+    pref_key: &str,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let p = std::path::PathBuf::from(path);
+    if !p.is_file() {
+        return Err(format!(
+            "configured {agent_label} binary '{path}' does not exist or is not a file — \
+             fix or clear the '{pref_key}' setting (Settings → System → Coding agents)"
+        )
+        .into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = std::fs::metadata(&p)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+        if !executable {
+            return Err(format!(
+                "configured {agent_label} binary '{path}' is not executable — \
+                 fix or clear the '{pref_key}' setting (Settings → System → Coding agents)"
+            )
+            .into());
+        }
+    }
+    Ok(p)
 }
 
 /// Place the spawned agent child in its OWN process group (Unix).
@@ -220,23 +286,47 @@ pub(super) async fn drain_stderr(
     output
 }
 
+/// Resolve `file_name` as an executable file on `path_var` — the ONE PATH
+/// walk behind [`sccache_on_path`], `resolve_lucidos_binary_in` (claude_code),
+/// and `detect_agent_binary` (runtime), emulating `Command::spawn`'s lookup.
+/// `file_name` is the FINAL on-disk name — callers append
+/// `std::env::consts::EXE_SUFFIX` themselves where it applies (bundled names
+/// like `LUCIDOS_BIN_NAME` already carry it).
+pub(crate) fn find_on_path(
+    file_name: &std::ffi::OsStr,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
+    let path_var = path_var?;
+    std::env::split_paths(path_var)
+        .map(|dir| dir.join(file_name))
+        .find(|candidate| candidate.is_file())
+}
+
 /// Whether `sccache` is resolvable as an executable on `path_var`.
 ///
 /// `path_var` is injected to keep this pure and unit-testable; production
 /// passes `std::env::var_os("PATH")`. The child process inherits a superset
-/// of the engine's PATH (see `path_with_prefix`), so the engine's own PATH is
+/// of the engine's PATH (see `path_with_prefixes`), so the engine's own PATH is
 /// the correct probe for what cargo will resolve at build time.
 pub(super) fn sccache_on_path(path_var: Option<&std::ffi::OsStr>) -> bool {
-    let Some(path_var) = path_var else {
-        return false;
-    };
     let exe = format!("sccache{}", std::env::consts::EXE_SUFFIX);
-    std::env::split_paths(path_var).any(|dir| dir.join(&exe).is_file())
+    find_on_path(std::ffi::OsStr::new(&exe), path_var).is_some()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_path_prefixes_pg_bin_alone_still_contributes() {
+        // Packaged with a mis-staged CLI: psql must still resolve — the PG dir
+        // is independent of the CLI dir's presence.
+        let pg = tempfile::TempDir::new().expect("tempdir");
+        assert_eq!(
+            agent_path_prefixes(None, Some(pg.path().to_path_buf())),
+            vec![pg.path().to_path_buf()]
+        );
+    }
 
     #[test]
     fn sccache_on_path_true_when_binary_present() {
@@ -269,6 +359,40 @@ mod tests {
     fn sccache_on_path_false_when_path_unset() {
         // No PATH at all → can't resolve anything → false (degrade to plain build).
         assert!(!sccache_on_path(None), "absent PATH must yield false");
+    }
+
+    // ── Agent-child PATH prefixes (agent_path_prefixes) ────────────────────
+    // Packaged builds: bare `psql` inside a CC/Codex session must resolve to
+    // the bundled Postgres (LUCIDOS_PG_BIN_DIR) — the PG* env vars advertise
+    // it. Dev (no env var) stays cli-dir-only.
+
+    #[test]
+    fn agent_path_prefixes_cli_dir_only_in_dev() {
+        // Dev: LUCIDOS_PG_BIN_DIR unset → only the CLI dir, unchanged behavior.
+        let cli = std::path::Path::new("/opt/lucidos/bin");
+        assert_eq!(
+            agent_path_prefixes(Some(cli), None),
+            vec![cli.to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn agent_path_prefixes_appends_existing_pg_bin_after_cli_dir() {
+        // Packaged: a real LUCIDOS_PG_BIN_DIR joins the PATH prefix AFTER the
+        // CLI dir (the CLI dir's first position is load-bearing).
+        let cli = std::path::Path::new("/opt/lucidos/bin");
+        let pg = tempfile::TempDir::new().expect("tempdir");
+        assert_eq!(
+            agent_path_prefixes(Some(cli), Some(pg.path().to_path_buf())),
+            vec![cli.to_path_buf(), pg.path().to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn agent_path_prefixes_ignores_missing_pg_bin_dir() {
+        // A set-but-absent dir (mis-staged runtime) must not poison PATH.
+        let missing = std::path::PathBuf::from("/nonexistent/postgres/bin");
+        assert!(agent_path_prefixes(None, Some(missing)).is_empty());
     }
 
     // ── Process-group isolation ────────────────────────────────────────────

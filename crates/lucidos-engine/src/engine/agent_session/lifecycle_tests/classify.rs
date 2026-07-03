@@ -256,9 +256,10 @@ fn empty_text_failed_does_not_propose() {
     );
 }
 
-/// Empty Result on a resumed turn with no error → real stale-resume
-/// signal. The run-loop kills the worktree+branch and retries with a
-/// fresh spawn.
+/// Empty Result on a resumed turn with no error AND no tool calls → real
+/// stale-resume signal (a dead session produces an immediate empty answer with
+/// zero activity). The run-loop retries with a fresh spawn, REUSING the
+/// worktree (it no longer deletes it).
 #[test]
 fn empty_result_on_resume_with_no_error_is_stale_resume() {
     assert!(is_stale_resume_signal(
@@ -266,6 +267,7 @@ fn empty_result_on_resume_with_no_error_is_stale_resume() {
         true,  // result_text_empty
         true,  // buffered_text_empty
         true,  // no_prior_results_this_turn
+        true,  // no_tool_calls_this_turn
         true,  // user_message_present
         false, // cc_error
     ));
@@ -273,8 +275,7 @@ fn empty_result_on_resume_with_no_error_is_stale_resume() {
 
 /// Empty Result on a resumed turn WITH a CC-reported error → real
 /// upstream failure, NOT stale resume. Without this guard a transient
-/// network drop would `worktree remove --force` + `branch -D`, destroying
-/// user work that the live session was about to commit.
+/// network drop would trigger a spurious fresh-spawn retry.
 #[test]
 fn empty_result_on_resume_with_cc_error_is_not_stale_resume() {
     assert!(!is_stale_resume_signal(
@@ -282,8 +283,30 @@ fn empty_result_on_resume_with_cc_error_is_not_stale_resume() {
         true,  // result_text_empty
         true,  // buffered_text_empty
         true,  // no_prior_results_this_turn
+        true,  // no_tool_calls_this_turn
         true,  // user_message_present
         true,  // cc_error
+    ));
+}
+
+/// THE FABLE FALSE-POSITIVE REGRESSION GUARD (2026-07-02). A terse model
+/// (Fable-5) routinely emits empty assistant text and jumps straight to a tool
+/// call — so `result_text_empty && buffered_text_empty` are both true even
+/// though the session is alive and working. A tool call this turn
+/// (`no_tool_calls_this_turn == false`) MUST veto the stale-resume verdict.
+/// Before this gate, every terse Fable resume was misclassified as stale,
+/// cancelled, and re-spawned → a duplicate CC process on the shared worktree
+/// (2x quota burn).
+#[test]
+fn empty_result_on_resume_but_made_tool_calls_is_not_stale_resume() {
+    assert!(!is_stale_resume_signal(
+        true,  // has_resume_session
+        true,  // result_text_empty  (Fable: no assistant text)
+        true,  // buffered_text_empty
+        true,  // no_prior_results_this_turn
+        false, // no_tool_calls_this_turn → a tool call happened → ALIVE
+        true,  // user_message_present
+        false, // cc_error
     ));
 }
 
@@ -291,7 +314,38 @@ fn empty_result_on_resume_with_cc_error_is_not_stale_resume() {
 /// when the dead session id actually came from a prior CodingAgentIdled).
 #[test]
 fn fresh_session_is_never_stale_resume() {
-    assert!(!is_stale_resume_signal(false, true, true, true, true, false));
+    assert!(!is_stale_resume_signal(
+        false, true, true, true, true, true, false
+    ));
+}
+
+/// CC's EXPLICIT session-not-found error IS a definitive stale-resume signal —
+/// the one whitelisted `cc_error` string, because re-resuming a gone session can
+/// never succeed. This is the exact error from dev/bf997e21 (a mid-flight
+/// `CLAUDE_CONFIG_DIR` switch relocated CC's transcript store).
+#[test]
+fn explicit_no_conversation_found_is_definitive() {
+    assert!(is_definitive_session_not_found(Some(
+        "No conversation found with session ID: 7c61f11b-414e-4e5e-9da7-bdbd3b3649d6"
+    )));
+}
+
+/// A generic `cc_error` (transient upstream failure) must NOT be treated as
+/// session-not-found — otherwise the recovery would `worktree remove` on a 5xx
+/// and strand the user's in-flight work. Only the exact whitelisted string
+/// qualifies.
+#[test]
+fn generic_cc_error_is_not_session_not_found() {
+    assert!(!is_definitive_session_not_found(Some("API Error: 529 overloaded")));
+    assert!(!is_definitive_session_not_found(Some("error_max_turns")));
+    assert!(!is_definitive_session_not_found(Some("")));
+}
+
+/// No error at all is not a session-not-found signal (that path is the
+/// empty-echo `is_stale_resume_signal` heuristic instead).
+#[test]
+fn no_error_is_not_session_not_found() {
+    assert!(!is_definitive_session_not_found(None));
 }
 
 /// Silent resume (warmup with no user content) still drops every Result,

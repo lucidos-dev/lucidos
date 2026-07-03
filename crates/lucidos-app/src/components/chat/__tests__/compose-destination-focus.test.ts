@@ -49,15 +49,26 @@ describe('compose destination final selection focus', () => {
     expect(deps.openSettingsSubview).toHaveBeenCalledWith('repositories');
   });
 
-  it('focuses the prompt after selecting a coding agent chip value', () => {
-    const deps = {
-      setCodingAgentDefault: vi.fn().mockResolvedValue(undefined),
-      focusPrompt: vi.fn(),
-    };
+  it('writes the coding agent to the focused draft, never a global, and focuses the prompt', () => {
+    const deps = { patchSelection: vi.fn(), focusPrompt: vi.fn() };
 
-    handleComposeCodingAgentSelection('claude-code', deps);
+    handleComposeCodingAgentSelection('thread-1', 'codex', deps);
 
-    expect(deps.setCodingAgentDefault).toHaveBeenCalledWith('claude-code');
+    // Per-draft: only this draft's backend changes; the account default is left
+    // to Settings (draft-only).
+    expect(deps.patchSelection).toHaveBeenCalledWith('thread-1', { codingAgent: 'codex' });
+    expect(deps.focusPrompt).toHaveBeenCalledOnce();
+  });
+
+  it('with no focused draft, writes the PENDING slot (null), never a global', () => {
+    const deps = { patchSelection: vi.fn(), focusPrompt: vi.fn() };
+
+    handleComposeCodingAgentSelection(null, 'claude-code', deps);
+
+    // patchComposeSelection(null, …) routes to the pending slot — a fresh-compose
+    // pick must NOT write `coding_agent_default` (every override-less draft reads
+    // it, so that would leak the pick to all drafts).
+    expect(deps.patchSelection).toHaveBeenCalledWith(null, { codingAgent: 'claude-code' });
     expect(deps.focusPrompt).toHaveBeenCalledOnce();
   });
 
@@ -66,5 +77,14 @@ describe('compose destination final selection focus', () => {
     expect(composeDropdowns.length).toBeGreaterThanOrEqual(2);
     expect(composeDropdowns[0]).toMatch(/class="compose-destination-picker"[\s\S]*restoreFocusOnSelect=\{false\}/);
     expect(composeDropdowns[1]).toMatch(/class="compose-coding-agent-chip"[\s\S]*restoreFocusOnSelect=\{false\}/);
+  });
+
+  it('does not mark the last-used option in the compose destination or coding-agent pickers', () => {
+    // The trigger already shows the current value; marking it inside the open
+    // list would only compete with the arrow-key focus row (see Dropdown
+    // `markCurrent`). Both compose pickers must opt out.
+    const composeDropdowns = composeRowSource.match(/<Dropdown[\s\S]*?\/>/g) ?? [];
+    expect(composeDropdowns[0]).toMatch(/class="compose-destination-picker"[\s\S]*markCurrent=\{false\}/);
+    expect(composeDropdowns[1]).toMatch(/class="compose-coding-agent-chip"[\s\S]*markCurrent=\{false\}/);
   });
 });

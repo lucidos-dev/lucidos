@@ -79,6 +79,22 @@ pub(crate) fn apply_inactivity_timeout_minutes(
     }
 }
 
+/// Whether the in-session apply (`apply_now_inner`) must run the Lucidos-source
+/// `/harden` + test flow before merging.
+///
+/// App coding-agent threads own their own hardening and never run the
+/// Lucidos-source `/harden` (their worktree has no `cargo`/`tsc`/`scripts` and
+/// their session prompt explicitly opts out) — so they ALWAYS skip, regardless
+/// of marker state. This mirrors the `is_app()` harden-gate skip in
+/// `change_ops::apply_change`; without it, clicking Apply on an app thread with
+/// a live session wrongly injected "Run /harden now." + `cargo test -p
+/// lucidos-engine` into the app session and then failed the apply with
+/// "Hardening did not complete". Non-app (Lucidos-source / external) threads
+/// gate on the harden marker as before.
+pub(super) fn should_run_in_session_hardening(is_app: bool, branch_hardened: bool) -> bool {
+    !is_app && !branch_hardened
+}
+
 impl LucidosEngine {
     /// Apply Now: keep the existing Claude Code session alive and use it for review/conflict resolution.
     /// Only kills CC after the merge succeeds. Falls back to stale session handling if no live session.
@@ -415,7 +431,15 @@ impl LucidosEngine {
         )
         .await;
 
-        if !branch_is_hardened(&self.pool, self.changes(), repo_root, branch_name).await {
+        // App threads skip the /harden + test gate entirely (apps own their
+        // hardening). Probe the marker only for non-app threads — mirrors the
+        // `is_app()` skip in `change_ops::apply_change`.
+        let is_app = crate::engine::change_ops::load_apply_kind_context(&self.pool, Some(thread_id))
+            .await
+            .is_app();
+        let branch_hardened = !is_app
+            && branch_is_hardened(&self.pool, self.changes(), repo_root, branch_name).await;
+        if should_run_in_session_hardening(is_app, branch_hardened) {
             self.request_hardening_in_session(thread_id, msg_tx)
                 .await?;
             self.wait_and_commit(
@@ -968,6 +992,13 @@ impl LucidosEngine {
             Some(post_sha.to_string()),
         )
         .await;
+        // Apply-time net for the "≤1 pending change per thread" invariant: now
+        // that this change landed, drop any stale pending change the thread
+        // still holds on another branch so it can't keep blocking Archive.
+        // `propose_change` is the primary guard; this is the apply-side backstop.
+        // See docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md.
+        self.discard_orphaned_pending_siblings(thread_id, change_id, actor.clone())
+            .await;
         // Refresh entity caches (apps, artifacts) for SSE subscribers — the
         // CC worktree wrote files directly into `data/apps/<id>/...` /
         // `data/artifacts/...`, so the only signal the frontend gets is
@@ -1000,6 +1031,13 @@ impl LucidosEngine {
                     actor,
                 )
                 .await;
+                // Frontend-only Lucidos-source live Apply (engine binary unchanged):
+                // re-snapshot the rebuilt dist/ so the served client advances without
+                // a respawn (dev). Mirrors the `change_ops::apply_change` wrapper;
+                // `is_lucidos_source()` is false for app/external threads.
+                if !requires_restart && client_update && kind_ctx.is_lucidos_source() {
+                    self.refresh_served_frontend_after_rebuild();
+                }
             }
             Ok(None) => {
                 log!(
@@ -1156,6 +1194,7 @@ mod tests {
             question_resume_pending: false,
             tools_in_flight: Arc::new(AtomicI32::new(0)),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            agent_cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -1203,6 +1242,34 @@ mod tests {
         assert_eq!(
             decide_in_place_merge_claim(Some(&s)),
             InPlaceMergeClaim::Claim
+        );
+    }
+
+    /// Regression: clicking Apply on an *app* coding-agent thread with a live
+    /// session must NOT run the Lucidos-source `/harden` + test flow, even when
+    /// the branch has no harden marker. Before the fix, `apply_now_inner`
+    /// injected "Run /harden now." + `cargo test -p lucidos-engine` into the app
+    /// session and failed the apply with "Hardening did not complete" — exactly
+    /// the reported bug on the "Create App Demo Video" (`demo-director`) thread.
+    #[test]
+    fn app_thread_never_runs_in_session_hardening() {
+        // App thread, no marker — must still skip.
+        assert!(!should_run_in_session_hardening(true, false));
+        // App thread, marker present — skip.
+        assert!(!should_run_in_session_hardening(true, true));
+    }
+
+    /// Non-app (Lucidos-source / external) threads still gate on the marker: run
+    /// hardening iff the branch isn't already hardened.
+    #[test]
+    fn non_app_thread_gates_in_session_hardening_on_marker() {
+        assert!(
+            should_run_in_session_hardening(false, false),
+            "unhardened non-app branch must run /harden before merging"
+        );
+        assert!(
+            !should_run_in_session_hardening(false, true),
+            "already-hardened non-app branch skips the redundant /harden"
         );
     }
 

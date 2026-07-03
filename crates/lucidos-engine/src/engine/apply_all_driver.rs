@@ -27,8 +27,13 @@ use crate::engine::LucidosEngine;
 /// Failure reason recorded for a batch member that was discarded or whose change
 /// row vanished before the batch finished — so recovery can mark it terminal and
 /// let the batch reach `is_complete()` instead of stalling on a member that can
-/// never apply.
-const DISCARDED_MEMBER_REASON: &str = "Change was discarded or removed before the batch finished";
+/// never apply. Also used by `discard_change`'s live `notify_apply_all(Failed …)`
+/// so a member discarded mid-batch (e.g. the "≤1 pending change per thread"
+/// reconcile dropping a sibling that is itself a batch member) advances the batch
+/// instead of stalling it on an `apply_change` that returns `Err` without a
+/// terminal event.
+pub(crate) const DISCARDED_MEMBER_REASON: &str =
+    "Change was discarded or removed before the batch finished";
 
 /// How recovery should treat a batch member, derived from its `changes.status`.
 /// `Terminal` covers `discarded`, a missing row, and any unknown status — all

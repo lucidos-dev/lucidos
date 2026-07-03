@@ -114,6 +114,114 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Frontend
 
+- **`initiateEngineRestart` dismissing the `engine-new-version` switch toast on
+  a spawn-FAILURE path is intentional; the badge is the recovery affordance.** A
+  reviewer (Codex flagged this P2) may note that `initiateEngineRestart` dismisses
+  the "New version available → Switch to new version" toast up front, and on the
+  engine-still-alive failure catches (`ApiError` / Tauri string reject) leaves
+  `engineVersionReady` true — so `checkEngineVersion`'s rising edge
+  (`ready && !engineVersionReady`) never re-shows the toast, and the switch toast
+  is gone until readiness flips again. This is deliberate: (1) recovery is intact
+  via the control-panel badge + reload glyph — `engineNewVersionReady()` is
+  `engineVersionReady.value` in dev, still true, so the glyph long-press → Restart
+  → `initiateEngineRestart` retries (the plan's designated *persistent* affordance;
+  the toast is the ready-time convenience). (2) The obvious "fix" — resetting
+  `engineVersionReady = false` on failure to force a re-toast — would open the
+  client-refresh ordering gate `!(restartRequired || engineVersionReady)` while the
+  OLD engine is still running, violating a core invariant of
+  `docs/plans/2026-07-01-version-toast-single-surface-and-client-ordering.md`
+  (client must never refresh ahead of the engine switch). Dismissing at the top
+  (not deferred to after the request) is what gives the instant single surface the
+  fix exists for. Re-flag only if the badge/glyph recovery path is removed.
+  (`store/actions/chat-changes.ts` `initiateEngineRestart`,
+  `store/actions/engine-update.ts` `checkEngineVersion`,
+  `components/layout/ControlPanel.tsx` `engineNewVersionReady`.)
+- **`removeEventListener(type, fn, { capture: true })` DOES remove a listener
+  added with `{ capture: true, passive: true }`.** A reviewer seeing an
+  `addEventListener(…, { capture: true, passive: true })` paired with a
+  `removeEventListener(…, { capture: true })` may flag a "listener leak" from
+  the asymmetric options. It isn't one: per the DOM spec, listener removal
+  matches on `(type, callback, capture)` ONLY — the `passive` and `once` flags
+  are explicitly NOT part of the match. The minimal `{ capture: true }` on
+  removal is the idiomatic, correct form (the navigation focus marker's
+  gesture-clear listeners in `components/shared/focusMarker.ts` `applyNavFocus`
+  use exactly this). Re-flag only if the `callback` reference or the `capture`
+  flag actually differs between add and remove. (`components/shared/focusMarker.ts`.)
+- **`.thread-content` (the `tabindex=0` transcript scroll region) deliberately
+  shows NO focus outline in any focus state.** A reviewer (Codex flagged this as
+  a P2 a11y regression) may note that removing `.thread-content:focus-visible`'s
+  outline drops the only visible keyboard-focus cue on the direct-focus paths
+  (Tab into the pane, the `⌘⇧2` / Search-Everywhere `focusPaneMainControl`) where
+  no per-turn `.nav-focus-stuck` marker is applied. This is a deliberate,
+  maintainer-requested visual call: a whole-pane accent ring around the entire
+  conversation while arrow-scrolling reads as chrome, not affordance, and the
+  keyboard-scroll *function* (Arrow/Page keys, focus landing via `paneFocus.ts`)
+  is fully preserved — only the ring is gone. Navigation that lands on a specific
+  turn still shows the `.nav-focus-stuck` marker. Re-flag only if the maintainer
+  reverses the preference. (`styles/chat/input-messages.css` `.thread-content:focus`,
+  `components/layout/paneFocus.ts`.)
+- **A deep-link's PULSE element can differ from its SCROLL target — the scroll
+  deliberately targets the whole `.chat-exchange`, not the pulsed panel.** A
+  reviewer may flag that `scrollToChangeAndPulse` (and `scrollToEventAndPulse`)
+  pulse a descendant panel (`.response-panel` on a proposing turn, `.initiator-panel`
+  on a resolution card / event) while `scrollToSelectorAndPulse` scrolls (via
+  `smoothScrollToElement`) to the `.chat-exchange`, so for an exchange with an
+  atypically tall `.initiator-panel` (a user prompt taller than the viewport) the
+  pulsed `.response-panel` can land below the fold. This is deliberate: the scroll
+  MUST target the `.chat-exchange` because only it carries the `scroll-margin-top`
+  gap that keeps the focus border from being clipped under the fixed header /
+  sticky title (commit `9884ece31`) — retargeting the scroll to the pulse panel
+  would regress that. The pulse-vs-scroll split is inherent to scoping the
+  highlight (fixing the original "whole turn highlighted" bug); the below-fold
+  case needs the tall-initiator edge AND is degraded feedback, not a broken
+  landing (the user still scrolls to the exchange; the sticky border persists on
+  the panel). Re-flag only with a concrete fix that keeps the `.chat-exchange`
+  scroll-margin behavior intact. (`components/chat/scrollState.ts`.)
+- **Turn-nav anchors on the marked turn when present, and only falls back to
+  `scrollTop + gap` scroll-position stepping when there's no marker.** Turn-nav
+  (`components/chat/scrollState.ts`) lands a turn's top `gap` px below the
+  container (the `.chat-exchange scroll-margin-top` clearance). `pickTurnTarget`
+  chooses the step mode: when the nav focus marker sits on a listed turn it steps
+  by INDEX from that turn (`anchorIdx + direction`); otherwise it steps by scroll
+  position via `pickTurnIndex` (comparing `tops[i]` against `scrollTop + gap`). The
+  index anchor is what makes turns that share a CLAMPED scroll position reachable —
+  after collapsing the last turn, the collapsed turn and an appended "Change
+  applied" card cluster in the last (no-scroll-room) viewport, where pure
+  scroll-position stepping keys off a pinned `scrollTop` and re-selected the same
+  turn (the change card was unreachable — the reported bug). A marker means the
+  user has NOT scrolled since the last nav (any scroll gesture fades it), so index
+  stepping is unambiguous; the no-marker fallback still handles the
+  first-press-from-scroll case and the tested mid-turn "prev snaps to the current
+  turn's top" read (both happen precisely when no marker is present), so that
+  behavior is preserved. Re-flag only with evidence that a clustered turn is NOT
+  reachable via the marker anchor, or that the mid-turn/first-press fallback
+  regressed. (`components/chat/scrollState.ts` `stepThreadTurn` / `pickTurnTarget`.)
+- **The thread drawer's `id={navKeyDomId(...)}` on rows + section headers does
+  NOT violate `frontend.md` "No `id` on dual-rendered components".** The rows
+  (`ThreadRowContent`, `ComposingThreadRow`) and section headers carry real DOM
+  `id`s because the drawer container is the single keyboard tab stop
+  (`role="tree"`, `tabindex=0`) and points `aria-activedescendant` at the active
+  row's id — which strictly requires an id, the one thing roving-tabindex would
+  avoid but the chosen aria-activedescendant model needs. It's safe because
+  `ThreadDrawer` is single-mounted: `App.tsx` mounts only the visible layout's
+  pane tree (`mobile ? <MobileSwipeContainer/> : <ThreadDrawer/>`), a breakpoint
+  swap is an unmount-then-mount (never two copies coexisting), and within one
+  mounted drawer only one view renders at a time and a thread renders once — so
+  ids are unique. The rule's hazard (two simultaneous layout copies → wrong-copy
+  resolution) is absent. Cross-component lookups still use the `data-` pattern
+  (`openHighlightedThreadActions` queries `[data-thread-nav=…]`, like the
+  pre-existing highlight scroller), not `getElementById`. Re-flag only if a
+  second `ThreadDrawer` can mount concurrently. (`components/drawer/ThreadDrawer.tsx`.)
+- **`paneFocus.ts`'s `FOCUSABLE` excluding `[tabindex="-1"]` on EVERY native
+  term (not just the trailing `[tabindex]` term) is intentional, not an
+  over-broad selector.** A `<button tabindex="-1">` is non-tabbable by native
+  Tab, so the per-pane trap must skip it too; the old selector matched it via
+  `button:not([disabled])` and let the trap cycle onto it (a latent defect — it
+  could land on `aria-hidden` file inputs / the change-actions placeholder).
+  This makes the drawer a genuine single tab stop (its mouse-only row buttons are
+  `tabindex=-1`) and aligns the trap with native semantics. Re-flag only if a
+  control needs to be a trap stop *while* `tabindex=-1` (a contradiction).
+  (`components/layout/paneFocus.ts`.)
 - **`dispatchForwardedChord` setting `focusedPane = 'content'` for ALL
   forwarded chords — including `toggleThreadDrawer` (⌘⇧1) — does NOT violate
   "the drawer toggle never sets focus" (commit 585274dc3).** That rule governs
@@ -247,6 +355,68 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   must NOT apply. Re-flag only if the gateway splash gains UI-scale awareness.
   (`crates/lucidos-app/index.html` `.boot-splash-status`.)
 
+- **Provider-settings components treat a non-`loaded` credentials Loadable as
+  "not configured" — sibling-wide pattern, failure surfaced at the section
+  level.** `ApiKeyProviderSettings`, `AnthropicProviderSettings`, and
+  `LocalProviderSettings` all compute `existing` via
+  `status === 'loaded' ? find(...) : undefined`, so a failed credentials fetch
+  renders the unconfigured Save flow instead of a per-row error. This reads as a
+  "failed must look different from empty" violation, but the credentials-load
+  failure is surfaced by `SettingsView`'s `LoadableError` on the credentials
+  list, and the three siblings deliberately share one shape. A fix belongs as a
+  cross-component change (all three + a section-level gate), not a one-file
+  divergence in whichever component a diff happens to touch. Re-flag only as a
+  deliberate cross-component cleanup, or if `SettingsView` loses its
+  section-level error surface. (`components/settings/ApiKeyProviderSettings.tsx`,
+  `AnthropicProviderSettings.tsx`, `LocalProviderSettings.tsx`,
+  `SettingsView.tsx`.)
+- **Mobile header titles are ABSOLUTELY TRUE-centered on the row middle, with a
+  symmetric `max-width` reserve that clamps a long title's left edge past the
+  leading icons — this is the explicit product requirement, not the between-icons
+  flanking-spacer variant (which was tried and reverted for reading off-center).**
+  `.mobile-header-title` (`styles/mobile.css`) is `position:absolute; left:50%;
+  transform:translate(-50%,-50%); max-width:calc(100% - 10.5rem)` so it sits on
+  the viewport/row axis (like the pane dots + desktop header) regardless of the
+  leading (hamburger + nav / filter) and trailing (actions) cluster widths. The
+  requirement was stated as *"they should be centered, as long as they don't
+  overlap the left-side icons; if centering would overlap, move them right so the
+  left edge clears the rightmost left icon."* The symmetric reserve delivers both:
+  a short title reads centered; a long one clamps + ellipsizes with its left edge
+  just past the widest leading cluster (~5rem). An in-flow flanking-spacer title
+  (commit `14a512b8b`, reverted) satisfied no-overlap but centered BETWEEN the
+  clusters, so it drifted off the row middle whenever the clusters differed in
+  width — the "Appearance/Threads not centered" report. **Accepted right-side
+  residual (do NOT re-flag):** because the reserve is symmetric and the CONTENT
+  header's trailing action cluster is variable and can be wide (app/file previews:
+  refresh/open/fullscreen/notifications + toggles ≈ 4–5 icons), a very long content
+  title's ellipsis tail can pass *visually* under those trailing icons on a narrow
+  (375px) viewport — the tail end of the true-center trade-off the user chose over
+  the off-center flanking layout. It is tap-safe (see below) and the alternatives
+  are worse (off-center flanking was rejected; a reserve wide enough to clear 5
+  icons would truncate common content titles to ~60px). Overlap handling: the
+  title box is `pointer-events:none` (taps fall through; brand's visible children +
+  the content title re-enable them), and `.mobile-header-row .content-header-actions`
+  is `z-index`-lifted so a long CONTENT title's ellipsis tail can't intercept an
+  action (only shows through behind it). The brand's long **workspace name** can't
+  spill over the left icons because `.pane-header-brand-label` is bounded to the
+  centered box (`max-width:100%`) so `.workspace-name-label` ellipsis-truncates
+  within it. That truncation — NOT the name-hide budget — is the no-spill
+  guarantee, which is why `ConnectionStatus.tsx` MUST keep summing the trailing
+  `.pane-header-spacer` width into `available`: the absolutely-centered mobile
+  brand is shrink-to-content, so `brandLabel.clientWidth` has no slack past the
+  text, and the spacer is the room the name occupies. Dropping that spacer term
+  collapsed the budget to the text width and latched the name hidden — the
+  "workspace name gone from the brand" regression. (Desktop has no spacer siblings
+  and a fixed-width brand-label with its own slack, so the sum is a no-op there.)
+  Guarded by
+  `e2e/mobile-threads-title-alignment.spec.ts` (center ≈ row middle + left edge ≥
+  leading cluster). Re-flag only if the title loses `position:absolute` (regresses
+  to off-center) or the content actions lose their `z-index` lift. The content
+  title's tap tooltip (`e2e/tooltip-swipe-dismiss-mobile.spec.ts`) works because
+  `.mobile-content-title` re-enables `pointer-events`.
+  (`components/layout/MobileAppHeader.tsx`, `components/layout/ConnectionStatus.tsx`,
+  `styles/mobile.css` `.mobile-header-title` / `.mobile-content-title`.)
+
 ## Scripts (bash)
 
 - **A single-quoted `trap` body that contains a double-quoted command path
@@ -313,6 +483,37 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if a path is added that sets `coding_agent_proposed` WITHOUT a
   `ChangeProposed`/`to_inbox` transition. (`core/store/threads/summaries.rs`,
   `engine/thread_lifecycle.rs`.)
+
+- **`base.css` is NOT served to app iframes — host-only theme tokens belong in its
+  theme blocks.** `/api/v1/sdk-iframe.css` is exactly two `include_str!` pieces
+  (`crates/lucidos-engine/src/api/sdk.rs`): the engine's own `sdk_iframe.css`
+  (which carries its OWN "keep in sync with base.css" token mirror) plus
+  `shared-components.css`. A reviewer may flag a new host-chrome token in
+  `base.css`'s `html`/`html[data-theme]` blocks (e.g. `--focus-pill-*`) as
+  "ships to every app iframe" or "belongs in `host-components.css`" — both wrong:
+  base.css never reaches apps, and `.claude/rules/frontend.md` explicitly keeps
+  ":root/theme token blocks" in `base.css` (`host-components.css` is for component
+  *rules*, not tokens; `--header-gradient`/`--titlebar-strip-bg` are the
+  host-chrome-token precedent). The js-sdk.md "Theme variables" drift rule applies
+  only to tokens added to `sdk_iframe.css`/`shared-components.css` themselves.
+  Re-flag only if the token is added to one of those two served files without the
+  doc row. (`styles/global/base.css`, `crates/lucidos-engine/src/api/sdk.rs`.)
+
+- **`openScaleModal` deliberately does NOT blur the UI-scale trigger button, and
+  the trigger uses plain `.settings-option`.** A reviewer (Codex did) may flag
+  that the value button stays `:focus`'d under the full-screen scale modal, so a
+  focus ring "could" show behind the dim backdrop on WebKit/iOS, and propose
+  blurring it on open. This was actually tried (a `document.activeElement.blur()`
+  in `openScaleModal`, plus a `.settings-value-button` class overriding the
+  outline) and **reverted at the user's explicit request** — the retained focus
+  ring behind the modal is original, long-standing behavior AND, empirically, is
+  NOT the "weird halo" users report: that halo is the *mobile slider thumb* (the
+  old `background-clip:padding-box` + transparent-border trick shrank the visible
+  dot to 1.25em and let iOS's default thumb bleed through; fixed by the solid
+  2.5em thumb in `toggle.css`). iOS also does not persist a focus ring on a
+  `<button>` after a tap. Re-flag only with evidence the *value button's* ring is
+  actually visible behind the modal AND is what a user reported. (`components/
+  shared/scaleModalState.ts`, `styles/settings/toggle.css`.)
 
 ## Settled architecture questions
 

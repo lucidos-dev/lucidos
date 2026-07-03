@@ -645,9 +645,13 @@ pub(super) async fn chat_submit(
     // the fit-to-model-size step happens at the LLM boundary
     // (`engine::chat::images` / the image-description pass) via
     // `ChatImage::fit_for_llm`, so compression lives in exactly one place.
-    let chat_images = if let Some(hashes) = request.image_hashes.take() {
+    // Keep the caller-supplied hashes: the Thread Queue branch below persists
+    // hashes (never inline base64) into the queued request, and by that point
+    // both wire fields have already been consumed here.
+    let supplied_image_hashes = request.image_hashes.take();
+    let chat_images = if let Some(hashes) = &supplied_image_hashes {
         let mut resolved = Vec::with_capacity(hashes.len());
-        for hash in &hashes {
+        for hash in hashes {
             match crate::core::blobs::read_blob_as_base64(state.engine.workspace_path(), hash) {
                 Some((data, mime_type)) => resolved.push(ChatImage {
                     base64: data,
@@ -927,11 +931,12 @@ pub(super) async fn chat_submit(
         let queue_thread_id = thread_id.unwrap_or_else(Uuid::new_v4);
         // Persist images as content-addressed blobs — queue requests never
         // carry inline base64 (the request is persisted in the event payload).
-        let image_hashes = match request.image_hashes.take() {
+        // The wire fields were consumed into `chat_images` above, so reuse the
+        // supplied hashes, else re-derive hashes from the resolved images
+        // (content-addressed, so re-persisting is idempotent).
+        let image_hashes = match supplied_image_hashes {
             Some(hashes) => hashes,
-            None => state
-                .engine
-                .queued_image_hashes(request.images.take().as_deref()),
+            None => state.engine.queued_image_hashes(chat_images.as_deref()),
         };
         let response_event_id = event_id
             .clone()
@@ -1209,33 +1214,63 @@ pub(super) async fn cancel_chat(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Query(query): Query<CancelChatQuery>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Json<super::CancelResponse>, StatusCode> {
     let thread_id = parse_optional_uuid(query.thread_id.as_deref())?;
-    // Resolve actor once and reuse for both the question-card resolution
-    // and the cancel-thread call — the actor stamps `ResponseCanceled.actor`
-    // so the timeline records which device clicked Stop.
+    // Resolve actor once and reuse for the question-card resolution, the
+    // cancel-thread call, and the settle fallback — the actor stamps
+    // `ResponseCanceled.actor` / `ResponseAborted.actor` so the timeline
+    // records which device clicked Stop.
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
     // Resolve any pending question card before firing the cancel token —
     // otherwise the chat agent's `ask_user_question` tool stays blocked on
     // `walk_question_batch.recv()` (no cancel-aware select) and the cancel
     // token is never observed. Mirrors `claude_code_stop`'s behavior; without
     // it, canceling a chat thread with an active question card hangs
-    // indefinitely in the "Canceling…" state.
-    if let Some(tid) = thread_id {
+    // indefinitely in the "Canceling…" state. A resolved card counts toward
+    // `canceled` — it IS a status-changing event the client will receive.
+    let question_resolved = if let Some(tid) = thread_id {
         crate::engine::agent_question::resolve_pending_question_as_canceled(
             &state.engine,
             tid,
             actor.clone(),
         )
-        .await;
-    }
-    match thread_id {
+        .await
+    } else {
+        false
+    };
+    // `canceled = false` means the server had nothing live to cancel — the
+    // client's optimistic "canceling" state is stale and it must re-sync.
+    let canceled = match thread_id {
         Some(uuid) => {
-            state.engine.cancel_thread(uuid, actor);
+            if state.engine.cancel_thread(uuid, actor.clone()) {
+                true
+            } else {
+                // No live handle: the projection may still be stuck at
+                // `running` (the client raced the terminal broadcast on load,
+                // or a spawn errored before emitting one). Settle it so a
+                // `ResponseAborted(StaleSettle)` lands and the thread stops
+                // looking mid-turn — parity with the CC interrupt path.
+                match crate::engine::claude_code::settle_stuck_running_thread(
+                    &state.pool,
+                    &state.engine.event_bus,
+                    uuid,
+                    actor,
+                )
+                .await
+                {
+                    Ok(settled) => settled,
+                    Err(e) => {
+                        crate::log!("[API] cancel_chat settle failed for {}: {}", uuid, e);
+                        false
+                    }
+                }
+            }
         }
         None => state.engine.cancel_all_threads(actor),
-    }
-    Ok(StatusCode::OK)
+    };
+    Ok(Json(super::CancelResponse {
+        canceled: question_resolved || canceled,
+    }))
 }
 
 /// Routes for the `/chat*` surface.

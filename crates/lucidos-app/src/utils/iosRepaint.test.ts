@@ -5,6 +5,22 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 let iosValue = true;
 vi.mock('./platform', () => ({ isIOS: () => iosValue }));
 
+// scrollState owns the notification deep-link scroll claim. The repaint now gates
+// its scrollTop nudge on hasPendingEventScroll() so it stops fighting a deep-link's
+// smooth scroll on iOS resume. Mock it to a controllable boolean — mirrors the
+// isIOS mock and avoids pulling in @preact/signals for a single flag. (The real
+// claim can't be set here: scrollToEventAndPulse bails before setting it when
+// `document` is undefined, which is the case in this DOM-less suite.)
+let pendingEventScroll = false;
+vi.mock('../components/chat/scrollState', () => ({ hasPendingEventScroll: () => pendingEventScroll }));
+
+// scrollActivity tracks whether a user touch-drag / momentum scroll is in flight.
+// The repaint gates its scrollTop nudge on it so a nudge can't cancel an in-flight
+// iOS momentum scroll (the "scrolling randomly stops when you let go" bug).
+// Mock to a controllable boolean, mirroring the isIOS / scrollState mocks.
+let userScrolling = false;
+vi.mock('./scrollActivity', () => ({ isUserScrolling: () => userScrolling }));
+
 import { forceIOSRepaint, forceIOSRepaintBurst, createRepaintThrottle, OPEN_REPAINT_BURST_DELAYS_MS } from './iosRepaint';
 
 describe('OPEN_REPAINT_BURST_DELAYS_MS', () => {
@@ -43,6 +59,8 @@ function flushFrame() {
 
 beforeEach(() => {
   iosValue = true;
+  pendingEventScroll = false;
+  userScrolling = false;
   rafQueue = [];
   rafIdSeq = 0;
   canceled = new Set();
@@ -237,6 +255,25 @@ describe('forceIOSRepaint', () => {
     expect(el.scrollTop).toBe(2000);
   });
 
+  it('nudges from the LIVE position, not a stale call-time baseline (streaming growth)', () => {
+    // The auto-tail regression: on iOS the streaming-repaint throttle calls
+    // forceIOSRepaint while at the bottom, but content grows (and useAutoScroll
+    // re-pins to the NEW bottom) between the call and the rAF nudge. A call-time
+    // baseline would nudge to (oldBottom - 1) — now far above the grown bottom —
+    // which scrollState.onScroll reads as scrolled-up and latches scrolledUp=true,
+    // permanently parking auto-scroll. The nudge must be ±1 from the CURRENT
+    // position so it stays inside the 80px / 2px slack and never trips it.
+    const el = fakeEl('', { scrollTop: 1200, scrollHeight: 2000, clientHeight: 800 }); // at bottom (2000-800)
+    forceIOSRepaint(el); // call-time baseline would capture 1200
+    // Streaming grows the transcript; useAutoScroll pins to the new bottom:
+    el.scrollHeight = 3000;
+    el.scrollTop = 2200; // new bottom (3000-800)
+    flushFrame(); // frame 1: nudge — must be ±1 from the LIVE 2200, not the stale 1200
+    expect(el.scrollTop).toBe(2199);
+    flushFrame(); // frame 2: restore to the live baseline it nudged from
+    expect(el.scrollTop).toBe(2200);
+  });
+
   it('nudges DOWN then restores when at the very top (direction-safe, scrollTop 0)', () => {
     const el = fakeEl('', { scrollTop: 0, scrollHeight: 2000, clientHeight: 800 });
     forceIOSRepaint(el);
@@ -284,6 +321,182 @@ describe('forceIOSRepaint', () => {
     flushFrame();
     expect(el.scrollTop).toBe(500);
     expect(el.offsetReads).toBe(0);
+  });
+
+  // --- deep-link claim gate (don't fight a notification deep-link's scroll) -----
+
+  it('skips the scrollTop nudge while a deep-link claim is held, but still repaints (transform + layout read)', () => {
+    // The residual iOS-PWA flakiness: a notification-tap foreground fires the
+    // resume repaint (visibilitychange/pageshow/focus) at the SAME instant
+    // scrollToEventAndPulse is smooth-scrolling to the target event. The ±1px
+    // nudge captures the PRE-deep-link baseline (the bottom) and fights the
+    // landing — middle/top/bottom nondeterministically. With a claim held the
+    // nudge must be skipped entirely (no off-baseline strand), while the cheaper
+    // compositor re-commit (transform round-trip + forced layout read) still runs.
+    pendingEventScroll = true;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+
+    flushFrame(); // frame 1: NO scroll nudge — defer to the deep-link
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('translateZ(0.1px)'); // transform repaint still fires
+    expect(el.offsetReads).toBeGreaterThanOrEqual(1); // forced layout read still happens
+
+    flushFrame(); // frame 2: scroll still untouched (not stranded), transform restored
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('');
+  });
+
+  it('still nudges + restores scrollTop when NO claim is held (repaint not regressed)', () => {
+    // The paired case: with no deep-link in flight the ±1px nudge is the
+    // user-confirmed compositor recovery and must keep working exactly as before.
+    pendingEventScroll = false;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+
+    flushFrame(); // frame 1: nudge
+    expect(el.scrollTop).toBe(499);
+    flushFrame(); // frame 2: restore
+    expect(el.scrollTop).toBe(500);
+  });
+
+  it('keeps a consistent nudge decision when the claim ARRIVES mid-burst (no off-baseline strand)', () => {
+    // hasPendingEventScroll() can flip between rAF1 and rAF2. The decision is
+    // captured ONCE at burst start (no claim → nudge ON), so a claim arriving
+    // before the restore frame must NOT skip the restore and strand scrollTop at
+    // the nudged value.
+    pendingEventScroll = false; // burst starts with no claim → nudge decided ON
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+
+    flushFrame(); // frame 1: nudge applied
+    expect(el.scrollTop).toBe(499);
+    pendingEventScroll = true; // a deep-link claim arrives mid-burst
+    flushFrame(); // frame 2: restore STILL runs (decision reused) — no strand
+    expect(el.scrollTop).toBe(500);
+  });
+
+  it('keeps a consistent skip decision when the claim RELEASES mid-burst (never nudges)', () => {
+    // The mirror case: a claim held at burst start decides nudge OFF; releasing it
+    // before the restore frame must NOT cause a spurious restore write — scrollTop
+    // was never moved, so neither frame may touch it.
+    pendingEventScroll = true; // burst starts with a claim → nudge decided OFF
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+
+    flushFrame(); // frame 1: no nudge
+    expect(el.scrollTop).toBe(500);
+    pendingEventScroll = false; // claim releases mid-burst
+    flushFrame(); // frame 2: restore is a no-op (decision was OFF) — scrollTop untouched
+    expect(el.scrollTop).toBe(500);
+  });
+
+  it('reuses the burst nudge decision across a superseding call (claim held → no nudge)', () => {
+    // A single iOS resume fires visibilitychange + pageshow + focus → three
+    // forceIOSRepaint calls in one tick. The first captures the decision; the
+    // supersedes reuse it. With a claim held the whole burst must skip the nudge.
+    pendingEventScroll = true;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+    forceIOSRepaint(el); // supersede — reuses the captured (skip) decision
+    forceIOSRepaint(el); // supersede
+
+    flushFrame();
+    expect(el.scrollTop).toBe(500); // still no nudge
+    expect(el.style.transform).toBe('translateZ(0.1px)'); // transform still repaints
+    flushFrame();
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('');
+  });
+
+  // --- active-scroll gate (don't cancel an in-flight iOS momentum scroll) -----
+
+  it('skips the scrollTop nudge while the user is actively scrolling, but still repaints (transform + layout read)', () => {
+    // iOS cancels a momentum scroll the instant scrollTop is written. The repaint
+    // nudge fires on timers (streaming throttle, thread-open burst, settle probe,
+    // page-resume) independent of the gesture, so mid-fling it stops the scroll
+    // dead — the "scrolling randomly stops instead of going further when you let
+    // go" report. While a touch-drag / its momentum tail is in flight the nudge
+    // must stand down (the scroll itself is already keeping the compositor
+    // committed), while the cheaper transform round-trip + forced layout read run.
+    userScrolling = true;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+
+    flushFrame(); // frame 1: NO scroll nudge — don't cancel momentum
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('translateZ(0.1px)'); // transform repaint still fires
+    expect(el.offsetReads).toBeGreaterThanOrEqual(1); // forced layout read still happens
+
+    flushFrame(); // frame 2: scroll still untouched (not stranded), transform restored
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('');
+  });
+
+  it('re-checks live scrolling at the write frame — a drag that starts after the (idle) call but before rAF1 still skips the nudge', () => {
+    // The repaint callers are timer/data-driven and the scrollTop write is deferred
+    // one frame. If the user starts a fling in the ~16ms between an idle call and
+    // rAF1, a decision frozen at call time would still write scrollTop and cancel
+    // the just-started momentum. The nudge must re-check the LIVE scroll state at
+    // the write point; the restore stays gated on whether a nudge was applied, so
+    // skipping here leaves scrollTop untouched on BOTH frames.
+    userScrolling = false; // idle at call → burst decision would allow the nudge
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+    userScrolling = true; // a drag begins before the deferred write frame runs
+
+    flushFrame(); // rAF1: re-check sees the drag → NO scrollTop write
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('translateZ(0.1px)'); // transform repaint still fires
+    expect(el.offsetReads).toBeGreaterThanOrEqual(1); // forced layout read still happens
+
+    flushFrame(); // rAF2: nothing was nudged → restore is a no-op
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('');
+  });
+
+  it('still nudges + restores scrollTop when the user is NOT scrolling (recovery not regressed)', () => {
+    // The paired case: idle (no touch in flight), the ±1px nudge is the
+    // user-confirmed compositor recovery and must keep working exactly as before.
+    userScrolling = false;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+    flushFrame(); // frame 1: nudge
+    expect(el.scrollTop).toBe(499);
+    flushFrame(); // frame 2: restore
+    expect(el.scrollTop).toBe(500);
+  });
+
+  it('reuses the burst skip decision across a superseding call (scrolling → never nudges)', () => {
+    // A single iOS resume fires visibilitychange + pageshow + focus → three calls
+    // in one tick; the supersedes reuse the first call's decision. While a scroll
+    // is in flight the whole burst must skip the nudge (and never strand scrollTop).
+    userScrolling = true;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+    forceIOSRepaint(el); // supersede — reuses the captured (skip) decision
+    forceIOSRepaint(el); // supersede
+    flushFrame();
+    expect(el.scrollTop).toBe(500); // still no nudge
+    expect(el.style.transform).toBe('translateZ(0.1px)'); // transform still repaints
+    flushFrame();
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('');
+  });
+
+  it('keeps a consistent skip decision when scrolling ends mid-burst (never nudges)', () => {
+    // The gesture window can lapse between rAF1 and rAF2. The decision is captured
+    // ONCE at burst start; a burst begun mid-scroll has the nudge OFF for the whole
+    // burst, so momentum ending before the restore frame can't trigger a spurious
+    // scrollTop write — scrollTop was never moved, so neither frame may touch it.
+    userScrolling = true; // burst starts mid-drag → nudge decided OFF
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+    flushFrame(); // frame 1: no nudge
+    expect(el.scrollTop).toBe(500);
+    userScrolling = false; // momentum ends before the restore frame
+    flushFrame(); // frame 2: restore is a no-op (decision was OFF) — untouched
+    expect(el.scrollTop).toBe(500);
   });
 });
 

@@ -47,7 +47,72 @@ impl LucidosEngine {
     /// Apply a single pending change: merge its branch into main.
     /// `actor` identifies who initiated the apply. HTTP callers construct via
     /// `api::actor::build_message_origin`; engine-internal callers pass `None`.
+    ///
+    /// Thin wrapper over `apply_change_inner` that runs two apply-time follow-ups,
+    /// both gated on the change ACTUALLY merging (`ApplyStatus::Applied` — not
+    /// `Noop`/`Hardening`/`Conflict`, which also return `Ok`):
+    ///
+    /// 1. **Reconcile the "≤1 pending change per thread" invariant** — discard any
+    ///    other pending change the thread still holds on a stale branch, so a
+    ///    pre-existing orphan can't keep blocking Archive. Gating on `Applied` is
+    ///    load-bearing: reconciling on `Noop`/`Hardening`/`Conflict` would discard
+    ///    a *newer* sibling (data loss) or drop siblings before the merge lands.
+    ///    See docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md.
+    /// 2. **Kick off the background engine rebuild** (dev only) when the change is
+    ///    engine-affecting, so a "New version available → Switch to new version"
+    ///    surfaces WITHOUT disrupting the running engine — Apply itself never
+    ///    restarts; the switch is a separate, user-triggered step. No-op in
+    ///    packaged; a second Apply coalesces the in-flight build. See
+    ///    docs/plans/2026-07-01-new-engine-version-switch-flow.md.
+    ///
+    /// This single point covers every `apply_change` caller (HTTP handler, the
+    /// no-live `apply_now` fast/stale paths, the Apply-All driver, the
+    /// post-hardening auto-apply re-entry); the live in-place merge path bypasses
+    /// this and reconciles in `apply_now_success`.
     pub async fn apply_change(
+        self: &Arc<Self>,
+        change_id: Uuid,
+        actor: Option<MessageOrigin>,
+    ) -> Result<ApplyResult, Box<dyn std::error::Error + Send + Sync>> {
+        let result = self.apply_change_inner(change_id, actor.clone()).await?;
+        if result.status == ApplyStatus::Applied {
+            if let Some(tid) = result.thread_id {
+                self.discard_orphaned_pending_siblings(tid, change_id, actor)
+                    .await;
+            }
+            if result.restart_required {
+                self.trigger_background_rebuild();
+            } else if self.change_is_frontend_only_lucidos_source(change_id).await {
+                // Frontend-only Lucidos-source Apply (engine binary unchanged): the
+                // switch flow won't run, so re-snapshot the rebuilt dist/ in-process
+                // and advance what we serve — otherwise the boot-pinned snapshot
+                // never updates and the client refresh badge/toast never fire (dev).
+                // See docs/plans/2026-07-02-frontend-only-apply-served-in-dev.md.
+                self.refresh_served_frontend_after_rebuild();
+            }
+        }
+        Ok(result)
+    }
+
+    /// Whether an applied change is a **frontend-only, Lucidos-source** change —
+    /// the case where the served `dist/` should advance in-process without a
+    /// respawn. Re-loads the change (Apply is not a hot path) to inspect its files
+    /// + kind; app / external-repo threads (`is_lucidos_source() == false`) and
+    /// non-frontend diffs return false. The caller already gated on
+    /// `!restart_required`, so this need only confirm the frontend + kind.
+    async fn change_is_frontend_only_lucidos_source(&self, change_id: Uuid) -> bool {
+        let Ok(Some(change)) = self.changes().get_by_id(change_id).await else {
+            return false;
+        };
+        let kind_ctx = load_apply_kind_context(&self.pool, change.thread_id).await;
+        kind_ctx.is_lucidos_source() && files_have_client_update(&change.files)
+    }
+
+    /// Inner apply implementation — see `apply_change` for the apply-time
+    /// follow-ups (orphan reconcile + background rebuild). `actor` identifies who
+    /// initiated the apply. HTTP callers construct via
+    /// `api::actor::build_message_origin`; engine-internal callers pass `None`.
+    async fn apply_change_inner(
         self: &Arc<Self>,
         change_id: Uuid,
         actor: Option<MessageOrigin>,

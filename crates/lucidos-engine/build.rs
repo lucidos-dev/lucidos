@@ -1,4 +1,6 @@
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Command;
 
@@ -19,8 +21,23 @@ fn main() {
     // Rebuild when the umbrella Lucidos RELEASE bumps (LUCIDOS_RELEASE is
     // baked in via include_str! in lib.rs).
     println!("cargo:rerun-if-changed=../../RELEASE");
+    // Cargo.lock + git state feed the ENGINE_BUILD_ID diff hash below.
+    println!("cargo:rerun-if-changed=../../Cargo.lock");
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/index");
 
     check_migration_versions(&manifest_dir.join("migrations"));
+
+    // Bake ENGINE_BUILD_ID (mirror crates/lucidos-gateway/build.rs) so a running
+    // engine can tell whether the on-disk binary it was launched from has since
+    // been rebuilt with different source — the dev "new version available" check
+    // (see docs/plans/2026-07-01-new-engine-version-switch-flow.md). Emitted
+    // BEFORE the version-bump early returns below so every build path stamps it.
+    // Deterministic for identical source (a no-op rebuild must not raise the
+    // badge): git short SHA, plus a hash of any uncommitted engine-source diff;
+    // falls back to a source-tree hash when git is unavailable (shipped build).
+    let build_id = compute_build_id(project_root, manifest_dir);
+    println!("cargo:rustc-env=ENGINE_BUILD_ID={build_id}");
 
     // Get current git HEAD commit
     let current_head = match git_head(project_root) {
@@ -86,6 +103,84 @@ fn main() {
     let new_version = format!("{}.{}", today, patch);
     fs::write(&version_file, format!("{}\n", new_version)).expect("Failed to write VERSION");
     fs::write(&stamp_file, &current_head).expect("Failed to write version stamp");
+}
+
+/// Compute the deterministic-per-source engine build id. Mirrors
+/// `crates/lucidos-gateway/build.rs::compute_build_id`, scoped to engine paths.
+fn compute_build_id(project_root: &Path, manifest_dir: &Path) -> String {
+    match git_short_head(project_root) {
+        Some(sha) => match engine_diff(project_root) {
+            Some(diff) if !diff.trim().is_empty() => format!("{sha}-{:016x}", hash_str(&diff)),
+            // Clean tree (or git couldn't diff) → the commit alone identifies it.
+            _ => sha,
+        },
+        // No git (shipped build) → hash the crate source so it's stable per tree.
+        None => format!("src-{:016x}", hash_dir_sources(&manifest_dir.join("src"))),
+    }
+}
+
+/// Short git HEAD (`rev-parse --short`). `None` when git is unavailable.
+fn git_short_head(project_root: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    if out.status.success() {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!s.is_empty()).then_some(s)
+    } else {
+        None
+    }
+}
+
+/// Uncommitted changes (staged + unstaged) to engine-relevant paths. `None` when
+/// git fails — the caller then treats the tree as clean rather than inventing a
+/// dirty marker. A byte-identical rebuild therefore yields the same id.
+fn engine_diff(project_root: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["diff", "HEAD", "--", "crates/lucidos-engine", "Cargo.lock"])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn hash_str(s: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// Hash every file under `dir` (sorted for determinism) — the no-git fallback.
+fn hash_dir_sources(dir: &Path) -> u64 {
+    let mut entries: Vec<_> = walk(dir);
+    entries.sort();
+    let mut h = DefaultHasher::new();
+    for path in entries {
+        if let Ok(bytes) = std::fs::read(&path) {
+            path.to_string_lossy().hash(&mut h);
+            bytes.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk(&path));
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
 }
 
 /// Get current git HEAD commit hash.

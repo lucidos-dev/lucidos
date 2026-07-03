@@ -133,6 +133,29 @@ export function setCanceledQuestion(threadId: string, toolUseId: string | undefi
   canceledQuestionByThread.value = next;
 }
 
+/** Threads whose Cancel was clicked while the thread was already
+ *  `waiting_for_user_answer` (a question OR permission card on screen). The
+ *  cleanup effect reads this to keep a card cancel bridged through
+ *  `waiting_for_user_answer` (via `shouldClearCanceling`'s awaiting branch),
+ *  while a generic running-turn cancel — which records no entry here — is
+ *  released the instant the turn leaves `running`, so a superseded cancel that
+ *  lands on a new card can't wedge "Canceling" forever. Complements
+ *  `canceledQuestionByThread`, which only covers `UserQuestionAsked` cards
+ *  (permission cards set this but not that). */
+export const canceledWhileAwaitingByThread = signal<Set<string>>(new Set());
+
+/** Record (or clear) whether a thread's Cancel was clicked while awaiting a
+ *  user answer. Clear it (pass `false`) on the same release the optimistic
+ *  canceling flag drops, so a later running-turn cancel isn't mis-keyed. */
+export function setCanceledWhileAwaiting(threadId: string, awaiting: boolean): void {
+  const set = canceledWhileAwaitingByThread.value;
+  if (awaiting === set.has(threadId)) return;
+  const next = new Set(set);
+  if (awaiting) next.add(threadId);
+  else next.delete(threadId);
+  canceledWhileAwaitingByThread.value = next;
+}
+
 export function composeHasContent(
   hasText: boolean,
   attachedImagesCount: number,
@@ -250,25 +273,38 @@ export function findPendingMultiSelectQuestion(
  *
  *  The flag bridges the click→SSE gap after Cancel so the morph button reads
  *  "Cancel..." (disabled) and a double-tap can't re-fire. It must drop once the
- *  cancel has landed, or the button sticks disabled until reload. Two release
- *  conditions:
+ *  cancel has landed, or the button sticks disabled until reload. Which release
+ *  condition applies depends on WHAT the cancel targeted at click time:
  *
- *   - the thread left every mid-turn status (the turn ended — nothing left to
- *     cancel); OR
- *   - the cancel targeted a question (`canceledQuestionId` set) that is no
- *     longer the thread's latest pending one (`latestPendingQuestionId`
- *     differs) — it resolved as Canceled and the agent idled or re-asked. This
- *     is the re-ask case the not-mid-turn check misses: status stays mid-turn
- *     the whole time (waiting_for_user_answer → running → waiting_for_user_answer).
+ *   - **Question-card cancel** (`canceledQuestionId` set): released when the
+ *     turn fully ended OR the targeted question is no longer the thread's latest
+ *     pending one (`latestPendingQuestionId` differs) — it resolved as Canceled
+ *     and the agent idled or re-asked. This is the re-ask case a not-mid-turn
+ *     check misses: status stays mid-turn the whole time
+ *     (waiting_for_user_answer → running → waiting_for_user_answer).
  *
- *  A running-turn cancel records no `canceledQuestionId`, so only the
- *  not-mid-turn condition releases it — "Cancel..." persists until the turn
- *  actually terminates. */
+ *   - **Card cancel with no question id** (`canceledWhileAwaitingAnswer`, i.e. a
+ *     coding-agent permission card — those are not `UserQuestionAsked`, so they
+ *     record no `canceledQuestionId`): bridge the gap until the turn leaves
+ *     every mid-turn state.
+ *
+ *   - **Generic running-turn cancel** (neither of the above): release the moment
+ *     the turn is no longer `running` — whether it terminated OR paused on a NEW
+ *     `waiting_for_user_answer` card the cancel never targeted. The latter is the
+ *     superseded-cancel case (a follow-up redirect swallowed the cancel, or the
+ *     agent answered a running-turn Stop by asking a question): treating
+ *     `waiting_for_user_answer` as still-mid-turn here wedges "Canceling"
+ *     forever (Codex incident, 2026-07-03). */
 export function shouldClearCanceling(
   status: ThreadStatus,
   canceledQuestionId: string | undefined,
   latestPendingQuestionId: string | undefined,
+  canceledWhileAwaitingAnswer = false,
 ): boolean {
-  if (!isMidTurn(status)) return true;
-  return canceledQuestionId !== undefined && latestPendingQuestionId !== canceledQuestionId;
+  if (canceledQuestionId !== undefined) {
+    if (!isMidTurn(status)) return true;
+    return latestPendingQuestionId !== canceledQuestionId;
+  }
+  if (canceledWhileAwaitingAnswer) return !isMidTurn(status);
+  return status !== 'running';
 }

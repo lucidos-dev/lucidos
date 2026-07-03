@@ -64,6 +64,7 @@ fn make_test_session(process_exited: bool) -> AgentSession {
         question_resume_pending: false,
         tools_in_flight: Arc::new(std::sync::atomic::AtomicI32::new(0)),
         coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        agent_cancel: tokio_util::sync::CancellationToken::new(),
     }
 }
 

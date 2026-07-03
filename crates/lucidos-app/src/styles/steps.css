@@ -1,15 +1,9 @@
-/* Steps container */
-.steps-container {
-    margin-top: 0.75rem;
-    padding-top: 0.75rem;
-}
-
 .steps-toggle {
     background: none;
     border: none;
     color: var(--text-secondary);
     cursor: pointer;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     font-family: var(--font-ui);
     padding: 0.25rem 0;
     display: flex;
@@ -23,15 +17,9 @@
     }
 }
 
-.steps-list {
-    margin-top: 0.5rem;
-    padding-left: 0.75rem;
-    border-left: 0.125rem solid var(--border-color);
-}
-
 .step {
     padding: 0.25rem 0.5rem;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     display: flex;
     align-items: flex-start;
@@ -76,7 +64,7 @@
     background: none;
     border: none;
     cursor: pointer;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     padding: 0.125rem 0;
 }
@@ -102,7 +90,7 @@
     align-items: baseline;
     gap: 0.375rem;
     padding: 0.125rem 0;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     font-family: var(--font-ui);
     min-width: 0;
@@ -233,7 +221,7 @@
     margin-left: auto;
     font-weight: 400;
     color: var(--text-muted);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
 }
 
 .context-inner-group {
@@ -253,7 +241,7 @@
     cursor: pointer;
     background: transparent;
     font-family: var(--font-ui);
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
 }
 
 .context-inner-label {
@@ -264,7 +252,7 @@
     margin-left: auto;
     font-weight: 400;
     color: var(--text-muted);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
 }
 
 .context-inner-group .context-section {
@@ -289,7 +277,7 @@
 }
 
 .context-section-header {
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     padding: 0.25rem 0;
     align-items: center;
     gap: 0.375rem;
@@ -301,12 +289,12 @@
 
 .context-section-chars {
     color: var(--text-muted);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
 }
 
 .context-section-content {
     font-family: var(--font-mono, monospace);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
     background: var(--bg-tertiary);
     padding: 0.5rem;
@@ -347,7 +335,7 @@
     align-items: baseline;
     justify-content: space-between;
     gap: 1rem;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
 }
 
 .step-detail-status {
@@ -374,7 +362,7 @@
 }
 
 .step-detail-description {
-    font-size: 0.9375rem;
+    font-size: var(--font-size-xl);
     font-weight: 500;
     overflow-wrap: break-word;
     word-break: break-word;
@@ -382,7 +370,7 @@
 
 .step-detail-detail {
     color: var(--text-secondary);
-    font-size: 0.875rem;
+    font-size: var(--font-size-lg);
     overflow-wrap: break-word;
     word-break: break-word;
 }
@@ -394,7 +382,7 @@
     border-radius: 0.375rem;
     padding: 0.625rem 0.75rem;
     font-family: var(--font-mono, monospace);
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
@@ -413,12 +401,8 @@
     margin-top: 0.25rem;
 }
 
-.step-detail-tabs {
-    align-self: flex-start;
-}
-
 .step-detail-section-label {
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     text-transform: uppercase;
     letter-spacing: 0.05em;
     color: var(--text-muted);
@@ -432,7 +416,7 @@
     border-radius: 0.375rem;
     padding: 0.625rem 0.75rem;
     font-family: var(--font-mono, monospace);
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
@@ -443,7 +427,7 @@
 
 .step-detail-empty {
     color: var(--text-muted);
-    font-size: 0.875rem;
+    font-size: var(--font-size-lg);
     text-align: center;
     padding: 1.5rem 0;
 }
@@ -456,7 +440,7 @@
 
 .step-detail-context-meta {
     color: var(--text-muted);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
 }
 
 .step-detail-context-meta code {
@@ -464,7 +448,7 @@
     background: var(--bg-tertiary);
     padding: 0.0625rem 0.25rem;
     border-radius: 0.1875rem;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
 }
 
 /* ContextCaptured panel — budget bar (shared .progress-bar), sections, usage. */
@@ -477,7 +461,7 @@
 .context-budget-row {
     display: flex;
     justify-content: space-between;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
 }
 
@@ -489,14 +473,14 @@
     color: var(--accent-yellow);
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
 }
 
 .context-usage {
     display: flex;
     flex-wrap: wrap;
     gap: 0.75rem;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     padding-top: 0.5rem;
 }
@@ -511,7 +495,7 @@
     color: var(--text-muted);
     padding: 0.0625rem 0.375rem;
     border-radius: 0.1875rem;
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     text-transform: uppercase;
     letter-spacing: 0.05em;
 }
@@ -527,13 +511,13 @@
     background: var(--bg-tertiary);
     border: 1px solid var(--border-subtle, var(--bg-tertiary));
     border-radius: 0.375rem;
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
 }
 
 .checkpoint-icon {
     flex: 0 0 auto;
     color: var(--text-muted);
-    font-size: 1rem;
+    font-size: var(--font-size-xl);
 }
 
 .checkpoint-body {
@@ -550,7 +534,7 @@
 
 .checkpoint-command {
     color: var(--text-muted);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -559,5 +543,5 @@
 .checkpoint-reverted {
     flex: 0 0 auto;
     color: var(--text-muted);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
 }

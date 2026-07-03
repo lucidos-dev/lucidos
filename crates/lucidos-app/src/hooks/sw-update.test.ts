@@ -1,44 +1,79 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { markSwUpdateDismissed, wasSwUpdateDismissed, noteUpdateBuildId, scheduleServiceWorkerUpdateChecks, requestServiceWorkerBuildId, refreshClient, clientRefreshing, getServedBuildId, shouldReloadForStaleChunk } from './sw-update';
 
-describe('SW update dismiss (build-id aware)', () => {
+// The toast dismissal now reads/writes the GLOBAL `preferences` signal (store)
+// and persists via the API client, instead of per-device localStorage. Mock both
+// so these unit tests neither load the full store graph nor hit HTTP — and so the
+// unrelated blocks below (refreshClient, getServedBuildId, …) stay isolated the
+// way they were before sw-update started importing the store.
+vi.mock('../store/store', async () => {
+  const { signal } = await import('@preact/signals');
+  return { preferences: signal({ status: 'not-loaded' }), showToast: vi.fn() };
+});
+vi.mock('../api/client', () => ({ setPreference: vi.fn(() => Promise.resolve({})) }));
+
+import {
+  markSwUpdateDismissed, wasSwUpdateDismissed, noteUpdateBuildId,
+  markSwitchDismissed, wasSwitchDismissed, noteSwitchBuildId,
+  scheduleServiceWorkerUpdateChecks, requestServiceWorkerBuildId,
+  refreshClient, clientRefreshing, getServedBuildId, shouldReloadForStaleChunk,
+} from './sw-update';
+import { preferences } from '../store/store';
+import { setPreference } from '../api/client';
+
+const mockSetPreference = vi.mocked(setPreference);
+const SWITCH_KEY = 'engine_switch_dismissed_build';
+const CLIENT_KEY = 'client_refresh_dismissed_build';
+
+describe('toast dismissal — workspace-global, build-id-keyed (engine switch + client refresh)', () => {
   beforeEach(() => {
-    sessionStorage.clear();
-    noteUpdateBuildId(''); // reset the module-level pending id between tests
+    mockSetPreference.mockReset();
+    mockSetPreference.mockResolvedValue({} as never);
+    preferences.value = { status: 'not-loaded' };
   });
 
-  it('a served build is not dismissed by default', () => {
-    expect(wasSwUpdateDismissed('server999')).toBe(false);
+  it('wasSwitchDismissed / wasSwUpdateDismissed match only the exact dismissed build id', () => {
+    preferences.value = { status: 'loaded', data: { [SWITCH_KEY]: 'disk-a', [CLIENT_KEY]: 'served-a' } };
+    expect(wasSwitchDismissed('disk-a')).toBe(true);
+    expect(wasSwUpdateDismissed('served-a')).toBe(true);
+    // A genuinely newer build (different id) is NOT dismissed → re-surfaces.
+    expect(wasSwitchDismissed('disk-b')).toBe(false);
+    expect(wasSwUpdateDismissed('served-b')).toBe(false);
   });
 
-  it('marks the noted served build as dismissed', () => {
-    noteUpdateBuildId('server999');
+  it('fails OPEN — unloaded preferences read as not-dismissed (toast surfaces)', () => {
+    preferences.value = { status: 'not-loaded' };
+    expect(wasSwitchDismissed('disk-a')).toBe(false);
+    expect(wasSwUpdateDismissed('served-a')).toBe(false);
+  });
+
+  it('markSwitchDismissed writes the GLOBAL switch preference (no device id) + optimistic update', () => {
+    preferences.value = { status: 'loaded', data: { theme: 'dark' } };
+    noteSwitchBuildId('disk-x');
+    markSwitchDismissed();
+    // Global write is exactly (key, id) — the OMITTED 3rd arg (device id) is what
+    // makes the dismiss workspace-wide (defers on every device).
+    expect(mockSetPreference).toHaveBeenCalledWith(SWITCH_KEY, 'disk-x');
+    // Optimistic local update so THIS device suppresses on its next poll without
+    // waiting for its own PreferencesChanged round-trip; unrelated keys preserved.
+    expect(preferences.value).toMatchObject({ status: 'loaded', data: { theme: 'dark', [SWITCH_KEY]: 'disk-x' } });
+    expect(wasSwitchDismissed('disk-x')).toBe(true);
+  });
+
+  it('markSwUpdateDismissed writes the GLOBAL client-refresh preference (no device id)', () => {
+    preferences.value = { status: 'loaded', data: {} };
+    noteUpdateBuildId('served-x');
     markSwUpdateDismissed();
-    expect(wasSwUpdateDismissed('server999')).toBe(true);
+    expect(mockSetPreference).toHaveBeenCalledWith(CLIENT_KEY, 'served-x');
+    expect(wasSwUpdateDismissed('served-x')).toBe(true);
   });
 
-  it('does NOT suppress a genuinely newer build after an earlier dismiss', () => {
-    noteUpdateBuildId('server999');
-    markSwUpdateDismissed();
-    // The badge/toast check passes the CURRENTLY served id; a newer one re-surfaces.
-    expect(wasSwUpdateDismissed('server1000')).toBe(false);
-  });
-
-  it('markSwUpdateDismissed is a no-op when no build was noted', () => {
-    markSwUpdateDismissed();
-    expect(wasSwUpdateDismissed('server999')).toBe(false);
-  });
-
-  it('returns false (surface the toast) when sessionStorage is unavailable', () => {
-    noteUpdateBuildId('server999');
-    const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
-      throw new Error('opaque origin');
-    });
-    try {
-      expect(wasSwUpdateDismissed('server999')).toBe(false);
-    } finally {
-      spy.mockRestore();
-    }
+  it('a genuinely newer build re-surfaces after an earlier dismiss', () => {
+    preferences.value = { status: 'loaded', data: {} };
+    noteSwitchBuildId('disk-a');
+    markSwitchDismissed();
+    expect(wasSwitchDismissed('disk-a')).toBe(true);
+    // The version poll passes the CURRENTLY on-disk id; a newer one re-surfaces.
+    expect(wasSwitchDismissed('disk-b')).toBe(false);
   });
 });
 

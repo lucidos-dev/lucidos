@@ -1,4 +1,5 @@
 import { API, json, mutatingFetchIdempotent, throwIfNotOk } from './_core';
+import type { ComposeSelectionOverride } from '../../store/composeSelections';
 
 // --- Compose state machine (threads-as-drafts) ---
 //
@@ -23,19 +24,25 @@ export async function ensureThreadStarted(id: string, mode: string): Promise<voi
 
 /** PUT /api/v1/threads/:id/compose. `image_hashes` semantics mirror the
  *  SQL COALESCE on the backend: `null` preserves, `[]` clears, `[h,…]`
- *  replaces. Hashes come from prior `uploadThreadBlob` calls. */
+ *  replaces. Hashes come from prior `uploadThreadBlob` calls. `selection`
+ *  follows the same COALESCE-preserve rule: `undefined` (omitted) preserves the
+ *  stored per-draft dropdown selection — so a text-only keystroke PUT never
+ *  wipes the draft's picks — while an object replaces it. */
 export async function putComposeOnThread(
   threadId: string,
   text: string,
   imageHashes: string[] | null,
   mode: string | null,
+  selection?: ComposeSelectionOverride,
 ): Promise<void> {
   const res = await mutatingFetchIdempotent(
     `${API}/threads/${encodeURIComponent(threadId)}/compose`,
     {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, image_hashes: imageHashes, mode }),
+      // Omit `selection` when undefined so the backend COALESCE preserves the
+      // stored value (a bare keystroke PUT must not clobber the picks).
+      body: JSON.stringify({ text, image_hashes: imageHashes, mode, selection }),
     },
   );
   await throwIfNotOk(res);

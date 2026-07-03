@@ -179,15 +179,37 @@ pub(crate) async fn resolve_worktree_path(
     path
 }
 
+/// The resume session id for a follow-up, scoped to the thread's pinned account:
+/// the newest session under `pinned_config_dir` when the thread has one, else the
+/// globally-newest session (a legacy thread with no recorded config dir). Scoping
+/// is what stops a resume from targeting a session created under a *different*
+/// account after a mid-thread toggle flip.
+async fn resume_sid_for_account(
+    pool: &sqlx::PgPool,
+    thread_id: uuid::Uuid,
+    pinned_config_dir: Option<&str>,
+) -> Option<String> {
+    match pinned_config_dir {
+        Some(dir) => lookup_latest_cc_session_id_for_config_dir(pool, thread_id, dir).await,
+        None => lookup_latest_cc_session_id(pool, thread_id).await,
+    }
+}
+
 /// Resolve `(resume_session_id, resume_branch)` for a follow-up CC request.
 /// Priority: pending-change branch > caller-supplied session > most recent
 /// `CodingAgentIdled` > fresh start. Pending-change branch wins because the
 /// change-proposal flow removes the worktree but keeps the branch's commits.
+///
+/// `pinned_config_dir` is the thread's account pin (its first config dir): the
+/// auto-detected resume session id is resolved WITHIN that account, so a thread
+/// that was mis-pinned onto another account by a toggle flip still resumes the
+/// session belonging to its original account rather than the globally-newest one.
 pub(super) async fn resolve_resume_context(
     pool: &sqlx::PgPool,
     changes: &crate::core::changes_projection::ChangesProjection,
     thread_id: uuid::Uuid,
     caller_session_id: Option<String>,
+    pinned_config_dir: Option<&str>,
 ) -> (Option<String>, Option<String>) {
     let pending_branch = changes
         .pending_for_thread(thread_id)
@@ -207,7 +229,7 @@ pub(super) async fn resolve_resume_context(
     if let Some(branch) = pending_branch {
         let resume_sid = match caller_session_id {
             Some(sid) => Some(sid),
-            None => lookup_latest_cc_session_id(pool, thread_id).await,
+            None => resume_sid_for_account(pool, thread_id, pinned_config_dir).await,
         };
         log!(
             "[AgentSession] Resuming on pending-change branch {} for thread {} (sid={:?})",
@@ -242,8 +264,13 @@ pub(super) async fn resolve_resume_context(
         });
 
     if let Some((event_type, sid)) = last_lifecycle.as_ref() {
-        if event_type == "CodingAgentIdled" {
-            let resume_sid = sid.clone().filter(|s| !s.is_empty());
+        // A resumable idle is the newest lifecycle event (a StaleResume /
+        // SessionEnded / change-apply shadow has a different event_type and falls
+        // through to a fresh spawn). Resolve the sid WITHIN the pinned account,
+        // which can differ from this globally-newest idle if the thread was
+        // mis-pinned onto another account by a mid-thread toggle flip.
+        if event_type == "CodingAgentIdled" && sid.as_ref().is_some_and(|s| !s.is_empty()) {
+            let resume_sid = resume_sid_for_account(pool, thread_id, pinned_config_dir).await;
             if resume_sid.is_some() {
                 let branch = lookup_session_branch_for_thread(pool, thread_id).await;
                 return (resume_sid, branch);
@@ -383,6 +410,108 @@ pub(crate) async fn lookup_latest_cc_session_id(
     .map_err(|e| {
         log!(
             "[AgentSession] Failed to look up latest cc_session_id for {}: {}",
+            thread_id,
+            e
+        );
+        e
+    })
+    .ok()
+    .flatten()
+    .flatten()
+    .filter(|s| !s.is_empty())
+}
+
+/// Claude Code's default config dir when `CLAUDE_CONFIG_DIR` is unset: `$HOME/.claude`.
+///
+/// Used to record the EFFECTIVE config dir of a fresh session that ran without an
+/// explicit `CLAUDE_CONFIG_DIR`, so a later resume can still pin the right dir even
+/// after the user sets one (the unset→set switch). If CC's default ever diverges
+/// from `~/.claude` a resume would pin a wrong dir and fail — but the explicit
+/// "No conversation found" recovery (`is_definitive_session_not_found`) backstops
+/// that by falling back to a fresh session. `None` only when `$HOME` is unset.
+pub(crate) fn default_claude_config_dir() -> Option<String> {
+    std::env::var_os("HOME").map(|home| {
+        std::path::Path::new(&home)
+            .join(".claude")
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
+/// Return the `CLAUDE_CONFIG_DIR` (provider/account) the thread's **first** CC
+/// session was created under — the thread's permanent account pin. Every spawn
+/// after turn 1 runs under this dir (see `run_session/run.rs`), so a thread can
+/// never switch provider mid-life even if the global `CLAUDE_CONFIG_DIR` toggle
+/// changes between turns. This closes the strand-on-the-wrong-account bug: a
+/// post-limit fresh spawn used to re-record whatever the live toggle was and
+/// leave the thread pinned to that new account. Resuming under the pinned dir
+/// also keeps `--resume` pointed at the dir CC wrote the transcript to
+/// (`$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`).
+///
+/// Recorded at the Init-time `CodingAgentSettingsChanged` — the authoritative
+/// point where CC reports its session id AND the engine knows the dir it spawned
+/// under. Read across both CC lifecycle event types (only the Init settings event
+/// carries the field today, so `CodingAgentIdled` rows return null and are
+/// filtered out); **earliest** non-null wins. `None` for a thread that has not
+/// recorded a dir yet — turn 1 then reads the live env, which is exactly how the
+/// pin gets established.
+pub(crate) async fn lookup_pinned_cc_config_dir(
+    pool: &sqlx::PgPool,
+    thread_id: uuid::Uuid,
+) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT payload->>'claude_config_dir' FROM events \
+         WHERE thread_id = $1 \
+           AND event_type IN ('CodingAgentIdled', 'CodingAgentSettingsChanged') \
+           AND payload->>'claude_config_dir' IS NOT NULL \
+           AND payload->>'claude_config_dir' <> '' \
+         ORDER BY sequence ASC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        log!(
+            "[AgentSession] Failed to look up pinned claude_config_dir for {}: {}",
+            thread_id,
+            e
+        );
+        e
+    })
+    .ok()
+    .flatten()
+    .flatten()
+    .filter(|s| !s.is_empty())
+}
+
+/// The newest `cc_session_id` recorded UNDER `config_dir` — the resume target
+/// scoped to the thread's pinned account. The `cc_session_id`↔`claude_config_dir`
+/// pairing lives only in the Init-time `CodingAgentSettingsChanged` (the sole
+/// event carrying both), so scope to that type. `None` when the pinned account
+/// has no recorded session — the caller then spawns fresh under the pinned dir
+/// rather than resuming a session that belongs to a different account.
+pub(crate) async fn lookup_latest_cc_session_id_for_config_dir(
+    pool: &sqlx::PgPool,
+    thread_id: uuid::Uuid,
+    config_dir: &str,
+) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT payload->>'cc_session_id' FROM events \
+         WHERE thread_id = $1 \
+           AND event_type = 'CodingAgentSettingsChanged' \
+           AND payload->>'claude_config_dir' = $2 \
+           AND payload->>'cc_session_id' IS NOT NULL \
+           AND payload->>'cc_session_id' <> '' \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .bind(config_dir)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        log!(
+            "[AgentSession] Failed to look up cc_session_id under {} for {}: {}",
+            config_dir,
             thread_id,
             e
         );

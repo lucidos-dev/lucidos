@@ -1072,19 +1072,12 @@ pub async fn confirm_pending_install(
     resync_plugin_triggers(engine, &pending.plugin_id, &installed_files, actor.clone()).await;
 
     // A plugin author's `setup` field is "ask the user / wire this up" work —
-    // inert until an agent runs it. Spawn a Lucidos Agent thread seeded with
-    // the instructions so setup actually happens; the id flows back so the
-    // frontend can navigate the user straight to it.
-    if let (Some(setup), Some(thread_id)) = (pending.setup.as_deref(), setup_thread_id) {
-        spawn_plugin_setup_thread(
-            engine,
-            thread_id,
-            &pending.plugin_name,
-            &pending.plugin_version,
-            setup,
-            actor,
-        )
-        .await;
+    // inert until an agent runs it. Spawn a Lucidos Agent thread so setup
+    // actually happens (the thread references the instructions via
+    // `system-knowhow/plugin-setup`, see `build_setup_thread_request`); the id
+    // flows back so the frontend can navigate the user straight to it.
+    if let (Some(_setup), Some(thread_id)) = (pending.setup.as_deref(), setup_thread_id) {
+        spawn_plugin_setup_thread(engine, thread_id, &pending.plugin_name, actor).await;
     }
 
     Ok(ConfirmedInstall {
@@ -1094,10 +1087,13 @@ pub async fn confirm_pending_install(
     })
 }
 
-/// Spawn a Lucidos Agent thread seeded with a plugin's `setup` instructions so
-/// the agent walks the user through completing them (asking questions, wiring
-/// config). Submitted through the Thread Queue like any background spawn, so it
-/// respects admission control. `thread_id` is pre-allocated by the caller (so
+/// Spawn a Lucidos Agent thread that walks the user through completing a
+/// plugin's setup (asking questions, wiring config). The seed is a short
+/// user-facing line; the "how to" lives in `system-knowhow/plugin-setup` and
+/// the author's `setup` text is referenced from the `PluginInstalled` event
+/// (see `build_setup_thread_request`). Submitted through the Thread Queue like
+/// any background spawn, so it respects admission control. `thread_id` is
+/// pre-allocated by the caller (so
 /// the same id can be recorded in the `PluginInstalled` event). The submission
 /// never fails for this kind (overflow is per-trigger only), so the thread is
 /// always either admitted immediately or queued — never dropped.
@@ -1122,11 +1118,9 @@ async fn spawn_plugin_setup_thread(
     engine: &LucidosEngine,
     thread_id: uuid::Uuid,
     plugin_name: &str,
-    plugin_version: &str,
-    setup: &str,
     actor: Option<MessageOrigin>,
 ) {
-    let request = build_setup_thread_request(thread_id, plugin_name, plugin_version, setup);
+    let request = build_setup_thread_request(thread_id, plugin_name);
     engine.thread_queue.submit(request, actor, None).await;
 }
 
@@ -1134,25 +1128,18 @@ async fn spawn_plugin_setup_thread(
 /// no I/O) so the request shape is unit-testable — the `SubThread` choice and
 /// the bound `child_thread_id` are load-bearing (see `spawn_plugin_setup_thread`
 /// for why), and a regression back to `AgentChat` would silently break setup.
+///
+/// The seed is a SHORT, user-facing line — the only thing shown in the thread's
+/// first bubble. The "how to run a plugin setup" meta-instructions live in
+/// `system-knowhow/plugin-setup` (loaded by the agent, see the chat system
+/// prompt's load-knowhow nudge), and the plugin author's own `setup` text is
+/// referenced from the durable `PluginInstalled` event — neither is embedded
+/// here, so the user isn't shown a wall of agent instructions.
 fn build_setup_thread_request(
     thread_id: uuid::Uuid,
     plugin_name: &str,
-    plugin_version: &str,
-    setup: &str,
 ) -> crate::engine::thread_queue::ThreadQueueRequest {
-    let prompt = format!(
-        "The \"{plugin_name}\" plugin (v{plugin_version}) was just installed in this workspace. \
-The plugin author left these setup instructions:\n\n---\n{setup}\n---\n\n\
-Walk the user through completing this setup now. Carry out any wiring or \
-configuration steps you can do yourself, and ask the user directly for \
-anything the instructions need from them (credentials, choices, \
-confirmations). When setup is complete, give a short confirmation of what is \
-now ready to use.\n\n\
-The user has been brought straight into this thread and is reading it right \
-now, so communicate entirely through your normal replies here. Do NOT call \
-send_notification — the user does not need a toast or push for setup steps \
-they are already watching in this thread."
-    );
+    let prompt = format!("Set up the newly installed {plugin_name} plugin.");
 
     crate::engine::thread_queue::ThreadQueueRequest::SubThread {
         prompt,

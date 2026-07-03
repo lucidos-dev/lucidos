@@ -1,13 +1,14 @@
 import {
   addPluginMarketplace,
   fetchPluginCatalog,
+  isTransportError,
   removePluginMarketplace,
   stagePluginInstall,
 } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
 import { marketplaceCatalog, panelOverlay, showConfirm, showToast } from '../store';
 import { setLoadingIfFresh, toFailed } from '../types';
-import type { MarketplacePlugin } from '../types';
+import type { MarketplaceCatalog, MarketplacePlugin } from '../types';
 import { pushNavState } from './navigation';
 import { revealContentPane } from './pane';
 
@@ -25,13 +26,41 @@ export const OFFICIAL_MARKETPLACE = {
 // refresh — each cloning every registered marketplace repo.
 let catalogLoadInFlight: Promise<void> | null = null;
 
+// The catalog scan clones every registered marketplace repo, so on a flaky link
+// (an iOS PWA resuming over Tailscale) the GET can fail at the transport layer
+// — Safari surfaces this as `TypeError: "Load failed"` — or time out client-side
+// before the engine answers. Both recover on their own moments later: the user
+// sees exactly this when they navigate away and back and the panel then loads
+// fine. So retry these transient failures with a short backoff before settling
+// the Loadable to `failed`, keeping it in `loading` (skeleton) meanwhile, rather
+// than leaving a terminal error that only a manual remount clears. A genuine
+// server error (the engine's `{error}` body, an `ApiError`) is NOT transient and
+// surfaces immediately. The service worker already retries GETs once, but only
+// immediately — too soon for a connection that needs a beat to re-establish.
+const CATALOG_RETRY_BACKOFFS_MS = [800, 1600, 3200];
+
+function isTransientCatalogError(e: unknown): boolean {
+  return isTransportError(e) || (e instanceof DOMException && e.name === 'TimeoutError');
+}
+
+async function fetchCatalogWithRetry(): Promise<MarketplaceCatalog> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fetchPluginCatalog();
+    } catch (e) {
+      if (attempt >= CATALOG_RETRY_BACKOFFS_MS.length || !isTransientCatalogError(e)) throw e;
+      await new Promise((resolve) => setTimeout(resolve, CATALOG_RETRY_BACKOFFS_MS[attempt]));
+    }
+  }
+}
+
 export function loadPluginCatalog(force = false): Promise<void> {
   if (!force && marketplaceCatalog.value.status === 'loaded') return Promise.resolve();
   if (catalogLoadInFlight) return catalogLoadInFlight;
   catalogLoadInFlight = (async () => {
     setLoadingIfFresh(marketplaceCatalog);
     try {
-      marketplaceCatalog.value = { status: 'loaded', data: await fetchPluginCatalog() };
+      marketplaceCatalog.value = { status: 'loaded', data: await fetchCatalogWithRetry() };
     } catch (e) {
       marketplaceCatalog.value = toFailed(e);
     }

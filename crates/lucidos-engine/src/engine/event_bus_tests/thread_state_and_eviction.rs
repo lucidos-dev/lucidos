@@ -825,3 +825,127 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+/// Sending a message clears ALL compose fields — including `compose_selection`.
+/// The MessageReceived / SessionStarted / ThreadDiscarded projection arms wipe
+/// the per-thread compose draft so a stale draft can't linger; `compose_selection`
+/// (the per-draft dropdown picks, added alongside text/images/mode) must be wiped
+/// in lockstep, or a sent thread retains a ghost selection in the DB that a reload
+/// would rehydrate. Regression guard for the frontend "peer-sent follow-up
+/// preserved as a draft" fix's backend half.
+#[tokio::test]
+async fn message_received_clears_compose_selection() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    // Composing thread with a stored per-draft selection (as a compose PUT would
+    // leave it).
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ThreadStarted {
+            mode: "lucidos".into(),
+            actor: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE thread_summaries \
+         SET compose_text = 'half-typed', compose_selection = '{\"scope\":{\"kind\":\"lucidos\"}}'::jsonb \
+         WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: "the actual message".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let (compose_text, compose_selection): (String, Option<serde_json::Value>) = sqlx::query_as(
+        "SELECT compose_text, compose_selection FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(compose_text, "", "compose_text must be cleared on send");
+    assert_eq!(
+        compose_selection, None,
+        "compose_selection must be cleared on send, in lockstep with the other compose fields"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The discard arm wipes `compose_selection` too — a discarded draft leaves no
+/// ghost dropdown picks behind for a replay/reload to resurrect.
+#[tokio::test]
+async fn thread_discarded_clears_compose_selection() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ThreadStarted {
+            mode: "lucidos".into(),
+            actor: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE thread_summaries \
+         SET compose_text = 'half-typed', compose_selection = '{\"model\":\"claude-opus-4-8\"}'::jsonb \
+         WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ThreadDiscarded { actor: None },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let compose_selection: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT compose_selection FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        compose_selection, None,
+        "compose_selection must be cleared on discard, in lockstep with the other compose fields"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

@@ -5,7 +5,7 @@ use crate::engine::command_guard::SideEffectCategory;
 use crate::engine::event_bus::SystemEvent;
 use crate::triggers::{
     is_valid_trigger_slug, slugify_trigger_name_with_fallback, validate_script_extension,
-    EventSubscription, TriggerConfig, TriggerRun,
+    EventSubscription, TriggerConfig, TriggerRun, TriggerRunStatus,
 };
 
 #[derive(Serialize)]
@@ -19,6 +19,11 @@ pub struct TriggerInfo {
     pub timezone: String,
     pub paused: bool,
     pub last_run: Option<String>,
+    /// Outcome of the most recent completed firing (`ok` / `failed`), surfaced
+    /// on the trigger row. Absent until the trigger has run at least once under
+    /// an engine that records status (legacy runs → timestamp only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_status: Option<TriggerRunStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_run: Option<String>,
     pub run: serde_json::Value,
@@ -68,6 +73,7 @@ impl TriggerInfo {
             timezone: config.timezone.clone(),
             paused: config.paused,
             last_run: config.last_run.map(|t| t.to_rfc3339()),
+            last_run_status: config.last_run_status,
             next_run: config.next_run().map(|t| t.to_rfc3339()),
             run,
             on: config.on.clone(),

@@ -721,19 +721,27 @@ describe('loadAllThreads — compose preservation', () => {
     unfocusPrompt();
   });
 
-  it('preserves local composeImages when textarea is focused on this thread', async () => {
+  it('preserves local composeImages when the user attached them here (locally edited)', async () => {
+    const { composeEditedAt } = await import('./compose');
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', { meta: { state: 'composing', composeImages: ['local-img-base64'] } }));
     threadMap.value = map;
     focusedThreadId.value = 't1';
     focusPromptOnThread('t1');
+    // A real image attach goes through updateCompose → markLocallyEdited, so the
+    // draft carries a composeEditedAt stamp. Authorship (not focus) is what
+    // protects it from an empty background snapshot.
+    composeEditedAt.set('t1', Date.now());
 
-    mockComposeApiResponse('t1', '', []);
+    mockComposeApiResponse('t1', '', []); // empty server snapshot (stale / pre-attach)
 
-    await loadAllThreads();
-
-    expect(getDraft('t1').image_hashes).toEqual(['local-img-base64']);
-    unfocusPrompt();
+    try {
+      await loadAllThreads();
+      expect(getDraft('t1').image_hashes).toEqual(['local-img-base64']);
+    } finally {
+      composeEditedAt.delete('t1');
+      unfocusPrompt();
+    }
   });
 
   it('preserves local composeText when a PUT is in flight (debounced push not yet acked)', async () => {
@@ -1031,6 +1039,28 @@ describe('loadAllThreads — compose preservation', () => {
     await loadAllThreads();
 
     expect(getDraft('t1').text).toBe('');
+  });
+
+  // Sibling of the SSE fix: an EMPTY snapshot (the shared draft was sent/discarded
+  // elsewhere) must clear a server-originated draft EVEN when the textarea is
+  // focused here — focus alone must not preserve a draft the user never typed.
+  // The non-empty focus guard (test at "preserves local composeText when textarea
+  // is focused") is unaffected. A locally-edited draft is still protected by
+  // stageDraftFromApi's hasLocalDraftEdit guard (the failed-PUT test above).
+  it('clears a focused server-originated draft when the resync snapshot is empty (peer sent elsewhere)', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', { meta: { state: 'active', composeText: 'follow-up drafted on my other device' } }));
+    threadMap.value = map;
+    focusedThreadId.value = 't1';
+    focusPromptOnThread('t1');
+    // No updateCompose here → composeEditedAt has no entry for t1 (server-originated).
+
+    mockComposeApiResponse('t1', ''); // peer's send cleared compose_text server-side
+
+    await loadAllThreads();
+
+    expect(getDraft('t1').text).toBe('');
+    unfocusPrompt();
   });
 });
 

@@ -255,7 +255,7 @@ async fn missing_mode_returns_400() {
 /// A thread is locked to its (mode, repo) at first message — switching
 /// either mid-thread caused multi-repo session mixing where the executor
 /// card and the commands menu disagreed (e.g. menu showed Lucidos skills
-/// while the session ran on User Acquisition). The chat handler must reject
+/// while the session ran on a different repo). The chat handler must reject
 /// follow-ups that try to flip mode or repo.
 ///
 /// `state='active'` here is the operative bit: the lock only kicks in once

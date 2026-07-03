@@ -4,12 +4,15 @@
 //! - [`rebuild`] — batch/derived operations: artifact summaries, user-profile
 //!   generation, full/incremental rebuild, correction replay, post-import hook.
 //! - [`scoring`] — pure similarity/decay helpers (Jaccard, age, relevance).
+//! - [`embedder_retry`] — background recovery for a degraded (empty)
+//!   `EmbedderSlot` boot (offline first-run model download).
 //!
 //! All methods hang off `impl LucidosEngine` in their child file, so external
 //! callers reach them via the type, unchanged. The free scoring helpers and
 //! `MEMORY_CORRECTION_THRESHOLD` are re-exported here so existing
 //! `engine::memory::<name>` paths keep resolving.
 
+mod embedder_retry;
 mod extract;
 mod rebuild;
 mod scoring;

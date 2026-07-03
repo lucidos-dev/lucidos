@@ -21,6 +21,8 @@ import {
 } from '../../api/client';
 import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { createFailureCounter } from '../../utils/failureCounter';
+import { isTauri } from '../../utils/platform';
+import { nudgeDockBadge } from '../../utils/tauri';
 
 const PAGE_SIZE = 15;
 
@@ -194,6 +196,12 @@ export async function loadUnreadNotifications(): Promise<void> {
  *  navigation. */
 export function handleNotificationSSE(): void {
   void loadUnreadNotifications();
+  // Under the Tauri desktop app, wake the native dock-badge loop so the badge
+  // reflects this change instantly. This handler runs on Created/Read/AllRead —
+  // all broadcast AFTER the engine commits — so it's race-free (unlike the
+  // optimistic local drop), and it covers reads from another device (their SSE
+  // arrives here too). No-op off Tauri; the recompute reads the fresh aggregate.
+  if (isTauri()) nudgeDockBadge();
   if (activeMenuItem.value === 'notifications' && !viewingNotification.value) {
     void loadNotifications();
   }

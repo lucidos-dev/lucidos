@@ -97,9 +97,10 @@ export function getWaitingState(): WaitingState | null {
 
 interface BannerSlots {
   /** The single secondary item the parent may move onto a row above when the
-   *  natural single-row layout would overflow — Diff for the actions state.
-   *  `null` when there is nothing worth lifting (the busy "Apply..." /
-   *  "Discard..." spinners and Diff-less actions all fit naturally). */
+   *  natural single-row layout would overflow — the standalone Diff button
+   *  whenever the branch has a diff. `null` when there is nothing worth lifting
+   *  (the busy "Apply..." / "Discard..." spinners and Diff-less actions all fit
+   *  naturally). */
   liftable: ComponentChildren | null;
   /** Action buttons that always render on the bottom row, anchored to the
    *  right. PromptInput renders sectionButtons (Pin / ✓ Pinned) just before
@@ -112,9 +113,11 @@ interface BannerSlots {
  *  (PromptInput) can decide whether to render them as one row or stack the
  *  liftable slot above the row that holds the icons. PromptInput owns where
  *  Pin / ✓ Pinned goes (always in the bottom row, before the action buttons),
- *  so getBannerSlots only worries about the action-side layout. When there's
- *  room, [Pin][Diff][Discard][Apply] sit together; when there isn't, only
- *  Diff hops to a row above and [Pin][Discard][Apply] stay on the bottom. */
+ *  so getBannerSlots only worries about the action-side layout. Diff is ALWAYS
+ *  its own standalone button in the liftable slot — never folded into the
+ *  Apply/Discard cluster — so when there's room [Pin][Diff][Discard][Apply]
+ *  sit together, and when there isn't only Diff hops to a row above while
+ *  [Pin][Discard][Apply] stay on the bottom. */
 export function getBannerSlots(state: BannerState): BannerSlots {
   if (state.type === 'applying') {
     return {
@@ -139,24 +142,27 @@ export function getBannerSlots(state: BannerState): BannerSlots {
     };
   }
 
-  // When the close set has a primary Apply action, collapse the whole cluster
-  // into a split button — a one-tap "Apply (& Restart)" face plus a caret menu
-  // holding Diff and every other action (Discard, Archive). One compact control
-  // instead of two or three buttons that overflowed the prompt row and forced
-  // the Diff lift. The separate-button + liftable-Diff path below still runs for
-  // the no-Apply states (e.g. an idle CC thread with a diff but no pending
-  // change → Archive + Diff).
+  // Diff is ALWAYS its own standalone button in the liftable slot — never folded
+  // into the Apply/Discard cluster. It shows whenever the branch has a diff on
+  // disk (state.showDiff), independent of whether the close set has an Apply.
+  const liftable = state.showDiff ? renderDiffButton(state.threadId) : null;
+
+  // When the close set has a primary Apply action, collapse the remaining
+  // close-set buttons into a split button — a one-tap "Apply (& Restart)" face
+  // plus a caret menu holding the other action(s) (Discard, Archive). One
+  // compact control instead of two or three buttons that overflowed the prompt
+  // row. Diff sits outside it, in the liftable slot above. The separate-button
+  // path below runs for the no-Apply states (e.g. an idle CC thread with a diff
+  // but no pending change → Archive + standalone Diff).
   const applyAction = state.actions.find((a) => a.kind === 'apply');
   if (applyAction) {
     const menuActions = state.actions.filter((a) => a !== applyAction);
     return {
-      liftable: null,
+      liftable,
       primary: (
         <ChangeActionSplitButton
           primary={applyAction}
           menuActions={menuActions}
-          showDiff={state.showDiff}
-          threadId={state.threadId}
         />
       ),
     };
@@ -170,41 +176,33 @@ export function getBannerSlots(state: BannerState): BannerSlots {
   const actionButtons = state.actions.map((action) => renderActionButton(action));
 
   return {
-    liftable: state.showDiff ? renderDiffButton(state.threadId) : null,
+    liftable,
     primary: <>{actionButtons}</>,
   };
 }
 
 /** Change-action split button: a one-tap primary face (Apply / Apply & Restart)
- *  plus a caret menu holding Diff (when the branch has a diff) and the remaining
- *  close-set actions (Discard, Archive). Built on the generic `SplitButton` (the
- *  same control the prompt's multi-select answer Submit uses), so the caret /
- *  Overlay-dismiss / inert-primary contract lives in one place. Labels,
- *  tooltips, and handlers all come from the same TaggedActions the desktop
- *  buttons use, so there's no enablement drift. */
+ *  plus a caret menu holding the remaining close-set actions (Discard, Archive).
+ *  Diff is NOT in here — it lives permanently outside this cluster as its own
+ *  standalone button (getBannerSlots' liftable slot). Built on the generic
+ *  `SplitButton` (the same control the prompt's multi-select answer Submit
+ *  uses), so the caret / Overlay-dismiss / inert-primary contract lives in one
+ *  place. Labels, tooltips, and handlers all come from the same TaggedActions
+ *  the desktop buttons use, so there's no enablement drift. */
 function ChangeActionSplitButton({
   primary,
   menuActions,
-  showDiff,
-  threadId,
 }: {
   primary: TaggedAction;
   menuActions: TaggedAction[];
-  showDiff: boolean;
-  threadId: string;
 }) {
-  const menuItems: SplitButtonMenuItem[] = [
-    ...(showDiff
-      ? [{ key: 'diff', label: 'Diff' as ComponentChildren, className: 'action-btn', onClick: () => void viewThreadCcDiff(threadId) }]
-      : []),
-    ...menuActions.map((action) => ({
-      key: action.kind,
-      label: action.label,
-      className: action.kind === 'discard' ? 'action-btn action-btn-danger' : 'action-btn',
-      tooltip: action.tooltip,
-      onClick: () => void action.invoke(),
-    })),
-  ];
+  const menuItems: SplitButtonMenuItem[] = menuActions.map((action) => ({
+    key: action.kind,
+    label: action.label,
+    className: action.kind === 'discard' ? 'action-btn action-btn-danger' : 'action-btn',
+    tooltip: action.tooltip,
+    onClick: () => void action.invoke(),
+  }));
   return (
     <SplitButton
       primaryLabel={primary.label}

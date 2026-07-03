@@ -13,10 +13,14 @@
  *  - the channel pick (`inputMode` signal / per-draft `draft.mode`, wire value
  *    `'lucidos' | 'claude_code'`) — per-thread and cross-device-synced while
  *    composing;
- *  - the coding target (`selectedScope` signal) — a device-global bound onto
- *    the thread's meta at send time (`sendCompose`).
- *  The picker presents the pair as one control; the asymmetry (draft-synced
- *  mode vs device-global scope) is pre-existing and kept as-is.
+ *  - the coding target (a `Scope`) — resolved PER-DRAFT via
+ *    `resolveScope(threadId)` (this draft's `composeSelections` override, or the
+ *    global `selectedScope` default) and bound onto the thread's meta at send
+ *    time (`sendCompose`). Callers pass the resolved value in; these helpers
+ *    never read the global directly.
+ *  The picker presents the pair as one control. (The channel pick is
+ *  cross-device-synced; the per-draft scope override is device-local — a
+ *  pre-existing asymmetry kept as-is.)
  */
 
 import type { Scope } from './store';
@@ -74,10 +78,11 @@ export function parseOptionValue(v: string): ComposeDestination {
 }
 
 /** The repo/app context-name chip for a compose draft, mirroring
- *  `threadContextName` (which reads a started thread's bound `meta`) but reading
- *  the device-global compose `selectedScope` — a draft hasn't bound its meta
- *  yet (see `sendCompose`). Returns undefined for a chat draft: a Lucidos thread
- *  carries no context chip, same as a started chat thread.
+ *  `threadContextName` (which reads a started thread's bound `meta`) but taking
+ *  the draft's resolved compose `Scope` (per-draft `resolveScope`, passed in by
+ *  the caller) — a draft hasn't bound its meta yet (see `sendCompose`). Returns
+ *  undefined for a chat draft: a Lucidos thread carries no context chip, same as
+ *  a started chat thread.
  *
  *  Resolution matches what started threads show: the Lucidos source → "Lucidos"
  *  (its repo name), an app → the app id (started app threads chip the id via

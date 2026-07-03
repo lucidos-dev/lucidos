@@ -282,46 +282,51 @@ fn read_app_version() -> String {
     read_version_file(&path)
 }
 
-/// Restart the engine. In a PACKAGED build the engine runs as a launchd service
-/// (`com.lucidos.engine`), so it restarts itself via `launchctl kickstart -k`
-/// (the dev `web-dev.sh` script isn't in the bundle). In dev it spawns
-/// `web-dev.sh --engine-only` to rebuild and restart the engine binary, leaving
-/// Vite and parent scripts untouched. Errors return `{"error": msg}` so the UI
-/// can show the actual reason instead of a silent failure.
+/// Switch the engine onto the new version (the disruptive step of the
+/// new-version-available/switch flow — the `/api/v1/restart` route). The new
+/// binary is ALREADY on disk: dev's *Apply* rebuilt it in the background, or the
+/// packaged updater installed it — so this only RESPAWNS, it does not build.
 ///
-/// Before restarting: enumerates all in-flight chat + CC threads and pre-emits
-/// boundary events with `actor: <user>` so the post-restart timeline reads "You
-/// restarted" instead of "⚙ System restarted". Recovery on the new engine sees
-/// these threads are already terminated and skips them.
+/// It does NOT pre-emit boundary events. Instead it **stashes the device actor**
+/// and returns; the actual boundary aborts are emitted at real teardown by the
+/// graceful-shutdown path (`main.rs::shutdown_signal` →
+/// `abort_in_flight_for_restart`, reading the stashed actor) — so nothing shows
+/// "Switched/Aborted" while the old engine is still alive. A device actor also
+/// marks the shutdown as a user-initiated switch, which recovery uses to
+/// auto-resume in-flight coding-agent threads (a crash leaves no such actor →
+/// manual Continue). Errors return `{"error": msg}` so the UI shows the reason.
+///
+/// Respawn path: prefer the gateway control API whenever the gateway spawned us
+/// (dev AND packaged — it injects `LUCIDOS_GATEWAY_PORT` + `LUCIDOS_WORKSPACE_ID`);
+/// fall back to launchd (packaged, no gateway) or `web-dev.sh --engine-only`
+/// (legacy `LUCIDOS_NO_GATEWAY` dev, where there's no gateway to do the respawn).
 pub(super) async fn restart_engine(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    state.engine.abort_in_flight_for_restart(actor).await;
+    // Stash the device actor for the teardown-time boundary emit (Phase 3) and the
+    // recovery auto-resume signal (Phase 4). No pre-emit here.
+    state.engine.set_restart_actor(actor);
+
+    // The gateway (dev or packaged) respawns this workspace's stack in place onto
+    // the already-on-disk binary — no rebuild here.
+    if let (Ok(port), Ok(id)) = (
+        std::env::var("LUCIDOS_GATEWAY_PORT"),
+        std::env::var("LUCIDOS_WORKSPACE_ID"),
+    ) {
+        return restart_via_gateway(&port, &id).await;
+    }
 
     if is_packaged() {
-        // Under the workspace gateway (ADR 0014) the engine is spawned +
-        // supervised by the standalone `lucidos-gateway`; an Apply's restart asks
-        // the gateway to respawn THIS workspace's stack in place (a control
-        // call), leaving peers and the gateway untouched. The bundle binary is
-        // fixed, so no rebuild is needed — a stack respawn re-reads the merged
-        // files. The gateway injects LUCIDOS_GATEWAY_PORT + LUCIDOS_WORKSPACE_ID
-        // when it spawns us. Legacy single-engine packaging falls back to launchd.
-        if let (Ok(port), Ok(id)) = (
-            std::env::var("LUCIDOS_GATEWAY_PORT"),
-            std::env::var("LUCIDOS_WORKSPACE_ID"),
-        ) {
-            return restart_via_gateway(&port, &id).await;
-        }
+        // Packaged, no gateway (legacy single-engine): launchd restarts the
+        // service onto the updater-installed binary.
         return restart_via_launchd();
     }
 
-    // Dev: the engine binary is built from source, so an Apply must REBUILD
-    // before restarting. `web-dev.sh --engine-only` rebuilds the binary and (in
-    // gateway dev) asks the gateway to respawn this workspace's stack onto it;
-    // in legacy dev it restarts the single engine. Either way the rebuild step
-    // is why dev does NOT call the gateway control API directly here.
+    // Legacy `LUCIDOS_NO_GATEWAY` dev: no gateway to respawn the engine, so drive
+    // it via `web-dev.sh --engine-only`. Apply already rebuilt the binary, so the
+    // build step here is a fast near-noop; the respawn is what matters.
     let script = crate::paths::script("web-dev.sh").map_err(|e| {
         log!("[Restart] {}", e);
         (
@@ -382,39 +387,107 @@ pub(super) async fn restart_engine(
     }
 }
 
+/// `GET /api/v1/engine/version-status` — the running engine's build id, whether a
+/// newer engine version is ready to switch onto, whether this is a packaged build,
+/// and the dev background-rebuild state. Drives the unified "New version available
+/// → Switch to new version" surface (dev half; packaged routes to the release
+/// updater). See `crates/lucidos-engine/src/engine/engine_version.rs`.
+pub(super) async fn engine_version_status(
+    State(state): State<AppState>,
+) -> Json<crate::engine::engine_version::VersionStatus> {
+    Json(state.engine.version_status().await)
+}
+
+/// `POST /api/v1/engine/rebuild` — manually kick off the dev background engine
+/// rebuild (the escape hatch behind the frontend "Rebuild & Switch" affordance),
+/// so a wedged workspace (source behind HEAD with a stale binary — e.g. after a
+/// failed background rebuild) can produce the new binary WITHOUT a manual
+/// `web-dev.sh -b`. Coordinated + coalesced by `trigger_background_rebuild`
+/// (checkout-shared build lock, single builder across co-located engines).
+/// No-op packaged (never rebuilds from source); returns 202 regardless so the
+/// caller isn't error-handling a no-op. The resulting `version-status`
+/// `build_state` transitions drive the UI (building → ready → Switch).
+pub(super) async fn engine_rebuild(State(state): State<AppState>) -> StatusCode {
+    state.engine.trigger_background_rebuild();
+    StatusCode::ACCEPTED
+}
+
 /// Gateway-mode restart (ADR 0014): POST the gateway's control API (behind the
 /// sigil namespace `/~/`) to respawn just this workspace's stack. The gateway
 /// kills the old engine (SIGUSR1, with a drain window) and spawns a fresh one on
 /// the same loopback port; the frontend tolerates the brief network rejection
 /// after the 2xx.
+///
+/// Supports BOTH protocols: the scheme is resolved by [`net_config::tls_scheme`]
+/// (the ONE place — `https` in dev where the gateway keeps its TLS certs, `http`
+/// packaged where they're stripped), and [`net_config::peer_scheme_order`] puts
+/// it first with the other protocol as a fallback, so a mismatch still restarts.
+/// A non-2xx RESPONSE is a real gateway error and is returned immediately — only
+/// a failure to reach the gateway falls through to the other scheme. Accepts the
+/// self-signed dev cert on this loopback call, the same posture as the gateway's
+/// own health client (`build_health_client`) and the dev scripts (`curl -sk`).
 async fn restart_via_gateway(
     gateway_port: &str,
     workspace_id: &str,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let url = format!(
-        "http://127.0.0.1:{gateway_port}/~/api/v1/control/workspaces/{workspace_id}/restart"
-    );
-    log!("[Restart] Gateway mode: POST {}", url);
-    let client = reqwest::Client::new();
-    match client.post(&url).send().await {
-        Ok(resp) if resp.status().is_success() => Ok(StatusCode::OK),
-        Ok(resp) => {
-            let msg = format!("gateway restart returned {}", resp.status());
-            log!("[Restart] {}", msg);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": msg })),
-            ))
-        }
+    // Loopback call to the co-located gateway; accept its self-signed dev cert
+    // (harmless for the plain-http packaged case) and bypass any ambient proxy.
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .danger_accept_invalid_certs(true)
+        .build()
+    {
+        Ok(c) => c,
         Err(e) => {
-            let msg = format!("gateway restart request failed: {e}");
+            let msg = format!("gateway restart client build failed: {e}");
             log!("[Restart] {}", msg);
-            Err((
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": msg })),
-            ))
+            ));
+        }
+    };
+
+    let schemes = crate::net_config::peer_scheme_order();
+    let mut last_err: Option<String> = None;
+    for (i, scheme) in schemes.iter().enumerate() {
+        let url = format!(
+            "{scheme}://127.0.0.1:{gateway_port}/~/api/v1/control/workspaces/{workspace_id}/restart"
+        );
+        log!("[Restart] Gateway mode: POST {}", url);
+        match client.post(&url).send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(StatusCode::OK),
+            Ok(resp) => {
+                // The gateway answered but rejected the request — a real error,
+                // not a protocol mismatch. Don't retry the other scheme.
+                let msg = format!("gateway restart returned {}", resp.status());
+                log!("[Restart] {}", msg);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": msg })),
+                ));
+            }
+            Err(e) => {
+                // Couldn't reach the gateway on this scheme (e.g. plain http
+                // against a TLS listener) — try the other protocol before giving
+                // up.
+                let msg = format!("gateway restart request failed: {e}");
+                let more = i + 1 < schemes.len();
+                log!(
+                    "[Restart] {}{}",
+                    msg,
+                    if more { " — retrying other scheme" } else { "" }
+                );
+                last_err = Some(msg);
+            }
         }
     }
+
+    let msg = last_err.unwrap_or_else(|| "gateway restart request failed".to_string());
+    Err((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": msg })),
+    ))
 }
 
 /// Packaged restart: the engine runs as the `com.lucidos.engine` launchd
@@ -836,6 +909,8 @@ pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
         .route("/restart", post(restart_engine))
+        .route("/engine/version-status", get(engine_version_status))
+        .route("/engine/rebuild", post(engine_rebuild))
         .route("/workspaces", get(list_workspaces))
         .route("/events", get(global_events))
         .route("/history", get(get_history))

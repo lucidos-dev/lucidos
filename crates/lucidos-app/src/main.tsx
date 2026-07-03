@@ -11,7 +11,10 @@ import { installActionBtnBlurListener } from './components/chat/promptFocus';
 import { installNoAutofill } from './utils/noAutofill';
 import { installNoDrag } from './utils/noDrag';
 import { isTouchDevice } from './utils/viewport';
-import { isIOSPwa } from './utils/platform';
+import { isIOSPwa, isTauri, isTauriPreGatewayEntry } from './utils/platform';
+import { invoke } from './utils/tauri';
+import { setBootStatus } from './utils/bootSplash';
+import { reconcileDesktopDeviceId } from './store/actions/devices';
 import { openAppById } from './store/actions/apps';
 import { startPerfProbe } from './utils/perfProbe';
 import './styles/global.css';
@@ -103,17 +106,55 @@ function recoverFromBrokenContext(): boolean {
   return true;
 }
 
-if (!recoverFromBrokenContext()) {
-  // Remember the workspace the user is in, so the gateway's smart root (`/`) can
-  // auto-open it next time (see lastWorkspace.ts / WorkspacePicker). Only inside a
-  // real workspace — never the picker (IS_PICKER) or legacy direct-engine root
-  // (WORKSPACE_ID null).
-  if (!IS_PICKER && WORKSPACE_ID) rememberLastWorkspace(WORKSPACE_ID);
-  // TEMP: locate the click-lag main-thread blocker (dev workspace). Quiet unless
-  // an interaction/task crosses the threshold. Remove once measured.
-  if (!IS_PICKER) startPerfProbe();
-  render(IS_PICKER ? <WorkspacePicker /> : <App />, appRoot);
+/** Packaged desktop shell, BEFORE `desktop::launch()` has navigated the window to
+ *  the gateway: the window is on Tauri's bundled asset scheme, where booting
+ *  `<App/>` would fire API calls + a service-worker registration that all throw
+ *  WebKit's "string did not match the expected pattern". Keep the inline boot
+ *  splash up with a "Starting Lucidos…" status; `desktop::launch()` navigates this
+ *  window to the gateway once the service is healthy (a full document load that
+ *  replaces the splash with the real app). Heartbeat on the cadence `useStartup`
+ *  would, so the WKWebView crash watchdog (lib.rs) doesn't reload the splash every
+ *  ~60s while we wait. */
+function stayOnStartingSplash(): void {
+  setBootStatus('Starting Lucidos…');
+  invoke('heartbeat').catch(() => {});
+  window.setInterval(() => { invoke('heartbeat').catch(() => {}); }, 15_000);
 }
+
+async function boot() {
+  // Packaged desktop shell before it has navigated to the gateway: stay on the
+  // boot splash instead of booting a broken `<App/>` against the asset scheme
+  // (see stayOnStartingSplash). There is no workspace context here, so the
+  // device-id reconcile + broken-context recovery below would be no-ops anyway —
+  // returning early just avoids the invalid API/SW calls.
+  if (isTauriPreGatewayEntry()) {
+    stayOnStartingSplash();
+    return;
+  }
+
+  // Desktop only: make the per-workspace device id durable across DMG reinstalls by
+  // reconciling it with the native store BEFORE the first API call (the id rides
+  // every request as `x-lucidos-device-id`). Browser/PWA skip this — their
+  // localStorage id is already durable, and an async function runs synchronously up
+  // to its first await, so the non-Tauri render below is unchanged in timing.
+  if (isTauri() && !IS_PICKER && WORKSPACE_ID) {
+    await reconcileDesktopDeviceId(WORKSPACE_ID);
+  }
+
+  if (!recoverFromBrokenContext()) {
+    // Remember the workspace the user is in, so the gateway's smart root (`/`) can
+    // auto-open it next time (see lastWorkspace.ts / WorkspacePicker). Only inside a
+    // real workspace — never the picker (IS_PICKER) or legacy direct-engine root
+    // (WORKSPACE_ID null).
+    if (!IS_PICKER && WORKSPACE_ID) rememberLastWorkspace(WORKSPACE_ID);
+    // Permanent perf debug tooling: surfaces the main-thread blocker behind any
+    // interaction lag. Quiet unless an interaction/task crosses the threshold;
+    // logs to the browser console only. See utils/perfProbe.ts.
+    if (!IS_PICKER) startPerfProbe();
+    render(IS_PICKER ? <WorkspacePicker /> : <App />, appRoot);
+  }
+}
+void boot();
 
 if (import.meta.hot) {
   import.meta.hot.accept();

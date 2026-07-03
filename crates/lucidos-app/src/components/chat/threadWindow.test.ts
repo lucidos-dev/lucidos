@@ -5,6 +5,7 @@ import {
     computeRenderFromIndex,
     hasMoreAbove,
     expandRenderCount,
+    scrollToTopNeedsRenderAll,
 } from './threadWindow';
 
 describe('thread render windowing', () => {
@@ -47,6 +48,24 @@ describe('thread render windowing', () => {
         it('caps at the total so it stabilizes once all is shown', () => {
             expect(expandRenderCount(30, 20)).toBe(30);
             expect(expandRenderCount(30, 30)).toBe(30);
+        });
+    });
+
+    describe('scrollToTopNeedsRenderAll', () => {
+        it('requires render-all while older exchanges sit above the window', () => {
+            // A long thread opens windowed to the tail — scroll-to-top must render
+            // the whole thread first, or it stalls partway (the "needed N clicks" bug).
+            expect(scrollToTopNeedsRenderAll(100, INITIAL_WINDOW)).toBe(true);
+            // One scroll-up expansion isn't enough on a long thread — still windowed.
+            expect(scrollToTopNeedsRenderAll(100, INITIAL_WINDOW + WINDOW_STEP)).toBe(true);
+        });
+
+        it('skips render-all once the full thread is already rendered', () => {
+            // Short thread fits in the initial window — scroll straight to top.
+            expect(scrollToTopNeedsRenderAll(INITIAL_WINDOW, INITIAL_WINDOW)).toBe(false);
+            expect(scrollToTopNeedsRenderAll(5, INITIAL_WINDOW)).toBe(false);
+            // Already expanded to everything (deep-link render-all / a prior top jump).
+            expect(scrollToTopNeedsRenderAll(1000, Infinity)).toBe(false);
         });
     });
 

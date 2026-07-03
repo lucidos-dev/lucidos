@@ -5,7 +5,7 @@ import { showToast, memoryRebuildProgress } from '../../store/store';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { Dropdown } from '../shared/Dropdown';
 import { LoadableError } from '../shared/LoadableError';
-import { ListSkeleton } from '../shared/ListSkeleton';
+import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { toFailed } from '../../store/types';
 import { formatTimeAgo, formatDateTime } from '../../utils/formatTime';
@@ -73,7 +73,14 @@ function importanceDotClass(importance: number): string {
   return 'low';
 }
 
-function MemoryEntryRow({ entry }: { entry: MemoryEntryInfo }) {
+/** Self-skeletonizing memory row: rendered with no entry inside a
+ *  SkeletonProvider (`<MemoryEntryRow />`) it draws itself as a collapsed loading
+ *  placeholder via the Sk* leaves; with a real `entry` it renders normally. The
+ *  prop is optional only to support the skeleton call; the real call site passes
+ *  it. The expand state stays collapsed in skeleton mode (initial state + the
+ *  click handler is gated on `!sk`), so the detail section never shows. */
+function MemoryEntryRow({ entry }: { entry?: MemoryEntryInfo }) {
+  const sk = useSkeleton();
   const [expanded, setExpanded] = useState(false);
   const [sourceData, setSourceData] = useState<Loadable<MemorySourceResponse>>({ status: 'not-loaded' });
   const [sourceVisible, setSourceVisible] = useState(false);
@@ -84,6 +91,7 @@ function MemoryEntryRow({ entry }: { entry: MemoryEntryInfo }) {
       return;
     }
     if (sourceData.status === 'loading') return;
+    if (!entry) return;
     setSourceData({ status: 'loading' });
     setSourceVisible(true);
     try {
@@ -100,24 +108,36 @@ function MemoryEntryRow({ entry }: { entry: MemoryEntryInfo }) {
   }
 
   return (
-    <div class={`list-row memory-entry-row ${expanded ? 'expanded' : ''}`} onClick={() => setExpanded(!expanded)}>
+    <div class={`list-row memory-entry-row ${expanded ? 'expanded' : ''}`} onClick={sk ? undefined : () => setExpanded(!expanded)}>
       <div class="list-row-info" style={{ cursor: 'pointer' }}>
         <div class="title list-row-name memory-entry-summary">
-          <span class="memory-topic-badge">{entry.topic}</span>
-          <span class="memory-summary-text">{entry.summary}</span>
+          <SkBlock w="4rem" h="1rem" round>
+            <span class="memory-topic-badge">{entry?.topic}</span>
+          </SkBlock>
+          <SkText class="memory-summary-text" w="14rem">{entry?.summary}</SkText>
         </div>
         <div class="list-row-details">
-          <span class={`memory-importance-dot ${importanceDotClass(entry.importance)}`}
-            data-tooltip={`Importance: ${entry.importance.toFixed(2)}`} />
-          <span class={`memory-source-badge ${entry.source.type}`}>
-            {entry.source.type === 'event' ? 'Event' : 'Artifact'}
-          </span>
-          <span data-tooltip={formatDateTime(new Date(entry.src_created_at))}>
-            {formatTimeAgo(new Date(entry.src_created_at))}
-          </span>
+          <SkBlock w="0.75rem" h="0.75rem" circle>
+            <span class={`memory-importance-dot ${importanceDotClass(entry?.importance ?? 0)}`}
+              data-tooltip={`Importance: ${(entry?.importance ?? 0).toFixed(2)}`} />
+          </SkBlock>
+          <SkBlock w="3.5rem" h="1.25rem" round>
+            <span class={`memory-source-badge ${entry?.source.type}`}>
+              {entry?.source.type === 'event' ? 'Event' : 'Artifact'}
+            </span>
+          </SkBlock>
+          {(sk || entry) && (
+            <SkText w="5rem">
+              {entry && (
+                <span data-tooltip={formatDateTime(new Date(entry.src_created_at))}>
+                  {formatTimeAgo(new Date(entry.src_created_at))}
+                </span>
+              )}
+            </SkText>
+          )}
         </div>
 
-        {expanded && (
+        {!sk && expanded && entry && (
           <div class="memory-entry-details">
             <div class="memory-detail-row">
               <span class="memory-detail-label">ID:</span>
@@ -300,7 +320,7 @@ export function MemoryInspector() {
       return <LoadableError noun="entries" error={entries.error} />;
     }
     return (
-      <LoadingFade showSkeleton={showEntriesLoading} skeleton={<ListSkeleton />}>
+      <LoadingFade showSkeleton={showEntriesLoading} skeleton={<ListSkeletonOf containerClass="list-rows" row={() => <MemoryEntryRow />} />}>
         {entries.status === 'loaded' ? (
           entries.data.entries.length === 0 ? (
             <div class="empty-state">No memory entries</div>

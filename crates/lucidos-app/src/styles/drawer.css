@@ -53,7 +53,7 @@
 }
 
 .thread-filter-title {
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
@@ -67,7 +67,7 @@
     gap: 0.5rem;
     padding: 0.375rem;
     border-radius: 0.25rem;
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     cursor: pointer;
 }
@@ -78,7 +78,7 @@
 
 .thread-filter-option-child {
     padding-left: 1.5rem;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
 }
 
 /* Leading channel glyph on the Show-section rows (Lucidos / Coding Agent /
@@ -149,7 +149,7 @@
 /* Muted caption under the Show header when the channel filter is unavailable
    (a non-`all` view bypasses it). Replaces the old disabled-button tooltip. */
 .thread-filter-section-note {
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     font-style: italic;
     color: var(--text-secondary);
     padding: 0 0.375rem 0.375rem;
@@ -166,7 +166,7 @@
     border: none;
     background: none;
     border-radius: 0.25rem;
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     /* A <button> doesn't inherit the document font, so without this the View rows
        render in the UA default font while the <label>-based Show rows below pick
        up `--font-ui` — make the status rows respect the user's font setting too. */
@@ -221,7 +221,7 @@
     justify-content: center;
     min-width: 0.875rem;
     color: var(--text-muted);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     font-variant-numeric: tabular-nums;
 }
 
@@ -234,7 +234,7 @@
 .badge.drawer-view-count {
     position: static;
     color: white;
-    font-size: 0.5625rem;
+    font-size: var(--font-size-3xs);
 }
 
 .thread-drawer-list {
@@ -244,19 +244,10 @@
        the "Threads" header chrome above the list. */
     padding-top: 0.75rem;
     padding-bottom: 0.25rem;
-    /* No reserved scrollbar gutter. The app's global `::-webkit-scrollbar`
-     * (components.css) gives every scroller a 0.5rem *classic* bar that reserves
-     * layout width — which pushed the focused/highlighted/hover row background
-     * an extra 0.5rem short of the drawer's right edge (the gutter painted
-     * `--bg-primary`, reading as an inconsistent gap to the right of the
-     * selection). Hiding the bar drops that accidental gutter; the row's
-     * intentional `margin-right` then owns the right-side room. The list still
-     * scrolls via wheel / trackpad / touch. */
-    scrollbar-width: none;
-}
-
-.thread-drawer-list::-webkit-scrollbar {
-    display: none;
+    /* Use the app's normal scrollbar (the global `::-webkit-scrollbar` /
+     * `scrollbar-width` from components.css) — a visible 0.5rem classic bar. Row
+     * backgrounds run full width up to it (no right-side inset), so the selection
+     * sits flush against the scrollbar rather than leaving a `--bg-primary` gap. */
 }
 
 .thread-row {
@@ -271,15 +262,12 @@
     padding-left: var(--thread-row-pad-left);
     /* Right padding gives the action icons breathing room inside the row. */
     padding-right: 0.5rem;
-    /* Inset the row 0.5rem from the drawer's right edge so the focused / hover /
-     * highlighted background (and the highlight outline, which rides the border
-     * box) reads as a card with room on the right rather than a strip flush to
-     * the edge. Margin (not clip-path) shrinks the actual box, so the background
-     * AND the outline inset together — a right clip-path would cut the outline's
-     * right side off. The bottom-edge divider `::after` (right: 0.5rem inside the
-     * row) shifts in with the box, preserving its gap from the selection edge.
-     * No left margin: nested sub-thread selections still reach the left edge. */
-    margin-right: 0.5rem;
+    /* No right inset: the focused / hover / highlighted background runs full
+     * width to the drawer's right edge (or up to the scrollbar when the list
+     * overflows), so the selection reads flush with no `--bg-primary` gap strip.
+     * The bottom-edge divider `::after` keeps its own `right: 0.5rem` content
+     * inset. No left margin either: nested sub-thread selections reach the left
+     * edge. */
     -webkit-touch-callout: none;
     -webkit-user-select: none;
     user-select: none;
@@ -440,7 +428,7 @@
  * than the badge and sitting a touch lower. Mobile bumps both to a 1.25rem box
  * (see the ≤768px block). */
 .family-disclosure-glyph {
-    font-size: 1rem;
+    font-size: var(--font-size-xl);
     line-height: 1rem;
 }
 
@@ -464,6 +452,29 @@
     padding-bottom: 1.875rem;
 }
 
+/* Family rows reserve bottom room on the left column (rule above) for the
+ * bottom-centered disclosure badge. That reserve would otherwise LIFT the
+ * flow-positioned created date (its `margin-top: auto` drops it to the column's
+ * content-box bottom, which now sits a full reserve-height above the row bottom)
+ * clear of the bottom-pinned pin + overflow menu opposite it — the family-row
+ * misalignment. Take the date out of flow and pin it to the bottom-left instead:
+ * `bottom: 0.5rem` matches the row's padding-bottom, so it lands level with the
+ * right column's actions (same as non-family rows), and `left` tracks the title's
+ * indent. The title stays in flow, so it keeps the reserve's protection.
+ *
+ * `right: calc(50% + 1rem)` bounds the date to the row's left half (less 1rem),
+ * so it ellipsizes before the horizontally-centered disclosure badge instead of
+ * painting over it. Out of flow the date is no longer constrained by the left
+ * flex column, so without this a long date on a deeply-nested row (its `left`
+ * indent grows with `--thread-depth` while the badge stays centered) or a narrow
+ * drawer would run under the chevron / count badge. */
+.thread-row.thread-row-has-family .thread-row-created {
+    position: absolute;
+    left: var(--thread-row-pad-left);
+    right: calc(50% + 1rem);
+    bottom: 0.5rem;
+}
+
 @media (hover: hover) {
     .family-disclosure:hover {
         color: var(--text-primary);
@@ -478,7 +489,7 @@
  * fill there; the blue tint stays distinct against both the normal and the
  * focused row bg. */
 .collapse-count-badge {
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     line-height: 1rem;
     min-width: 1rem;
@@ -519,6 +530,38 @@ html[data-theme="dark"] .collapse-count-badge {
     background: var(--bg-selected);
 }
 
+/* Dark mode: the name chip's fill --bg-tertiary (#163052) is nearly identical to
+ * the selected-row fill --bg-selected (#163356) — only ~3-4 levels apart on G/B —
+ * so the repo/app/trigger name chip loses its edge on a selected row. Fill colour
+ * alone can't fix it: the whole row ramp is dark navy, so any fill light enough to
+ * separate the chip from the rows is too light for the muted gray --text-secondary
+ * text, and any fill dark enough for the text sits on top of the rows. So keep the
+ * dark fill (text stays readable) and delineate the chip with a 1px --border-color
+ * outline (#2c456a, lighter than EVERY row fill incl. selected) — it reads as a
+ * distinct pill on every row state regardless of how close its fill is to the row.
+ * The channel/type tag stacked above it (.message-channel-tag) gets the SAME
+ * outline so the two chips in a row read consistently — an outline on only one of
+ * the pair looks like a mistake. (.message-channel-tag is only rendered in the
+ * drawer row today, but scope it to .thread-row so a future chat-header reuse of
+ * the class stays borderless.) box-sizing is border-box and ContextChip's width
+ * pin already includes border widths (ThreadDrawer.tsx), so the outline doesn't
+ * shift layout. Light mode's fills are already well clear of --bg-tertiary
+ * (#eff2f5 vs #e1e4e8), so both chips keep the plain fill there. */
+html[data-theme="dark"] .thread-row-context,
+html[data-theme="dark"] .thread-row .message-channel-tag {
+    border: 1px solid var(--border-color);
+}
+
+/* The error channel tag (.channel-error, an unknown-channel row) declares its own
+ * red border-color in response.css but never rendered it — it set no width/style,
+ * so the border was inert. The shorthand above now supplies the width/style AND a
+ * neutral colour that (being more specific + loaded later) would repaint the error
+ * tag neutral. Restore its red outline so the error tag keeps its identity — which
+ * also finally realizes .channel-error's original intent. */
+html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
+    border-color: var(--accent-red);
+}
+
 .thread-row-left {
     flex: 1;
     min-width: 0;
@@ -528,6 +571,12 @@ html[data-theme="dark"] .collapse-count-badge {
     /* Give wrapped titles descent room without making every row taller: this
      * only affects row height when the title column is the tallest column. */
     padding-bottom: 0.25rem;
+    /* Stretch to the row height (matching `.thread-row-right`) so the created
+     * date's `margin-top: auto` has free space to consume — it then drops to the
+     * bottom of the column, level with the bottom-pinned pin + overflow menu in
+     * the right column. Without this the column is content-height (`.list-row`'s
+     * `align-items: flex-start`), leaving no room to push the date down. */
+    align-self: stretch;
 }
 
 .thread-row-title-row {
@@ -536,7 +585,7 @@ html[data-theme="dark"] .collapse-count-badge {
 }
 
 .thread-row-title {
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     font-weight: 400;
     overflow-wrap: break-word;
     word-break: break-word;
@@ -544,8 +593,12 @@ html[data-theme="dark"] .collapse-count-badge {
 
 .thread-row-created {
     display: block;
-    margin-top: 0.125rem;
-    font-size: 0.625rem;
+    /* Pin to the bottom of the (stretched) left column so the created date sits
+     * level with the bottom-pinned pin + overflow menu opposite it. Collapses to
+     * 0 when the title fills the column (multi-line), leaving the parent's
+     * 0.125rem gap as the minimum spacing below the title. */
+    margin-top: auto;
+    font-size: var(--font-size-2xs);
     line-height: 1.2;
     color: var(--text-muted);
     overflow: hidden;
@@ -555,7 +608,7 @@ html[data-theme="dark"] .collapse-count-badge {
 
 .draft-indicator {
     display: inline-block;
-    font-size: 0.625rem;
+    font-size: var(--font-size-2xs);
     font-weight: 500;
     color: var(--text-muted);
     background: color-mix(in srgb, var(--accent) 15%, transparent);
@@ -583,8 +636,12 @@ html[data-theme="dark"] .collapse-count-badge {
  * long name breaks early (the trigger above wraps after "NIGHTLY BUILD →")
  * instead of running most of the row's width before wrapping; because both this
  * max-width and the `.label` font-size are in rem, the wrap point stays the same
- * across UI scales. The detail times live in the row's long-press/hover tooltip
- * (see threadRowInfo.ts), so this column is type + name only. */
+ * across UI scales. Once wrapped, the chip is pinned to its WIDEST line by
+ * ContextChip (ThreadDrawer.tsx) — CSS can't shrink a constrained box to the
+ * longest line of wrapped text, so the JS measures the line boxes and sets an
+ * explicit width, removing the dead space beside the shorter lines. The detail
+ * times live in the row's long-press/hover tooltip (see threadRowInfo.ts), so
+ * this column is type + name only. */
 .thread-row-context {
     max-width: 7rem;
     white-space: normal;
@@ -733,14 +790,14 @@ html[data-theme="dark"] .collapse-count-badge {
      * is bottom-anchored, so it grows upward; the base `bottom` is tuned (0.625rem)
      * to keep the 1.25rem chevron/badge centered on the copy-icon line. */
     .family-disclosure-glyph {
-        font-size: 1.25rem;
+        font-size: var(--font-size-3xl);
         line-height: 1.25rem;
     }
 
     /* Scoped to .family-disclosure so collapsed section-header count badges keep
      * their compact size. */
     .family-disclosure .collapse-count-badge {
-        font-size: 0.8125rem;
+        font-size: var(--font-size-md);
         line-height: 1.25rem;
         min-width: 1.25rem;
         padding: 0 0.4375rem;
@@ -791,7 +848,7 @@ html[data-theme="dark"] .collapse-count-badge {
     border: none;
     outline: none;
     color: var(--text-primary);
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     font-family: inherit;
     padding: 0.125rem 0;
 }
@@ -812,7 +869,7 @@ html[data-theme="dark"] .collapse-count-badge {
 }
 
 .thread-drawer-loading {
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--text-secondary);
     padding: 0.5rem;
 }
@@ -879,20 +936,15 @@ html[data-theme="dark"] .collapse-count-badge {
 .thread-drawer .list-section-title {
     background: none;
     padding: 0.5rem 1rem 0.375rem 1.25rem;
-    /* Mirror `.thread-row`'s right inset (its `margin-right: 0.5rem`) so the
+    /* No right inset — matches `.thread-row` (which also runs full width). The
        keyboard-highlight band painted on a focused header
-       (`.list-section-title-highlighted`) stops at the SAME x as a focused /
-       highlighted thread-row's background — instead of bleeding full-width to
-       the drawer's right edge (toward/under the scrollbar). Left already matches:
-       neither carries a left margin, so both bands start flush at the drawer's
-       left edge. Margin (not padding) is what owns the band's right edge, and
-       it rides the base rule (not the `-highlighted` state) — exactly like
-       `.thread-row` — so the box width is constant across highlight states and
-       toggling focus never shifts the box or perturbs the FLIP measurement. */
-    margin-right: 0.5rem;
+       (`.list-section-title-highlighted`) runs to the drawer's right edge (or up
+       to the scrollbar when the list overflows), lining up with a focused /
+       highlighted thread-row's background. Left already matches: neither carries
+       a left margin, so both bands start flush at the drawer's left edge. */
     color: var(--text-primary);
     font-weight: 700;
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     /* Lay out the section icon + label on one centered row for EVERY drawer
        header — the collapsible lifecycle headers (Pinned/Current/Archive) and
        the flat alternate-view headers (Drafts/Needs attention), which share the
@@ -1073,7 +1125,7 @@ html[data-theme="dark"] .collapse-count-badge {
 .thread-title-input {
     font-family: inherit;
     font-weight: 600;
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     line-height: 1.3;
     color: var(--text-primary);
     background: var(--bg-tertiary);
@@ -1208,7 +1260,7 @@ textarea.thread-title-edit-input {
     background: none;
     border: none;
     color: var(--text-muted);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     font-style: italic;
     cursor: pointer;
     padding: 0;

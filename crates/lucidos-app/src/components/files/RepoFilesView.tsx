@@ -10,29 +10,32 @@ import { buildFolderTree } from '../../store/actions/artifacts';
 import type { FolderNode } from '../../store/actions/artifacts';
 import { useDelayedLoading, useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { loadedOr, type Loadable } from '../../store/types';
-import { ListSkeleton } from '../shared/ListSkeleton';
+import { ListSkeletonOf } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { FileTypeIcon } from '../../utils/fileIcons';
-import { TreeNode } from './FolderTree';
+import { TreeNode, folderTreeSkeletonRow } from './FolderTree';
 import { changeBadgeLabel } from './changeBadge';
 import { diffStats } from './diffStats';
 import { DiffStatsInline, DiffView } from './DiffView';
 
 /** Whether the registered-repo Files view has the data its CURRENT mode renders.
- *  All-files mode shows the file tree (repoFiles); Changes mode shows the diff
- *  (repoDiff), not the tree. The skeleton vs content both gate on this so neither
- *  flashes before its data is in. The Changes-mode diff gate is load-bearing:
- *  repoFiles usually resolves first, so without folding repoDiff in here
- *  ChangesFileList would render an empty [] → a spurious "No changes" while the
- *  diff is still loading (and before the single-file overlay opens over it).
- *  Exported for the unit test. */
+ *  Each mode gates ONLY on the data it actually draws, so the view is ready as
+ *  soon as that data is in — not blocked on the other mode's fetch:
+ *  - All-files mode draws the file tree (repoFiles) → gate on the tree.
+ *  - Changes mode draws the diff (repoDiff), NOT the tree → gate on the diff.
+ *  Gating Changes mode on the diff alone lets the diff list appear as soon as
+ *  the diff loads, instead of waiting for the whole-repo tree listing that only
+ *  All Files needs (and which is often the slower call). The diff gate still
+ *  prevents the "No changes" flash — an empty [] rendered while the diff is in
+ *  flight (and before the single-file overlay opens over it). Exported for the
+ *  unit test. */
 export function repoFilesContentReady(opts: {
   filesStatus: Loadable<unknown>['status'];
   diffStatus: Loadable<unknown>['status'];
   mode: 'all' | 'changes';
 }): boolean {
-  if (opts.filesStatus !== 'loaded') return false;
-  return opts.mode !== 'changes' || opts.diffStatus === 'loaded';
+  if (opts.mode === 'changes') return opts.diffStatus === 'loaded';
+  return opts.filesStatus === 'loaded';
 }
 
 export function RepoFilesView() {
@@ -57,7 +60,10 @@ export function RepoFilesView() {
   // so don't gate the render on its load state.
   const hasRepo = repoSource.value != null;
 
-  if (hasRepo && loadable.status === 'failed') {
+  // A file-tree listing failure only breaks All Files (it renders the tree);
+  // Changes mode draws the diff and doesn't need the tree, so don't let a tree
+  // failure hide a perfectly good diff. Switching to All Files surfaces it.
+  if (hasRepo && mode === 'all' && loadable.status === 'failed') {
     return (
       <div class="files-toolbar">
         <span class="files-hint error-text">Failed to load: {loadable.error}</span>
@@ -94,7 +100,7 @@ export function RepoFilesView() {
   }
 
   return (
-    <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeleton fill />}>
+    <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf fill containerClass="folder-tree" row={folderTreeSkeletonRow} />}>
       {contentReady ? (
         <>
           {/* Toolbar holds only the All Files / Changes toggle now (Expand/Collapse

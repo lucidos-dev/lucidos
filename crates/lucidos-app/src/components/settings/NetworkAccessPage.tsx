@@ -146,7 +146,7 @@ export function NetworkAccessPage() {
                 role="radio"
                 aria-checked={mode === opt.mode}
                 class={`settings-option${mode === opt.mode ? ' active' : ''}`}
-                title={opt.hint}
+                data-tooltip={opt.hint}
                 onClick={() => setMode(opt.mode)}
               >
                 {opt.label}

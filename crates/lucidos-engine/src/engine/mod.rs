@@ -11,6 +11,8 @@ pub(crate) mod cc_settings;
 mod change_ops;
 mod chat;
 pub(crate) mod claude_code;
+pub mod engine_version;
+mod frontend_refresh;
 pub(crate) mod command_guard;
 pub(crate) mod command_judge;
 pub mod command_permission;
@@ -21,11 +23,13 @@ pub(crate) mod loaded_knowhow;
 pub(crate) mod git_ops;
 pub mod http;
 pub(crate) mod inline_question_repair;
+pub(crate) mod inline_tool_call_repair;
 mod memory;
 pub mod memory_consumer;
 mod pending_apply_actors;
 pub(crate) mod preferences;
 mod session_seed;
+pub mod startup_lease;
 pub mod supervisor_respawn_sidecar;
 pub mod thread_events;
 pub mod thread_lifecycle;
@@ -59,7 +63,7 @@ use crate::core::{
     PREF_MODEL_TITLE,
 };
 use crate::llm::LlmProvider;
-use crate::memory::{FastEmbedProvider, MemoryExtractor, PgVectorIndex};
+use crate::memory::{EmbedderSlot, MemoryExtractor, PgVectorIndex};
 use crate::runtime::{
     CodingAgent, AgentRuntime, BrowserLogins, BrowserRuntime, ClaudeCodeRuntime, CodexRuntime,
     HeadlessBlocklist, PythonRuntime,
@@ -147,7 +151,12 @@ pub struct LucidosEngine {
     /// out under a short read guard (never held across an `.await`). Mirrors the
     /// `Arc<RwLock<…>>` convention of `ModelRegistry` / `LocationHandle`.
     llm: Arc<std::sync::RwLock<Arc<dyn LlmProvider>>>,
-    embedder: Arc<FastEmbedProvider>,
+    /// Late-binding embedder slot: holds the loaded model on a normal boot,
+    /// or stays empty when the first-run download failed (offline packaged
+    /// install) — memory features degrade descriptively and the background
+    /// retry (`spawn_embedder_retry_if_degraded`) installs the model without
+    /// a restart. See `memory::EmbedderSlot`.
+    embedder: Arc<EmbedderSlot>,
     memory_index: Option<PgVectorIndex>,
     extractor: Option<MemoryExtractor>,
     /// Vertex project ID — used to build image providers on demand.
@@ -170,6 +179,70 @@ pub struct LucidosEngine {
     /// Acquired via `scheduler::BackupGuard::try_acquire`. POST /api/v1/backup
     /// returns 409 when the guard is held; the scheduled cron skips its tick.
     pub backup_in_progress: AtomicBool,
+    /// Dev-only background-rebuild state driving the "new version available"
+    /// surface. Set by the Apply-triggered rebuild (Phase 2); read by
+    /// `GET /api/v1/engine/version-status`. Idle in packaged (no source rebuild).
+    /// See `engine/engine_version.rs`.
+    build_state: std::sync::RwLock<engine_version::BuildState>,
+    /// Memoized "is a newer engine binary on disk?" verdict, keyed by the running
+    /// binary's last-seen mtime, so a polling client doesn't fork
+    /// `current_exe --build-id` every tick (mirrors the gateway's `UpdateCheck`).
+    update_check: std::sync::Mutex<engine_version::UpdateCheck>,
+    /// Throttled cache of "is the engine SOURCE behind HEAD with a
+    /// restart-requiring change pending?" (the `engine_source_matches_head` git
+    /// check). Read by `GET /api/v1/engine/version-status` (polled every ~4s per
+    /// client) and the self-heal driver, so the underlying `git diff` runs at most
+    /// once per TTL regardless of client count. Dev-only; always false packaged.
+    /// See `engine_version::source_behind_head`.
+    source_behind_cache: std::sync::Mutex<engine_version::SourceBehindCache>,
+    /// Self-heal bookkeeping: how many background rebuilds this engine has
+    /// auto-triggered for the current HEAD, so a genuinely broken `main` can't
+    /// spin builds forever (bounded per HEAD; reset when HEAD moves). Dev-only.
+    /// See `engine_version::self_heal_engine_version_if_needed`.
+    self_heal_state: std::sync::Mutex<engine_version::SelfHealState>,
+    /// Handle to the in-flight Apply-triggered background rebuild task (dev), so a
+    /// later Apply can coalesce — abort the running build and start over. The
+    /// build child is `kill_on_drop`, so aborting the task kills the cargo process.
+    /// See `engine_version::trigger_background_rebuild`.
+    build_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Monotonic generation so only the latest background rebuild updates
+    /// `build_state` — a superseded build's completion is ignored.
+    build_generation: std::sync::atomic::AtomicU64,
+    /// Dev-only: swappable served-frontend dir. `api::serve_frontend` reads the
+    /// current snapshot path per request; a *frontend-only* Apply re-snapshots
+    /// `dist/` and swaps this so the served client advances WITHOUT an engine
+    /// respawn (INV-A: only when the engine binary is unchanged — a mixed change
+    /// still advances only via a Switch). `None` in packaged / headless (no
+    /// `LUCIDOS_STATIC_DIR`). Set once by `api::create_router` via
+    /// `init_served_frontend`. See `engine::frontend_refresh`.
+    served_frontend: std::sync::OnceLock<Arc<std::sync::RwLock<PathBuf>>>,
+    /// The source dir (`LUCIDOS_STATIC_DIR` = live `dist/`) that served-frontend
+    /// snapshots are taken from. Set alongside `served_frontend`.
+    served_frontend_source: std::sync::OnceLock<PathBuf>,
+    /// Monotonic generation for served-frontend re-snapshots: coalesces rapid
+    /// frontend-only Applies (only the latest generation swaps) AND names the
+    /// snapshot subdir. Boot pins generation 0; the first refresh is generation 1.
+    /// Mirrors `build_generation`.
+    frontend_refresh_generation: std::sync::atomic::AtomicU64,
+    /// Handle to the in-flight served-frontend refresh task, so a later Apply can
+    /// abort + supersede it. Mirrors `build_task`.
+    frontend_refresh_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Device actor stashed by the switch handler (`/api/v1/restart`) at
+    /// request time and read by the graceful-shutdown boundary emit at ACTUAL
+    /// teardown — the HTTP handler has the device, the SIGUSR1 signal handler
+    /// does not. Present → a user-initiated switch (attributes "You" / enables
+    /// auto-resume on recovery); absent → a non-switch stop (System attribution,
+    /// manual Continue). `take`n once at teardown so a later non-switch stop
+    /// can't reuse a stale actor. See `engine_version` + Phase 3/4 of the plan.
+    restart_actor: std::sync::Mutex<Option<thread_events::MessageOrigin>>,
+    /// Thread ids `recover_orphaned_worktrees` decided to auto-resume after a
+    /// user-initiated *Switch to new version* (in-flight coding-agent threads with
+    /// a device-attributed teardown boundary). Drained by `main.rs` AFTER the spawn
+    /// dispatcher subscribes — recovery runs before it, so emitting
+    /// `ContinuationRequested` during recovery would be missed. A crash-interrupted
+    /// thread is NOT enqueued here (it keeps the manual Continue affordance) — the
+    /// loop-safety guarantee.
+    pending_switch_resumes: std::sync::Mutex<Vec<Uuid>>,
     /// Per-thread handles (cancellation token + injection channel). Key = thread_id.
     /// Uses std::sync::Mutex since operations are trivial (insert/remove),
     /// and this allows the ThreadGuard to clean up synchronously in Drop (even on panic).

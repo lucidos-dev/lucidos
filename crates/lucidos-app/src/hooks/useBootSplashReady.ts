@@ -2,6 +2,7 @@ import { useEffect } from 'preact/hooks';
 import { effect } from '@preact/signals';
 import { connectionStatus, threadsLoaded } from '../store/store';
 import { bootSplashPresent, dismissBootSplash, setBootStatus } from '../utils/bootSplash';
+import { WORKSPACE_ID } from '../utils/basePath';
 import type { ConnectionStatus } from '../store/types';
 
 /** Safety cap: dismiss the splash even if the workspace never reports ready, so a
@@ -34,6 +35,23 @@ export function isWorkspaceReady(connection: ConnectionStatus, threads: boolean)
   return connection === 'connected' && threads;
 }
 
+/** The status word shown if the splash is STILL up after {@link STATUS_DELAY_MS}
+ *  — i.e. the launch is slow or stuck. Pure so it can be tested without the
+ *  DOM/signals.
+ *
+ *  A **direct** engine port (`isDirect`, `WORKSPACE_ID === null`) does not
+ *  auto-start: only the gateway lazy-starts a workspace on access, so a still-
+ *  unconnected direct context means the workspace simply isn't running — say so
+ *  rather than the misleading "Opening your workspace…". Behind the gateway the
+ *  frontend only loads after the engine is already up (the gateway serves its own
+ *  "Starting engine…" splash until then), so a stall there is a genuine
+ *  connection hiccup — keep "Connecting…". */
+export function delayedBootStatus(connected: boolean, isDirect: boolean): string {
+  if (connected) return 'Loading…';
+  if (isDirect) return 'Workspace not started';
+  return 'Connecting…';
+}
+
 /**
  * Drives the inline boot splash (index.html) for a WORKSPACE document: holds it
  * up — the mark playing its reveal then breathing — until the app is genuinely
@@ -48,7 +66,9 @@ export function useBootSplashReady(): void {
 
     const cap = window.setTimeout(dismissBootSplash, BOOT_SPLASH_SAFETY_MS);
     const statusTimer = window.setTimeout(() => {
-      setBootStatus(connectionStatus.value === 'connected' ? 'Loading…' : 'Connecting…');
+      setBootStatus(
+        delayedBootStatus(connectionStatus.value === 'connected', WORKSPACE_ID === null),
+      );
     }, STATUS_DELAY_MS);
     // Set once the readiness gate first fires, so the min-reveal delay isn't
     // re-armed on every subsequent signal change.

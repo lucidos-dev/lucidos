@@ -46,6 +46,18 @@ async fn fetch_compose_row(
     .expect("compose row query")
 }
 
+/// Read `compose_selection` (the per-draft dropdown selection) for one thread.
+async fn fetch_compose_selection(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Option<serde_json::Value> {
+    sqlx::query_scalar("SELECT compose_selection FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await
+        .expect("compose_selection query")
+}
+
 fn threads_url() -> String {
     format!("{}/api/v1/threads", base_url())
 }
@@ -255,6 +267,91 @@ async fn put_compose_text_only_preserves_mode() {
 
     let (_state, _text, _images, mode) = fetch_compose_row(&pool, id).await;
     assert_eq!(mode.as_deref(), Some("claude_code"), "mode must persist");
+}
+
+/// PUT compose with a `selection` persists the per-draft dropdown selection to
+/// `thread_summaries.compose_selection` AND surfaces it on the `/api/v1/threads`
+/// composing list, so a reload rehydrates the draft's picks.
+#[tokio::test]
+async fn put_compose_persists_and_surfaces_selection() {
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect to e2e db");
+    let id = Uuid::new_v4();
+    client
+        .post(threads_url())
+        .json(&json!({ "id": id, "mode": "claude_code" }))
+        .send()
+        .await
+        .expect("POST /threads failed");
+
+    let selection = json!({
+        "scope": { "kind": "app", "appId": "habit-tracker" },
+        "codingAgent": "codex",
+        "ccModel": "sonnet",
+    });
+    let resp = client
+        .put(compose_url(&id))
+        .json(&json!({ "text": "wire it up", "image_hashes": [], "selection": selection }))
+        .send()
+        .await
+        .expect("PUT compose with selection failed");
+    assert_eq!(resp.status(), 204);
+
+    // Column persisted.
+    assert_eq!(fetch_compose_selection(&pool, id).await.as_ref(), Some(&selection));
+
+    // Surfaced on the composing list so the frontend rehydrates on reload.
+    let listed: serde_json::Value = client
+        .get(threads_url())
+        .send()
+        .await
+        .expect("GET /threads failed")
+        .json()
+        .await
+        .expect("threads json");
+    let composing = listed["composing"].as_array().expect("composing[] array");
+    let row = composing
+        .iter()
+        .find(|t| t["thread_id"] == json!(id.to_string()))
+        .expect("draft present in composing[]");
+    assert_eq!(row["compose_selection"], selection, "selection must be on the list row");
+}
+
+/// A text-only keystroke PUT (no `selection` field) must PRESERVE the stored
+/// selection via COALESCE — otherwise every keystroke would wipe the picks.
+#[tokio::test]
+async fn put_compose_text_only_preserves_selection() {
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect to e2e db");
+    let id = Uuid::new_v4();
+    client
+        .post(threads_url())
+        .json(&json!({ "id": id, "mode": "lucidos" }))
+        .send()
+        .await
+        .expect("POST failed");
+
+    let selection = json!({ "model": "opus", "reasoningEffort": "high" });
+    client
+        .put(compose_url(&id))
+        .json(&json!({ "text": "first", "image_hashes": [], "selection": selection }))
+        .send()
+        .await
+        .expect("PUT with selection failed");
+
+    // Text-only PUT — `selection` omitted; COALESCE keeps the stored value.
+    client
+        .put(compose_url(&id))
+        .json(&json!({ "text": "first and more" }))
+        .send()
+        .await
+        .expect("text-only PUT failed");
+
+    assert_eq!(
+        fetch_compose_selection(&pool, id).await.as_ref(),
+        Some(&selection),
+        "text-only PUT must preserve the stored selection"
+    );
 }
 
 #[tokio::test]

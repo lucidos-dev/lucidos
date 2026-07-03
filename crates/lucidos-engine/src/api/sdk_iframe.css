@@ -36,6 +36,20 @@
     --icon-size-md: 1rem;
     --icon-size-lg: 1.25rem;
 
+    /* Type scale — the sanctioned font sizes. The appended shared-components.css
+       references var(--font-size-*), and app iframes never load base.css, so
+       these MUST be defined here. Keep in sync with base.css. */
+    --font-size-3xs: 0.5625rem;   /* 9px — micro-label / tiny badge */
+    --font-size-2xs: 0.625rem;    /* 10px */
+    --font-size-xs: 0.6875rem;    /* 11px */
+    --font-size-sm: 0.75rem;      /* 12px */
+    --font-size-md: 0.8125rem;    /* 13px */
+    --font-size-lg: 0.875rem;     /* 14px */
+    --font-size-xl: 1rem;         /* 16px */
+    --font-size-2xl: 1.125rem;    /* 18px */
+    --font-size-3xl: 1.25rem;     /* 20px */
+    --font-size-display: 2.25rem; /* 36px */
+
     /* Brand blue — the icon-mark identity color. Theme-independent; feeds
        --accent-action (the filled-button blue) per theme below. Keep in sync
        with base.css. */
@@ -143,7 +157,7 @@ input, textarea, select {
     border-radius: var(--radius-md);
     padding: var(--space-sm) var(--space-md);
     font-family: var(--font-ui);
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     outline: none;
     transition: border-color var(--transition);
 }
@@ -158,7 +172,7 @@ button {
     border: 1px solid var(--border-color);
     border-radius: var(--radius-md);
     padding: var(--space-sm) var(--space-lg);
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     cursor: pointer;
     transition: background var(--transition), border-color var(--transition);
 }
@@ -187,7 +201,7 @@ button:hover {
     border-radius: var(--radius-md);
     padding: var(--space-sm) var(--space-md);
     font-family: inherit;
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     line-height: 1.25;
     text-align: left;
     cursor: pointer;
@@ -224,7 +238,7 @@ button:hover {
 .lucidos-select-chevron {
     flex-shrink: 0;
     color: var(--text-muted);
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     line-height: 1;
 }
 
@@ -250,7 +264,7 @@ button:hover {
 
 .lucidos-select-option {
     padding: var(--space-sm) var(--space-md);
-    font-size: 0.8125rem;
+    font-size: var(--font-size-md);
     color: var(--text-primary);
     cursor: pointer;
     white-space: nowrap;

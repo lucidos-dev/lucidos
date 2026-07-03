@@ -231,21 +231,52 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                             .join("; ")
                     })
                     .filter(|s| !s.is_empty());
-                // Fall back to the subtype label (e.g. "error_max_turns") when
-                // CC omits `errors` so ResponseFailed still has a non-empty
-                // user-facing reason string. Skip "success" — CC sometimes
-                // emits `is_error: true` with `subtype: "success"` (observed
-                // on upstream API drops after the conversation has streamed
-                // an `API Error: …` text). Using it would render as
-                // `[ERROR] **Error:** success` in the timeline.
-                Some(joined.unwrap_or_else(|| {
+                // Fall back to the subtype label (e.g. "error_max_turns") when CC
+                // omits `errors[]`, so ResponseFailed still has a non-empty,
+                // user-readable reason string.
+                //
+                // BUT a `subtype` of "success" (or an absent subtype) is NOT a
+                // usable failure reason: CC sometimes stamps `is_error: true` on a
+                // turn it *also* labels structurally successful. Two shapes:
+                //
+                //   (1) A genuine upstream API drop CC still labelled successful:
+                //       CC's own "API Error: …" message became the final result
+                //       text (see the Claude Code error surface — the exact prefix
+                //       is `API Error:`, e.g. `API Error: 500 {…}` / `API Error:
+                //       Stream idle timeout`). Preserve it as the failure reason —
+                //       the streamed text IS the honest cause, and surfacing it
+                //       beats the old generic "Unknown error". Matched on a
+                //       leading `API Error` prefix (a genuinely successful turn's
+                //       result text never *starts* with it), never a loose
+                //       substring — so a turn that merely mentions "api error"
+                //       mid-sentence is not mis-flagged as Failed.
+                //
+                //   (2) Everything else — a genuinely completed turn CC merely
+                //       mis-stamped (streamed a full response, committed work).
+                //       There is nothing actionable to report, and fabricating a
+                //       generic "Unknown error" flips it to `Failed` — a red
+                //       "Event stream error / Unknown error" on a turn that
+                //       produced real output and proposed a change (and it even
+                //       trips ResponseFailed-subscribed triggers). Return `None`
+                //       and let `classify_result` decide on the turn's ACTUAL
+                //       content: real text/tools → `Generated`; produced *nothing*
+                //       → still fails, via the accurate empty-response branch.
+                //
+                // Model-tolerance measure — see docs/temporary-measures.md
+                // ("CC is_error:true + subtype:success").
+                joined.or_else(|| {
                     let subtype = val.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
                     if subtype.is_empty() || subtype == "success" {
-                        "Unknown error".to_string()
+                        // Contradictory success + is_error, no errors[]: preserve
+                        // only CC's own "API Error: …" message (a genuine drop),
+                        // else None so classify_result decides on content.
+                        text.trim_start()
+                            .starts_with("API Error")
+                            .then(|| text.trim().to_string())
                     } else {
-                        subtype.to_string()
+                        Some(subtype.to_string())
                     }
-                }))
+                })
             } else {
                 None
             };
@@ -263,15 +294,32 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
         // ticks at step boundaries and a step longer than
         // WATCHDOG_INACTIVITY_LIMIT_MS is killed mid-work even while CC streams.
         //
-        // Beyond liveness we extract ONE thing: the plaintext reasoning carried by
-        // a `content_block_delta` whose `delta.type` is `thinking_delta`. CC's
+        // Beyond liveness we extract ONE thing WHEN it is present: plaintext
+        // reasoning carried by a `content_block_delta` whose `delta.type` is
+        // `thinking_delta` (the text rides on `delta.thinking`, not `delta.text`).
+        // When the stream carries it, capture it as `AgentEvent::Thought` — the
         // *complete* assistant message keeps thinking as a signature-only block
         // (plaintext stripped from the persisted JSONL), so the live stream is the
-        // only place the reasoning text exists — capture it as `AgentEvent::Thought`
-        // or it is lost. Streamed text deltas are deliberately NOT taken here: the
-        // full assistant text arrives separately as `AgentEvent::Message`, so
-        // reading it from the delta too would duplicate it. The StreamActivity ping
-        // is always emitted regardless, so the watchdog contract is unchanged.
+        // only place any reasoning text would appear. Streamed text deltas are
+        // deliberately NOT taken here: the full assistant text arrives separately
+        // as `AgentEvent::Message`, so reading it from the delta too would
+        // duplicate it. The StreamActivity ping is always emitted regardless, so
+        // the watchdog contract is unchanged.
+        //
+        // DORMANT TODAY — and NOT provider-specific (corrected 2026-07-02). For the
+        // current models (Fable 5, Opus 4.8/4.7, Sonnet 5) Anthropic's
+        // `thinking.display` defaults to "omitted", so thinking blocks stream with
+        // EMPTY text (encrypted signature only) and no `thinking_delta` ever
+        // arrives — this branch produces nothing. That holds on BOTH Vertex AND the
+        // first-party Anthropic API (verified empirically on `.claude-personal`:
+        // one `signature_delta`, zero `thinking_delta`), and even
+        // `--thinking-display summarized` does not populate it through Claude Code's
+        // headless `--output-format stream-json` path (an upstream CC limitation —
+        // GitHub anthropics/claude-code#7840, #56356; and the raw chain of thought
+        // is never returned regardless — a summary is the most any display mode
+        // yields). So `CodingAgentThoughtStreamed` stays empty for these models
+        // regardless of provider or flag; switching CC's provider does NOT fix it.
+        // See the `cc-reasoning-dormant` investigation in docs/temporary-measures.md.
         "stream_event" => {
             let mut events = Vec::new();
             if let Some(text) = val
@@ -279,7 +327,11 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                 .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("content_block_delta"))
                 .and_then(|e| e.get("delta"))
                 .filter(|d| d.get("type").and_then(|v| v.as_str()) == Some("thinking_delta"))
-                .and_then(|d| d.get("text"))
+                // The reasoning text rides on `delta.thinking`, NOT `delta.text`
+                // (only a `text_delta` uses `text`) — matching the chat path's
+                // Anthropic-wire parser in `llm/anthropic_wire.rs`. Reading `text`
+                // here silently dropped every thought (the original bug).
+                .and_then(|d| d.get("thinking"))
                 .and_then(|v| v.as_str())
             {
                 if !text.is_empty() {

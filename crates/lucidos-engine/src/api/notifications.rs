@@ -489,7 +489,7 @@ mod tests {
     #[test]
     fn sanitize_push_scope_url_rejects_wrong_workspace_prefix() {
         let scope = sanitize_push_scope_url(
-            Some("https://lucidos.test/personal/".into()),
+            Some("https://lucidos.test/myws/".into()),
             &headers("/dev/", Some("https://lucidos.test")),
         );
         assert!(scope.is_none());

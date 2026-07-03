@@ -115,3 +115,112 @@ describe('toggleDevicePush optimistic update', () => {
     expect(showToast).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * Durable per-workspace device id (packaged desktop app). The id used to live only
+ * in WKWebView localStorage, which a new DMG bundle re-buckets — so the app
+ * registered a brand-new device on every update. `reconcileDeviceIdWithNativeStore`
+ * adopts the id from the native store (which survives a reinstall) before the first
+ * API call. The function is pure (deps injected), so these tests provide fakes.
+ */
+describe('reconcileDeviceIdWithNativeStore', () => {
+  const KEY = 'lucidos-device-id';
+
+  /** Minimal in-memory Storage stub with a spied setItem. */
+  function makeStorage(init: Record<string, string> = {}) {
+    const m = new Map(Object.entries(init));
+    return {
+      getItem: (k: string) => (m.has(k) ? (m.get(k) as string) : null),
+      setItem: vi.fn((k: string, v: string) => {
+        m.set(k, v);
+      }),
+      read: (k: string) => (m.has(k) ? (m.get(k) as string) : null),
+    };
+  }
+
+  it('seeds localStorage from the native store after a reinstall (THE fix)', async () => {
+    // Reinstall: WKWebView re-bucketed localStorage so it is empty, but the native
+    // store survives and returns the OLD durable id. We must adopt it, not the fresh
+    // candidate — otherwise a brand-new device registers.
+    const { reconcileDeviceIdWithNativeStore } = await import('./devices');
+    const storage = makeStorage();
+    const randomUUID = vi.fn(() => 'fresh-uuid');
+    const getOrCreate = vi.fn(async () => 'old-durable-id');
+
+    await reconcileDeviceIdWithNativeStore({ workspace: 'alpha', getOrCreate, storage, randomUUID });
+
+    expect(getOrCreate).toHaveBeenCalledWith('alpha', 'fresh-uuid');
+    expect(storage.setItem).toHaveBeenCalledWith(KEY, 'old-durable-id');
+    expect(storage.read(KEY)).toBe('old-durable-id');
+  });
+
+  it('does not churn an existing install (existing id is adopted as the candidate)', async () => {
+    // First run of the fixed build with a pre-existing localStorage id: get-or-create
+    // returns that same id, so nothing is rewritten and no random uuid is minted.
+    const { reconcileDeviceIdWithNativeStore } = await import('./devices');
+    const storage = makeStorage({ [KEY]: 'existing-id' });
+    const randomUUID = vi.fn(() => 'fresh-uuid');
+    const getOrCreate = vi.fn(async (_ws: string, candidate: string) => candidate);
+
+    await reconcileDeviceIdWithNativeStore({ workspace: 'alpha', getOrCreate, storage, randomUUID });
+
+    expect(getOrCreate).toHaveBeenCalledWith('alpha', 'existing-id');
+    expect(randomUUID).not.toHaveBeenCalled();
+    expect(storage.setItem).not.toHaveBeenCalled();
+  });
+
+  it('persists a freshly minted id on a true first run (empty native store)', async () => {
+    const { reconcileDeviceIdWithNativeStore } = await import('./devices');
+    const storage = makeStorage();
+    const randomUUID = vi.fn(() => 'fresh-uuid');
+    const getOrCreate = vi.fn(async (_ws: string, candidate: string) => candidate);
+
+    await reconcileDeviceIdWithNativeStore({ workspace: 'alpha', getOrCreate, storage, randomUUID });
+
+    expect(getOrCreate).toHaveBeenCalledWith('alpha', 'fresh-uuid');
+    expect(storage.setItem).toHaveBeenCalledWith(KEY, 'fresh-uuid');
+  });
+
+  it('is best-effort: a failing native store never throws and never rewrites', async () => {
+    const { reconcileDeviceIdWithNativeStore } = await import('./devices');
+    const storage = makeStorage({ [KEY]: 'existing-id' });
+    const randomUUID = vi.fn(() => 'fresh-uuid');
+    const getOrCreate = vi.fn(async () => {
+      throw new Error('IPC down');
+    });
+
+    await expect(
+      reconcileDeviceIdWithNativeStore({ workspace: 'alpha', getOrCreate, storage, randomUUID }),
+    ).resolves.toBeUndefined();
+    expect(storage.setItem).not.toHaveBeenCalled();
+    expect(storage.read(KEY)).toBe('existing-id');
+  });
+
+  it('seeds the candidate before the await so a concurrent getDeviceId stays consistent', async () => {
+    // Empty storage (reinstall) + a native call that never resolves in time: the
+    // candidate is seeded synchronously, so a getDeviceId() that runs mid-boot
+    // returns this id rather than minting a different throwaway UUID (which would
+    // register a spurious device — the timeout-edge race the seed closes).
+    const { reconcileDeviceIdWithNativeStore } = await import('./devices');
+    const storage = makeStorage();
+    const randomUUID = vi.fn(() => 'fresh-uuid');
+    let resolveIpc!: (v: string) => void;
+    const getOrCreate = vi.fn(() => new Promise<string>((res) => { resolveIpc = res; }));
+
+    const pending = reconcileDeviceIdWithNativeStore({
+      workspace: 'alpha',
+      getOrCreate,
+      storage,
+      randomUUID,
+    });
+
+    // Before the IPC resolves, storage already holds the candidate.
+    expect(storage.read(KEY)).toBe('fresh-uuid');
+
+    // The native store echoes the candidate (true first run) → no second write.
+    resolveIpc('fresh-uuid');
+    await pending;
+    expect(storage.read(KEY)).toBe('fresh-uuid');
+    expect(storage.setItem).toHaveBeenCalledTimes(1);
+  });
+});

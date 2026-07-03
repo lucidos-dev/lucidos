@@ -135,7 +135,8 @@ impl EventBus {
                            END,
                            compose_text = '',
                            compose_images = '[]'::jsonb,
-                           compose_mode = NULL
+                           compose_mode = NULL,
+                           compose_selection = NULL
                        -- Defense in depth: refuse to resurrect a discarded thread if a
                        -- stale MessageReceived slips past the API-layer guard.
                        WHERE thread_summaries.state != 'discarded'"#,
@@ -231,7 +232,8 @@ impl EventBus {
                            state = 'active',
                            compose_text = '',
                            compose_images = '[]'::jsonb,
-                           compose_mode = NULL
+                           compose_mode = NULL,
+                           compose_selection = NULL
                        -- Defense in depth (see MessageReceived above for rationale).
                        WHERE thread_summaries.state != 'discarded'"#,
                 )
@@ -560,7 +562,8 @@ impl EventBus {
                 sqlx::query(
                     "UPDATE thread_summaries SET state = 'discarded', \
                      archive_state = 'archived', \
-                     compose_text = '', compose_images = '[]'::jsonb, compose_mode = NULL \
+                     compose_text = '', compose_images = '[]'::jsonb, compose_mode = NULL, \
+                     compose_selection = NULL \
                      WHERE thread_id = $1 AND state = 'composing'",
                 )
                 .bind(thread_id)
@@ -866,9 +869,8 @@ impl EventBus {
             // exchange on user input — surface in REVIEW. AskUserQuestion kills
             // the Claude Code subprocess; the permission prompt keeps it alive while
             // its MCP stdio server blocks on the engine's HTTP response. The
-            // projection treats them identically: status flips to
-            // 'waiting_for_user_answer' on the request and back to 'running'
-            // on the resolution.
+            // REQUEST flips status to 'waiting_for_user_answer' unconditionally for
+            // both; the RESOLUTION side differs by kind — see the two arms below.
             ThreadEvent::UserQuestionAsked { .. }
             | ThreadEvent::CodingAgentPermissionRequest { .. }
             | ThreadEvent::CommandPermissionRequested { .. }
@@ -885,13 +887,39 @@ impl EventBus {
                 .await?;
                 Vec::new()
             }
-            ThreadEvent::UserQuestionAnswered { .. }
-            | ThreadEvent::CodingAgentPermissionResolved { .. }
+            // A question answer can RESUME a session that already idled: answering
+            // an AskUserQuestion after the thread parked spawns a `--resume`
+            // (see `agent_question.rs`, `ANSWERED_AFTER_IDLE_REASON`). So it must
+            // flip `idle -> running` UNCONDITIONALLY.
+            ThreadEvent::UserQuestionAnswered { .. } => {
+                sqlx::query(
+                    "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), \
+                     status = 'running', last_revived_at = NOW() WHERE thread_id = $1",
+                )
+                .bind(thread_id)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
+            // A permission resolution only ever unblocks an in-memory broadcast
+            // waiter (cc_permission / command_permission / mcp_permission) — it
+            // NEVER spawns a resume. So it may flip to 'running' ONLY when the
+            // thread is still genuinely parked on the card
+            // ('waiting_for_user_answer'). Resolving a card whose session already
+            // ended (a stale click hours after idle, or the clear-at-idle sweep
+            // in `emit_coding_agent_idled`) must NOT resurrect an idle/terminal
+            // thread into a dead 'running' with no live session to consume it —
+            // that was the zombie-`running` bug
+            // (`docs/plans/2026-07-02-cc-permission-card-zombie-running.md`). Both
+            // CASE arms read the pre-update `status`, so they agree.
+            ThreadEvent::CodingAgentPermissionResolved { .. }
             | ThreadEvent::CommandPermissionResolved { .. }
             | ThreadEvent::McpPermissionResolved { .. } => {
                 sqlx::query(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), \
-                     status = 'running', last_revived_at = NOW() WHERE thread_id = $1",
+                     status = CASE WHEN status = 'waiting_for_user_answer' THEN 'running' ELSE status END, \
+                     last_revived_at = CASE WHEN status = 'waiting_for_user_answer' THEN NOW() ELSE last_revived_at END \
+                     WHERE thread_id = $1",
                 )
                 .bind(thread_id)
                 .execute(&mut **tx)

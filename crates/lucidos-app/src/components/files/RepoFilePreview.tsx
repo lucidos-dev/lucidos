@@ -16,6 +16,7 @@ import { DiffView } from './DiffView';
 import { RenderedDiff } from './RenderedDiff';
 import { ChangesFileList } from './RepoFilesView';
 import { LoadableError } from '../shared/LoadableError';
+import { bridgePreviewIframeShortcuts } from './previewIframeShortcuts';
 
 interface Props {
   repoId: string;
@@ -196,7 +197,7 @@ function RepoFileMedia({ repoId, path, changeId, ext }: { repoId: string; path: 
   if (kind === 'image') {
     return <img src={url} alt={path} style="max-width:100%;max-height:100%;object-fit:contain;" onClick={() => { if (isMobile()) openImagePopup(url); }} />;
   }
-  if (kind === 'pdf') return <iframe src={url} style="width:100%;height:100%;border:none;" />;
+  if (kind === 'pdf') return <iframe src={url} style="width:100%;height:100%;border:none;" onLoad={(e) => bridgePreviewIframeShortcuts(e.currentTarget)} />;
   if (kind === 'video') return <video src={url} controls style="max-width:100%;max-height:100%;" />;
   return <audio src={url} controls style="width:100%;" />;
 }
@@ -255,9 +256,13 @@ function RepoFileText({ repoId, path, changeId }: { repoId: string; path: string
   if (renderPreview) {
     // No html/htm branch: REPO_RENDERABLE_EXTS excludes them, so a repo HTML file
     // never reaches here — it renders as syntax-highlighted source below.
-    if (ext === 'md') return <div class="response-content markdown-content" dangerouslySetInnerHTML={{ __html: renderedHtml! }} />;
-    if (ext === 'csv') return <div dangerouslySetInnerHTML={{ __html: renderedHtml! }} />;
-    if (ext === 'svg') return <img src={renderedHtml!} alt={path} style="max-width:100%;max-height:100%;object-fit:contain;" onClick={() => { if (isMobile()) openImagePopup(renderedHtml!); }} />;
+    // `.repo-file-rendered` insets the content to match the rendered diff
+    // (.rendered-diff), so toggling diff ↔ full file keeps the same gutter.
+    if (ext === 'md') return <div class="repo-file-rendered"><div class="response-content markdown-content" dangerouslySetInnerHTML={{ __html: renderedHtml! }} /></div>;
+    if (ext === 'csv') return <div class="repo-file-rendered" dangerouslySetInnerHTML={{ __html: renderedHtml! }} />;
+    // The media variant keeps a definite height so the image's max-height:100%
+    // still fits the pane (the bare padding wrapper would leave it unconstrained).
+    if (ext === 'svg') return <div class="repo-file-rendered repo-file-rendered-media"><img src={renderedHtml!} alt={path} style="max-width:100%;max-height:100%;object-fit:contain;" onClick={() => { if (isMobile()) openImagePopup(renderedHtml!); }} /></div>;
   }
 
   const sel = selectedLines.value;

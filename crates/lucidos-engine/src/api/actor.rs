@@ -204,9 +204,14 @@ pub fn host_protection_env_vars(workspace_path: &std::path::Path) -> Vec<(&'stat
                 .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
                 .unwrap_or(false);
             if behind_gateway {
+                // Scheme via `net_config::tls_scheme` (never hardcoded): a
+                // fronted engine serves plain HTTP today (the gateway strips
+                // `LUCIDOS_TLS_*`), and this resolves to exactly what THIS
+                // process serves either way.
+                let scheme = crate::net_config::tls_scheme();
                 vars.push((
                     "LUCIDOS_API_BASE_URL",
-                    format!("http://127.0.0.1:{api_port}"),
+                    format!("{scheme}://127.0.0.1:{api_port}"),
                 ));
             }
             vars.push(("LUCIDOS_API_PORT", api_port));

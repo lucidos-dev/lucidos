@@ -7,7 +7,8 @@ export interface FileSearchResult {
 }
 
 /** Collect searchable files from workspace, repo, and change sources.
- *  Deduplicates within each source category; same path may appear in
+ *  Deduplicates within the repo and change categories (workspace paths come
+ *  from a disk listing that is already unique); the same path may appear in
  *  different sources (e.g. workspace AND repo) since they're distinct files. */
 export function collectSearchResults(
   workspacePaths: string[],
@@ -20,7 +21,6 @@ export function collectSearchResults(
 
   for (const p of workspacePaths) {
     results.push({ path: p, source: 'workspace' });
-    seen.add(p);
   }
 
   for (const p of repoPaths) {

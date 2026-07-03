@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { PanelOverlay } from '../store';
 
 // NavEntry and pure functions are tested directly without importing the
@@ -522,5 +522,133 @@ describe('wipPreviewThreadId is a nav-tracked axis', () => {
 
     cursor += 3;
     expect(stack[cursor].wipPreviewThreadId).toBe('thread-abc');
+  });
+});
+
+// Unlike the pure-logic suites above (which duplicate the stack math), this one
+// exercises the REAL restoreState() path: seed the persisted nav stack in
+// localStorage, import the navigation + store modules fresh, then trigger
+// ensureInitialized() → restoreState() by reading a nav computed. It pins the
+// fix that a transient, request-backed form overlay (plugin install/uninstall,
+// email-confirm, engine-prompted credential) is NOT resurrected on reload — its
+// staged request id is dead — while persistent forms and the scalar nav fields
+// still restore.
+describe('restoreState suppresses transient request-backed form overlays on reload', () => {
+  // Mirrors NAV_KEY in entityReferences.ts (the key restoreState reads/writes).
+  const NAV_KEY = 'lucidos-nav-history';
+
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  /** Seed NAV_KEY with a single-entry stack whose cursor overlay is `overlay`
+   *  (plus optional scalar nav fields), import navigation + store fresh, and
+   *  trigger restore by reading a nav computed (which runs ensureInitialized).
+   *  Returns the freshly-imported store module so the caller can assert on the
+   *  signals restoreState mutated. */
+  async function restoreWithOverlay(
+    overlay: PanelOverlay,
+    scalars: { menuItem?: string; settingsSubview?: string } = {},
+  ) {
+    const entry = {
+      menuItem: scalars.menuItem ?? 'plugins',
+      settingsSubview: scalars.settingsSubview ?? 'main',
+      overlay,
+      wipPreviewThreadId: null,
+    };
+    localStorage.setItem(NAV_KEY, JSON.stringify({ stack: [entry], cursor: 0 }));
+    const nav = await import('./navigation');
+    const store = await import('../store');
+    // Reading a nav computed runs ensureInitialized() → restoreState(cursor entry).
+    void nav.canGoBack.value;
+    return store;
+  }
+
+  it('drops a stale plugin-uninstall overlay while still restoring menuItem + settingsSubview', async () => {
+    const store = await restoreWithOverlay(
+      {
+        type: 'form',
+        form: {
+          type: 'plugin-uninstall',
+          request: {
+            uninstall_id: 'u-dead-uuid',
+            plugin_id: 'habit-tracker',
+            plugin_version: '1.0.0',
+            plugin_name: 'Habit Tracker',
+            files_present: ['data/apps/habit-tracker/manifest.json'],
+            files_missing: [],
+          },
+        },
+      },
+      { menuItem: 'settings', settingsSubview: 'accounts' },
+    );
+    // The stale uninstall panel is NOT resurrected …
+    expect(store.panelOverlay.value).toBeNull();
+    // … but the scalar nav fields still restore.
+    expect(store.activeMenuItem.value).toBe('settings');
+    expect(store.settingsSubview.value).toBe('accounts');
+  });
+
+  it('drops a stale plugin-install overlay', async () => {
+    const store = await restoreWithOverlay({
+      type: 'form',
+      form: {
+        type: 'plugin-install',
+        request: {
+          install_id: 'i-dead-uuid',
+          source: 'git://example.com/habit-tracker',
+          source_type: 'git',
+          manifest: {},
+          files: [],
+          overwrites: [],
+          plugin_id: 'habit-tracker',
+          plugin_version: '1.0.0',
+          plugin_name: 'Habit Tracker',
+        },
+      },
+    });
+    expect(store.panelOverlay.value).toBeNull();
+  });
+
+  it('drops a stale email-confirm overlay', async () => {
+    const store = await restoreWithOverlay({
+      type: 'form',
+      form: {
+        type: 'email-confirm',
+        request: {
+          to: ['someone@example.com'],
+          subject: 'Hello',
+          body: 'staged body',
+          account: 'work',
+          from: 'me@example.com',
+        },
+      },
+    });
+    expect(store.panelOverlay.value).toBeNull();
+  });
+
+  it('drops an engine-prompted credential request (credential form WITH a request)', async () => {
+    const store = await restoreWithOverlay({
+      type: 'form',
+      form: { type: 'credential', request: { service: 'example-service' } },
+    });
+    expect(store.panelOverlay.value).toBeNull();
+  });
+
+  it('restores a Settings-driven credential edit (credential form WITHOUT a request)', async () => {
+    const overlay: PanelOverlay = { type: 'form', form: { type: 'credential', editing: 'example-service' } };
+    const store = await restoreWithOverlay(overlay);
+    expect(store.panelOverlay.value).toEqual(overlay);
+  });
+
+  it('restores a persistent trigger form overlay', async () => {
+    const overlay: PanelOverlay = { type: 'form', form: { type: 'trigger', triggerId: 'trigger-x' } };
+    const store = await restoreWithOverlay(overlay);
+    expect(store.panelOverlay.value).toEqual(overlay);
   });
 });

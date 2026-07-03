@@ -1,5 +1,36 @@
 import { describe, it, expect } from 'vitest';
-import { trapTargetIndex, paneTabTarget } from './paneFocus';
+import {
+  trapTargetIndex, paneTabTarget,
+  shouldReconcilePaneFocus, PANE_FOCUS_REGION,
+  isContentPaneIframeFocus,
+} from './paneFocus';
+
+// A click inside any content-pane iframe (app, preview, PDF plugin, cross-origin
+// URL) moves the host's activeElement to the <iframe> and fires window blur; this
+// pure check decides whether that focus target should move the content-pane
+// focus marker. It
+// keys on tagName + a `.pane-content` ancestor (not `instanceof HTMLIFrameElement`)
+// so it's testable without jsdom, mirroring appFrame.test.ts's stub style.
+describe('isContentPaneIframeFocus', () => {
+  const fake = (tagName: string, inContentPane: boolean): Element =>
+    ({ tagName, closest: (sel: string) => (sel === '.pane-content' && inContentPane ? {} : null) } as unknown as Element);
+
+  it('is true for an iframe inside the content pane', () => {
+    expect(isContentPaneIframeFocus(fake('IFRAME', true))).toBe(true);
+  });
+
+  it('is false for a non-iframe element (a normal pane control keeps host focus)', () => {
+    expect(isContentPaneIframeFocus(fake('BUTTON', true))).toBe(false);
+  });
+
+  it('is false for an iframe outside the content pane (e.g. an app frame elsewhere)', () => {
+    expect(isContentPaneIframeFocus(fake('IFRAME', false))).toBe(false);
+  });
+
+  it('is false for null activeElement', () => {
+    expect(isContentPaneIframeFocus(null)).toBe(false);
+  });
+});
 
 // Pure boundary logic for the per-pane Tab trap. The DOM handler relies on a
 // pane being a contiguous subtree, so the browser's default Tab handles the
@@ -72,5 +103,54 @@ describe('paneTabTarget', () => {
     expect(paneTabTarget(1, -1, true)).toBe(0);
     expect(paneTabTarget(1, 0, false)).toBe(0);
     expect(paneTabTarget(1, 0, true)).toBe(0);
+  });
+});
+
+// Pure decision behind `reconcilePaneFocus` — keeps real DOM focus in sync with
+// the focused-pane (focusedPane) marker so native scroll keys act on the pane the
+// marker points at. The DOM-touching wrapper (rAF + query + `.focus()`) is
+// covered by browser e2e; this pins the "should we move focus at all" contract.
+describe('shouldReconcilePaneFocus', () => {
+  it('pulls focus in when desktop, no overlay, and focus is outside the pane', () => {
+    expect(shouldReconcilePaneFocus({ mobile: false, overlayOpen: false, focusInsidePane: false })).toBe(true);
+  });
+
+  it('never steals a click\'s own focus — no-op when focus is already inside the pane', () => {
+    // This is what composes with focusPaneMainControl (lands focus in-pane → this
+    // then no-ops) and never yanks focus off a control clicked inside the pane.
+    expect(shouldReconcilePaneFocus({ mobile: false, overlayOpen: false, focusInsidePane: true })).toBe(false);
+  });
+
+  it('no-op on mobile (panes are navigated, not focused)', () => {
+    expect(shouldReconcilePaneFocus({ mobile: true, overlayOpen: false, focusInsidePane: false })).toBe(false);
+  });
+
+  it('no-op while an overlay owns focus (overlayStack manages its own focus)', () => {
+    expect(shouldReconcilePaneFocus({ mobile: false, overlayOpen: true, focusInsidePane: false })).toBe(false);
+  });
+
+  it('any single blocking condition suppresses the pull-in', () => {
+    // Only the all-clear case moves focus; every other combination is a no-op.
+    const combos = [
+      { mobile: true, overlayOpen: true, focusInsidePane: true },
+      { mobile: true, overlayOpen: false, focusInsidePane: false },
+      { mobile: false, overlayOpen: true, focusInsidePane: false },
+      { mobile: false, overlayOpen: false, focusInsidePane: true },
+    ];
+    for (const c of combos) expect(shouldReconcilePaneFocus(c)).toBe(false);
+  });
+});
+
+// The keyboard "surface" each pane hands focus to. Drawer maps to the pane
+// container itself (its list-nav keydown handler lives there); thread/content map
+// to their scroll regions so native Arrow/Page keys scroll the focused pane.
+describe('PANE_FOCUS_REGION', () => {
+  it('maps each pane to its scroll/keyboard-nav surface', () => {
+    // Thread is scoped to `.thread-view` so the compose/welcome `.thread-content`
+    // (no `.thread-view` wrapper, never focusable) is excluded — only a real
+    // thread's transcript matches.
+    expect(PANE_FOCUS_REGION.thread).toBe('.thread-view .thread-content');
+    expect(PANE_FOCUS_REGION.content).toBe('.content-pane-body');
+    expect(PANE_FOCUS_REGION.drawer).toBe('.thread-drawer');
   });
 });

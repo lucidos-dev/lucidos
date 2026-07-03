@@ -31,7 +31,7 @@ mod titles;
 #[cfg(test)]
 pub(crate) use context_build::{build_capture_sections, build_loaded_knowhow_block};
 #[cfg(test)]
-pub(crate) use system_prompt::ASK_USER_QUESTION_RULE;
+pub(crate) use system_prompt::{ASK_USER_QUESTION_RULE, REPEATED_ACTION_RULE};
 
 impl LucidosEngine {
     /// Process a trigger prompt (emits TriggerStarted instead of MessageReceived).

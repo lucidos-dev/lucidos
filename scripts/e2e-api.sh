@@ -44,9 +44,9 @@ export E2E_WORKSPACE
 
 # The CLI tests shell out to the `lucidos` binary. Make sure it's built and at
 # the expected target path before tests run.
-cargo build -p lucidos-cli
+cargo build --locked -p lucidos-cli
 
-CMD=(cargo test -p lucidos-e2e --test api)
+CMD=(cargo test --locked -p lucidos-e2e --test api)
 [ -n "$FILTER" ] && CMD+=("$FILTER")
 [ ${#CARGO_ARGS[@]} -gt 0 ] && CMD+=("--" "${CARGO_ARGS[@]}")
 

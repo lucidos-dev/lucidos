@@ -124,23 +124,7 @@ impl VertexProvider {
             }],
         });
 
-        let generation_config = if model.starts_with("gemini-3") {
-            let effort = reasoning_effort.unwrap_or("high");
-            if effort == "none" {
-                Some(VertexGenerationConfig {
-                    thinking_config: VertexThinkingConfig { thinking_budget: 0 },
-                })
-            } else {
-                let budget = crate::llm::thinking_budget_for_effort(effort);
-                Some(VertexGenerationConfig {
-                    thinking_config: VertexThinkingConfig {
-                        thinking_budget: budget,
-                    },
-                })
-            }
-        } else {
-            None
-        };
+        let generation_config = gemini_generation_config(model, reasoning_effort);
 
         let request = VertexRequest {
             system_instruction: system_inst,
@@ -189,6 +173,62 @@ impl VertexProvider {
         }
 
         Ok(response)
+    }
+}
+
+/// Build the `generationConfig.thinkingConfig` for a Gemini call. Only Gemini 3.x
+/// models get a thinking config; everything else returns `None` (unchanged).
+///
+/// Gemini 3.x wants `thinkingLevel` (never the deprecated `thinkingBudget` — it
+/// can 400 and degrades quality on 3.x), and `includeThoughts` routes the
+/// model's deliberation into `thought:true` parts that `build_gemini_llm_response`
+/// strips — so the visible answer stops "reasoning out loud". Extracted from
+/// `chat_gemini` so the request shape can be unit-tested.
+fn gemini_generation_config(
+    model: &str,
+    reasoning_effort: Option<&str>,
+) -> Option<VertexGenerationConfig> {
+    if !model.starts_with("gemini-3") {
+        return None;
+    }
+    let effort = reasoning_effort.unwrap_or("high");
+    Some(VertexGenerationConfig {
+        thinking_config: VertexThinkingConfig {
+            thinking_level: gemini_thinking_level(model, effort),
+            include_thoughts: true,
+        },
+    })
+}
+
+/// Map the unified `reasoning_effort` to a Gemini 3.x `thinkingLevel`, clamped to
+/// the levels the specific model accepts: Gemini 3 Flash supports
+/// `minimal`/`low`/`medium`/`high`; Gemini 3 Pro supports only `low`/`high`
+/// (sending Pro `minimal` or `medium` 400s). Gemini 3 can't fully disable
+/// thinking, so `none` maps to the model's floor (`minimal` on Flash, `low` on
+/// Pro). Unknown/higher efforts default to `high` — the model's own default.
+/// Lowercase per Google's REST docs.
+fn gemini_thinking_level(model: &str, effort: &str) -> &'static str {
+    let flash = model.contains("flash");
+    match effort {
+        // Gemini 3 can't be fully disabled; use the model's floor.
+        "none" => {
+            if flash {
+                "minimal"
+            } else {
+                "low"
+            }
+        }
+        "low" => "low",
+        // `medium` is Flash-only; Pro rounds up to its nearest valid level.
+        "medium" => {
+            if flash {
+                "medium"
+            } else {
+                "high"
+            }
+        }
+        // high / xhigh / max / unknown — cap at the model default.
+        _ => "high",
     }
 }
 
@@ -287,9 +327,18 @@ struct VertexGenerationConfig {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct VertexThinkingConfig {
-    #[serde(rename = "thinkingBudget")]
-    thinking_budget: u32,
+    /// Gemini 3.x reasoning control (`minimal`/`low`/`medium`/`high` — which are
+    /// valid depends on the model, see `gemini_thinking_level`). Replaces the
+    /// deprecated `thinkingBudget` for 3.x entirely: sending a budget to a
+    /// Gemini 3 model can 400 and degrades quality, and Gemini 3 thinking can't
+    /// be fully disabled (`minimal`, Flash-only, is the floor).
+    thinking_level: &'static str,
+    /// When true, Gemini returns its deliberation as `thought:true` parts that
+    /// `build_gemini_llm_response` strips — otherwise Flash narrates its
+    /// reasoning in the ordinary answer text.
+    include_thoughts: bool,
 }
 
 #[derive(Serialize)]
@@ -887,5 +936,54 @@ mod tests {
 
         assert_eq!(resp.stop_reason.as_deref(), Some("MAX_TOKENS"));
         assert_eq!(resp.output_tokens, Some(32768));
+    }
+
+    #[test]
+    fn gemini_thinking_level_clamps_to_model_supported_levels() {
+        // Flash supports the full set: minimal/low/medium/high.
+        assert_eq!(gemini_thinking_level("gemini-3.5-flash", "none"), "minimal");
+        assert_eq!(gemini_thinking_level("gemini-3.5-flash", "low"), "low");
+        assert_eq!(gemini_thinking_level("gemini-3.5-flash", "medium"), "medium");
+        assert_eq!(gemini_thinking_level("gemini-3.5-flash", "high"), "high");
+        assert_eq!(gemini_thinking_level("gemini-3.5-flash", "xhigh"), "high");
+        assert_eq!(gemini_thinking_level("gemini-3.5-flash", "max"), "high");
+        // Pro accepts only low/high: minimal floors to low, medium rounds to high.
+        assert_eq!(gemini_thinking_level("gemini-3-pro-preview", "none"), "low");
+        assert_eq!(gemini_thinking_level("gemini-3-pro-preview", "medium"), "high");
+        assert_eq!(gemini_thinking_level("gemini-3-pro-preview", "high"), "high");
+        // Unknown falls back to "high" — the model default.
+        assert_eq!(gemini_thinking_level("gemini-3.5-flash", "bogus"), "high");
+    }
+
+    #[test]
+    fn gemini_generation_config_none_for_non_gemini_3() {
+        // Claude-via-Vertex and Gemini 2.5 must not get a thinkingConfig here.
+        assert!(gemini_generation_config("claude-opus-4-8", Some("high")).is_none());
+        assert!(gemini_generation_config("gemini-2.5-flash", Some("high")).is_none());
+    }
+
+    #[test]
+    fn gemini_generation_config_uses_thinking_level_never_budget() {
+        // Gemini 3.x must always use thinkingLevel + includeThoughts and NEVER
+        // the deprecated thinkingBudget — sending a budget to a 3.x model can 400
+        // and degrades quality, including for the `none`/Off case.
+        for effort in ["none", "low", "medium", "high", "max"] {
+            let cfg = gemini_generation_config("gemini-3.5-flash", Some(effort)).unwrap();
+            let json = serde_json::to_value(&cfg).unwrap();
+            let tc = &json["thinkingConfig"];
+            assert!(tc["thinkingLevel"].is_string(), "effort {effort}: {tc}");
+            assert_eq!(tc["includeThoughts"], true, "effort {effort}");
+            assert!(
+                tc.get("thinkingBudget").is_none(),
+                "must never send thinkingBudget to Gemini 3 (effort {effort}): {tc}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_generation_config_defaults_to_high_when_effort_absent() {
+        let cfg = gemini_generation_config("gemini-3.5-flash", None).unwrap();
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["thinkingConfig"]["thinkingLevel"], "high");
     }
 }

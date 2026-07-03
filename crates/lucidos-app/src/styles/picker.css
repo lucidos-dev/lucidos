@@ -12,6 +12,9 @@
   padding: 4rem 1rem 3rem;
   overflow-y: auto;
   color: #fff;
+  /* The gateway surface wears a neutral sans-serif rather than the app's
+     monospace --font-ui — a calmer welcome screen. */
+  font-family: var(--font-sans);
   /* The mark's own radial gradient, scaled to fill the viewport — a lighter
      take on the brand blue, with a soft highlight for depth. */
   background:
@@ -25,6 +28,14 @@
   max-width: 30rem;
 }
 
+/* Buttons/inputs don't inherit font-family from their container, so opt them
+   into the picker's neutral sans explicitly — otherwise they'd fall back to the
+   UA default and read differently from the surrounding text. */
+.ws-picker button,
+.ws-picker input {
+  font-family: inherit;
+}
+
 /* ── Header / animated mark ───────────────────────────────────────────────── */
 
 /* Header is centered (brand lockup + "Choose a workspace"), with a tight gap to
@@ -35,14 +46,15 @@
   position: relative;
 }
 
-/* Gateway reload control — pinned to the header's top-right so it stays clear of
-   the centered brand lockup. Subtle until a new build is available, when it warms
-   and grows a badge dot. (Dev surface: only lights up when a rebuilt gateway
-   binary is on disk.) */
+/* Gateway reload control — sits just to the LEFT of the settings gear in the
+   header's top-right (2rem gear width + a 0.25rem gap), clear of the centered
+   brand lockup. Subtle until a new build is available, when it warms and grows a
+   badge dot. (Dev surface: only lights up when a rebuilt gateway binary is on
+   disk.) */
 .ws-picker-reload {
   position: absolute;
   top: 0;
-  right: 0;
+  right: 2.25rem;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -98,13 +110,13 @@
   }
 }
 
-/* Network access control — pinned to the header's top-LEFT (the reload control
-   owns top-right) so it stays clear of the centered brand. Mirrors the reload
-   control's subtle styling. */
+/* Network access (settings) control — the RIGHTMOST header control, pinned to the
+   top-right corner (its natural corner); the reload control sits just to its left.
+   Mirrors the reload control's subtle styling. */
 .ws-picker-net-btn {
   position: absolute;
   top: 0;
-  left: 0;
+  right: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -130,25 +142,48 @@
   cursor: default;
 }
 
-/* Network access popover (anchored to the gear). Wider than the small confirm
-   popovers since it holds a form. Inherits ws-picker-confirm's chrome. Tuned for
-   a compact, refined rhythm: secondary prose uses translucent white (the picker's
-   white-on-blue stand-in for --text-secondary, applied via color not opacity so
-   the accent inside it stays full-strength). */
+/* Network access popover — drops from the settings gear in the header's top-right
+   corner, right-aligned to the same edge (the gear is at right:0). Inherits
+   ws-picker-confirm's chrome. Tuned for a compact, refined rhythm: secondary prose
+   uses translucent white (the picker's white-on-blue stand-in for
+   --text-secondary, applied via color not opacity so the accent inside it stays
+   full-strength). */
 .ws-picker-net {
+  top: 2.25rem;
+  right: 0;
   width: min(21rem, calc(100vw - 2rem));
   text-align: left;
 }
 .ws-picker-net-title {
   margin: 0 0 0.25rem;
-  font-size: 0.9375rem;
+  /* Clearly larger + brighter than the description below. The class also sets an
+     explicit white color: as a bare <h2> it would otherwise inherit the global
+     `h2 { color: var(--text-primary) }`, which is dark in light theme and renders
+     the heading near-invisible on the dark-blue popover — so the muted-white
+     description visually outweighed it. */
+  font-size: var(--font-size-2xl);
   font-weight: 600;
+  line-height: 1.25;
+  color: #fff;
 }
 .ws-picker-net-desc {
   margin: 0 0 0.625rem;
-  font-size: 0.8125rem;
+  font-size: var(--font-size-md);
   color: rgba(255, 255, 255, 0.62);
   line-height: 1.4;
+}
+
+/* Value-bearing controls (segmented bind picker, address field, inherit toggle).
+   They render at full structure immediately so the popover's height is fixed at
+   open; while the gateway config is in flight they dim + go inert (no value is
+   marked active yet, so no wrong default shows). On load they fade to full
+   strength — opacity only, so the popover never resizes (the load jank fix). */
+.ws-picker-net-controls {
+  transition: opacity var(--duration-normal) ease;
+}
+.ws-picker-net-controls.is-loading {
+  opacity: 0.45;
+  pointer-events: none;
 }
 
 /* Three-mode bind picker as a single connected segmented control: an inset
@@ -170,7 +205,7 @@
   border-radius: 0.375rem;
   background: transparent;
   color: rgba(255, 255, 255, 0.7);
-  font-size: 0.75rem;
+  font-size: var(--font-size-sm);
   font-weight: 500;
   line-height: 1.25;
   cursor: pointer;
@@ -191,12 +226,12 @@
   align-items: center;
   gap: 0.5rem;
   margin-top: 0.625rem;
-  font-size: 0.8125rem;
+  font-size: var(--font-size-md);
   cursor: pointer;
 }
 .ws-picker-net-hint {
   margin: 0.25rem 0 0;
-  font-size: 0.75rem;
+  font-size: var(--font-size-sm);
   color: rgba(255, 255, 255, 0.6);
   line-height: 1.4;
 }
@@ -222,12 +257,12 @@
 .ws-picker-net-error {
   display: block;
   margin-top: 0.25rem;
-  font-size: 0.75rem;
+  font-size: var(--font-size-sm);
   color: #ffd9d4;
 }
 .ws-picker-net-restart {
   margin: 0.625rem 0 0;
-  font-size: 0.75rem;
+  font-size: var(--font-size-sm);
   color: rgba(255, 255, 255, 0.7);
   font-style: italic;
 }
@@ -314,7 +349,7 @@
      cleanly against the logo without the font's leading offsetting it. */
   line-height: 1;
   color: #fff;
-  font-size: 2.25rem;
+  font-size: var(--font-size-display);
   font-weight: 700;
   letter-spacing: -0.01em;
 }
@@ -322,7 +357,7 @@
 .ws-picker-header p {
   margin: 0.25rem 0 0;
   color: rgba(255, 255, 255, 0.72);
-  font-size: 0.9375rem;
+  font-size: var(--font-size-xl);
 }
 
 /* ── States ──────────────────────────────────────────────────────────────── */
@@ -334,7 +369,7 @@
   border-radius: 0.625rem;
   padding: 0.625rem 0.875rem;
   margin-bottom: 1rem;
-  font-size: 0.875rem;
+  font-size: var(--font-size-lg);
 }
 
 .ws-picker-empty {
@@ -344,17 +379,17 @@
 }
 
 /* ── Loading skeleton ────────────────────────────────────────────────────────
-   Shimmer placeholders shown while the workspace list loads (immediately, then
-   crossfaded into the list by <LoadingFade>). Skeleton rows reuse the real
-   `.ws-picker-row`/`.ws-picker-open` wrapper, so each row's height is fixed by
-   its tallest cell — the 2rem action placeholder, matching the real row's 2rem
-   `.ws-picker-icon` — giving an identical 3.25rem row height (2rem + 1.25rem
-   padding) so the skeleton→list handoff doesn't reflow. White-on-blue
-   translucent fill matching the picker's brand language; reuses the global
-   `shimmer` keyframes (drawer.css). */
-.ws-picker-skel-dot,
-.ws-picker-skel-name,
-.ws-picker-skel-action {
+   The list placeholder renders the real `.ws-picker-row`/`.ws-picker-open`
+   markup via the shared self-skeletonizing primitives (Skeleton.tsx → `.sk-bar`
+   leaves), so each row's height is fixed by its tallest cell — the 2rem action
+   block, matching the real row's 2rem `.ws-picker-icon` — giving an identical
+   3.25rem row height (2rem + 1.25rem padding) so the skeleton→list handoff
+   doesn't reflow. The picker sits on the brand-blue gradient, so re-skin the
+   shared `.sk-bar` fill (theme-token by default) to a white-on-blue translucent
+   shimmer in this context; structure + the `shimmer` animation stay shared.
+   Scoped to the whole picker so both the workspace-list rows and the Network
+   access popover skeleton share the shimmer. */
+.ws-picker .sk-bar {
   background: linear-gradient(
     90deg,
     rgba(255, 255, 255, 0.08) 25%,
@@ -362,32 +397,6 @@
     rgba(255, 255, 255, 0.08) 75%
   );
   background-size: 200% 100%;
-  animation: shimmer 1.5s infinite;
-}
-
-/* Matches .ws-picker-dot */
-.ws-picker-skel-dot {
-  flex: 0 0 auto;
-  width: 0.625rem;
-  height: 0.625rem;
-  border-radius: 50%;
-}
-
-/* A partial name bar; margin-right:auto pushes the action placeholder to the
-   row's right edge, the way the flex-grow name cell does in a real row. */
-.ws-picker-skel-name {
-  flex: 0 1 9rem;
-  height: 0.875rem;
-  border-radius: 0.4375rem;
-  margin-right: auto;
-}
-
-/* Matches the .ws-picker-icon pill (the play/stop control). */
-.ws-picker-skel-action {
-  flex: 0 0 auto;
-  width: 2rem;
-  height: 2rem;
-  border-radius: 0.5rem;
 }
 
 /* ── List / rows (flat, no card) ─────────────────────────────────────────── */
@@ -446,7 +455,7 @@
   flex: 1 1 auto;
   min-width: 0;
   font-weight: 600;
-  font-size: 1rem;
+  font-size: var(--font-size-xl);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -467,7 +476,7 @@
   border-radius: 0.625rem;
   background: rgba(255, 255, 255, 0.92);
   color: #0a3d91;
-  font-size: 0.75rem;
+  font-size: var(--font-size-sm);
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   line-height: 1;
@@ -571,7 +580,7 @@
   border-radius: 0.4375rem;
   background: transparent;
   color: #fff;
-  font-size: 0.875rem;
+  font-size: var(--font-size-lg);
   font-weight: 500;
   text-align: left;
   cursor: pointer;
@@ -606,11 +615,11 @@
   box-shadow: 0 0.5rem 1.5rem rgba(3, 25, 60, 0.55);
   text-align: left;
 }
-/* The reload icon is pinned to the header's top-right, so the confirm hangs
-   below it, right-aligned to the same edge. */
+/* The reload icon sits just left of the settings gear (right: 2.25rem), so the
+   confirm hangs below it, right-aligned to the icon's right edge. */
 .ws-picker-confirm-reload {
   top: 2.25rem;
-  right: 0;
+  right: 2.25rem;
 }
 /* The stop confirm hangs below-right of the row's stop button. */
 .ws-picker-confirm-stop {
@@ -619,7 +628,7 @@
 }
 .ws-picker-confirm-text {
   margin: 0 0 0.625rem;
-  font-size: 0.8125rem;
+  font-size: var(--font-size-md);
   line-height: 1.4;
   color: rgba(255, 255, 255, 0.85);
 }
@@ -641,7 +650,7 @@
 }
 
 .ws-picker-delete {
-  font-size: 0.875rem;
+  font-size: var(--font-size-lg);
   color: rgba(255, 255, 255, 0.85);
 }
 
@@ -653,7 +662,7 @@
   border-radius: 0.5rem;
   color: #fff;
   padding: 0.4375rem 0.625rem;
-  font-size: 0.9375rem;
+  font-size: var(--font-size-xl);
 }
 .ws-picker-input::placeholder { color: rgba(255, 255, 255, 0.55); }
 .ws-picker-input:focus {
@@ -668,7 +677,7 @@
   color: #fff;
   border-radius: 0.5rem;
   padding: 0.4375rem 0.875rem;
-  font-size: 0.875rem;
+  font-size: var(--font-size-lg);
   font-weight: 500;
   cursor: pointer;
   transition: background 0.15s ease;
@@ -698,7 +707,7 @@
 }
 
 .ws-picker-suggestions-label {
-  font-size: 0.8125rem;
+  font-size: var(--font-size-md);
   color: rgba(255, 255, 255, 0.6);
 }
 
@@ -708,7 +717,7 @@
   color: #fff;
   border-radius: 1rem;
   padding: 0.25rem 0.75rem;
-  font-size: 0.8125rem;
+  font-size: var(--font-size-md);
   font-weight: 500;
   cursor: pointer;
   transition: background 0.15s ease, border-color 0.15s ease;
@@ -732,7 +741,7 @@
   color: #fff;
   border-radius: 0.625rem;
   padding: 0.625rem 1.125rem;
-  font-size: 0.9375rem;
+  font-size: var(--font-size-xl);
   font-weight: 500;
   cursor: pointer;
   transition: background 0.15s ease, border-color 0.15s ease;
@@ -774,7 +783,7 @@
   border: 1px dashed rgba(255, 255, 255, 0.45);
   border-radius: 0.625rem;
   color: rgba(255, 255, 255, 0.8);
-  font-size: 0.875rem;
+  font-size: var(--font-size-lg);
   text-align: center;
   cursor: pointer;
   transition: background 0.15s ease, border-color 0.15s ease;
@@ -785,7 +794,7 @@
 }
 
 .ws-picker-restore-warn {
-  font-size: 0.8125rem;
+  font-size: var(--font-size-md);
   color: #ffd9d4;
 }
 
@@ -798,7 +807,7 @@
   margin-top: 1.25rem;
   padding: 0.625rem 0.875rem;
   border-radius: 0.625rem;
-  font-size: 0.875rem;
+  font-size: var(--font-size-lg);
   background: rgba(0, 0, 0, 0.22);
   border: 1px solid rgba(255, 255, 255, 0.18);
 }
@@ -816,7 +825,7 @@
   width: 1rem;
   height: 1rem;
   border-radius: 50%;
-  border: 2px solid rgba(255, 255, 255, 0.3);
+  border: 0.125rem solid rgba(255, 255, 255, 0.3);
   border-top-color: #fff;
   animation: ws-restore-spin 0.8s linear infinite;
 }
@@ -834,10 +843,7 @@
   .ws-rv-final,
   .ws-picker-dot-booting,
   .ws-picker-restore-spinner,
-  .ws-picker-reload.is-reloading svg,
-  .ws-picker-skel-dot,
-  .ws-picker-skel-name,
-  .ws-picker-skel-action {
+  .ws-picker-reload.is-reloading svg {
     animation: none;
   }
 }

@@ -1,11 +1,10 @@
 import { createPortal } from 'preact/compat';
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { signal, useSignal } from '@preact/signals';
-import { connectionStatus, restartRequired, updateAvailable, workspaceName } from '../../store/store';
+import { connectionStatus, restartRequired, updateAvailable, engineVersionReady, engineBuilding, enginePackaged, workspaceName } from '../../store/store';
 import { initiateEngineRestart } from '../../store/actions/chat-changes';
 import { refreshClient } from '../../hooks/sw-update';
 import { useLongPress } from '../../hooks/useLongPress';
-import { installPairedSwallow } from '../../hooks/useAnchoredPopover';
 import { CheckIcon, ReloadIcon } from '../shared/icons';
 import { fetchWorkspaces } from '../../api/client';
 import type { WorkspaceInfo } from '../../api/client';
@@ -15,6 +14,7 @@ import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { Overlay } from '../shared/Overlay';
 import { LoadingFade } from '../shared/LoadingFade';
+import { SkeletonProvider, SkText, SkBlock } from '../shared/Skeleton';
 import { viewportIsMobile } from '../../utils/viewport';
 
 export const controlPanelOpen = signal(false);
@@ -124,30 +124,116 @@ export function toggleControlPanelAtClick(e: MouseEvent & { currentTarget: Event
   controlPanelOpen.value = !controlPanelOpen.value;
 }
 
-export function controlPanelBadgeCount(): number {
-  return (restartRequired.value ? 1 : 0) + (updateAvailable.value ? 1 : 0);
+/** Whether a new engine version is actually READY to switch onto — the honest
+ *  "ready for the switch" signal that agrees with the background-build scheme.
+ *
+ *  In **dev** this is `engineVersionReady` alone: Apply is non-disruptive and
+ *  kicks off a background rebuild, so a freshly-applied restart-requiring change
+ *  (`restartRequired`) does NOT mean a new version exists yet — the switch only
+ *  becomes available once that build finishes and the on-disk binary differs
+ *  (the version-status poll flips `engineVersionReady`, see engine-update.ts).
+ *  Surfacing it at Apply time lit the badge before anything could have been built.
+ *
+ *  In **packaged** there is no background build — a newer GitHub release is
+ *  immediately installable — so `restartRequired` (set from the outdated-release
+ *  check in connection.ts) IS the ready signal; `engineVersionReady` never fires
+ *  there (the poll no-ops for packaged builds).
+ *
+ *  Note: `restartRequired` deliberately still gates the client-refresh ordering
+ *  (client-update.ts holds a refresh until after the engine switch, even during
+ *  the build window) — that is a different concern from this visible badge. */
+export function engineNewVersionReady(): boolean {
+  return engineVersionReady.value || (enginePackaged.value && restartRequired.value);
+}
+
+/** Visible state of the brand-title badge.
+ *  - `building` — a background engine rebuild is in flight (dev): spinning refresh icon.
+ *  - `ready` — a new engine version is ready to switch onto, or a newer client
+ *    bundle is available to refresh: a single `!` attention mark.
+ *  - `none` — nothing to surface; the badge is not rendered.
+ *  Building wins over ready: a switch/refresh isn't offered until the build lands. */
+export type BrandBadgeState = 'building' | 'ready' | 'none';
+
+export function controlPanelBadgeState(): BrandBadgeState {
+  if (engineBuilding.value) return 'building';
+  if (engineNewVersionReady() || updateAvailable.value) return 'ready';
+  return 'none';
 }
 
 export function controlPanelBadgeTooltip(): string | undefined {
-  const restart = restartRequired.value;
+  if (engineBuilding.value) return 'Building new version…';
+  const newVersion = engineNewVersionReady();
   const update = updateAvailable.value;
-  if (restart && update) return 'Restart needed · Update available';
-  if (restart) return 'Restart needed';
-  if (update) return 'Update available';
+  if (newVersion && update) return 'New version available · Client update available';
+  if (newVersion) return 'New version available';
+  if (update) return 'Client update available';
   return undefined;
 }
 
+/** The brand-title badge shared by the desktop + mobile app headers. Renders a
+ *  spinning refresh icon while a new engine version builds, a `!` when a
+ *  switch/refresh is ready, and nothing otherwise. Reads the driving signals in
+ *  its own render so it re-renders in place as they change. */
+export function BrandBadge() {
+  const state = controlPanelBadgeState();
+  if (state === 'none') return null;
+  return (
+    <span class="badge brand-badge" data-tooltip={controlPanelBadgeTooltip()}>
+      {state === 'building'
+        ? <span class="brand-badge-spinner"><ReloadIcon /></span>
+        : '!'}
+    </span>
+  );
+}
+
 /** Display state for the current workspace's refresh control: its tooltip and
- *  whether to show the update-available dot. Pure so it can be unit-tested across
- *  all four pending×update combinations. `pending` = a restart is pending
- *  (`restartRequired`); `update` = a newer build is available (`updateAvailable`,
- *  the same honest build-id signal that drives the brand badge). */
+ *  whether to show the client-update dot. Pure so the whole presentation rule is
+ *  unit-testable from the three raw signals.
+ *
+ *  - `ready` = a new engine version is ready to switch onto (`engineNewVersionReady()`)
+ *    — a hold restarts onto it; the honest "ready for the switch" signal, NOT the
+ *    apply-time `restartRequired`, so the reload glyph only lights once the
+ *    background rebuild is ready.
+ *  - `clientUpdateAvailable` = a newer client bundle is served (the `updateAvailable`
+ *    build-id signal; named without the shadow so the body can't confuse it for
+ *    the imported signal).
+ *  - `enginePending` = an engine switch is pending or building
+ *    (`restartRequired || engineVersionReady`).
+ *
+ *  The client-refresh dot is advertised only when a newer bundle exists AND no
+ *  engine switch is pending/building. With the engine serving a build-pinned
+ *  client (api/frontend_snapshot.rs) the web `updateAvailable` signal is already
+ *  false during a pending switch (the served build matches the loaded one), so
+ *  `!enginePending` is defense-in-depth here — and it also holds the Tauri
+ *  app-version axis (which sets `updateAvailable` directly) until after the
+ *  switch, so this actionable control never invites a refresh onto the old engine. */
 export function currentWorkspaceRefreshState(
-  pending: boolean,
-  update: boolean,
+  ready: boolean,
+  clientUpdateAvailable: boolean,
+  enginePending: boolean,
 ): { tooltip: string; showUpdateBadge: boolean } {
-  const base = pending ? 'Refresh · hold to restart & apply changes' : 'Refresh · hold to restart';
+  const update = clientUpdateAvailable && !enginePending;
+  const base = ready ? 'Refresh · hold to restart & apply changes' : 'Refresh · hold to restart';
   return { tooltip: update ? `Update available · ${base}` : base, showUpdateBadge: update };
+}
+
+/** Whether a click on a Restart-confirm button should actually fire its action.
+ *
+ *  A long-press reveals the Cancel/Restart confirm buttons UNDER the still-down
+ *  pointer, and the browser pairs a stray release `click` with the long-press.
+ *  On the mouse path that stray click lands on the freshly-mounted confirm
+ *  button — but its `pointerdown` was on the now-unmounted refresh glyph, before
+ *  the confirm rendered, so the confirm button never saw a `pointerdown` for it.
+ *  A genuine deliberate tap always dispatches its OWN `pointerdown` on the
+ *  confirm button first (`freshPointerDown`). Keyboard activation (Enter/Space)
+ *  dispatches a `click` with no `pointerdown` at all, so it's allowed via
+ *  `keyboard` (a click whose `detail === 0`). Deterministic — no time fuses, no
+ *  document listeners. Pure so the "fires on the first click" contract is
+ *  directly unit-testable. */
+export function shouldActivateConfirm(
+  { freshPointerDown, keyboard }: { freshPointerDown: boolean; keyboard: boolean },
+): boolean {
+  return freshPointerDown || keyboard;
 }
 
 function isGatewayRunning(ws: WorkspaceStatus): boolean {
@@ -190,25 +276,52 @@ function ManageWorkspacesItem() {
  *  highlighted. */
 function CurrentWorkspaceControls() {
   const confirming = useSignal(false);
-  const pending = restartRequired.value;
-  const update = updateAvailable.value;
+  // Gates a confirm-button click on its OWN preceding pointerdown (see
+  // shouldActivateConfirm). The stray release click the browser pairs with the
+  // long-press has no such pointerdown (it fired on the now-unmounted refresh
+  // glyph), so it's ignored deterministically — the user's FIRST deliberate
+  // click fires. Reset when the confirm opens and after acting so each reveal
+  // starts clean.
+  const freshPress = useSignal(false);
+  // Highlight the reload glyph as "new version ready to switch onto" only when
+  // the rebuild is actually READY (engineNewVersionReady) — not the instant a
+  // restart-requiring change is applied. Under the background-build scheme the
+  // dev binary is still compiling right after Apply, so keying the highlight off
+  // `restartRequired` lit it before there was anything to switch to.
+  const ready = engineNewVersionReady();
+  // An engine switch is pending or mid-build. currentWorkspaceRefreshState uses
+  // this to suppress the client-refresh dot in that window (defense-in-depth atop
+  // the build-pinned serving, and the guard for the Tauri app-version axis), so
+  // this actionable control never invites a refresh onto the still-old engine.
+  const enginePending = restartRequired.value || engineVersionReady.value;
 
   const longPress = useLongPress(
     () => {
-      confirming.value = true;
       // The refresh button unmounts as the confirm buttons render in its place
-      // under the still-down pointer, so useLongPress's own (button-bound) click
-      // swallow can't run. This document-level one-shot eats the click/touchend
-      // the browser pairs with the long-press release, so it can't activate a
-      // confirm button without a deliberate fresh tap.
-      installPairedSwallow();
+      // under the still-down pointer. Start the reveal with a clean freshPress
+      // flag so the stray release click (whose pointerdown was on the refresh
+      // glyph, not on a confirm button) is ignored — only a deliberate fresh
+      // pointerdown on a confirm button, or a keyboard activation, fires it.
+      freshPress.value = false;
+      confirming.value = true;
     },
     () => { refreshClient(); },
   );
 
+  // A confirm click acts only when it had its own preceding pointerdown on the
+  // button (freshPress) or is keyboard-synthesized (detail === 0). The stray
+  // long-press release click has neither, so it no-ops here without a fuse.
+  const confirmAllowed = (e: Event): boolean =>
+    shouldActivateConfirm({
+      freshPointerDown: freshPress.value,
+      keyboard: (e as MouseEvent).detail === 0,
+    });
+
   const doRestart = (e: Event) => {
     e.preventDefault();
     e.stopPropagation();
+    if (!confirmAllowed(e)) return;
+    freshPress.value = false;
     confirming.value = false;
     closeControlPanel();
     void initiateEngineRestart();
@@ -216,23 +329,26 @@ function CurrentWorkspaceControls() {
   const cancel = (e: Event) => {
     e.preventDefault();
     e.stopPropagation();
+    if (!confirmAllowed(e)) return;
+    freshPress.value = false;
     confirming.value = false;
   };
 
   if (confirming.value) {
+    const armFresh = () => { freshPress.value = true; };
     return (
       <span class="control-panel-ws-restart-confirm">
-        <button type="button" class="control-panel-ws-cancel" onClick={cancel}>Cancel</button>
-        <button type="button" class="control-panel-ws-confirm" onClick={doRestart}>Restart</button>
+        <button type="button" class="control-panel-ws-cancel" onPointerDown={armFresh} onClick={cancel}>Cancel</button>
+        <button type="button" class="control-panel-ws-confirm" onPointerDown={armFresh} onClick={doRestart}>Restart</button>
       </span>
     );
   }
 
-  const { tooltip, showUpdateBadge } = currentWorkspaceRefreshState(pending, update);
+  const { tooltip, showUpdateBadge } = currentWorkspaceRefreshState(ready, updateAvailable.value, enginePending);
   return (
     <button
       type="button"
-      class={`control-panel-ws-refresh${pending ? ' is-pending' : ''}`}
+      class={`control-panel-ws-refresh${ready ? ' is-pending' : ''}`}
       aria-label={tooltip}
       data-tooltip={tooltip}
       onPointerDown={longPress.onPointerDown}
@@ -252,22 +368,25 @@ function CurrentWorkspaceControls() {
   );
 }
 
-/** Shimmer placeholder rows shown while the workspace switcher loads its list.
- *  Reuses `.control-panel-workspace-row` so each row's height (min-height 2rem)
- *  matches a real switcher row exactly — no reflow on the skeleton→list handoff.
- *  Decorative → aria-hidden. Shown immediately (the panel is a popover with no
- *  competing content behind the list — see `.claude/rules/frontend.md`
- *  § "full-screen surface"). */
+/** Placeholder rows shown while the workspace switcher loads its list. Renders
+ *  the real `.control-panel-workspace-row` markup (dot + name) via the shared
+ *  self-skeletonizing primitives (Skeleton.tsx → `.sk-bar` leaves), so each row's
+ *  height (min-height 2rem) matches a real switcher row exactly — no reflow on
+ *  the skeleton→list handoff, and the shimmer vocabulary is shared (no bespoke
+ *  skel classes to drift). Decorative → aria-hidden; crossfaded in via
+ *  `<LoadingFade>`. */
 function WorkspaceSwitcherSkeleton({ rows = 3 }: { rows?: number }) {
   return (
-    <div class="control-panel-workspace-skel" aria-hidden="true">
-      {Array.from({ length: rows }, (_, i) => (
-        <div class="control-panel-workspace-row" key={i}>
-          <span class="control-panel-skel-dot" />
-          <span class="control-panel-skel-name" />
-        </div>
-      ))}
-    </div>
+    <SkeletonProvider>
+      <div class="control-panel-workspace-skel" aria-hidden="true">
+        {Array.from({ length: rows }, (_, i) => (
+          <div class="control-panel-workspace-row" key={i}>
+            <SkBlock w="0.625rem" h="0.625rem" circle />
+            <SkText class="control-panel-ws-name" w="8rem" />
+          </div>
+        ))}
+      </div>
+    </SkeletonProvider>
   );
 }
 

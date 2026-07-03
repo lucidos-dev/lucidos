@@ -17,6 +17,7 @@ import { refreshPushSubscription, recoverServiceWorker } from '../store/actions/
 import { setupNativePushTapRouting } from '../store/actions/native-push';
 import { startDevicePresenceTracking } from '../store/actions/device-presence';
 import { startAppUpdateChecks, stopAppUpdateChecks } from '../store/actions/app-update';
+import { startEngineUpdateChecks, stopEngineUpdateChecks, checkEngineVersion } from '../store/actions/engine-update';
 import { startScrollVisibilityHandler } from '../components/chat/scrollState';
 import { isTauri } from '../utils/platform';
 import { invoke } from '../utils/tauri';
@@ -25,6 +26,7 @@ import { restoreRepoSelectionFromStorage } from '../store/actions/repositories';
 import { openThreadAcrossWorkspaces } from '../store/actions/cross-workspace';
 import { CHECK_ICON, COPY_ICON } from '../utils/markedConfig';
 import { activeMenuItem, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, showConfirm, showPrompt, FOCUSED_THREAD_KEY, setFocusedThread } from '../store/store';
+import { installContentPaneIframeFocusTracking } from '../components/layout/paneFocus';
 import { requestServiceWorkerBuildId } from './sw-update';
 import { syncClientUpdateFromBuild } from '../store/actions/client-update';
 import {
@@ -83,6 +85,15 @@ export function useStartup(): void {
     loadPreferences().then(() => {
       // Notifications must load after preferences so the persisted filter is applied
       if (activeMenuItem.value === 'notifications') loadNotifications();
+      // The version-update dismissals are now GLOBAL preferences, so the update
+      // surfaces skip while preferences are still loading (they can't yet know if
+      // this build was dismissed). Re-derive now that preferences are known: the
+      // client-refresh has no poll of its own, so without this a previously
+      // dismissed toast would flash on cold start and linger until the next resume
+      // / PreferencesChanged; the engine-switch also derives promptly instead of
+      // waiting up to one 4s poll.
+      void syncClientUpdateFromBuild();
+      void checkEngineVersion();
     }).catch(() => { /* loadPreferences sets Loadable failed internally — UI shows the error */ });
     void loadPinnedApps();
     loadAllThreads().catch(() => {
@@ -217,6 +228,19 @@ export function useStartup(): void {
     // hoisted here for the cleanup to reach.
     let updateFoundReg: ServiceWorkerRegistration | null = null;
     let updateFoundHandler: ((this: ServiceWorkerRegistration) => void) | null = null;
+    if (!window.isSecureContext && !isTauri()) {
+      // Telemetry carve-out (.claude/rules/frontend.md): runs on every page load
+      // without user intent, so no toast (a per-load nag can't be dismissed for
+      // good). On an insecure origin (plain http://<host> — e.g. a packaged
+      // Linux install reached over the LAN) the platform grants no service
+      // worker and no push; Chrome hides navigator.serviceWorker entirely, so
+      // the block below silently no-ops. The user still finds out where it
+      // matters: enabling push (Settings → Devices) toasts the same condition
+      // via pushUnsupportedReasonHere().
+      console.warn(
+        `[Startup] Insecure origin (${location.origin}): service worker + push notifications unavailable. Open Lucidos over https:// or localhost (SSH tunnel / tailscale serve).`,
+      );
+    }
     if ('serviceWorker' in navigator) {
       // Base-path aware (ADR 0014): behind the gateway the SW is served at
       // /<slug>/sw.js and scoped to /<slug>/, so each workspace is an
@@ -357,7 +381,7 @@ export function useStartup(): void {
         id?: unknown;
         payload?: {
           title?: unknown; message?: unknown; okLabel?: unknown; cancelLabel?: unknown; danger?: unknown;
-          type?: unknown; durationMs?: unknown; dismissable?: unknown;
+          type?: unknown; durationMs?: unknown; dismissable?: unknown; key?: unknown;
           defaultValue?: unknown; placeholder?: unknown; multiline?: unknown;
         };
       } | null;
@@ -377,7 +401,9 @@ export function useStartup(): void {
         const allowed = ['success', 'info', 'warning', 'error'] as const;
         type ToastT = (typeof allowed)[number];
         const toastType: ToastT = allowed.includes(payload.type as ToastT) ? payload.type as ToastT : 'info';
+        const key = typeof payload.key === 'string' && payload.key.length > 0 ? payload.key : undefined;
         showToast(payload.message, toastType, {
+          key,
           autoDismissMs: typeof payload.durationMs === 'number' ? payload.durationMs : undefined,
           dismissable: typeof payload.dismissable === 'boolean' ? payload.dismissable : undefined,
         });
@@ -444,6 +470,11 @@ export function useStartup(): void {
       // while we were backgrounded lights the update badge even if the browser's
       // own SW update check is slow/wedged on iOS.
       void syncClientUpdateFromBuild();
+      // Reconcile the engine build state too: a PWA suspended for the whole
+      // background build missed the transient EngineBuildStateChanged pokes (SSE
+      // isn't replayed on reconnect), so re-poll authoritatively on resume — shows
+      // 'ready' if the build finished while away, never a stale spin.
+      void checkEngineVersion();
       // Probe the SW for liveness too — a wedged SW won't accept update()
       // either, so resume is the natural moment to detect and recover.
       checkSwHealth().catch(() => { /* best-effort recovery; next probe retries */ });
@@ -502,6 +533,12 @@ export function useStartup(): void {
     // notices. Tauri-only; a no-op in a browser/PWA/dev. See store/actions/app-update.ts.
     startAppUpdateChecks();
 
+    // Dev: poll the engine version-status so a background rebuild (kicked off by
+    // Apply) surfaces "New version available → Switch to new version" once ready.
+    // No-op in packaged (that path uses the release updater above). See
+    // store/actions/engine-update.ts.
+    startEngineUpdateChecks();
+
     return () => {
       unmounted = true;
       stopLiveness();
@@ -510,6 +547,7 @@ export function useStartup(): void {
       stopSwProbe();
       if (heartbeatInterval) clearInterval(heartbeatInterval);
       stopAppUpdateChecks();
+      stopEngineUpdateChecks();
       clearTimeout(initialHealthCheck);
       window.removeEventListener('message', onAppFrameMessage);
       stopHashRouting();
@@ -529,4 +567,11 @@ export function useStartup(): void {
       window.removeEventListener('pageshow', onResume);
     };
   }, []);
+
+  // Keep the content-pane focus marker fresh when keyboard focus lands inside a
+  // content-pane iframe (app, file/HTML/PDF preview, cross-origin URL preview).
+  // Those clicks never reach the pane's own onPointerDown handler, so the focus
+  // marker would otherwise go stale. See installContentPaneIframeFocusTracking
+  // (paneFocus.ts).
+  useEffect(() => installContentPaneIframeFocusTracking(), []);
 }

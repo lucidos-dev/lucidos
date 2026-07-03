@@ -94,7 +94,7 @@ If the user's request doesn't clearly land in one of the rows above, **ask** —
 Three independent fields control the notification:
 
 - **`app_id`** — *which* app the notification is about. Drives the inbox modal's "Open <app>" button. Set it whenever the notification relates to a specific app (so the user can navigate from the modal to the relevant app), even when the tap routing is `{ kind: 'modal' }`.
-- **`tap`** — *what happens on tap*. Discriminated union: `{ kind: 'modal' }` (default — opens the inbox modal showing the body), `{ kind: 'none' }` (passive — marks read with no navigation; for informational pushes that need no follow-up), or `{ kind: 'navigate', to: NavigateUi }` (delegates to the same router `navigate_ui` uses; `to` is its arg shape). Every kind marks the source notification read on tap.
+- **`tap`** — *what happens on tap*. Discriminated union: `{ kind: 'modal' }` (default — opens the inbox detail showing the body; use it for informational pushes too, every notification is openable) or `{ kind: 'navigate', to: NavigateUi }` (delegates to the same router `navigate_ui` uses; `to` is its arg shape). Both mark the source notification read on tap. (The passive `{ kind: 'none' }` kind was retired — `docs/plans/2026-07-02-remove-notification-tap-none.md`.)
 - **`event_id`** — *which specific event inside the linked thread* raised the notification. Optional UUID. Used by the §4 in-app matrix to silently mark-read when the user is already looking at the source event. Distinct from `tap.to.event_id` (which is the scroll-and-pulse target when the tap navigates to a thread — typically the same value).
 
 | Trigger says | `app_id` | `tap` | `event_id` |
@@ -106,9 +106,9 @@ Three independent fields control the notification:
 | Daily summary "you completed 5 tasks today" — informational, no CTA | omit | `{ kind: 'modal' }` (default) | — |
 | 22:00 bedtime nudge — informational | omit | `{ kind: 'modal' }` (default) | — |
 | Habit-tracker weekly report — about an app, but the action is reading | habit-tracker | `{ kind: 'modal' }` (default) | — |
-| "Backup complete" / "Sync finished" — purely informational, no action needed | omit | `{ kind: 'none' }` | — |
+| "Backup complete" / "Sync finished" — purely informational, no action needed | omit | `{ kind: 'modal' }` (default) | — |
 
-Tap defaults to `{ kind: 'modal' }` so the user reads the message and decides what to do — `navigate` is the explicit opt-in for direct CTAs and panel deep-links. `{ kind: 'none' }` is for passive informational pushes — the row marks itself read the moment the user could see it (toast on screen, OR push tapped), so it doesn't sit in the inbox waiting for acknowledgement. The notification always lands in the inbox regardless of `tap`, so the user can re-open the modal manually from the bell icon.
+Tap defaults to `{ kind: 'modal' }` so the user reads the message and decides what to do — `navigate` is the explicit opt-in for direct CTAs and panel deep-links. Informational pushes use the default `{ kind: 'modal' }` too — every notification is openable (the passive `{ kind: 'none' }` kind was retired). The notification always lands in the inbox regardless of `tap`, so the user can re-open the detail manually from the bell icon.
 
 See `system-knowhow/js-sdk.md` § `lucidos.notifications` for the full `NavigateUi` target list (panels, apps, threads, files, triggers, creation forms, URLs).
 
@@ -324,7 +324,15 @@ and the engine adds `data/triggers/*/trigger.toml` to the workspace repo's local
 `.git/info/exclude`. **Don't hand-edit it** — a change is overwritten on the next
 trigger event or restart; edit triggers via `create_trigger`/`update_trigger`
 (or the UI), which emit the events the projection follows. Runtime/identity
-fields (`id`, `last_run`, `paused`) are deliberately omitted.
+fields (`id`, `last_run`, `last_run_status`, `paused`) are deliberately omitted.
+
+Each firing is recorded as events (`TriggerExecuted` + `TriggerCompleted`, plus any
+*domain event* the run emits), and the trigger's row in the triggers panel shows the
+**last run's OK/failed status** next to its timestamp. There's no built-in run-history
+view: for deeper detail on a threadless trigger's runs — what it found, when, why a run
+failed — ask the *Lucidos Agent* (it reads the events via `query_events`) or build an
+*app* on the trigger's events (`lucidos.events`), since every surface already reaches
+them.
 
 The file exists so a trigger is inspectable (the Plugins panel's installed-plugin
 file links point at it for plugin-shipped triggers) and so a *plugin* can SHIP a

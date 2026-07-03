@@ -1,7 +1,8 @@
 import { useRef, useEffect, useState, useMemo } from 'preact/hooks';
 import { Overlay } from '../shared/Overlay';
 import { signal, useSignalEffect } from '@preact/signals';
-import { pendingChatMessage, showToast, openImagePopupFromGroup, focusedThreadId, threadMap, panelUrl, panelTitle, cancelingThreadIds, answeringThreadIds, clearThreadAnswering, effectiveThreadStatus, isMidTurn, currentApp, wipPreviewThreadId, selectedCodingAgent } from '../../store/store';
+import { pendingChatMessage, showToast, openImagePopupFromGroup, focusedThreadId, threadMap, panelUrl, panelTitle, cancelingThreadIds, answeringThreadIds, clearThreadAnswering, effectiveThreadStatus, isMidTurn, currentApp, wipPreviewThreadId, promptSendCollapsing, composeViewActive } from '../../store/store';
+import { resolveCodingAgent } from '../../store/composeSelections';
 import { sendMessage, handleCancelExchange } from '../../store/actions/chat';
 import { currentChatContext, type ChatContext } from '../../store/actions/chatContext';
 import { answerThreadQuestion } from '../../store/actions/chat-claude-code';
@@ -27,15 +28,16 @@ import { CodingAgentControlMenu, codingAgentMenuOpenRequest } from './CodingAgen
 import { LucidosControlMenu } from './LucidosControlMenu';
 import { TodoListIndicator } from './TodoListPanel';
 import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton, type BannerState } from './WaitingBanner';
-import { composeHasContent, computeMorphMode, computeAnswerActionMode, dispatchSend, computeSubmitMultiCount, findPendingMultiSelectQuestion, findLatestPendingQuestion, shouldClearCanceling, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
+import { composeHasContent, computeMorphMode, computeAnswerActionMode, dispatchSend, computeSubmitMultiCount, findPendingMultiSelectQuestion, findLatestPendingQuestion, shouldClearCanceling, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
 import { SplitButton } from '../shared/SplitButton';
 export * from './prompt-input-helpers';
 import { useFitsInOneRow } from '../../hooks/useFitsInOneRow';
 import { focusIfNeeded, composeHandlers } from './promptFocus';
-import { syncTextareaValue, shouldSkipSyncWhileEditing } from './promptValueSync';
+import { syncTextareaValue, shouldSkipSyncWhileEditing, promptOverrideSyncSeq } from './promptValueSync';
 import { effectiveCodingAgentBackend, effectiveSendMode } from './promptToggleMode';
-import { resizeTextarea, useFontMetricsResize } from './promptResize';
+import { resizeTextarea, useFontMetricsResize, animateTextareaHeightFrom } from './promptResize';
 import { isMobile } from '../../utils/viewport';
+import { prefersReducedMotion } from '../../utils/platform';
 import { createTapGate } from '../../utils/tapGesture';
 import { errorDetail } from '../../utils/errorDetail';
 import { extractPasteUrl, escapeMarkdownLinkText } from '../../utils/extractPasteUrl';
@@ -103,18 +105,18 @@ function CameraCapture() {
     cameraOpen.value = false;
   }
 
+  // Backdrop-only modal (the attach menu that opened it is gone by now, so
+  // there is no anchor toggle) — <Overlay> owns dismiss/swallow/Escape/inert.
   return (
-    <div class="camera-overlay" onClick={close}>
-      <div class="camera-container" onClick={(e) => e.stopPropagation()}>
-        <video ref={videoRef} autoPlay playsInline muted class="camera-video" />
-        <div class="camera-controls">
-          <button class="camera-capture-btn" onClick={capture} data-tooltip="Take photo">
-            <CaptureIcon />
-          </button>
-          <button class="action-btn action-btn-danger" onClick={close}>Cancel</button>
-        </div>
+    <Overlay open onClose={close} overlayClass="camera-overlay" panelClass="camera-container" panelRole="dialog">
+      <video ref={videoRef} autoPlay playsInline muted class="camera-video" />
+      <div class="camera-controls">
+        <button class="camera-capture-btn" onClick={capture} data-tooltip="Take photo">
+          <CaptureIcon />
+        </button>
+        <button class="action-btn action-btn-danger" onClick={close}>Cancel</button>
       </div>
-    </div>
+    </Overlay>
   );
 }
 
@@ -169,10 +171,20 @@ export function PromptInput() {
   // Preserve cursor on same-thread re-syncs; let it end-snap on thread switch.
   // shouldSkipSyncWhileEditing protects in-flight keystrokes — see its docstring.
   const prevTidRef = useRef<string | null | undefined>(undefined);
+  // Whether the PREVIOUS render was the centered compose view — drives the
+  // compose↔compose height animation (which must NOT fire on a compose↔active
+  // switch, where the ThreadPane FLIP owns the transition instead).
+  const wasComposeViewRef = useRef(false);
+  // A deliberate programmatic override (welcome starter suggestion) bumps this
+  // counter to force the very next sync past the skip-while-editing guard. Track
+  // the last value we acted on so a bump forces exactly one sync.
+  const overrideSyncSeq = promptOverrideSyncSeq.value;
+  const lastOverrideSyncSeqRef = useRef(overrideSyncSeq);
   useEffect(() => {
     const el = inputRef.current;
     if (!el) return;
     const sameThread = prevTidRef.current === tid;
+    const isComposeView = composeViewActive.value;
     const thisElementActive = document.activeElement === el;
     // An empty canonical draft must reach the textarea even while it is focused:
     // clearing is never "clobbering in-flight typing" — composeText is '' only
@@ -181,16 +193,39 @@ export function PromptInput() {
     // block an empty sync left stale text stuck in a focused textarea after the
     // clear-X on WebKit (the "Clearing a follow-up draft" flake).
     const forceEmptySync = composeText === '';
-    if ((forceEmptySync || !shouldSkipSyncWhileEditing(el, sameThread, thisElementActive))
+    // A one-shot override (suggestion replacing an in-progress draft) must land
+    // in the textarea regardless of focus/content — the drawer-updates-but-prompt-
+    // stays-stale bug. requestPromptOverrideSync bumps the counter after the draft
+    // write, so this render sees both.
+    const forceOverride = overrideSyncSeq !== lastOverrideSyncSeqRef.current;
+    lastOverrideSyncSeqRef.current = overrideSyncSeq;
+    if ((forceEmptySync || forceOverride || !shouldSkipSyncWhileEditing(el, sameThread, thisElementActive))
         && syncTextareaValue(el, composeText, sameThread)) {
+      // Compose-view → compose-view switch (e.g. draft ↔ draft, or draft ↔ the
+      // blank compose view): the centered layout stays put, so the ThreadPane
+      // FLIP never fires and the textarea would otherwise insta-resize. Ease its
+      // height from the previous view's to the new one. Gate on composeViewActive
+      // (NOT "both are composing threads" — the blank view has no thread id, which
+      // is exactly the case the old gate missed). A compose↔active switch flips
+      // composeViewActive, so this is false there and the FLIP owns it instead.
+      // Capture the old inline height BEFORE autoResize overwrites it. Desktop-only
+      // + motion-respecting, mirroring the ThreadPane FLIP.
+      const animateSwitch = !sameThread && wasComposeViewRef.current && isComposeView
+        && !isMobile() && !prefersReducedMotion();
+      const fromHeight = animateSwitch ? el.style.height : '';
       autoResize();
-      requestAnimationFrame(() => requestAnimationFrame(() => autoResize()));
+      if (animateSwitch && fromHeight) {
+        animateTextareaHeightFrom(el, fromHeight);
+      } else {
+        requestAnimationFrame(() => requestAnimationFrame(() => autoResize()));
+      }
     }
     if (!sameThread && !isMobile()) {
       requestAnimationFrame(() => focusIfNeeded(el));
     }
     prevTidRef.current = tid;
-  }, [tid, composeText]);
+    wasComposeViewRef.current = isComposeView;
+  }, [tid, composeText, overrideSyncSeq]);
 
   useFontMetricsResize(() => autoResize());
 
@@ -295,7 +330,18 @@ export function PromptInput() {
       return;
     }
     el.value = '';
-    el.style.height = 'auto';
+    // In the centered compose layout the prompt re-docks on send. Defer the
+    // height collapse to the ThreadPane FLIP so a tall draft shrinks *and*
+    // slides into the docked follow-up state together, instead of snapping
+    // short first and then moving. The FLIP consumes this flag and owns the
+    // reset in every path (incl. reduced-motion / mobile), so it can't stick
+    // tall. Follow-up sends (docked already, no FLIP) reset immediately.
+    const inComposeLayout = !threadId || thread?.meta.state === 'composing';
+    if (inComposeLayout) {
+      promptSendCollapsing.value = true;
+    } else {
+      el.style.height = 'auto';
+    }
     scrollToBottom();
     if (isMobile()) el.blur();
 
@@ -340,7 +386,7 @@ export function PromptInput() {
     // keep the slash as normal message text.
     const tid = focusedThreadId.value;
     const thread = tid ? threadMap.value.get(tid) : undefined;
-    const isClaudeCodeMode = effectiveCodingAgentBackend(thread, selectedCodingAgent.value) === 'claude-code';
+    const isClaudeCodeMode = effectiveCodingAgentBackend(thread, resolveCodingAgent(tid)) === 'claude-code';
     if (isClaudeCodeMode && val.startsWith('/')) {
       el.value = '';
       autoResize();
@@ -469,14 +515,29 @@ export function PromptInput() {
   const toggleMode = effectiveSendMode(focusedThread);
   const willUseCodingAgent = toggleMode === 'claude_code';
   const hasUrlContext = !!panelUrl.value && !willUseCodingAgent;
-  const promptCodingAgent = effectiveCodingAgentBackend(focusedThread, selectedCodingAgent.value);
+  // Per-draft coding-agent backend: resolve the focused draft's override (falls
+  // back to the global default) so the control button + slash routing match the
+  // draft the user is editing, not a global another draft changed.
+  const isComposingFocused = focusedThread?.meta.state === 'composing';
+  // Compose context = a focused composing draft OR the fresh no-draft compose
+  // view (no focused thread). NOT an active thread. Drives the control menus'
+  // per-draft/pending routing so a fresh-compose pick lands in the pending slot,
+  // never a global that every override-less draft reads.
+  const inComposeContext = !focusedThread || focusedThread.meta.state === 'composing';
+  const promptCodingAgent = effectiveCodingAgentBackend(
+    focusedThread,
+    resolveCodingAgent(focusedThreadId.value),
+  );
   const showCodingAgentControls = promptCodingAgent !== null;
   // A focused composing draft has no backend session yet. Load controls as a
   // compose-view menu so Codex/Claude and repo scope come from the picker,
-  // not from the server's legacy thread default.
+  // not from the server's legacy thread default. `codingAgentControlThreadId` is
+  // the active-session id; `composeControlThreadId` is the composing draft id —
+  // mutually exclusive, and the compose one keys the per-draft model/effort/scope.
   const codingAgentControlThreadId = focusedThread?.meta.state === 'active'
     ? focusedThreadId.value ?? undefined
     : undefined;
+  const composeControlThreadId = isComposingFocused ? focusedThreadId.value ?? undefined : undefined;
 
   const waitingState = getWaitingState();
 
@@ -528,11 +589,13 @@ export function PromptInput() {
     if (!thread) return;
     const canceledQid = canceledQuestionByThread.value.get(focused);
     const latestPendingQid = findLatestPendingQuestion(thread)?.toolUseId;
-    if (shouldClearCanceling(effectiveThreadStatus(thread), canceledQid, latestPendingQid)) {
+    const canceledWhileAwaiting = canceledWhileAwaitingByThread.value.has(focused);
+    if (shouldClearCanceling(effectiveThreadStatus(thread), canceledQid, latestPendingQid, canceledWhileAwaiting)) {
       const next = new Set(cancelingThreadIds.value);
       next.delete(focused);
       cancelingThreadIds.value = next;
       setCanceledQuestion(focused, undefined);
+      setCanceledWhileAwaiting(focused, false);
     }
     // cancelingThreadIds.value intentionally omitted from deps — the effect
     // writes to it, and it only needs to fire when status changes (carried by
@@ -640,12 +703,22 @@ export function PromptInput() {
     const targetId = cancelTargetId;
     if (!targetId) return;
     const targetQuestionId = findLatestPendingQuestion(focusedThread)?.toolUseId;
+    // Whether a card (question OR permission) was on screen at click time.
+    // A permission card sets no `canceledQuestionId` (it isn't an
+    // UserQuestionAsked), so this bit is what keeps such a cancel bridged
+    // through waiting_for_user_answer instead of falling to the running-turn
+    // release. See `shouldClearCanceling`.
+    const canceledWhileAwaiting = focusedThread
+      ? effectiveThreadStatus(focusedThread) === 'waiting_for_user_answer'
+      : false;
     if (queuedUploadSends.value.has(targetId)) {
       clearQueuedUploadSend(targetId);
       setCanceledQuestion(targetId, undefined);
+      setCanceledWhileAwaiting(targetId, false);
       return;
     }
     setCanceledQuestion(targetId, targetQuestionId);
+    setCanceledWhileAwaiting(targetId, canceledWhileAwaiting);
     void handleCancelExchange(targetId);
   }
 
@@ -888,8 +961,8 @@ export function PromptInput() {
         />
         <div class={rowClass} ref={promptActionsAreaRef}>
           {showCodingAgentControls
-            ? <CodingAgentControlMenu threadId={codingAgentControlThreadId} codingAgent={promptCodingAgent} />
-            : <><LucidosControlMenu /><TodoListIndicator /></>}
+            ? <CodingAgentControlMenu threadId={codingAgentControlThreadId} composeThreadId={composeControlThreadId} codingAgent={promptCodingAgent} />
+            : <><LucidosControlMenu threadId={focusedThreadId.value ?? undefined} composeContext={inComposeContext} /><TodoListIndicator /></>}
           {(() => {
             // WIP app preview toggle: visible whenever the focused thread is an
             // app coding-agent thread that has an in-flight diff

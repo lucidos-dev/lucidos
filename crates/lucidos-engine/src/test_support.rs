@@ -16,6 +16,13 @@ fn admin_url() -> String {
         .unwrap_or_else(|_| "postgres://lucidos:lucidos@localhost:5432/postgres".into())
 }
 
+/// Connection URL for a throwaway database created by `setup_test_db`. Lets a
+/// test open its own dedicated connection to the same DB (e.g. the startup-lease
+/// tests, which contend a Postgres advisory lock across independent connections).
+pub fn test_db_url(db_name: &str) -> String {
+    admin_url().replace("/postgres", &format!("/{}", db_name))
+}
+
 pub async fn setup_test_db() -> (PgPool, String) {
     let base_url = admin_url();
     let db_name = format!(

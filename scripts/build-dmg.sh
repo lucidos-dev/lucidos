@@ -67,9 +67,21 @@
 # reads. For back-compat, TAURI_SIGNING_PRIVATE_KEY set directly (contents, or a
 # path Tauri auto-detects) is still honored and left untouched.
 #
+# ── Headless tarball (--emit-tarball) ────────────────────────────────────────
+# In ADDITION to the .app/.dmg, --emit-tarball packages the self-contained runtime
+# tree (engine + gateway + frontend + postgres + sdk) as a plain, headless
+# lucidos-<version>-<target-triple>.tar.gz plus a sha256 sidecar — the download
+# artifact a later install.sh lays down instead of compiling from source (step 1 of
+# docs/plans/2026-06-30-installer-step1-headless-tarball.md). It is sourced from the SIGNED
+# .app Resources, so the Mach-O files inside the tarball keep their Developer ID
+# signatures. The flag applies to any BUILD mode and changes nothing when absent;
+# it is a no-op under --check and a build-less --release-attach (neither builds a
+# .app to package).
+#
 # Usage:
 #   ./scripts/build-dmg.sh                 # build an unsigned local .dmg (no events)
 #   ./scripts/build-dmg.sh --check         # validate the staged resource contract
+#   ./scripts/build-dmg.sh --emit-tarball  # also emit the headless .tar.gz + .sha256
 #   APPLE_SIGNING_IDENTITY="Developer ID Application: …" \
 #   APPLE_ID=… APPLE_PASSWORD=… APPLE_TEAM_ID=… \
 #   TAURI_SIGNING_PRIVATE_KEY_PATH=~/.tauri/lucidos-updater.key \
@@ -112,8 +124,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 APP_DIR="$REPO_ROOT/crates/lucidos-app"
 STAGE="$APP_DIR/bundle-resources"
-BUNDLED_EXECUTABLES=(lucidos-engine lucidos-gateway)
-RESOURCE_NAMES=(lucidos-engine lucidos-gateway frontend postgres sdk)
+# `lucidos` (the CLI) is a bundled Mach-O executable too — it MUST be codesigned
+# (BUNDLED_EXECUTABLES) or notarization rejects it, and it MUST be staged
+# (RESOURCE_NAMES) or the engine can't launch the CC permission MCP server.
+BUNDLED_EXECUTABLES=(lucidos-engine lucidos-gateway lucidos)
+RESOURCE_NAMES=(lucidos-engine lucidos-gateway lucidos frontend postgres sdk)
 
 PG_VERSION="${PG_VERSION:-18.4.0}"   # match the dev/docker stack (pgvector/pgvector:pg18)
 PGVECTOR_VERSION="${PGVECTOR_VERSION:-0.8.2}"
@@ -142,6 +157,23 @@ source "$SCRIPT_DIR/lib/tauri_signing_key.sh"
 # shellcheck source=scripts/lib/release_staging.sh
 source "$SCRIPT_DIR/lib/release_staging.sh"
 
+# Headless-tarball packaging (the --emit-tarball flag, step 1 of
+# docs/plans/2026-06-30-installer-step1-headless-tarball.md). Pure tar/gzip + the sha256
+# helper above; depends on release_staging_sha256, so source it AFTER
+# release_staging.sh. Public-mirror-safe like release_staging.sh — source it
+# unconditionally.
+# shellcheck source=scripts/lib/headless_tarball.sh
+source "$SCRIPT_DIR/lib/headless_tarball.sh"
+
+# Shared staging library (step 2 of the installer rework): the platform-agnostic
+# spine of staging — target-triple resolution, the theseus PG18 + pgvector
+# fetch/compile recipe, the frontend/binary builds, and the 6-resource assemble.
+# build-dmg.sh (macOS/.app) and scripts/build-headless.sh (Linux + macOS headless)
+# both source it so the staging recipe lives in exactly one place. Pure helpers,
+# public-mirror-safe — source it unconditionally like release_staging.sh.
+# shellcheck source=scripts/lib/stage_runtime.sh
+source "$SCRIPT_DIR/lib/stage_runtime.sh"
+
 # Release-mode state (set by arg parsing below). In default (local-build) mode
 # all stay 0: no events, no asserted creds, no staging, no asset upload.
 #   RELEASE_MODE  1 for any --release* mode (drives event emission + assertions)
@@ -159,6 +191,8 @@ STAGING_DIR_ARG=""     # --staging-dir override (required for --release-attach)
 STAGING_DIR=""         # resolved staging dir (default .lucidos/release-staging/<v>)
 EFFECTIVE_VERSION=""   # the version stamped into the DMG; set after arg parse
 CURRENT_STEP=""        # cockpit step id currently in flight (for failure emit)
+EMIT_TARBALL=0         # 1 for --emit-tarball: also emit the headless .tar.gz + .sha256
+HEADLESS_TARBALL_PATH="" # set by emit_headless_tarball for the final report
 
 step() { printf '\n==> %s\n' "$*"; }
 
@@ -219,8 +253,19 @@ assert_release_credentials() {
     fi
 }
 
+# The bundle.resources map (`bundle-resources/<name>` → `<name>` for each staged
+# RESOURCE_NAME) as inner JSON object members. Single source of truth so the two
+# consumers — the no-version resource_config_json (also the verify loop's
+# expectation) and the versioned tauri_build_config_json — can't drift, and a new
+# resource is added in exactly one place. `lucidos` (the CLI) is load-bearing:
+# without it cargo tauri build never copies the binary into Contents/Resources,
+# so the engine can't launch the CC permission MCP server.
+resource_map_json() {
+    printf '%s' '"bundle-resources/lucidos-engine":"lucidos-engine","bundle-resources/lucidos-gateway":"lucidos-gateway","bundle-resources/lucidos":"lucidos","bundle-resources/frontend":"frontend","bundle-resources/postgres":"postgres","bundle-resources/sdk":"sdk"'
+}
+
 resource_config_json() {
-    printf '%s' '{"bundle":{"resources":{"bundle-resources/lucidos-engine":"lucidos-engine","bundle-resources/lucidos-gateway":"lucidos-gateway","bundle-resources/frontend":"frontend","bundle-resources/postgres":"postgres","bundle-resources/sdk":"sdk"}}}'
+    printf '%s' "{\"bundle\":{\"resources\":{$(resource_map_json)}}}"
 }
 
 # The committed tauri.conf.json pins version 0.1.0; a release must stamp the real
@@ -239,7 +284,7 @@ tauri_build_config_json() {
     local ver
     ver="$(release_version)"
     if [ -n "$ver" ]; then
-        printf '%s' "{\"version\":\"$ver\",\"bundle\":{\"resources\":{\"bundle-resources/lucidos-engine\":\"lucidos-engine\",\"bundle-resources/lucidos-gateway\":\"lucidos-gateway\",\"bundle-resources/frontend\":\"frontend\",\"bundle-resources/postgres\":\"postgres\",\"bundle-resources/sdk\":\"sdk\"}}}"
+        printf '%s' "{\"version\":\"$ver\",\"bundle\":{\"resources\":{$(resource_map_json)}}}"
     else
         resource_config_json
     fi
@@ -250,6 +295,7 @@ usage() {
 Usage:
   ./scripts/build-dmg.sh                 # build an unsigned local .dmg (no events)
   ./scripts/build-dmg.sh --check         # validate the staged resource contract
+  ./scripts/build-dmg.sh --emit-tarball  # also emit the headless .tar.gz + .sha256
   APPLE_SIGNING_IDENTITY="Developer ID Application: …" \
   APPLE_ID=… APPLE_PASSWORD=… APPLE_TEAM_ID=… \
   TAURI_SIGNING_PRIVATE_KEY_PATH=~/.tauri/lucidos-updater.key \
@@ -274,6 +320,15 @@ Release-mode flags:
   --upload-tag TAG     GitHub Release tag to attach the DMG + updater assets to
   --notes-file FILE    CHANGELOG section used as the latest.json `notes`
   --repo-slug OWNER/R  GitHub repo for the release (default lucidos-dev/lucidos)
+
+Headless tarball:
+  --emit-tarball       ALSO emit a plain lucidos-<version>-<triple>.tar.gz (engine +
+                       gateway + frontend + postgres + sdk) + a .sha256 sidecar,
+                       sourced from the signed .app Resources (signatures preserved).
+                       Applies to any build mode (no-op under --check / a build-less
+                       --release-attach); default behavior is unchanged when absent.
+                       Output: the active --staging-dir, else
+                       .lucidos/release-staging/<version>/.
 
 Updater signing key:
   TAURI_SIGNING_PRIVATE_KEY_PATH   path to the updater key (e.g.
@@ -331,6 +386,39 @@ stage_release_artifacts() {
     release_staging_write_manifest "$dir" "$EFFECTIVE_VERSION" "$source_commit" \
         "$(basename "$DMG_PATH")" "$(basename "$app_tarball")" "$(basename "$app_sig")" \
         || die "failed to write the staging manifest in $dir"
+}
+
+# headless_tarball_version — the version stamped into the headless tarball name.
+# Release builds carry EFFECTIVE_VERSION (from RELEASE); otherwise defer to the
+# shared resolver (RELEASE → tauri.conf.json → 0.0.0), the same logic
+# build-headless.sh uses. Mirrors how the .dmg gets its version.
+headless_tarball_version() {
+    if [ -n "$EFFECTIVE_VERSION" ]; then
+        printf '%s' "$EFFECTIVE_VERSION"
+        return 0
+    fi
+    stage_runtime_version "$REPO_ROOT" "$APP_DIR"
+}
+
+# emit_headless_tarball — package the self-contained runtime tree as the headless
+# lucidos-<version>-<triple>.tar.gz + .sha256 sidecar, IN ADDITION to the .app/.dmg
+# (step 1 of docs/plans/2026-06-30-installer-step1-headless-tarball.md; a later install.sh
+# downloads it instead of compiling). It sources from the SIGNED .app
+# Contents/Resources — NOT bundle-resources/, whose copies sign_app_bundle never
+# touches — so the Mach-O files in the tarball keep their Developer ID signatures.
+# This reuses the already-built/-signed staging tree (no PG re-fetch, no pgvector
+# recompile). Output goes to the active STAGING_DIR when a release build set one,
+# else .lucidos/release-staging/<version>/; a release dir is unaffected because the
+# tarball is NOT added to manifest.json (release_staging_verify ignores it).
+emit_headless_tarball() {
+    local resources version out_dir tar_path
+    resources="$APP_PATH/Contents/Resources"
+    [ -d "$resources" ] || die "headless tarball: $resources not found (no built .app to package)"
+    version="$(headless_tarball_version)"
+    out_dir="${STAGING_DIR:-$REPO_ROOT/.lucidos/release-staging/$version}"
+    tar_path="$(headless_tarball_emit "$resources" "$out_dir" "$version" "$TARGET_TRIPLE" "${RESOURCE_NAMES[@]}")" \
+        || die "failed to emit the headless tarball"
+    HEADLESS_TARBALL_PATH="$tar_path"
 }
 
 # upload_staged_assets <staging-dir> — generate latest.json from the STAGED
@@ -442,6 +530,7 @@ while [ $# -gt 0 ]; do
         --upload-tag)      [ $# -ge 2 ] || die "--upload-tag requires an argument"; UPLOAD_TAG="$2"; shift 2 ;;
         --notes-file)      [ $# -ge 2 ] || die "--notes-file requires an argument"; NOTES_FILE="$2"; shift 2 ;;
         --repo-slug)       [ $# -ge 2 ] || die "--repo-slug requires an argument"; REPO_SLUG="$2"; shift 2 ;;
+        --emit-tarball)    EMIT_TARBALL=1; shift ;;
         *)                 die "unknown argument: $1" ;;
     esac
 done
@@ -499,13 +588,13 @@ fi
 
 [ "$(uname -s)" = "Darwin" ] || die "build-dmg.sh builds the macOS bundle and must run on a Mac."
 
-# Resolve the theseus-rs relocatable-binary triple for this host.
-case "$(uname -m)" in
-    arm64|aarch64) HOST_ARCH="aarch64" ;;
-    x86_64)        HOST_ARCH="x86_64" ;;
-    *) die "unsupported arch $(uname -m)" ;;
-esac
-TARGET_TRIPLE="${TARGET_TRIPLE:-${HOST_ARCH}-apple-darwin}"
+# Resolve the theseus-rs relocatable-binary triple for this host (shared with the
+# Linux/headless path via stage_runtime.sh). On a Mac this resolves to
+# <arch>-apple-darwin; an explicit TARGET_TRIPLE still wins.
+if [ -z "${TARGET_TRIPLE:-}" ]; then
+    TARGET_TRIPLE="$(stage_runtime_host_triple)" \
+        || die "could not resolve the target triple for $(uname -s)/$(uname -m)"
+fi
 
 command -v cargo >/dev/null || die "cargo not found — install Rust (https://rustup.rs)."
 if ! cargo tauri --version >/dev/null 2>&1; then
@@ -515,74 +604,51 @@ command -v npm >/dev/null || die "npm not found — install Node.js."
 
 begin_step build "Compiling engine + gateway + app, fetching PostgreSQL $PG_VERSION + pgvector, running cargo tauri build (.app + .dmg)."
 
+# Staging steps 1–4 are the platform-agnostic spine shared with the Linux/headless
+# path; they live in scripts/lib/stage_runtime.sh so the recipe exists once.
+
 # ── 1. frontend ─────────────────────────────────────────────────────────────
 step "Building frontend (dist/)"
-(cd "$REPO_ROOT" && npm install)
-(cd "$REPO_ROOT/packages/lucidos-sdk" && npm run build)   # /api/v1/sdk.js for app UIs
-(cd "$APP_DIR" && npm run build)
-[ -f "$APP_DIR/dist/index.html" ] || die "frontend build did not produce dist/index.html"
+stage_runtime_build_frontend "$REPO_ROOT" "$APP_DIR" || die "frontend build failed"
 
-# ── 2. gateway + engine (release) ───────────────────────────────────────────
-step "Building gateway + engine (release)"
-# .cargo/config.toml sets rustc-wrapper=sccache; disable it if sccache is absent
-# so the build doesn't fail on a missing wrapper.
-command -v sccache >/dev/null || export RUSTC_WRAPPER=""
-(cd "$REPO_ROOT" && cargo build -p lucidos-engine -p lucidos-gateway -p lucidos-cli --release)
+# ── 2. gateway + engine + cli (release) ─────────────────────────────────────
+# Build engine + gateway + the `lucidos` CLI — all three are bundled. The CLI is
+# load-bearing: the engine launches the CC permission-prompt MCP server via the
+# sibling `lucidos` binary (find_lucidos_cli_dir), so a build that omits it breaks
+# every coding-agent thread in the packaged app on its first tool call.
+step "Building gateway + engine + cli (release)"
+stage_runtime_build_binaries "$REPO_ROOT" lucidos-engine lucidos-gateway lucidos-cli \
+    || die "gateway + engine + cli build failed"
 ENGINE_BIN="$REPO_ROOT/target/release/lucidos-engine"
 GATEWAY_BIN="$REPO_ROOT/target/release/lucidos-gateway"
+CLI_BIN="$REPO_ROOT/target/release/lucidos"
 [ -x "$ENGINE_BIN" ] || die "engine binary not found at $ENGINE_BIN"
 [ -x "$GATEWAY_BIN" ] || die "gateway binary not found at $GATEWAY_BIN"
+[ -x "$CLI_BIN" ] || die "lucidos CLI binary not found at $CLI_BIN"
 
 # ── 3. relocatable PostgreSQL + pgvector ────────────────────────────────────
-# Mirrors scripts/prototype/desktop-pg-pgvector-spike.sh (proven recipe).
+# Mirrors scripts/prototype/desktop-pg-pgvector-spike.sh (proven recipe). On macOS
+# stage_runtime_fetch_postgres applies the PG_SYSROOT override; on Linux it uses
+# system gcc.
 step "Fetching relocatable PostgreSQL $PG_VERSION + building pgvector $PGVECTOR_VERSION ($TARGET_TRIPLE)"
-PG_WORK="$REPO_ROOT/.lucidos/dmg-build/pg"
-mkdir -p "$PG_WORK"
-PG_DIRNAME="postgresql-${PG_VERSION}-${TARGET_TRIPLE}"
-PG_PREFIX="$PG_WORK/$PG_DIRNAME"
-PGCONFIG="$PG_PREFIX/bin/pg_config"
-if [ ! -x "$PGCONFIG" ]; then
-    curl -fsSL -m 300 -o "$PG_WORK/$PG_DIRNAME.tar.gz" \
-        "https://github.com/theseus-rs/postgresql-binaries/releases/download/${PG_VERSION}/${PG_DIRNAME}.tar.gz"
-    tar -xzf "$PG_WORK/$PG_DIRNAME.tar.gz" -C "$PG_WORK"
-fi
-[ -x "$PGCONFIG" ] || die "pg_config missing after extract"
-
-SHAREDIR="$("$PGCONFIG" --sharedir)"
-if [ ! -f "$SHAREDIR/extension/vector.control" ]; then
-    step "Compiling pgvector against the bundled PG"
-    curl -fsSL -m 180 -o "$PG_WORK/pgvector.tar.gz" \
-        "https://github.com/pgvector/pgvector/archive/refs/tags/v${PGVECTOR_VERSION}.tar.gz"
-    rm -rf "$PG_WORK/pgvector" && mkdir -p "$PG_WORK/pgvector"
-    tar -xzf "$PG_WORK/pgvector.tar.gz" -C "$PG_WORK/pgvector" --strip-components=1
-    # The theseus tarball bakes its CI Xcode SDK path into PGXS; override it.
-    ( cd "$PG_WORK/pgvector" \
-        && make -s PG_CONFIG="$PGCONFIG" PG_SYSROOT="$(xcrun --show-sdk-path)" \
-        && make -s install PG_CONFIG="$PGCONFIG" PG_SYSROOT="$(xcrun --show-sdk-path)" )
-fi
-[ -f "$SHAREDIR/extension/vector.control" ] || die "pgvector did not install into the bundled PG"
+PG_PREFIX="$(stage_runtime_fetch_postgres "$PG_VERSION" "$PGVECTOR_VERSION" "$TARGET_TRIPLE" "$REPO_ROOT/.lucidos/dmg-build/pg")" \
+    || die "failed to fetch/compile relocatable PostgreSQL + pgvector for $TARGET_TRIPLE"
 
 # ── 4. stage resources ──────────────────────────────────────────────────────
 step "Staging bundle resources → $STAGE"
-rm -rf "$STAGE"
-mkdir -p "$STAGE"
-cp "$ENGINE_BIN" "$STAGE/lucidos-engine"
-cp "$GATEWAY_BIN" "$STAGE/lucidos-gateway"
-for bin in "${BUNDLED_EXECUTABLES[@]}"; do
-    chmod +x "$STAGE/$bin"
-done
-cp -R "$APP_DIR/dist" "$STAGE/frontend"
-cp -R "$PG_PREFIX" "$STAGE/postgres"
-# The JS SDK (/api/v1/sdk.js) used by app-UI iframes; the engine finds it via
-# LUCIDOS_SDK_DIR (set by the desktop launcher to <resources>/sdk).
-cp -R "$REPO_ROOT/packages/lucidos-sdk/dist" "$STAGE/sdk"
+stage_runtime_assemble "$STAGE" "$ENGINE_BIN" "$GATEWAY_BIN" "$CLI_BIN" "$APP_DIR/dist" \
+    "$PG_PREFIX" "$REPO_ROOT/packages/lucidos-sdk/dist" >/dev/null \
+    || die "failed to stage bundle resources into $STAGE"
 
 # ── 5. tauri build ──────────────────────────────────────────────────────────
 step "Running cargo tauri build (app + dmg)"
 # Inject the resource map at build time (kept out of the committed tauri.conf.json
 # so normal `cargo check` / dev builds aren't tied to staged artifacts).
 RESOURCES_CONFIG="$(tauri_build_config_json)"
-TAURI_BUILD_ARGS=(tauri build --bundles app,dmg --config "$RESOURCES_CONFIG")
+# Trailing `-- --locked` is forwarded to the inner `cargo build` so the release
+# bundle is built strictly from the committed Cargo.lock (fail-closed on any
+# manifest↔lock drift), matching every other build path.
+TAURI_BUILD_ARGS=(tauri build --bundles app,dmg --config "$RESOURCES_CONFIG" -- --locked)
 
 # A no-password updater key is still signed with an EMPTY password, not "no
 # password env at all". Tauri defaults the password to empty when the var is
@@ -780,6 +846,17 @@ if [ "$DO_BUILD" = "1" ]; then
     stage_release_artifacts "$STAGING_DIR"
 fi
 
+# ── 6b2. headless tarball (opt-in --emit-tarball) ────────────────────────────
+# Emit the plain headless lucidos-<version>-<triple>.tar.gz + .sha256 IN ADDITION
+# to the .app/.dmg, sourced from the signed .app Resources so the Mach-O files stay
+# signed. Gated entirely on --emit-tarball, so default behavior is unchanged. Not a
+# cockpit step (no ReleaseStep* event); when STAGING_DIR is set it lands alongside
+# the staged DMG without entering manifest.json (so verify/upload are unaffected).
+if [ "$EMIT_TARBALL" = "1" ]; then
+    step "Emitting headless tarball (lucidos-<version>-$TARGET_TRIPLE.tar.gz + .sha256)"
+    emit_headless_tarball
+fi
+
 # ── 6c. upload staged assets (one-shot --release only) ───────────────────────
 # --release-build skips this (DO_ATTACH=0) and leaves the staging in place for a
 # later --release-attach / release.sh --publish-verified — the whole point of the
@@ -800,6 +877,9 @@ if [ -n "$UPDATER_SIG" ]; then
     echo "  updater artifacts: $(dirname "$UPDATER_SIG")/*.app.tar.gz(.sig)"
 else
     echo "  (no updater .sig — set TAURI_SIGNING_PRIVATE_KEY_PATH to the updater key to emit signed update artifacts.)"
+fi
+if [ -n "$HEADLESS_TARBALL_PATH" ]; then
+    echo "  headless tarball: $HEADLESS_TARBALL_PATH (+ .sha256)"
 fi
 if [ "$DO_BUILD" = "1" ] && [ -n "$STAGING_DIR" ]; then
     echo "  staged:  $STAGING_DIR (manifest.json + .dmg + .app.tar.gz + .sig)"

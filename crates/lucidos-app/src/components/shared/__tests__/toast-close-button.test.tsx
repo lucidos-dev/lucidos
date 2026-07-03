@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { Toast } from '../Toast';
+import { ToastList } from '../Toast';
 import { toasts, showToast, engineRestarting } from '../../../store/store';
 import { initiateEngineRestart, RESTART_TOAST_KEY } from '../../../store/actions/chat-changes';
 
@@ -29,7 +29,7 @@ beforeEach(() => {
 describe('Toast close button — gated by dismissable flag', () => {
   it('omits .toast-close when dismissable: false', () => {
     showToast('Restarting engine...', 'info', { key: RESTART_TOAST_KEY, spinning: true, dismissable: false });
-    expect(findByClass(Toast(), 'toast-close').length).toBe(0);
+    expect(findByClass(ToastList(), 'toast-close').length).toBe(0);
   });
 
   it('renders .toast-close on warning toasts (dismissable defaults to true)', () => {
@@ -37,17 +37,17 @@ describe('Toast close button — gated by dismissable flag', () => {
       key: RESTART_TOAST_KEY,
       action: { label: 'Restart', onClick: () => {} },
     });
-    expect(findByClass(Toast(), 'toast-close').length).toBe(1);
+    expect(findByClass(ToastList(), 'toast-close').length).toBe(1);
   });
 
   it('renders .toast-close on plain info toasts (no opts → dismissable defaults to true)', () => {
     showToast('Hello', 'info');
-    expect(findByClass(Toast(), 'toast-close').length).toBe(1);
+    expect(findByClass(ToastList(), 'toast-close').length).toBe(1);
   });
 
   it('the close button click dismisses a dismissable toast', () => {
     showToast('Hello', 'info');
-    const buttons = findByClass(Toast(), 'toast-close');
+    const buttons = findByClass(ToastList(), 'toast-close');
     expect(buttons.length).toBe(1);
     const onClick = (buttons[0].props as { onClick?: () => void }).onClick;
     onClick!();
@@ -62,11 +62,12 @@ describe('initiateEngineRestart raises a light dismissible status toast', () => 
     void initiateEngineRestart().catch(() => {});
     const toast = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
     expect(toast).toBeDefined();
-    // Dev (non-packaged) starts on the build phase with a progress spinner.
-    expect(toast!.message).toBe('Building the new version…');
+    // The switch shows the "Starting new version…" progress toast (the binary is
+    // already built — Apply rebuilt it in the background; the switch only respawns).
+    expect(toast!.message).toBe('Starting new version…');
     expect(toast!.dismissable).not.toBe(false);
     expect(toast!.spinning).toBe(true);
     // And the rendered tree shows the close button so the user can dismiss it.
-    expect(findByClass(Toast(), 'toast-close').length).toBe(1);
+    expect(findByClass(ToastList(), 'toast-close').length).toBe(1);
   });
 });

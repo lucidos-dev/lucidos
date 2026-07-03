@@ -54,10 +54,15 @@ Layer shapes (all live in `proxy_pipeline_config::LayerConfig`):
 {"type": "static_credential", "kind": "basic",       "credential": "u-and-p"}     // value must be "user:password"
 {"type": "static_credential", "kind": "query_param", "credential": "k", "param_name": "api-key"}
 
-// Script handshake — `script` is workspace-relative (no `..`, no leading `/`).
-// `oauth_providers` is optional; when present, each listed provider's connected
-// OAuth access token is injected as `OAUTH_<UPPER>_ACCESS_TOKEN` in the script's env.
+// Script handshake — `script` resolves relative to `data/` (no `..`, no leading
+// `/`): `"scripts/auth/comfort-cloud.py"` is the file at
+// `data/scripts/auth/comfort-cloud.py` (git-tracked). `credential` is OPTIONAL —
+// omit it when the script sources its secret elsewhere (OS keychain, OAuth-only
+// exchange); then no `CRED_*` env var is injected from this layer. `oauth_providers`
+// is optional; when present, each listed provider's connected OAuth access token is
+// injected as `OAUTH_<UPPER>_ACCESS_TOKEN` in the script's env.
 {"type": "script_handshake", "credential": "comfort-cloud", "script": "scripts/auth/comfort-cloud.py"}
+{"type": "script_handshake", "script": "scripts/auth/keychain-login.py"}   // no credential — secret sourced by the script
 {"type": "script_handshake", "credential": "firebase-web-api-key", "script": "scripts/auth/firebase-google-exchange.py", "oauth_providers": ["google"]}
 
 // Built-in Binance-shape HMAC. Sign-only the query string; appends
@@ -99,6 +104,8 @@ For login dances. The engine caches the script's output until `expires_in` elaps
 
 ### Script contract
 
+- **Where the file lives.** `script` is resolved relative to `data/` — the file at `data/scripts/auth/foo.py` is referenced as `"script": "scripts/auth/foo.py"`. Keep handshake scripts under `data/` so they're git-tracked. (A legacy script placed at the workspace root still resolves as a back-compat fallback, but move it under `data/`.)
+- **`credential` is optional.** When the layer config sets `credential`, that credential is injected as env vars (shape below) before the script runs. When it's omitted, no `CRED_*` env var is injected from this layer — the script must source its secret by other means (read a rotating token from the OS keychain, do an OAuth-only exchange, etc.). The env-var table below applies only when a credential is configured.
 - Reads the named credential from env vars. The shape depends on the credential's type — same convention `run_python` / `run_bash` already inject for their subprocesses, so a script you wrote for one works for the other:
 
   | Credential type | Env vars injected |

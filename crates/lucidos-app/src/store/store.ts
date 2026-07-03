@@ -35,7 +35,7 @@ import type { EventChannel, ArchiveState, DisplaySection } from '../generated/th
 import { resetContentScroll } from '../hooks/useScrollMemory';
 import type { Change, CodingAgentModelValue, CodingAgentReasoningEffort } from '../api/client';
 import type { EnvironmentVariable, ModelInfo } from '../api/types';
-import { markSwUpdateDismissed } from '../hooks/sw-update';
+import { markSwUpdateDismissed, markSwitchDismissed } from '../hooks/sw-update';
 
 /** localStorage key holding the focused thread id across reloads. Focus is
  *  per-device, not worth round-tripping through the server. */
@@ -313,6 +313,12 @@ export function setFocusedThread(id: string | null): void {
 // True while the prompt FLIP animation is sliding from compose→thread position.
 // ThreadView gates its content behind this to avoid rendering exchanges mid-slide.
 export const promptAnimating = signal(false);
+
+// One-shot ticket: PromptInput.submit() sets this on a compose→active send so the
+// ThreadPane FLIP knows to defer + animate the textarea height collapse together
+// with the position slide (instead of the textarea snapping short first). The FLIP
+// consumes it and owns the height reset in every exit path, so it can't stick tall.
+export const promptSendCollapsing = signal(false);
 
 // True when the next focusThread should trigger slide-up reveal animation.
 // Set only by handleArchiveThread → focusThread (Done → next thread).
@@ -667,6 +673,17 @@ export const activeThreadIsComposing = computed(() => {
   return threadMap.value.get(id)?.meta.state === 'composing';
 });
 
+// True when the prompt is in the centered "compose" layout: either the brand-new
+// blank view (no focused thread and no exchanges) or a focused composing draft.
+// Single source of truth for both ThreadPane's compose↔active FLIP and
+// PromptInput's compose↔compose height animation, so they agree by construction:
+// the FLIP fires only when this CHANGES; the height-anim only while it STAYS true.
+export const composeViewActive = computed(() => {
+  const id = focusedThreadId.value;
+  const isEmpty = activeExchanges.value.length === 0;
+  return (!id && isEmpty) || activeThreadIsComposing.value;
+});
+
 // --- Split layout ---
 export const SPLIT_RATIO_KEY = 'lucidos-split-ratio';
 export const splitRatio = signal(
@@ -674,10 +691,11 @@ export const splitRatio = signal(
 );
 
 /** Which desktop pane currently holds focus. Drives the two-stage pane toggles
- *  (a toggle first focuses an unfocused pane, then hides it on the next press)
- *  and the accent line under the focused pane's header region. Desktop-only:
- *  mobile navigates between panes instead of focusing one. Not persisted — a
- *  fresh load focuses the chat pane, the primary work area. */
+ *  (a toggle first focuses an unfocused pane, then hides it on the next press),
+ *  the header wash over the focused pane's header segment, and per-pane keyboard
+ *  Tab routing. Desktop-only: mobile navigates between panes instead of focusing
+ *  one. Not persisted — a fresh load focuses the chat pane, the primary work
+ *  area. */
 export type FocusedPane = 'drawer' | 'thread' | 'content';
 export const focusedPane = signal<FocusedPane>('thread');
 // --- Mobile view ---
@@ -824,12 +842,13 @@ function restoreScope(): Scope {
 
 export const selectedScope = signal<Scope>(restoreScope());
 
-/** The compose destination picker's coding-agent chip (Claude Code | Codex).
- *  Bound onto the thread's meta at compose promotion (`sendCompose`) —
- *  afterwards the thread is locked to that backend server-side. Remembered
- *  per workspace: seeded from the `coding_agent_default` preference by
- *  `loadPreferences`, written back via `setCodingAgentDefault` on chip change.
- *  (Reverses the earlier session-only default — see ADR 0006.) */
+/** The account DEFAULT coding agent (Claude Code | Codex) — the SEED for a fresh
+ *  compose's backend chip. Seeded from the `coding_agent_default` preference by
+ *  `loadPreferences`. Per-draft compose picks live in `composeSelections` and do
+ *  NOT write this back (draft-only), so changing the chip on one draft never
+ *  changes another draft or this default; `resolveCodingAgent` falls back here
+ *  for an override-less draft. Bound onto the thread's meta at compose promotion
+ *  (`sendCompose`). (See ADR 0006 for the workspace-scoped default.) */
 export const selectedCodingAgent = signal<import('../api/types').CodingAgent>('claude-code');
 
 /** Translate a Scope into the engine's `folder` request field. Lucidos →
@@ -1319,8 +1338,8 @@ export const TOAST_AUTO_DISMISS_MS = 5_000;
  *  Map entry would survive until the setTimeout fires. */
 const keyedDismissTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-export function showToast(message: string, type: ToastType = 'info', opts?: { key?: string; action?: ToastAction; secondaryAction?: ToastAction; onClick?: () => void; spinning?: boolean; autoDismissMs?: number; dismissable?: boolean; showDuringRestart?: boolean }) {
-  const { key, action, secondaryAction, onClick, spinning, autoDismissMs, dismissable, showDuringRestart } = opts ?? {};
+export function showToast(message: string, type: ToastType = 'info', opts?: { key?: string; action?: ToastAction; secondaryAction?: ToastAction; onClick?: () => void; spinning?: boolean; autoDismissMs?: number; dismissable?: boolean; showDuringRestart?: boolean; noAutofocus?: boolean }) {
+  const { key, action, secondaryAction, onClick, spinning, autoDismissMs, dismissable, showDuringRestart, noAutofocus } = opts ?? {};
   // While the engine is restarting the UiBlockingOverlay covers the screen and
   // every in-flight request fails as the engine goes down (changes fetch, SSE,
   // health poll). Suppress the resulting failure/info toasts — including the
@@ -1335,16 +1354,21 @@ export function showToast(message: string, type: ToastType = 'info', opts?: { ke
   if (key) {
     const existing = toasts.value.find((t) => t.key === key);
     if (existing) {
-      toasts.value = toasts.value.map((t) => t.key === key ? { ...t, message, type, action, secondaryAction, onClick, spinning, dismissable } : t);
+      toasts.value = toasts.value.map((t) => t.key === key ? { ...t, message, type, action, secondaryAction, onClick, spinning, dismissable, noAutofocus } : t);
       scheduleAutoDismiss(key, autoDismissMs);
       return;
     }
   }
   const id = ++toastIdCounter;
+  // Freeze the toast over the pane focused right now — a later focus switch must
+  // not make it jump panes (drawer counts as the thread pane). The keyed-update
+  // branch above deliberately does NOT touch `pane`, so an in-place update keeps
+  // the toast where it first appeared.
+  const pane = focusedPane.value === 'content' ? 'content' : 'thread';
   // Prepend so the newest toast renders at the top of the column-stacked
   // container and pushes existing ones down (the container is pinned to the
   // top of the viewport, so array order is top→bottom).
-  toasts.value = [{ id, message, type, key, action, secondaryAction, onClick, spinning, dismissable }, ...toasts.value];
+  toasts.value = [{ id, message, type, key, action, secondaryAction, onClick, spinning, dismissable, noAutofocus, pane }, ...toasts.value];
   if (key) {
     scheduleAutoDismiss(key, autoDismissMs);
     return;
@@ -1368,36 +1392,39 @@ function scheduleAutoDismiss(key: string, autoDismissMs: number | undefined): vo
   keyedDismissTimers.set(key, setTimeout(() => dismissToast(key), autoDismissMs));
 }
 
-export function dismissToast(idOrKey: number | string) {
-  toasts.value = toasts.value.filter((t) =>
-    typeof idOrKey === 'string' ? t.key !== idOrKey : t.id !== idOrKey
-  );
-  if (typeof idOrKey === 'string') {
-    const t = keyedDismissTimers.get(idOrKey);
-    if (t) {
-      clearTimeout(t);
-      keyedDismissTimers.delete(idOrKey);
-    }
-  }
-  if (idOrKey === 'update-available') {
-    updateAvailable.value = false;
-    markSwUpdateDismissed();
+/** Structurally remove a keyed toast WITHOUT the user-dismiss side effects — it
+ *  does NOT clear a badge or record a build as user-dismissed. Use this to keep a
+ *  toast in lockstep with the signal that drives it (e.g. hide the Refresh toast
+ *  the moment the client is no longer stale): a signal-driven hide must never be
+ *  mistaken for the user dismissing the prompt, which would wrongly suppress it
+ *  for that build. `dismissToast` (the user path) layers the side effects on top. */
+export function removeToast(key: string): void {
+  toasts.value = toasts.value.filter((t) => t.key !== key);
+  const timer = keyedDismissTimers.get(key);
+  if (timer) {
+    clearTimeout(timer);
+    keyedDismissTimers.delete(key);
   }
 }
 
-/** True when a toast already on screen offers the user a way to act on a pending
- *  build/restart — i.e. it carries an action button. The action-bearing
- *  refresh/restart toasts are the pre-restart "Engine restart required" toast
- *  (its Restart button) and the "New version available" toast itself, so the
- *  presence of `action` is a sufficient signal. Used to suppress a redundant
- *  "New version available" toast when one of those is already visible. Two
- *  notable action-LESS toasts deliberately don't trip this guard: the post-restart
- *  "Engine restarted" confirmation (so a restart that also rebuilt the client
- *  still surfaces the refresh prompt) and the "Applied …" toast (the rebuilt
- *  frontend isn't ready at apply time — the refresh affordance is deferred to the
- *  build-id staleness check). */
-export function hasRefreshToast(): boolean {
-  return toasts.value.some((t) => t.action !== undefined);
+export function dismissToast(idOrKey: number | string) {
+  if (typeof idOrKey !== 'string') {
+    toasts.value = toasts.value.filter((t) => t.id !== idOrKey);
+    return;
+  }
+  removeToast(idOrKey);
+  // User-dismiss side effect, per update surface: remember THIS build as
+  // dismissed (keyed by build id in hooks/sw-update.ts) so the honest re-checks
+  // don't re-surface the toast — a genuinely newer build still will. Dismiss ==
+  // "defer to later": it does NOT clear the badge — the badge stays lit as the
+  // persistent update affordance (the user updates from the reload badge). The
+  // badge is re-derived from staleness/readiness by the sync/poll checks, so it
+  // clears on its own once the client is current / the engine has switched.
+  if (idOrKey === 'update-available') {
+    markSwUpdateDismissed();
+  } else if (idOrKey === NEW_VERSION_TOAST_KEY) {
+    markSwitchDismissed();
+  }
 }
 
 export function showConfirm(
@@ -1490,6 +1517,38 @@ export const recoveryProgress = signal<{ completed: number; total: number } | nu
 
 // --- Update available ---
 export const updateAvailable = signal(false);
+
+// --- New engine version ready to switch onto (dev background rebuild) ---
+// Set by the version-status poll (store/actions/engine-update.ts) when a newer
+// engine binary is on disk. Drives the "New version available → Switch to new
+// version" toast + the control-panel badge. Distinct from `updateAvailable` (the
+// client-bundle refresh) and `restartRequired` (a restart-requiring change was
+// applied): this is the honest "the rebuilt engine is READY to switch to" signal.
+export const engineVersionReady = signal(false);
+
+// --- New engine version currently building (dev background rebuild) ---
+// Set by the version-status poll (store/actions/engine-update.ts) when the engine
+// reports `build_state === 'building'` — a background rebuild kicked off by Apply
+// is in progress but not yet ready to switch onto. Drives the spinning-refresh
+// brand badge. Always false in packaged builds (no background build there).
+export const engineBuilding = signal(false);
+
+// Toast key for the poll-driven "New version available → Switch to new version"
+// info toast (store/actions/engine-update.ts). Lives here (not in engine-update.ts)
+// so `initiateEngineRestart` (chat-changes.ts) can dismiss it when a switch begins
+// without a chat-changes ↔ engine-update import cycle — the switch progress toast
+// then replaces it as the single version surface.
+export const NEW_VERSION_TOAST_KEY = 'engine-new-version';
+
+// Toast key for the "frontend change applied — takes effect on Switch" hint,
+// shown when the engine emits FrontendUpdateDeferred (a frontend-only Apply
+// couldn't advance the served client in-process because an engine version
+// change is pending — see engine::frontend_refresh INV-A + engine-update.ts's
+// handleFrontendUpdateDeferred). Keyed so repeated frontend-only applies while
+// a Switch is pending coalesce into one toast. Lives here (not engine-update.ts)
+// so initiateEngineRestart (chat-changes.ts) can collapse it into the switch
+// progress toast without an import cycle — same pattern as NEW_VERSION_TOAST_KEY.
+export const FRONTEND_UPDATE_DEFERRED_TOAST_KEY = 'engine-frontend-update-deferred';
 
 // --- Service worker build id ---
 /** BUILD_ID of the active service worker (stamped into sw.js by the

@@ -55,6 +55,16 @@ pub const RESTART_INTERRUPT_REASON: &str =
 /// Claude Code subprocess died first).
 pub const SUPERSEDED_REASON: &str = "Superseded by a new message";
 
+/// Reason stamped on a `CodingAgentPermissionResolved` that the engine emits
+/// when a coding-agent session IDLES with a permission card still unresolved
+/// (e.g. a workflow whose parallel subagent's card dangled while the main turn
+/// finished). Cleared at the turn boundary in `emit_coding_agent_idled` so the
+/// stale card can't sit clickable and a later click can't resurrect the
+/// finished thread. Distinct from `SUPERSEDED_REASON` (the user typed instead
+/// of clicking) and from the boot orphan-recovery reason (engine restart).
+pub const SESSION_ENDED_REASON: &str =
+    "Coding agent session ended before answering — request expired";
+
 /// Reason returned to CC's MCP middleware when `permission_prompt` auto-
 /// allows a request via a session-allow match. Echoed in the HTTP response
 /// body so CC's tool-call log records *why* the prompt was bypassed; no
@@ -781,9 +791,61 @@ fn outcome_from_permission_recv(
 }
 
 /// Resolve every unresolved `CodingAgentPermissionRequest` on `thread_id` as
-/// denied, because the user typed a new message instead of clicking a button
-/// on the permission card. Two effects, mirroring
-/// `recover_orphan_cc_permission_requests` but scoped to one live thread:
+/// denied — because the user typed a new message instead of clicking a button
+/// on the permission card. Thin wrapper over
+/// [`resolve_pending_permissions_with_reason`]; the caller still routes the
+/// typed message to CC as a normal follow-up, this only clears the stale card.
+pub async fn resolve_pending_permissions_as_superseded(
+    pool: &sqlx::PgPool,
+    event_bus: &EventBus,
+    pending: &Mutex<PermissionState>,
+    thread_id: Uuid,
+    actor: Option<MessageOrigin>,
+) {
+    resolve_pending_permissions_with_reason(
+        pool,
+        event_bus,
+        pending,
+        thread_id,
+        actor,
+        SUPERSEDED_REASON,
+        "[CCPermission] CodingAgentPermissionResolved (superseded)",
+    )
+    .await;
+}
+
+/// Resolve every unresolved `CodingAgentPermissionRequest` on `thread_id` as
+/// denied — because the coding-agent session IDLED with a card still dangling
+/// (a workflow whose parallel subagent's card outlived the main turn, a
+/// canceled turn, etc.). Thin wrapper over
+/// [`resolve_pending_permissions_with_reason`]. Called from
+/// `emit_coding_agent_idled` at the turn boundary: by then the session/turn is
+/// done, so any still-pending card is orphaned and clearing it is safe (a live
+/// card blocks the turn, so idle cannot fire during a genuine wait).
+pub async fn resolve_pending_permissions_as_session_ended(
+    pool: &sqlx::PgPool,
+    event_bus: &EventBus,
+    pending: &Mutex<PermissionState>,
+    thread_id: Uuid,
+    actor: Option<MessageOrigin>,
+) {
+    resolve_pending_permissions_with_reason(
+        pool,
+        event_bus,
+        pending,
+        thread_id,
+        actor,
+        SESSION_ENDED_REASON,
+        "[CCPermission] CodingAgentPermissionResolved (session ended)",
+    )
+    .await;
+}
+
+/// Shared core of the "clear every unresolved `CodingAgentPermissionRequest` on
+/// this thread as denied" sweeps — the superseded path (user typed instead of
+/// clicking) and the session-ended path (the session idled with a card
+/// dangling). Mirrors `recover_orphan_cc_permission_requests` but scoped to one
+/// thread. Two effects per unresolved request:
 ///
 ///   1. Fan a `false` (deny) out to any still-blocked MCP handler via the
 ///      in-memory broadcast entry, so the Claude Code subprocess's pending
@@ -792,18 +854,21 @@ fn outcome_from_permission_recv(
 ///   2. Emit `CodingAgentPermissionResolved { allowed: false }` so the
 ///      PermissionCard's buttons stop dangling — without this the card sits
 ///      clickable forever (clicking it 404s once CC interrupts and the waiter
-///      is gc'd) and the thread reads as stuck on `waiting_for_user_answer`.
-///      The projection flips the thread status back to `running`.
+///      is gc'd) and the thread reads as stuck.
 ///
-/// No-op when nothing is pending / everything is already resolved. The caller
-/// still routes the typed message to CC as a normal follow-up — this only
-/// clears the stale card.
-pub async fn resolve_pending_permissions_as_superseded(
+/// A resolution now flips the thread to `running` ONLY from
+/// `waiting_for_user_answer` (see `event_bus_projection_thread.rs`), so emitting
+/// these on an already-idle thread clears the stale card WITHOUT resurrecting it
+/// into a dead `running`. `reason` / `log_label` distinguish the two callers in
+/// the persisted event and the logs. No-op when nothing is pending.
+async fn resolve_pending_permissions_with_reason(
     pool: &sqlx::PgPool,
     event_bus: &EventBus,
     pending: &Mutex<PermissionState>,
     thread_id: Uuid,
     actor: Option<MessageOrigin>,
+    reason: &str,
+    log_label: &str,
 ) {
     let rows: Vec<(Option<String>,)> = match sqlx::query_as(
         "SELECT e.payload->>'request_id' \
@@ -850,12 +915,12 @@ pub async fn resolve_pending_permissions_as_superseded(
                     event: ThreadEvent::CodingAgentPermissionResolved {
                         request_id,
                         allowed: false,
-                        reason: Some(SUPERSEDED_REASON.to_string()),
+                        reason: Some(reason.to_string()),
                         persist_scope: None,
                     },
                     meta: EventMeta::with_actor(actor.clone()),
                 },
-                "[CCPermission] CodingAgentPermissionResolved (superseded)",
+                log_label,
             )
             .await;
     }

@@ -16,7 +16,7 @@ export function ThreadToggleButton({ class: cls }: Props) {
       // fire focusPane via different events: the header regions
       // (.pane-header-brand / .collapsed-thread-actions) on CLICK, and the thread
       // pane body (.pane-thread, via SplitLayout) on POINTERDOWN. Swallow BOTH so
-      // toggling the drawer never shifts the focus line to the thread pane.
+      // toggling the drawer never shifts pane focus to the thread pane.
       // stopPropagation is bubble-phase only, so the capture-phase overlay
       // outside-dismiss still closes any open popover (see useAnchoredPopover).
       onPointerDown={(e) => e.stopPropagation()}

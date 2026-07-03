@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: Review the current branch diff for correctness bugs plus reuse / simplification / efficiency / altitude cleanups, scaled by an effort arg (low/medium → precision, fewer high-confidence findings; high → recall-biased; xhigh/max → broader + a gap sweep). Returns findings as a JSON array. Repo-owned so it runs identically under Claude Code and Codex — Phase 1 of /harden drives it. Pass an effort word as the arg (default medium).
+description: Review the current branch diff for correctness bugs plus reuse / simplification / efficiency / altitude cleanups, scaled by an effort arg (low/medium → precision, fewer high-confidence findings; high → recall-biased; xhigh/max → broader + a gap sweep). Reports findings through a structured channel (the ReportFindings tool, or an in-band array handoff for agents without it) — never pasted into chat. Repo-owned so it runs identically under Claude Code and Codex — Phase 1 of /harden drives it. Pass an effort word as the arg (default medium).
 ---
 
 # code-review (Lucidos, repo-owned)
@@ -168,23 +168,39 @@ not pad.
 
 ## Output
 
-Return findings as a JSON array of at most `max findings` objects:
+Findings are **structured data for the caller** (`/harden` Phase 1), never a
+message for the reader. Report them through the structured channel your runtime
+offers — and **never print a findings array as prose: not empty `[]`/`{}`, not
+populated, not fenced, not inline.** A bare `[]` in the transcript is meaningless
+noise; it is the exact recurring bug this contract exists to prevent (see
+`docs/temporary-measures.md` § "code-review findings array leaking into chat").
+Keep the machine-readable findings path separate from the chat path — that
+separation, not a downstream text filter, is the fix.
+
+Each finding is an object, ranked most-severe first, capped at `max findings`:
 
 ```json
-[
-  {
-    "file": "path/to/file.ext",
-    "line": 123,
-    "summary": "one-sentence statement of the bug",
-    "failure_scenario": "concrete inputs/state → wrong output/crash"
-  }
-]
+{
+  "file": "path/to/file.ext",
+  "line": 123,
+  "summary": "one-sentence statement of the bug",
+  "failure_scenario": "concrete inputs/state → wrong output/crash"
+}
 ```
 
-Ranked most-severe first. If more than the cap survive, keep the most severe. If
-nothing survives verification, return `[]`.
+Route the findings by what your runtime offers:
 
-This JSON is the **handoff contract to the caller** (`/harden` Phase 1), not a
-message for the user. The caller translates it into prose and fixes the real
-findings — see `harden.md` Phase 1 for the apply/report rules (never paste the
-raw array, empty or populated, into the chat).
+- **You have a `ReportFindings` tool (Claude Code):** call it **exactly once**
+  with the findings array — ranked most-severe first, and an **empty array when
+  nothing survives verification**. It renders the findings structurally instead
+  of as text, so the empty case never becomes a stray `[]`. Do NOT also print the
+  findings. This is the whole handoff: the tool result stays in your context, so
+  you still fix the real findings in `/harden` Phase 1.
+- **You have no such tool (Codex / any other agent):** the findings array is your
+  own structured working record — `/harden` Phase 1 runs this review inline, so
+  *you* are the caller: build the array, then act on it directly (fix the real
+  findings in Phase 1). Keep it internal — **report to the reader in prose only,
+  never paste the array**. When nothing survives, write `No findings.` and proceed;
+  never a bare `[]`.
+
+See `harden.md` Phase 1 for the caller's apply/report rules.

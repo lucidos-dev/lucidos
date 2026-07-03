@@ -19,15 +19,15 @@ async fn test_execute_python_error() {
     let result = runtime.execute("raise ValueError('test error')").await;
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("ValueError"));
-    }
+}
 
-    #[tokio::test]
-    async fn test_execute_writes_to_workspace_cwd() {
-        let dir = tempdir().unwrap();
-        let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
+#[tokio::test]
+async fn test_execute_writes_to_workspace_cwd() {
+    let dir = tempdir().unwrap();
+    let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
 
-        let result = runtime
-            .execute("open('test_file.txt', 'w').write('ok'); print('done')")
+    let result = runtime
+        .execute("open('test_file.txt', 'w').write('ok'); print('done')")
         .await;
     assert!(result.is_ok());
     assert_eq!(result.unwrap().trim(), "done");

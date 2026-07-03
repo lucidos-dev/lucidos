@@ -25,6 +25,11 @@ const MAX_COMPOSE_TEXT_BYTES: usize = 64 * 1024;
 /// image refs without enabling N×64KB blowups. Each image is a URL/path
 /// reference, not the binary blob.
 const MAX_COMPOSE_IMAGES: usize = 32;
+/// Cap on the JSON-encoded `compose_selection` object. A partial
+/// `ComposeSelectionOverride` is a handful of short fields (~a few hundred
+/// bytes); 8 KiB is generous headroom while still fencing off a runaway client,
+/// since this fans out over SSE like the other compose fields.
+const MAX_COMPOSE_SELECTION_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct PostThreadBody {
@@ -55,6 +60,13 @@ pub(super) struct PutComposeBody {
     /// the thread is no longer in `composing`. Absent on text-only updates.
     #[serde(default)]
     pub mode: Option<String>,
+    /// Per-draft dropdown selections (target/scope, coding agent, Lucidos model
+    /// + reasoning, coding-agent model + reasoning) as a partial
+    /// `ComposeSelectionOverride`-shaped object. `None` (absent) preserves the
+    /// existing stored selection via SQL COALESCE — a text-only keystroke PUT
+    /// must not wipe the draft's picks; a dropdown change sends the full object.
+    #[serde(default)]
+    pub selection: Option<JsonValue>,
 }
 
 fn validate_mode(mode: &str) -> Result<(), ApiError> {
@@ -233,6 +245,18 @@ pub(super) async fn put_compose(
         .as_ref()
         .map(|h| serde_json::Value::Array(h.iter().cloned().map(JsonValue::String).collect()));
 
+    // Guard the selection payload: it fans out over SSE like the text/images do,
+    // and a partial `ComposeSelectionOverride` is tiny (a handful of short
+    // fields), so anything large is a runaway client, not a real draft.
+    if let Some(ref sel) = body.selection {
+        if serde_json::to_string(sel).map(|s| s.len()).unwrap_or(0) > MAX_COMPOSE_SELECTION_BYTES {
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "compose_selection exceeds size cap",
+            ));
+        }
+    }
+
     // Mode toggle on a thread that's already past `composing` is a contract
     // violation — pre-check so we surface 409 before the UPDATE rejects it
     // for an unrelated reason and we lose the precise error.
@@ -242,12 +266,16 @@ pub(super) async fn put_compose(
     // WHERE clause already gates mode-carrying writes to `state='composing'`.
     //
     // `compose_images` uses COALESCE($3, compose_images): NULL bind preserves
-    // the existing array, `[]` clears it.
-    let row: Option<(String, Option<String>, JsonValue)> = sqlx::query_as(
+    // the existing array, `[]` clears it. `compose_selection` uses
+    // COALESCE($5, compose_selection) the same way: a text-only/keystroke PUT
+    // (NULL bind) must preserve the draft's stored dropdown picks, while a
+    // dropdown change sends the full object.
+    let row: Option<(String, Option<String>, JsonValue, Option<JsonValue>)> = sqlx::query_as(
         "UPDATE thread_summaries
             SET compose_text = $2,
                 compose_images = COALESCE($3, compose_images),
                 compose_mode = COALESCE($4, compose_mode),
+                compose_selection = COALESCE($5, compose_selection),
                 source = CASE $4::text
                     WHEN 'claude_code' THEN 'claude_code'
                     WHEN 'lucidos'     THEN 'chat'
@@ -256,17 +284,18 @@ pub(super) async fn put_compose(
           WHERE thread_id = $1
             AND state IN ('composing', 'active')
             AND ($4::text IS NULL OR state = 'composing')
-         RETURNING state, compose_mode, compose_images",
+         RETURNING state, compose_mode, compose_images, compose_selection",
     )
     .bind(id)
     .bind(&body.text)
     .bind(images_bind.as_ref())
     .bind(body.mode.as_deref())
+    .bind(body.selection.as_ref())
     .fetch_optional(state.engine.pool())
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let (_state_str, resolved_mode, post_compose_images) = match row {
+    let (_state_str, resolved_mode, post_compose_images, post_compose_selection) = match row {
         Some(r) => r,
         None => {
             // Cold path: UPDATE matched zero rows. Distinguish "no row" from
@@ -327,6 +356,10 @@ pub(super) async fn put_compose(
         text: body.text,
         image_hashes: hashes_for_event,
         mode: resolved_mode,
+        // Read back whatever COALESCE produced — the new object on a dropdown
+        // change, the existing stored object on a preserve (keystroke) write —
+        // so every SSE receiver hydrates the authoritative per-draft selection.
+        selection: post_compose_selection,
         origin_device_id: device_id,
     });
     state

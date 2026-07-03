@@ -38,7 +38,12 @@ export function removePluginMarketplace(id: string): Promise<RemoveMarketplaceRe
 }
 
 export function fetchPluginCatalog(): Promise<MarketplaceCatalog> {
-  return json(`${API}/plugins/catalog`);
+  // The catalog scan shallow-clones every registered marketplace repo, so it can
+  // run well past the 10s default on a slow link — give it more headroom before
+  // the client aborts (a premature timeout flips the Loadable to a spurious
+  // "Failed to load plugin catalog"). The action layer retries a timeout anyway,
+  // but a fair first attempt avoids the user-visible retry delay.
+  return json(`${API}/plugins/catalog`, undefined, 30000);
 }
 
 /** Installed plugins from the event projection (no marketplace scan). Backs the

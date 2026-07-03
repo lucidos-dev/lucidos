@@ -116,6 +116,22 @@ then check **both directions**:
    suppressions, ADR-recorded design decisions, open-ended tech debt with no concrete
    end condition) — those are tracked elsewhere or not at all.
 
+## Phase 3.6: Packaged-Runtime Dependency & Fail-Fast Sweep
+
+A **reporting** cross-cutting pass (like Phase 3.5): surface findings in the final summary; don't silently rewire spawns or staging. It generalizes the bug class catalogued in `data/artifacts/audits/packaged-app-bundle-and-failfast-audit.md` — a runtime dependency that resolves in dev (rich shell PATH + `target/{debug,release}/` binaries side-by-side) but is absent or unreachable in the packaged macOS `.app` / headless tarball / `install.sh` service (minimal launchd PATH `/usr/bin:/bin:/usr/sbin:/sbin` + a fixed staged `RESOURCE_NAMES` set), failing as a cryptic mid-stream tool error or an indefinite boot-splash hang instead of a clear message.
+
+First establish the ground truth — read what is actually staged and which env vars the packaged runtime sets:
+
+- `scripts/lib/stage_runtime.sh` — `RESOURCE_NAMES` + `stage_runtime_assemble` (the staged set)
+- `crates/lucidos-app/src/desktop.rs` — `spawn_gateway` env + `bundled_resources`
+- `scripts/lib/service.sh` — `service_runtime_env_pairs` (the install-service env)
+
+Then sweep the engine + gateway + CLI (`crates/lucidos-engine/src/`, `crates/lucidos-gateway/src/`, `crates/lucidos-cli/src/`) for both directions:
+
+1. **Pattern A — unstaged or PATH-dependent runtime deps.** Grep for `Command::new(`, MCP server `command:` entries, hook `command`s, `include_str!`/`include_bytes!` vs disk reads, `LUCIDOS_*_DIR` / `*_BIN` env reads, and `current_exe()`-relative walks. For each, classify: resolved by absolute path / staged-dir env var (safe), or bare name relying on PATH. Flag any bare-name spawn whose target is not on the launchd minimal PATH and not staged, and any disk-read asset that no delivery vehicle stages. A genuinely external user-install is acceptable only if probed like `resolve_claude_binary` AND fail-fast on absence.
+2. **Pattern B — silent degrade instead of fail-fast.** Flag any binary/dir resolution that returns `None`/`Err` and proceeds anyway, any "is the env var set?" check that never stats the path, any health/readiness check that reports healthy while a required surface is missing, and any spawn whose missing dependency can only surface mid-stream.
+3. **Delivery-vehicle drift.** Confirm `RESOURCE_NAMES` + the env contract are identical across `build-dmg.sh`, `build-headless.sh`, `stage_runtime.sh`, `desktop.rs::spawn_gateway`, and `service.sh::service_runtime_env_pairs` — and that the `--check` validators assert the runtime-required set, not just the resource map's self-consistency.
+
 ## Phase 4: Verify
 
 Run tests based on which file types changed:

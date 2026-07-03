@@ -191,3 +191,39 @@ export async function restartEngine(): Promise<void> {
   const res = await mutatingFetch(`${API}/restart`, { method: 'POST' });
   await throwIfNotOk(res);
 }
+
+/** Whether a newer engine version is ready to switch onto, plus the dev
+ *  background-rebuild state. Dev half of the "New version available → Switch to
+ *  new version" flow; packaged reports `update_available: false` (its new-version
+ *  source is the release updater). See engine `GET /api/v1/engine/version-status`. */
+export interface EngineVersionStatus {
+  build_id: string;
+  update_available: boolean;
+  /** The on-disk binary's build id (dev), omitted when packaged / unreadable.
+   *  The switch badge+toast dismissal is keyed on this so a dismiss sticks for
+   *  THIS on-disk build but a genuinely newer build re-surfaces the switch. */
+  disk_build_id?: string;
+  packaged: boolean;
+  build_state: 'idle' | 'building' | 'ready' | 'failed';
+  /** Dev only: the engine SOURCE is behind HEAD by a restart-requiring change —
+   *  a NEW engine version exists in source even if no fresh binary is on disk yet
+   *  (rebuild failed / not run). Distinct from `update_available` (a fresh binary
+   *  IS on disk). Lets the UI surface a pending version + offer "Rebuild & Switch"
+   *  so the Switch is never a dead-end. Absent/false when packaged or git is
+   *  unavailable. */
+  source_behind_head?: boolean;
+}
+
+export async function engineVersionStatus(): Promise<EngineVersionStatus> {
+  return json(`${API}/engine/version-status`);
+}
+
+/** Manually kick off the dev background engine rebuild (escape hatch for a wedged
+ *  workspace whose source is behind HEAD with a stale binary — e.g. after a failed
+ *  background rebuild). No-op packaged. The resulting version-status `build_state`
+ *  transitions drive the UI (building → ready → Switch). See engine
+ *  `POST /api/v1/engine/rebuild`. */
+export async function rebuildEngine(): Promise<void> {
+  const res = await mutatingFetch(`${API}/engine/rebuild`, { method: 'POST' });
+  await throwIfNotOk(res);
+}

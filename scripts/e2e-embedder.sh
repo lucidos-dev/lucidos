@@ -74,5 +74,5 @@ echo "Running real-embedder tests (downloads ~465 MB on first run)..."
 # `--nocapture` surfaces the SKIP line `shared_embedder()` prints when the model
 # can't be fetched, so an HF outage reads as an explicit skip rather than a
 # silent pass.
-cargo test -p lucidos-engine --features real-embedder-tests --lib \
+cargo test --locked -p lucidos-engine --features real-embedder-tests --lib \
     -- "${GATED_TESTS[@]}" --nocapture "${CARGO_ARGS[@]}"

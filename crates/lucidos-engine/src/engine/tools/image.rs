@@ -127,6 +127,10 @@ impl LucidosEngine {
         // text description. The provider would then synthesise a derivative
         // image of nothing useful. Block these prompts with a pointer at the
         // model's native vision instead.
+        // TEMPORARY MEASURE — model-tolerance (removable; see
+        // docs/temporary-measures.md § "generate_image vision-misuse guard",
+        // governed by .claude/rules/temporary-measures.md). Drop once the model
+        // reliably stops mistaking generate_image for a vision tool.
         if looks_like_description_prompt(prompt) {
             return Err(
                 "this prompt looks like a request to describe/analyse an image, but \

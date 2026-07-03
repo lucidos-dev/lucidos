@@ -300,7 +300,12 @@ pub async fn get_repo_diff(
         return Err((StatusCode::BAD_REQUEST, "Invalid branch name".into()));
     }
 
-    let range = format!("main...{}", query.branch);
+    // Resolve the real default branch (`origin/<default>` / `main` / `master` /
+    // `HEAD`), never a hardcoded `main` — external repos legitimately use a
+    // different default, and diffing against a phantom `main` 400s with
+    // "unknown revision". Mirrors `get_change_diff` / `get_thread_cc_diff`.
+    let base = crate::engine::git_ops::default_diff_base(std::path::Path::new(&repo.path)).await;
+    let range = format!("{}...{}", base, query.branch);
     let output = crate::engine::git_ops::git_cmd(
         &["diff", &range, "--no-color"],
         std::path::Path::new(&repo.path),

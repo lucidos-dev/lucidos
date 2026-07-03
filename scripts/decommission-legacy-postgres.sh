@@ -5,8 +5,6 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-FRONTEND_DIR="$PROJECT_DIR/crates/lucidos-app"
-SCRIPT_NAME="decommission-legacy-postgres.sh"
 
 cd "$PROJECT_DIR"
 

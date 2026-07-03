@@ -12,6 +12,7 @@ import {
   patchPendingUpload,
 } from '../../store/pendingUploads';
 import { addAttachedImageHash, rememberSessionBlobUrl } from './pastedImages';
+import { generateUuid } from '../../utils/uuid';
 
 const PLUGIN_EXT = '.lucidos-plugin';
 
@@ -27,7 +28,7 @@ export async function attachImageToActiveDraft(file: File): Promise<void> {
   // surface as a brief black flash when the preview swapped to a fresh
   // `<img src="/api/v1/blobs/<hash>">` that re-fetched over the network.
   const previewUrl = URL.createObjectURL(file);
-  const localId = crypto.randomUUID();
+  const localId = generateUuid();
   addPendingUpload({
     localId,
     threadId,

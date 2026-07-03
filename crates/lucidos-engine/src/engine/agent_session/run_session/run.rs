@@ -5,7 +5,7 @@ use crate::engine::change_ops::now_epoch_millis;
 use crate::engine::claude_code::STALE_RESUME_ERROR;
 use crate::engine::git_ops::{
     auto_commit_preserving_marker, branch_changed_files, default_local_branch,
-    describe_branch_changes, files_require_restart, git_cmd, is_external_repo_path,
+    describe_branch_changes, files_require_restart, is_external_repo_path,
     is_harden_marker_present, main_worktree,
 };
 use crate::engine::thread_events::{EventChannel, SessionEndReason};
@@ -17,14 +17,14 @@ use uuid::Uuid;
 
 use crate::engine::agent_session::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
 use crate::engine::agent_session::lifecycle::{
-    classify_result, idle_action,
+    classify_result, idle_action, is_definitive_session_not_found,
     is_silent_resume, is_stale_resume_signal, reset_per_turn_flags,
     should_auto_commit_on_cleanup, should_propose_change_at_idle,
     terminal_clears_user_hit_stop, terminate_decision, watchdog_gate, IdleAction, TerminalKind,
     TerminateDecision, WatchdogGate, WATCHDOG_DIAG_LOG_THRESHOLD_MS,
     WATCHDOG_HUNG_TOOL_CEILING_MS, WATCHDOG_INACTIVITY_LIMIT_MS, WATCHDOG_TICK_INTERVAL_SECS,
 };
-use crate::engine::agent_session::resume::{change_description_fallback, resolve_resume_context, CC_TURN_CLOSER_EVENTS};
+use crate::engine::agent_session::resume::{change_description_fallback, default_claude_config_dir, resolve_resume_context, CC_TURN_CLOSER_EVENTS};
 use crate::engine::agent_session::spawn::spawn_or_resume;
 
 /// Decrement the paired-tool counter, flooring at 0. An unpaired decrement
@@ -324,9 +324,23 @@ impl LucidosEngine {
             spawns.insert(thread_id, std::time::Instant::now());
         }
 
+        // The thread's pinned account — the config dir of its FIRST session.
+        // Computed once here and injected on EVERY spawn below (see
+        // `inject_config_dir`) so a live `CLAUDE_CONFIG_DIR` toggle can never move
+        // an existing thread to another provider; it also scopes the auto-detected
+        // resume session id to this account.
+        let pinned_config_dir =
+            crate::engine::agent_session::lookup_pinned_cc_config_dir(self.pool(), thread_id).await;
         let (resume_session_id, resume_branch) =
             if recovery_worktree.is_none() && conflict_change_id.is_none() {
-                resolve_resume_context(self.pool(), self.changes(), thread_id, resume_session_id).await
+                resolve_resume_context(
+                    self.pool(),
+                    self.changes(),
+                    thread_id,
+                    resume_session_id,
+                    pinned_config_dir.as_deref(),
+                )
+                .await
             } else {
                 (resume_session_id, None)
             };
@@ -551,6 +565,58 @@ impl LucidosEngine {
                 );
                 Vec::new()
             });
+        // Resolve the CLAUDE_CONFIG_DIR (provider/account) this session runs under.
+        // A CC session's transcript lives at
+        // `$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`, and the thread is PINNED
+        // to the account of its FIRST session (`pinned_config_dir`, resolved above).
+        //   * `inject_config_dir` — the engine-owned override, injected on EVERY
+        //     spawn of an existing thread (resume, fresh, Tier-3 merge,
+        //     post-stale-resume retry, recovery). This is what guarantees a thread
+        //     never switches provider after turn 1: a live `CLAUDE_CONFIG_DIR`
+        //     toggle change is ignored for any thread that already has a pin.
+        //     `None` ONLY for the truly-first turn (no pin yet) — that spawn reads
+        //     the live env and thereby establishes the pin. Injecting on resume
+        //     also keeps `--resume` pointed at the dir CC wrote the transcript to
+        //     (the dev/bf997e21 "No conversation found" fix).
+        //   * `effective_config_dir` — the dir CC ACTUALLY runs under this spawn
+        //     (the injected pin, else the user's live value on turn 1, else CC's
+        //     default `$HOME/.claude`). Recorded at Init so the pin persists —
+        //     including the unset→set case (turn 1 on the default, user later set a
+        //     dir): the recorded default is re-injected on every later spawn.
+        let inject_config_dir = pinned_config_dir.clone();
+        let effective_config_dir = inject_config_dir.clone().or_else(|| {
+            // Match CC's actual precedence for a fresh session so the recorded dir
+            // never diverges from where CC writes the transcript: the user-managed
+            // env var (DB table — `apply_lucidos_env` sets it over the inherited
+            // env) wins, then the engine's own inherited process env (a shell that
+            // exported CLAUDE_CONFIG_DIR without a DB row), then CC's default.
+            user_env_vars
+                .iter()
+                .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+                .map(|(_, v)| v.clone())
+                .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok().filter(|v| !v.is_empty()))
+                .or_else(default_claude_config_dir)
+        });
+        // User-configured agent binary path (Settings → System → Coding agents).
+        // Resolved here — the spawn orchestration has the pool — and validated
+        // inside the runtime's spawn, which fails loud naming the setting on a
+        // path that doesn't resolve (never a silent fallback to probing).
+        let binary_override_key = match coding_agent {
+            crate::runtime::CodingAgent::ClaudeCode => crate::core::PREF_CODING_AGENT_CLAUDE_PATH,
+            crate::runtime::CodingAgent::Codex => crate::core::PREF_CODING_AGENT_CODEX_PATH,
+        };
+        let binary_override = crate::core::PreferenceStore::get(self.pool(), binary_override_key)
+            .await
+            .unwrap_or_else(|e| {
+                log!(
+                    "[AgentSession] Failed to load {} preference: {}",
+                    binary_override_key,
+                    e
+                );
+                None
+            })
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
         let runtime = match spawn_or_resume(
             self,
             coding_agent,
@@ -567,6 +633,11 @@ impl LucidosEngine {
                 repo_name: repo_name.as_deref(),
                 interactive: interactive_session,
                 user_env_vars: &user_env_vars,
+                binary_override: binary_override.as_deref(),
+                // Override CLAUDE_CONFIG_DIR only on an actual resume (see
+                // `inject_config_dir` above); a fresh session passes None so its
+                // env / CC default is untouched.
+                claude_config_dir: inject_config_dir.as_deref(),
                 // Resume with no fresh input = the engine expects the agent
                 // to pick up on its own (recovery / ContinuationRequested).
                 // Mirrors the `has_content` gate below that skips the
@@ -738,6 +809,9 @@ impl LucidosEngine {
                 question_resume_pending: false,
                 tools_in_flight: tools_in_flight_shared.clone(),
                 coding_agent,
+                // Clone so the external watchdog can cancel from outside this
+                // loop — the in-loop paths use the original `agent_cancel`.
+                agent_cancel: agent_cancel.clone(),
             };
             sessions.insert(thread_id, session);
         }
@@ -835,8 +909,9 @@ impl LucidosEngine {
                         coding_agent,
                         // Fires before CC's Init — the session id isn't known
                         // yet. The Init handler emits a second SettingsChanged
-                        // carrying it (see below).
+                        // carrying it AND the config dir (see below).
                         cc_session_id: None,
+                        claude_config_dir: None,
                     },
                     meta: meta.clone(),
                 })
@@ -851,6 +926,14 @@ impl LucidosEngine {
         }
 
         let mut result_texts: Vec<String> = Vec::new();
+        // Count tool calls seen before the first `Result`. Feeds the
+        // stale-resume heuristic (`is_stale_resume_signal`): a resumed turn that
+        // made ANY tool call is alive and working — even when it produced no
+        // assistant text (terse models like Fable). The stale check only fires
+        // on the first Result (`result_texts.is_empty()`), so a session-scoped
+        // counter is exactly "tool calls before the first Result." Prevents the
+        // 2026-07-02 false stale-resume → duplicate-process bug.
+        let mut tool_calls_seen: u32 = 0;
         let mut claude_text_buf = String::new();
         let mut last_text_persisted_len: usize = 0;
         // Reasoning/thinking stream buffer (coalesced like the text buffer above).
@@ -1108,6 +1191,12 @@ impl LucidosEngine {
                                     permission_mode: None,
                                     coding_agent,
                                     cc_session_id: Some(cc_sid.clone()),
+                                    // Pin the session↔config-dir pairing at Init:
+                                    // the dir this session was created under is what
+                                    // a later resume must re-inject to find its
+                                    // transcript. See `effective_config_dir` above
+                                    // and `lookup_pinned_cc_config_dir`.
+                                    claude_config_dir: effective_config_dir.clone(),
                                 },
                                 meta: meta.clone(),
                             }).await {
@@ -1264,6 +1353,11 @@ impl LucidosEngine {
                             // loop watchdog inside this same `select!` observes
                             // the value monotonically anyway.
                             tools_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // A tool call this turn proves the session is alive —
+                            // even a terse model that emits no text. Gates the
+                            // stale-resume heuristic below so a working Fable
+                            // resume is never misread as a dead session.
+                            tool_calls_seen = tool_calls_seen.saturating_add(1);
                             if crate::engine::agent_session::lifecycle::is_user_question_tool(&name) {
                                 // Question flow — the agent subprocess blocks until the user
                                 // answers and the engine renders the card from the
@@ -1464,15 +1558,33 @@ impl LucidosEngine {
                                         // after resume. The session was expired and produced no output.
                                         // Abort without emitting ResponseGenerated/CodingAgentIdled so
                                         // the caller can retry with a fresh session.
+                                        //
+                                        // Two independent signals, both meaning "the id we --resume'd is
+                                        // gone": the empty-echo heuristic (`is_stale_resume_signal`,
+                                        // gated on !cc_error so a transient 5xx never deletes user work),
+                                        // AND CC's EXPLICIT "No conversation found with session ID" error.
+                                        // The explicit error arrives AS a cc_error, so it bypasses the
+                                        // heuristic's gate — but it's deterministic (re-resuming can never
+                                        // succeed), so it's the one whitelisted error string that still
+                                        // recovers. Both take the same path: shadow the dead sid via
+                                        // SessionEnded(StaleResume), remove the worktree, keep the branch,
+                                        // return STALE_RESUME_ERROR so the caller retries fresh (chat →
+                                        // process_cc.rs; merge/apply → the Tier-2 Err arm falls through to
+                                        // a fresh Tier-3 merge session). Root cause: dev/bf997e21, a
+                                        // mid-flight CLAUDE_CONFIG_DIR switch relocated CC's transcript
+                                        // store.
+                                        let explicit_session_not_found = resume_session_id.is_some()
+                                            && is_definitive_session_not_found(cc_error.as_deref());
                                         if is_stale_resume_signal(
                                             resume_session_id.is_some(),
                                             result_text_empty,
                                             buffered_text_empty,
                                             result_texts.is_empty(),
+                                            tool_calls_seen == 0,
                                             !user_message.is_empty(),
                                             cc_error.is_some(),
-                                        ) {
-                                            log!("[AgentSession] Stale resume detected — CC returned empty Result for non-empty user message. Aborting session for retry.");
+                                        ) || explicit_session_not_found {
+                                            log!("[AgentSession] Stale resume detected (empty-echo heuristic or explicit session-not-found) — aborting session to retry with a fresh spawn.");
                                             agent_cancel.cancel();
                                             // Remove from sessions map so retry can start fresh
                                             {
@@ -1494,30 +1606,54 @@ impl LucidosEngine {
                                                 },
                                                 meta: meta.clone(),
                                             }, "[AgentSession] SessionEnded (stale resume)").await;
-                                            // Clean up so the retry starts fresh. The dead
-                                            // `cc_session_id` is unusable, but the BRANCH is the
-                                            // thread's durable anchor: the retry
-                                            // (`run_direct_agent` with `resume_session_id: None`)
-                                            // reuses it via the SessionStarted lookup, and
-                                            // `recover_orphaned_worktrees` keys on it after a
-                                            // restart. So remove the worktree only (the retry
-                                            // recreates it) and KEEP the branch — even with zero
-                                            // unique commits. Deleting a no-commit branch here was
-                                            // the thread-9e37697e data-loss class: it forced the
-                                            // retry onto a fresh branch from main, discarding the
-                                            // thread's identity. Only the explicit Discard /
-                                            // conflict-resolution paths delete a coding-agent
-                                            // branch.
-                                            if let Some(ref wt) = worktree_path {
-                                                if let Err(e) = git_cmd(
-                                                    &["worktree", "remove", "--force", &wt.to_string_lossy()],
-                                                    &repo_root,
+                                            // NEVER CREATE A DUPLICATE: await the old process
+                                            // group's full teardown before signalling the retry.
+                                            // `agent_cancel.cancel()` drives the driver_task's
+                                            // `graceful_kill_child_process_group` (SIGTERM →
+                                            // GROUP_TEARDOWN_GRACE → SIGKILL → reap); the driver
+                                            // drops `events_tx` only AFTER that completes, so
+                                            // draining `events_rx` to a closed channel is a precise
+                                            // await of "the old CC process group is dead." Without
+                                            // it the fresh retry (`run_direct_agent`) could spawn
+                                            // while the wedged old process is still alive on the
+                                            // SHARED deterministic worktree — the 2026-07-02
+                                            // double-process (2x quota) bug. Bounded so a stuck
+                                            // teardown can't wedge the loop (grace is 3s; 15s is
+                                            // generous headroom).
+                                            let teardown_deadline = tokio::time::Instant::now()
+                                                + std::time::Duration::from_secs(15);
+                                            loop {
+                                                match tokio::time::timeout_at(
+                                                    teardown_deadline,
+                                                    events_rx.recv(),
                                                 )
                                                 .await
                                                 {
-                                                    log!("[AgentSession] stale-resume worktree remove failed for {}: {}", wt.display(), e);
+                                                    // Trailing events from the dying process — drop them.
+                                                    Ok(Some(_)) => continue,
+                                                    // Channel closed → the old process group is dead.
+                                                    Ok(None) => break,
+                                                    Err(_) => {
+                                                        log!("[AgentSession] stale-resume teardown wait timed out for thread {} — proceeding with retry (old process may briefly linger)", thread_id);
+                                                        break;
+                                                    }
                                                 }
                                             }
+                                            // NEVER DELETE A POSSIBLY-USEFUL WORKTREE. The
+                                            // deterministic `thread-<id>` worktree is SHARED per
+                                            // thread and holds the user's warm working copy; we do
+                                            // NOT remove it here. The retry (`run_direct_agent` with
+                                            // `resume_session_id: None`) REUSES the existing worktree
+                                            // — `spawn_context` runs `worktree_add` only when the dir
+                                            // is absent, and `clear_stranded_worktree_dir` handles a
+                                            // genuinely-broken one. The branch is the thread's
+                                            // durable anchor and is kept regardless. The background
+                                            // WorktreeCleanup worker is the SOLE deleter of a valid
+                                            // worktree (gated on is_active, dirty, unmerged commits,
+                                            // retention). The old inline `git worktree remove
+                                            // --force` here deleted a live worktree out from under a
+                                            // concurrent process and needlessly wiped node_modules —
+                                            // removed 2026-07-02.
                                             return Err(STALE_RESUME_ERROR.into());
                                         }
 

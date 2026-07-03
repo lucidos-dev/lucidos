@@ -28,6 +28,8 @@ fn test_spawn_args<'a>(
         interactive: false,
         continuation: false,
         user_env_vars: &[],
+        claude_config_dir: None,
+        binary_override: None,
     }
 }
 
@@ -51,6 +53,8 @@ fn test_spawn_args_with_event<'a>(
         interactive: false,
         continuation: false,
         user_env_vars: &[],
+        claude_config_dir: None,
+        binary_override: None,
     }
 }
 
@@ -74,6 +78,8 @@ fn test_spawn_args_with_repo<'a>(
         interactive: false,
         continuation: false,
         user_env_vars: &[],
+        claude_config_dir: None,
+        binary_override: None,
     }
 }
 
@@ -102,6 +108,8 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
         interactive: false,
         continuation: false,
         user_env_vars: &user_env,
+        claude_config_dir: None,
+        binary_override: None,
     };
     let cmd = build_command(&args, None);
     let env = collect_envs(&cmd);
@@ -115,6 +123,53 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
             .map(|v| v.as_os_str()),
         Some(std::ffi::OsStr::new("engine-repo")),
         "engine-owned LUCIDOS_REPO must override a user var of the same name"
+    );
+}
+
+#[test]
+fn build_command_pins_claude_config_dir_over_user_env() {
+    // A RESUME must run under the config dir the session was created in, even
+    // when the user has since toggled CLAUDE_CONFIG_DIR to something else. The
+    // pinned value (SpawnArgs.claude_config_dir) is set AFTER apply_lucidos_env's
+    // user-env loop, so it wins the collision — the fix for dev/bf997e21.
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let user_env = vec![(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        "/home/u/.claude-personal".to_string(),
+    )];
+    let mut args = test_spawn_args(p, p, thread_id);
+    args.user_env_vars = &user_env;
+    args.claude_config_dir = Some("/home/u/.claude");
+    let cmd = build_command(&args, None);
+    let env = collect_envs(&cmd);
+    assert_eq!(
+        env.get(std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+            .map(|v| v.as_os_str()),
+        Some(std::ffi::OsStr::new("/home/u/.claude")),
+        "pinned config dir must override the user's live CLAUDE_CONFIG_DIR on resume"
+    );
+}
+
+#[test]
+fn build_command_leaves_user_claude_config_dir_when_not_pinned() {
+    // A FRESH session (no pin) must leave the user's CLAUDE_CONFIG_DIR untouched.
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let user_env = vec![(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        "/home/u/.claude-personal".to_string(),
+    )];
+    let mut args = test_spawn_args(p, p, thread_id);
+    args.user_env_vars = &user_env;
+    // claude_config_dir left None (fresh session)
+    let cmd = build_command(&args, None);
+    let env = collect_envs(&cmd);
+    assert_eq!(
+        env.get(std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+            .map(|v| v.as_os_str()),
+        Some(std::ffi::OsStr::new("/home/u/.claude-personal")),
+        "a fresh session must keep the user's CLAUDE_CONFIG_DIR (no engine override)"
     );
 }
 
@@ -277,7 +332,15 @@ fn collect_args(cmd: &tokio::process::Command) -> Vec<String> {
 fn build_command_uses_permission_prompt_tool_not_skip_permissions() {
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
-    let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
+    // The permission MCP server is launched via the ABSOLUTE path to the bundled
+    // `lucidos` binary next to the engine — not the bare name — so it doesn't
+    // depend on PATH propagating through the engine → claude(Node) → MCP-server
+    // spawn chain (the bug that broke Claude Code in the packaged .app). Stage a
+    // fake bundled binary and assert the config points at its absolute path.
+    let cli = tempfile::TempDir::new().expect("tempdir");
+    let lucidos_path = cli.path().join(LUCIDOS_BIN_NAME);
+    std::fs::write(&lucidos_path, b"#!/bin/sh\n").expect("write fake lucidos");
+    let cmd = build_command(&test_spawn_args(p, p, thread_id), Some(cli.path()));
     let args = collect_args(&cmd);
 
     assert!(
@@ -300,7 +363,11 @@ fn build_command_uses_permission_prompt_tool_not_skip_permissions() {
         .expect("--mcp-config must be present");
     let cfg: serde_json::Value = serde_json::from_str(&args[mcp_config_idx + 1])
         .expect("--mcp-config value must be valid JSON");
-    assert_eq!(cfg["mcpServers"]["lucidos_perm"]["command"], "lucidos");
+    assert_eq!(
+        cfg["mcpServers"]["lucidos_perm"]["command"],
+        lucidos_path.to_string_lossy().as_ref(),
+        "permission server must be launched via the absolute bundled `lucidos` path"
+    );
     assert_eq!(
         cfg["mcpServers"]["lucidos_perm"]["args"][0],
         "mcp-permission-server"
@@ -309,6 +376,47 @@ fn build_command_uses_permission_prompt_tool_not_skip_permissions() {
     assert!(
         args.iter().any(|a| a == "--strict-mcp-config"),
         "--strict-mcp-config keeps the permission server isolated from the user's global MCP config"
+    );
+}
+
+#[test]
+fn resolve_lucidos_binary_prefers_bundled_cli_dir() {
+    // The bundled `lucidos` next to the engine wins, resolved to its absolute
+    // path so the permission MCP server never depends on PATH.
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let bin = dir.path().join(LUCIDOS_BIN_NAME);
+    std::fs::write(&bin, b"#!/bin/sh\n").expect("write fake lucidos");
+    let resolved =
+        resolve_lucidos_binary_in(Some(dir.path()), None).expect("must resolve the bundled binary");
+    assert_eq!(resolved, bin);
+}
+
+#[test]
+fn resolve_lucidos_binary_falls_back_to_path() {
+    // No bundled binary next to the engine, but `lucidos` is on PATH (Homebrew,
+    // npm, a dev's target dir) → resolve via PATH rather than failing.
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let bin = dir.path().join(LUCIDOS_BIN_NAME);
+    std::fs::write(&bin, b"#!/bin/sh\n").expect("write fake lucidos");
+    let path_env = dir.path().as_os_str().to_owned();
+    let resolved = resolve_lucidos_binary_in(None, Some(path_env.as_os_str()))
+        .expect("must resolve via PATH");
+    assert_eq!(resolved, bin);
+}
+
+#[test]
+fn resolve_lucidos_binary_errors_when_missing_everywhere() {
+    // Reachable from neither cli_dir nor PATH → fail fast with a descriptive,
+    // packaging-aware error instead of letting CC start a doomed session whose
+    // first tool call dies with "Available MCP tools: none".
+    let empty = tempfile::TempDir::new().expect("tempdir"); // exists, no `lucidos` inside
+    let path_env = empty.path().as_os_str().to_owned();
+    let err = resolve_lucidos_binary_in(Some(empty.path()), Some(path_env.as_os_str()))
+        .expect_err("must error when lucidos is unreachable");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("lucidos") && msg.contains("PATH"),
+        "error must name the missing binary and explain where it looked: {msg}"
     );
 }
 
@@ -450,12 +558,84 @@ fn resolve_claude_binary_prefers_native_installer_path() {
     let claude_path = local_bin.join("claude");
     std::fs::write(&claude_path, b"#!/bin/sh\necho fake\n").expect("write fake claude");
 
-    let resolved = resolve_claude_binary(Some(tmp.path()));
+    let resolved = resolve_claude_binary(Some(tmp.path()), None);
     assert_eq!(
         resolved,
         claude_path.as_os_str(),
         "must resolve to the absolute native-installer path when present"
     );
+}
+
+#[test]
+fn resolve_claude_binary_override_wins_over_probes() {
+    // A user-configured path (coding_agent_claude_path) beats every probe —
+    // even when the native-installer path exists.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let local_bin = tmp.path().join(".local").join("bin");
+    std::fs::create_dir_all(&local_bin).expect("create .local/bin");
+    std::fs::write(local_bin.join("claude"), b"#!/bin/sh\n").expect("write fake claude");
+    let override_path = tmp.path().join("custom-claude");
+
+    let resolved = resolve_claude_binary(Some(tmp.path()), Some(&override_path));
+    assert_eq!(
+        resolved,
+        override_path.as_os_str(),
+        "a configured binary path must win over the probe list"
+    );
+}
+
+#[test]
+fn resolve_claude_binary_probes_claude_local_install() {
+    // The older `claude migrate-installer` layout: $HOME/.claude/local/claude.
+    // Probed after ~/.local/bin so the canonical native install still wins.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let local_install = tmp.path().join(".claude").join("local");
+    std::fs::create_dir_all(&local_install).expect("create .claude/local");
+    let claude_path = local_install.join("claude");
+    std::fs::write(&claude_path, b"#!/bin/sh\n").expect("write fake claude");
+
+    let resolved = resolve_claude_binary(Some(tmp.path()), None);
+    assert_eq!(
+        resolved,
+        claude_path.as_os_str(),
+        "must probe the ~/.claude/local install location"
+    );
+}
+
+#[test]
+fn resolve_binary_override_rejects_missing_path() {
+    // A typo'd override must FAIL naming the setting — never silently fall
+    // back to probing (that would spawn a different binary than configured).
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let missing = tmp.path().join("nope/claude");
+    let err = crate::runtime::spawn_env::resolve_binary_override(
+        missing.to_str().unwrap(),
+        "Claude Code (`claude`)",
+        "coding_agent_claude_path",
+    )
+    .expect_err("nonexistent override must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("coding_agent_claude_path"),
+        "error must name the preference so the user can fix it: {msg}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_binary_override_rejects_non_executable_file() {
+    // Present-but-not-executable fails with the exec-bit message instead of a
+    // later cryptic spawn EACCES that doesn't name the setting.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let file = tmp.path().join("claude");
+    std::fs::write(&file, b"not a binary").expect("write file");
+    let err = crate::runtime::spawn_env::resolve_binary_override(
+        file.to_str().unwrap(),
+        "Claude Code (`claude`)",
+        "coding_agent_claude_path",
+    )
+    .expect_err("non-executable override must be rejected");
+    assert!(err.to_string().contains("not executable"), "{err}");
 }
 
 #[test]
@@ -466,23 +646,26 @@ fn resolve_claude_binary_falls_back_to_bare_name_when_native_missing() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     // .local/bin intentionally not created.
 
-    let resolved = resolve_claude_binary(Some(tmp.path()));
-    assert_eq!(
-        resolved,
-        std::ffi::OsStr::new("claude"),
-        "must fall back to bare \"claude\" so PATH lookup at spawn time still works"
+    let resolved = resolve_claude_binary(Some(tmp.path()), None);
+    // May resolve to a system install (Homebrew) when present on the test
+    // host; otherwise the bare name. Either way it must not point inside the
+    // empty temp home.
+    assert!(!resolved.is_empty());
+    assert!(
+        !resolved
+            .to_string_lossy()
+            .starts_with(&*tmp.path().to_string_lossy()),
+        "an empty HOME must not resolve to a HOME-relative path: {resolved:?}"
     );
 }
 
 #[test]
 fn resolve_claude_binary_falls_back_when_no_home() {
-    // No HOME → can't construct the native-installer path → bare fallback.
-    let resolved = resolve_claude_binary(None);
-    assert_eq!(
-        resolved,
-        std::ffi::OsStr::new("claude"),
-        "must fall back to bare \"claude\" when HOME is unset"
-    );
+    // No HOME → no HOME-derived probe candidates. The Homebrew prefixes may
+    // still resolve on the test host; assert only that the result is usable
+    // and not empty (the bare "claude" fallback otherwise).
+    let resolved = resolve_claude_binary(None, None);
+    assert!(!resolved.is_empty());
 }
 
 #[test]

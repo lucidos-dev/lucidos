@@ -30,7 +30,15 @@ export function InlineForm() {
     case 'app-edit': return <AppUiEditModal />;
     case 'new-app': return <NewAppModal />;
     case 'trigger': return <TriggerDetails key={form.triggerId ?? 'new'} />;
-    case 'email-confirm': return <EmailConfirmModal />;
+    // The modal seeds subject/body useState once per mount — the key remounts it
+    // when a different draft replaces the open form (no request id exists, so the
+    // state-seeding fields are the identity; JSON keeps field boundaries unambiguous).
+    case 'email-confirm':
+      return (
+        <EmailConfirmModal
+          key={JSON.stringify([form.request.account, form.request.to, form.request.subject, form.request.body])}
+        />
+      );
     case 'plugin-install': return <PluginInstallPanel />;
     case 'plugin-uninstall': return <PluginUninstallPanel />;
   }

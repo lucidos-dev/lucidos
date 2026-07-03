@@ -1,7 +1,7 @@
 import { useSignal } from '@preact/signals';
 import { dismissWelcomeSuggestions } from '../../store/actions/preferences';
 import { openProviderSettings } from '../../store/actions/menu';
-import { prefillCompose } from '../../store/actions/compose';
+import { applySuggestion } from '../../store/actions/compose';
 import { composeHandlers } from './promptFocus';
 import { llmConfigured } from '../../store/store';
 import { ChevronLeftIcon, ChevronRightIcon } from '../shared/icons';
@@ -58,9 +58,10 @@ export function ProviderSetupWelcome() {
 }
 
 /** Conversational starter ideas — example things to ask the Lucidos Agent.
- *  Clicking a suggestion prefills it into the prompt (via `prefillCompose`) so
- *  the user can edit and send, rather than retyping it. Shown one at a time in a
- *  chevron carousel (SuggestionCarousel). */
+ *  Clicking a suggestion drops it into the prompt (via `applySuggestion`, which
+ *  targets the Lucidos Agent and confirms before overriding an in-progress draft)
+ *  so the user can edit and send, rather than retyping it. Shown one at a time in
+ *  a chevron carousel (SuggestionCarousel). */
 const IDEAS: string[] = [
   'Build me an app that tracks my reading list.',
   'Send a summary of my emails for review every weekday at 8am.',
@@ -86,10 +87,10 @@ export function suggestionView(ideas: string[], index: number) {
  *  on every step — the inapplicable one (at the first / last suggestion) is
  *  `disabled` (greyed, non-interactive) rather than hidden, so the carousel
  *  controls never disappear. Same circular nav treatment as the notification
- *  detail chevrons. The suggestion itself is a button: clicking it prefills the
- *  prompt (focus-first via `composeHandlers` so the iOS keyboard opens within the
- *  tap gesture). Kept in its own component so WelcomeMessage stays hook-free (the
- *  welcome tests invoke it as a plain function).
+ *  detail chevrons. The suggestion itself is a button: clicking it drops it into
+ *  the prompt (focus-first via `composeHandlers` so the iOS keyboard opens within
+ *  the tap gesture). Kept in its own component so WelcomeMessage stays hook-free
+ *  (the welcome tests invoke it as a plain function).
  *
  *  All suggestions are rendered stacked in a single CSS grid cell
  *  (`.welcome-carousel-viewport`) so the viewport's height is driven by the
@@ -124,7 +125,7 @@ export function SuggestionCarousel() {
               aria-hidden={active ? undefined : 'true'}
               tabIndex={active ? undefined : -1}
               aria-label={`Use this suggestion: ${idea}`}
-              {...composeHandlers(() => { prefillCompose(idea); })}
+              {...composeHandlers(() => { void applySuggestion(idea); })}
             >
               {idea}
             </button>

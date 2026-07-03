@@ -38,18 +38,62 @@ pub(crate) fn resolve_from_env() -> Result<Workspace, BoxError> {
     let pwd = std::env::current_dir()
         .map_err(|e| format!("Failed to read current dir: {}", e))?;
     let env_ws = std::env::var("LUCIDOS_WORKSPACE").ok().map(PathBuf::from);
-    let mut ws = resolve(&pwd, env_ws.as_deref())?;
-    // Prefer the engine-provided base URL when set (workspace gateway, ADR 0014
-    // — see `Workspace::api_base_override`). Read here, not in `resolve`, to keep
-    // `resolve` free of env reads so tests can drive it deterministically.
-    if let Some(base) = std::env::var("LUCIDOS_API_BASE_URL")
+    // Read the engine-provided base URL here, not in the resolver, to keep the
+    // pure helpers free of env reads so tests can drive them deterministically
+    // (workspace gateway, ADR 0014 — see `Workspace::api_base_override`).
+    let api_base_override = std::env::var("LUCIDOS_API_BASE_URL")
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        ws.api_base_override = Some(base);
-    }
-    Ok(ws)
+        .filter(|s| !s.is_empty());
+    resolve_with_override(&pwd, env_ws.as_deref(), api_base_override)
+}
+
+/// Env-free resolution that honours the engine-supplied `LUCIDOS_API_BASE_URL`
+/// override (workspace gateway, ADR 0014). Split from `resolve_from_env` so
+/// tests can drive it without racing the global env table.
+///
+/// When `api_base_override` is `Some`, that override IS the authoritative engine
+/// endpoint (`Workspace::base_url`), so the `.lucidos/ports` file is OPTIONAL.
+/// The packaged gateway spawns the engine on a random loopback port and never
+/// writes that file (only dev's `web-dev.sh` does), so requiring it here made
+/// every `lucidos` CLI call inside a packaged coding-agent thread fail at
+/// startup — the permission-prompt MCP server exited before advertising its
+/// tools, so Claude Code aborted every tool call with "Available MCP tools:
+/// none". We still best-effort read the ports file to fill `api_port`/`proto`,
+/// but they are unused while an override is present (`base_url` returns the
+/// override verbatim), so a missing or unreadable file is not an error.
+///
+/// When `api_base_override` is `None` (legacy / Tauri / terminal), this is
+/// identical to `resolve`: the ports file is required, same errors, same
+/// precedence — so dev behaviour is unchanged.
+pub(crate) fn resolve_with_override(
+    start_dir: &Path,
+    env_workspace: Option<&Path>,
+    api_base_override: Option<String>,
+) -> Result<Workspace, BoxError> {
+    let Some(base) = api_base_override else {
+        return resolve(start_dir, env_workspace);
+    };
+    // Root: prefer the engine-supplied workspace (always set alongside the
+    // override), else walk up for a ports file, else fall back to the start dir
+    // so `data_dir()` still resolves. Never an error on the override path.
+    let root = env_workspace
+        .map(Path::to_path_buf)
+        .or_else(|| walk_up_for_ports(start_dir))
+        .unwrap_or_else(|| start_dir.to_path_buf());
+    // Best-effort port/proto — unused while the override is present, so tolerate
+    // a missing/unreadable ports file. Derive the fallback proto from the
+    // override's scheme purely for internal consistency.
+    let (api_port, proto) = read_ports(&root.join(".lucidos/ports")).unwrap_or_else(|_| {
+        let proto = if base.starts_with("https") { "https" } else { "http" };
+        (0, proto.to_string())
+    });
+    Ok(Workspace {
+        root,
+        api_port,
+        proto,
+        api_base_override: Some(base),
+    })
 }
 
 /// Separated from env reads so tests can drive it without racing the global
@@ -279,6 +323,58 @@ mod tests {
             api_base_override: Some("http://127.0.0.1:62072".to_string()),
         };
         assert_eq!(ws.base_url(), "http://127.0.0.1:62072");
+    }
+
+    #[test]
+    fn override_makes_ports_file_optional() {
+        // The packaged gateway hands down LUCIDOS_API_BASE_URL but never writes
+        // .lucidos/ports. Resolution must succeed anyway and return the override
+        // as the base URL — the fix for the "Available MCP tools: none" abort.
+        let ws = tempdir().unwrap(); // no .lucidos/ports inside
+        let unrelated = tempdir().unwrap();
+        let resolved = resolve_with_override(
+            unrelated.path(),
+            Some(ws.path()),
+            Some("http://127.0.0.1:57206".to_string()),
+        )
+        .unwrap();
+        assert_eq!(resolved.root, ws.path());
+        assert_eq!(resolved.base_url(), "http://127.0.0.1:57206");
+    }
+
+    #[test]
+    fn override_wins_even_when_ports_file_present() {
+        // With both a ports file and an override, the override is authoritative.
+        let ws = tempdir().unwrap();
+        write_ports(ws.path(), 5174);
+        let resolved = resolve_with_override(
+            ws.path(),
+            Some(ws.path()),
+            Some("http://127.0.0.1:62072".to_string()),
+        )
+        .unwrap();
+        assert_eq!(resolved.base_url(), "http://127.0.0.1:62072");
+    }
+
+    #[test]
+    fn override_absent_still_requires_ports_file() {
+        // No override → identical to `resolve`: the ports file is mandatory and a
+        // missing one is an error (dev / Tauri / terminal path unchanged).
+        let tmp = tempdir().unwrap(); // no ports file
+        let err = resolve_with_override(tmp.path(), None, None).unwrap_err();
+        assert!(err.to_string().contains("Could not locate"), "{err}");
+    }
+
+    #[test]
+    fn override_root_falls_back_to_start_dir_without_env_workspace() {
+        // Override present but no LUCIDOS_WORKSPACE and no ports anywhere: root
+        // falls back to the start dir so data_dir() still resolves, no error.
+        let start = tempdir().unwrap();
+        let resolved =
+            resolve_with_override(start.path(), None, Some("http://127.0.0.1:1".to_string()))
+                .unwrap();
+        assert_eq!(resolved.root, start.path());
+        assert_eq!(resolved.base_url(), "http://127.0.0.1:1");
     }
 
     #[test]

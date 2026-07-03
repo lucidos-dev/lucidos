@@ -56,11 +56,27 @@ fi
 
 setup_e2e_session e2e-browser --cleanup-worktrees-on-teardown
 
+# Host-load backpressure guard — the e2e lock is now held (by setup_e2e_session in
+# standalone mode, or by the umbrella scripts/e2e.sh under $LUCIDOS_E2E_UMBRELLA),
+# so this is the chokepoint right before the Playwright browser swarm spawns, for
+# BOTH entry paths. If the host is already saturated it waits/backs off; if it
+# stays saturated past the wait cap it returns HOST_LOAD_SATURATED_EXIT (75) and we
+# exit cleanly rather than piling the swarm onto a pegged host and wedging the
+# machine (2026-07-01 incident — see docs/e2e-test-decisions.md + host_load_guard.sh).
+# The lock is released on the way out by the EXIT-trap chain (standalone: this
+# script's teardown_e2e; umbrella: e2e.sh's set -e + teardown_e2e), so exit 75 never
+# leaves a stale lock. Deliberately invoked ONCE here, not also in e2e.sh, so the
+# umbrella run doesn't double the wait. e2e-api.sh is intentionally not guarded.
+wait_for_host_load || exit $?
+
 echo "Running browser e2e tests (port $VITE_PORT)"
 
 cd "$PROJECT_DIR/crates/lucidos-app"
 
-npm install
+# Strict, deterministic install from the committed root lockfile (npm workspaces
+# hoists to the root, so run ci there; subshell keeps cwd at the app dir for
+# Playwright below).
+( cd "$PROJECT_DIR" && npm ci )
 
 export E2E_WORKSPACE
 [ -n "$HEADED" ] && export HEADED=1

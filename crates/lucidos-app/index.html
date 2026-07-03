@@ -124,10 +124,19 @@
         d.setAttribute('data-theme', resolved);
         var bg = resolved === 'light' ? '#ffffff' : '#07172e';
         d.style.setProperty('--bg-primary', bg);
-        // iOS PWA cold-restart flashes WKWebView's underlying white until
-        // global.css applies `html { background: var(--bg-primary); }`.
-        // Inlining the bg on <html> covers that gap.
-        d.style.background = bg;
+        // Paint the boot-splash brand gradient on the root during boot (solid
+        // #0a4ea8 fallback + fixed attachment). This covers TWO gaps at once:
+        //   1. the WKWebView white flash on iOS PWA cold-restart (what the
+        //      previous solid-`bg` inline covered), and
+        //   2. the iOS standalone bottom safe-area strip that the fixed
+        //      `inset:0` .boot-splash element leaves bare — otherwise the dark
+        //      var(--bg-primary) root shows through as a black band under the
+        //      splash. Same fixed-attachment-gradient technique the gateway
+        //      splash uses (crates/lucidos-gateway/src/proxy.rs `.mark`/html bg).
+        // dismissBootSplash() (src/utils/bootSplash.ts) reverts this to
+        // var(--bg-primary) once the splash is gone, so no blue lingers behind
+        // the app's own bottom safe-area inset.
+        d.style.background = '#0a4ea8 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed';
         var FONTS = {
           monospace: "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
           system: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",

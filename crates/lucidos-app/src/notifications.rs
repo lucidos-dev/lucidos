@@ -291,31 +291,61 @@ mod imp {
         }
     }
 
-    /// Set the dock-icon badge to `count` (the AGGREGATE unread total across
-    /// running workspaces — the Tauri window fronts the gateway, so its app icon
-    /// represents all workspaces). `0` clears the badge; `>99` shows "99+".
+    /// Set the dock-icon badge to `label`, or clear it with `None`. The caller
+    /// (`crate::apply_unread_indicator`) formats the AGGREGATE unread total across
+    /// running workspaces (the Tauri window fronts the gateway, so its app icon
+    /// represents all workspaces) — including the `0`→clear and `>99`→"99+" rules —
+    /// and routes it here only while the client is a normal `Regular` Dock app; a
+    /// menu-bar-only client has no Dock tile and shows the count via
+    /// [`set_tray_title`] instead.
     ///
     /// MUST be called on the main thread — `MainThreadMarker::new()` returns
     /// `None` off it and we bail (the desktop poll marshals here via
     /// `run_on_main_thread`). Unlike [`setup`]/[`show`] this works in dev too: the
     /// dock tile exists for an unbundled `cargo run` app (only UN needs a bundle).
-    pub fn set_dock_badge(count: u64) {
+    pub fn set_dock_badge(label: Option<String>) {
         use objc2::MainThreadMarker;
         use objc2_app_kit::NSApplication;
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
         let tile = NSApplication::sharedApplication(mtm).dockTile();
-        if count > 0 {
-            let label = if count > 99 {
-                "99+".to_string()
-            } else {
-                count.to_string()
-            };
-            tile.setBadgeLabel(Some(&NSString::from_str(&label)));
-        } else {
-            tile.setBadgeLabel(None);
+        match label {
+            Some(l) => tile.setBadgeLabel(Some(&NSString::from_str(&l))),
+            None => tile.setBadgeLabel(None),
         }
+    }
+
+    /// Set (or clear, with `None`) the menu-bar tray icon's title text. Used to show
+    /// the unread count next to the icon while the client is menu-bar-only, where
+    /// there is no Dock tile to badge (`crate::apply_unread_indicator` routes the
+    /// count here vs [`set_dock_badge`] based on the activation policy). Looks up
+    /// the tray by the id it was built with (`lucidos-tray`). Best-effort: a missing
+    /// tray / failure is logged, not fatal.
+    pub fn set_tray_title(app: &AppHandle, title: Option<String>) {
+        if let Some(tray) = app.tray_by_id("lucidos-tray") {
+            if let Err(e) = tray.set_title(title.as_deref()) {
+                eprintln!("[Tauri] Failed to set tray title: {e}");
+            }
+        }
+    }
+
+    /// Bring the app to the foreground. Needed after leaving the `Accessory`
+    /// activation policy: switching back to `Regular` alone can leave the app
+    /// behind other apps with an unclickable menu bar (a known AppKit gotcha), so
+    /// the reopen path explicitly activates. Must run on the main thread (all
+    /// callers do — tray menu / notification tap / Reopen).
+    pub fn activate_app() {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::NSApplication;
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        // `activateIgnoringOtherApps:` is deprecated as of macOS 14 in favor of the
+        // parameterless `activate()`, but that exists only on macOS 14+ and this app
+        // targets macOS 11+ (see tauri.conf.json), so keep the cross-version call.
+        #[allow(deprecated)]
+        NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
     }
 
     /// Drain (and clear) every deep link stashed by a tap the page may not have
@@ -330,7 +360,7 @@ mod imp {
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{dismiss, set_dock_badge, setup, show, take_pending_taps};
+pub use imp::{activate_app, dismiss, set_dock_badge, set_tray_title, setup, show, take_pending_taps};
 
 /// Non-macOS desktop has no native notification path (the engine still
 /// web-pushes browser / PWA clients); these are no-ops so call sites stay
@@ -349,7 +379,12 @@ pub fn dismiss(_id: Option<String>) {}
 /// No dock badge off macOS (the native app-icon badge is a macOS dock-tile
 /// concept). Browser / PWA clients still get the Badging API on every platform.
 #[cfg(not(target_os = "macos"))]
-pub fn set_dock_badge(_count: u64) {}
+pub fn set_dock_badge(_label: Option<String>) {}
+
+/// No tray-title unread count off macOS — the menu-bar-only activation model is a
+/// macOS concept; a no-op so `crate::apply_unread_indicator` stays platform-agnostic.
+#[cfg(not(target_os = "macos"))]
+pub fn set_tray_title(_app: &tauri::AppHandle, _title: Option<String>) {}
 
 /// No native tap stash off macOS (no native notification path here); always
 /// empty so the Tauri command stays platform-agnostic.

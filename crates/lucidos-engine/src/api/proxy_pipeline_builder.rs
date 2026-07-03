@@ -234,7 +234,7 @@ mod tests {
             layer_namespace(
                 1,
                 &LayerConfig::ScriptHandshake {
-                    credential: "x".into(),
+                    credential: Some("x".into()),
                     script: "scripts/x.py".into(),
                     oauth_providers: Vec::new(),
                 },

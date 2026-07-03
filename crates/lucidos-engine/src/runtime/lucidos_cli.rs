@@ -12,8 +12,9 @@ pub(crate) const LUCIDOS_BIN_NAME: &str = "lucidos.exe";
 pub(crate) const LUCIDOS_BIN_NAME: &str = "lucidos";
 
 static CLI_DIR: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
-    let exe = std::env::current_exe().ok()?;
-    find_lucidos_cli_dir(exe.parent()?)
+    let exe = std::env::current_exe().ok();
+    let exe_parent = exe.as_deref().and_then(Path::parent);
+    resolve_cli_dir(std::env::var_os("LUCIDOS_CLI_BIN"), exe_parent)
 });
 
 /// Directory containing the bundled `lucidos` binary. The engine's exe path
@@ -21,6 +22,31 @@ static CLI_DIR: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
 /// Returns None when the binary isn't reachable — caller skips CLI wiring.
 pub fn lucidos_cli_dir() -> Option<&'static Path> {
     CLI_DIR.as_deref()
+}
+
+/// Resolve the directory containing the bundled `lucidos` CLI.
+///
+/// Packaged builds (the macOS `.app` / headless tarball / install service) stamp
+/// `LUCIDOS_CLI_BIN` with the absolute path of the staged binary — checked FIRST
+/// because the packaged engine lives at `<resources>/lucidos-engine` with the
+/// CLI as a flat sibling `<resources>/lucidos`, and the launchd PATH never
+/// carries it. Dev / `cargo` / test builds have no such env and fall back to the
+/// sibling-walk up from the engine's exe dir. `env_bin` is `LUCIDOS_CLI_BIN`,
+/// `exe_parent` is `current_exe().parent()`; both are injected so the resolution
+/// is unit-testable without touching process env / `current_exe`.
+pub(crate) fn resolve_cli_dir(
+    env_bin: Option<std::ffi::OsString>,
+    exe_parent: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(bin) = env_bin {
+        let path = PathBuf::from(bin);
+        if path.is_file() {
+            return path.parent().map(Path::to_path_buf);
+        }
+        // Set but the file is gone (mis-staged / quarantined): fall through to
+        // the sibling-walk rather than returning a dir without `lucidos`.
+    }
+    exe_parent.and_then(find_lucidos_cli_dir)
 }
 
 /// Walk up from `start` looking for a directory containing the `lucidos`
@@ -101,34 +127,52 @@ pub(crate) fn ensure_workspace_bin_symlink(
     Some(bin_dir)
 }
 
-/// Build a `PATH` value with `extra_dir` prepended to the engine's inherited
-/// PATH. Uses `join_paths` so the OS-correct separator is used and entries
-/// containing the separator get quoted.
-pub(crate) fn path_with_prefix(
-    extra_dir: &Path,
+/// Build a `PATH` value with `extra_dirs` prepended (in order) to the engine's
+/// inherited PATH. Uses `join_paths` so the OS-correct separator is used and
+/// entries containing the separator get quoted.
+pub(crate) fn path_with_prefixes(
+    extra_dirs: &[PathBuf],
 ) -> Result<std::ffi::OsString, std::env::JoinPathsError> {
     let existing = std::env::var_os("PATH").unwrap_or_default();
     std::env::join_paths(
-        std::iter::once(extra_dir.to_path_buf()).chain(std::env::split_paths(&existing)),
+        extra_dirs
+            .iter()
+            .cloned()
+            .chain(std::env::split_paths(&existing)),
     )
 }
 
 /// Env vars to inject into every Lucidos-spawned script (Python, bash,
-/// scheduled tasks). Always sets `LUCIDOS_WORKSPACE`; sets `PATH` (with
-/// `<workspace>/.lucidos/bin` prepended) when the bundled CLI is reachable.
+/// scheduled tasks). Always sets `LUCIDOS_WORKSPACE`; prepends to `PATH`
+/// `<workspace>/.lucidos/bin` (when the bundled CLI is reachable, so scripts
+/// resolve bare `lucidos …`) AND `pg_bin_dir` (when given + present, so the
+/// advertised bare `psql -c '…'` resolves — in a packaged build psql lives at
+/// `<resources>/postgres/bin` = `LUCIDOS_PG_BIN_DIR`, which is not on the
+/// launchd minimal PATH). `pg_bin_dir` is passed in (from the caller's
+/// `LUCIDOS_PG_BIN_DIR` read) so this stays pure/testable.
 ///
 /// Side effect: ensures the workspace bin symlink exists so the prepended
 /// PATH actually resolves `lucidos`.
 pub(crate) fn workspace_script_env_vars(
     workspace: &Path,
     cli_dir: Option<&Path>,
+    pg_bin_dir: Option<&Path>,
 ) -> Vec<(String, String)> {
     let mut vars = vec![(
         "LUCIDOS_WORKSPACE".to_string(),
         workspace.display().to_string(),
     )];
+    let mut prefixes: Vec<PathBuf> = Vec::new();
     if let Some(bin_dir) = ensure_workspace_bin_symlink(workspace, cli_dir) {
-        match path_with_prefix(&bin_dir) {
+        prefixes.push(bin_dir);
+    }
+    if let Some(pg_bin) = pg_bin_dir {
+        if pg_bin.is_dir() {
+            prefixes.push(pg_bin.to_path_buf());
+        }
+    }
+    if !prefixes.is_empty() {
+        match path_with_prefixes(&prefixes) {
             Ok(p) => vars.push(("PATH".to_string(), p.to_string_lossy().into_owned())),
             Err(e) => crate::log!("[LucidosCLI] failed to join PATH: {}", e),
         }

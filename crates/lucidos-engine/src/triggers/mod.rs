@@ -7,7 +7,7 @@ pub mod summary;
 
 pub use config::{
     is_valid_trigger_slug, slugify_trigger_name_with_fallback, validate_script_extension,
-    EventSubscription, TriggerConfig, TriggerRun,
+    EventSubscription, TriggerConfig, TriggerRun, TriggerRunStatus,
 };
 pub use summary::{ensure_non_empty_error, ensure_non_empty_summary, script_fallback_summary};
 pub use groups::{
@@ -63,6 +63,7 @@ mod tests {
             on: subs,
             paused: false,
             last_run: None,
+            last_run_status: None,
             app_id: None,
             go_to_review: false,
             group_id: None,
@@ -172,6 +173,7 @@ mod tests {
             on: vec![],
             paused: false,
             last_run: None,
+            last_run_status: None,
             app_id: None,
             go_to_review: false,
             group_id: None,

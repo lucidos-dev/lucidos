@@ -16,7 +16,7 @@ const markReadOptimistic = vi.fn();
 vi.mock('../actions/notifications', () => ({
   handleNotificationSSE: vi.fn(),
   markReadOptimistic: (...args: unknown[]) => markReadOptimistic(...args),
-  viewNotification: vi.fn(),
+  viewNotification: vi.fn(() => Promise.resolve()),
   loadUnreadNotifications: vi.fn(),
   loadNotifications: vi.fn(),
 }));
@@ -34,6 +34,7 @@ vi.mock('../actions/devices', () => ({ getDeviceId: () => 'dev-test' }));
 import type { Tap } from '@lucidos/sdk';
 import { handleGlobalEvent } from '../actions/thread-sync';
 import { focusThreadOrBootstrap } from '../actions/threads';
+import { viewNotification } from '../actions/notifications';
 import {
   handleNotificationToastRequested,
   TOAST_REQUEST_STALE_AFTER_MS,
@@ -81,16 +82,54 @@ describe('NotificationToastRequested (active page) → in-app toast', () => {
     expect(t.key).toBe('notification-notif-1');
   });
 
-  it('omits the click-through when the deep link would only open the inbox modal', () => {
+  it('gives a modal (pure) notification a single [Open] button (right/primary) and no OK', () => {
     // Plain notification (no app/thread, no tap) — resolveDeepLink returns
-    // view-notification. The toast is passive: title + body + dismiss, so
-    // clicking it can't auto-open the modal the user already sees inline.
+    // view-notification. The toast carries ONE explicit button: [Open]
+    // (the Toast component's `action`, rendered right/primary) which opens the
+    // detail via dispatchDeepLink → viewNotification and marks read. There is no
+    // separate [OK] / secondaryAction — deferring is the X (dismiss, keep
+    // unread). Merely showing the toast does NOT mark it read (that's the X/defer
+    // contract); only [Open] marks read. No whole-toast text click either
+    // (auto-opening the detail is the pinned regression).
     emitToast({ notification_id: 'notif-plain' });
 
     const t = toasts.value[0];
     expect(t).toBeTruthy();
-    expect(t.action).toBeUndefined();
     expect(t.onClick).toBeUndefined();
+    expect(t.action?.label).toBe('Open');
+    expect(t.secondaryAction).toBeUndefined();
+    expect(t.noAutofocus).toBe(true);
+    // The X (close) stays available so the user can defer; a modal/navigate
+    // toast is never rendered non-dismissable.
+    expect(t.dismissable).not.toBe(false);
+    // Showing the toast is not a read — the row stays unread until [Open] or a
+    // panel read.
+    expect(markReadOptimistic).not.toHaveBeenCalled();
+  });
+
+  it('[Open] on a modal notification opens the detail and marks it read', async () => {
+    emitToast({ notification_id: 'notif-open' });
+    const t = toasts.value[0];
+    t.action!.onClick();
+    expect(viewNotification).toHaveBeenCalledWith('notif-open');
+    // The read is guaranteed by the handler (after viewNotification settles),
+    // not left to viewNotification's fetch-contingent internal mark.
+    await Promise.resolve();
+    expect(markReadOptimistic).toHaveBeenCalledWith('notif-open');
+  });
+
+  it('[Open] on a modal notification still marks it read when the detail fetch fails', async () => {
+    // viewNotification swallows a failed fetch (no detail panel) and does NOT
+    // mark read — but the toast is already dismissed, so [Open] must mark read
+    // itself, else the row silently stays unread (the exact double-read this
+    // feature removes). Guaranteed via the settle handler.
+    vi.mocked(viewNotification).mockReturnValueOnce(Promise.reject(new Error('fetch failed')));
+    emitToast({ notification_id: 'notif-openfail' });
+    const t = toasts.value[0];
+    t.action!.onClick();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(markReadOptimistic).toHaveBeenCalledWith('notif-openfail');
   });
 
   it('uses notification-<id> as the toast key so retries share one slot', () => {
@@ -106,7 +145,7 @@ describe('NotificationToastRequested (active page) → in-app toast', () => {
     expect(toasts.value[0].message).toBe('Lucidos: body only');
   });
 
-  it('forwards tap.kind=navigate (to app) for app-CTA notifications', () => {
+  it('gives a navigate (app-CTA) notification a single [Open] button and no OK', () => {
     emitToast({
       notification_id: 'notif-4',
       title: 'Time to check in',
@@ -117,20 +156,20 @@ describe('NotificationToastRequested (active page) → in-app toast', () => {
 
     const t = toasts.value[0];
     expect(t).toBeTruthy();
-    // The CTA is rendered as a clickable text link, not a button — single-
-    // action notification toasts dispatch on text click (matches the
-    // change-applied / discarded toasts in thread-sync.ts).
-    expect(t.action).toBeUndefined();
-    expect(t.onClick).toBeTypeOf('function');
+    // One explicit button — [Open] navigates. No [OK] (deferring is the X).
+    // The old whole-text click is gone.
+    expect(t.onClick).toBeUndefined();
+    expect(t.action?.label).toBe('Open');
+    expect(t.secondaryAction).toBeUndefined();
+    expect(t.noAutofocus).toBe(true);
   });
 
-  it('forwards tap.kind=navigate (to a thread + event) so the toast click deep-links to the source event', () => {
+  it('[Open] on a navigate (thread + event) notification deep-links to the source event', () => {
     // The reported bug was the in-app toast NOT landing on the source event in
-    // a thread. The toast click must route through the SAME navigate dispatch
-    // the inbox modal and push taps use → focusThreadOrBootstrap(threadId, {
-    // targetEventId }). This pins the wiring that feeds the scroll the event id;
-    // the scroll-and-pulse itself (and its fix for unfocused threads) is covered
-    // by e2e/notifications.spec.ts.
+    // a thread. [Open] must route through the SAME navigate dispatch the inbox
+    // detail and push taps use → focusThreadOrBootstrap(threadId, { targetEventId }).
+    // This pins the wiring that feeds the scroll the event id; the scroll-and-pulse
+    // itself (and its fix for unfocused threads) is covered by e2e/notifications.spec.ts.
     emitToast({
       notification_id: 'notif-q',
       title: 'Claude is asking',
@@ -141,22 +180,46 @@ describe('NotificationToastRequested (active page) → in-app toast', () => {
     });
 
     const t = toasts.value[0];
-    expect(t.onClick).toBeTypeOf('function');
-    t.onClick!();
+    expect(t.action?.label).toBe('Open');
+    t.action!.onClick();
 
     expect(focusThreadOrBootstrap).toHaveBeenCalledWith('t-9', { targetEventId: 'e-7' });
+    expect(markReadOptimistic).toHaveBeenCalledWith('notif-q');
   });
 
-  it('marks tap=none read as soon as the toast is shown (no user interaction needed)', () => {
-    // tap=none is passive — the toast IS the read moment. The row should
-    // drop from unread the moment we display the banner.
-    emitToast({ notification_id: 'notif-passive', tap: { kind: 'none' } });
+  it('defers a navigate notification via the X (dismissable, keeps it unread) — no OK button', () => {
+    // The only "clear without opening" path is the toast's built-in X, which
+    // dismisses WITHOUT marking read (Toast.tsx → dismissToast, no mark). There
+    // is no [OK] that marks read without navigating: on a tap-target toast that
+    // would bury an unanswered question. So the toast exposes exactly one action
+    // ([Open]) and stays dismissable; merely showing it never marks read.
+    emitToast({
+      notification_id: 'notif-defer',
+      thread_id: 't-9',
+      event_id: 'e-7',
+      tap: { kind: 'navigate', to: { target: 'thread', id: 't-9', event_id: 'e-7' } },
+    });
+
+    const t = toasts.value[0];
+    expect(t.action?.label).toBe('Open');
+    expect(t.secondaryAction).toBeUndefined();
+    expect(t.dismissable).not.toBe(false);
+    expect(markReadOptimistic).not.toHaveBeenCalled();
+    expect(focusThreadOrBootstrap).not.toHaveBeenCalled();
+  });
+
+  it('coerces a historical tap=none into a modal [Open] toast (not passive/auto-read)', () => {
+    // tap=none is retired (docs/plans/2026-07-02-remove-notification-tap-none.md).
+    // A historical/coerced none behaves like modal: an [Open] toast that persists
+    // and is NOT auto-marked-read on show — every notification is openable.
+    emitToast({ notification_id: 'notif-legacy-none', tap: { kind: 'none' } as unknown as Tap });
 
     const t = toasts.value[0];
     expect(t).toBeTruthy();
-    expect(t.action).toBeUndefined();
-    expect(t.onClick).toBeUndefined();
-    expect(markReadOptimistic).toHaveBeenCalledWith('notif-passive');
+    expect(t.action?.label).toBe('Open');
+    expect(t.secondaryAction).toBeUndefined();
+    expect(t.dismissable).not.toBe(false);
+    expect(markReadOptimistic).not.toHaveBeenCalled();
   });
 });
 
@@ -388,24 +451,9 @@ describe('NotificationToastRequested → overflow at 5+ individual toasts', () =
     expect(toasts.value.filter(t => t.key?.startsWith('notification-'))).toHaveLength(4);
     expect(markReadOptimistic).toHaveBeenCalledWith('n-5');
   });
-
-  it('marks tap=none read even when its toast is folded into the overflow indicator', () => {
-    // Pile up to the overflow threshold with non-passive toasts.
-    for (let i = 1; i <= 4; i++) emitToast({ notification_id: `n-${i}` });
-    // Now a passive notification arrives — it gets rolled into "+1 more"
-    // and no individual toast renders for it. But tap=none's contract
-    // (notifications.md §4) is "row IS read the moment the user could have
-    // seen it" — letting a pile-up keep passive rows unread defeats the
-    // entire purpose.
-    emitToast({ notification_id: 'passive-overflowed', tap: { kind: 'none' } });
-
-    expect(toasts.value.find(t => t.key === 'notification-passive-overflowed')).toBeUndefined();
-    expect(toasts.value.find(t => t.key === 'notifications-overflow')).toBeTruthy();
-    expect(markReadOptimistic).toHaveBeenCalledWith('passive-overflowed');
-  });
 });
 
-describe('tap=none toast auto-dismiss', () => {
+describe('notification toasts persist (no auto-dismiss)', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     toasts.value = [];
@@ -420,23 +468,9 @@ describe('tap=none toast auto-dismiss', () => {
     vi.useRealTimers();
   });
 
-  it('auto-dismisses the tap=none toast after the standard passive duration', () => {
-    // Passive notifications have no Open button — a sticky banner would
-    // just sit on screen forever.
-    emitToast({ notification_id: 'passive-tick', tap: { kind: 'none' } });
-
-    expect(toasts.value.find(t => t.key === 'notification-passive-tick')).toBeTruthy();
-
-    vi.advanceTimersByTime(TOAST_AUTO_DISMISS_MS - 1);
-    expect(toasts.value.find(t => t.key === 'notification-passive-tick')).toBeTruthy();
-
-    vi.advanceTimersByTime(1);
-    expect(toasts.value.find(t => t.key === 'notification-passive-tick')).toBeUndefined();
-  });
-
   it('leaves an actioned (tap.kind=navigate) toast sticky', () => {
     // Guards against a future "auto-dismiss every keyed toast" overcorrection
-    // — the clickable text must remain reachable for the user to act on.
+    // — the [Open] button (and the X) must remain reachable for the user to act.
     emitToast({
       notification_id: 'cta-stick',
       app_id: 'habit-tracker',
@@ -445,5 +479,12 @@ describe('tap=none toast auto-dismiss', () => {
 
     vi.advanceTimersByTime(TOAST_AUTO_DISMISS_MS * 2);
     expect(toasts.value.find(t => t.key === 'notification-cta-stick')).toBeTruthy();
+  });
+
+  it('leaves a modal (pure) notification toast sticky so [Open] stays usable', () => {
+    emitToast({ notification_id: 'modal-stick' });
+
+    vi.advanceTimersByTime(TOAST_AUTO_DISMISS_MS * 2);
+    expect(toasts.value.find(t => t.key === 'notification-modal-stick')).toBeTruthy();
   });
 });

@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.15.0 — 2026-07-03
+
+### Added
+- **New-version / Switch flow** — Apply now auto-builds the engine in the background and splits *build* from *switch*: a unified "new version available" surface, an `ENGINE_BUILD_ID` + `/engine/version-status` endpoint, cause-gated resume that preserves pending questions, and switch-as-respawn with boundary events deferred to teardown. The Apply button reads **Apply\*** when a restart is required; the brand badge shows a "!"/spinning build icon instead of a count; version toasts defer on dismiss with a persistent update badge; a hint toast explains when a frontend-only Apply is deferred to Switch. The engine also surfaces when its source is *behind* the running binary and self-heals a failed background rebuild; the pending-Rebuild toast only shows when no switchable binary already exists.
+- **Keyboard navigation of thread content** — arrow-key scrolling and turn-by-turn traversal (Cmd+Up/Down), Enter to collapse/expand the navigated turn, a unified deep-link "navigate to element" + chevron-scroll model with perceptible deceleration, and a persistent deep-link focus marker ("focus stick").
+- **Focused-pane cue** — the focused pane's header segment gets a subtle lighter-blue wash (extended over the divider seams) so the active pane reads at a glance, mirrored on the mobile active-pane dot. (The earlier header focus *pill* was tried and dropped in favor of the wash.)
+- **Animated compose height** — the prompt textarea animates its height (and position) on send and on draft↔draft / draft↔blank compose-view switches, with in-flight/rapid-switch frames cancelled cleanly.
+- **Thread drawer overhaul** — the compose-draft tooltip becomes a ⋯ menu (Delete + Info), fully keyboard-drivable; a keyboard shortcut expands/collapses the focused thread's sub-threads; single-focus (aria-activedescendant) model.
+- **Remote access & Linux install** — `install.sh` downloads a prebuilt cross-platform headless tarball by default and registers the gateway as a user service; opt-in TLS (`--tls-cert`/`--tls-key`) and network bind (`--bind` via `network.toml`); a user-facing `scripts/run.sh` entry point; `build-headless.sh` + CI matrix for the Linux tarball; post-extract execution smoke + runtime-dep preflights.
+- **Self-skeletonizing loading system** — skeleton primitives with a fill helper, tree-shaped skeletons for files/repos, self-skeletonized list rows, drawer search, and triggers; retires the generic `ListSkeleton`.
+- **Per-thread model memory** — each thread remembers its last model + reasoning effort; coding-agent threads are pinned to their first account.
+- **Native dock badge & notification actions** — a nudgeable dock-badge loop driven by notification SSE, an on-demand unread-total endpoint, and `[Open]`/`[OK]` action buttons on in-app notification toasts (web links in toasts are now clickable).
+- **Pane-anchored toasts** — each toast is pinned to and centered over the pane it appeared on.
+- **`--font-size-*` type scale** — host + app-iframe type-scale tokens, with all font-size literals migrated onto them.
+- **Per-draft compose state** — compose-view dropdown selections and attachments persist per draft in the DB.
+- **macOS menu-bar mode** — the desktop client goes menu-bar-only when its windows close.
+- **Durable native device id** — the packaged desktop app persists its device id natively, so reinstalls keep a single device instead of spawning duplicates.
+- **Trigger last-run status** — triggers surface last-run OK/failed status and a build-on-top pointer.
+- **Codex key auto-detect** — the engine auto-detects an OpenAI key from the Codex CLI auth file; the chat agent is nudged to emit clickable `[Name](app:<id>)` app links.
+- **Graceful memory degradation** — the engine boots with memory degraded (instead of failing) when the embedding model can't download, with an actionable error.
+
+### Changed
+- **Apply/Discard** — the Diff button is permanently pulled out of the split button; frontend-only Applies propagate to peer dev workspaces and re-snapshot the served frontend without a respawn.
+- **App-name links** — stopped auto-linking bare app-name mentions in chat/notifications in favor of the explicit `[Name](app:<id>)` form.
+- **Plugin setup threads** — setup instructions moved to knowhow with a short seed message.
+- **Navigation focus marker** unified across chat, settings, and plugins (drops the entrance flash, fades on any user action).
+- **Lockfile determinism** — builds use `npm ci` and `cargo --locked`; the `lucidos` CLI is bundled as a runtime resource in the packaged app.
+- **Vertex** — `eu` multi-region added as a prefilled region option.
+- **Spacing & type consistency** — content-pane padding unified onto a `--space-*` scale (Files tree + cards are deliberate carve-outs); prompt/confirm modal font sizes normalized with a codified no-magic-font-size rule.
+
+### Fixed
+- **Security** — closes a CRITICAL CVE via wasmtime 25→36; blocks cross-origin browser-proxy requests; hardens `http_request` credential redirects; `git2` 0.20.4 + safe Rust security bumps; scrubs credentials from the packaged env.
+- **Vertex Gemini 3 reasoning** — uses `thinkingLevel` + `includeThoughts` so reasoning stops leaking into the answer, and never sends `thinkingBudget` to Gemini 3 (clamps `thinkingLevel` per model).
+- **Coding-agent reliability** — stops a Fable false stale-resume from spawning duplicate CC processes / deleting live worktrees; an external watchdog kills a wedged coding-agent subprocess on recovery; preserves genuine CC API-drop failures instead of fabricating "Unknown error"; recovery reuses a worktree only when it's on the branch being recovered; a startup lease serializes restart recovery; `CLAUDE_CONFIG_DIR` is pinned per session so a mid-flight provider toggle can't strand a resume; reads CC `thinking_delta` from the correct field.
+- **Packaged runtime** — packaged PATH floor + agent-binary detection (psql on the coding-agent PATH); resolves user-installed tools under the service-manager minimal PATH; boot preflights (git, PG client, embedding model, required resources) with actionable warnings; Docker entrypoint aligned to the PG18 binary path.
+- **Changes/Archive** — reconciles an orphaned pending change that blocked Archive; gates apply-time reconcile on Applied and advances Apply-All on discard; the Apply-All merge-conflict toast no longer dangles.
+- **Streaming resilience** — bounds the streaming send-header phase so a stalled LLM connection can't hang a turn; idempotent thread pin/unpin so a double-submit can't 409.
+- **iOS/mobile** — repaint scroll-nudge no longer cancels momentum scroll; reliable scroll-to-top; boot-splash covers the iOS safe-area strip; mobile header titles centered without overlapping leading icons.
+- **Chat** — repaired leaked inline tool-call XML in the agentic loop; the title model no longer executes instruction-style prompts; the agent is told its reasoning isn't shown to the user and is forbidden from claiming a repeated action without a fresh tool call; the coding agent must not ask post-work confirmations that block Apply (scoped to Apply-based prompts).
+- **Cancel** — releases a stuck "Canceling" state when a running-turn cancel is superseded into waiting-for-answer, and clears the awaiting-bit on cancel rollback.
+- **Build lock** — fails open (rather than reporting SkippedLocked) when the checkout is unresolvable; scoped to engine-triggered builds.
+- **Drawer / notifications** — restored the normal drawer scrollbar and dropped the right-inset selection gap; channel/error tags keep their dark-mode hairline and red outline; notifications panel toolbar padding aligned with the plugins panel.
+- **Toast / focus** — collapsed-pane toasts recenter over the surviving pane; toast focus/tab handling hardened for touch and overlays.
+
+### Removed
+- Retired the generic `ListSkeleton` component (replaced by the self-skeletonizing system) and a stale `crates/lucidos-app/package-lock.json`.
 ## v0.14.0 — 2026-06-29
 
 ### Added

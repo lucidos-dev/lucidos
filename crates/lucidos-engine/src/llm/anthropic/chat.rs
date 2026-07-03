@@ -82,18 +82,12 @@ impl AnthropicProvider {
             if let Some(beta) = &beta {
                 builder = builder.header("anthropic-beta", beta);
             }
+            let builder = builder.json(&request);
 
-            let resp = match builder.json(&request).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    if attempt <= crate::llm::MAX_RETRIES {
-                        let delay = crate::llm::retry_delay(attempt, 1);
-                        crate::llm::log_retry(model, &format!("Network error: {:?}", e), attempt, delay);
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                    return Err(crate::llm::with_retry_context(e, attempt).into());
-                }
+            let resp = match crate::llm::send_streaming_request(builder, model, attempt).await {
+                crate::llm::StreamSend::Got(r) => r,
+                crate::llm::StreamSend::Retry => continue,
+                crate::llm::StreamSend::Failed(e) => return Err(e),
             };
 
             let status = resp.status();

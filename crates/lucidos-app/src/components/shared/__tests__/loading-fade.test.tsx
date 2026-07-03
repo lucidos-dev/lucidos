@@ -11,8 +11,11 @@ vi.mock('../../../hooks/useDelayedLoading', () => ({
 }));
 
 import { LoadingFade } from '../LoadingFade';
-import { ListSkeleton } from '../ListSkeleton';
 import { vnodeToText } from '../../chat/__tests__/vnodeToText';
+
+// A trivial stand-in skeleton — these tests assert only LoadingFade's structural
+// placement (content wrapper vs skeleton sibling), not the skeleton's contents.
+const testSkeleton = <div class="test-skeleton" />;
 
 const fragmentChildren = (
   <>
@@ -26,7 +29,7 @@ describe('LoadingFade', () => {
   it('wraps a multi-child fragment in ONE content element so it does not flatten into many grid children', () => {
     mocks.lingering = false;
     const text = vnodeToText(
-      LoadingFade({ showSkeleton: false, skeleton: <ListSkeleton />, children: fragmentChildren }),
+      LoadingFade({ showSkeleton: false, skeleton: testSkeleton, children: fragmentChildren }),
     );
 
     // The grid's immediate child must be the single content wrapper — NOT the
@@ -46,7 +49,7 @@ describe('LoadingFade', () => {
   it('renders the skeleton as a SIBLING of the content wrapper while mounted (the two stacking grid children)', () => {
     mocks.lingering = true;
     const text = vnodeToText(
-      LoadingFade({ showSkeleton: true, skeleton: <ListSkeleton />, children: fragmentChildren }),
+      LoadingFade({ showSkeleton: true, skeleton: testSkeleton, children: fragmentChildren }),
     );
 
     // Content wrapper and skeleton are both direct children of .loading-fade, so

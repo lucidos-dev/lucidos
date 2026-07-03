@@ -1,20 +1,21 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// isTextInput uses `instanceof HTMLElement`, which isn't available in the
-// node test env. Mock just that predicate; keep the rest of the module real.
+// isTextInput / isThreadTranscript use `instanceof HTMLElement`, which isn't
+// available in the node test env. Mock just those predicates; keep the rest real.
 vi.mock('../utils/dom', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../utils/dom')>();
-  return { ...actual, isTextInput: vi.fn(() => false) };
+  return { ...actual, isTextInput: vi.fn(() => false), isThreadTranscript: vi.fn(() => false) };
 });
 
-import { dispatchEscape, classifyForwardedChord, dispatchForwardedChord, shouldTypeToFocusPrompt } from './useKeyboardShortcuts';
-import { isTextInput } from '../utils/dom';
+import { dispatchEscape, classifyForwardedChord, dispatchForwardedChord, dispatchPreviewIframeShortcut, shouldTypeToFocusPrompt } from './useKeyboardShortcuts';
+import { isTextInput, isThreadTranscript } from '../utils/dom';
 import { pushOverlay, _resetOverlayStackForTesting } from '../store/overlayStack';
 import { focusedPane, splitRatio } from '../store/store';
 
 beforeEach(() => {
   _resetOverlayStackForTesting();
   vi.mocked(isTextInput).mockReturnValue(false);
+  vi.mocked(isThreadTranscript).mockReturnValue(false);
 });
 
 describe('dispatchEscape (non-destructive Escape policy)', () => {
@@ -85,6 +86,20 @@ describe('shouldTypeToFocusPrompt (bare-typing → prompt textarea)', () => {
   it('skips while an IME composition is active', () => {
     expect(shouldTypeToFocusPrompt(ev({ isComposing: true }), { mobile: false, overlayOpen: false })).toBe(false);
   });
+
+  it('does NOT steal Space while the transcript region is focused — Space must page it down', () => {
+    vi.mocked(isThreadTranscript).mockReturnValue(true);
+    expect(shouldTypeToFocusPrompt(ev({ key: ' ' }), { mobile: false, overlayOpen: false })).toBe(false);
+  });
+
+  it('still focuses the prompt for a printable LETTER while the transcript is focused (type → compose)', () => {
+    vi.mocked(isThreadTranscript).mockReturnValue(true);
+    expect(shouldTypeToFocusPrompt(ev({ key: 'a' }), { mobile: false, overlayOpen: false })).toBe(true);
+  });
+
+  it('types Space to the prompt when the transcript is NOT focused (unchanged)', () => {
+    expect(shouldTypeToFocusPrompt(ev({ key: ' ' }), { mobile: false, overlayOpen: false })).toBe(true);
+  });
 });
 
 describe('classifyForwardedChord (keydowns forwarded from app iframes)', () => {
@@ -146,5 +161,55 @@ describe('dispatchForwardedChord (forwarded chord ⇒ content pane is focused)',
     dispatchForwardedChord(chord({ metaKey: true, key: 'c' }));
     expect(splitRatio.value).toBe(0.5);
     expect(focusedPane.value).toBe('thread');
+  });
+});
+
+describe('dispatchPreviewIframeShortcut (keydown INSIDE a content-pane preview iframe)', () => {
+  // KeyboardEvent isn't a global in the node test env, so fake the chord shape
+  // the dispatcher reads, with a preventDefault that records defaultPrevented.
+  const key = (over: Partial<{ metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; key: string }>) => {
+    const e = { metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, key: '', defaultPrevented: false, ...over } as unknown as KeyboardEvent & { defaultPrevented: boolean };
+    (e as { preventDefault: () => void }).preventDefault = () => { (e as { defaultPrevented: boolean }).defaultPrevented = true; };
+    return e;
+  };
+
+  beforeEach(() => {
+    (globalThis as { innerWidth: number }).innerWidth = 1024; // desktop
+    // Focus is inside the preview iframe, but the host never saw a pointerdown
+    // cross the iframe boundary, so focusedPane is stale on the thread pane.
+    focusedPane.value = 'thread';
+    splitRatio.value = 0.5; // content pane visible, not maximized
+  });
+
+  it('⌘⇧↵ maximizes the content pane (the reported bug) and suppresses the browser default', () => {
+    // Without the bridge this keydown never reaches the host: no maximize, and
+    // Chrome runs its own default for ⌘⇧↵ (the page context menu).
+    const e = key({ key: 'Enter', metaKey: true, shiftKey: true });
+    expect(dispatchPreviewIframeShortcut(e)).toBe(true);
+    expect((e as { defaultPrevented: boolean }).defaultPrevented).toBe(true); // browser default suppressed
+    expect(focusedPane.value).toBe('content');       // reconciled before dispatch
+    expect(splitRatio.value).toBe(0);                // content pane group maximized
+  });
+
+  it('⌘⇧3 CLOSES the content pane the preview lives in (reconciles stale focus)', () => {
+    expect(dispatchPreviewIframeShortcut(key({ key: '3', metaKey: true, shiftKey: true }))).toBe(true);
+    expect(splitRatio.value).toBe(1); // collapsed = closed
+  });
+
+  it('leaves a non-shortcut key (plain Enter on a link, normal typing) untouched', () => {
+    const e = key({ key: 'Enter' });
+    expect(dispatchPreviewIframeShortcut(e)).toBe(false);
+    expect((e as { defaultPrevented: boolean }).defaultPrevented).toBe(false); // preview keeps its own behavior
+    expect(splitRatio.value).toBe(0.5);
+    expect(focusedPane.value).toBe('thread');
+  });
+
+  it('Escape dismisses an open host overlay (e.g. a modal over the content)', () => {
+    const dismiss = vi.fn();
+    pushOverlay({ id: 'm', dismiss });
+    const e = key({ key: 'Escape' });
+    expect(dispatchPreviewIframeShortcut(e)).toBe(true);
+    expect(dismiss).toHaveBeenCalledTimes(1);
+    expect((e as { defaultPrevented: boolean }).defaultPrevented).toBe(true);
   });
 });

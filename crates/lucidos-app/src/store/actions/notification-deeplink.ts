@@ -7,10 +7,6 @@ export type DeepLinkAction =
    *  with the navigation. */
   | { type: 'navigate'; to: NavigateUi; notification: string | null }
   | { type: 'view-notification'; id: string }
-  /** Mark the notification read but don't navigate anywhere. Used by
-   *  `tap.kind === 'none'` — the row is passive; landing on Lucidos (push
-   *  tap) or seeing the in-app toast is the "read" moment. */
-  | { type: 'mark-read'; id: string }
   | { type: 'noop' };
 
 export interface DeepLinkTarget {
@@ -38,16 +34,15 @@ export interface DeepLinkTarget {
  *  panel (the `modal` tap kind is the wire name, not a UI modal). */
 export function resolveDeepLink(target: DeepLinkTarget): DeepLinkAction {
   const tap: Tap = target.tap ?? { kind: 'modal' };
-  switch (tap.kind) {
-    case 'modal':
-      if (target.notification) return { type: 'view-notification', id: target.notification };
-      return { type: 'noop' };
-    case 'none':
-      if (target.notification) return { type: 'mark-read', id: target.notification };
-      return { type: 'noop' };
-    case 'navigate':
-      return { type: 'navigate', to: tap.to, notification: target.notification ?? null };
+  // Only `navigate` deep-links; everything else opens the inbox detail. That
+  // "everything else" defensively covers the retired `none` kind (and any
+  // unknown future kind) arriving via untyped runtime data (an old SW message,
+  // a stale URL param, a historical row) — every notification is openable.
+  if (tap.kind === 'navigate') {
+    return { type: 'navigate', to: tap.to, notification: target.notification ?? null };
   }
+  if (target.notification) return { type: 'view-notification', id: target.notification };
+  return { type: 'noop' };
 }
 
 const DEEP_LINK_KEYS = ['notification', 'thread', 'event', 'tap'] as const;
@@ -113,8 +108,9 @@ function validateTap(raw: unknown): Tap | null {
   switch (obj.kind) {
     case 'modal':
       return { kind: 'modal' };
-    case 'none':
-      return { kind: 'none' };
+    // The retired `none` kind is intentionally NOT accepted — a `{kind:'none'}`
+    // payload (old SW message / stale URL) falls through to `null`, which
+    // `resolveDeepLink` demotes to the openable modal default.
     case 'navigate': {
       const to = obj.to;
       if (!to || typeof to !== 'object') return null;

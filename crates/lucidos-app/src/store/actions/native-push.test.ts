@@ -178,6 +178,66 @@ describe('setupNativePushTapRouting → drain → dispatchDeepLink', () => {
     expect(dispatchDeepLink).toHaveBeenCalledTimes(2);
   });
 
+  // A native banner only ever shows while the page is INACTIVE
+  // (handleNativePushRequested gates on isPageActive), so a banner tap ALWAYS
+  // lands on a backgrounded/hidden — often JS-throttled — WKWebView.
+  // show_main_window then just SHOWS the existing window (no reload), so the
+  // startup cold drain never re-runs and the warm app.emit can be dropped on the
+  // just-resumed webview. The window 'focus' / document 'visibilitychange' events
+  // WebKit fires on show are the reliable, eval-independent drain triggers — this
+  // is the "tap focuses the window but never deep-links" fix.
+  it('drains and routes when the window regains focus (no-reload window-show path)', async () => {
+    await setupNativePushTapRouting(); // startup drain empty
+    await flush();
+    dispatchDeepLink.mockClear();
+
+    takePendingNativeTaps.mockResolvedValueOnce([
+      {
+        notification_id: 'n-focus',
+        thread_id: 't-7',
+        tap: { kind: 'navigate', to: { target: 'thread', id: 't-7' } },
+      },
+    ]);
+    window.dispatchEvent(new Event('focus'));
+    await flush();
+    expect(dispatchDeepLink).toHaveBeenCalledWith(
+      expect.objectContaining({ notification: 'n-focus', thread: 't-7' }),
+    );
+  });
+
+  it('drains and routes when the page becomes visible again', async () => {
+    await setupNativePushTapRouting(); // startup drain empty
+    await flush();
+    dispatchDeepLink.mockClear();
+
+    takePendingNativeTaps.mockResolvedValueOnce([
+      { notification_id: 'n-vis', tap: { kind: 'modal' } },
+    ]);
+    document.dispatchEvent(new Event('visibilitychange'));
+    await flush();
+    expect(dispatchDeepLink).toHaveBeenCalledWith(
+      expect.objectContaining({ notification: 'n-vis' }),
+    );
+  });
+
+  it('does NOT drain on a visibilitychange into the hidden state', async () => {
+    await setupNativePushTapRouting();
+    await flush();
+    dispatchDeepLink.mockClear();
+    takePendingNativeTaps.mockClear();
+
+    const prev = document.visibilityState;
+    try {
+      (document as unknown as { visibilityState: string }).visibilityState = 'hidden';
+      document.dispatchEvent(new Event('visibilitychange'));
+      await flush();
+      expect(takePendingNativeTaps).not.toHaveBeenCalled();
+      expect(dispatchDeepLink).not.toHaveBeenCalled();
+    } finally {
+      (document as unknown as { visibilityState: string }).visibilityState = prev;
+    }
+  });
+
   it('an empty drain dispatches nothing', async () => {
     await setupNativePushTapRouting();
     await flush();

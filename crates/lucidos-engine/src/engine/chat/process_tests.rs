@@ -781,6 +781,44 @@ fn chat_prompt_nudges_use_of_ask_user_question() {
     );
 }
 
+/// The chat-agent prompt must forbid claiming a repeated action ("again") was
+/// performed without actually calling the tool that turn. Observed failure
+/// (testing-notifications thread, 2026-06-30): the user said "again" four times;
+/// the agent fired `send_notification` on the first two, then — seeing the two
+/// prior identical `ToolUse: send_notification` entries in its context — wrote
+/// "Sent another" for the last two WITHOUT calling the tool, so nothing went
+/// out. The CRITICAL RULES anti-hallucination guidance was scoped to file
+/// writes; this rule generalizes it and names the repeat-request trap directly.
+#[test]
+fn chat_prompt_forbids_faking_repeated_actions() {
+    let rule = super::REPEATED_ACTION_RULE;
+    assert!(
+        rule.contains("again"),
+        "REPEATED_ACTION_RULE must name the repeat-request trigger word \
+         (\"again\") — that's the exact phrasing the user used when the agent \
+         claimed a send it never made",
+    );
+    assert!(
+        rule.contains("CURRENT TURN") || rule.contains("THIS turn") || rule.contains("this turn"),
+        "REPEATED_ACTION_RULE must pin the action to the CURRENT turn — the \
+         failure was the model treating a PRIOR turn's tool call as if it \
+         counted for this one",
+    );
+    assert!(
+        rule.contains("send_notification"),
+        "REPEATED_ACTION_RULE must name `send_notification` — the concrete \
+         action tool the model faked on repeat; naming it keeps the rule \
+         self-evident to the model when it next debates whether a prior call \
+         counts",
+    );
+    assert!(
+        rule.contains("PREVIOUS turn") || rule.contains("does NOT mean the action happened"),
+        "REPEATED_ACTION_RULE must spell out that a prior identical tool call \
+         in context is a record of a PREVIOUS turn, not proof the action \
+         happened this time — that misread is the root of the bug",
+    );
+}
+
 // --- FreeText answer eligibility (child-completion vs. human follow-up) ---
 
 use super::run::message_can_answer_pending_question;
@@ -804,7 +842,8 @@ async fn coding_agent_route_does_not_inherit_chat_model_or_effort_defaults() {
         .unwrap();
 
     let (model, effort) =
-        resolve_route_overrides(&pool, Some(true), Some("claude-opus-4-8[1m]"), None).await;
+        resolve_route_overrides(&pool, Some(true), None, None, Some("claude-opus-4-8[1m]"), None)
+            .await;
 
     assert_eq!(model, None);
     assert_eq!(effort, None);
@@ -819,7 +858,8 @@ async fn coding_agent_route_preserves_explicit_agent_effort_pick() {
         .await
         .unwrap();
 
-    let (model, effort) = resolve_route_overrides(&pool, Some(true), None, Some("xhigh")).await;
+    let (model, effort) =
+        resolve_route_overrides(&pool, Some(true), None, None, None, Some("xhigh")).await;
 
     assert_eq!(model, None);
     assert_eq!(effort.as_deref(), Some("xhigh"));
@@ -837,10 +877,44 @@ async fn chat_route_still_inherits_chat_model_and_effort_defaults() {
         .await
         .unwrap();
 
-    let (model, effort) = resolve_route_overrides(&pool, None, None, None).await;
+    let (model, effort) = resolve_route_overrides(&pool, None, None, None, None, None).await;
 
     assert_eq!(model.as_deref(), Some("claude-opus-4-8[1m]"));
     assert_eq!(effort.as_deref(), Some("high"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Per-thread memory at the route layer: a chat follow-up with no explicit
+/// override reuses the model/effort the thread last ran with, NOT the account
+/// preference (docs/plans/2026-07-03-per-thread-model-memory.md).
+#[tokio::test]
+async fn chat_route_reuses_thread_last_model_over_preference() {
+    let (pool, db_name) = setup_test_db().await;
+    PreferenceStore::set(&pool, PREF_CHAT_MODEL, "account-model")
+        .await
+        .unwrap();
+    PreferenceStore::set(&pool, PREF_CHAT_REASONING_EFFORT, "high")
+        .await
+        .unwrap();
+    let tid = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+         VALUES ($1, 'thread', $2, 'MessageReceived', $3, now(), $4)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(tid.to_string())
+    .bind(serde_json::json!({ "text": "hi", "model": "thread-model", "reasoning_effort": "low" }))
+    .bind(tid)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (model, effort) =
+        resolve_route_overrides(&pool, None, Some(tid), None, None, None).await;
+
+    assert_eq!(model.as_deref(), Some("thread-model"));
+    assert_eq!(effort.as_deref(), Some("low"));
     pool.close().await;
     teardown_test_db(&db_name).await;
 }

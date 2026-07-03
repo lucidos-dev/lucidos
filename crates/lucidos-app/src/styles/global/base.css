@@ -15,6 +15,11 @@ html {
     /* Font stacks */
     --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
     --font-ui: var(--font-mono);
+    /* Neutral system sans-serif — the gateway workspace picker opts out of the
+       app's monospace --font-ui for a calmer, brand-neutral surface. Native
+       stack so it needs no font load and is unaffected by a user font preference
+       (which only overrides --font-ui). */
+    --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
 
     /* Z-index scale */
     --z-float: 20;
@@ -46,15 +51,91 @@ html {
     /* Layout */
     --divider-width: 0.1875rem;
     --content-max-width: 50rem;
+    /* Height of the desktop transcript's top fade (the mask that dissolves
+       messages as they scroll up under the thread title header — see
+       .thread-content in chat/input-messages.css). Shared so the deep-link /
+       navigation scroll clearance (.chat-exchange scroll-margin-top in
+       chat/response.css) lands an element BELOW this band, not inside it where
+       its top / focus-marker border would be faded out. */
+    --thread-top-fade: 1.5rem;
+    /* Height of the mobile transcript's top fade — the gradient below the sticky
+       thread-title bar (.mobile-thread-title-row::after in mobile.css) that
+       dissolves content scrolling up under the bar. Shared with the mobile
+       .chat-exchange scroll-margin-top (chat/response.css) so a navigated turn
+       lands clear of it. Mobile's desktop-mask analog; kept a touch shorter. */
+    --mobile-title-fade: 0.75rem;
+    /* How far the navigation focus marker (.nav-focus-stuck, host-components.css)
+       reaches beyond a turn's box: outline-offset (0.1875rem) + outline width
+       (0.1875rem). The transcript reserves this much extra room past each fade
+       (top padding past --thread-top-fade, bottom padding past --prompt-fade) so
+       a marker on the first/last turn clears the fade instead of being dissolved
+       by it — the "highlight border isn't fully visible on the top/bottom turn"
+       report. Keep in sync with .nav-focus-stuck if its outline changes. */
+    --nav-focus-reach: 0.375rem;
+    /* Desktop floating scroll chevrons (.scroll-to-top / .scroll-to-bottom in
+       chat/input-messages.css). Since these were pulled IN from the right gutter
+       to sit OVER the centered transcript (fix 956b47519), a deep-link / turn-nav
+       landing near the top would tuck the element (and its focus-marker outline)
+       right under the up-chevron with no room. Shared here so the landing
+       clearance (.chat-exchange scroll-margin-top, chat/response.css) is computed
+       from the chevron's OWN size + top inset and can never drift from it. */
+    --scroll-chevron-size: 2rem;   /* button diameter (width == height) */
+    --scroll-chevron-top: 0.75rem; /* desktop top inset (see @media hover) */
+    /* Upward reach of the transcript's bottom dissolve — the bg-colored box-shadow
+       cast over the scroll area by .prompt-area (panels/content.css). The
+       transcript's bottom padding reserves this plus --nav-focus-reach so the
+       last turn's focus marker clears it. Keep matched to that box-shadow. */
+    --prompt-fade: 1rem;
     /* Left inset shared by a turn's body content — LLM response body and every
        initiator body (change card, question, permission, child completion) line
-       up against the same edge. */
+       up against the same edge. Also the UNIFORM gap the navigation focus marker
+       leaves to a turn's content on all four sides (chat/response.css). */
     --turn-body-inset: 0.4rem;
+    /* Vertical feed-rhythm padding on every transcript turn (.initiator-panel /
+       .response-panel in chat/input-messages.css) — the space between adjacent
+       turns (there is no divider line). Named so the navigation focus marker can
+       hand this padding back as margin when it tightens a focused turn's box to a
+       uniform gap (chat/response.css .nav-focus-stuck rule). */
+    --turn-feed-pad-y: 0.85rem;
 
     /* Icon sizes (used by .icon-btn variants) */
     --icon-size-sm: 0.875rem;
     --icon-size-md: 1rem;
     --icon-size-lg: 1.25rem;
+
+    /* Type scale — the only sanctioned font sizes. Snap to the nearest step;
+       don't reintroduce eyeballed in-between values (0.8/0.85/0.72rem …). The
+       `rem` units keep every step scaling with the user's UI-scale preference
+       (html font-size = var(--user-ui-scale)). This block is MIRRORED into the
+       engine's api/sdk_iframe.css :root so app iframes (which never load this
+       file) get the same scale via the appended shared-components.css — keep the
+       two in sync. em/percentage/inherit font-sizes stay literal on purpose
+       (they're deliberately relative). */
+    --font-size-3xs: 0.5625rem;   /* 9px — micro-label / tiny uppercase badge */
+    --font-size-2xs: 0.625rem;    /* 10px — dots, micro-meta */
+    --font-size-xs: 0.6875rem;    /* 11px — dense metadata */
+    --font-size-sm: 0.75rem;      /* 12px — labels, secondary */
+    --font-size-md: 0.8125rem;    /* 13px — body default */
+    --font-size-lg: 0.875rem;     /* 14px — emphasis */
+    --font-size-xl: 1rem;         /* 16px — section headings */
+    --font-size-2xl: 1.125rem;    /* 18px — larger headings */
+    --font-size-3xl: 1.25rem;     /* 20px — large headings */
+    --font-size-display: 2.25rem; /* 36px — hero */
+
+    /* Spacing scale — the sanctioned structural padding/gap steps. MIRROR of the
+       app-iframe --space-* scale in the engine's api/sdk_iframe.css :root (apps
+       never load this file, so the two are defined separately) — the VALUES must
+       stay identical so a shared component (e.g. .list-row in shared-components.css,
+       which is served to app iframes) renders the same rhythm in both. Do NOT
+       redefine an existing step's value here without changing sdk_iframe.css too —
+       apps in the wild key off these. Content-pane views snap their structural
+       padding to these and share the --space-lg (1rem) horizontal gutter; see the
+       "content-pane padding" rule in .claude/rules/frontend.md. */
+    --space-xs: 0.25rem;   /* 4px */
+    --space-sm: 0.5rem;    /* 8px */
+    --space-md: 0.75rem;   /* 12px */
+    --space-lg: 1rem;      /* 16px — the content-pane horizontal gutter */
+    --space-xl: 1.5rem;    /* 24px */
 
     --dot-gap: 0.35rem;
 
@@ -139,6 +220,24 @@ html, html[data-theme="dark"] {
        slab against the near-black app), without sinking into murky navy. Light
        foreground stays legible on it. */
     --header-gradient: linear-gradient(180deg, #15549e 0%, #0b3868 100%);
+    /* Active-pane cue — the mobile active pane dot (.mobile-dot.active) wears
+       this fill + layered neon bloom on the header bar. The body is a soft cool
+       BLUE — landing between the prior brand blue and near-white (a midpoint of
+       the two), so it reads bright and high-contrast on --header-gradient's deep
+       blue stop while keeping a clear blue tint rather than going fully white; the
+       soft blue bloom reinforces the brand identity. Per theme it's tuned only
+       slightly — the light override below is a touch lighter/more opaque to stay
+       crisp on the brighter light bar. */
+    --focus-pill-bg: rgba(169, 197, 232, 0.87);
+    --focus-pill-glow: 0 0 0.25rem rgba(178, 206, 240, 0.42),
+                       0 0 0.625rem rgba(158, 190, 232, 0.28);
+    /* Focused-pane header wash — a faint lighter-blue overlay filling the focused
+       pane's header segment (the .header-focus-wash box), so the whole segment
+       reads a touch lighter-blue than the deep bar — the visual cue for which pane
+       is focused. Same soft cool-blue hue as the active-pane dot at a much lower
+       alpha so it lightens without flattening the brand blue; it crossfades in/out
+       as focus moves between panes. */
+    --focus-header-tint: rgba(169, 197, 232, 0.12);
     /* Reclaimed macOS title-bar band (.titlebar-strip) — solid = the gradient's
        TOP stop above, so the strip is seamless with the header's top edge. */
     --titlebar-strip-bg: #15549e;
@@ -212,6 +311,15 @@ html[data-theme="light"] {
     /* Header bar — vivid brand blue on the white app (deep-navy dark-mode
        variant is in the dark theme block above). */
     --header-gradient: linear-gradient(180deg, var(--brand-blue) 0%, var(--brand-blue-deep) 100%);
+    /* Active-pane cue — a touch lighter/more opaque than the dark-theme value so
+       the soft-blue dot stays crisp on the brighter light bar (see the dark block
+       for the intent). */
+    --focus-pill-bg: rgba(191, 213, 243, 0.93);
+    --focus-pill-glow: 0 0 0.25rem rgba(198, 220, 248, 0.5),
+                       0 0 0.625rem rgba(186, 212, 244, 0.34);
+    /* Focused-pane header wash — a touch lighter/more opaque than the dark value
+       so it stays visible on the brighter light bar (see the dark block). */
+    --focus-header-tint: rgba(191, 213, 243, 0.16);
     /* Reclaimed macOS title-bar band (.titlebar-strip) — solid = the gradient's
        TOP stop above (--brand-blue), so the strip is seamless with the header. */
     --titlebar-strip-bg: var(--brand-blue);
@@ -236,7 +344,7 @@ label {
     border: 1px solid var(--border-color);
     border-radius: 0.625rem;
     font-family: var(--font-ui);
-    font-size: 0.6875rem;
+    font-size: var(--font-size-xs);
     font-weight: 400;
     font-style: normal;
     line-height: 1.4;
@@ -274,7 +382,7 @@ label {
 
 #tooltip-title {
     font-weight: 600;
-    font-size: 0.75rem;
+    font-size: var(--font-size-sm);
     color: var(--text-primary);
     margin-bottom: 0.5rem;
 }

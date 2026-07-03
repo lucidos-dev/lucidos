@@ -15,6 +15,13 @@ export function isInteractiveTarget(el: EventTarget | null): boolean {
   return !!el.closest('button, a, input, textarea, select, label, [role="button"], [contenteditable]');
 }
 
+/** True if the element is, or sits within, the focusable conversation transcript
+ *  scroll region (`.thread-content`). Used so a Space keypress while that region
+ *  has focus pages it down instead of being captured by type-to-focus-prompt. */
+export function isThreadTranscript(el: EventTarget | null): boolean {
+  return el instanceof HTMLElement && el.closest('.thread-content') !== null;
+}
+
 const KEYBOARD_INPUT_TYPES = new Set([
   'text', 'search', 'email', 'password', 'tel', 'url', 'number',
 ]);

@@ -18,8 +18,14 @@ import {
   type NativePushDismissRequestedPayload,
 } from './native-push';
 import { addRestartGroup } from './chat-changes';
+import {
+  handleFrontendUpdateDeferred,
+  handleEngineBuildStateChanged,
+  type FrontendUpdateDeferredPayload,
+} from './engine-update';
 import { changeToastMessage } from './changeToast';
 import { scheduleServiceWorkerUpdateChecks } from '../../hooks/sw-update';
+import { syncClientUpdateFromBuild } from './client-update';
 import { loadPreferences } from './preferences';
 import { loadArtifacts } from './artifacts';
 import { refreshAppUI, captureAppUI } from './apps';
@@ -38,6 +44,7 @@ import { refreshRepoView } from './repositories';
 import { processSSEForReferences } from './entityReferences';
 import { loadAllThreads, refreshThreadEvents, loadThreadEvents } from './thread-loading';
 import { applyRemoteCompose, pendingComposePuts, hasLocalDraftEdit } from './compose';
+import type { ComposeSelectionOverride } from '../composeSelections';
 import { clearDraft, setDraft } from '../composeDrafts';
 import { removeThreadNavEntries } from './thread-navigation';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
@@ -457,7 +464,8 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     }
   }
 
-  // Compose-clear must yield to a user actively typing here. Three layers:
+  // Compose-clear on a peer's send must yield ONLY to the user's own unsent
+  // work — authorship, not DOM focus, is the guard:
   //   1. Origin-device echo: when the send/discard came from this device,
   //      sendCompose/discardCompose already mutated local compose state
   //      synchronously. The SSE echo arrives later and would blank any text
@@ -470,11 +478,16 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   //      echoed MessageReceived whose device_id didn't match (e2e / cross-device)
   //      wiped a just-typed follow-up after the user navigated away — the
   //      value='' face of drafts.spec.ts:65 (docs/plans/2026-06-27-mobile-webkit-shard-contention.md).
-  //   3. Focused textarea (cross-device fallback): clearComposeIfUnfocused keeps
-  //      a draft the user is mid-keystroke on in the focused composing textarea.
+  // Deliberately NOT gated on `isComposeFocusedHere`: a focus guard also keeps a
+  // SERVER-ORIGINATED (synced-from-peer) draft the user never typed — so a
+  // follow-up drafted on device A, synced here, then sent by A stayed as a ghost
+  // draft in this device's focused textarea. hasLocalDraftEdit is the correct
+  // line (it's false for a synced draft, true the moment the user types), so the
+  // backend's own compose_text='' clear on MessageReceived is mirrored here
+  // regardless of focus.
   if (event.type === 'MessageReceived') {
     if (thread.meta.state !== 'active') { thread.meta.state = 'active'; metaChanged = true; }
-    if (!isFromThisDevice(event) && !hasLocalDraftEdit(threadId)) clearComposeIfUnfocused(threadId);
+    if (!isFromThisDevice(event) && !hasLocalDraftEdit(threadId)) clearDraft(threadId);
   }
   if (event.type === 'ThreadDiscarded') {
     if (thread.meta.state !== 'discarded') { thread.meta.state = 'discarded'; metaChanged = true; }
@@ -574,8 +587,10 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
       // rebuilt bundle isn't served yet, so an eager badge would lead the real
       // update. Instead nudge the SW to pick up the rebuilt /sw.js over the next
       // few seconds; its activation re-runs the build-id check, which lights BOTH
-      // badge and toast together once the new build is genuinely served. No-op in
-      // the live dev server (sw.js never changes).
+      // badge and toast together once the new build is genuinely served. For a
+      // frontend-only Apply the engine re-snapshots its served dist in-process
+      // (engine::frontend_refresh), so the served sw.js advances within a few
+      // seconds without a respawn — this nudge is what surfaces it.
       scheduleServiceWorkerUpdateChecks();
     }
   } else if (event.type === 'ChangeDiscarded') {
@@ -767,6 +782,20 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       break;
 
     case 'PreferencesChanged':
+      // A peer device may have just dismissed the client-refresh toast globally
+      // (the `client_refresh_dismissed_build` preference — hooks/sw-update.ts), so
+      // reload preferences and THEN re-derive the client-update surface to hide the
+      // toast on this device too. Ordered: syncClientUpdateFromBuild reads the
+      // reloaded `preferences` signal via `wasSwUpdateDismissed`, so it must run
+      // after loadPreferences resolves (else it reads the stale value and the
+      // reload wouldn't re-trigger it). Idempotent + self-correcting (re-derives
+      // badge + toast from staleness). The engine-switch toast needs no equivalent
+      // here — its 4s version-status poll (engine-update.ts) already hides itself
+      // once `wasSwitchDismissed` reads true from the reloaded preferences.
+      // loadPreferences sets `preferences` to `failed` via toFailed on error — no
+      // extra surface needed here.
+      void loadPreferences().then(() => syncClientUpdateFromBuild()).catch(() => { /* best-effort re-derive */ });
+      break;
     // `set_language` / `set_timezone` (chat-agent tools) write the preference
     // and emit LanguageSet / TimezoneSet but NOT PreferencesChanged, so without
     // these arms the cached `preferences` (and thus the locale/timezone shown in
@@ -774,8 +803,6 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
     // map, covering both.
     case 'LanguageSet':
     case 'TimezoneSet':
-      // loadPreferences sets `preferences` to `failed` via toFailed on error —
-      // no extra surface needed here.
       void loadPreferences();
       break;
 
@@ -788,6 +815,31 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // is the one that actually fires for the live SystemEvent SSE frame
       // (`{"type":"AppUiRefreshRequested","data":{"app_id":"..."}}`).
       void refreshAppUI(data.app_id as string | undefined);
+      break;
+
+    case 'FrontendUpdateDeferred':
+      // Dev-only transient signal: a frontend-only Apply couldn't advance the
+      // served client in-process because an engine version change is pending
+      // (engine::frontend_refresh INV-A). The change ships on the next Switch;
+      // surface a keyed hint so it reads as queued, not ignored.
+      handleFrontendUpdateDeferred(data as unknown as FrontendUpdateDeferredPayload);
+      break;
+
+    case 'ServedFrontendAdvanced':
+      // Dev-only transient signal: THIS engine advanced its served-frontend
+      // snapshot to the checkout-shared dist/ after a PEER workspace's
+      // frontend-only Apply (engine::frontend_refresh::sync_served_frontend_if_safe).
+      // Re-run the honest build-id check so the Refresh badge/toast surface without
+      // a manual restart — idempotent + self-correcting, so no payload needed.
+      void syncClientUpdateFromBuild();
+      break;
+
+    case 'EngineBuildStateChanged':
+      // Dev-only transient POKE: the engine's background rebuild changed state
+      // (building → ready/failed). Re-run the authoritative version-status read so
+      // the building spinner / Switch badge track a real build over SSE instead of
+      // only on the throttled 4s poll (iOS suspends it on a backgrounded PWA).
+      handleEngineBuildStateChanged();
       break;
 
     case 'MemoryRebuildProgress': {
@@ -930,19 +982,33 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
     //      with newer text; the SSE event for our previous PUT could clobber
     //      it on arrival otherwise.
     //   3. focused-textarea — if the user is mid-keystroke on this thread's
-    //      input, dropping the inbound update is safer than blanking what
-    //      they just typed.
+    //      input, dropping a peer's NON-empty update is safer than moving the
+    //      cursor / blanking what they just typed. It must NOT drop a peer's
+    //      EMPTY clear, though: that's the "follow-up sent/discarded elsewhere"
+    //      signal, and gating it on focus left the peer's draft preserved in a
+    //      focused-but-untyped textarea. applyRemoteCompose's own
+    //      hasLocalDraftEdit guard still protects a draft THIS device authored.
     case 'ThreadComposeChanged': {
       const originDeviceId = data.origin_device_id as string | undefined;
       if (originDeviceId && originDeviceId === getDeviceId()) break;
       const id = data.id as string;
       if (pendingComposePuts.has(id)) break;
-      if (isComposeFocusedHere(id)) break;
+      const text = (data.text as string) ?? '';
+      const imageHashes = Array.isArray(data.image_hashes) ? data.image_hashes as string[] : [];
       const modeRaw = data.mode as string | undefined;
+      const mode = modeRaw === 'claude_code' ? 'claude_code' : modeRaw === 'lucidos' ? 'lucidos' : null;
+      const isEmptyClear = text === '' && imageHashes.length === 0 && mode === null;
+      if (!isEmptyClear && isComposeFocusedHere(id)) break;
       applyRemoteCompose(id, {
-        text: (data.text as string) ?? '',
-        image_hashes: Array.isArray(data.image_hashes) ? data.image_hashes as string[] : [],
-        mode: modeRaw === 'claude_code' ? 'claude_code' : modeRaw === 'lucidos' ? 'lucidos' : null,
+        text,
+        image_hashes: imageHashes,
+        mode,
+        // Per-draft dropdown selection (DB-backed); hydrated into composeSelections
+        // so a peer's dropdown change syncs. Absent (`skip_serializing_if` when the
+        // DB has no stored selection) → undefined → setComposeSelectionFromServer
+        // clears any stale local entry (the DB is authoritative). An in-flight local
+        // pick is already protected by the pendingComposePuts guard above.
+        selection: (data.selection as ComposeSelectionOverride | null | undefined),
       });
       break;
     }

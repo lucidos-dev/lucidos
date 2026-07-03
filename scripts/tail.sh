@@ -49,7 +49,7 @@ if [ -z "$WORKSPACE" ]; then
 fi
 if [ -z "$WORKSPACE" ]; then
     echo "Usage: $0 <workspace> [OPTIONS]"
-    echo "  e.g. $0 personal"
+    echo "  e.g. $0 dev"
     exit 1
 fi
 
