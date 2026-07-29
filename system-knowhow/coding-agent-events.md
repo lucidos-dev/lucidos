@@ -9,7 +9,7 @@ description: What ThreadEvents the engine emits during a Claude Code / Codex cod
 
 The session's *worktree* wraps the enclosing git, which differs by `coding_agent_kind`:
 
-- `lucidos` (default) — full checkout of the Lucidos source repo.
+- `lucidos` (default) — full checkout of the Lucidos source repo. Only available on an install whose engine was launched from a Lucidos source checkout; a packaged install ships the binary alone, so there is no platform source, the compose destination picker hides the "Lucidos source" target, and `run_coding_agent` with `folder` omitted is refused.
 - `app` — sparse-checkout of the workspace git narrowed to `data/apps/<id>/` (see *app worktree*). Apply ff-merges to the workspace git's local `main`; no engine restart; `/harden` does not run; `AppUiRefreshRequested` emits when iframe-bundled files change.
 - `external` — full checkout of the user-registered external git repository. No Apply / Discard surface.
 

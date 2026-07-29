@@ -1,5 +1,6 @@
 import { useCallback, useEffect } from 'preact/hooks';
 import {
+  appUpdateCheckError,
   connectionStatus,
   engineStartedAt,
   engineVersion,
@@ -19,6 +20,7 @@ import {
   workspacePath,
 } from '../../store/store';
 import { initiateEngineRestart } from '../../store/actions/chat-changes';
+import { checkForAppUpdate, installAppUpdate, packagedUpdateVersion } from '../../store/actions/app-update';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { requestServiceWorkerBuildId, refreshClient } from '../../hooks/sw-update';
 import { isUnstampedBuildId } from '../../utils/buildId';
@@ -126,6 +128,24 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
     }
   }, []);
 
+  /** Update now if one is known, otherwise re-check on demand. The on-demand
+   *  path matters because the automatic check is a 6h poll: without it the only
+   *  way to ask "is there something newer?" was to quit and relaunch. */
+  const handleAppUpdate = useCallback(async () => {
+    if (packagedUpdateVersion()) {
+      await installAppUpdate();
+      return;
+    }
+    await checkForAppUpdate();
+    // Runs on USER intent, so unlike the background poll this reports both
+    // outcomes rather than staying silent.
+    if (appUpdateCheckError.value) {
+      showToast(`Couldn't check for updates: ${appUpdateCheckError.value}`, 'error');
+    } else if (!latestTauriAppVersion.value) {
+      showToast('Lucidos is up to date', 'success');
+    }
+  }, []);
+
   const copyApiUrl = useCallback(() => {
     navigator.clipboard.writeText(getApiUrl()).then(
       () => showToast('Copied to clipboard', 'success'),
@@ -144,7 +164,9 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
   // time and drifted from the running engine on every engine-only Apply, showing
   // two disagreeing numbers no user action could reconcile (see vite.config.ts).
   const clientVersion = tauriClientVersion ?? formatBuildId(CLIENT_BUILD_ID);
-  const tauriHasUpdate = !!(tauriClientVersion && latestTauriVer && isNewerVersion(latestTauriVer, tauriClientVersion));
+  // One derivation, shared with the button's action so the label and what the
+  // click does can never disagree.
+  const tauriHasUpdate = !!packagedUpdateVersion();
   const clientBehind = tauriClientVersion ? tauriHasUpdate : update;
   const clientBehindLabel = tauriClientVersion ? ` (latest: ${latestTauriVer})` : ' (update available)';
 
@@ -266,10 +288,30 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
               Client update available - refresh to activate
             </div>
           )}
+          {/* The PERSISTENT route to a packaged update. The in-app toast is
+              transient and dismissable, so it cannot be the only way to reach
+              one — dismissing it used to strand the user until the next 6h poll
+              (or a full quit-and-relaunch). */}
+          {tauriHasUpdate && (
+            <div class="system-notice">
+              Lucidos {latestTauriVer} is available - update and restart to install
+            </div>
+          )}
+          {/* A check that FAILED must not look like "you are up to date". */}
+          {appUpdateCheckError.value && (
+            <div class="system-notice">
+              Couldn't check for updates: {appUpdateCheckError.value}
+            </div>
+          )}
           <div class="system-actions">
             <button class="action-btn" onClick={handleRefresh}>
               Refresh Client
             </button>
+            {tauriClientVersion && (
+              <button class="action-btn" onClick={handleAppUpdate}>
+                {tauriHasUpdate ? 'Update & Restart' : 'Check for Updates'}
+              </button>
+            )}
             <button class="action-btn" onClick={handleRestart}>
               Rebuild &amp; Restart
             </button>

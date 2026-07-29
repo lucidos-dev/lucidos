@@ -314,20 +314,27 @@ Don't claim "I'll delete it after it runs" without doing one of the above — se
 
 ## On-disk trigger definition (`trigger.toml`)
 
-Every trigger has a **derived read-model** of its definition at
-`data/triggers/<slug>/trigger.toml`, mirroring the durable subset of its config
-(`name`, `slug`, `schedule`, `timezone`, `run`, `on`, `app_id`, `go_to_review`,
-`group_id`, `side_effect_grant`). It's maintained by the engine from the trigger
-events — written on create/update, removed on delete, and fully rebuilt from
-events on boot (ADR 0019).
+**The scheduler never reads this file.** `data/triggers/<slug>/trigger.toml` is a
+**derived read-model** of the trigger's definition, mirroring the durable subset
+of its config (`name`, `slug`, `schedule`, `timezone`, `run`, `on`, `app_id`,
+`go_to_review`, `group_id`, `side_effect_grant`). The engine maintains it from
+the trigger events — written on create/update, removed on delete, fully rebuilt
+from events on boot (ADR 0019). Runtime/identity fields (`id`, `last_run`,
+`last_run_status`, `paused`) are deliberately omitted. It is **not
+version-controlled**: the engine adds `data/triggers/*/trigger.toml` to the
+workspace repo's local `.git/info/exclude`.
 
-It is **NOT the source of truth and NOT version-controlled**: events are
-authoritative (the scheduler runs off the event-replayed config, never the file),
-and the engine adds `data/triggers/*/trigger.toml` to the workspace repo's local
-`.git/info/exclude`. **Don't hand-edit it** — a change is overwritten on the next
-trigger event or restart; edit triggers via `create_trigger`/`update_trigger`
-(or the UI), which emit the events the projection follows. Runtime/identity
-fields (`id`, `last_run`, `last_run_status`, `paused`) are deliberately omitted.
+Events are authoritative — the scheduler runs off the event-replayed config, and
+this file mirrors that config, never feeds it. Two rules follow:
+
+- **Never hand-edit it.** The edit writes a file that reads correctly and changes
+  nothing the scheduler sees; the next trigger event or restart overwrites it.
+  Change triggers via `create_trigger`/`update_trigger` (or the UI), which emit
+  the events the projection follows.
+- **Never verify from it.** After a config change, re-read the trigger from
+  `list_triggers` — that's the live registration. Reading `trigger.toml` back off
+  disk proves only that you wrote it, so a change the scheduler never saw still
+  verifies green.
 
 Each firing is recorded as events (`TriggerExecuted` + `TriggerCompleted`, plus any
 *domain event* the run emits), and the trigger's row in the triggers panel shows the
@@ -341,17 +348,40 @@ The file exists so a trigger is inspectable (the Plugins panel's installed-plugi
 file links point at it for plugin-shipped triggers) and so a *plugin* can SHIP a
 trigger by declaring one — see `building-a-plugin.md`.
 
+### Renamed trigger → stale `run.path`
+
+The folder is named by the trigger's `slug`, never by its current `name`.
+Renaming moves nothing. Changing the slug (explicit `slug` via the CLI / HTTP
+API, or a delete-and-recreate) relocates only `trigger.toml` to
+`data/triggers/<new-slug>/` and deletes the old copy — `scripts/`, `knowhow/`,
+and the registered `run.path` all stay under the old slug. The tell: a
+`trigger.toml`-only folder beside a `scripts/`-only one.
+
+Repair, in order:
+
+1. `git mv` the old slug's `scripts/` and `knowhow/` (whichever exist) into
+   `data/triggers/<new-slug>/`.
+2. `update_trigger(trigger_id, run={type:"script", path:"triggers/<new-slug>/scripts/run.py"})`
+   — only the event re-points the scheduler.
+3. Confirm the new path in `list_triggers`, then delete the old folder. Deleting
+   before step 2 lands removes the script the scheduler is still calling.
+
+A broken run reports `Script not found: data/scripts/<path>` — the last candidate
+in the path-resolution fallback, not the configured path. The configured one is
+in `list_triggers`.
+
 ## Setup checklist
 
 1. **Set timezone first** if not already set. Cron is 6 fields (`second minute hour day-of-month month day-of-week`) in the user's local timezone, DST-aware via IANA tz. The `create_trigger` tool refuses without a timezone.
 2. **`list_triggers` first** to check whether an existing trigger should be updated instead of creating a new one.
 3. **Decide cron vs. `on` (and whether `on` needs multiple entries)** before writing the trigger.
 4. **Write `run.intent` as the user would say it.**
-5. **If the trigger needs a procedure-laden recipe, write it to a knowhow file.** Trigger-scoped recipes belong at `data/triggers/<slug>/knowhow/<descriptive>.md` (where `<slug>` is the trigger's kebab-case slug field — set it explicitly via `create_trigger`/`update_trigger`; if you don't, the engine derives one from the name on read but never persists it, so renaming the trigger silently moves the per-trigger knowhow path). Broadly reusable recipes go in shared `data/knowhow/` (see `building-knowhow.md`). The trigger thread discovers knowhow the same way chat does — via `load_knowhow` calls the LLM makes itself — so there is no `run.knowhow` field to populate. Any legacy `run.knowhow:[...]` you might see in old `TriggerCreated` payloads is silently dropped by the deserializer; rewrite the intent to either name the relevant knowhow inline ("see `system-knowhow/X`") or be rich enough to nudge discovery from the system-prompt knowhow listing. Make the file's `name` and `description` frontmatter precise so semantic discovery finds it.
+5. **If the trigger needs a procedure-laden recipe, write it to a knowhow file.** Trigger-scoped recipes belong at `data/triggers/<slug>/knowhow/<descriptive>.md` — `<slug>` is fixed at creation (derived from the name when not given) and never re-derived, so after a rename the folder keeps the old name. The LLM tools take no `slug`; the CLI (`lucidos triggers create --slug`) and HTTP API do, and changing it strands `knowhow/` and `scripts/` under the old slug — see § "Renamed trigger → stale `run.path`". Broadly reusable recipes go in shared `data/knowhow/` (see `building-knowhow.md`). The trigger thread discovers knowhow the same way chat does — via `load_knowhow` calls the LLM makes itself — so there is no `run.knowhow` field to populate. Any legacy `run.knowhow:[...]` you might see in old `TriggerCreated` payloads is silently dropped by the deserializer; rewrite the intent to either name the relevant knowhow inline ("see `system-knowhow/X`") or be rich enough to nudge discovery from the system-prompt knowhow listing. Make the file's `name` and `description` frontmatter precise so semantic discovery finds it.
 
 ## Common mistakes to avoid
 
 - **Recreating instead of editing.** See "Edit, don't recreate" above. The single biggest source of orphaned thread history.
+- **Hand-editing `trigger.toml`.** It's a derived read-model the scheduler never reads: the edit silently no-ops (the trigger keeps its old config) and is clobbered by the next trigger event or restart. Change the config with `update_trigger`, then verify against `list_triggers` — never by reading the file back. See "On-disk trigger definition" above.
 - **Recipe-in-text.** Putting procedure into `run.intent` instead of knowhow. See "The most important rule" above.
 - **Cron when an event subscription fits.** Polling burns runs and adds latency. If an event exists, prefer it.
 - **Parallel triggers for one workflow that reacts to several events.** Use one trigger with multiple `on` entries; never duplicate the intent across siblings — editing one and forgetting the other silently drifts behaviour.

@@ -249,8 +249,13 @@ pub(super) async fn health(State(state): State<AppState>) -> Json<serde_json::Va
 /// [`restart_via_gateway`] (a plain-`http` POST to the dev gateway, which serves
 /// `https`) instead of rebuilding via `web-dev.sh --engine-only` — surfacing as
 /// "gateway restart request failed: error sending request for url".
+///
+/// Delegates to [`crate::paths::has_lucidos_source`] so this flag and the chat
+/// agent's own "can I edit Lucidos here?" answer cannot drift — the compose
+/// destination picker hides "Lucidos source" on the strength of THIS field,
+/// and `run_coding_agent` refuses a source spawn on the strength of that one.
 fn is_packaged() -> bool {
-    crate::paths::repo_root().is_err()
+    !crate::paths::has_lucidos_source()
 }
 
 /// launchd label of the always-on engine service (matches

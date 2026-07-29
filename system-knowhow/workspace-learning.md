@@ -74,7 +74,7 @@ The audience differs: `[workspace]` findings get actioned in the workspace itsel
 Scope tag *is* the routing decision; never re-route by hand.
 
 - **`[workspace]` → Lucidos handles it.** The Lucidos LLM has the tools needed to edit knowhow, trigger configs, app code, intents, and repo registration. Action through a regular Lucidos chat thread, not a coding-agent thread.
-- **`[engine]` → a coding agent handles it.** Findings land in the Lucidos source repo (Rust crates, engine config, SDK/CLI surface, `system-knowhow/` itself). Action via `run_coding_agent` against the Lucidos repo.
+- **`[engine]` → a coding agent handles it.** Findings land in the Lucidos source repo (Rust crates, engine config, SDK/CLI surface, `system-knowhow/` itself). Action via `run_coding_agent` against the Lucidos repo — but only on an install launched from a Lucidos source checkout. On a packaged install there is no platform source, that spawn is refused, and an `[engine]` finding can only be *reported* (write it up in the report and tell the user it needs a workspace running from a source checkout). Don't downgrade it to `[workspace]` to make it actionable.
 
 A `[workspace]` finding never goes to a coding-agent session; an `[engine]` finding never goes to a Lucidos chat.
 

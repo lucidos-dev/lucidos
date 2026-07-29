@@ -20,7 +20,7 @@ So treat every file outside `docs/plans/**` and `WORKSPACES.md` as **public**. T
 1. **Personal / family data** — real names of family or personal contacts, references to their personal documents (banking, tax, power-of-attorney), personal artifact paths naming a family member.
 2. **A contributor's real name as example/fixture data** — a possessive device label ("<Name>'s MacBook"), a home path, an email address. (Attribution is the exception — see below.)
 3. **Company-internal identifiers** — the employer domain and its GitHub org, MDM/infra domains, internal repo/app/project names used as examples, colleague names in incidental references. (The concrete tokens are the denylist in `WORKSPACES.md`.)
-4. **Machine-specific paths / live workspace names** outside `WORKSPACES.md` — real home paths (`/Users/<realname>`, `/home/<realuser>`), and the named live workspaces `personal` / `work`. Machine specifics belong **only** in `WORKSPACES.md` (which is stubbed at release).
+4. **Machine-specific paths / live workspace names** outside `WORKSPACES.md` — real home paths (`/Users/<realname>`, `/home/<realuser>`), and the named live workspaces `personal` / `work` *pointed at as machines* (a `~/workspaces/personal` path, "the work workspace has the live data"). Machine specifics belong **only** in `WORKSPACES.md` (which is stubbed at release). The bare words are ordinary English and are fine as UI copy that names no machine — `WORKSPACE_NAME_SUGGESTIONS` in `WorkspacePicker.tsx` offers "personal" / "work" as first-run name suggestions, which says nothing about what exists on this laptop.
 
 ## Approved generic placeholders
 

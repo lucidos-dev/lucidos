@@ -20,7 +20,8 @@ pub(crate) use cc_spawn_coalesce::{
     combine_messages, queued_to_orphans, CcSpawnCoalescer, LeaderElection, QueuedMessage,
 };
 pub(crate) use coding_agent_kind::{
-    classify_resolved_folder, resolve_folder_input, CodingAgentKind, FolderClassification,
+    classify_resolved_folder, err_no_lucidos_source, resolve_folder_input, CodingAgentKind,
+    FolderClassification,
 };
 
 pub(crate) use apply_now::{probe_merge_conflicts, InPlaceMergeStart};

@@ -76,6 +76,33 @@ fn drain_startup_failure_reason(
     })
 }
 
+/// Where a Lucidos-**source** session roots when no `Lucidos` repository row
+/// resolved and the spawn isn't an app spawn.
+///
+/// `dev_root` comes from [`main_worktree`], which falls back to the process cwd
+/// when there is no source checkout — on a packaged install that is the
+/// **workspace** directory, itself a git repo. Returning it there would branch
+/// the user's workspace git and label it platform source: exactly the silent
+/// mis-rooting that let a packaged install report "Claude Code session started"
+/// for a request to change Lucidos itself.
+///
+/// So the fallback survives only for its real case — a dev build whose registry
+/// row hasn't been written yet (very early startup) — and is a hard refusal
+/// otherwise. Backstops every caller; the `run_coding_agent` tool refuses the
+/// same case earlier so the model sees it in-turn.
+///
+/// Pure over `has_lucidos_source` so both branches are testable without a
+/// packaged binary. See `docs/plans/2026-07-29-no-lucidos-source-agent-context.md`.
+fn unregistered_lucidos_root(
+    dev_root: PathBuf,
+    has_lucidos_source: bool,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    if has_lucidos_source {
+        return Ok(dev_root);
+    }
+    Err(crate::engine::agent_session::err_no_lucidos_source())
+}
+
 impl LucidosEngine {
     /// Flush any reasoning accumulated in `buf` past `last_len` as a
     /// `CodingAgentThoughtStreamed`, advancing `last_len`. Idempotent (emits only
@@ -427,8 +454,15 @@ impl LucidosEngine {
                 Some(repo_name),
             )
         } else {
-            // No default registered (very early startup) and no explicit id.
-            (None, dev_root, false, None, None)
+            // No repo resolved and not an app spawn — i.e. "edit Lucidos
+            // itself". Only legitimate when a source checkout exists.
+            (
+                None,
+                unregistered_lucidos_root(dev_root, crate::paths::has_lucidos_source())?,
+                false,
+                None,
+                None,
+            )
         };
 
         let workspace_name = self.workspace_name();
@@ -2522,6 +2556,41 @@ pub(super) async fn build_resume_prompt_text(
         block.len()
     );
     format!("{}\n\n{}", block, user_message)
+}
+
+#[cfg(test)]
+mod unregistered_lucidos_root_tests {
+    use super::*;
+
+    /// The regression. On a packaged install `main_worktree()` resolves to the
+    /// WORKSPACE dir; handing that back would branch the user's workspace git
+    /// and call it Lucidos platform source. Refuse instead.
+    #[test]
+    fn refuses_when_there_is_no_source_checkout() {
+        let workspace_dir = PathBuf::from("/Users/me/Library/Application Support/lucidos/ws");
+        let err = unregistered_lucidos_root(workspace_dir, false)
+            .expect_err("a Lucidos-source spawn with no source checkout must be refused")
+            .to_string();
+        assert!(
+            err.contains("no source checkout"),
+            "refusal must say why: {err}"
+        );
+        assert!(
+            err.contains("data/apps/<id>"),
+            "refusal must name the routes that still work: {err}"
+        );
+    }
+
+    /// The fallback's legitimate case survives untouched: a dev build whose
+    /// `Lucidos` registry row hasn't been written yet (very early startup).
+    #[test]
+    fn keeps_the_early_startup_fallback_on_a_dev_build() {
+        let dev_root = PathBuf::from("/Users/me/src/lucidos");
+        assert_eq!(
+            unregistered_lucidos_root(dev_root.clone(), true).expect("dev build must still resolve"),
+            dev_root
+        );
+    }
 }
 
 #[cfg(test)]

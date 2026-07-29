@@ -203,6 +203,15 @@ struct GatewayInner {
     /// healthy / stopped so a later cold open never shows a stale phase. Mirrors
     /// the `routes` map (cheap `RwLock`, off the stack-mutex path).
     boot_phases: RwLock<HashMap<String, BootProgress>>,
+    /// id → the engine's TERMINAL boot-failure message, set via the `boot-failure`
+    /// control endpoint. Present means "this boot cannot succeed": the splash
+    /// renders the message instead of a phase label and the supervisor stops
+    /// respawning. Deliberately a SEPARATE map from `boot_phases` rather than a
+    /// field on [`BootProgress`], because `MarkUnhealthy` clears the phase on
+    /// purpose (a stale label would lie about a dead engine) and that is exactly
+    /// the moment the failure message must survive. Cleared only when the
+    /// workspace boots healthy or is stopped.
+    boot_failures: RwLock<HashMap<String, String>>,
     /// Single-slot state of the picker's restore-from-backup flow (see
     /// [`RestoreStatus`]). Polled via the control API; never persisted.
     restore: RwLock<RestoreStatus>,
@@ -280,6 +289,30 @@ impl GatewayState {
         if let Ok(mut p) = self.inner.boot_phases.write() {
             p.remove(id);
         }
+    }
+
+    /// Record a terminal boot failure for `id` (see [`GatewayInner::boot_failures`]).
+    /// Called by the `boot-failure` control endpoint when a dying engine reports
+    /// why its boot cannot succeed.
+    pub fn set_boot_failure(&self, id: &str, message: &str) {
+        if let Ok(mut f) = self.inner.boot_failures.write() {
+            f.insert(id.to_string(), message.to_string());
+        }
+        crate::log!("[Gateway] '{}' reported a terminal boot failure: {}", id, message);
+    }
+
+    /// Drop any terminal boot failure for `id`. Called ONLY when the workspace
+    /// boots healthy or is stopped — never from `MarkUnhealthy`, which is the
+    /// state the message exists to explain.
+    fn clear_boot_failure(&self, id: &str) {
+        if let Ok(mut f) = self.inner.boot_failures.write() {
+            f.remove(id);
+        }
+    }
+
+    /// The terminal boot-failure message for `id`, if one was reported this boot.
+    fn boot_failure(&self, id: &str) -> Option<String> {
+        self.inner.boot_failures.read().ok()?.get(id).cloned()
     }
 
     /// The boot-splash label for `id` — the current phase's label, or the default
@@ -625,14 +658,19 @@ impl GatewayState {
         // First splash phase: provisioning Postgres can pull/start a container or
         // run `initdb` on a first-ever open.
         self.set_boot_phase(&ws.id, BootPhase::ProvisioningDatabase);
+        // A new boot episode starts with a clean slate: the user may have installed
+        // a newer Lucidos since the failure, and a stale message would outlive the
+        // condition it described.
+        self.clear_boot_failure(&ws.id);
         let prov = self.ensure_postgres(ws).await?;
 
         if stack::probe_health(&self.inner.health_client, self.engine_scheme(), ws.port).await
             == ProbeOutcome::Healthy
         {
             crate::log!("[Gateway] re-adopting healthy engine for '{}'", ws.id);
-            // Already up — no boot window to narrate.
+            // Already up — no boot window to narrate, and nothing failed.
             self.clear_boot_phase(&ws.id);
+            self.clear_boot_failure(&ws.id);
             return Ok((prov.handle, None, Health::Healthy));
         }
 
@@ -1102,8 +1140,10 @@ impl GatewayState {
         }
         self.clear_route(id);
         // No live route means the next open lazy-starts fresh — drop any stale
-        // boot phase so that open begins from the default splash label.
+        // boot phase so that open begins from the default splash label, and any
+        // terminal failure so the retry is judged on its own merits.
         self.clear_boot_phase(id);
+        self.clear_boot_failure(id);
         crate::log!("[Gateway] stopped '{}' (kept in registry)", id);
         Ok(())
     }
@@ -1205,6 +1245,8 @@ impl GatewayState {
         s.health_misses = 0;
 
         self.set_boot_phase(&s.ws.id, BootPhase::ProvisioningDatabase);
+        // Fresh attempt — see the matching clear in `bring_up`.
+        self.clear_boot_failure(&s.ws.id);
         let prov = match self.ensure_postgres(&s.ws).await {
             Ok(p) => p,
             Err(e) => {
@@ -1322,8 +1364,10 @@ impl GatewayState {
                 // Refresh the per-workspace badge count (None if the fetch failed
                 // even though health passed — show no badge rather than a stale one).
                 s.last_unread = unread;
-                // Booted — drop the boot phase so a later cold open starts clean.
+                // Booted — drop the boot phase so a later cold open starts clean,
+                // and the failure message with it (this boot demonstrably worked).
                 self.clear_boot_phase(&t.id);
+                self.clear_boot_failure(&t.id);
                 continue;
             }
 
@@ -1338,12 +1382,15 @@ impl GatewayState {
             // load spike can't cull a working engine (ADR 0014, 2026-06-27).
             s.health_misses = s.health_misses.saturating_add(1);
 
+            let boot_failure = self.boot_failure(&t.id);
+
             match respawn_decision(
                 outcome,
                 alive,
                 since_spawn,
                 s.health_misses,
                 s.restart_attempts,
+                boot_failure.is_some(),
             ) {
                 // Healthy is handled above; treat defensively as a no-op.
                 SuperviseAction::Healthy => {}
@@ -1354,17 +1401,33 @@ impl GatewayState {
                     s.health = Health::Unhealthy;
                     // Gave up auto-respawning — drop the phase; the last label
                     // would otherwise lie ("Downloading memory model…" on a dead
-                    // engine). The splash falls back to the neutral default.
+                    // engine). The splash falls back to the neutral default, or to
+                    // the reported failure when we have one (`boot_failures` is
+                    // deliberately NOT cleared here — it outlives the phase).
                     self.clear_boot_phase(&t.id);
-                    if s.last_error.is_none() {
-                        s.last_error = Some(
-                            "engine failed to become healthy after repeated restarts".to_string(),
-                        );
+                    match &boot_failure {
+                        // A reported cause always beats the generic "gave up"
+                        // string, including one an earlier probe already set —
+                        // this is the specific, actionable text, and it doubles as
+                        // the picker's health-dot tooltip.
+                        Some(message) => s.last_error = Some(message.clone()),
+                        None if s.last_error.is_none() => {
+                            s.last_error = Some(
+                                "engine failed to become healthy after repeated restarts"
+                                    .to_string(),
+                            )
+                        }
+                        None => {}
                     }
                     crate::log!(
-                        "[Gateway] '{}' marked unhealthy after {} restarts",
+                        "[Gateway] '{}' marked unhealthy after {} restarts{}",
                         t.id,
-                        s.restart_attempts
+                        s.restart_attempts,
+                        if boot_failure.is_some() {
+                            " (terminal boot failure — not retrying)"
+                        } else {
+                            ""
+                        }
                     );
                 }
                 SuperviseAction::Respawn => {
@@ -1456,9 +1519,21 @@ fn respawn_decision(
     since_spawn: Duration,
     misses: u32,
     restart_attempts: u32,
+    terminal_boot_failure: bool,
 ) -> SuperviseAction {
     if outcome == ProbeOutcome::Healthy {
         return SuperviseAction::Healthy;
+    }
+    // The engine told us this boot cannot succeed (`boot-failure` control
+    // endpoint) — canonically a database migrated by a newer Lucidos. Retrying
+    // re-runs the identical failure, so go straight to Unhealthy instead of
+    // burning the restart cap first: five pointless cold boots only delayed the
+    // message by ~30s in the 2026-07-29 incident. Ordered ahead of the alive check
+    // because a dying engine can still be mid-exit when this probe lands; the
+    // "never cull an alive engine" rule protects a HEALTHY-but-busy process, and
+    // this one has already declared itself dead.
+    if terminal_boot_failure {
+        return SuperviseAction::MarkUnhealthy;
     }
     // Never cull an alive process. Inside the cold-boot window it's BOOTING
     // (pgvector init / migrations / embedding warmup take tens of seconds, shown
@@ -1724,6 +1799,7 @@ pub async fn run() -> Result<(), BoxError> {
             starting: AsyncMutex::new(HashSet::new()),
             routes: RwLock::new(HashMap::new()),
             boot_phases: RwLock::new(HashMap::new()),
+            boot_failures: RwLock::new(HashMap::new()),
             restore: RwLock::new(RestoreStatus::default()),
             exe_path: std::env::current_exe().ok(),
             update_check: Mutex::new(UpdateCheck::default()),
@@ -1879,8 +1955,17 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
             // marked `Unhealthy`, so the time budget is the only honest signal.
             // Non-document traffic (API/SSE/assets from an already-open tab) still
             // proxies; the frontend owns its own disconnected recovery.
-            if is_document_navigation(&req) && boot_window_stalled(state.boot_elapsed(&slug)) {
-                return proxy::stalled_page();
+            if is_document_navigation(&req) {
+                // A reported TERMINAL failure outranks the time budget: we already
+                // know why this workspace will never come up, so say so now rather
+                // than making the user wait out BOOT_ESCAPE_BUDGET for a page that
+                // only says "taking longer than expected".
+                if let Some(message) = state.boot_failure(&slug) {
+                    return proxy::failed_page(&message);
+                }
+                if boot_window_stalled(state.boot_elapsed(&slug)) {
+                    return proxy::stalled_page();
+                }
             }
             let target = format!("{}://127.0.0.1:{port}", state.engine_scheme());
             // The route is set the instant `bring_up` spawns the engine — while
@@ -2499,10 +2584,53 @@ mod tests {
         BOOT_GRACE + Duration::from_secs(1)
     }
 
+    /// [`respawn_decision`] with no terminal boot failure — the ordinary
+    /// supervision policy every case below exercises. The terminal-failure
+    /// override has its own tests.
+    fn decide(
+        outcome: ProbeOutcome,
+        alive: bool,
+        since_spawn: Duration,
+        misses: u32,
+        restart_attempts: u32,
+    ) -> SuperviseAction {
+        respawn_decision(outcome, alive, since_spawn, misses, restart_attempts, false)
+    }
+
+    /// A reported terminal boot failure short-circuits to Unhealthy on the FIRST
+    /// probe — no backoff, no restart cap, no five pointless cold boots. Retrying
+    /// re-runs the identical failure (the 2026-07-29 downgrade incident).
+    #[test]
+    fn terminal_boot_failure_marks_unhealthy_immediately() {
+        for outcome in [
+            ProbeOutcome::Slow,
+            ProbeOutcome::Unreachable,
+            ProbeOutcome::Other,
+        ] {
+            for alive in [true, false] {
+                assert_eq!(
+                    respawn_decision(outcome, alive, Duration::ZERO, 0, 0, true),
+                    SuperviseAction::MarkUnhealthy,
+                    "outcome={outcome:?} alive={alive} must not be retried",
+                );
+            }
+        }
+    }
+
+    /// The override must not hijack a WORKING engine: a healthy probe still wins,
+    /// so a stale failure flag can never cull a workspace that came back up.
+    #[test]
+    fn terminal_boot_failure_never_overrides_a_healthy_probe() {
+        assert_eq!(
+            respawn_decision(ProbeOutcome::Healthy, true, established(), 0, 0, true),
+            SuperviseAction::Healthy
+        );
+    }
+
     #[test]
     fn healthy_probe_keeps_engine() {
         assert_eq!(
-            respawn_decision(ProbeOutcome::Healthy, true, established(), 0, 0),
+            decide(ProbeOutcome::Healthy, true, established(), 0, 0),
             SuperviseAction::Healthy
         );
     }
@@ -2516,7 +2644,7 @@ mod tests {
             ProbeOutcome::Other,
         ] {
             assert_eq!(
-                respawn_decision(outcome, true, Duration::from_secs(1), 999, 0),
+                decide(outcome, true, Duration::from_secs(1), 999, 0),
                 SuperviseAction::Booting,
                 "outcome={outcome:?}"
             );
@@ -2527,7 +2655,7 @@ mod tests {
     fn within_backoff_waits() {
         // Just (re)spawned, not yet healthy → don't respawn again immediately.
         assert_eq!(
-            respawn_decision(
+            decide(
                 ProbeOutcome::Unreachable,
                 false,
                 Duration::from_secs(0),
@@ -2552,7 +2680,7 @@ mod tests {
         ] {
             for misses in [1, 5, 50, 9999] {
                 assert_eq!(
-                    respawn_decision(outcome, true, established(), misses, 0),
+                    decide(outcome, true, established(), misses, 0),
                     SuperviseAction::Wait,
                     "outcome={outcome:?} misses={misses}"
                 );
@@ -2565,7 +2693,7 @@ mod tests {
         // Liveness gates everything: an alive engine is left alone even with the
         // restart cap's worth of attempts accumulated — never marked Unhealthy.
         assert_eq!(
-            respawn_decision(
+            decide(
                 ProbeOutcome::Unreachable,
                 true,
                 established(),
@@ -2580,7 +2708,7 @@ mod tests {
     fn unreachable_engine_culled_promptly() {
         // A refused connection is a strong "down" signal → small threshold.
         assert_eq!(
-            respawn_decision(
+            decide(
                 ProbeOutcome::Unreachable,
                 false,
                 established(),
@@ -2590,7 +2718,7 @@ mod tests {
             SuperviseAction::Wait
         );
         assert_eq!(
-            respawn_decision(
+            decide(
                 ProbeOutcome::Unreachable,
                 false,
                 established(),
@@ -2606,7 +2734,7 @@ mod tests {
         // Probe timed out but the process has EXITED → treat as dead, not busy,
         // so a crash recovers promptly instead of waiting the slow threshold.
         assert_eq!(
-            respawn_decision(
+            decide(
                 ProbeOutcome::Slow,
                 false,
                 established(),
@@ -2620,7 +2748,7 @@ mod tests {
     #[test]
     fn restart_cap_marks_unhealthy_instead_of_respawning() {
         assert_eq!(
-            respawn_decision(
+            decide(
                 ProbeOutcome::Unreachable,
                 false,
                 established(),

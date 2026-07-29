@@ -81,6 +81,32 @@ pub(crate) fn repo_root_above(exe: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// Was this engine launched from a Lucidos **source checkout**?
+///
+/// The one predicate for "can anything here edit the Lucidos platform's own
+/// code". A dev engine is built from source and resolves [`repo_root`]; a
+/// packaged `.app` / headless install ships only the binary, so `repo_root`
+/// errs and there is no platform source to edit.
+///
+/// Three surfaces key off this exact signal and must never disagree:
+///
+///  - startup skips registering the reserved `Lucidos` repository
+///    (`engine_impl::construction`) — without the gate it would register the
+///    *workspace* dir, because [`crate::git_ops::main_worktree`] falls back to
+///    the cwd;
+///  - `/api/v1/health`'s `packaged` flag (`api::history::is_packaged`
+///    delegates here), which is how the compose destination picker decides to
+///    hide the "Lucidos source" target;
+///  - the chat system prompt and `run_coding_agent`, which must tell the model
+///    the truth and refuse a Lucidos-source spawn when there is no source.
+///
+/// NOT the same as [`crate::runtime::is_packaged`] (`LUCIDOS_PACKAGED=1`),
+/// which describes the *staging layout* of bundled resources, not the presence
+/// of a checkout.
+pub fn has_lucidos_source() -> bool {
+    repo_root().is_ok()
+}
+
 /// Best-effort repo root: falls back to compile-time `CARGO_MANIFEST_DIR`
 /// when the binary lives outside a Lucidos tree (engine startup, recovery).
 pub fn repo_root_or_compile_time_fallback() -> PathBuf {

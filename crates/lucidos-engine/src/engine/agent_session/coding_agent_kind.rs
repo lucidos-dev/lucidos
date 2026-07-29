@@ -128,6 +128,34 @@ fn err_repo_lookup(msg: String) -> FolderResolutionError {
     format!("Repository lookup failed: {msg}").into()
 }
 
+/// Refusal for a Lucidos-**source** coding-agent spawn on an install that was
+/// not launched from a source checkout (see
+/// [`crate::paths::has_lucidos_source`]).
+///
+/// Two call sites share this one string so the model gets identical, actionable
+/// wording wherever it asks: the synchronous `run_coding_agent` refusal in
+/// `agentic_loop_special_tool` (which returns it as the tool result, in-turn),
+/// and the `run_session` guard that backstops every other caller.
+///
+/// Actionable matters here. The failure this replaces was the agent *inventing*
+/// a capability, narrating edits to `crates/lucidos-engine/…`, and telling the
+/// user to Apply and restart — so the message must both deny the request and
+/// name the routes that DO work, or the model will simply retry the same spawn.
+pub fn err_no_lucidos_source() -> FolderResolutionError {
+    "This Lucidos install has no source checkout — the engine was not launched \
+     from a Lucidos source tree, so there is no platform source here to edit and \
+     no coding-agent thread can be started against it ON THIS INSTALL. Do NOT \
+     claim you can change Lucidos itself here, and do not tell the user to Apply \
+     or restart for such a change. What DOES work: `folder=\"data/apps/<id>\"` to \
+     edit an installed app, or `folder=<repo name>` for a repository registered \
+     via `manage_repositories`. Changing Lucidos itself requires an engine \
+     running from a Lucidos source checkout (a dev build) — if the user has such \
+     a workspace, route the work there with \
+     `run_coding_agent(workspace=\"<name>\", relation=\"top\")`, which is \
+     forwarded to that engine and is NOT blocked by this refusal."
+        .into()
+}
+
 /// Forbidden system roots. Lookups are anchored at start so a `/etcetera`
 /// folder isn't accidentally captured.
 const FORBIDDEN_SYSTEM_ROOTS: &[&str] = &[
@@ -638,6 +666,39 @@ mod tests {
         assert!(
             err.contains("not the Lucidos source repo"),
             "would-be source must fall through to the unrecognised-path refusal: {err}",
+        );
+    }
+
+    /// The refusal both spawn sites share must be ACTIONABLE, not just a denial.
+    /// The observed failure was the agent narrating edits to
+    /// `crates/lucidos-engine/…` and telling the user to Apply + restart on a
+    /// packaged install; a bare "no" invites the model to retry the same spawn,
+    /// so the message has to name the routes that actually work.
+    #[test]
+    fn no_lucidos_source_refusal_names_the_working_alternatives() {
+        let msg = err_no_lucidos_source().to_string();
+        assert!(
+            msg.contains("no source checkout"),
+            "must state WHY it is refused: {msg}"
+        );
+        assert!(
+            msg.contains("data/apps/<id>"),
+            "must point at the app coding-agent route: {msg}"
+        );
+        assert!(
+            msg.contains("manage_repositories"),
+            "must point at the external-repo route: {msg}"
+        );
+        assert!(
+            msg.contains("Apply"),
+            "must warn off the apply/restart narration that made this a user-visible lie: {msg}"
+        );
+        // Scoped to this install: a cross-workspace spawn returns before this
+        // guard and is enforced by the target engine, so the refusal must not
+        // read as "no coding agent can ever do platform work".
+        assert!(
+            msg.contains("ON THIS INSTALL") && msg.contains("run_coding_agent(workspace="),
+            "refusal must scope itself and keep the cross-workspace route open: {msg}"
         );
     }
 }

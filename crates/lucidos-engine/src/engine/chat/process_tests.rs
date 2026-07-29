@@ -1,7 +1,7 @@
 use super::super::process_helpers::{
     build_system_knowhow_section, build_trigger_knowhow_section, build_trigger_started_event,
-    classify_or_fallback, summarize_or_fallback, TriggerContext, APPLY_VERIFY_RULE,
-    ENGINE_RESTART_RULE,
+    classify_or_fallback, summarize_or_fallback, TriggerContext, APPLY_VERIFY_DEV_ADDENDUM,
+    APPLY_VERIFY_RULE, ENGINE_RESTART_RULE,
 };
 use super::{build_capture_sections, build_loaded_knowhow_block};
 use crate::core::knowhow::KnowhowSummary;
@@ -312,6 +312,16 @@ fn engine_restart_rule_still_blocks_post_restart_promises() {
     );
 }
 
+/// The rule as a DEV install sees it: the unconditional half plus the dev-only
+/// addendum, exactly as `build_chat_system_prompt` composes it when a Lucidos
+/// source checkout exists. The two are separate constants because the
+/// rebuild/restart choreography is meaningless on an install with no source
+/// (see `system_prompt::coding_surface_section`), but every assertion below
+/// still has to hold for the dev variant.
+fn apply_verify_rule_dev_variant() -> String {
+    format!("{APPLY_VERIFY_RULE}{APPLY_VERIFY_DEV_ADDENDUM}")
+}
+
 /// The apply/verify rule must keep the chat agent from bouncing yes/no
 /// "did you apply it? / did you restart?" confirmations at the user — the
 /// font-fix-session failure pattern. It must (1) name both self-service tools,
@@ -320,35 +330,35 @@ fn engine_restart_rule_still_blocks_post_restart_promises() {
 /// gateway gotcha, and (5) ban the "does it look right now?" closer.
 #[test]
 fn apply_verify_rule_tells_agent_to_act_and_verify_not_ask() {
-    let lowered = APPLY_VERIFY_RULE.to_lowercase();
+    let rule = apply_verify_rule_dev_variant();
+    let lowered = rule.to_lowercase();
     assert!(
-        APPLY_VERIFY_RULE.contains("`changes` tool")
-            && APPLY_VERIFY_RULE.contains("action 'list'")
-            && APPLY_VERIFY_RULE.contains("action 'apply'"),
-        "rule must name the grouped `changes` tool and its list/apply actions:\n{APPLY_VERIFY_RULE}"
+        rule.contains("`changes` tool")
+            && rule.contains("action 'list'")
+            && rule.contains("action 'apply'"),
+        "rule must name the grouped `changes` tool and its list/apply actions:\n{rule}"
     );
     assert!(
         lowered.contains("have you applied it") && lowered.contains("did you restart"),
-        "rule must explicitly ban the two confirmation questions:\n{APPLY_VERIFY_RULE}"
+        "rule must explicitly ban the two confirmation questions:\n{rule}"
     );
     assert!(
         lowered.contains("cannot restart the engine"),
-        "rule must state the agent cannot restart the engine (only the user can):\n{APPLY_VERIFY_RULE}"
+        "rule must state the agent cannot restart the engine (only the user can):\n{rule}"
     );
     assert!(
         lowered.contains("probing the served asset")
             || lowered.contains("probe the served asset")
             || lowered.contains("probe served assets"),
-        "rule must tell the agent to verify by probing the served asset:\n{APPLY_VERIFY_RULE}"
+        "rule must tell the agent to verify by probing the served asset:\n{rule}"
     );
     assert!(
-        APPLY_VERIFY_RULE.contains("/<workspace>/api/v1/")
-            && lowered.contains("unknown workspace 'api'"),
-        "rule must record the workspace-prefixed-route gateway gotcha:\n{APPLY_VERIFY_RULE}"
+        rule.contains("/<workspace>/api/v1/") && lowered.contains("unknown workspace 'api'"),
+        "rule must record the workspace-prefixed-route gateway gotcha:\n{rule}"
     );
     assert!(
         lowered.contains("does it look right now") || lowered.contains("does it match"),
-        "rule must ban the post-apply confirmation-question closer:\n{APPLY_VERIFY_RULE}"
+        "rule must ban the post-apply confirmation-question closer:\n{rule}"
     );
 }
 
@@ -378,13 +388,18 @@ fn apply_verify_rule_does_not_disable_ask_user_question() {
 /// The rule must reinforce that the user works on Lucidos constantly and knows
 /// the apply/restart/reload dance — so the agent doesn't re-explain it (the
 /// other half of "don't interrogate the user").
+///
+/// Dev-variant only. On an install with no Lucidos source checkout the premise
+/// is false — there is no engine rebuild to know the dance for — so this half
+/// is deliberately absent there; `system_prompt::tests` pins that direction.
 #[test]
 fn apply_verify_rule_reinforces_user_knows_the_dance() {
-    let lowered = APPLY_VERIFY_RULE.to_lowercase();
+    let rule = apply_verify_rule_dev_variant();
+    let lowered = rule.to_lowercase();
     assert!(
         lowered.contains("knows the apply/restart/reload dance")
             && lowered.contains("do not re-explain it"),
-        "rule must reinforce that the user knows the dance and must not be re-taught it:\n{APPLY_VERIFY_RULE}"
+        "rule must reinforce that the user knows the dance and must not be re-taught it:\n{rule}"
     );
 }
 

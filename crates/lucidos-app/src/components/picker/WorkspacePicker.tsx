@@ -97,7 +97,7 @@ const RESTORE_PHASE_LABELS: Record<string, string> = {
 /** Quick-fill names offered in the create form while the name field is empty —
  *  the first-run "name your first workspace" nudge. Clicking one fills the
  *  (editable) field; the user still confirms with Create. */
-export const WORKSPACE_NAME_SUGGESTIONS = ['home', 'team'] as const;
+export const WORKSPACE_NAME_SUGGESTIONS = ['personal', 'work'] as const;
 
 /* ── Inline icons (kept local so the picker stays self-contained) ─────────── */
 
@@ -477,7 +477,7 @@ export function WorkspacePicker() {
   // First run: when the picker loads with zero workspaces, open the create form
   // so the user names their first workspace right away — instead of the passive
   // "No workspaces yet" dead-end (and instead of a pre-made `default`). The field
-  // stays empty and editable; the suggestion chips ("home" / "team") offer a
+  // stays empty and editable; the suggestion chips ("personal" / "work") offer a
   // one-click fill. Runs once; a manual Cancel then stays cancelled.
   const firstRunPrompted = useSignal(false);
   useEffect(() => {

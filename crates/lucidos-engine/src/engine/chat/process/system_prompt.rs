@@ -11,9 +11,79 @@ use chrono::Utc;
 use std::path::Path;
 
 use super::super::process_helpers::{
-    build_system_knowhow_section, build_trigger_knowhow_section, TriggerContext, APPLY_VERIFY_RULE,
-    ENGINE_RESTART_RULE,
+    build_system_knowhow_section, build_trigger_knowhow_section, TriggerContext,
+    APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE, ENGINE_RESTART_RULE,
 };
+
+/// What this install lets a coding agent edit, when the engine WAS launched
+/// from a Lucidos source checkout. Paired with [`NO_LUCIDOS_SOURCE_SECTION`];
+/// exactly one of the two is in every prompt (see [`coding_surface_section`]).
+const LUCIDOS_SOURCE_SECTION: &str = "\n\nWHAT A CODING AGENT CAN EDIT ON THIS INSTALL:\n\
+     This engine is running from a Lucidos SOURCE CHECKOUT, so you can edit the \
+     Lucidos platform's own code — call `run_coding_agent` with `folder` omitted \
+     and the session runs against the source tree. A change to Rust/backend files \
+     needs the user to Apply and then trigger the rebuild + restart before it is \
+     live. You can also edit an installed app (`folder=\"data/apps/<id>\"`) or a \
+     repository registered via `manage_repositories`.";
+
+/// What this install lets a coding agent edit, when there is NO Lucidos source
+/// checkout (a packaged `.app` / headless install).
+///
+/// This is the fix for the reported failure: with nothing in the prompt saying
+/// otherwise, the agent read the `run_coding_agent` description ("omit `folder`
+/// to edit Lucidos itself"), asserted it had read `crates/lucidos-engine/…`,
+/// spawned a session, and told the user to Apply and rebuild — on an install
+/// with no source tree at all. The engine now refuses that spawn, but the model
+/// must be TOLD, not just blocked, or it narrates the capability first and
+/// discovers the refusal after the user has already been misled.
+const NO_LUCIDOS_SOURCE_SECTION: &str = "\n\nWHAT A CODING AGENT CAN EDIT ON THIS INSTALL:\n\
+     This engine was NOT launched from a Lucidos source checkout — this install \
+     ships the binary only. There is no Lucidos platform source here, so you \
+     CANNOT edit Lucidos itself: no engine code, no frontend code, no `crates/…` \
+     path. A `run_coding_agent` call with `folder` omitted and no `workspace` — \
+     i.e. aimed at THIS install — is REFUSED.\n\
+     Consequences you must respect:\n\
+     - NEVER say or imply you have read, inspected, or can change Lucidos's own \
+       source. You have no access to it. If you want to reason about engine \
+       behaviour, say plainly that you're reasoning from observed behaviour and \
+       documentation, not from the source.\n\
+     - NEVER tell the user to Apply, rebuild, or restart for a change to Lucidos \
+       itself — there is no such change to apply here, and this install does not \
+       rebuild from source (updates arrive through the app updater).\n\
+     - When the user asks for a change to Lucidos itself, say directly that it \
+       can't be done on this install, and offer the cross-workspace route below \
+       if one applies. Never spawn a local coding agent to try anyway.\n\
+     What DOES work here: editing an installed app with \
+     `run_coding_agent(folder=\"data/apps/<id>\")`, and editing a repository \
+     registered via `manage_repositories` with `run_coding_agent(folder=<repo \
+     name>)`. Both are unaffected by the absence of platform source.\n\
+     CROSS-WORKSPACE IS STILL OPEN: the refusal above is about THIS install, not \
+     about you. If the user has another workspace whose engine DOES run from a \
+     Lucidos source checkout, you can route platform work there with \
+     `run_coding_agent(workspace=\"<name>\", relation=\"top\")` and `folder` \
+     omitted — that call is forwarded to the target engine, which applies its own \
+     source check. Don't guess that such a workspace exists; offer it when the \
+     user names one or you already know of one.";
+
+/// Pick the coding-surface prompt section for this install.
+///
+/// The single divergence point between the two system-prompt variants — one
+/// that says the agent can edit the source it is running on, one that says it
+/// cannot. Pure over the flag so both variants are unit-testable without a
+/// packaged binary; the caller supplies
+/// [`crate::paths::has_lucidos_source`], which is the same signal behind the
+/// `/health` `packaged` flag (so the compose picker and the chat agent can
+/// never disagree about whether "Lucidos source" exists).
+///
+/// Constant per process, so splicing it does not disturb the provider
+/// prompt-cache prefix the surrounding sections rely on.
+pub(crate) fn coding_surface_section(has_lucidos_source: bool) -> &'static str {
+    if has_lucidos_source {
+        LUCIDOS_SOURCE_SECTION
+    } else {
+        NO_LUCIDOS_SOURCE_SECTION
+    }
+}
 
 /// Nudges the Lucidos chat agent to use the `ask_user_question` tool for any
 /// choice-shaped question (yes/no, A vs B, pick-from-list, "what next?"
@@ -599,9 +669,19 @@ VERIFICATION: Before saying "done", check that the tool returned success THIS tu
 
 __REPEATED_ACTION_RULE__"#;
 
+        // The one divergence between the two prompt variants: whether this
+        // install has Lucidos platform source to edit. Same signal as the
+        // `/health` `packaged` flag the compose picker gates on.
+        let has_lucidos_source = crate::paths::has_lucidos_source();
+        let apply_verify_rule = if has_lucidos_source {
+            format!("{}{}", APPLY_VERIFY_RULE, APPLY_VERIFY_DEV_ADDENDUM)
+        } else {
+            APPLY_VERIFY_RULE.to_string()
+        };
+
         let system_prompt_base = system_prompt_base
             .replace("__ENGINE_RESTART_RULE__", ENGINE_RESTART_RULE)
-            .replace("__APPLY_VERIFY_RULE__", APPLY_VERIFY_RULE)
+            .replace("__APPLY_VERIFY_RULE__", &apply_verify_rule)
             .replace("__ASK_USER_QUESTION_RULE__", ASK_USER_QUESTION_RULE)
             .replace("__REPEATED_ACTION_RULE__", REPEATED_ACTION_RULE)
             .replace(
@@ -613,7 +693,12 @@ __REPEATED_ACTION_RULE__"#;
                 &super::super::recursion_guard::MAX_CHILDREN_PER_THREAD.to_string(),
             );
 
-        let system_prompt = format!("{}{}", system_prompt, system_prompt_base);
+        let system_prompt = format!(
+            "{}{}{}",
+            system_prompt,
+            system_prompt_base,
+            coding_surface_section(has_lucidos_source)
+        );
 
         // Tell the LLM where Lucidos is running
         let api_port = std::env::var("LUCIDOS_API_PORT").unwrap_or_else(|_| "3000".to_string());
@@ -810,8 +895,130 @@ Do NOT refuse to discuss the user's own personal information from their own file
 
 #[cfg(test)]
 mod tests {
-    use super::workspace_identity_section;
+    use super::super::super::process_helpers::{APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE};
+    use super::{coding_surface_section, workspace_identity_section};
     use std::path::{Path, PathBuf};
+
+    /// The reported failure, pinned. On an install with no source checkout the
+    /// prompt must say so outright — the agent had claimed to read
+    /// `crates/lucidos-engine/src/core/oauth.rs`, spawned a coding agent, and
+    /// told the user to Apply + rebuild, on a packaged install with no source.
+    #[test]
+    fn no_source_variant_denies_editing_lucidos_and_names_what_works() {
+        let section = coding_surface_section(false);
+
+        assert!(
+            section.contains("NOT launched from a Lucidos source checkout"),
+            "must state the install has no source checkout:\n{section}"
+        );
+        assert!(
+            section.contains("CANNOT edit Lucidos itself"),
+            "must deny platform edits outright:\n{section}"
+        );
+        assert!(
+            section.contains("REFUSED"),
+            "must warn that the no-`folder` spawn is refused, so the agent \
+             doesn't narrate a session it can't start:\n{section}"
+        );
+        // The two escalations that made this user-visible: inventing source
+        // knowledge, and prescribing an apply/rebuild that cannot happen.
+        assert!(
+            section.contains("NEVER say or imply you have read"),
+            "must forbid claiming to have read the source:\n{section}"
+        );
+        assert!(
+            section.contains("NEVER tell the user to Apply, rebuild, or restart"),
+            "must forbid the apply/rebuild instruction:\n{section}"
+        );
+        // A denial with no alternative just invites a retry.
+        assert!(
+            section.contains("data/apps/<id>") && section.contains("manage_repositories"),
+            "must name the app + external-repo routes that still work:\n{section}"
+        );
+    }
+
+    /// The denial is about THIS install, not about the agent. A cross-workspace
+    /// `run_coding_agent(workspace="…")` returns at
+    /// `agentic_loop_special_tool.rs:351-367` — before the local source guard —
+    /// and the TARGET engine applies its own check, so it stays valid here. An
+    /// unqualified "never spawn a coding agent for a Lucidos change" would make
+    /// the documented cross-workspace capability unreachable from every packaged
+    /// install, which is the one nearby way to over-correct this fix.
+    #[test]
+    fn no_source_variant_preserves_the_cross_workspace_route() {
+        let section = coding_surface_section(false);
+
+        assert!(
+            section.contains("CROSS-WORKSPACE IS STILL OPEN"),
+            "must keep the cross-workspace route open:\n{section}"
+        );
+        assert!(
+            section.contains("run_coding_agent(workspace="),
+            "must show the call shape that still works:\n{section}"
+        );
+        // The refusal has to be scoped, or the carve-out above contradicts it.
+        assert!(
+            section.contains("aimed at THIS install") && section.contains("local coding agent"),
+            "the refusal must be scoped to local spawns so it doesn't read as \
+             a blanket ban:\n{section}"
+        );
+    }
+
+    /// The dev variant keeps today's behaviour: platform source is editable.
+    #[test]
+    fn source_variant_says_the_platform_source_is_editable() {
+        let section = coding_surface_section(true);
+
+        assert!(
+            section.contains("running from a Lucidos SOURCE CHECKOUT"),
+            "must state a source checkout exists:\n{section}"
+        );
+        assert!(
+            section.contains("`folder` omitted"),
+            "must keep the omit-folder route documented:\n{section}"
+        );
+        assert!(
+            !section.contains("CANNOT edit Lucidos itself"),
+            "the dev variant must not carry the denial:\n{section}"
+        );
+    }
+
+    /// Exactly two variants, and they genuinely differ — a refactor that
+    /// collapsed them (or returned the same constant twice) would silently
+    /// restore the bug on packaged installs.
+    #[test]
+    fn the_two_variants_are_distinct() {
+        assert_ne!(
+            coding_surface_section(true),
+            coding_surface_section(false),
+            "the source and no-source prompt variants must differ"
+        );
+    }
+
+    /// The apply/verify split: `changes` guidance is install-independent (app
+    /// coding-agent threads still produce changes on a packaged install), while
+    /// the engine rebuild/restart choreography is dev-only — a packaged install
+    /// never rebuilds from source.
+    #[test]
+    fn apply_verify_rule_keeps_changes_guidance_and_quarantines_the_rebuild_dance() {
+        assert!(
+            APPLY_VERIFY_RULE.contains("`changes` tool (action 'list' / 'apply')"),
+            "the changes-tool guidance must hold on every install"
+        );
+        assert!(
+            !APPLY_VERIFY_RULE.contains("works on Lucidos constantly"),
+            "the dev-only framing must not be in the unconditional rule"
+        );
+        assert!(
+            !APPLY_VERIFY_RULE.contains("did you restart?"),
+            "the rebuild/restart dance must not be in the unconditional rule"
+        );
+        assert!(
+            APPLY_VERIFY_DEV_ADDENDUM.contains("works on Lucidos constantly")
+                && APPLY_VERIFY_DEV_ADDENDUM.contains("did you restart?"),
+            "the dev addendum must carry both dev-only halves"
+        );
+    }
 
     /// The regression test for the leak this section was built to stop: the
     /// prompt's WORKSPACE line must never carry a `$HOME`-rooted absolute

@@ -544,7 +544,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     drop(boot_pool);
 
-    // Create engine with pgvector for embeddings
+    // Create engine with pgvector for embeddings.
+    //
+    // Deliberately NO catch-all boot-failure report here. A reported failure is
+    // terminal — it stops the gateway respawning — and construction can fail for
+    // plenty of transient reasons (Postgres not ready yet, a dropped connection
+    // during schema init or recovery) that the supervisor's existing retry
+    // recovers from. Only a CLASSIFIED-terminal failure reports, from the site
+    // that can classify it: see `boot_failure::terminal_migration_message`.
     let engine = LucidosEngine::new(
         workspace_path.clone(),
         &database_url,

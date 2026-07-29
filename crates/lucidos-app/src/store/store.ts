@@ -204,6 +204,11 @@ export const lucidosReleaseDirty = signal<boolean>(false);
 export const engineVersion = signal<string | null>(null);
 export const latestEngineVersion = signal<string | null>(null);
 export const latestTauriAppVersion = signal<string | null>(null);
+/** Why the last packaged app-update check failed, or `null` when it succeeded
+ *  (or has not run). Rendered in Settings → System so a failing check is
+ *  DIAGNOSABLE instead of silent — swallowing it is what made a stranded 0.15.0
+ *  install indistinguishable from an up-to-date one. */
+export const appUpdateCheckError = signal<string | null>(null);
 /** True when the connected engine is a packaged desktop build. Routes the
  *  "Restart" control (LaunchAgent kickstart vs. dev rebuild script) and gates
  *  the Tauri-only Mobile Access settings page. Set from /health. */

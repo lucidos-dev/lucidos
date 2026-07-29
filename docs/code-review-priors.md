@@ -836,6 +836,22 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `last_run` ever starts feeding on a DB-clock value again.
   (`crates/lucidos-engine/src/triggers/run_history.rs`.)
 
+- **The no-Lucidos-source spawn guard does NOT break cross-workspace
+  `run_coding_agent` — the forwarding path returns before it.** Reviewers see
+  `if folder_input.is_none() && !crate::paths::has_lucidos_source()` in
+  `agentic_loop_special_tool.rs` and flag that a packaged install can no longer
+  route a folder-less spawn to a `workspace="dev"` target that *does* have a
+  checkout. It can: the `workspace_arg` branch a few lines above returns
+  `cross_workspace_run_coding_agent(...)` outright, so a cross-workspace call
+  never reaches the guard, and the receiving engine applies its own check via
+  `run_session`'s `unregistered_lucidos_root`. The guard is local-spawn-only by
+  position, not by an explicit `workspace.is_none()` term — which is what makes
+  it read as unguarded. (Codex flagged exactly this on 2026-07-29; the *prompt*
+  wording was genuinely over-broad and was scoped, but the code was correct.)
+  Re-flag only if the cross-workspace early return moves below the guard.
+  (`crates/lucidos-engine/src/engine/agentic_loop_special_tool.rs`,
+  `crates/lucidos-engine/src/engine/agent_session/run_session/run.rs`.)
+
 ## Settled architecture questions
 
 - **No shared turn-lifecycle orchestrator across the agent-session loop and

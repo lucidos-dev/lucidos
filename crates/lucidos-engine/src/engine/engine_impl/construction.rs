@@ -678,7 +678,28 @@ impl LucidosEngine {
 
         // Run sqlx migrations before any schema init calls
         crate::boot_report::report(crate::boot_report::MIGRATING);
-        sqlx::migrate!().run(&pool).await?;
+        let migrator = sqlx::migrate!();
+        if let Err(e) = migrator.run(&pool).await {
+            // Some migration failures are TERMINAL — no respawn fixes them — and
+            // the most common is an app DOWNGRADE onto a database a newer Lucidos
+            // already migrated (`VersionMissing`). Translate those into something
+            // the user can act on and hand it to the gateway BEFORE we exit, or
+            // the splash spins forever on the neutral label while the real reason
+            // sits in the engine log.
+            //
+            // `None` means retryable (a dropped connection, a transient IO fault):
+            // report nothing, so the supervisor's respawn still gets its chance.
+            // See `boot_failure`.
+            if let Some(message) = crate::boot_failure::terminal_migration_message(
+                &e,
+                &crate::boot_failure::applied_versions(&pool).await,
+                &crate::boot_failure::embedded_versions(&migrator),
+                env!("CARGO_PKG_VERSION"),
+            ) {
+                crate::boot_failure::report(&message).await;
+            }
+            return Err(e.into());
+        }
 
         let event_store = EventStore::new(pool.clone());
         event_store.init_schema().await?;
@@ -905,15 +926,17 @@ impl LucidosEngine {
         // disk), so a registry wipe / re-seed always recomputes the SAME id —
         // coding-agent threads bound to it never orphan.
         //
-        // DEV-ONLY: gate on a genuine source checkout. On a packaged build
-        // `paths::repo_root()` errs (the signal `is_packaged()` keys on) and the
-        // `repo_root` above — from `main_worktree()` — falls back to the
+        // DEV-ONLY: gate on a genuine source checkout, via the shared
+        // `has_lucidos_source()` predicate (the same signal behind the `/health`
+        // `packaged` flag and the chat agent's coding-surface prompt — one
+        // definition, so the three can't drift). On a packaged build it is false
+        // and the `repo_root` above — from `main_worktree()` — falls back to the
         // workspace dir. Registering THAT under the reserved name "Lucidos" would
         // mis-label the user's workspace as the platform source (then hidden by
         // the compose picker's reserved-name handling). There is no Lucidos
         // source on packaged, so skip both the registration and the
         // source-thread backfill below.
-        if crate::paths::repo_root().is_ok() {
+        if crate::paths::has_lucidos_source() {
             let default_repo_root_commit = git_ops::root_commit_sha(&repo_root).await;
             if let Err(e) = crate::core::repositories::RepositoryStore::ensure_exists(
                 &pool,

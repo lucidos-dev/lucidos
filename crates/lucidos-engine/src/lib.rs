@@ -63,6 +63,7 @@ pub fn module_label(path: &str) -> &str {
 }
 
 pub mod api;
+pub mod boot_failure;
 pub mod boot_report;
 pub mod capability_manifest;
 pub mod core;

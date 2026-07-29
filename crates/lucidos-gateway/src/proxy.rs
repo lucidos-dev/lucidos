@@ -172,7 +172,30 @@ pub async fn proxy(
 /// to SHOW this response; it is never cached (still a 503 + `no-store`).
 pub fn starting_page(label: &str) -> Response {
     // 2s meta-refresh, no escape link — the happy-path boot window.
-    boot_splash_response(splash_page_html(label, 2, false), "2")
+    boot_splash_response(splash_page_html(label, Some(2), false), "2")
+}
+
+/// The boot-splash TERMINAL-FAILURE page: the engine reported a boot failure it
+/// cannot retry its way out of (see `lucidos-engine/src/boot_failure.rs`), most
+/// commonly a database written by a NEWER Lucidos than the installed one — what an
+/// app downgrade produces. `message` is the engine's own user-facing sentence.
+///
+/// Differs from [`stalled_page`] in the two ways that matter: it states the actual
+/// cause instead of "taking longer than expected", and it carries **no
+/// meta-refresh** at all. Reloading cannot fix a boot that is definitionally
+/// unachievable, and the gateway has already stopped respawning the engine, so a
+/// refresh loop would only re-render the same page forever. The escape link to the
+/// picker is the one action left. Same 503 + boot-splash marker as its siblings, so
+/// the PWA service worker shows it rather than serving the cached app shell.
+///
+/// This page is also the ONLY place the "install a newer version" remedy can reach
+/// the user: the packaged in-app update toast is started from the workspace app's
+/// startup hook (`useStartup.ts` → `startAppUpdateChecks`), which never runs while
+/// the workspace is stuck on this splash.
+pub fn failed_page(message: &str) -> Response {
+    // `Retry-After` still advertises a sane poll interval for well-behaved clients
+    // even though the page itself does not self-refresh.
+    boot_splash_response(splash_page_html(message, None, true), "60")
 }
 
 /// The boot-splash ESCAPE page, served once a workspace has been stuck in its boot
@@ -185,7 +208,7 @@ pub fn starting_page(label: &str) -> Response {
 /// picker↔workspace loop). Same 503 + boot-splash marker as [`starting_page`].
 pub fn stalled_page() -> Response {
     boot_splash_response(
-        splash_page_html("This is taking longer than expected.", 10, true),
+        splash_page_html("This is taking longer than expected.", Some(10), true),
         "10",
     )
 }
@@ -219,20 +242,32 @@ fn boot_splash_response(html: String, retry_after: &'static str) -> Response {
 /// on a rounded square) — inlined rather than referenced because the splash must
 /// render before any engine can serve `/favicon.svg`. Geometry + gradient are the
 /// single-source values from the icon generator; keep them in sync if the brand
-/// changes there. `label` is interpolated verbatim — pass trusted, static text.
+/// changes there.
+///
+/// `label` is HTML-ESCAPED before interpolation. The phase labels are static
+/// strings, but [`failed_page`]'s message arrives from the engine over the
+/// `boot-failure` control endpoint — loopback-only and id-validated, yet no longer
+/// trusted-static once it crosses a wire. Escaping here rather than at that one
+/// call site keeps every present and future caller safe by construction.
+///
 /// `refresh_secs` sets the meta-refresh interval (2s on the happy-path
-/// [`starting_page`], slower on [`stalled_page`]); when `escape` is set a manual
-/// "Back to workspaces" link to the picker is shown below the label.
-fn splash_page_html(label: &str, refresh_secs: u32, escape: bool) -> String {
-    // Split the template around the refresh interval, the label, and the escape
-    // link so the static CSS (full of `{}`) needs no `format!` brace-escaping.
+/// [`starting_page`], slower on [`stalled_page`]); `None` omits the refresh tag
+/// entirely, for [`failed_page`], where reloading can never change the outcome.
+/// When `escape` is set a manual "Back to workspaces" link to the picker is shown
+/// below the label.
+fn splash_page_html(label: &str, refresh_secs: Option<u32>, escape: bool) -> String {
+    // Split the template around the refresh tag, the label, and the escape link so
+    // the static CSS (full of `{}`) needs no `format!` brace-escaping.
     const HEAD_A: &str = r##"<!doctype html><html><head><meta charset="utf-8">
-<meta http-equiv="refresh" content=""##;
-    const HEAD_B: &str = r##"">
+"##;
+    const HEAD_B: &str = r##"
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0a4ea8">
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><radialGradient id='g' gradientUnits='userSpaceOnUse' cx='30' cy='22' r='125'><stop offset='0' stop-color='%232d83e0'/><stop offset='1' stop-color='%230a4ea8'/></radialGradient></defs><rect width='100' height='100' rx='22' fill='url(%23g)'/><g transform='translate(13 13) scale(0.74)' fill='%23fff'><rect x='17' y='17' width='29' height='29' rx='7'/><rect x='17' y='54' width='29' height='29' rx='7'/><rect x='54' y='54' width='29' height='29' rx='7'/><path d='M68.5 12 C71 25 74 28.5 87 31 C74 33.5 71 37 68.5 50 C66 37 63 33.5 50 31 C63 28.5 66 25 68.5 12 Z'/></g></svg>">
-<title>Starting…</title>
+<title>"##;
+    // Split again around the tab title: the failure page must not sit in the tab
+    // claiming "Starting…" while the page itself says the workspace cannot open.
+    const HEAD_C: &str = r##"</title>
 <style>
 html,body{margin:0;height:100%}
 /* Paint the gradient on the root with a solid fallback + fixed attachment so it
@@ -282,7 +317,25 @@ label's size/spacing, underlined so it reads as a tap target. */
     const ESCAPE_LINK: &str =
         r##"<a class="mark-escape" href="/~/?pick">Back to workspaces</a>"##;
     let escape_html = if escape { ESCAPE_LINK } else { "" };
-    format!("{HEAD_A}{refresh_secs}{HEAD_B}{label}</p>\n{escape_html}\n</body></html>")
+    // Omitted entirely (not `content="0"`) when there is nothing to wait for.
+    let refresh_html = match refresh_secs {
+        Some(secs) => format!(r#"<meta http-equiv="refresh" content="{secs}">"#),
+        None => String::new(),
+    };
+    // A page with nothing to wait for is not "Starting…".
+    let title = if refresh_secs.is_some() { "Starting…" } else { "Cannot open workspace" };
+    let label = escape_html_text(label);
+    format!("{HEAD_A}{refresh_html}{HEAD_B}{title}{HEAD_C}{label}</p>\n{escape_html}\n</body></html>")
+}
+
+/// Escape text for interpolation into HTML element content or a quoted attribute.
+/// `&` first, or the later replacements' own ampersands would be double-escaped.
+fn escape_html_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 /// Build the shared reqwest client used for proxying to the workspace engines.
@@ -330,7 +383,7 @@ mod tests {
 
     #[test]
     fn starting_splash_renders_the_phase_label_and_has_no_escape_link() {
-        let html = splash_page_html("Downloading memory model — first run, this can take a minute…", 2, false);
+        let html = splash_page_html("Downloading memory model — first run, this can take a minute…", Some(2), false);
         // The current boot-phase label is shown beneath the mark.
         assert!(html.contains("Downloading memory model — first run, this can take a minute…"));
         // The 2s auto-refresh that advances the label / drives the happy-path
@@ -348,7 +401,7 @@ mod tests {
 
     #[test]
     fn stalled_splash_has_manual_escape_link_and_slower_refresh() {
-        let html = splash_page_html("This is taking longer than expected.", 10, true);
+        let html = splash_page_html("This is taking longer than expected.", Some(10), true);
         assert!(html.contains("This is taking longer than expected."));
         // A slower (10s) refresh so a late-but-real recovery still lands on the
         // workspace, rather than the happy-path 2s.
@@ -365,6 +418,53 @@ mod tests {
     #[test]
     fn stalled_page_is_503_with_boot_splash_marker() {
         let resp = stalled_page();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get("x-lucidos-boot-splash").map(|v| v.to_str().unwrap()),
+            Some("1")
+        );
+    }
+
+    /// A terminal failure must not self-refresh: the gateway has stopped
+    /// respawning, so a reload loop would re-render the same page forever.
+    #[test]
+    fn failure_splash_states_the_cause_with_no_refresh_but_an_escape_link() {
+        let html = splash_page_html(
+            "Lucidos 0.15.0 cannot open this workspace: its database was created by a \
+             newer version of Lucidos.",
+            None,
+            true,
+        );
+        assert!(html.contains("its database was created by a newer version"), "{html}");
+        // No meta-refresh AT ALL — not `content="0"`, not a long interval.
+        assert!(!html.contains("http-equiv=\"refresh\""), "{html}");
+        // ...and the tab must not claim the workspace is still starting.
+        assert!(html.contains("<title>Cannot open workspace</title>"), "{html}");
+        assert!(!html.contains("Starting…"), "{html}");
+        // The escape to the picker is the only action left.
+        assert!(html.contains(r##"href="/~/?pick""##));
+        assert!(html.contains("Back to workspaces"));
+    }
+
+    /// The failure message crosses a wire (the `boot-failure` control endpoint), so
+    /// it is not trusted-static like the phase labels are.
+    #[test]
+    fn splash_escapes_html_in_the_label() {
+        let html = splash_page_html(
+            r#"<script>alert("x")</script> & 'quoted'"#,
+            None,
+            false,
+        );
+        assert!(!html.contains("<script>"), "raw tag survived: {html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+        assert!(html.contains("&amp;"), "{html}");
+        assert!(html.contains("&quot;"), "{html}");
+        assert!(html.contains("&#39;"), "{html}");
+    }
+
+    #[test]
+    fn failed_page_is_503_with_boot_splash_marker() {
+        let resp = failed_page("Lucidos 0.15.0 cannot open this workspace.");
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             resp.headers().get("x-lucidos-boot-splash").map(|v| v.to_str().unwrap()),

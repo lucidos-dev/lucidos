@@ -274,3 +274,55 @@ table still holds, achieved differently:
 `LUCIDOS_BIND_LOOPBACK` keeps its meaning as the `behind_gateway` signal
 (`api/actor.rs`); it no longer drives the bind decision (the default already is
 loopback). `LUCIDOS_BIND_ALL` is the sole bind-widening switch.
+
+## Addendum (2026-07-29): a terminal boot failure is rendered, never retried
+
+§11's boot window models *progress* — a **boot phase** the engine reports so the
+splash can narrate a slow cold boot. It had no model for a boot that cannot
+succeed, and the gap is not cosmetic: the supervisor's only vocabulary for "the
+engine keeps exiting" was the restart cap, after which `MarkUnhealthy` cleared the
+phase and the splash fell back to its neutral default.
+
+The 2026-07-29 incident made the cost concrete. Installing the 0.15.0 DMG over a
+database the 0.16.0 RC had migrated left the engine exiting on every spawn with
+`VersionMissing(20260713144403)` — sqlx refusing to run because the database
+recorded five migrations that binary had never heard of. The gateway respawned it
+five times, marked the workspace unhealthy, and served `Workspace starting…` for
+four minutes followed by `This is taking longer than expected.` The engine knew
+the exact cause and the exact remedy; both reached only
+`engine-service.err.log`. Recovery required reading that file and hand-editing
+`_sqlx_migrations`.
+
+**Decision.** A **boot failure** is a first-class concept alongside a boot phase,
+with three properties that follow from it being terminal rather than
+informational:
+
+1. **The engine classifies it, and the gateway stays dumb.** Only the engine
+   knows which migrations it embeds, so only it can say how far ahead the
+   database is. The gateway stores and renders an opaque string.
+2. **The report is awaited, not detached.** `boot_report` fires a detached task
+   because a phase report must never delay a boot. Here the process is about to
+   exit, so a detached task would never run at all.
+3. **It stops the respawn loop immediately.** `VersionMissing` re-runs
+   identically on every attempt; burning the restart cap first only delays the
+   message. `respawn_decision` short-circuits to `MarkUnhealthy`, ahead of the
+   never-cull-an-alive-engine rule — that rule protects a healthy-but-busy
+   process, and this one has declared itself dead.
+
+**Deliberately not done: auto-repair.** The engine never deletes migration rows
+or otherwise mutates the database to make itself start. Un-recording migrations
+is a destructive, judgment-dependent act — whether the data those migrations
+wrote can be abandoned depends on what they did — so it stays a human decision.
+The message explains the situation; it does not act on it.
+
+**The message never names a target version.** Migrations carry no app-version
+tag, so the newest unknown migration id cannot be mapped back to a Lucidos
+release. Saying "install 0.16.0" would be a guess; the message gives the counts,
+which are facts, and says "a newer version", which is true.
+
+Consequence for rendering: the failure page carries **no meta-refresh**. Every
+other boot-window surface polls because the condition might clear; this one
+cannot, and the gateway has already stopped respawning, so a refresh loop would
+only re-render the same page forever. The escape link to the picker is the single
+remaining action. Splash labels are now HTML-escaped as well — a phase label is a
+static string, but a failure message crosses the control-plane wire.

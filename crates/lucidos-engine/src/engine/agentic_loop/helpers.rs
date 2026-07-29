@@ -106,17 +106,64 @@ pub(crate) fn group_injected_prompts(prompts: Vec<InjectedPrompt>) -> Vec<Inject
     groups
 }
 
-pub(crate) fn framed_injected_prompt(prompt: &InjectedPrompt) -> String {
-    match prompt.mode {
-        super::super::thread_events::ActorMode::Human => format!(
-            "[USER CORRECTION — the user sent this while you were working. \
-             Prioritize this over your current plan and adjust accordingly.]\n\n{}",
+/// Where a framed injection is being delivered — the half of the framing the
+/// prompt itself can't carry.
+///
+/// Load-bearing, not cosmetic: "carry on with the work you had in progress" is
+/// true mid-turn and false for a re-processed orphan, whose turn already
+/// terminated. Framing the two the same way tells the model to resume work
+/// that no longer exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InjectionDelivery {
+    /// Appended to the message list of a turn that is still running.
+    MidTurn,
+    /// Re-processed as a turn of its own because the previous turn ended
+    /// before draining it (`api::chat::process_orphan_chain`).
+    NewTurn,
+}
+
+/// Wrap an injected message so the model knows when it arrived relative to the
+/// turn it lands in.
+///
+/// The mid-turn human framing deliberately does NOT call the message a
+/// *correction*. It used to ("prioritize this over your current plan and
+/// adjust accordingly"), which made every interjection read as a course
+/// change: a bare "status?" sent while the agent was mid-work got answered and
+/// then ended the turn, abandoning the work in progress. Only the user knows
+/// whether they meant "instead" or "also" — so state both paths and let the
+/// model classify, with resuming as the default.
+///
+/// A `NewTurn` delivery gets no resume directive at all: there is no work in
+/// progress to carry on with, and no response in flight to fold an update
+/// into. It only reports *when* the message was sent, since the turn it
+/// arrived during has since finished and its result is already in history.
+pub(crate) fn framed_injected_prompt(
+    prompt: &InjectedPrompt,
+    delivery: InjectionDelivery,
+) -> String {
+    use super::super::thread_events::ActorMode;
+    match (prompt.mode, delivery) {
+        (ActorMode::Human, InjectionDelivery::MidTurn) => format!(
+            "[USER INTERJECTION — the user sent this while you were working. \
+             Answer it, then carry on with the work you had in progress, in this \
+             same turn; answering is not a reason to end your turn. If it \
+             redirects you, drop the old plan and follow the new direction \
+             instead.]\n\n{}",
             prompt.text
         ),
-        super::super::thread_events::ActorMode::Agent
-        | super::super::thread_events::ActorMode::Engine => format!(
+        (ActorMode::Human, InjectionDelivery::NewTurn) => format!(
+            "[USER MESSAGE — sent while the previous turn was still finishing, \
+             so it is being handled now as its own turn.]\n\n{}",
+            prompt.text
+        ),
+        (ActorMode::Agent | ActorMode::Engine, InjectionDelivery::MidTurn) => format!(
             "[SYSTEM UPDATE — new information arrived while you were working. \
              Incorporate this into your current response.]\n\n{}",
+            prompt.text
+        ),
+        (ActorMode::Agent | ActorMode::Engine, InjectionDelivery::NewTurn) => format!(
+            "[SYSTEM UPDATE — this arrived while the previous turn was still \
+             finishing, so it is being handled now as its own turn.]\n\n{}",
             prompt.text
         ),
     }
@@ -132,16 +179,22 @@ pub(crate) fn prompts_have_images(prompts: &[InjectedPrompt]) -> bool {
         .any(|prompt| prompt.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
 }
 
+/// Build the one user message a mid-turn injection batch is appended to. The
+/// delivery is intrinsic to this builder — it exists only for the live-turn
+/// path; the orphan path uses [`coalesced_user_text_for_reprocess`].
 pub(crate) fn coalesced_user_text_message(prompts: &[InjectedPrompt]) -> Message {
     let has_images = prompts_have_images(prompts);
 
     let content = if prompts.len() == 1 && !has_images {
-        MessageContent::Text(framed_injected_prompt(&prompts[0]))
+        MessageContent::Text(framed_injected_prompt(
+            &prompts[0],
+            InjectionDelivery::MidTurn,
+        ))
     } else {
         let mut blocks = Vec::new();
         for prompt in prompts {
             blocks.push(ContentBlock::Text {
-                text: framed_injected_prompt(prompt),
+                text: framed_injected_prompt(prompt, InjectionDelivery::MidTurn),
             });
             if let Some(imgs) = &prompt.images {
                 for img in imgs {
@@ -163,10 +216,13 @@ pub(crate) fn coalesced_user_text_message(prompts: &[InjectedPrompt]) -> Message
     }
 }
 
+/// Build the opening text of the turn that re-processes orphaned injections —
+/// messages the previous turn ended before draining. That turn is over, so
+/// these are framed as `NewTurn`, never with a resume directive.
 pub(crate) fn coalesced_user_text_for_reprocess(prompts: &[InjectedPrompt]) -> String {
     prompts
         .iter()
-        .map(framed_injected_prompt)
+        .map(|prompt| framed_injected_prompt(prompt, InjectionDelivery::NewTurn))
         .collect::<Vec<_>>()
         .join("\n\n---\n\n")
 }

@@ -391,6 +391,19 @@ impl LucidosEngine {
                     );
                 }
                 let folder_input = folder_param.or(repo_param);
+                // Omitting `folder` MEANS "edit Lucidos itself" — which only
+                // exists on an install launched from a source checkout. Refuse
+                // here, synchronously, so the model learns it in the same turn
+                // and can tell the user the truth instead of narrating platform
+                // edits it cannot make. (`run_session` guards the same case for
+                // every other caller; this site exists because a tool result is
+                // the only channel the model actually reads.)
+                if folder_input.is_none() && !crate::paths::has_lucidos_source() {
+                    return Some(format!(
+                        "Error: {}",
+                        crate::engine::agent_session::err_no_lucidos_source()
+                    ));
+                }
                 // Resolve the folder against the §3.2 classification table.
                 // App folder (`data/apps/<id>` or absolute path under the
                 // workspace's `data/apps/<id>`) → spawn an app coding-agent

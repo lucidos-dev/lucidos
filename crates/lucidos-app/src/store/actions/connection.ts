@@ -296,7 +296,13 @@ export async function checkConnection(): Promise<boolean> {
     // flagged a phantom update with nothing to refresh to. Web freshness is the
     // service-worker BUILD_ID check (syncClientUpdateFromBuild), run on load /
     // resume / panel open and after a restart below.
-    if (health.latest_tauri_app_version) {
+    // `'unknown'` is the engine's sentinel for "couldn't read it", not a version.
+    // It is what EVERY packaged install reports: the engine derives this field by
+    // reading `crates/lucidos-app/VERSION` under `paths::repo_root()`, and a
+    // packaged install has no repo root. Storing the sentinel would both render as
+    // a bogus "(latest: unknown)" and clobber the real answer the packaged
+    // updater writes here (see store/actions/app-update.ts).
+    if (health.latest_tauri_app_version && health.latest_tauri_app_version !== 'unknown') {
       latestTauriAppVersion.value = health.latest_tauri_app_version;
       const appVersion = window.__LUCIDOS_APP_VERSION__;
       if (appVersion && isNewerVersion(health.latest_tauri_app_version, appVersion)) {

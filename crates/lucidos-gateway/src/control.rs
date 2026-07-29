@@ -49,6 +49,11 @@ pub fn router() -> Router<GatewayState> {
         // startup, before its HTTP server is up — see the engine's
         // `report_boot_phase`.
         .route("/workspaces/:id/boot-phase", post(set_boot_phase))
+        // ...and reports here when that startup DIES in a way no retry can fix
+        // (chiefly a database migrated by a newer Lucidos). Unlike the phase
+        // report this one is awaited by the engine, because the process exits
+        // immediately after — see the engine's `boot_failure`.
+        .route("/workspaces/:id/boot-failure", post(set_boot_failure))
         .route("/workspaces/:id", delete(delete_workspace))
         // Request-level authorization for the whole destructive control plane.
         .layer(middleware::from_fn(control_authz))
@@ -214,6 +219,15 @@ struct BootPhaseBody {
     /// Kebab-case phase name (see [`crate::boot_phase::BootPhase::from_wire`]).
     /// An unrecognized value is accepted and ignored (forward-compatible).
     phase: String,
+}
+
+#[derive(Deserialize)]
+struct BootFailureBody {
+    /// The engine's user-facing explanation of why this boot cannot succeed,
+    /// rendered verbatim (HTML-escaped) on the splash. The gateway deliberately
+    /// does not classify it — the engine is the only side that knows which
+    /// migrations it carries.
+    message: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -515,6 +529,28 @@ async fn set_boot_phase(
     reject_invalid_id(&id)?;
     if let Some(phase) = crate::boot_phase::BootPhase::from_wire(&body.phase) {
         state.set_boot_phase(&id, phase);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Record a TERMINAL boot failure for `id`: the engine has determined this boot
+/// cannot succeed and is exiting. Unlike [`set_boot_phase`] this is not telemetry
+/// — it changes behavior. The gateway renders the message on the splash instead of
+/// "Workspace starting…" and stops auto-respawning the engine, because the
+/// canonical cause (a database migrated by a newer Lucidos) is not something a
+/// restart can resolve.
+///
+/// An empty message is ignored rather than rendered as a blank splash. 204 on
+/// success; 400 only for a malformed id, which the engine never sends.
+async fn set_boot_failure(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(body): Json<BootFailureBody>,
+) -> Result<StatusCode, ApiError> {
+    reject_invalid_id(&id)?;
+    let message = body.message.trim();
+    if !message.is_empty() {
+        state.set_boot_failure(&id, message);
     }
     Ok(StatusCode::NO_CONTENT)
 }

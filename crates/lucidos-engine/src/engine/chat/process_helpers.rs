@@ -52,10 +52,29 @@ pub(super) const ENGINE_RESTART_RULE: &str = "ENGINE RESTARTS INTERRUPT IN-FLIGH
 /// CANNOT restart the engine — only the user triggers the rebuild) and the
 /// `ASK_USER_QUESTION_RULE` carve-out (ask only for genuine decisions). The
 /// served-asset probe note records the gateway routing gotcha: bundled SDK /
-/// static assets live under the workspace-prefixed route. The rule also
-/// reinforces that the user works on Lucidos constantly and knows the
-/// apply/restart/reload dance — so the agent must not re-explain it.
-pub(super) const APPLY_VERIFY_RULE: &str = "APPLYING & VERIFYING CHANGES — ACT AND VERIFY, DON'T ASK:\nYou have the `changes` tool (action 'list' / 'apply') — you can inspect and apply *changes* (coding-agent-proposed branches awaiting Apply) yourself, so NEVER bounce a yes/no question back to the user about state you can check. The user works on Lucidos constantly and knows the apply/restart/reload dance cold — do not re-explain it, and do not ask them to confirm they did it.\n- NEVER ask \"have you applied it?\" / \"did you apply the change?\" — call `changes` with action 'list' and read whether it is `pending` or `applied`. If the user asked for it to be applied, call `changes` with action 'apply' directly; don't ask permission for the thing they just told you to do.\n- NEVER ask \"did you restart?\" / \"is the engine back up yet?\". You CANNOT restart the engine yourself — only the user can trigger the rebuild/restart, and Lucidos shows them the restart toast. So for a change that touches Rust/backend files (`requires_restart: true`): (a) apply it, (b) state plainly that a restart is required and that the USER must trigger it (don't promise the change is live immediately), then (c) VERIFY whether the new build is live by probing the served asset or behavior YOURSELF — e.g. `curl` the served file — rather than asking. If the probe still shows the old output, say so factually (\"the engine is still serving the pre-restart build\") instead of asking \"did you restart?\".\n- PROBE SERVED ASSETS UNDER THE WORKSPACE-PREFIXED ROUTE: bundled SDK / static assets are served under the workspace route, e.g. `https://<host>/<workspace>/api/v1/sdk-iframe.css` — NOT a bare `/api/v1/...` path. A bare path makes the gateway resolve the first segment (`api`) as a workspace name and 404 with \"unknown workspace 'api'\".\n- NEVER end an apply/restart loop with a confirmation question like \"does it look right now?\" or \"does it match?\". State what you verified, objectively. Reserve `ask_user_question` for a genuine decision the user has to make — not to confirm a step you could check yourself.";
+/// static assets live under the workspace-prefixed route.
+///
+/// **Install-independent half.** Everything here holds wherever *changes*
+/// exist — which includes an install with no Lucidos source checkout, since
+/// app coding-agent threads still propose changes the user Applies. The
+/// dev-only half (the "works on Lucidos constantly" framing and the
+/// Rust-change rebuild/restart choreography) lives in
+/// [`APPLY_VERIFY_DEV_ADDENDUM`] and is spliced only when a source checkout
+/// exists — a packaged install never rebuilds the engine, and an app change
+/// never restarts it, so promising that dance there is simply wrong.
+pub(super) const APPLY_VERIFY_RULE: &str = "APPLYING & VERIFYING CHANGES — ACT AND VERIFY, DON'T ASK:\nYou have the `changes` tool (action 'list' / 'apply') — you can inspect and apply *changes* (coding-agent-proposed branches awaiting Apply) yourself, so NEVER bounce a yes/no question back to the user about state you can check.\n- NEVER ask \"have you applied it?\" / \"did you apply the change?\" — call `changes` with action 'list' and read whether it is `pending` or `applied`. If the user asked for it to be applied, call `changes` with action 'apply' directly; don't ask permission for the thing they just told you to do.\n- PROBE SERVED ASSETS UNDER THE WORKSPACE-PREFIXED ROUTE: bundled SDK / static assets are served under the workspace route, e.g. `https://<host>/<workspace>/api/v1/sdk-iframe.css` — NOT a bare `/api/v1/...` path. A bare path makes the gateway resolve the first segment (`api`) as a workspace name and 404 with \"unknown workspace 'api'\".\n- NEVER end an apply/restart loop with a confirmation question like \"does it look right now?\" or \"does it match?\". State what you verified, objectively. Reserve `ask_user_question` for a genuine decision the user has to make — not to confirm a step you could check yourself.";
+
+/// The half of the apply/verify rule that is only true on an install launched
+/// from a Lucidos source checkout: the engine rebuild+restart choreography for
+/// a Rust change, and the "this user does this daily" framing.
+///
+/// Spliced by `build_chat_system_prompt` only when
+/// [`crate::paths::has_lucidos_source`] is true. On a packaged install there is
+/// no engine rebuild at all (updates ship through the app updater) and app
+/// changes never restart the engine, so an agent reciting this would be
+/// instructing the user through a flow that does not exist — which is precisely
+/// what happened in the reported failure.
+pub(super) const APPLY_VERIFY_DEV_ADDENDUM: &str = "\n- The user works on Lucidos constantly and knows the apply/restart/reload dance cold — do not re-explain it, and do not ask them to confirm they did it.\n- NEVER ask \"did you restart?\" / \"is the engine back up yet?\". You CANNOT restart the engine yourself — only the user can trigger the rebuild/restart, and Lucidos shows them the restart toast. So for a change that touches Rust/backend files (`requires_restart: true`): (a) apply it, (b) state plainly that a restart is required and that the USER must trigger it (don't promise the change is live immediately), then (c) VERIFY whether the new build is live by probing the served asset or behavior YOURSELF — e.g. `curl` the served file — rather than asking. If the probe still shows the old output, say so factually (\"the engine is still serving the pre-restart build\") instead of asking \"did you restart?\".";
 
 /// Build the TriggerStarted thread-event + meta for a scheduler-fired trigger
 /// run. Extracted as a pure function so the wiring rule "the `config.id`
