@@ -61,6 +61,14 @@ impl CodingAgentKind {
 /// `Display` impl rendered.
 pub type FolderResolutionError = Box<dyn std::error::Error + Send + Sync>;
 
+// Every path in the err_* messages below is rendered with
+// `core::home_path::abbreviate`. They are returned verbatim to the chat model
+// (`agentic_loop_special_tool` formats the error straight into the
+// `run_coding_agent` tool result), and a home dir named
+// `<username>@<employer-domain>` would ship to the provider on every failed
+// resolve. `~/…` still tells the agent exactly which folder it named, and
+// `resolve_folder_input` expands `~` on the way back in.
+
 fn err_not_found(path: &str) -> FolderResolutionError {
     format!(
         "Folder does not exist: {path}. \
@@ -76,7 +84,7 @@ fn err_inside_lucidos_state(path: &Path) -> FolderResolutionError {
         "Folder `{}` is inside the engine's `.lucidos/` state directory \
          and cannot be edited by a coding-agent thread. Pick a real source \
          folder.",
-        path.display()
+        crate::core::home_path::abbreviate(path)
     )
     .into()
 }
@@ -84,7 +92,7 @@ fn err_inside_lucidos_state(path: &Path) -> FolderResolutionError {
 fn err_forbidden_system_path(path: &Path) -> FolderResolutionError {
     format!(
         "Folder `{}` is a system path and cannot be edited by a coding-agent thread.",
-        path.display()
+        crate::core::home_path::abbreviate(path)
     )
     .into()
 }
@@ -96,8 +104,8 @@ fn err_non_app_data_path(path: &Path, workspace_root: &Path) -> FolderResolution
          only supported for whole app folders. For knowhow / triggers / \
          artifacts / config / scripts, use the chat path: file tools + the \
          `lucidos` CLI.",
-        path.display(),
-        workspace_root.display()
+        crate::core::home_path::abbreviate(path),
+        crate::core::home_path::abbreviate(workspace_root)
     )
     .into()
 }
@@ -110,8 +118,8 @@ fn err_unrecognised_path(path: &Path, workspace_root: &Path) -> FolderResolution
          supported in v1. Register the repo with \
          `manage_repositories action='add'` if it's a git repo, otherwise \
          use the chat path.",
-        path.display(),
-        workspace_root.display()
+        crate::core::home_path::abbreviate(path),
+        crate::core::home_path::abbreviate(workspace_root)
     )
     .into()
 }
@@ -183,6 +191,13 @@ where
     if trimmed.is_empty() {
         return Err(err_not_found(trimmed));
     }
+    // `~/…` → absolute, before anything classifies it. LLM-visible listings
+    // (`manage_repositories` action=list) render repo paths abbreviated so the
+    // home dir's name never reaches the model provider, so the model naturally
+    // echoes the `~` form back here. `looks_like_repo_name` already rejects
+    // `~`, and expansion is a no-op for every other shape.
+    let expanded = crate::core::home_path::expand(trimmed);
+    let trimmed = expanded.as_str();
     let candidate: PathBuf = if trimmed.starts_with('/') {
         PathBuf::from(trimmed)
     } else if looks_like_repo_name(trimmed) {
@@ -198,7 +213,8 @@ where
         .unwrap_or_else(|_| candidate.clone());
 
     if !canonical.exists() {
-        return Err(err_not_found(&candidate.to_string_lossy()));
+        let shown = crate::core::home_path::abbreviate(&candidate);
+        return Err(err_not_found(&shown));
     }
     Ok(canonical)
 }
@@ -341,6 +357,40 @@ impl std::fmt::Debug for FolderClassification {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `manage_repositories` action=`list` renders repo paths as `~/…` so the
+    /// home dir's name (on an MDM fleet: `<username>@<employer-domain>`) never
+    /// reaches the model provider. That only works if the abbreviated form the
+    /// model echoes back as `folder` still resolves — otherwise the privacy fix
+    /// would break `run_coding_agent` against every registered repo.
+    #[test]
+    fn resolve_folder_input_expands_a_tilde_path() {
+        let home = std::env::var("HOME").expect("HOME must be set to run this test");
+        let expected = std::fs::canonicalize(&home).expect("home dir must exist");
+        let workspace_root = Path::new("/nonexistent-workspace-root");
+
+        let resolved = resolve_folder_input("~", workspace_root, |_| Ok(None))
+            .expect("`~` must resolve to the home dir");
+        assert_eq!(resolved, expected);
+
+        // Trailing-segment form goes through the same expansion — `~/.` is the
+        // home dir again, and is guaranteed to exist on any machine.
+        let resolved = resolve_folder_input("~/.", workspace_root, |_| Ok(None))
+            .expect("`~/.` must resolve to the home dir");
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn resolve_folder_input_still_rejects_a_missing_tilde_path() {
+        // Expansion must not turn a bogus path into a silent workspace-relative
+        // join — a `~/…` that doesn't exist is still "not found".
+        let err = resolve_folder_input(
+            "~/definitely-not-a-real-directory-9f3a2b",
+            Path::new("/nonexistent-workspace-root"),
+            |_| Ok(None),
+        );
+        assert!(err.is_err());
+    }
 
     #[test]
     fn coding_agent_kind_round_trips_str() {

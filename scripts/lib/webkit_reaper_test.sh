@@ -70,8 +70,8 @@ is_dead() {
 }
 
 assert_dead() {
-    local pid="$1" label="$2" i
-    for i in 1 2 3 4 5 6 7 8 9 10; do
+    local pid="$1" label="$2"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
         is_dead "$pid" && break
         sleep 0.1
     done
@@ -205,11 +205,11 @@ test_interval_validation() {
     echo "test: _reaper_interval_s rejects non-numeric / zero, keeps valid"
     local got
     got=$(E2E_WEBKIT_REAP_INTERVAL_S=5s _reaper_interval_s)
-    [ "$got" = "5" ] && pass "non-numeric '5s' → default 5" || fail "got '$got' (expected 5)"
+    if [ "$got" = "5" ]; then pass "non-numeric '5s' → default 5"; else fail "got '$got' (expected 5)"; fi
     got=$(E2E_WEBKIT_REAP_INTERVAL_S=0 _reaper_interval_s)
-    [ "$got" = "5" ] && pass "zero → default 5 (no busy-loop)" || fail "got '$got' (expected 5)"
+    if [ "$got" = "5" ]; then pass "zero → default 5 (no busy-loop)"; else fail "got '$got' (expected 5)"; fi
     got=$(E2E_WEBKIT_REAP_INTERVAL_S=3 _reaper_interval_s)
-    [ "$got" = "3" ] && pass "valid '3' kept" || fail "got '$got' (expected 3)"
+    if [ "$got" = "3" ]; then pass "valid '3' kept"; else fail "got '$got' (expected 3)"; fi
 }
 
 # ── Test 5: default match resolution ───────────────────────────────────
@@ -217,14 +217,18 @@ test_default_match() {
     echo "test: _reaper_match default + PLAYWRIGHT_BROWSERS_PATH override"
     local got
     got=$(unset E2E_WEBKIT_REAP_MATCH PLAYWRIGHT_BROWSERS_PATH; _reaper_match)
-    [ "$got" = "ms-playwright/webkit" ] \
-        && pass "default match = $got" \
-        || fail "expected 'ms-playwright/webkit', got '$got'"
+    if [ "$got" = "ms-playwright/webkit" ]; then
+        pass "default match = $got"
+    else
+        fail "expected 'ms-playwright/webkit', got '$got'"
+    fi
 
     got=$(unset E2E_WEBKIT_REAP_MATCH; PLAYWRIGHT_BROWSERS_PATH=/opt/pw _reaper_match)
-    [ "$got" = "/opt/pw/webkit" ] \
-        && pass "PLAYWRIGHT_BROWSERS_PATH override = $got" \
-        || fail "expected '/opt/pw/webkit', got '$got'"
+    if [ "$got" = "/opt/pw/webkit" ]; then
+        pass "PLAYWRIGHT_BROWSERS_PATH override = $got"
+    else
+        fail "expected '/opt/pw/webkit', got '$got'"
+    fi
 }
 
 # ── Test 6: start/stop lifecycle leaves no loop behind ─────────────────
@@ -242,9 +246,11 @@ test_start_stop_lifecycle() {
         fail "reaper loop did not start"
     fi
 
-    [ -f "$E2E_WEBKIT_REAPER_PIDFILE" ] \
-        && pass "pidfile written" \
-        || fail "pidfile not written"
+    if [ -f "$E2E_WEBKIT_REAPER_PIDFILE" ]; then
+        pass "pidfile written"
+    else
+        fail "pidfile not written"
+    fi
 
     local loop_pid="${WEBKIT_REAPER_PID:-}"
     stop_webkit_reaper >/dev/null 2>&1
@@ -255,9 +261,11 @@ test_start_stop_lifecycle() {
         pass "reaper loop stopped"
     fi
 
-    [ -f "$E2E_WEBKIT_REAPER_PIDFILE" ] \
-        && fail "pidfile not removed on stop" \
-        || pass "pidfile removed on stop"
+    if [ -f "$E2E_WEBKIT_REAPER_PIDFILE" ]; then
+        fail "pidfile not removed on stop"
+    else
+        pass "pidfile removed on stop"
+    fi
 
     # Idempotent: a second stop with nothing running must succeed quietly.
     if stop_webkit_reaper >/dev/null 2>&1; then

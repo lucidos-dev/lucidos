@@ -202,7 +202,7 @@ pub(super) async fn claude_code_commands(
         let has_active_session = match tid {
             Some(tid) => {
                 let guard = state.engine.agent_sessions.lock().await;
-                guard.get(&tid).is_some_and(|s| !s.process_exited)
+                guard.get(&tid).is_some_and(|s| s.is_live())
             }
             None => false,
         };

@@ -101,6 +101,97 @@ fn agent_message_deltas_stream_and_completed_emits_only_remainder() {
     );
 }
 
+// The plan tool (codex's TodoWrite analog) arrives as `turn/plan/updated`
+// with `{plan: [{step, status}]}` — verified live against codex-cli 0.142.5.
+// It maps to the exec protocol's `todo_list` shape (`{items: [{text,
+// completed}]}`) as a synthesized ToolUse/ToolResult pair per *distinct*
+// list, so plan progress renders on the default protocol too.
+#[test]
+fn plan_update_emits_normalized_todo_list_pair() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn();
+    let evs = note(
+        &mut t,
+        "turn/plan/updated",
+        serde_json::json!({
+            "threadId": "t", "turnId": "u", "explanation": null,
+            "plan": [
+                {"step": "Map the code", "status": "completed"},
+                {"step": "Fix the bug", "status": "inProgress"},
+                {"step": "Run tests", "status": "pending"},
+            ],
+        }),
+    );
+    match &evs[..] {
+        [
+            AgentEvent::ToolUse { name, input, id },
+            AgentEvent::ToolResult {
+                status,
+                id: result_id,
+                ..
+            },
+        ] => {
+            assert_eq!(name, "todo_list");
+            assert_eq!(id, result_id, "pair must share an id");
+            assert_eq!(status, "success");
+            assert_eq!(
+                input,
+                &serde_json::json!({"items": [
+                    {"text": "Map the code", "completed": true},
+                    {"text": "Fix the bug", "completed": false},
+                    {"text": "Run tests", "completed": false},
+                ]}),
+                "plan steps normalize to the exec todo_list shape"
+            );
+        }
+        other => panic!("expected a ToolUse/ToolResult pair, got {other:?}"),
+    }
+}
+
+#[test]
+fn plan_update_dedupes_identical_snapshots_across_turns() {
+    let plan = serde_json::json!({
+        "threadId": "t", "turnId": "u",
+        "plan": [{"step": "a", "status": "inProgress"}],
+    });
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn();
+    assert_eq!(note(&mut t, "turn/plan/updated", plan.clone()).len(), 2);
+    // Identical snapshot — nothing new to show.
+    assert!(note(&mut t, "turn/plan/updated", plan.clone()).is_empty());
+    // The plan persists across turns: a new turn re-announcing the unchanged
+    // list must not re-emit a card (dedup state survives begin_turn).
+    t.begin_turn();
+    assert!(note(&mut t, "turn/plan/updated", plan).is_empty());
+    // A changed snapshot emits a fresh pair with a distinct id.
+    let evs = note(
+        &mut t,
+        "turn/plan/updated",
+        serde_json::json!({
+            "threadId": "t", "turnId": "u",
+            "plan": [{"step": "a", "status": "completed"}],
+        }),
+    );
+    assert_eq!(evs.len(), 2);
+    let (first_id, second_id) = (
+        match &evs[0] {
+            AgentEvent::ToolUse { id, .. } => id.clone(),
+            other => panic!("expected ToolUse, got {other:?}"),
+        },
+        "plan_1".to_string(),
+    );
+    assert_ne!(first_id, second_id, "each emission gets a unique id");
+    // An empty or missing plan emits nothing.
+    assert!(
+        note(
+            &mut t,
+            "turn/plan/updated",
+            serde_json::json!({"threadId": "t", "turnId": "u", "plan": []}),
+        )
+        .is_empty()
+    );
+}
+
 // Reasoning deltas (raw `textDelta` and summary `summaryTextDelta`) surface as
 // Thoughts so the timeline can render a live "Thinking" step; an empty delta
 // emits nothing.

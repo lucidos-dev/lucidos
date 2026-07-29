@@ -75,6 +75,38 @@ LEFT JOIN LATERAL (
 ) start_evt ON true
 "#;
 
+/// [`ORPHAN_THREADS_SQL`] plus the shared **preserve guard**: a thread parked on
+/// an unanswered `AskUserQuestion` is a stable, resumable checkpoint, never an
+/// interrupted turn — so it must NEVER be swept into a `ResponseAborted`. This
+/// closes the reproduced gap where a coding-agent thread that
+/// `recover_orphaned_worktrees` deliberately preserved (and therefore did NOT
+/// add to `exclude_thread_ids`) was re-aborted here as "System — Response
+/// interrupted", and the equivalent chat case (this sweep is the ONLY restart
+/// abort path a question-parked chat thread hits). Same `unanswered_question_exists_sql`
+/// fragment every other abort path uses, so the guard cannot drift.
+fn orphan_threads_sql() -> String {
+    format!(
+        "{ORPHAN_THREADS_SQL}\nWHERE NOT {}",
+        crate::engine::agent_recovery::unanswered_question_exists_sql("o.thread_id::text")
+    )
+}
+
+/// [`ORPHAN_TOOL_CALLS_SQL`] plus the shared preserve guard, injected before the
+/// `ORDER BY`. A question-parked chat thread has a dangling
+/// `ToolCalled{ask_user_question}` (the loop emits it before blocking in
+/// `walk_question_batch`); without this guard the sweep would synthesize a
+/// "[Tool execution interrupted…]" `ToolResult` for it, poisoning the pending
+/// question's tool-use pair so the resumed turn reads the answer as an error.
+fn orphan_tool_calls_sql() -> String {
+    ORPHAN_TOOL_CALLS_SQL.replace(
+        "ORDER BY e.thread_id",
+        &format!(
+            "AND NOT {} ORDER BY e.thread_id",
+            crate::engine::agent_recovery::unanswered_question_exists_sql("e.thread_id::text")
+        ),
+    )
+}
+
 /// SQL the orphan-recovery sweep runs to fetch the `(ToolCalled, ToolResult)`
 /// pairs it pairs into orphans. Extracted from `recover_orphan_tool_calls`
 /// for the same testability reason as `ORPHAN_THREADS_SQL`.
@@ -136,7 +168,7 @@ impl LucidosEngine {
         // The thread sits in `requesting` forever with no Continue path.
         // SQL is in the `ORPHAN_THREADS_SQL` const at module top so the
         // sibling test in `recovery_tests` can run the exact same query.
-        let rows: Vec<OrphanRow> = match sqlx::query_as(ORPHAN_THREADS_SQL)
+        let rows: Vec<OrphanRow> = match sqlx::query_as(&orphan_threads_sql())
             .bind(exclude_thread_ids)
             .fetch_all(self.pool())
             .await
@@ -216,6 +248,146 @@ impl LucidosEngine {
     }
 }
 
+/// Blast-radius bound on the boot auto-resume. A switch normally interrupts one
+/// or two in-flight chat threads; this only bites on a pathological workspace.
+/// Anything over the cap is logged by thread id and keeps its manual Continue —
+/// a silent truncation would read as "resumed everything".
+const MAX_CHAT_SWITCH_RESUMES: usize = 16;
+
+/// The chat / trigger threads a user-initiated *Switch to new version* interrupted
+/// and that nothing has resumed since.
+///
+/// Coding agents get this via `recover_orphaned_worktrees` → `enqueue_switch_resume`;
+/// this is the chat half. It cannot reuse `recover_orphaned_threads`: that sweep
+/// requires a turn with activity and **no** terminal event (the crash shape), whereas
+/// the switch teardown (`abort_in_flight_for_restart`) always lands a
+/// `ResponseAborted` first — so a switch-interrupted chat thread is invisible to it.
+///
+/// The predicate is the same one the coding-agent gate uses, assembled from the
+/// shared fragments in `agent_recovery::recovery` so the two can't drift:
+///
+/// * `SWITCH_TEARDOWN_ABORT_SQL` — a device-attributed `EngineShutdown` abort, the
+///   teardown boundary's fingerprint. A crash leaves none → manual Continue.
+/// * no newer `THREAD_START_EVENTS_SQL` event — the loop-breaker. `continue_chat`
+///   emits `ContinuationStarted`, which is in that set, so a resume that dies before
+///   producing anything else is not resumed a second time on the next boot.
+///
+/// A question-parked thread needs no special case: the preserve guard means no abort
+/// was ever emitted for it, so it cannot match.
+///
+/// Selection is by `source`, deliberately NOT by `is_coding_agent` — that column is
+/// separately known to be corruptible (a chat thread's `ContinuationStarted` used to
+/// flip it true), and this gate must not inherit that bug. Archived threads are
+/// excluded for the same reason `ORPHAN_THREADS_SQL` excludes them: the user closed
+/// them, and resuming would revive the row.
+fn switch_resume_candidates_sql() -> String {
+    // GROUP BY (not DISTINCT) so the result is one row per THREAD. A thread with
+    // two unsuperseded switch aborts would otherwise yield two rows and drive
+    // `continue_chat` twice — harmless (the second is a no-op via that function's
+    // own idempotency check) but a duplicate-work path the query should not
+    // express. Oldest interruption first, so a boot resumes in the order the
+    // threads were interrupted.
+    format!(
+        "SELECT e.aggregate_id::uuid AS thread_id, MAX(e.sequence) AS abort_sequence \
+         FROM events e \
+         JOIN thread_summaries t ON t.thread_id = e.aggregate_id::uuid \
+         WHERE e.aggregate = 'thread' \
+           AND t.source IN ('chat', 'trigger') \
+           AND t.state = 'active' \
+           AND t.archive_state != 'archived' \
+           AND {abort} \
+           AND e.sequence > COALESCE(( \
+               SELECT MAX(s.sequence) FROM events s \
+               WHERE s.aggregate_id = e.aggregate_id \
+                 AND s.event_type IN ({starts}) \
+           ), 0) \
+         GROUP BY e.aggregate_id \
+         ORDER BY abort_sequence ASC",
+        abort = crate::engine::agent_recovery::SWITCH_TEARDOWN_ABORT_SQL,
+        starts = crate::engine::agent_recovery::THREAD_START_EVENTS_SQL,
+    )
+}
+
+/// Run [`switch_resume_candidates_sql`]. Errors yield an empty list (logged): a
+/// transient DB failure must degrade to the manual Continue affordance, never to a
+/// panic on the boot path.
+pub(crate) async fn switch_resume_candidates(pool: &sqlx::PgPool) -> Vec<uuid::Uuid> {
+    match sqlx::query_as::<_, (uuid::Uuid, i64)>(&switch_resume_candidates_sql())
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => rows.into_iter().map(|(id, _)| id).collect(),
+        Err(e) => {
+            log!(
+                "[Recovery] chat switch-resume candidate scan failed: {} — \
+                 affected threads keep their manual Continue",
+                e
+            );
+            Vec::new()
+        }
+    }
+}
+
+impl LucidosEngine {
+    /// Auto-resume the chat / trigger threads a user-initiated *Switch to new
+    /// version* interrupted — the chat parity of `resume_pending_switches`.
+    ///
+    /// Drives each candidate through `continue_chat`, the same entry point the
+    /// manual **Continue** button uses, so the resumed turn gets the identical
+    /// `ContinuationStarted` boundary and side-effect engine note. `actor: None`
+    /// matches the coding-agent path's choice: the resume is a recovery
+    /// consequence, not a device click, so the boundary keeps the Lucidos-mark
+    /// chip rather than reading "You".
+    ///
+    /// Sequential on purpose — each resume spawns an agentic loop, and a boot-time
+    /// fan-out of LLM calls is worth avoiding. `continue_chat` itself returns after
+    /// spawning, so this does not wait for the turns to finish.
+    ///
+    /// Called from `main.rs` AFTER `thread_queue.spawn_settle_subscriber()`: a
+    /// resumed chat turn immediately reads as `running`, and the settle subscriber
+    /// must be live for that status change to reconcile a queue slot. It also must
+    /// follow `recover_orphan_tool_calls`, or the re-entered turn reconstructs an
+    /// unpaired `tool_use` block and the provider rejects the call.
+    pub async fn resume_pending_chat_switches(self: &Arc<Self>) {
+        let mut candidates = switch_resume_candidates(self.pool()).await;
+        if candidates.is_empty() {
+            return;
+        }
+
+        if candidates.len() > MAX_CHAT_SWITCH_RESUMES {
+            let skipped = candidates.split_off(MAX_CHAT_SWITCH_RESUMES);
+            log!(
+                "[Recovery] {} chat thread(s) interrupted by the switch exceed the \
+                 per-boot resume cap of {} — these keep their manual Continue: {:?}",
+                skipped.len(),
+                MAX_CHAT_SWITCH_RESUMES,
+                skipped
+            );
+        }
+
+        log!(
+            "[Recovery] Auto-resuming {} chat/trigger thread(s) after a user switch",
+            candidates.len()
+        );
+
+        for thread_id in candidates {
+            match self.continue_chat(thread_id, None).await {
+                Ok(outcome) => log!(
+                    "[Recovery] chat switch-resume for thread {}: {:?}",
+                    thread_id,
+                    outcome
+                ),
+                Err(e) => log!(
+                    "[Recovery] chat switch-resume for thread {} failed: {} — \
+                     the manual Continue affordance remains",
+                    thread_id,
+                    e
+                ),
+            }
+        }
+    }
+}
+
 impl LucidosEngine {
     /// Re-emit a synthetic `ToolResult` for every persisted `ToolCalled` that
     /// has no matching `ToolResult` in the same thread. Mirror of the
@@ -243,7 +415,7 @@ impl LucidosEngine {
         // SQL is in the `ORPHAN_TOOL_CALLS_SQL` const at module top so
         // the sibling test in `recovery_tests` can run the exact same
         // query.
-        let rows: Vec<EventRow> = match sqlx::query_as::<_, EventRow>(ORPHAN_TOOL_CALLS_SQL)
+        let rows: Vec<EventRow> = match sqlx::query_as::<_, EventRow>(&orphan_tool_calls_sql())
             .fetch_all(self.pool())
             .await
         {

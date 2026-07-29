@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn ensure_non_empty_error_keeps_reason_verbatim() {
-        let reason = "Shell script error (exit 1):\nboom";
+        let reason = "Shell script error (exit code 1):\nboom";
         assert_eq!(ensure_non_empty_error(reason, "T"), reason);
     }
 

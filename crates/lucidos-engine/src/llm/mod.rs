@@ -13,6 +13,7 @@ pub mod tools;
 pub mod unconfigured;
 pub mod validate;
 pub mod vertex;
+pub mod web_search;
 
 pub use anthropic::{AnthropicAuth, AnthropicProvider};
 pub use image::{ImageProvider, ImageSize};
@@ -34,8 +35,19 @@ pub use tools::{
     get_save_thread_image_tool, get_view_image_tool,
 };
 pub use vertex::VertexProvider;
+pub use web_search::{WebSearchChain, WebSearchProvider, NO_SEARCH_BACKEND};
 
 use std::time::Duration;
+
+/// OpenRouter's OpenAI-compatible API root. Single home shared by the LLM
+/// provider (`provider_build`) and the builtin `openrouter` proxy
+/// (`api::proxy_builtin`).
+pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+/// Direct Anthropic API root (`{base}/messages`). Single home shared by the
+/// LLM provider (`anthropic::chat`) and the builtin `anthropic` proxy
+/// (`api::proxy_builtin`).
+pub const ANTHROPIC_API_BASE_URL: &str = "https://api.anthropic.com/v1";
 
 /// Max retry attempts for LLM API calls (shared across providers).
 pub const MAX_RETRIES: u32 = 3;

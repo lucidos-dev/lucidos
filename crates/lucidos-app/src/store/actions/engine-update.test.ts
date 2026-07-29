@@ -13,10 +13,10 @@ vi.mock('../../hooks/sw-update', () => ({
   markSwUpdateDismissed: vi.fn(),
 }));
 
-import { checkEngineVersion, handleFrontendUpdateDeferred, handleEngineBuildStateChanged, DEFERRED_HINT_STALE_AFTER_MS } from './engine-update';
+import { checkEngineVersion, handleFrontendUpdateDeferred, handleFrontendUpdateStranded, handleEngineBuildStateChanged, DEFERRED_HINT_STALE_AFTER_MS } from './engine-update';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
 import { noteSwitchBuildId, wasSwitchDismissed, markSwitchDismissed } from '../../hooks/sw-update';
-import { toasts, engineVersionReady, engineBuilding, engineRestarting, preferences, showToast, dismissToast, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
+import { toasts, engineVersionReady, engineBuilding, engineRestarting, preferences, showToast, dismissToast, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
 
 const mockStatus = vi.mocked(engineVersionStatus);
 const mockWasSwitchDismissed = vi.mocked(wasSwitchDismissed);
@@ -31,6 +31,7 @@ function status(over: Partial<{
   packaged: boolean;
   build_state: 'idle' | 'building' | 'ready' | 'failed';
   source_behind_head: boolean;
+  shared_build_in_progress: boolean;
 }> = {}) {
   return {
     build_id: 'eng123',
@@ -39,6 +40,7 @@ function status(over: Partial<{
     packaged: false,
     build_state: 'idle' as const,
     source_behind_head: false,
+    shared_build_in_progress: false,
     ...over,
   };
 }
@@ -184,6 +186,34 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     expect(engineVersionReady.value).toBe(false);
   });
 
+  it('announces nothing for a finished rebuild that produced no newer binary (no phantom Switch)', async () => {
+    // The 2026-07-26 loop: the ~10s self-heal driver cycles build_state
+    // idle → building → ready, and a `ready` that changed nothing used to be
+    // announced as a new version on its own — re-showing the toast every cycle
+    // and offering a Switch that respawns onto the same binary. `ready` now
+    // requires update_available (which the engine derives direction-honestly).
+    mockStatus.mockResolvedValue(status({ update_available: false, build_state: 'ready' }));
+    await checkEngineVersion();
+    expect(hasSwitchToast()).toBe(false);
+    expect(engineVersionReady.value).toBe(false);
+  });
+
+  it('keeps the Rebuild escape hatch when a finished rebuild left the version still pending', async () => {
+    // Same wedge, but source IS behind: silence would hide a real pending
+    // version AND its manual escape, so the pending branch admits 'ready'
+    // (only 'building' suppresses it). INV-5b.
+    mockStatus.mockResolvedValue(status({
+      source_behind_head: true,
+      update_available: false,
+      build_state: 'ready',
+      shared_build_in_progress: false,
+    }));
+    await checkEngineVersion();
+    const toast = toasts.value.find((t) => t.key === 'engine-new-version');
+    expect(toast?.action?.label).toBe('Rebuild');
+    expect(engineVersionReady.value).toBe(false);
+  });
+
   it('surfaces a pending-version toast with a Rebuild action when source is behind but no fresh binary exists', async () => {
     // The wedge: engine source is behind HEAD (a new version exists) but the
     // on-disk binary hasn't advanced (rebuild failed / not run). The Switch isn't
@@ -221,6 +251,39 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     await checkEngineVersion();
     expect(hasSwitchToast()).toBe(false);
     expect(engineBuilding.value).toBe(true);
+  });
+
+  it('shows the building spinner (not a Rebuild toast) when a co-located peer is building the shared binary', async () => {
+    // Multi-workspace: this workspace lost the shared build lock so its own
+    // rebuild SkippedLocked → build_state fell back to 'idle', but a peer's build
+    // IS in flight and will advance the shared binary. Show the spinner, withhold
+    // the misleading manual "Rebuild".
+    mockStatus.mockResolvedValue(status({
+      source_behind_head: true,
+      update_available: false,
+      build_state: 'idle',
+      shared_build_in_progress: true,
+    }));
+    await checkEngineVersion();
+    expect(hasSwitchToast()).toBe(false);
+    expect(engineBuilding.value).toBe(true);
+    expect(engineVersionReady.value).toBe(false);
+  });
+
+  it('still shows the Rebuild toast (no spinner) when genuinely stuck — nothing is building', async () => {
+    // The complement of the peer-building case: source behind, no fresh binary,
+    // and NO build in flight (shared lock free) → genuinely stuck, so the manual
+    // Rebuild escape hatch must still appear and the spinner must stay off.
+    mockStatus.mockResolvedValue(status({
+      source_behind_head: true,
+      update_available: false,
+      build_state: 'idle',
+      shared_build_in_progress: false,
+    }));
+    await checkEngineVersion();
+    const toast = toasts.value.find((t) => t.key === 'engine-new-version');
+    expect(toast?.action?.label).toBe('Rebuild');
+    expect(engineBuilding.value).toBe(false);
   });
 
   it('a failed rebuild offers a Retry action (not a dead-end)', async () => {
@@ -322,5 +385,101 @@ describe('handleEngineBuildStateChanged — SSE poke re-runs the authoritative c
     await Promise.resolve();
     expect(engineBuilding.value).toBe(false);
     expect(engineVersionReady.value).toBe(true);
+  });
+});
+
+describe('handleFrontendUpdateStranded — the change is NOT coming', () => {
+  const WORKTREE = '/w/dev/.lucidos/worktrees/thread-abc/crates/lucidos-app/dist';
+
+  function strandedToasts() {
+    return toasts.value.filter((t) => t.key === FRONTEND_UPDATE_STRANDED_TOAST_KEY);
+  }
+
+  beforeEach(() => {
+    toasts.value = [];
+  });
+
+  it('warns (not info) — a silently-absent applied change is a broken state, not a queued one', () => {
+    handleFrontendUpdateStranded({
+      served_dir: WORKTREE, served_in_worktree: true, sent_at_ms: Date.now(),
+    });
+    const shown = strandedToasts();
+    expect(shown).toHaveLength(1);
+    expect(shown[0].type).toBe('warning');
+    expect(shown[0].noAutofocus).toBe(true);
+  });
+
+  it('never claims the change arrives on Switch — that is the deferred hint, and here it would be false', () => {
+    handleFrontendUpdateStranded({
+      served_dir: WORKTREE, served_in_worktree: true, sent_at_ms: Date.now(),
+    });
+    expect(strandedToasts()[0].message).not.toMatch(/switch/i);
+  });
+
+  it('uses its own key so it cannot coalesce with the deferred hint', () => {
+    handleFrontendUpdateDeferred({ sent_at_ms: Date.now() });
+    handleFrontendUpdateStranded({
+      served_dir: WORKTREE, served_in_worktree: true, sent_at_ms: Date.now(),
+    });
+    expect(toasts.value.filter((t) => t.key === FRONTEND_UPDATE_DEFERRED_TOAST_KEY)).toHaveLength(1);
+    expect(strandedToasts()).toHaveLength(1);
+  });
+
+  it('names the served path and, for a worktree, the corrective action', () => {
+    handleFrontendUpdateStranded({
+      served_dir: WORKTREE, served_in_worktree: true, sent_at_ms: Date.now(),
+    });
+    const msg = strandedToasts()[0].message;
+    expect(msg).toContain(WORKTREE);
+    expect(msg).toMatch(/real checkout/i);
+  });
+
+  it('points at the build-watch instead when the cause is not a worktree', () => {
+    handleFrontendUpdateStranded({
+      served_dir: '/Users/me/projects/lucidos/crates/lucidos-app/dist',
+      served_in_worktree: false,
+      sent_at_ms: Date.now(),
+    });
+    const msg = strandedToasts()[0].message;
+    expect(msg).toMatch(/build-watch/i);
+    expect(msg).not.toMatch(/worktree/i);
+  });
+
+  it('only claims permanence for the worktree case — a slow build is recoverable', () => {
+    // A build slower than the engine's wait, or a briefly-stopped watch, still
+    // lands and the ~10s peer sync advances the snapshot on its own. Telling the
+    // user their change will not appear would be false there.
+    handleFrontendUpdateStranded({
+      served_dir: '/Users/me/projects/lucidos/crates/lucidos-app/dist',
+      served_in_worktree: false,
+      sent_at_ms: Date.now(),
+    });
+    const recoverable = strandedToasts()[0].message;
+    expect(recoverable).not.toMatch(/will not appear|never/i);
+    expect(recoverable).toMatch(/yet|on its own/i);
+
+    toasts.value = [];
+    handleFrontendUpdateStranded({
+      served_dir: WORKTREE, served_in_worktree: true, sent_at_ms: Date.now(),
+    });
+    // The worktree case genuinely cannot self-heal, so it must say so.
+    expect(strandedToasts()[0].message).toMatch(/will not appear/i);
+  });
+
+  it('drops a stale event — the stack may already have been fixed', () => {
+    handleFrontendUpdateStranded({
+      served_dir: WORKTREE,
+      served_in_worktree: true,
+      sent_at_ms: Date.now() - DEFERRED_HINT_STALE_AFTER_MS - 1,
+    });
+    expect(strandedToasts()).toHaveLength(0);
+  });
+
+  it('the OK action dismisses it', () => {
+    handleFrontendUpdateStranded({
+      served_dir: WORKTREE, served_in_worktree: true, sent_at_ms: Date.now(),
+    });
+    strandedToasts()[0].action?.onClick();
+    expect(strandedToasts()).toHaveLength(0);
   });
 });

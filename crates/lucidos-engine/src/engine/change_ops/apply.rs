@@ -48,27 +48,30 @@ impl LucidosEngine {
     /// `actor` identifies who initiated the apply. HTTP callers construct via
     /// `api::actor::build_message_origin`; engine-internal callers pass `None`.
     ///
-    /// Thin wrapper over `apply_change_inner` that runs two apply-time follow-ups,
-    /// both gated on the change ACTUALLY merging (`ApplyStatus::Applied` — not
-    /// `Noop`/`Hardening`/`Conflict`, which also return `Ok`):
-    ///
-    /// 1. **Reconcile the "≤1 pending change per thread" invariant** — discard any
-    ///    other pending change the thread still holds on a stale branch, so a
-    ///    pre-existing orphan can't keep blocking Archive. Gating on `Applied` is
-    ///    load-bearing: reconciling on `Noop`/`Hardening`/`Conflict` would discard
-    ///    a *newer* sibling (data loss) or drop siblings before the merge lands.
-    ///    See docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md.
-    /// 2. **Kick off the background engine rebuild** (dev only) when the change is
-    ///    engine-affecting, so a "New version available → Switch to new version"
-    ///    surfaces WITHOUT disrupting the running engine — Apply itself never
-    ///    restarts; the switch is a separate, user-triggered step. No-op in
-    ///    packaged; a second Apply coalesces the in-flight build. See
-    ///    docs/plans/2026-07-01-new-engine-version-switch-flow.md.
+    /// Thin wrapper over `apply_change_inner` that runs the apply-time
+    /// **"≤1 pending change per thread" reconcile** — discard any other pending
+    /// change the thread still holds on a stale branch, so a pre-existing orphan
+    /// can't keep blocking Archive. Gated on the change ACTUALLY merging
+    /// (`ApplyStatus::Applied` — not `Noop`/`Hardening`/`Conflict`, which also
+    /// return `Ok`); that gate is load-bearing, since reconciling on
+    /// `Noop`/`Hardening`/`Conflict` would discard a *newer* sibling (data loss)
+    /// or drop siblings before the merge lands. See
+    /// docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md.
     ///
     /// This single point covers every `apply_change` caller (HTTP handler, the
     /// no-live `apply_now` fast/stale paths, the Apply-All driver, the
-    /// post-hardening auto-apply re-entry); the live in-place merge path bypasses
-    /// this and reconciles in `apply_now_success`.
+    /// post-hardening auto-apply re-entry) whose merge finishes *before* the
+    /// return. Two paths finish after it and reconcile themselves, for the same
+    /// reason: their result is `Conflict` at return time, so this gate can never
+    /// see the eventual `Applied`. The live in-place merge reconciles in
+    /// `apply_now_success`; the detached Tier-2 merge reconciles in its spawned
+    /// task, re-reading the change row and gating on `status == "applied"` so the
+    /// data-loss trap above still holds.
+    ///
+    /// The *other* apply-time follow-up — kicking the background engine rebuild
+    /// (or re-snapshotting the served `dist/`) — deliberately does NOT live here:
+    /// it hangs off `emit_change_applied`, the one emit every merge path performs
+    /// exactly once. See `change_ops_emitters::post_apply_dev_refresh`.
     pub async fn apply_change(
         self: &Arc<Self>,
         change_id: Uuid,
@@ -80,38 +83,14 @@ impl LucidosEngine {
                 self.discard_orphaned_pending_siblings(tid, change_id, actor)
                     .await;
             }
-            if result.restart_required {
-                self.trigger_background_rebuild();
-            } else if self.change_is_frontend_only_lucidos_source(change_id).await {
-                // Frontend-only Lucidos-source Apply (engine binary unchanged): the
-                // switch flow won't run, so re-snapshot the rebuilt dist/ in-process
-                // and advance what we serve — otherwise the boot-pinned snapshot
-                // never updates and the client refresh badge/toast never fire (dev).
-                // See docs/plans/2026-07-02-frontend-only-apply-served-in-dev.md.
-                self.refresh_served_frontend_after_rebuild();
-            }
         }
         Ok(result)
     }
 
-    /// Whether an applied change is a **frontend-only, Lucidos-source** change —
-    /// the case where the served `dist/` should advance in-process without a
-    /// respawn. Re-loads the change (Apply is not a hot path) to inspect its files
-    /// + kind; app / external-repo threads (`is_lucidos_source() == false`) and
-    /// non-frontend diffs return false. The caller already gated on
-    /// `!restart_required`, so this need only confirm the frontend + kind.
-    async fn change_is_frontend_only_lucidos_source(&self, change_id: Uuid) -> bool {
-        let Ok(Some(change)) = self.changes().get_by_id(change_id).await else {
-            return false;
-        };
-        let kind_ctx = load_apply_kind_context(&self.pool, change.thread_id).await;
-        kind_ctx.is_lucidos_source() && files_have_client_update(&change.files)
-    }
-
-    /// Inner apply implementation — see `apply_change` for the apply-time
-    /// follow-ups (orphan reconcile + background rebuild). `actor` identifies who
-    /// initiated the apply. HTTP callers construct via
-    /// `api::actor::build_message_origin`; engine-internal callers pass `None`.
+    /// Inner apply implementation — see `apply_change` for the apply-time orphan
+    /// reconcile. `actor` identifies who initiated the apply. HTTP callers
+    /// construct via `api::actor::build_message_origin`; engine-internal callers
+    /// pass `None`.
     async fn apply_change_inner(
         self: &Arc<Self>,
         change_id: Uuid,
@@ -711,9 +690,10 @@ impl LucidosEngine {
                         ));
                     }
                     Err(_) => {
-                        // ff failed — CC needs to merge main into the branch
+                        // ff failed — CC needs to merge main into the branch,
+                        // in a detached task (see the spawn below).
                         log!(
-                            "[Changes] Fast path failed for {} — resuming CC for merge",
+                            "[Changes] Fast path failed for {} — spawning a detached CC merge (Tier 2)",
                             change.branch_name
                         );
                     }
@@ -728,125 +708,186 @@ impl LucidosEngine {
                 // branch — grep for `pending_apply_actors.take`) stamps the
                 // resulting ChangeApplied / ChangeApplyFailed with the device
                 // that clicked Apply. Without this the cleanup falls through to
-                // None, which renders as "Lucidos Engine" in the chat chip.
-                // Mirrors the Tier-3 stash below — Tier 2 needs it too because
-                // the cleanup is the sole emitter for the merge outcome (this
-                // code path no longer re-emits after `run_merge_session_tier2`
-                // returns).
+                // None, which renders as "Lucidos Engine" in the chat chip. The
+                // stash is load-bearing precisely because the merge is detached:
+                // by the time it finishes, this scope is long gone. Mirrors the
+                // Tier-3 stash.
                 if let Some(a) = actor.as_ref() {
                     self.pending_apply_actors.stash(change_id, a.clone());
                 }
 
-                match CodingAgentChangeOps::run_merge_session_tier2(
-                    self.as_ref(),
-                    thread_id,
-                    change_id,
-                    &wt_path,
-                    &change.branch_name,
-                    &change.description,
-                    resume_token,
-                )
-                .await
-                {
-                    Ok(_) => {
-                        // The conflict-recovery cleanup in `run_session.rs`
-                        // (the `if let Some(change) = conflict_change` branch)
-                        // has already run `ff_merge_to_main` and emitted
-                        // ChangeApplied (or ChangeApplyFailed on a leftover
-                        // unmerged state). Do NOT re-check merge state and
-                        // re-emit here. The cleanup's ff_merge_to_main deletes
-                        // the branch, so a `merge-base --is-ancestor main
-                        // branch` check would falsely report "not merged" and
-                        // a re-emitted ChangeApplyFailed would lie about a
-                        // merge that actually succeeded ("Claude Code session
-                        // ended without completing the merge — try applying
-                        // again"). Re-read the change row to construct an
-                        // accurate ApplyResult for the HTTP caller; the
-                        // EventBus emit in the cleanup runs synchronously so
-                        // the projection reflects the new terminal state by
-                        // the time we're here.
-                        match self.changes().get_by_id(change_id).await {
-                            Ok(Some(c)) if c.status == "applied" => {
-                                // ChangeApplied + AppUiRefreshRequested +
-                                // entity events were already emitted by the
-                                // run_session.rs conflict-recovery cleanup
-                                // (see the long comment above). Don't
-                                // re-emit them here — duplicate iframe
-                                // reloads otherwise.
-                                self.broadcast_changes_updated().await;
-                                return Ok(ApplyResult::applied_with_merge(
+                // Detach. `run_merge_session_tier2` drives an entire
+                // coding-agent session, and awaiting it here would tie that
+                // session's lifetime to the caller's future — for the HTTP
+                // handlers that means an iOS PWA backgrounding itself kills a
+                // merge mid-conflict-resolution (2026-07-28, thread 293f96d5:
+                // the subprocess died 72 s in with `interruptedByShutdown`, and
+                // the entry it left behind wedged the thread). Every other
+                // CC-assisted merge path already spawns — Tier 1 via
+                // `spawn_in_place_conflict_recovery`, Tier 3 via
+                // `spawn_merge_session`; Tier 2 was the last inline one.
+                //
+                // Nothing is lost by returning early: the outcome was never
+                // carried by this return value. The conflict-recovery cleanup in
+                // `run_session.rs` owns the terminal (`ChangeApplied` /
+                // `ChangeApplyFailed`) and the post-await block here only ever
+                // re-read the change row to shape an `ApplyResult` for the
+                // caller. Callers cope with `Conflict` already: the frontend
+                // resolves its spinner on the events, and the Apply-All driver
+                // is fed by the same events.
+                // No apply-level liveness timeout here, unlike Tier 1's
+                // `spawn_in_place_conflict_recovery`. That one waits on
+                // `idle_notify` for a session it does not own, so a silent
+                // agent would hang it forever. This task OWNS the session
+                // through `run_direct_agent`, which carries the in-loop and
+                // external watchdogs — a second timer on top would just race
+                // them. (Tier 2 had no such timeout while it was inline either.)
+                let engine = self.clone_arc();
+                let branch_name = change.branch_name.clone();
+                let description = change.description.clone();
+                let merge_wt = wt_path.clone();
+                let tier3_change = change.clone();
+                let tier3_kind_ctx = kind_ctx.clone();
+                let tier3_repo_root = repo_root.clone();
+                let task_actor = actor.clone();
+                Self::spawn_cc_task_guarded(engine.clone(), thread_id, async move {
+                    match CodingAgentChangeOps::run_merge_session_tier2(
+                        engine.as_ref(),
+                        thread_id,
+                        change_id,
+                        &merge_wt,
+                        &branch_name,
+                        &description,
+                        resume_token,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            // The cleanup already emitted the terminal and, on
+                            // success, ff'd main.
+                            //
+                            // Reconcile orphaned sibling pending changes here,
+                            // not in `apply_change`: that call site is gated on
+                            // the returned `ApplyStatus::Applied`, and this path
+                            // now returns `Conflict` long before the merge
+                            // lands. Re-read the row for the same reason the
+                            // old inline code did — the cleanup, not this task,
+                            // decides whether the change actually applied — and
+                            // gate on `"applied"` so a failed or handed-off
+                            // merge never discards a newer sibling's work (the
+                            // data-loss trap `apply_change`'s `Applied` gate
+                            // exists to avoid).
+                            match engine.changes().get_by_id(change_id).await {
+                                Ok(Some(c)) if c.status == "applied" => {
+                                    engine
+                                        .discard_orphaned_pending_siblings(
+                                            thread_id,
+                                            change_id,
+                                            task_actor.clone(),
+                                        )
+                                        .await;
+                                }
+                                Ok(_) => {}
+                                Err(e) => log!(
+                                    "[Changes] post-merge re-read of {} failed: {} — \
+                                     skipping the orphan-sibling reconcile",
                                     change_id,
-                                    Some(thread_id),
-                                    c.requires_restart && !kind_ctx.is_app(),
-                                    c.pre_merge_sha.unwrap_or_default(),
-                                    c.post_merge_sha.unwrap_or_default(),
-                                    &c.commits,
-                                    c.files.len(),
-                                ));
+                                    e
+                                ),
                             }
-                            Ok(_) => {
-                                // Cleanup didn't mark it applied — the failure
-                                // event it emitted (e.g. "Conflict resolution
-                                // incomplete") is already on the wire so the
-                                // UI surfaces the message from there.
-                                return Ok(ApplyResult::conflict(
+                            engine.broadcast_changes_updated().await;
+                        }
+                        Err(e) => {
+                            log!(
+                                "[Changes] CC merge failed for {}: {} — falling back to Tier 3",
+                                change_id,
+                                e
+                            );
+                            // Tier 3 spawns its own merge session and re-stashes
+                            // the actor with its own scope; clear this Tier-2
+                            // stash so the fallback doesn't double-park.
+                            engine.pending_apply_actors.take(change_id);
+                            let _ = git_cmd(&["merge", "--abort"], &merge_wt).await;
+                            if let Err(e) = engine
+                                .apply_change_tier3(
+                                    &tier3_change,
                                     change_id,
-                                    thread_id,
-                                    change.files.len(),
-                                    "Merge did not complete — try applying again.",
-                                ));
-                            }
-                            Err(e) => {
+                                    task_actor,
+                                    &tier3_kind_ctx,
+                                    &tier3_repo_root,
+                                    effective_requires_restart,
+                                )
+                                .await
+                            {
                                 log!(
-                                    "[Changes] DB error re-reading change {} after Tier 2 merge: {} — treating as conflict",
+                                    "[Changes] Tier-3 fallback after the Tier-2 merge failure also failed for {}: {}",
                                     change_id,
                                     e
                                 );
-                                return Ok(ApplyResult::conflict(
-                                    change_id,
-                                    thread_id,
-                                    change.files.len(),
-                                    "Database error after merge — try applying again.",
-                                ));
                             }
                         }
                     }
-                    Err(e) => {
-                        log!(
-                            "[Changes] CC merge failed for {}: {} — falling through to Tier 3",
-                            change_id,
-                            e
-                        );
-                        // Tier 3 will spawn its own merge session and re-stash
-                        // the actor with its own scope; clear this Tier-2
-                        // stash so the fallthrough doesn't double-park.
-                        self.pending_apply_actors.take(change_id);
-                        let _ = git_cmd(&["merge", "--abort"], &wt_path).await;
-                    }
-                }
+                });
+
+                return Ok(ApplyResult::conflict(
+                    change_id,
+                    thread_id,
+                    change.files.len(),
+                    "Merge conflict — the coding-agent session is resolving it. \
+                     The change will apply automatically when resolution completes.",
+                ));
             }
         }
 
+        self.apply_change_tier3(
+            &change,
+            change_id,
+            actor,
+            &kind_ctx,
+            &repo_root,
+            effective_requires_restart,
+        )
+        .await
+    }
+
+    /// Tier 3: no live session and no worktree for the branch — fast-forward
+    /// `main` directly when the branch is already a descendant, else try a
+    /// throwaway catchup worktree, else hand the merge to a coding agent in a
+    /// temp worktree and return `Conflict` so the caller stops waiting.
+    ///
+    /// Split out of `apply_change_inner` so the *detached* Tier-2 merge task can
+    /// reach it too: Tier 2 used to fall through to this code inline when its
+    /// merge session failed, and that fallthrough has to survive the merge
+    /// moving off the caller's future.
+    async fn apply_change_tier3(
+        self: &Arc<Self>,
+        change: &crate::core::changes::Change,
+        change_id: Uuid,
+        actor: Option<MessageOrigin>,
+        kind_ctx: &ApplyKindContext,
+        repo_root: &std::path::Path,
+        effective_requires_restart: bool,
+    ) -> Result<ApplyResult, Box<dyn std::error::Error + Send + Sync>> {
         // Tier 3: No worktree — try ff directly, spawn CC in temp worktree if needed
 
         // Fast path: branch may already be a descendant of main
         {
             let _merge_guard = MERGE_MUTEX.lock().await;
-            let main_sha = git_cmd(&["rev-parse", "main"], &repo_root)
+            let main_sha = git_cmd(&["rev-parse", "main"], repo_root)
                 .await
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
-            let branch_sha = git_cmd(&["rev-parse", &change.branch_name], &repo_root)
+            let branch_sha = git_cmd(&["rev-parse", &change.branch_name], repo_root)
                 .await
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
 
-            if let Ok(shas) = ff_main_to(&repo_root, &branch_sha, &main_sha).await {
+            if let Ok(shas) = ff_main_to(repo_root, &branch_sha, &main_sha).await {
                 log!(
                     "[Changes] Fast path succeeded for {} (Tier 3)",
                     change.branch_name
                 );
-                let commits = commits_in_range(&repo_root, &shas.0, &shas.1).await;
+                let commits = commits_in_range(repo_root, &shas.0, &shas.1).await;
                 // Phase 6.2: keep the branch alive — it's at the same SHA as
                 // main now, and the thread may resume CC against it later. No
                 // worktree exists for this branch in Tier 3, so there's
@@ -855,7 +896,7 @@ impl LucidosEngine {
                 // the merged work. App threads merge to the workspace git's
                 // main, which is local-only by design — no remote push.
                 if !kind_ctx.is_app() {
-                    push_main_in_background(&repo_root);
+                    push_main_in_background(repo_root);
                 }
                 self.emit_change_applied(
                     change.thread_id.unwrap_or(change_id),
@@ -869,7 +910,7 @@ impl LucidosEngine {
                     Some(shas.1.clone()),
                 )
                 .await;
-                self.maybe_emit_app_ui_refresh(&kind_ctx, &change.files, actor.as_ref()).await;
+                self.maybe_emit_app_ui_refresh(kind_ctx, &change.files, actor.as_ref()).await;
                 self.emit_entity_events_for_change_apply(
                     &change.files,
                     Some(&shas.0),
@@ -897,17 +938,17 @@ impl LucidosEngine {
             let temp_wt = worktrees_dir(self.workspace_path())
                 .join(format!("apply-{}", change_id.as_simple()));
             let temp_wt_str = temp_wt.to_string_lossy().into_owned();
-            let _ = git_cmd(&["worktree", "remove", "--force", &temp_wt_str], &repo_root).await;
+            let _ = git_cmd(&["worktree", "remove", "--force", &temp_wt_str], repo_root).await;
 
             let add_ok = matches!(
-                worktree_add(&repo_root, &temp_wt, &[&change.branch_name]).await,
+                worktree_add(repo_root, &temp_wt, &[&change.branch_name]).await,
                 Ok(o) if o.status.success()
             );
 
             if add_ok {
                 let result =
-                    catchup_and_ff_to_main(&repo_root, &temp_wt, &change.branch_name).await;
-                let _ = git_cmd(&["worktree", "remove", "--force", &temp_wt_str], &repo_root).await;
+                    catchup_and_ff_to_main(repo_root, &temp_wt, &change.branch_name).await;
+                let _ = git_cmd(&["worktree", "remove", "--force", &temp_wt_str], repo_root).await;
 
                 if let Ok((pre_sha, post_sha)) = result {
                     // `catchup_and_ff_to_main` deletes change.branch_name on success.
@@ -916,7 +957,7 @@ impl LucidosEngine {
                         "[Changes] Auto-merge path succeeded for {} (Tier 3)",
                         change.branch_name
                     );
-                    let commits = commits_in_range(&repo_root, &pre_sha, &post_sha).await;
+                    let commits = commits_in_range(repo_root, &pre_sha, &post_sha).await;
                     self.emit_change_applied(
                         change.thread_id.unwrap_or(change_id),
                         change_id,
@@ -929,7 +970,7 @@ impl LucidosEngine {
                         Some(post_sha.clone()),
                     )
                     .await;
-                    self.maybe_emit_app_ui_refresh(&kind_ctx, &change.files, actor.as_ref()).await;
+                    self.maybe_emit_app_ui_refresh(kind_ctx, &change.files, actor.as_ref()).await;
                     self.emit_entity_events_for_change_apply(
                         &change.files,
                         Some(&pre_sha),
@@ -958,10 +999,10 @@ impl LucidosEngine {
             worktrees_dir(self.workspace_path()).join(format!("merge-{}", change_id.as_simple()));
         let wt_path_str = wt_path.to_string_lossy().into_owned();
 
-        let _ = git_cmd(&["worktree", "remove", "--force", &wt_path_str], &repo_root).await;
-        let _ = git_cmd(&["branch", "-D", &temp_branch], &repo_root).await;
+        let _ = git_cmd(&["worktree", "remove", "--force", &wt_path_str], repo_root).await;
+        let _ = git_cmd(&["branch", "-D", &temp_branch], repo_root).await;
 
-        match worktree_add(&repo_root, &wt_path, &["-b", &temp_branch]).await {
+        match worktree_add(repo_root, &wt_path, &["-b", &temp_branch]).await {
             Ok(o) if o.status.success() => {}
             Ok(o) => {
                 let msg = format!(

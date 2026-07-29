@@ -6,7 +6,7 @@
 //! fresh, empty bucket even though `~/Library/Application Support/<id>/` survives —
 //! the frontend then mints a new UUID and the user shows up as a brand-new device
 //! after every update (the same class of OS-state-keyed-by-code-identity problem the
-//! engine binary hits with TCC grants; see `.claude/rules/scripts.md`).
+//! engine binary hits with TCC grants; see `.claude/rules/dev-runtime.md`).
 //!
 //! We persist the id natively as a plain JSON map under the App Support data dir —
 //! path-based storage, exactly like `config/engine-port` and `config/workspaces.json`,

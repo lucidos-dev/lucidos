@@ -76,8 +76,15 @@ pub(super) fn terminate_decision(
     }
 }
 
-/// Decide whether to snapshot the worktree as a pending change when CC
-/// goes idle.
+/// Decide whether a CC idle may write to change state at all — proposing the
+/// worktree as a pending change, or reconciling one that already exists.
+///
+/// Deliberately blind to whether the branch actually has a diff: the caller
+/// reads the file list once and routes on it, proposing when there are files
+/// and reconciling the existing pending row to zero when there are none. Making
+/// "has a diff" part of THIS gate is the bug that shipped change `2cc8391f` — a
+/// branch whose commits cancelled out skipped the whole block, so its pending
+/// row kept advertising a file (and a restart) that the live Diff didn't show.
 ///
 /// Auto-propose surfaces the worktree as a pending change with an Apply
 /// button. We only do that when the turn ended cleanly (Generated) — any
@@ -109,15 +116,16 @@ pub(super) fn terminate_decision(
 /// This replaced an earlier gate whose only automatic recovery was a 5-minute
 /// nudge — the wait that gate imposed was worse than the rare wasted re-harden
 /// it prevented.
-pub(super) fn should_propose_change_at_idle(
-    wt_has_changes: bool,
+///
+/// Every guard above applies identically to proposing and to reconciling —
+/// hence the shared gate rather than two parallel checks.
+pub(super) fn may_touch_change_state_at_idle(
     is_external_repo: bool,
     is_shutdown: bool,
     is_conflict_session: bool,
     terminal_kind: &Option<TerminalKind>,
 ) -> bool {
-    wt_has_changes
-        && !is_external_repo
+    !is_external_repo
         && !is_shutdown
         && !is_conflict_session
         && matches!(terminal_kind, Some(TerminalKind::Generated))
@@ -270,7 +278,7 @@ pub(super) fn terminal_clears_user_hit_stop(terminal: &TerminalKind) -> bool {
 /// uncommitted on the branch. The post-commit hook fires per commit and
 /// emits a per-commit `ChangeProposed`; without this gate, every cleanup
 /// auto-commit on a half-finished session published a spurious Apply card
-/// for partial work even though the aggregate `should_propose_change_at_idle`
+/// for partial work even though the aggregate `may_touch_change_state_at_idle`
 /// gate had already refused.
 ///
 /// Recovery is unaffected: `recover_orphaned_worktrees` re-spawns CC inside
@@ -287,37 +295,126 @@ pub(super) fn should_auto_commit_on_cleanup(
 pub(super) enum ConflictResolutionCleanupAction {
     Apply,
     Abort { message: &'static str },
+    /// The safety net just emitted `ContinuationRequested` for this session —
+    /// the auto-recovery continuation resumes the SAME merge turn via
+    /// `--resume`, so the merge duty transfers instead of failing: leave the
+    /// in-progress merge, the worktree, the branch, the parked apply actor,
+    /// and the event pairing (no `MergeResolutionCleared` /
+    /// `ChangeApplyFailed`) untouched. The `Continue` spawn consumer re-derives
+    /// the duty from the still-unpaired `MergeConflictDetected` and passes
+    /// `conflict_change_id` to the resumed session, whose own completion then
+    /// applies or aborts for real.
+    HandOff,
 }
 
 /// Decide whether a conflict-resolution worktree is safe to fast-forward into
-/// main. A clean `Generated` result is the only apply path. Anything else means
+/// main. A clean `Generated` result is the only apply path — and it wins even
+/// over a pending continuation: an external-watchdog false positive can race
+/// a natural `Generated` end, and deferring an already-committed merge to a
+/// fragile `--resume` would risk losing finished work (the continuation then
+/// finds the pairing closed by `ChangeApplied` and degrades to a plain
+/// resume). A user cancel also beats the hand-off — Stop means "don't land
+/// this merge", continuation or not. After those two, a pending auto-recovery
+/// continuation hands the duty off (see `HandOff`) — checked before
+/// `has_unmerged`, because a stray-killed merge turn is EXPECTED to leave
+/// unmerged files behind for the continuation to finish. Anything else means
 /// the merge-fix turn was interrupted, failed, aborted, or never produced a
 /// trustworthy terminal event, so the original change must stay pending.
 pub(super) fn conflict_resolution_cleanup_action(
     has_unmerged: bool,
     last_terminal: &Option<TerminalKind>,
+    continuation_pending: bool,
 ) -> ConflictResolutionCleanupAction {
+    if !has_unmerged && matches!(last_terminal, Some(TerminalKind::Generated)) {
+        return ConflictResolutionCleanupAction::Apply;
+    }
+    if matches!(last_terminal, Some(TerminalKind::Canceled(_))) {
+        return ConflictResolutionCleanupAction::Abort {
+            message: "Conflict resolution canceled — merge aborted. The change is still pending; try applying again.",
+        };
+    }
+    if continuation_pending {
+        return ConflictResolutionCleanupAction::HandOff;
+    }
     if has_unmerged {
         return ConflictResolutionCleanupAction::Abort {
             message: "Conflict resolution incomplete — merge aborted. The change is still pending; try applying again.",
         };
     }
-
-    match last_terminal {
-        Some(TerminalKind::Generated) => ConflictResolutionCleanupAction::Apply,
-        Some(TerminalKind::Canceled(_)) => ConflictResolutionCleanupAction::Abort {
-            message: "Conflict resolution canceled — merge aborted. The change is still pending; try applying again.",
-        },
-        _ => ConflictResolutionCleanupAction::Abort {
-            message: "Conflict resolution did not finish cleanly — merge aborted. The change is still pending; try applying again.",
-        },
+    ConflictResolutionCleanupAction::Abort {
+        message: "Conflict resolution did not finish cleanly — merge aborted. The change is still pending; try applying again.",
     }
+}
+
+/// A conflict-resolution Abort may delete git state ONLY when THIS session
+/// actually ran in the dedicated temp worktree on the temp branch
+/// (`merge_temp_branch` recorded by `MergeResolutionStarted` — the Tier-3
+/// shape — AND matching the session's own branch). Tier-2 merges run in the
+/// thread's OWN worktree on the REAL change branch; there the failed attempt
+/// created nothing but the in-progress merge, so `git merge --abort` is the
+/// entire cleanup — deleting the worktree/branch would destroy the user's
+/// committed work (the failure-path-cleanup rule in `.claude/rules/rust.md`).
+///
+/// Matching against the SESSION's branch (not just `merge_temp_branch`
+/// presence) is load-bearing: after a hand-off whose temp worktree was
+/// pruned, the Continue consumer re-attaches the duty on the thread's own
+/// worktree while the change row still carries the stale temp columns — a
+/// presence-only gate would then `worktree remove --force` the THREAD
+/// worktree the session actually ran in.
+pub(super) fn conflict_abort_deletes_temp_state(
+    merge_temp_branch: Option<&str>,
+    session_branch: &str,
+) -> bool {
+    merge_temp_branch.is_some_and(|tb| tb == session_branch)
+}
+
+/// Inputs to [`is_stale_resume_signal`]. A named struct rather than a
+/// positional argument list because every field is a `bool` — the same reason
+/// [`super::external_watchdog::ExternalWatchdogInput`] exists next door. Eight
+/// positional bools is a silent-transposition hazard at exactly the call site
+/// where a transposition kills a live session.
+///
+/// `Copy` so the call site can evaluate the predicate twice off one value — once
+/// as-is, once with the veto forced off — to detect that the confirmed attach is
+/// what saved the session, without restating the other seven fields.
+#[derive(Clone, Copy)]
+pub(super) struct StaleResumeInputs {
+    /// This turn asked the backend to `--resume` a specific session id.
+    pub has_resume_session: bool,
+    /// The backend's `Init` reported back the SAME session id we asked it to
+    /// resume — proof the resume attached to the live conversation.
+    pub resume_attach_confirmed: bool,
+    pub result_text_empty: bool,
+    pub buffered_text_empty: bool,
+    pub no_prior_results_this_turn: bool,
+    pub no_tool_calls_this_turn: bool,
+    pub user_message_present: bool,
+    pub cc_error: bool,
 }
 
 /// True when an arriving `Result` is the "stale --resume" signal — CC echoed
 /// our forwarded user message back as an empty answer because the persisted
 /// session id no longer exists. The run-loop responds by retrying with a fresh
 /// spawn (reusing the existing worktree — it does NOT delete it).
+///
+/// `resume_attach_confirmed` is the STRUCTURAL gate and vetoes everything below
+/// it. The rest of this predicate infers "the session is dead" from output
+/// SHAPE, which cannot distinguish a dead session from a live one that happened
+/// to say nothing. The session id can: both backends report the id they
+/// actually attached to at `Init` (CC's `system.init`; Codex's
+/// `thread/start`|`thread/resume` response), and a resume that FAILED yields a
+/// different id — CC starts a fresh conversation, Codex falls back to
+/// `thread/start` (`codex_app_server_tests::stale_resume_falls_back_to_fresh_thread`).
+/// So `init_sid == requested_sid` proves the conversation is live, and no
+/// amount of empty output may override it.
+///
+/// Without this gate the 2026-07-29 wedge: a *Switch to new version* auto-resume
+/// re-attached correctly (Init echoed the requested sid), but the prior turn had
+/// been killed mid-tool-call, so `claude --print --resume` auto-injected its own
+/// synthetic `Continue from where you left off.` / `No response requested.` pair
+/// to close the orphaned tool_use and emitted a `result` for THAT — before
+/// reading our stdin. Empty text, zero tool calls, 10 ms after Init. The healthy
+/// Opus-5 session was cancelled and the thread wedged at `running`.
 ///
 /// `cc_error.is_none()` is load-bearing: an empty Result with `is_error: true`
 /// is a real upstream failure (network drop, 5xx), not an expired session.
@@ -336,22 +433,15 @@ pub(super) fn conflict_resolution_cleanup_action(
 /// duplicate CC process on the shared worktree (2x quota burn). Opus/Sonnet
 /// stream substantive prose first (`buffered_text_empty` is false), so they
 /// never reached this predicate at all.
-pub(super) fn is_stale_resume_signal(
-    has_resume_session: bool,
-    result_text_empty: bool,
-    buffered_text_empty: bool,
-    no_prior_results_this_turn: bool,
-    no_tool_calls_this_turn: bool,
-    user_message_present: bool,
-    cc_error: bool,
-) -> bool {
-    has_resume_session
-        && result_text_empty
-        && buffered_text_empty
-        && no_prior_results_this_turn
-        && no_tool_calls_this_turn
-        && user_message_present
-        && !cc_error
+pub(super) fn is_stale_resume_signal(i: StaleResumeInputs) -> bool {
+    i.has_resume_session
+        && !i.resume_attach_confirmed
+        && i.result_text_empty
+        && i.buffered_text_empty
+        && i.no_prior_results_this_turn
+        && i.no_tool_calls_this_turn
+        && i.user_message_present
+        && !i.cc_error
 }
 
 /// CC's deterministic "the session I asked to `--resume` doesn't exist" error.
@@ -427,7 +517,7 @@ pub(super) enum SessionEndAction {
     /// `cc_session_id` on this branch. Keep the branch (even with zero commits)
     /// so `resolve_branch_for_resume` finds it; do NOT propose, because a
     /// cancelled turn is half-finished work the user shouldn't be invited to
-    /// apply (mirrors `should_propose_change_at_idle`). Without this the
+    /// apply (mirrors `may_touch_change_state_at_idle`). Without this the
     /// no-commits cancel path falls into `KeepEmptyBranch` (still resumable, but
     /// without the cancel-specific "half-finished, don't propose" semantics).
     KeepCanceledBranch,
@@ -623,7 +713,7 @@ impl WatchdogGate {
 /// stray kill. The process-group isolation fix should prevent the stray
 /// SIGTERM in the first place; this is the defense-in-depth recovery for any
 /// residual mid-stream signal death.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SafetyNetAction {
     /// Loop ended with a natural terminator (Generated, Failed, Canceled,
     /// Aborted) — the in-loop emit already closed the turn.

@@ -74,6 +74,57 @@ pub fn codex_reasoning_effort_options() -> &'static [CcMenuOption] {
     &CODEX_MENU_OPTIONS.reasoning_efforts
 }
 
+/// Reasoning-summary mode both Codex drivers request. Codex's default
+/// (`auto`) resolves to NO summaries over the app-server/exec protocols —
+/// verified live against codex-cli 0.142.5: zero `item/reasoning/*`
+/// notifications and an empty `summary` on the completed reasoning item, even
+/// at `high` effort with real reasoning tokens billed — which left the
+/// `CodingAgentThoughtStreamed` capture dormant for Codex. `detailed` makes
+/// codex stream `item/reasoning/summaryTextDelta`, so a long reasoning pass
+/// renders as a live Thinking step instead of a silent gap.
+pub(super) const CODEX_REASONING_SUMMARY: &str = "detailed";
+
+/// Project-doc fallback both Codex drivers configure. Codex natively reads
+/// only `AGENTS.md`, which Lucidos deliberately does not ship (ADR 0004 — no
+/// AGENTS.md injection); Claude Code auto-loads `CLAUDE.md` + `.claude/rules`.
+/// Pointing codex's *fallback* filename list at `CLAUDE.md` gives a Codex
+/// session the same working agreement without writing anything into the repo
+/// (a repo that ships its own `AGENTS.md` still wins — fallback only). The
+/// byte cap is raised above codex's 32 KiB default: Lucidos' CLAUDE.md is
+/// ~29 KiB and growing, and silent truncation would drop the tail rules.
+pub(super) const CODEX_PROJECT_DOC_FALLBACKS: &[&str] = &["CLAUDE.md"];
+pub(super) const CODEX_PROJECT_DOC_MAX_BYTES: u64 = 65536;
+
+/// Validate a reasoning-effort value against the Codex model/effort matrix
+/// (`codex_menu_options.json` is the source of truth). An out-of-vocabulary or
+/// model-incompatible value fails the whole turn with `invalid_request_error`
+/// (two real turns died this way on 2026-06-21), so both drivers drop it with a
+/// log line instead: Codex then applies its own default effort.
+pub(super) fn validate_codex_effort<'a>(
+    model: Option<&str>,
+    effort: Option<&'a str>,
+) -> Option<&'a str> {
+    let e = effort.filter(|e| !e.is_empty())?;
+    let supported = codex_reasoning_effort_options()
+        .iter()
+        .find(|o| o.value == e)
+        .is_some_and(|option| {
+            option.supported_models.as_ref().is_none_or(|models| {
+                model.is_some_and(|model| models.iter().any(|supported| supported == model))
+            })
+        });
+    if supported {
+        Some(e)
+    } else {
+        log!(
+            "[Codex] dropping unsupported reasoning effort '{}' for model '{}' — codex default applies",
+            e,
+            model.unwrap_or("default/unknown"),
+        );
+        None
+    }
+}
+
 /// Render the control-command menu for the frontend's `/model` picker —
 /// Codex counterpart of `claude_code::cc_command_definitions`. No
 /// `set_permission_mode`: Codex has no CC-style permission-MODE protocol to
@@ -83,11 +134,15 @@ pub fn codex_command_definitions() -> serde_json::Value {
     fn options_to_json(opts: &[CcMenuOption]) -> Vec<serde_json::Value> {
         opts.iter()
             .map(|m| {
-                serde_json::json!({
+                let mut option = serde_json::json!({
                     "value": m.value,
                     "label": m.label,
                     "description": m.description,
-                })
+                });
+                if let Some(models) = &m.supported_models {
+                    option["supported_models"] = serde_json::json!(models);
+                }
+                option
             })
             .collect()
     }
@@ -117,13 +172,13 @@ pub(super) struct CodexConfig {
     pub(super) system_prompt: Option<String>,
     pub(super) model: Option<String>,
     pub(super) reasoning_effort: Option<String>,
-    /// Extra writable root for the worktree's shared git dir (`--add-dir` on
-    /// exec; `sandbox_workspace_write.writable_roots` on app-server) — a
-    /// linked worktree's `.git` is a file pointing at
-    /// `<main>/.git/worktrees/<x>`, so `git commit` inside the sandbox needs
-    /// write access there. Resolved once at spawn via
-    /// `git rev-parse --git-common-dir`.
-    pub(super) git_common_dir: Option<PathBuf>,
+    /// Extra writable roots for the OS sandbox, beyond the session worktree
+    /// that `--sandbox workspace-write` already grants (`--add-dir` on exec;
+    /// `sandbox_workspace_write.writable_roots` on app-server). Resolved once
+    /// at spawn by [`sandbox_writable_roots`], which documents why each entry
+    /// is there. Deliberately a closed, explicit list — every entry is a hole
+    /// in the sandbox and needs a reason.
+    pub(super) sandbox_writable_roots: Vec<PathBuf>,
     /// Pre-built env (Lucidos contract) applied to every spawned child.
     pub(super) env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 }
@@ -190,9 +245,8 @@ impl AgentRuntime for CodexRuntime {
         }
         ensure_workspace_bin_symlink(args.worktree_path, cli_dir);
 
-        // Linked worktrees keep their real git dir under the main repo —
-        // resolve it so the sandbox profile can allow `git commit`.
-        let git_common_dir = resolve_git_common_dir(args.worktree_path).await;
+        let sandbox_writable_roots =
+            sandbox_writable_roots(args.worktree_path, args.workspace_path).await;
 
         // Bake the Lucidos env contract once; each per-turn child re-applies it.
         let env = {
@@ -222,7 +276,7 @@ impl AgentRuntime for CodexRuntime {
             system_prompt: args.system_prompt.map(str::to_string),
             model: args.model.map(str::to_string),
             reasoning_effort: args.reasoning_effort.map(str::to_string),
-            git_common_dir,
+            sandbox_writable_roots,
             env,
         };
 
@@ -276,6 +330,83 @@ impl AgentRuntime for CodexRuntime {
     }
 }
 
+/// The extra writable roots a Codex session needs beyond its own worktree,
+/// which `--sandbox workspace-write` already grants. Every entry is a
+/// deliberate hole in the sandbox:
+///
+/// 1. **The worktree's shared git dir.** A linked worktree's `.git` is a file
+///    pointing at `<main>/.git/worktrees/<x>`, so an in-agent `git commit`
+///    writes outside the worktree. Omitted when git can't tell us (degrade).
+/// 2. **The workspace's `data/` tree.** Writing there is the documented
+///    contract for a coding-agent thread: `lucidos data write` /
+///    `lucidos data path` resolve under `<workspace>/data/`, and the workspace
+///    knowhow instructs agents to log follow-ups to
+///    `artifacts/work-tracker/data.json`. That path is OUTSIDE the worktree, so
+///    the macOS seatbelt refused it with `EPERM (os error 1)` — which is how
+///    the 2026-07-26 nightly's Codex security pass silently failed to persist
+///    two high-severity findings. Claude Code runs unsandboxed and never hit
+///    it, so the contract looked like it worked.
+///
+/// Scoped to `<workspace>/data`, deliberately **not** the workspace root: the
+/// root also holds `.lucidos/` (engine runtime, logs, pid files, the gateway
+/// registry) and every sibling worktree — none of which a session has any
+/// business writing. A missing `data/` dir is skipped rather than created;
+/// the engine provisions it at boot, so its absence means something is off and
+/// a spawn-time `mkdir` would only paper over it.
+async fn sandbox_writable_roots(worktree: &Path, workspace: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(git_dir) = resolve_git_common_dir(worktree).await {
+        // Canonicalized for the same reason the data dir below is: the seatbelt
+        // matches REAL paths, so a workspace reached through a symlink (a
+        // `/tmp/...` one resolves to `/private/tmp/...` on macOS) would grant a
+        // root the kernel never matches — and in-agent `git commit`, the only
+        // reason this entry exists, would stay blocked. Falls back to the
+        // as-resolved path if it has since vanished.
+        roots.push(std::fs::canonicalize(&git_dir).unwrap_or(git_dir));
+    }
+    let data_dir = workspace.join(crate::core::DATA_DIR);
+    // `canonicalize` does three jobs here, all load-bearing:
+    //   * proves the dir exists (replacing a bare `is_dir` probe);
+    //   * makes the path ABSOLUTE — `LUCIDOS_WORKSPACE` is used verbatim and is
+    //     routinely relative (the Makefile passes `./test-workspace`; the boot
+    //     fallback is `./workspace`). codex resolves a relative `--add-dir`
+    //     against the CHILD's cwd, which is the worktree — so a relative root
+    //     would punch the hole somewhere meaningless and leave the real `data/`
+    //     blocked, i.e. silently no fix at all;
+    //   * resolves symlinks, which the macOS seatbelt matches on (`/var` →
+    //     `/private/var` is the classic one).
+    match std::fs::canonicalize(&data_dir).ok().filter(|d| d.is_dir()) {
+        Some(dir) if widens_past_the_workspace(&dir, workspace) => crate::log!(
+            "[Codex] {} resolves to {}, which contains the workspace — refusing \
+             to grant it; the sandbox will block `lucidos data write`",
+            data_dir.display(),
+            dir.display()
+        ),
+        Some(dir) => roots.push(dir),
+        None => crate::log!(
+            "[Codex] {} is not a reachable directory — the sandbox will block \
+             `lucidos data write` to the parent workspace",
+            data_dir.display()
+        ),
+    }
+    roots
+}
+
+/// Does this resolved `data/` path grant MORE than the data tree — the
+/// workspace root itself, or an ancestor of it (`/` included)?
+///
+/// Resolving symlinks is what the sandbox needs (see `sandbox_writable_roots`),
+/// but it also means a `data` symlink decides the hole's width. Relocating the
+/// tree (`data -> /Volumes/ext/lucidos-data`) is legitimate and stays allowed;
+/// WIDENING it (`data -> .`, `data -> /`) is not, because it silently grants
+/// the `.lucidos/` runtime and every sibling worktree — the exact scoping this
+/// function's doc comment promises it withholds. Cheaper to make impossible
+/// than to document as a footgun.
+fn widens_past_the_workspace(resolved_data: &Path, workspace: &Path) -> bool {
+    let workspace = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    workspace.starts_with(resolved_data)
+}
+
 /// `git rev-parse --git-common-dir` for the worktree. `None` (log + degrade)
 /// when git fails — Codex still runs, but its own `git commit` would be
 /// blocked by the sandbox; the engine's auto-commit (which runs unsandboxed)
@@ -321,17 +452,30 @@ fn build_codex_turn_command(
     cmd.arg("--sandbox").arg("workspace-write");
     cmd.arg("-c")
         .arg("sandbox_workspace_write.network_access=true");
+    // Reasoning summaries + CLAUDE.md project-doc fallback — see the
+    // CODEX_REASONING_SUMMARY / CODEX_PROJECT_DOC_FALLBACKS docs. TOML value
+    // syntax: `-c` values parse as TOML, so the list renders as `["..."]`.
+    cmd.arg("-c").arg(format!(
+        "model_reasoning_summary=\"{CODEX_REASONING_SUMMARY}\""
+    ));
+    cmd.arg("-c").arg(format!(
+        "project_doc_fallback_filenames={}",
+        serde_json::to_string(CODEX_PROJECT_DOC_FALLBACKS).expect("static list serializes")
+    ));
+    cmd.arg("-c").arg(format!(
+        "project_doc_max_bytes={CODEX_PROJECT_DOC_MAX_BYTES}"
+    ));
     for flag in lucidos_mcp_server_config_overrides(&config.env) {
         cmd.arg("-c").arg(flag);
     }
-    if let Some(git_dir) = &config.git_common_dir {
-        cmd.arg("--add-dir").arg(git_dir);
+    for root in &config.sandbox_writable_roots {
+        cmd.arg("--add-dir").arg(root);
     }
     // "default" = let the user's Codex config pick (mirrors CC's sentinel).
     if let Some(m) = model.filter(|m| !m.is_empty() && *m != "default") {
         cmd.arg("-m").arg(m);
     }
-    if let Some(e) = effort.filter(|e| !e.is_empty()) {
+    if let Some(e) = validate_codex_effort(model, effort) {
         cmd.arg("-c")
             .arg(format!("model_reasoning_effort=\"{}\"", e));
     }

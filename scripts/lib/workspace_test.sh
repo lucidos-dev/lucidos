@@ -545,6 +545,77 @@ EOF
 # only kill it when the last one is gone. Mirrors how cleanup_processes / stop.sh
 # tear it down. The ref-count reuses running_frontend_workspaces_in_project, so a
 # fake Vite preview with cwd inside the project stands in for "still serving".
+test_gateway_scope_ignores_the_optin() {
+    echo "test: the opt-out CANNOT buy a worktree-rooted machine-global gateway"
+
+    # The asymmetry that matters. `web-dev.sh -w e2e-test -b` from a worktree stops
+    # the user's gateway and relaunches it pinned to a throwaway checkout, where it
+    # outlives the session and serves every workspace a frozen dist/ — the
+    # 2026-07-26 incident. No test workflow justifies that, so `gateway` scope
+    # ignores LUCIDOS_ALLOW_WORKTREE_STACK entirely.
+    local wt="$SANDBOX/ws3/.lucidos/worktrees/thread-gw"
+    mkdir -p "$wt"
+
+    local out rc
+    out="$(LUCIDOS_ALLOW_WORKTREE_STACK=1 assert_stack_not_worktree_pinned "$wt" gateway 2>&1)" && rc=0 || rc=$?
+    if [ "${rc:-0}" -ne 0 ]; then
+        pass "gateway scope refuses even with the opt-in set"
+    else
+        fail "opt-in bought a worktree-rooted gateway — the exact incident mechanism"
+    fi
+    case "$out" in
+        *"does NOT apply"*) pass "message says the opt-in is powerless here" ;;
+        *) fail "message should state the opt-in does not apply: $out" ;;
+    esac
+    case "$out" in
+        *"./scripts/e2e.sh"*) pass "message points at the e2e scripts (no start step needed)" ;;
+        *) fail "message should point at ./scripts/e2e.sh: $out" ;;
+    esac
+    # The advice must not send the reader in a circle: LUCIDOS_NO_GATEWAY alone
+    # drops to `stack` scope, which still refuses without LUCIDOS_ALLOW_WORKTREE_STACK
+    # (web-dev.sh does not set it). If the message names NO_GATEWAY it must name both.
+    case "$out" in
+        *LUCIDOS_NO_GATEWAY*)
+            case "$out" in
+                *LUCIDOS_NO_GATEWAY*LUCIDOS_ALLOW_WORKTREE_STACK*)
+                    pass "the gateway-less hint names BOTH opt-ins" ;;
+                *) fail "message suggests LUCIDOS_NO_GATEWAY alone, which is still refused: $out" ;;
+            esac ;;
+        *) pass "no circular NO_GATEWAY-only hint" ;;
+    esac
+}
+
+test_stack_scope_still_honours_the_optin() {
+    echo "test: stack scope (direct engine, what e2e uses) still honours the opt-in"
+
+    # scripts/lib/e2e.sh calls start_engine directly and never starts a gateway,
+    # so it only ever reaches this scope. Regressing it breaks e2e's frontend.
+    local wt="$SANDBOX/ws4/.lucidos/worktrees/thread-e2e"
+    mkdir -p "$wt"
+    if LUCIDOS_ALLOW_WORKTREE_STACK=1 assert_stack_not_worktree_pinned "$wt" >/dev/null 2>&1; then
+        pass "default scope permits a worktree-rooted direct-engine stack"
+    else
+        fail "opt-in no longer works for the direct-engine path (this breaks e2e)"
+    fi
+    # And the scope defaults to `stack` when omitted.
+    if LUCIDOS_ALLOW_WORKTREE_STACK=1 assert_stack_not_worktree_pinned "$wt" stack >/dev/null 2>&1; then
+        pass "explicit stack scope behaves the same as the default"
+    else
+        fail "explicit stack scope diverged from the default"
+    fi
+}
+
+test_gateway_scope_allows_a_real_checkout() {
+    echo "test: gateway scope does not fire for a normal checkout"
+    local proj="$SANDBOX/projects/lucidos-gw"
+    mkdir -p "$proj"
+    if assert_stack_not_worktree_pinned "$proj" gateway >/dev/null 2>&1; then
+        pass "real checkout allowed in gateway scope"
+    else
+        fail "gateway scope wrongly refused a real checkout"
+    fi
+}
+
 test_keeps_shared_build_watch_when_a_workspace_still_serves() {
     echo "test: shared build-watch survives while another workspace still serves"
 
@@ -781,8 +852,494 @@ test_legacy_pg_volume_layout_detects_parent_pgdata
 test_legacy_pg_volume_layout_detects_root_pgdata
 test_swap_ports_writes_shared_database_url
 test_seed_gateway_registry_removes_legacy_database_url
+
+# ── worktree-pinned stack guard ────────────────────────────────────────
+# Regression cover for the 2026-07-26 incident: the whole stack (gateway binary,
+# engine binary, LUCIDOS_STATIC_DIR) was running out of an orphaned CC worktree,
+# so every frontend-only Apply silently served a frozen dist/.
+# See docs/plans/2026-07-26-worktree-pinned-stack-guard.md.
+
+test_worktree_predicate_classifies_paths() {
+    echo "test: path_is_in_cc_worktree classifies worktree vs real checkout paths"
+
+    local p ok=1
+    # Inside a CC worktree → true. Note the predicate must NOT stat: an orphaned
+    # worktree may no longer exist, which is exactly when the guard must fire.
+    for p in \
+        "/Users/me/workspaces/dev/.lucidos/worktrees/thread-abc123" \
+        "/Users/me/workspaces/dev/.lucidos/worktrees/thread-abc123/crates/lucidos-app" \
+        "/w/.lucidos/worktrees"
+    do
+        path_is_in_cc_worktree "$p" || { fail "should be worktree: $p"; ok=0; }
+    done
+    # A real checkout → false, including paths that merely mention the words.
+    for p in \
+        "/Users/me/projects/lucidos" \
+        "/Users/me/projects/lucidos/crates/lucidos-app" \
+        "/Users/me/worktrees/lucidos" \
+        "/Users/me/projects/.lucidos-worktrees/x"
+    do
+        path_is_in_cc_worktree "$p" && { fail "should NOT be worktree: $p"; ok=0; }
+    done
+    [ "$ok" = "1" ] && pass "predicate classifies both directions"
+}
+
+test_refuses_worktree_pinned_stack() {
+    echo "test: a worktree-rooted checkout is refused with an actionable message"
+
+    local wt="$SANDBOX/ws/.lucidos/worktrees/thread-dead/crates"
+    mkdir -p "$wt"
+    local out rc
+    out="$(LUCIDOS_ALLOW_WORKTREE_STACK='' assert_stack_not_worktree_pinned \
+             "$SANDBOX/ws/.lucidos/worktrees/thread-dead" 2>&1)" && rc=0 || rc=$?
+
+    if [ "${rc:-0}" -ne 0 ]; then
+        pass "refused with non-zero exit"
+    else
+        fail "worktree-rooted checkout was allowed"
+    fi
+    # The message has to be actionable, not just a refusal.
+    case "$out" in
+        *"web-dev.sh -w"*) pass "message names the command to run" ;;
+        *) fail "message lacks the corrective command: $out" ;;
+    esac
+    case "$out" in
+        *LUCIDOS_ALLOW_WORKTREE_STACK*) pass "message names the opt-in" ;;
+        *) fail "message lacks the opt-in escape hatch: $out" ;;
+    esac
+}
+
+test_worktree_stack_allowed_with_explicit_optin() {
+    echo "test: LUCIDOS_ALLOW_WORKTREE_STACK=1 keeps the e2e path working"
+
+    # This is the contract e2e depends on — CC sessions run
+    # `web-dev.sh -w e2e-test -b` from inside their own worktree.
+    if LUCIDOS_ALLOW_WORKTREE_STACK=1 assert_stack_not_worktree_pinned \
+         "$SANDBOX/ws/.lucidos/worktrees/thread-live" >/dev/null 2>&1; then
+        pass "opt-in permits a worktree-rooted stack"
+    else
+        fail "opt-in did not permit a worktree-rooted stack (this breaks e2e)"
+    fi
+}
+
+test_worktree_error_names_the_real_checkout() {
+    echo "test: the refusal resolves the real checkout from the worktree .git file"
+
+    local wt="$SANDBOX/ws2/.lucidos/worktrees/thread-x"
+    mkdir -p "$wt"
+    # A linked worktree's .git is a file pointing back at the main checkout.
+    echo "gitdir: $SANDBOX/realcheckout/.git/worktrees/thread-x" > "$wt/.git"
+
+    local out
+    out="$(LUCIDOS_ALLOW_WORKTREE_STACK='' assert_stack_not_worktree_pinned "$wt" 2>&1)" || true
+    case "$out" in
+        *"cd $SANDBOX/realcheckout"*) pass "names the real checkout to cd into" ;;
+        *) fail "did not resolve the real checkout: $out" ;;
+    esac
+}
+
+test_real_checkout_is_not_refused() {
+    echo "test: a normal checkout passes the guard untouched"
+
+    local proj="$SANDBOX/projects/lucidos"
+    mkdir -p "$proj"
+    if LUCIDOS_ALLOW_WORKTREE_STACK='' assert_stack_not_worktree_pinned "$proj" >/dev/null 2>&1; then
+        pass "real checkout allowed"
+    else
+        fail "real checkout was wrongly refused"
+    fi
+}
+
+# ── Published launch binaries (ADR 0022) ───────────────────────────────
+# Regression cover for the 2026-07-26 root cause: every cargo variant in the
+# checkout uplifts to ONE `target/<profile>/lucidos-engine`, so launching from
+# it ran (and compared against) whatever landed there last — another commit,
+# another feature configuration. Builds now publish into
+# `target/<profile>/launch/<variant>/` and launch from there.
+# See docs/plans/2026-07-27-launch-binary-published-per-variant.md.
+
+# A stand-in for a built binary: prints `$id` for `--build-id`, like the real
+# `lucidos-engine --build-id` the verification step reads.
+make_build_id_stub() {
+    local path="$1" id="$2"
+    mkdir -p "$(dirname "$path")"
+    # shellcheck disable=SC2016 # ${1:-} belongs to the GENERATED script, so it must not expand here
+    printf '#!/bin/bash\n[ "${1:-}" = "--build-id" ] && printf "%%s\\n" "%s"\nexit 0\n' "$id" > "$path"
+    chmod +x "$path"
+}
+
+test_launch_bin_dir_is_per_profile_and_variant() {
+    echo "test: the launch dir is keyed by BOTH profile and feature variant"
+
+    local PROJECT_DIR="$SANDBOX/proj-launchdir"
+
+    local got
+    got="$(RELEASE="" ENGINE_BUILD_FEATURES="" launch_bin_dir)"
+    if [ "$got" = "$PROJECT_DIR/target/debug/launch/plain" ]; then
+        pass "plain debug build publishes to target/debug/launch/plain"
+    else
+        fail "unexpected plain debug launch dir: $got"
+    fi
+
+    # The pairing that matters: e2e (release + e2e-test-hooks) and a dev
+    # workspace (debug + plain) must resolve to DISJOINT directories, so a
+    # hooks-enabled engine — whose push transport is an in-process stub — can
+    # never become what a dev workspace launches.
+    local e2e_dir dev_dir
+    e2e_dir="$(RELEASE=1 ENGINE_BUILD_FEATURES="e2e-test-hooks" launch_bin_dir)"
+    dev_dir="$(RELEASE="" ENGINE_BUILD_FEATURES="" launch_bin_dir)"
+    if [ "$e2e_dir" = "$PROJECT_DIR/target/release/launch/e2e-test-hooks" ]; then
+        pass "e2e publishes to target/release/launch/e2e-test-hooks"
+    else
+        fail "unexpected e2e launch dir: $e2e_dir"
+    fi
+    if [ "$e2e_dir" != "$dev_dir" ]; then
+        pass "e2e and dev launch dirs are disjoint"
+    else
+        fail "e2e and dev share a launch dir — the whole collision is back"
+    fi
+
+    # LUCIDOS_E2E_DEBUG=1 drops e2e to the debug profile; it must still not
+    # land on the plain dev binary.
+    got="$(RELEASE="" ENGINE_BUILD_FEATURES="e2e-test-hooks" launch_bin_dir)"
+    if [ "$got" = "$PROJECT_DIR/target/debug/launch/e2e-test-hooks" ]; then
+        pass "debug e2e stays out of the plain debug launch dir"
+    else
+        fail "unexpected debug e2e launch dir: $got"
+    fi
+
+    # Multiple features collapse into one component, and the slug can never
+    # escape the launch dir (it is a path component).
+    got="$(ENGINE_BUILD_FEATURES="a b" engine_build_variant_slug)"
+    if [ "$got" = "a_b" ]; then
+        pass "a multi-feature list becomes one path component"
+    else
+        fail "unexpected multi-feature slug: $got"
+    fi
+    got="$(ENGINE_BUILD_FEATURES="../escape" engine_build_variant_slug)"
+    if [ "$got" = "escape" ]; then
+        pass "slug strips path separators and dots"
+    else
+        fail "slug did not sanitize traversal: $got"
+    fi
+}
+
+test_publish_launch_binary_is_atomic_and_executable() {
+    echo "test: publishing replaces the launch binary completely and leaves no temp"
+
+    local src="$SANDBOX/publish-src/lucidos-engine"
+    local dst="$SANDBOX/publish-dst/launch/plain/lucidos-engine"
+    mkdir -p "$(dirname "$src")"
+    printf 'NEW-BINARY' > "$src"
+    chmod +x "$src"
+    mkdir -p "$(dirname "$dst")"
+    printf 'OLD-BINARY' > "$dst"
+
+    if publish_launch_binary "$src" "$dst"; then
+        pass "publish reported success"
+    else
+        fail "publish of an existing source failed"
+    fi
+    if [ "$(cat "$dst")" = "NEW-BINARY" ]; then
+        pass "launch binary replaced with the freshly built one"
+    else
+        fail "launch binary not replaced: $(cat "$dst")"
+    fi
+    if [ -x "$dst" ]; then
+        pass "published binary is executable"
+    else
+        fail "published binary lost its exec bit"
+    fi
+    # A leftover temp would mean a non-atomic path: a spawn could catch a
+    # half-written binary, which is exactly what the rename prevents.
+    if [ -z "$(find "$(dirname "$dst")" -name '*.tmp.*' 2>/dev/null)" ]; then
+        pass "no temp file left behind"
+    else
+        fail "publish left a temp file in the launch dir"
+    fi
+}
+
+test_publish_failure_preserves_the_previous_binary() {
+    echo "test: a failed publish never leaves the launch path missing (never strands)"
+
+    local src_dir="$SANDBOX/publish-fail-src"
+    local dst_dir="$SANDBOX/publish-fail-dst/launch/plain"
+    mkdir -p "$src_dir" "$dst_dir"
+    # The engine did not build (aborted / killed mid-compile); gateway + CLI did.
+    printf 'GW' > "$src_dir/lucidos-gateway"
+    printf 'CLI' > "$src_dir/lucidos"
+    printf 'PREVIOUS-ENGINE' > "$dst_dir/lucidos-engine"
+
+    # Keep the suite hermetic: the real signer is macOS + keychain dependent and
+    # would either print a setup hint or try to codesign these 2-byte fixtures.
+    sign_engine_binary() { :; }
+    local rc=0
+    publish_launch_binaries "$src_dir" "$dst_dir" || rc=$?
+    unset -f sign_engine_binary
+    if [ "$rc" -ne 0 ]; then
+        pass "publish reports failure when the engine is missing"
+    else
+        fail "publish claimed success with no engine to publish"
+    fi
+    if [ "$(cat "$dst_dir/lucidos-engine")" = "PREVIOUS-ENGINE" ]; then
+        pass "the previously published engine is left intact"
+    else
+        fail "a failed publish clobbered the working engine binary"
+    fi
+    if [ -z "$(find "$dst_dir" -name '*.tmp.*' 2>/dev/null)" ]; then
+        pass "no temp file left behind on the failure path"
+    else
+        fail "failed publish left a temp file"
+    fi
+    # The `lucidos` CLI must land next to the engine — find_lucidos_cli_dir
+    # walks up from the engine's exe dir, and without it the lucidos-cli skill
+    # is not installed into coding-agent sessions.
+    if [ -x "$dst_dir/lucidos" ]; then
+        pass "the lucidos CLI is published next to the engine"
+    else
+        fail "the lucidos CLI was not published alongside the engine"
+    fi
+}
+
+test_publish_signs_the_temp_before_the_rename() {
+    echo "test: signing happens on the temp copy, never on the published path"
+
+    # `codesign --force` rewrites its target IN PLACE. Signing the already-
+    # renamed binary would leave a peer engine spawning a half-rewritten file —
+    # defeating the atomicity the rename exists for. Assert the ordering by
+    # recording what sign_engine_binary was handed and whether the destination
+    # existed at that moment.
+    local src="$SANDBOX/sign-order-src/lucidos-engine"
+    local dst="$SANDBOX/sign-order-dst/launch/plain/lucidos-engine"
+    mkdir -p "$(dirname "$src")"
+    printf 'BINARY' > "$src"
+
+    local signed_path="" dst_existed_at_sign_time=""
+    sign_engine_binary() {
+        signed_path="$1"
+        [ -e "$dst" ] && dst_existed_at_sign_time=yes || dst_existed_at_sign_time=no
+    }
+
+    publish_launch_binary "$src" "$dst" sign
+    unset -f sign_engine_binary
+
+    case "$signed_path" in
+        "$dst".tmp.*) pass "signed the temp copy, not the launch path" ;;
+        "") fail "sign_engine_binary was never called for a 'sign' publish" ;;
+        *) fail "signed the wrong path: $signed_path" ;;
+    esac
+    if [ "$dst_existed_at_sign_time" = "no" ]; then
+        pass "the launch path did not exist yet when signing ran"
+    else
+        fail "signing ran after the rename — a peer could spawn a mid-codesign binary"
+    fi
+
+    # And a publish without the flag must not sign at all (the CLI).
+    signed_path=""
+    sign_engine_binary() { signed_path="$1"; }
+    publish_launch_binary "$src" "$SANDBOX/sign-order-dst/launch/plain/lucidos"
+    unset -f sign_engine_binary
+    if [ -z "$signed_path" ]; then
+        pass "an unsigned publish does not invoke the signer"
+    else
+        fail "unexpectedly signed $signed_path"
+    fi
+}
+
+test_published_build_state_classifies_against_head() {
+    echo "test: published_build_state tells 'stale' from 'unknown'"
+
+    local PROJECT_DIR="$SANDBOX/proj-buildstate"
+    mkdir -p "$PROJECT_DIR"
+    git -C "$PROJECT_DIR" init -q 2>/dev/null
+    git -C "$PROJECT_DIR" config user.email "test@example.com"
+    git -C "$PROJECT_DIR" config user.name "Test"
+    printf 'x' > "$PROJECT_DIR/a.txt"
+    git -C "$PROJECT_DIR" add . >/dev/null 2>&1
+    git -C "$PROJECT_DIR" commit -qm first >/dev/null 2>&1
+    local short full
+    short="$(git -C "$PROJECT_DIR" rev-parse --short HEAD)"
+    full="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
+
+    local stub="$SANDBOX/buildstate/lucidos-engine"
+
+    make_build_id_stub "$stub" "$short"
+    if [ "$(published_build_state "$stub")" = "current" ]; then
+        pass "HEAD's short sha reads as current"
+    else
+        fail "HEAD's short sha misread: $(published_build_state "$stub")"
+    fi
+
+    # Dirty engine source stamps `<sha>-<diffhash>` — still the same commit.
+    make_build_id_stub "$stub" "$short-0badc0ffee123456"
+    if [ "$(published_build_state "$stub")" = "current" ]; then
+        pass "a dirty-tree suffix is still current"
+    else
+        fail "dirty-tree id misread as not current"
+    fi
+
+    # The abbreviation trap: the two sides can be abbreviated to different
+    # lengths, so the comparison must be a prefix test in BOTH directions —
+    # otherwise every build would "fail" verification and rebuild forever.
+    make_build_id_stub "$stub" "$full"
+    if [ "$(published_build_state "$stub")" = "current" ]; then
+        pass "a longer abbreviation of the same commit is current"
+    else
+        fail "prefix comparison is not symmetric"
+    fi
+
+    # A binary from a different commit — the case the retry exists for.
+    make_build_id_stub "$stub" "0123456789abc"
+    if [ "$(published_build_state "$stub")" = "stale" ]; then
+        pass "a different commit reads as stale"
+    else
+        fail "a different commit was not detected as stale"
+    fi
+
+    # Indeterminate must never read as stale: a rebuild cannot fix any of these,
+    # so treating them as a mismatch would double every build forever.
+    make_build_id_stub "$stub" "src-0123456789abcdef"
+    if [ "$(published_build_state "$stub")" = "unknown" ]; then
+        pass "a no-git src-… id is unknown, not stale"
+    else
+        fail "src-… id misclassified"
+    fi
+    make_build_id_stub "$stub" ""
+    if [ "$(published_build_state "$stub")" = "unknown" ]; then
+        pass "an empty build id is unknown"
+    else
+        fail "empty build id misclassified"
+    fi
+    printf '#!/bin/bash\nexit 1\n' > "$stub"; chmod +x "$stub"
+    if [ "$(published_build_state "$stub")" = "unknown" ]; then
+        pass "a binary that cannot report its id is unknown"
+    else
+        fail "unreadable build id misclassified"
+    fi
+    if [ "$(published_build_state "$SANDBOX/buildstate/does-not-exist")" = "unknown" ]; then
+        pass "a missing binary is unknown"
+    else
+        fail "missing binary misclassified"
+    fi
+
+    # No git in the checkout (shipped tarball / CI container).
+    local PROJECT_DIR_NOGIT="$SANDBOX/proj-nogit"
+    mkdir -p "$PROJECT_DIR_NOGIT"
+    make_build_id_stub "$stub" "0123456789abc"
+    if [ "$(PROJECT_DIR="$PROJECT_DIR_NOGIT" published_build_state "$stub")" = "unknown" ]; then
+        pass "a non-git checkout is unknown, never stale"
+    else
+        fail "non-git checkout misclassified"
+    fi
+}
+
+test_locate_prefers_published_and_falls_back() {
+    echo "test: the no-build path prefers the published binary, then warns"
+
+    local PROJECT_DIR="$SANDBOX/proj-locate"
+    local ENGINE_BIN="" GATEWAY_BIN="" out rc=0
+    mkdir -p "$PROJECT_DIR/target/debug/launch/plain"
+    : > "$PROJECT_DIR/target/debug/lucidos-engine"
+    : > "$PROJECT_DIR/target/debug/lucidos-gateway"
+    : > "$PROJECT_DIR/target/debug/launch/plain/lucidos-engine"
+    : > "$PROJECT_DIR/target/debug/launch/plain/lucidos-gateway"
+
+    out="$(RELEASE="" locate_launch_binaries 2>&1)"
+    RELEASE="" locate_launch_binaries >/dev/null 2>&1
+    if [ "$ENGINE_BIN" = "$PROJECT_DIR/target/debug/launch/plain/lucidos-engine" ]; then
+        pass "published binary preferred over cargo's uplift path"
+    else
+        fail "did not prefer the published binary: $ENGINE_BIN"
+    fi
+    if [ "$GATEWAY_BIN" = "$PROJECT_DIR/target/debug/launch/plain/lucidos-gateway" ]; then
+        pass "engine and gateway come from the same directory"
+    else
+        fail "gateway did not pair with the engine: $GATEWAY_BIN"
+    fi
+    case "$out" in
+        *WARNING*) fail "warned while a published binary was available: $out" ;;
+        *) pass "no warning when launching a published binary" ;;
+    esac
+
+    # No published binary yet (first launch after this change, or a hand-run
+    # `cargo build`): fall back rather than strand the workspace, but say so.
+    rm -f "$PROJECT_DIR/target/debug/launch/plain/lucidos-engine"
+    out="$(RELEASE="" locate_launch_binaries 2>&1)"
+    RELEASE="" locate_launch_binaries >/dev/null 2>&1
+    if [ "$ENGINE_BIN" = "$PROJECT_DIR/target/debug/lucidos-engine" ]; then
+        pass "falls back to cargo's uplift path instead of stranding"
+    else
+        fail "no fallback to the uplift path: $ENGINE_BIN"
+    fi
+    case "$out" in
+        *WARNING*"-b"*) pass "the fallback warns and names -b" ;;
+        *) fail "fallback did not warn actionably: $out" ;;
+    esac
+
+    # A launch dir holding ONLY the engine is a half-finished build: selecting it
+    # would pair a fresh engine with a missing gateway and fail much later, with
+    # a far less obvious error than "run with -b".
+    mkdir -p "$PROJECT_DIR/target/debug/launch/plain"
+    : > "$PROJECT_DIR/target/debug/launch/plain/lucidos-engine"
+    rm -f "$PROJECT_DIR/target/debug/launch/plain/lucidos-gateway"
+    RELEASE="" locate_launch_binaries >/dev/null 2>&1
+    if [ "$ENGINE_BIN" = "$PROJECT_DIR/target/debug/lucidos-engine" ]; then
+        pass "a gateway-less launch dir is skipped, not half-selected"
+    else
+        fail "selected an incomplete launch dir: $ENGINE_BIN"
+    fi
+    rm -f "$PROJECT_DIR/target/debug/launch/plain/lucidos-engine"
+
+    # A release request still falls back to a debug build, as it always has.
+    if RELEASE=1 locate_launch_binaries >/dev/null 2>&1 &&
+       [ "$ENGINE_BIN" = "$PROJECT_DIR/target/debug/lucidos-engine" ]; then
+        pass "a release request still falls back to debug"
+    else
+        fail "release→debug fallback regressed: $ENGINE_BIN"
+    fi
+
+    # A featured build looks in its OWN launch dir, not the plain one.
+    mkdir -p "$PROJECT_DIR/target/debug/launch/e2e-test-hooks"
+    : > "$PROJECT_DIR/target/debug/launch/e2e-test-hooks/lucidos-engine"
+    : > "$PROJECT_DIR/target/debug/launch/e2e-test-hooks/lucidos-gateway"
+    if RELEASE="" ENGINE_BUILD_FEATURES="e2e-test-hooks" locate_launch_binaries >/dev/null 2>&1 &&
+       [ "$ENGINE_BIN" = "$PROJECT_DIR/target/debug/launch/e2e-test-hooks/lucidos-engine" ]; then
+        pass "a featured build locates its own variant dir"
+    else
+        fail "featured build did not use its variant dir: $ENGINE_BIN"
+    fi
+
+    # Nothing on disk at all keeps the historical, actionable error.
+    local PROJECT_DIR_EMPTY="$SANDBOX/proj-locate-empty"
+    mkdir -p "$PROJECT_DIR_EMPTY"
+    out="$(PROJECT_DIR="$PROJECT_DIR_EMPTY" RELEASE="" locate_launch_binaries 2>&1)" && rc=0 || rc=$?
+    if [ "${rc:-0}" -ne 0 ]; then
+        pass "an empty checkout still fails"
+    else
+        fail "an empty checkout reported success"
+    fi
+    case "$out" in
+        *"No engine binary found. Run with -b to build."*) pass "keeps the historical error text" ;;
+        *) fail "error text changed: $out" ;;
+    esac
+}
+
 test_keeps_shared_build_watch_when_a_workspace_still_serves
 test_kills_shared_build_watch_when_no_workspace_serves
+test_launch_bin_dir_is_per_profile_and_variant
+test_publish_launch_binary_is_atomic_and_executable
+test_publish_failure_preserves_the_previous_binary
+test_publish_signs_the_temp_before_the_rename
+test_published_build_state_classifies_against_head
+test_locate_prefers_published_and_falls_back
+test_worktree_predicate_classifies_paths
+test_refuses_worktree_pinned_stack
+test_worktree_stack_allowed_with_explicit_optin
+test_worktree_error_names_the_real_checkout
+test_real_checkout_is_not_refused
+test_gateway_scope_ignores_the_optin
+test_stack_scope_still_honours_the_optin
+test_gateway_scope_allows_a_real_checkout
 
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"

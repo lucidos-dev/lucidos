@@ -54,27 +54,33 @@ function makeStorage(): Storage {
     key: (i: number) => Object.keys(store)[i] ?? null,
   };
 }
-// Node ≥22 ships an experimental Web Storage global that throws on access
-// unless the process was started with `--localstorage-file <path>`. A bare
-// `typeof === 'undefined'` guard leaves that broken global in place, so every
-// test importing a store module crashes at import with
-// "localStorage.getItem is not a function". Install the in-memory stub
-// whenever the real one is missing OR non-functional.
-function storageWorks(s: unknown): boolean {
-  try {
-    if (!s || typeof (s as Storage).getItem !== 'function') return false;
-    (s as Storage).getItem('__probe__');
-    return true;
-  } catch {
-    return false;
-  }
+// Node ≥22 ships a Web Storage global that is unusable here: without a
+// `--localstorage-file <path>` it throws (Node 22/23) or warns and degrades
+// (Node 25) the moment it is touched, so every test importing a store module
+// used to crash at import with "localStorage.getItem is not a function".
+//
+// Install the in-memory stub UNCONDITIONALLY. Tests want a deterministic,
+// per-process store that starts empty and shares nothing with the machine —
+// never a real on-disk one — so there is no case where keeping the platform's
+// implementation is right, and probing to find out is itself the problem: the
+// old code called `getItem('__probe__')` on the built-in, and Node's accessor
+// emits "`--localstorage-file` was provided without a valid path" on that read.
+// One warning per vitest worker meant 365 lines of noise in a full run (the
+// 2026-07-26 nightly's BuildClean concern 2) — enough to bury a real warning.
+//
+// `Object.defineProperty`, not assignment: Node defines `localStorage` as a
+// getter on `globalThis` (node:internal/webstorage), and a plain assignment to
+// a getter-only accessor throws in the ESM module scope. Redefining the
+// property replaces the accessor outright, so the built-in is never invoked.
+function installStorage(name: 'localStorage' | 'sessionStorage'): void {
+  Object.defineProperty(globalThis, name, {
+    value: makeStorage(),
+    writable: true,
+    configurable: true,
+  });
 }
-if (!storageWorks((globalThis as any).localStorage)) {
-  (globalThis as any).localStorage = makeStorage();
-}
-if (!storageWorks((globalThis as any).sessionStorage)) {
-  (globalThis as any).sessionStorage = makeStorage();
-}
+installStorage('localStorage');
+installStorage('sessionStorage');
 // Minimal EventTarget on window — enough for addEventListener/dispatchEvent in tests.
 if (typeof (globalThis as any).addEventListener === 'undefined') {
   const listeners: Record<string, Function[]> = {};

@@ -1123,3 +1123,54 @@ describe('CC compose pick is per-draft (no cross-thread leak)', () => {
     expect(getComposeSelectionOverride('cc-m').ccModel).toBeUndefined();
   });
 });
+
+/** `pendingComposePuts` means "the server has not seen this device's latest
+ *  compose intent yet" — every consumer (the `ThreadComposeChanged` SSE guard,
+ *  `upsertThread`'s staleness gate, the supersede check) reads it that way and
+ *  yields while it is set. It must therefore stay set until the LAST scheduled
+ *  write settles, not the first: an edit made while a PUT is in flight schedules
+ *  a fresh debounce, and a PUT slower than the debounce can overlap the next one
+ *  outright. Releasing on the earlier one's completion advertised "settled" with
+ *  a newer write still pending. */
+describe('pendingComposePuts covers the LAST pending write, not the first', () => {
+  let resolveFirstPut: (() => void) | null = null;
+
+  beforeEach(() => {
+    _resetComposeDraftsForTesting();
+    composeEditedAt.delete('t-1');
+    pendingComposePuts.clear();
+    const map = new Map<string, ThreadState>();
+    map.set('t-1', makeThread({ id: 't-1', state: 'active' }));
+    threadMap.value = map;
+    connectionStatus.value = 'connected';
+    focusedThreadId.value = 't-1';
+    vi.useFakeTimers();
+    globalThis.fetch = vi.fn(() => new Promise<Response>((resolve) => {
+      resolveFirstPut = () => resolve(new Response(null, { status: 204 }));
+    })) as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    globalThis.fetch = originalFetch;
+    resolveFirstPut = null;
+    pendingComposePuts.clear();
+    composeEditedAt.delete('t-1');
+    _resetComposeDraftsForTesting();
+    threadMap.value = new Map();
+    focusedThreadId.value = null;
+    connectionStatus.value = 'disconnected';
+  });
+
+  it('stays set when a keystroke re-arms the debounce while the first PUT is in flight', async () => {
+    updateCompose('t-1', { text: 'first' });
+    await vi.advanceTimersByTimeAsync(300);       // debounce fires → PUT in flight
+    expect(pendingComposePuts.has('t-1')).toBe(true);
+
+    updateCompose('t-1', { text: 'first and more' });  // re-arms the debounce
+    resolveFirstPut?.();
+    await vi.advanceTimersByTimeAsync(0);         // the FIRST PUT settles
+
+    expect(pendingComposePuts.has('t-1')).toBe(true);
+  });
+});

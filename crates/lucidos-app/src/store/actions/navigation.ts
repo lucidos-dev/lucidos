@@ -42,9 +42,14 @@ function inlineFormsEqual(a: InlineForm | null, b: InlineForm | null): boolean {
     case 'new-app': return true;
     case 'trigger': return a.triggerId === (b as typeof a).triggerId;
     case 'email-confirm': {
+      const bb = b as typeof a;
       const ar = a.request;
-      const br = (b as typeof a).request;
+      const br = bb.request;
+      // `sentAt` is part of the identity: the pending confirmation and the
+      // receipt for the same email are different destinations (one still has a
+      // Send button), so they must never dedupe against each other.
       return (
+        a.sentAt === bb.sentAt &&
         ar.subject === br.subject &&
         ar.to.length === br.to.length &&
         ar.to.every((addr, i) => addr === br.to[i])
@@ -154,19 +159,24 @@ function migrateEntry(raw: Record<string, unknown>): NavEntry {
  *  by an engine-staged request whose id (a fresh-per-prepare-call UUID) is dead
  *  the moment the page reloads — restoring the panel would show a stale form
  *  whose Confirm/Cancel resolves a request that no longer exists. Covers plugin
- *  install/uninstall, email-confirm, and an *engine-prompted* credential request
- *  (a `credential` form WITH a `request`). A `credential` form WITHOUT a request
- *  is a Settings-driven edit of a stored credential and restores normally, as do
- *  the persistent forms (app-edit, new-app, trigger). Mirrors the url-preview
- *  suppression guard in `restoreState`. */
+ *  install/uninstall, a *pending* email-confirm, and an *engine-prompted*
+ *  credential request (a `credential` form WITH a `request`). A `credential`
+ *  form WITHOUT a request is a Settings-driven edit of a stored credential and
+ *  restores normally, as do the persistent forms (app-edit, new-app, trigger).
+ *  Mirrors the url-preview suppression guard in `restoreState`. */
 function isTransientForm(overlay: PanelOverlay): boolean {
   if (overlay?.type !== 'form') return false;
   const form = overlay.form;
   switch (form.type) {
     case 'plugin-install':
     case 'plugin-uninstall':
-    case 'email-confirm':
       return true;
+    case 'email-confirm':
+      // A SENT email is a receipt, not a staged request — nothing is left to
+      // resolve, so it restores like any other destination. That's what makes it
+      // a real history entry rather than a session artifact. Only the pending
+      // confirmation dies with the page.
+      return form.sentAt == null;
     case 'credential':
       return form.request != null;
     default:

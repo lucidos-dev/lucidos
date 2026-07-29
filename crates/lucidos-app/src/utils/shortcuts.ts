@@ -50,7 +50,13 @@ export interface ShortcutDef {
 const B = (mod: boolean, shift: boolean, alt: boolean, key: string): Binding => ({ mod, shift, alt, key });
 
 /** The full registry. Order is the cheat-sheet display order. All entries are
- *  rebindable; the single-key `c`/`t` shortcuts were intentionally dropped. */
+ *  rebindable; the single-key `c`/`t` shortcuts were intentionally dropped.
+ *  Labels render in Settings → Keyboard shortcuts (and in Search Everywhere via
+ *  `searchIndex.ts`), so they use `system-knowhow/glossary.md`'s two layers: a
+ *  shortcut acting on ONE pane names it mechanically — thread drawer, thread
+ *  pane, content pane — while `maximizePaneGroup`, which acts on a whole side,
+ *  names the sides (Conversation / Canvas). Never surface the dev-only "pane
+ *  group" here; it is defined in `docs/glossary.md` only. */
 export const SHORTCUT_DEFS: readonly ShortcutDef[] = [
   { id: 'newThread', label: 'New thread', category: 'Navigation', defaultBinding: B(true, true, false, 'o') },
   { id: 'closeThread', label: 'Close thread (cascade)', category: 'Navigation', defaultBinding: B(true, true, false, 'w') },
@@ -59,12 +65,12 @@ export const SHORTCUT_DEFS: readonly ShortcutDef[] = [
   { id: 'toggleSubthreads', label: 'Expand or collapse sub-threads (focused thread)', category: 'Navigation', defaultBinding: B(true, true, false, 'e') },
   { id: 'historyBack', label: 'Back (focused pane)', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowDown') },
   { id: 'historyForward', label: 'Forward (focused pane)', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowUp') },
-  { id: 'prevThreadTurn', label: 'Previous turn (conversation)', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowUp') },
-  { id: 'nextThreadTurn', label: 'Next turn (conversation)', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowDown') },
+  { id: 'prevThreadTurn', label: 'Previous turn (thread)', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowUp') },
+  { id: 'nextThreadTurn', label: 'Next turn (thread)', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowDown') },
   { id: 'toggleThreadDrawer', label: 'Show or hide thread drawer', category: 'Panes', defaultBinding: B(true, true, false, '1') },
   { id: 'toggleThreadPane', label: 'Focus or hide thread pane', category: 'Panes', defaultBinding: B(true, true, false, '2') },
   { id: 'toggleContentPane', label: 'Focus or hide content pane', category: 'Panes', defaultBinding: B(true, true, false, '3') },
-  { id: 'maximizePaneGroup', label: 'Maximize focused pane group', category: 'Panes', defaultBinding: B(true, true, false, 'Enter') },
+  { id: 'maximizePaneGroup', label: 'Maximize focused side (Conversation or Canvas)', category: 'Panes', defaultBinding: B(true, true, false, 'Enter') },
   { id: 'narrowThreadPane', label: 'Narrow thread pane', category: 'Panes', defaultBinding: B(true, false, true, 'ArrowLeft') },
   { id: 'widenThreadPane', label: 'Widen thread pane', category: 'Panes', defaultBinding: B(true, false, true, 'ArrowRight') },
   { id: 'narrowThreadDrawer', label: 'Narrow thread drawer', category: 'Panes', defaultBinding: B(true, true, true, 'ArrowLeft') },

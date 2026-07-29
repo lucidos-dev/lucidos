@@ -226,9 +226,12 @@ async fn append_injected_prompts_coalesces_messages_but_emits_each_audit_row() {
     ];
 
     let mut messages = Vec::<Message>::new();
+    let appended =
+        append_injected_prompts_to_messages(&bus, thread_id, &meta, &mut messages, prompts).await;
+    assert!(appended.appended, "coalescing should append one LLM message");
     assert!(
-        append_injected_prompts_to_messages(&bus, thread_id, &meta, &mut messages, prompts).await,
-        "coalescing should append one LLM message"
+        appended.image_message_idxs.is_empty(),
+        "text-only injections must not be pinned against image trimming"
     );
     assert_eq!(messages.len(), 1);
     let MessageContent::Blocks(blocks) = &messages[0].content else {
@@ -248,6 +251,62 @@ async fn append_injected_prompts_coalesces_messages_but_emits_each_audit_row() {
     assert_eq!(
         injected_links,
         vec![first_followup_id.to_string(), second_followup_id.to_string()]
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// Regression for the reported bug's first half: the user attached a screenshot
+/// to a message that arrived while the thread was already working, so it was
+/// queued and later injected mid-turn. The loop advanced `user_message_idx` on
+/// injection but nothing recorded that the appended message carried image bytes
+/// — trim pass 0 keeps images on the last message plus the pinned ones only, so
+/// the model's very next tool call stripped it and the agent went blind to a
+/// picture the user had just sent.
+///
+/// The helper must report the appended message's index so the loop can pin it.
+#[tokio::test]
+async fn append_injected_prompts_reports_image_bearing_message_for_pinning() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let origin_id = Uuid::new_v4();
+    let meta = anchor_request(&bus, thread_id, origin_id, "original request").await;
+
+    let prompts = vec![InjectedPrompt {
+        text: "feil i appen".to_string(),
+        event_id: Some(Uuid::new_v4()),
+        mode: ActorMode::Human,
+        spawning_event_id: None,
+        images: Some(vec![crate::api::ChatImage {
+            // 1x1 transparent PNG.
+            base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==".to_string(),
+            mime_type: "image/png".to_string(),
+        }]),
+        origin: None,
+        kind: crate::engine::InjectedPromptKind::UserText,
+    }];
+
+    let mut messages = Vec::<Message>::new();
+    let appended =
+        append_injected_prompts_to_messages(&bus, thread_id, &meta, &mut messages, prompts).await;
+
+    assert!(appended.appended);
+    assert_eq!(
+        appended.image_message_idxs,
+        vec![messages.len() - 1],
+        "an injected message carrying images must be reported so the loop pins it \
+         against trim pass 0"
+    );
+    let MessageContent::Blocks(blocks) = &messages[0].content else {
+        panic!("an image-bearing injection must become a block message");
+    };
+    assert!(
+        blocks
+            .iter()
+            .any(|b| matches!(b, crate::llm::ContentBlock::Image { .. })),
+        "the injected image bytes must actually reach the message"
     );
 
     teardown_test_db(&db_name).await;

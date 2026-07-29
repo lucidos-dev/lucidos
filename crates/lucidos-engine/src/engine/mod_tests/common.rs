@@ -29,12 +29,7 @@ pub(crate) fn register(
     let mut guard_map = threads.lock().unwrap();
     guard_map.insert(
         thread_id,
-        ThreadHandle {
-            token: token.clone(),
-            injection_tx,
-            generation: gen,
-            cancel_actor: Arc::new(std::sync::Mutex::new(None)),
-        },
+        ThreadHandle::new(token.clone(), injection_tx, gen),
     );
     let guard = ThreadGuard {
         active_threads: threads.clone(),
@@ -94,12 +89,7 @@ pub(crate) async fn register_queued_with_timeout(
     let mut guard_map = threads.lock().unwrap();
     guard_map.insert(
         thread_id,
-        ThreadHandle {
-            token: token.clone(),
-            injection_tx,
-            generation: gen,
-            cancel_actor: Arc::new(std::sync::Mutex::new(None)),
-        },
+        ThreadHandle::new(token.clone(), injection_tx, gen),
     );
     let guard = ThreadGuard {
         active_threads: threads.clone(),

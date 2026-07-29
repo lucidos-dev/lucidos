@@ -12,6 +12,15 @@ use std::collections::HashMap;
 impl VertexProvider {
     /// Search the web using Gemini's Google Search grounding.
     /// Returns a formatted string with the grounded answer and numbered source list.
+    ///
+    /// Always issued against the GLOBAL endpoint via
+    /// [`VertexProvider::global_gemini_endpoint`], never the configured region —
+    /// grounding is a global-endpoint feature, and the configured region is the
+    /// *chat* region, which may serve no Gemini models at all (see that method's
+    /// docs). Routing this call through `endpoint_for_model` instead is the
+    /// 2026-07-03 regression: `vertex_region = eu` (needed for Claude Opus 5)
+    /// sent it to a multi-region with no Google publisher models and every
+    /// search 404'd. Pinned by `grounding_endpoint_is_global_for_every_region`.
     pub async fn search_with_grounding(
         &self,
         query: &str,
@@ -20,7 +29,9 @@ impl VertexProvider {
         let model = "gemini-2.5-flash-lite";
         let request = serde_json::json!({
             "system_instruction": {
-                "parts": [{"text": "You are a web search assistant. Search the web thoroughly and return comprehensive, detailed results with sources. Focus on finding and presenting relevant information from search results rather than answering from your own knowledge."}]
+                // Shared with the other web-search backends so all three ask for
+                // the same behavior — see `llm::web_search`.
+                "parts": [{"text": crate::llm::web_search::SEARCH_SYSTEM_PROMPT}]
             },
             "contents": [{
                 "role": "user",
@@ -30,7 +41,7 @@ impl VertexProvider {
         });
 
         let access_token = self.get_access_token().await?;
-        let url = self.endpoint_for_model(model);
+        let url = self.global_gemini_endpoint(model);
 
         let (status, body) = self
             .request_with_retry(model, &url, &access_token, &request)

@@ -36,8 +36,8 @@ const { checkConnection } = await import('../actions/connection');
 const RESTART_TOAST_KEY = 'restart-required';
 const STARTED_AT = '2026-06-28T06:00:00Z';
 const RESTARTED_AT = '2026-06-28T07:00:00Z';
-const BUILD_MESSAGE = 'Starting new version…';
-const SWAP_MESSAGE = 'Starting new version…';
+const NEW_VERSION_MESSAGE = 'Starting new version…';
+const PLAIN_MESSAGE = 'Restarting engine…';
 
 function loadedHealth(overrides: Record<string, unknown> = {}) {
   return {
@@ -48,11 +48,14 @@ function loadedHealth(overrides: Record<string, unknown> = {}) {
 const unreachable = { status: 'failed', error: 'Failed to fetch' };
 
 /** Seed localStorage as if a restart was in flight when the page unloaded, then
- *  reset the signals to fresh-reload defaults and run the startup restore. */
-function reloadMidRestart(packaged: boolean): void {
+ *  reset the signals to fresh-reload defaults and run the startup restore.
+ *  `newVersion` mirrors what initiateEngineRestart persisted — whether the restart
+ *  delivers a new engine version (→ "Starting new version…") or is a plain respawn
+ *  (→ "Restarting engine…"). */
+function reloadMidRestart(newVersion: boolean): void {
   // syncRestartToast set RESTART_LS_KEY; initiateEngineRestart set the in-flight marker.
   localStorage.setItem(RESTART_LS_KEY, 'true');
-  localStorage.setItem(RESTART_IN_FLIGHT_LS_KEY, JSON.stringify({ startedAt: STARTED_AT, packaged }));
+  localStorage.setItem(RESTART_IN_FLIGHT_LS_KEY, JSON.stringify({ startedAt: STARTED_AT, newVersion }));
   connectionStatus.value = 'connecting';
   engineStartedAt.value = null;
   engineRestarting.value = false;
@@ -77,11 +80,11 @@ beforeEach(() => {
 
 describe('restart progress toast survives a reload (in-flight marker)', () => {
   it('restores the PROGRESS toast (not the warning) and re-arms restart state', () => {
-    reloadMidRestart(false);
+    reloadMidRestart(true);
 
     const toast = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
     expect(toast).toBeTruthy();
-    expect(toast!.message).toBe(BUILD_MESSAGE);
+    expect(toast!.message).toBe(NEW_VERSION_MESSAGE);
     expect(toast!.spinning).toBe(true);
     // NOT the pre-restart "Engine restart required" warning — that one carries a
     // Restart action; the progress toast has none.
@@ -94,14 +97,14 @@ describe('restart progress toast survives a reload (in-flight marker)', () => {
     expect(restartRequired.value).toBe(true);
   });
 
-  it('restores the swap-phase message for a packaged restart (no build step)', () => {
-    reloadMidRestart(true);
+  it('restores the plain "Restarting engine…" wording when no new version is delivered', () => {
+    reloadMidRestart(false);
 
-    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)!.message).toBe(SWAP_MESSAGE);
+    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)!.message).toBe(PLAIN_MESSAGE);
   });
 
   it('carries the restored toast to "Engine restarted" on reconnect with a new started_at', async () => {
-    reloadMidRestart(false);
+    reloadMidRestart(true);
     expect(engineRestarting.value).toBe(true);
 
     // Engine comes back with a NEW started_at. hasEverConnected is false (fresh
@@ -117,16 +120,17 @@ describe('restart progress toast survives a reload (in-flight marker)', () => {
     expect(localStorage.getItem(RESTART_IN_FLIGHT_LS_KEY)).toBeNull();
   });
 
-  it('advances the restored build-phase toast to swap when the old engine goes unreachable', async () => {
-    reloadMidRestart(false);
-    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)!.message).toBe(BUILD_MESSAGE);
+  it('keeps the restored progress toast up (unchanged) when the old engine goes unreachable', async () => {
+    reloadMidRestart(true);
+    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)!.message).toBe(NEW_VERSION_MESSAGE);
 
-    // Old engine killed → first /health failure advances the toast to the swap phase.
+    // Old engine killed → a /health failure must NOT dismiss or reword the toast
+    // (there is no build→swap phase transition); it stays with its spinner.
     mockCheckHealth.mockResolvedValueOnce(unreachable);
     await checkConnection();
 
     const toast = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
-    expect(toast!.message).toBe(SWAP_MESSAGE);
+    expect(toast!.message).toBe(NEW_VERSION_MESSAGE);
     expect(toast!.spinning).toBe(true);
     // Still restarting — the flag must NOT clear on a mere disconnect.
     expect(engineRestarting.value).toBe(true);
@@ -148,18 +152,17 @@ describe('restart progress toast survives a reload (in-flight marker)', () => {
   it('a re-sync that flips restartRequired false does NOT dismiss the restored progress toast', () => {
     // After restore, the startup refreshChangesState resolves with the applied
     // change no longer pending (restart_required=false) and calls syncRestartToast.
-    // While engineRestarting is true, that must leave the build/swap progress toast
-    // alone — otherwise the user reloaded mid-restart and the toast vanishes (and
-    // the swap-advance won't recreate a dismissed toast).
-    reloadMidRestart(false);
-    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)!.message).toBe(BUILD_MESSAGE);
+    // While engineRestarting is true, that must leave the progress toast alone —
+    // otherwise the user reloaded mid-restart and the toast vanishes.
+    reloadMidRestart(true);
+    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)!.message).toBe(NEW_VERSION_MESSAGE);
 
     restartRequired.value = false; // backend: applied change dropped out of pending
     syncRestartToast();
 
     const toast = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
     expect(toast).toBeTruthy();
-    expect(toast!.message).toBe(BUILD_MESSAGE);
+    expect(toast!.message).toBe(NEW_VERSION_MESSAGE);
     expect(engineRestarting.value).toBe(true);
   });
 

@@ -279,7 +279,7 @@ async fn user_question_lifecycle_propagates_count() {
         thread_id: child_id,
         event: ThreadEvent::UserQuestionAnswered {
             tool_use_id: "tu-1".into(),
-            answer: crate::engine::thread_events::AnswerKind::FreeText {
+            answer: AnswerKind::FreeText {
                 text: "yes".into(),
             },
         },

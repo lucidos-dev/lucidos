@@ -202,6 +202,35 @@ those stay. The test: *would we still want this if the model were perfect?* No �
 it's a tolerance measure.) For these entries, **Impermanent because** names the
 exact model mistake the measure tolerates.
 
+### "The model" means every model in the registry, not the newest one
+
+Every removal condition below is phrased as "when **the model** reliably stops
+doing X." That singular was written when one Anthropic family served every
+request. It no longer holds: the *model registry* routes chat across Anthropic
+(Vertex + direct), OpenAI, OpenRouter (Kimi K3, GLM 5.2), and a configurable
+local OpenAI-compatible endpoint, and any enabled model can be a user's
+`chat_model`.
+
+So read every "the model" below as **the weakest model the registry routes to**,
+not the newest one. A crutch is dead weight only once every routed model has
+stopped needing it. Two consequences:
+
+- **A new flagship is not evidence of removability.** Adding a stronger default
+  doesn't retire a crutch that a weaker routed model still trips over. Sample
+  across the models actually in use, not just the current default.
+- **Enabling a model can make a measure MORE load-bearing.** A tolerance keyed
+  to one family's failure shape (e.g. the Anthropic `<invoke name=…>` tool-call
+  serialization) doesn't cover the shapes other families leak, so adding a
+  non-Anthropic model widens what the crutch has to survive rather than
+  narrowing it.
+
+**Sample honestly.** A grep that returns zero is only evidence if the sampled
+population actually exercised the choice the measure tolerates. Count the
+denominator — occurrences where the model *made* the decision — not the raw file
+or turn count, and say what the denominator was. A removal condition that can be
+satisfied by a population that never made the choice is a badly-written
+condition; fix the condition rather than acting on it.
+
 ### CC `is_error: true` + `subtype: "success"` contradiction (no fabricated failure)
 
 - **Added:** 2026-07-02
@@ -253,12 +282,28 @@ exact model mistake the measure tolerates.
   named `--font-family` as a mistake to avoid and it kept recurring, so guidance
   alone was insufficient.
 - **Removal / resolution condition:** When app coding-agent threads reliably emit
-  `--font-ui` (sample a batch of recently-generated apps; if none reference
-  `--font-family` / `--font`, the crutch is dead). On removal, also drop the
-  "tolerated aliases" notes in `system-knowhow/js-sdk.md` § Theme variables and
+  `--font-ui`. Sample only apps **created after 2026-06-25** (this measure's Added
+  date — an older app can't evidence a post-measure habit) and classify each as
+  *token-choosing* if any of its `index.html` / `*.css` references `--font-ui`
+  **or** an alias (`--font-family` / `--font`). **The denominator is the
+  token-choosing apps only.** Apps that name no UI-font token are silent for a
+  reason that says nothing about naming: `sdk-iframe.css` already sets
+  `body { font-family: var(--font-ui) }`, so an app never has to name the token to
+  get the user's font, and most don't. Counting those apps makes a clean grep look
+  like a cured habit when it is really an empty sample. A `--font-mono`-only app is
+  likewise not token-choosing — `--font-mono` is a separate token with no
+  competing mis-guess. Drop the aliases when **at least 10 token-choosing apps**
+  created after 2026-06-25 use `--font-ui` and **none** use an alias. Fewer than 10
+  is an insufficient sample, **not** a pass — in particular a sweep that finds
+  *zero* token-choosing apps is no evidence at all; leave the measure active and
+  re-sweep later. On removal, also drop the "tolerated aliases" notes in
+  `system-knowhow/js-sdk.md` § Theme variables and
   `system-knowhow/building-an-app.md`, and restore the stricter "don't invent
   `--font-family`" wording.
-- **Status:** active
+- **Status:** active — last swept 2026-07-25 across two workspaces: of the apps
+  created after 2026-06-25, only 3 were token-choosing (all `--font-ui`, no
+  aliases). Below the 10-app threshold, so the measure stays. The one alias use in
+  the sampled period predates the measure and is not a post-measure regression.
 
 ### `generate_image` vision-misuse guard
 
@@ -316,33 +361,48 @@ exact model mistake the measure tolerates.
   and narrow CRITICAL RULE #1 / VERIFICATION back to file writes.
 - **Status:** active
 
-### Empty-echo stale-resume: require zero tool calls (terse-model tolerance)
+### Empty-echo stale-resume: output-shape inference for an unconfirmed attach
 
 - **Added:** 2026-07-02
+- **Narrowed:** 2026-07-29 — a confirmed attach now vetoes the whole heuristic
+  (see below); what remains is the unconfirmed-attach fallback.
 - **Lives in:** `crates/lucidos-engine/src/engine/agent_session/lifecycle.rs`
-  (`is_stale_resume_signal`'s `no_tool_calls_this_turn` condition) + its feeder
-  `tool_calls_seen` counter in
+  (`is_stale_resume_signal` / `StaleResumeInputs` — the output-shape fields
+  `result_text_empty`, `buffered_text_empty`, `no_prior_results_this_turn`,
+  `no_tool_calls_this_turn`) + its feeder `tool_calls_seen` counter in
   `crates/lucidos-engine/src/engine/agent_session/run_session/run.rs`, with the
-  regression test `empty_result_on_resume_but_made_tool_calls_is_not_stale_resume`
-  in `agent_session/lifecycle_tests/classify.rs`.
-- **Impermanent because (tolerates):** The empty-echo stale-resume heuristic infers
-  "the resumed CC session is dead" from empty assistant output on the first Result.
-  A terse model (Fable-5) legitimately produces empty text and jumps straight to a
-  tool call — indistinguishable-by-output from a dead session. To stop
-  misclassifying a live-but-terse resume as stale (which cancelled + re-spawned →
-  a duplicate CC process on the shared worktree, 2x quota — the 2026-07-02
-  demo-director incident), we additionally require the turn made NO tool calls.
-  Pure heuristic/model-tolerance: the whole empty-output inference is a crutch — a
-  robust signal would key on the ECHOED CC session id, not output shape.
-- **Removal / resolution condition:** When resume liveness is derived from a
-  structured signal — the CC `result` event exposing the resumed session id (so it
-  can be compared to the one we asked to `--resume`), or an explicit
-  session-not-found code — drop the empty-echo heuristic entirely
-  (`is_stale_resume_signal` + `no_tool_calls_this_turn` + `tool_calls_seen`) and key
-  the fresh-spawn retry on that signal alone (`is_definitive_session_not_found` is
-  the start of it). Verify no genuine stale resume slips through on a representative
-  window.
-- **Status:** active
+  regression tests `empty_result_on_resume_but_made_tool_calls_is_not_stale_resume`
+  and `unconfirmed_attach_still_falls_back_to_the_empty_echo_heuristic` in
+  `agent_session/lifecycle_tests/classify.rs`.
+- **Impermanent because (tolerates):** The heuristic infers "the resumed session is
+  dead" from empty assistant output on the first Result, which no model output can
+  actually prove. Two false positives so far, from opposite directions: a terse
+  model (Fable-5) that emits no text and jumps straight to a tool call
+  (2026-07-02 demo-director — cancelled + re-spawned → duplicate CC process on the
+  shared worktree, 2× quota), and a resumed transcript ending on an interrupted
+  tool_use, where `claude --print --resume` emits a Result for its OWN synthetic
+  `Continue from where you left off.` / `No response requested.` turn before
+  reading our stdin (2026-07-29 thread `cb503361`, Opus-5 — killed 10 ms after
+  Init, thread wedged at `running`). The `no_tool_calls_this_turn` condition
+  covers the first; nothing about output shape covers the second.
+- **Partially resolved (2026-07-29):** the structured signal this row asked for is
+  now implemented as `StaleResumeInputs::resume_attach_confirmed` — both backends
+  report at `Init` the session id they actually attached to, and a FAILED resume
+  yields a different one (CC opens a fresh conversation; Codex falls back to
+  `thread/start`). A match is structural proof of life and vetoes every
+  output-shape field. That removes the entire false-positive surface for resumes
+  the backend confirms.
+- **Removal / resolution condition:** What remains is the **unconfirmed-attach**
+  case — the backend reported a different session id, or reported none before the
+  first Result — where output shape is still the only signal. Drop the remaining
+  heuristic (`is_stale_resume_signal`'s four shape fields + `tool_calls_seen`) once
+  a *reported-and-different* sid is treated as definitive on its own, i.e. once
+  `Init` is guaranteed to precede the first `Result` on every backend so
+  `init_sid != resume_sid` can decide alone without an output fallback. Verify by
+  confirming Init-before-Result ordering holds for CC and the Codex app-server
+  across a representative window, then key the fresh-spawn retry on the sid
+  comparison plus `is_definitive_session_not_found` alone.
+- **Status:** active (narrowed)
 
 ### Bare `app` href recovery (LLM link with no id)
 
@@ -639,10 +699,15 @@ measure now eligible for removal** — search this file for the id to find them 
 - **Measures referencing this investigation:** iOS-PWA liveness diagnostic (§1),
   Thread-render blank-body probe (§1) — both resolved 2026-06-30, code retained.
 
-### `cc-reasoning-dormant` — coding-agent "Thinking" step shows nothing
+### `cc-reasoning-dormant` — CC coding-agent "Thinking" step shows nothing
 
 - **Opened:** 2026-06-30 (root cause corrected 2026-07-02 — it is NOT
   Vertex-specific; the entry was formerly `cc-reasoning-dormant-on-vertex`).
+  Scope narrowed 2026-07-07: **Claude Code only.** The Codex half of the same
+  feature is live — codex's default `model_reasoning_summary` emits no
+  reasoning notifications, so both Codex drivers now request `detailed`
+  (`CODEX_REASONING_SUMMARY`, `runtime/codex.rs`) and Codex threads stream
+  reasoning summaries into `CodingAgentThoughtStreamed`.
 - **Lives in:** n/a (investigation). The feature code is correct and stays — the
   `CodingAgentThoughtStreamed` capture in
   `crates/lucidos-engine/src/runtime/claude_code_parse.rs` (`stream_event` arm) and
@@ -652,9 +717,16 @@ measure now eligible for removal** — search this file for the id to find them 
   model's reasoning as a live "Thinking" step instead of a frozen "Working", per
   `docs/plans/2026-06-25-surface-coding-agent-reasoning-in-timeline.md`) is wired
   end-to-end but produces **zero events** for the current models. Anthropic's
-  `thinking.display` defaults to `"omitted"` on Fable 5 / Opus 4.8/4.7 / Sonnet 5,
-  so thinking blocks stream with EMPTY text (encrypted signature only) and no
-  `thinking_delta` arrives. **This is NOT Vertex-specific** — the original heading
+  `thinking.display` defaults to `"omitted"` on every current model — Fable 5 /
+  Opus 5 / Opus 4.8/4.7 / Sonnet 5 — so thinking blocks stream with EMPTY text
+  (encrypted signature only) and no `thinking_delta` arrives. **Opus 5 does not
+  resolve it** — re-checked 2026-07-25 against Opus 5 specifically, not CC in
+  aggregate: the dev workspace has 15 CC threads whose selected model is
+  `claude-opus-5*`, carrying 955 `CodingAgentTextStreamed` events and **zero**
+  `CodingAgentThoughtStreamed`. That is the expected result, because the block is
+  upstream Claude Code's headless `stream-json` path and is model-independent — so
+  no future model is expected to resolve it either. (Every thought event on record
+  in that workspace is Codex.) **This is NOT Vertex-specific** — the original heading
   and premise were wrong. Verified empirically 2026-07-02 by driving the `claude`
   CLI on the **first-party Anthropic API** (`CLAUDE_CONFIG_DIR=~/.claude-personal`,
   Claude Max subscription): the headless `--output-format stream-json` stream

@@ -673,11 +673,49 @@ impl async_imap::Authenticator for &XOAuth2 {
     }
 }
 
+/// Hard wall-clock bound for establishing one IMAP session (TCP connect +
+/// TLS + greeting + auth). None of those phases carries its own timeout —
+/// `TcpStream::connect` waits on the OS (a filtered route can take 75s+ on
+/// macOS) and the greeting read is unbounded — so this gives the most common
+/// failure (an unreachable server) a fast, sharp error. Post-auth stalls are
+/// covered by the whole-operation `IMAP_OP_TIMEOUT` in `email_client.rs`;
+/// sibling of `SMTP_SEND_TIMEOUT` there.
+const IMAP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Connect to an IMAP server and return an authenticated session.
 /// Uses TLS if `account.use_tls` is true, plain TCP otherwise.
 /// If `oauth_access_token` is provided, uses XOAUTH2 SASL authentication
 /// instead of plain LOGIN.
 async fn imap_connect(
+    account: &EmailAccount,
+    oauth_access_token: Option<&str>,
+) -> Result<async_imap::Session<ImapStream>, BoxError> {
+    imap_connect_with_timeout(account, oauth_access_token, IMAP_CONNECT_TIMEOUT).await
+}
+
+/// `imap_connect` with an explicit wall-clock bound (tests pass a short one).
+async fn imap_connect_with_timeout(
+    account: &EmailAccount,
+    oauth_access_token: Option<&str>,
+    connect_timeout: std::time::Duration,
+) -> Result<async_imap::Session<ImapStream>, BoxError> {
+    tokio::time::timeout(
+        connect_timeout,
+        imap_connect_unbounded(account, oauth_access_token),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "IMAP connect to {}:{} timed out after {}s — the server did not respond \
+             (network may block IMAP, or the server is stalled)",
+            account.imap_host,
+            account.imap_port,
+            connect_timeout.as_secs()
+        )
+    })?
+}
+
+async fn imap_connect_unbounded(
     account: &EmailAccount,
     oauth_access_token: Option<&str>,
 ) -> Result<async_imap::Session<ImapStream>, BoxError> {

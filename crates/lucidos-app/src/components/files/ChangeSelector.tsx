@@ -4,6 +4,7 @@ import {
 } from '../../store/store';
 import { selectRepoChange, loadMoreRepoChanges } from '../../store/actions/repositories';
 import { formatTimeAgo } from '../../utils/formatTime';
+import { formatFileCount } from '../../utils/formatFileCount';
 import type { Change } from '../../api/client';
 import { LoadableError } from '../shared/LoadableError';
 import { Overlay } from '../shared/Overlay';
@@ -81,7 +82,7 @@ export function ChangeSelector() {
                 >
                   <span class="change-option-desc">{changeLabel(c)}</span>
                   <span class="change-option-meta">
-                    {c.file_count} file{c.file_count !== 1 ? 's' : ''}
+                    {formatFileCount(c.file_count)}
                   </span>
                 </div>
               ))}
@@ -98,7 +99,7 @@ export function ChangeSelector() {
                 >
                   <span class="change-option-desc">{changeLabel(c)}</span>
                   <span class="change-option-meta">
-                    {c.file_count} file{c.file_count !== 1 ? 's' : ''}
+                    {formatFileCount(c.file_count)}
                     {c.resolved_at && ` \u00b7 ${formatTimeAgo(new Date(c.resolved_at))}`}
                   </span>
                 </div>

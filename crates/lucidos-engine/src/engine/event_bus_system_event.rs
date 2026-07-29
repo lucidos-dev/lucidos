@@ -254,6 +254,31 @@ pub enum SystemEvent {
     FrontendUpdateDeferred {
         sent_at_ms: i64,
     },
+    /// A *frontend-only* Apply rebuilt fine but the engine's served client can
+    /// never advance to it, because the `dist/` it serves is not the `dist/` the
+    /// build-watch republishes. Distinct from `FrontendUpdateDeferred`, which
+    /// means "queued, arrives on Switch" — here nothing is coming, so the two
+    /// must not share a message.
+    ///
+    /// The known cause is a stack pinned to a coding-agent worktree
+    /// (`served_in_worktree`), where the served `dist/` is frozen at the commit
+    /// that worktree was cut from while the shared checkout rebuilds elsewhere —
+    /// the 2026-07-26 incident, where every frontend Apply silently did nothing
+    /// for hours. `served_in_worktree: false` means the same stranding from some
+    /// other cause (no build-watch running, a `dist/` nobody rebuilds), which
+    /// wants different advice, so the flag is carried rather than assumed.
+    ///
+    /// Transient (never persisted — a pure UI signal like
+    /// `FrontendUpdateDeferred`) and dev-only by construction
+    /// (`refresh_served_frontend_after_rebuild` early-returns when packaged).
+    /// See `docs/plans/2026-07-26-worktree-pinned-stack-guard.md`.
+    FrontendUpdateStranded {
+        /// Absolute path of the `dist/` this engine serves from.
+        served_dir: String,
+        /// Whether that path lies inside a coding-agent worktree.
+        served_in_worktree: bool,
+        sent_at_ms: i64,
+    },
     /// A dev engine advanced its boot-pinned served-frontend snapshot to the
     /// checkout-shared `dist/` after ANOTHER workspace's *frontend-only* Apply
     /// moved it — the applying engine advances only its OWN snapshot, so a peer
@@ -930,6 +955,7 @@ impl SystemEvent {
             Self::AppDeleted { .. } => "AppDeleted",
             Self::AppUiRefreshRequested { .. } => "AppUiRefreshRequested",
             Self::FrontendUpdateDeferred { .. } => "FrontendUpdateDeferred",
+            Self::FrontendUpdateStranded { .. } => "FrontendUpdateStranded",
             Self::ServedFrontendAdvanced { .. } => "ServedFrontendAdvanced",
             Self::EngineBuildStateChanged { .. } => "EngineBuildStateChanged",
             Self::DomainEvent { .. } => "DomainEvent",
@@ -1020,6 +1046,7 @@ impl SystemEvent {
         "AppDeleted",
         "AppUiRefreshRequested",
         "FrontendUpdateDeferred",
+        "FrontendUpdateStranded",
         "ServedFrontendAdvanced",
         "EngineBuildStateChanged",
         "DomainEvent",
@@ -1150,6 +1177,7 @@ impl SystemEvent {
             }
             Self::EngineSupervisorRespawned { .. }
             | Self::FrontendUpdateDeferred { .. }
+            | Self::FrontendUpdateStranded { .. }
             | Self::ServedFrontendAdvanced { .. }
             | Self::EngineBuildStateChanged { .. } => "engine",
             Self::EmailSent { .. } => "email",

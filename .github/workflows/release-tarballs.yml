@@ -9,13 +9,13 @@
 # same scripts/lib/stage_runtime.sh code; the triple selects the theseus relocatable
 # Postgres asset.
 #
-# WHAT THIS WORKFLOW DOES NOT DO — it does NOT auto-publish anything:
+# WHAT THIS WORKFLOW DOES NOT DO — it never creates or tags a Release:
 #   • It NEVER creates a GitHub Release and NEVER cuts a tag.
-#   • On a plain push (tag or branch) it ONLY uploads workflow artifacts.
-#   • The optional "attach to an existing Release" step is gated behind a manual
-#     workflow_dispatch input (attach_to_release, default FALSE) AND a tag ref, and
-#     it only `gh release upload`s to a Release that ALREADY exists — it never
-#     creates one. So nothing is ever published automatically.
+#   • On a plain tag push it ONLY uploads workflow artifacts.
+#   • The attach step only ADDS assets to a Release that ALREADY exists. It runs
+#     automatically for a PUBLISHED, non-prerelease Release (so a real release
+#     gets its Linux/macOS tarballs without a human dispatch), and on demand via
+#     workflow_dispatch with attach_to_release=true. rc-* prereleases are skipped.
 #
 # Supported pair (parent plan): macOS arm64 + Linux x86_64. macOS x86_64 and Linux
 # aarch64 are best-effort. x86_64-unknown-linux-gnu is the MUST-WORK entry;
@@ -41,13 +41,26 @@ on:
   workflow_dispatch:
     inputs:
       attach_to_release:
-        description: 'Also attach the tarballs to an EXISTING GitHub Release (requires dispatching against a tag). Default off — never auto-publishes.'
+        description: 'Also attach the tarballs to an EXISTING GitHub Release. Default off — never creates a Release.'
         type: boolean
         default: false
+      attach_tag:
+        description: 'Release tag to attach to (e.g. v0.15.0). Empty = use the dispatched ref, which must then BE a tag. Set it to backfill a past release from a branch carrying a CI fix the tag tree predates.'
+        type: string
+        default: ''
   # Build artifacts on a version tag. This does NOT publish — it only uploads
-  # workflow artifacts (the attach step requires a manual dispatch + the flag).
+  # workflow artifacts (the attach step needs a Release to already exist).
   push:
     tags: ['v*']
+  # A PUBLISHED, non-prerelease GitHub Release attaches its platform tarballs
+  # automatically. This is what makes install.sh's default download path work at
+  # all: `release.sh --publish-verified` cuts the Release with the macOS DMG, and
+  # this run adds the Linux + macOS headless tarballs to it ~30 min later. The
+  # step still only ADDS assets to an existing Release — it never creates or tags
+  # one. The `rc-<version>` PRERELEASE that Phase A arms is excluded by the
+  # `prerelease == false` guard below, so the RC gate is untouched.
+  release:
+    types: [published]
 
 permissions:
   # `contents: write` is needed ONLY by the gated attach-to-release step below;
@@ -66,11 +79,23 @@ jobs:
           - { runner: ubuntu-latest,    triple: x86_64-unknown-linux-gnu,  container: 'ubuntu:22.04' }
           # Best-effort additions (parent plan):
           - { runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu, container: 'ubuntu:22.04' }
-          - { runner: macos-14,         triple: aarch64-apple-darwin }
+          # aarch64-darwin needs the macos-15 (Apple-silicon) image, not macos-14:
+          # the theseus-rs relocatable PG 18 arm64 binary is built against macOS 26
+          # libSystem (references _strchrnul), which the older macos-14 runner OS
+          # lacks — so pg_config won't even run there and staging aborts.
+          - { runner: macos-15,         triple: aarch64-apple-darwin }
           - { runner: macos-15-intel,   triple: x86_64-apple-darwin }
     runs-on: ${{ matrix.runner }}
     # Empty for the macOS entries → no container, runs on the VM as before.
     container: ${{ matrix.container }}
+    # Force bash for every `run` step. Inside the ubuntu:22.04 container GitHub
+    # otherwise invokes steps with `sh -e {0}` (dash), which does NOT support the
+    # `set -o pipefail` our steps rely on ("set: Illegal option -o pipefail",
+    # exit 2). bash ships in the ubuntu:22.04 base image and on the macOS runners,
+    # so this resolves everywhere and gives us `-o pipefail` consistently.
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 75   # container entries pay a cold rustup + apt install on top of the build
     steps:
       # pgvector compiles against the relocatable PG via PGXS (needs make + a C
@@ -89,13 +114,18 @@ jobs:
           git --version && python3 --version
 
       # The ubuntu:22.04 container has no Rust toolchain (the preinstalled one lives
-      # on the runner image, outside the container). Pin stable via rustup.
-      - name: Install Rust toolchain (container)
+      # on the runner image, outside the container). Install rustup ITSELF with no
+      # toolchain: this step runs BEFORE checkout, so rust-toolchain.toml isn't on
+      # disk yet, and installing `stable` here would download a toolchain that the
+      # pin then discards — cargo would fetch the pinned one on its first
+      # invocation anyway. `--default-toolchain none` means exactly one toolchain
+      # is ever downloaded, and it is the pinned one.
+      - name: Install rustup (container; toolchain comes from rust-toolchain.toml)
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain stable --profile minimal
+            | sh -s -- -y --default-toolchain none --no-modify-path
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Checkout
@@ -109,8 +139,12 @@ jobs:
       - name: Toolchain versions
         run: |
           set -euo pipefail
-          # macOS runners ship a preinstalled stable Rust toolchain on PATH; the
-          # Linux container installed one via rustup above.
+          # First cargo/rustc call after checkout, so this is where rustup
+          # materialises the toolchain pinned by rust-toolchain.toml — on the
+          # Linux container (which has rustup but no toolchain) and on the macOS
+          # runners (which ship a preinstalled stable that the pin overrides).
+          # Printing the active toolchain makes a pin bump visible in the log.
+          rustup show active-toolchain
           rustc --version
           cargo --version
           node --version
@@ -172,19 +206,63 @@ jobs:
       # ── OPTIONAL, OPT-IN ONLY — never fires automatically ──────────────────────
       # Attach the built tarballs to an EXISTING GitHub Release. Requires BOTH a
       # manual workflow_dispatch with attach_to_release=true AND dispatching against
-      # a tag ref. Uses `gh release upload` (NOT `gh release create`), so it only
-      # adds assets to a Release someone already cut — it never publishes one. This
-      # is the structural hook for a future release flow; it stays inert by default.
-      - name: Attach tarballs to the existing Release (opt-in; manual + tag only)
+      # a tag ref (the tag names the Release to attach to). It only ADDS assets to a
+      # Release someone already cut — it never publishes one. This is the structural
+      # hook for a future release flow; it stays inert by default.
+      #
+      # Upload is done via the raw GitHub REST API (curl), NOT `gh release upload`,
+      # because the Linux matrix entries run inside the ubuntu:22.04 container which
+      # has no `gh` CLI (only the macOS runner images ship it). curl works on BOTH
+      # the container and the macOS runners.
+      - name: Attach tarballs to the existing Release
+        # Two ways in:
+        #   1. release:published, non-prerelease -> automatic (the release flow).
+        #      rc-<ver> prereleases are excluded so the RC gate never sees these.
+        #   2. workflow_dispatch with attach_to_release=true -> manual/backfill.
+        #      Target tag comes from inputs.attach_tag, else the dispatched ref
+        #      (which must then be a tag). attach_tag lets a branch carrying a CI
+        #      fix attach to an older tag whose own tree predates that fix.
         if: >-
-          github.event_name == 'workflow_dispatch'
-          && inputs.attach_to_release == true
-          && startsWith(github.ref, 'refs/tags/')
+          (github.event_name == 'release' && github.event.release.prerelease == false)
+          || (github.event_name == 'workflow_dispatch'
+              && inputs.attach_to_release == true
+              && (inputs.attach_tag != '' || startsWith(github.ref, 'refs/tags/')))
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.attach_tag }}
         run: |
           set -euo pipefail
-          echo "Attaching $(ls dist/headless/*.tar.gz) to existing Release ${GITHUB_REF_NAME}"
-          gh release upload "${GITHUB_REF_NAME}" \
-            dist/headless/*.tar.gz dist/headless/*.tar.gz.sha256 \
-            --repo "${GITHUB_REPOSITORY}" --clobber
+          # Resolve which Release to attach to: the published Release's own tag,
+          # else the explicit dispatch input, else the dispatched tag ref.
+          attach_tag="${RELEASE_TAG:-}"
+          [ -n "$attach_tag" ] || attach_tag="${INPUT_TAG:-}"
+          [ -n "$attach_tag" ] || attach_tag="${GITHUB_REF_NAME}"
+          [ -n "$attach_tag" ] || { echo "no target tag resolved" >&2; exit 1; }
+          echo "Attaching $(ls dist/headless/*.tar.gz) to existing Release ${attach_tag}"
+          api="https://api.github.com"; up="https://uploads.github.com"
+          # Look up the release id by tag.
+          rel_id=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "$api/repos/${GITHUB_REPOSITORY}/releases/tags/${attach_tag}" | \
+            python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+          echo "release id = $rel_id"
+          for f in dist/headless/*.tar.gz dist/headless/*.tar.gz.sha256; do
+            base=$(basename "$f")
+            # delete any existing asset with the same name (clobber)
+            existing=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "$api/repos/${GITHUB_REPOSITORY}/releases/$rel_id/assets" | \
+              python3 -c "import sys,json;[print(a['id']) for a in json.load(sys.stdin) if a['name']=='$base']")
+            for aid in $existing; do
+              curl -sS -X DELETE -H "Authorization: Bearer ${GH_TOKEN}" \
+                "$api/repos/${GITHUB_REPOSITORY}/releases/assets/$aid" >/dev/null
+            done
+            echo "uploading $base"
+            curl -sS --fail -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Content-Type: application/gzip" \
+              --data-binary @"$f" \
+              "$up/repos/${GITHUB_REPOSITORY}/releases/$rel_id/assets?name=$base" >/dev/null \
+              && echo "  ok $base"
+          done

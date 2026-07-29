@@ -11,7 +11,7 @@ import type { MenuItem } from '../types';
 import { loadCredentials } from './credentials';
 import { loadEnvironmentVariables } from './environmentVariables';
 import { loadDevices } from './devices';
-import { loadNotifications } from './notifications';
+import { refreshActiveNotificationsTab } from './notifications';
 import { loadTriggers } from './triggers';
 import { loadApps } from './apps';
 import { loadInstalledPlugins } from './plugins';
@@ -53,7 +53,7 @@ export function switchMenuItem(item: MenuItem) {
   if (item === 'plugins') void loadInstalledPlugins();
   if (item === 'triggers') void loadTriggers();
   if (item === 'settings') void loadDevices();
-  if (item === 'notifications') void loadNotifications();
+  if (item === 'notifications') refreshActiveNotificationsTab();
 
   pushNavState();
   revealContentPane();

@@ -10,10 +10,11 @@
 //! hooks with their subprocesses; chat tools with their LLM call. On
 //! resume, CC re-emits the AskUserQuestion tool_use, the hook fires
 //! again, and the endpoint's crash-recovery path reads a previously-
-//! persisted UserQuestionAnswered event from the DB instead. Chat
-//! tools have no resume — a restarted chat turn aborts via
-//! `ResponseAborted` and the persisted card is orphaned by
-//! `QUESTION_OVERTAKEN_EVENT_TYPES`; the user re-sends to ask again.
+//! persisted UserQuestionAnswered event from the DB instead. A chat thread
+//! parked on a question is now PRESERVED across a restart (not aborted): the
+//! card stays answerable, and answering with no live waiter (`notify` returns
+//! `false`) re-enters the agentic loop via `resume_chat_after_answer` — the
+//! chat parity of CC's re-fire-the-hook resume.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -50,13 +51,22 @@ impl QuestionWaitRegistry {
             .subscribe()
     }
 
-    /// Wake every waiter on `tool_use_id`. No-op if nothing is registered
-    /// (the answer arrives before the hook re-subscribes after a crash;
-    /// crash-recovery path will read the event from DB instead).
-    pub async fn notify(&self, tool_use_id: &str, payload: AnswerPayload) {
+    /// Wake every waiter on `tool_use_id`. Returns whether a LIVE in-process
+    /// waiter actually received the payload. `false` means no live loop is
+    /// blocked on this id — either nothing is registered (the answer arrived
+    /// before the hook re-subscribed after a crash) or the registered channel
+    /// has no receivers left. The chat answer path keys on this: a `false`
+    /// return after an engine restart (the in-process loop died with the
+    /// process, so the map is empty) is what tells it to re-enter the agentic
+    /// loop instead of relying on an in-memory wake that no longer lands. The
+    /// coding-agent path ignores the return (it decides resume via
+    /// `agent_sessions` / the DB crash-recovery lookup instead).
+    pub async fn notify(&self, tool_use_id: &str, payload: AnswerPayload) -> bool {
         let map = self.inner.read().await;
-        if let Some(tx) = map.get(tool_use_id) {
-            let _ = tx.send(payload);
+        match map.get(tool_use_id) {
+            // `send` is Ok(n) with n = receivers that got it; Err when zero.
+            Some(tx) => tx.send(payload).is_ok(),
+            None => false,
         }
     }
 
@@ -98,6 +108,39 @@ mod tests {
         registry.notify("never-registered", AnswerPayload {
             answers: serde_json::json!({}),
         }).await;
+    }
+
+    /// `notify` reports whether a LIVE in-process waiter received the wake — the
+    /// signal the chat answer path uses to decide it must re-enter the agentic
+    /// loop (a restart drops the in-memory waiter, so a post-restart answer sees
+    /// `false` and triggers `resume_chat_after_answer`).
+    #[tokio::test]
+    async fn notify_reports_live_waiter_presence() {
+        let registry = QuestionWaitRegistry::new();
+        let payload = || AnswerPayload {
+            answers: serde_json::json!({"q?": "A"}),
+        };
+
+        // Nothing registered (the post-restart shape: the map died with the
+        // process) → false.
+        assert!(
+            !registry.notify("toolu_gone", payload()).await,
+            "no registered waiter must report no live loop"
+        );
+
+        // A live waiter (loop blocked in-process) → true.
+        let waiter = registry.register("toolu_live").await;
+        assert!(
+            registry.notify("toolu_live", payload()).await,
+            "a live in-process waiter must be reported"
+        );
+
+        // Receiver dropped (loop gone but entry not yet forgotten) → false.
+        drop(waiter);
+        assert!(
+            !registry.notify("toolu_live", payload()).await,
+            "a registered id whose receiver is gone must report no live loop"
+        );
     }
 
     #[tokio::test]

@@ -31,6 +31,27 @@
 #     exercises the REAL stranger path (curl|sh -> git clone lucidos-dev), because
 #     the published tag must exist first. Post-publish; reports fast, can't gate.
 #
+# Testing the ORIGIN rather than a tree:
+#
+#   * FRONT DOOR (job: front-door) — the advertised `curl -fsSL
+#     <origin>/install.sh | sh`, on a fresh ubuntu:22.04. Every job above tests
+#     a TREE (this checkout, or an artifact built from it); this one tests what
+#     the deployed site is actually serving right now, which is a separate thing
+#     that can break on its own. It runs in one of two MODES:
+#
+#       - full    (dispatch + the daily cron, default origin https://lucidos.dev)
+#                 all four rungs, ending in a real install on a bare box.
+#       - payload (push to rc/**, origin https://lucidos.dev/rc; also selectable
+#                 on a dispatch) rung 1 ONLY — fetch the served installer, parse
+#                 its helper-lib list + lib base out of it, fetch those, and
+#                 assert every payload is shell rather than the soft-404 landing
+#                 page. Then STOP GREEN. See the job for why it must not install.
+#
+#     The full mode is deliberately NOT on the rc/** push: it would gate an RC on
+#     the state of production, which the RC has not shipped to yet. The payload
+#     mode is the opposite — it gates the RC's OWN copy of the installer at
+#     /rc/install.sh, before anything reaches the real path.
+#
 # NOTE: only effective once lucidos-dev is public. Before the public flip this
 # repo is still private, so runs bill against the private free tier (~2000
 # min/month, macOS 10x) — the first launch relies on the manual DMG verify plus,
@@ -57,6 +78,34 @@ on:
         type: choice
         default: 'both'
         options: [both, ubuntu-only, macos-only]
+      # front-door only. The Pages deploy does NOT run in CI — it runs on the
+      # maintainer's machine off a workspace trigger chain (LucidosReleased ->
+      # DMG-link bump -> SitePublishRequested -> publisher -> SitePublished), so
+      # GitHub's `release: published` webhook fires while the deploy is still in
+      # flight and would verify the OLD origin: a pass for the wrong reason.
+      # The post-publish hook is therefore a dispatch fired BY the publisher
+      # once SitePublished lands, which is what these two inputs serve.
+      origin:
+        description: 'front-door: origin to test (https:// only, no trailing slash)'
+        type: string
+        default: 'https://lucidos.dev'
+      mode:
+        description: 'front-door: full = install too; payload = fetch+sniff only (use for an RC origin — no v<ver> tag exists yet)'
+        type: choice
+        default: 'full'
+        options: [full, payload]
+      # dmg-verify only. A DEFERRED release publishes before Apple's notarization
+      # verdict, so it never creates the rc-<ver> prerelease that normally fires
+      # this gate (an unstapled DMG cannot pass a stapled-ticket assertion). When
+      # release.sh --attach-notarized later staples and swaps the asset, it
+      # dispatches this input so verification FOLLOWS the artifact to the GA tag.
+      # Setting it runs dmg-verify and NOTHING else — every other job guards on
+      # it being empty, or a 30-second asset check would drag a 40-minute source
+      # install and a 90-minute tarball build along with it.
+      dmg_tag:
+        description: 'dmg-verify: verify the DMG on this published tag (e.g. v0.16.0). Runs dmg-verify only.'
+        type: string
+        default: ''
   push:
     branches: ['rc/**']        # release candidates -> auto clean-machine gate
   # release events drive two different jobs:
@@ -68,8 +117,13 @@ on:
   #     clone safety net (smoke).
   release:
     types: [prereleased, released, published]
+  # Two crons, and each job picks EXACTLY ONE via `github.event.schedule` (the
+  # cron string that fired). A schedule trigger is workflow-wide, so without that
+  # guard the daily front-door cron would also drag the 40-min source install and
+  # the 90-min tarball build in with it, seven times a week instead of once.
   schedule:
-    - cron: '0 4 * * 1'        # weekly Mon 04:00 UTC — catch toolchain drift
+    - cron: '0 4 * * 1'        # weekly Mon 04:00 UTC — catch toolchain drift (smoke, tarball-smoke)
+    - cron: '0 6 * * *'        # daily 06:00 UTC — the live lucidos.dev front door (front-door)
 
 # install.sh defaults LUCIDOS_HOME=$HOME/lucidos and clones from GitHub. In CI
 # we already have the repo checked out, so point it at the checkout and skip the
@@ -83,16 +137,21 @@ jobs:
   smoke:
     name: install-smoke (${{ matrix.os }})
     # ONLY runs in the public mirror — this file also lives in the private source
-    # repo (kennethtiller/lucidos), where macOS bills at 10x; the repo guard keeps
+    # repo (a personal account, so macOS bills at 10x); the repo guard keeps
     # it inert there. On a release event the source smoke is the post-publish safety
     # net for the REAL GA only, so it runs solely on `published` with
     # prerelease==false. An rc-<ver> prerelease upload (which ALSO fires `published`,
     # prerelease==true) is the DMG-verify trigger, not a source-install one — skip it
     # here so the source smoke (already run on push to rc/**) doesn't double-run.
+    # The schedule clause keeps this job on its WEEKLY cron only — the daily cron
+    # exists for front-door, and a schedule trigger fires the whole workflow.
     if: >-
       github.repository == 'lucidos-dev/lucidos'
       && (github.event_name != 'release'
           || github.event.release.prerelease == false)
+      && (github.event_name != 'schedule'
+          || github.event.schedule == '0 4 * * 1')
+      && inputs.dmg_tag == ''
     strategy:
       fail-fast: false
       matrix:
@@ -259,10 +318,18 @@ jobs:
           if-no-files-found: ignore
 
   # ── DMG VERIFY ───────────────────────────────────────────────────────────────
-  # Gates the signed/notarized DMG before the real release. Fires when Phase A
-  # uploads the rc-<ver> PRERELEASE (release `prereleased` OR `released`, guarded on
-  # prerelease==true — see the release-types note above). Downloads the DMG
-  # asset onto a CLEAN macOS runner — one that has never trusted your Developer ID
+  # Gates the signed/notarized DMG. TWO ways in, because the artifact does not
+  # always arrive at the same time as the release:
+  #   • the normal path — Phase A uploads the rc-<ver> PRERELEASE (release
+  #     `prereleased` OR `released`, guarded on prerelease==true; see the
+  #     release-types note above), and this gates it BEFORE the real release;
+  #   • the deferred path — a release published while Apple's notary verdict was
+  #     outstanding never created that prerelease (an unstapled DMG cannot pass
+  #     the stapled-ticket assertion below). `release.sh --attach-notarized`
+  #     staples the DMG, swaps the published asset, then dispatches this job with
+  #     `dmg_tag=v<ver>` so the gate runs against the GA tag. Verification follows
+  #     the artifact rather than requiring a prerelease that no longer exists.
+  # Either way it downloads the DMG asset onto a CLEAN macOS runner — one that has never trusted your Developer ID
   # cert and has no prior state — and confirms Gatekeeper accepts it, the
   # notarization ticket is stapled, and the app actually mounts + launches. This
   # is strictly stronger than verifying on your dev box (which already trusts the
@@ -275,23 +342,24 @@ jobs:
     # guard on prerelease==true so the real GA publish never triggers it.
     if: >-
       github.repository == 'lucidos-dev/lucidos'
-      && github.event_name == 'release'
-      && github.event.release.prerelease == true
+      && ((github.event_name == 'release'
+           && github.event.release.prerelease == true)
+          || (github.event_name == 'workflow_dispatch' && inputs.dmg_tag != ''))
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - name: Download the rc DMG from the prerelease
+      - name: Download the DMG from the release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.dmg_tag }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/dmg"
-          echo "Fetching DMG asset(s) from prerelease $TAG"
+          echo "Fetching DMG asset(s) from $TAG"
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
             --pattern '*.dmg' --dir "$RUNNER_TEMP/dmg"
           DMG="$(ls "$RUNNER_TEMP/dmg"/*.dmg | head -1)"
-          [ -f "$DMG" ] || { echo "::error::no .dmg asset on prerelease $TAG"; exit 1; }
+          [ -f "$DMG" ] || { echo "::error::no .dmg asset on $TAG"; exit 1; }
           echo "DMG=$DMG" >> "$GITHUB_ENV"
           echo "Downloaded: $DMG ($(du -h "$DMG" | cut -f1))"
 
@@ -375,10 +443,15 @@ jobs:
   # + Ubuntu only (free), same repo + release guards as the other jobs.
   tarball-smoke:
     name: tarball-smoke (ubuntu)
+    # Weekly cron only (see the smoke job's schedule clause) — the daily cron is
+    # front-door's.
     if: >-
       github.repository == 'lucidos-dev/lucidos'
       && (github.event_name != 'release'
           || github.event.release.prerelease == false)
+      && (github.event_name != 'schedule'
+          || github.event.schedule == '0 4 * * 1')
+      && inputs.dmg_tag == ''
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -563,4 +636,481 @@ jobs:
             ${{ runner.temp }}/uninstall.log
             ${{ runner.temp }}/journal.log
           if-no-files-found: ignore
+
+  # ── FRONT DOOR (the LIVE lucidos.dev origin) ─────────────────────────────────
+  # WHY THIS EXISTS — do not delete it as "redundant with smoke".
+  #
+  # Every other job in this file tests a TREE: `smoke` installs from this
+  # checkout, `tarball-smoke` builds the artifact in-job and serves it over
+  # file://, `dmg-verify` consumes a release asset. In all three, install.sh's
+  # helper libs (scripts/lib/*.sh) are present by construction — they are right
+  # there on disk, or on GitHub. So none of them can see what the DEPLOYED origin
+  # is serving, and on 2026-07-29 that blind spot shipped:
+  #
+  #   * The Cloudflare Pages deploy published /install.sh but NOT the
+  #     scripts/lib/*.sh helpers a PIPED install sources (`curl … | sh` has no
+  #     checkout, so _source_libs fetches them from ${INSTALL_URL%/install.sh}/scripts/lib).
+  #   * Pages answers an unknown path with the landing-page HTML at status **200**
+  #     (SPA fallback), so `curl -fsSL` SUCCEEDED and wrote HTML to the lib file.
+  #   * The installer then sourced it as shell:
+  #         stage_runtime.sh: line 1: syntax error near unexpected token `newline'
+  #         stage_runtime.sh: line 1: `<!DOCTYPE html>'
+  #
+  # A green `smoke` cannot catch that; only a run against the real origin can.
+  # This job is that net — it takes the exact path a Show HN reader takes.
+  #
+  # The two OTHER halves of the fix live elsewhere and are not duplicated here:
+  # the Pages publisher uploads + post-deploy-verifies the helper libs, and
+  # install.sh fails closed on an HTML payload. This job is the CI net that
+  # notices when the deployed origin regresses regardless of either.
+  #
+  # ubuntu:22.04 CONTAINER, not the bare runner: the container's /bin/sh is dash,
+  # so `| sh` takes install.sh's dash re-exec branch — it re-fetches itself and
+  # then fetches the helper libs over the network, which is the exact code path
+  # that broke. On the runner image /bin/sh is dash too, but a container also
+  # gives us a machine with only curl + ca-certificates on it, like a real one.
+  #
+  # Verification ladder (all four in full mode; rung 1 alone in payload mode):
+  #   1. BEFORE installing: every helper lib install.sh needs resolves to SHELL,
+  #      not HTML. The lib names are PARSED out of the fetched install.sh (never
+  #      hardcoded, or the list rots the day a lib is added). This is the rung
+  #      that would have caught the 2026-07-29 bug outright — and, because it
+  #      touches nothing but payloads, the only one an RC can run.
+  #   2. the install runs with no DOCTYPE / shell syntax error in its log
+  #   3. the gateway answers /~/api/v1/health with status: ok (polled)
+  #   4. the frontend serves HTTP 200
+  #
+  # TWO MODES, because two different callers need these rungs pointed at two
+  # different origins (FD_MODE, resolved below):
+  #
+  #   * full    — all four rungs. workflow_dispatch (default origin
+  #               https://lucidos.dev) + the DAILY cron, so a broken front door
+  #               is caught within a day even when nobody publishes. The
+  #               post-publish caller is a dispatch too: the Pages deploy runs
+  #               OUTSIDE CI (a workspace trigger chain on the maintainer's
+  #               machine), so `release: published` fires mid-deploy and would
+  #               verify the previous origin. The publisher fires this dispatch
+  #               itself once SitePublished lands.
+  #   * payload — rung 1 only, then stop green. Auto-runs on every push to rc/**
+  #               against https://lucidos.dev/rc, where the RC copy of the
+  #               installer is published (libs at /rc/scripts/lib/), so the
+  #               soft-404 class is caught BEFORE anything reaches the real path.
+  #
+  # WHY PAYLOAD MODE MUST NOT INSTALL — do not "fix" this by re-enabling rungs
+  # 2-4 for the RC. An RC install.sh bakes LUCIDOS_DEFAULT_VERSION=<rc version>
+  # and resolves its tarball to
+  # https://github.com/lucidos-dev/lucidos/releases/download/v<ver>/… . During an
+  # RC that tag DOES NOT EXIST: Phase A publishes only an `rc-<ver>` PRERELEASE
+  # carrying the DMG + updater .sig, and headless tarballs live solely on real
+  # `v*` releases. A full `curl | sh` against /rc/install.sh would therefore 404
+  # at the download step every single time and this job would be permanently red.
+  # Nothing is lost: the bug class the RC gate exists to catch (the 2026-07-29
+  # soft-404 — the origin answers a script path with the landing page at status
+  # 200, piped into a shell) is caught entirely by rung 1, which only fetches and
+  # sniffs payloads. Rung 2 cannot help here — it is an assertion over the LOG of
+  # a real install run, so it needs the tarball rung 1 deliberately never wants.
+  front-door:
+    name: front-door (${{ github.event_name == 'push' && 'rc, payload only' || 'live origin' }}, ubuntu:22.04)
+    # Public mirror only (see the smoke job's repo guard). Dispatch, the daily
+    # cron, and the rc/** push — never the release events this workflow also
+    # listens for, and never the weekly cron (that one is smoke/tarball-smoke's).
+    # The rc/** arm is spelled out rather than left implicit in `push`: the only
+    # push trigger on this workflow is rc/** today, and an added branch must not
+    # silently inherit the front-door gate.
+    if: >-
+      github.repository == 'lucidos-dev/lucidos'
+      && (github.event_name == 'workflow_dispatch'
+          || (github.event_name == 'push'
+              && startsWith(github.ref, 'refs/heads/rc/'))
+          || (github.event_name == 'schedule'
+              && github.event.schedule == '0 6 * * *'))
+      && inputs.dmg_tag == ''
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
+    timeout-minutes: 30
+    # This job pipes remote code into a shell by design, so give it a token with
+    # no scopes at all — it reads nothing from the repo and writes nothing back.
+    permissions: {}
+    env:
+      # Which rungs run. A push to rc/** is always payload-only (the tarball for
+      # an RC does not exist — see the block above); anything else takes the
+      # dispatch input, which defaults to full. The input exists so a human CAN
+      # point a dispatch at the RC origin without the job being structurally red.
+      FD_MODE: ${{ (github.event_name == 'push' && 'payload') || inputs.mode || 'full' }}
+      # The RAW origin — possibly attacker-influenced (a dispatch input), so it is
+      # deliberately NOT named FRONT_DOOR and is never consumed directly. The
+      # first step validates + normalises it and exports the real FRONT_DOOR via
+      # $GITHUB_ENV; every later step reads THAT, under `set -u`, so a validation
+      # step that never ran leaves nothing usable behind.
+      FRONT_DOOR_INPUT: ${{ (github.event_name == 'push' && 'https://lucidos.dev/rc') || inputs.origin || 'https://lucidos.dev' }}
+      GW_DEFAULT_PORT: '5252'          # install.sh's default; it auto-picks upward if taken
+      GW_HEALTH_TIMEOUT_SECS: '900'    # download + extract + embedded-PG first boot
+      # A stranger's shell has no LUCIDOS_* set, but this workflow's top-level env
+      # block exports two for the --dev smoke job — and install.sh treats every
+      # LUCIDOS_* as a flag. Blank them so this job reproduces a bare machine
+      # (install.sh resolves each with `${VAR:-default}`, so empty == unset).
+      LUCIDOS_HOME: ''
+      LUCIDOS_WORKSPACE: ''
+    steps:
+      # ── validate the origin BEFORE anything touches it ────────────────────────
+      # The origin can come from a workflow_dispatch input, and this job pipes
+      # whatever it fetches straight into a shell — so treat it as hostile input.
+      # Accept ONLY https:// over a strict character allowlist: the later steps
+      # embed it in a command line, and a value carrying ';', '$(…)', backticks,
+      # quotes or whitespace would be shell, not a URL. (`https://` also keeps a
+      # dispatch off plain http and off file:// — no downgrade, no local read.)
+      #
+      # This is a floor, not a leash: a dispatch is already write-access-gated,
+      # so the point is that a mistyped or copy-pasted value fails LOUDLY here
+      # rather than turning into an arbitrary command three steps later.
+      - name: Resolve and validate the origin under test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$FD_MODE" in
+            full|payload) ;;
+            *) echo "::error::FD_MODE must be 'full' or 'payload' (got '$FD_MODE')"; exit 1 ;;
+          esac
+
+          # Be forgiving about a pasted trailing slash — every use site appends
+          # "/install.sh", and "…//install.sh" would soft-404 into a confusing
+          # HTML diagnosis rather than an obvious "you typed a trailing slash".
+          origin="$FRONT_DOOR_INPUT"
+          while [ "${origin%/}" != "$origin" ]; do origin="${origin%/}"; done
+
+          if ! [[ "$origin" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)*$ ]]; then
+            echo "::error::refusing origin '$FRONT_DOOR_INPUT' — it must be an https:// URL of the form https://host[:port][/path] using only [A-Za-z0-9._~-] in its path. This job pipes what the origin serves into a shell, so anything that is not plainly a URL is rejected."
+            exit 1
+          fi
+
+          # Export under a DIFFERENT name than the raw input, so a later step can
+          # never accidentally read the unvalidated value, and so a skipped or
+          # failed validation leaves FRONT_DOOR unset (every consumer runs under
+          # `set -u`, i.e. fail closed) instead of silently usable. Writing to
+          # $GITHUB_ENV is only safe AFTER the allowlist: the file is parsed
+          # line-by-line, so a value carrying a newline could otherwise define a
+          # second, arbitrary variable for every later step.
+          echo "FRONT_DOOR=$origin" >> "$GITHUB_ENV"
+
+          echo "origin: $origin"
+          echo "mode:   $FD_MODE"
+          if [ "$FD_MODE" = "full" ]; then
+            echo "rungs:  1 (payload sniff), 2 (no HTML sourced), 3 (gateway health), 4 (frontend 200)"
+          else
+            echo "rungs:  1 (payload sniff) ONLY — no install, no tarball, no gateway"
+          fi
+
+      # A bare machine, not a CI image: only what a fresh server actually has.
+      # NO checkout — this job must know nothing about the tree it lives in; its
+      # entire input is what the origin under test serves.
+      - name: Bare-machine deps (curl + ca-certificates only)
+        shell: bash
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends curl ca-certificates
+          echo "/bin/sh -> $(readlink -f /bin/sh)"   # must be dash: that is the point
+
+      # ── rung 1 ────────────────────────────────────────────────────────────────
+      # The assertion that would have caught the 2026-07-29 failure outright, and
+      # the reason this job is worth its minutes. `curl -fsSL` is NOT enough on a
+      # soft-404 origin: -f only fails on an HTTP error status, and Pages' SPA
+      # fallback returns the landing page at 200. So check the PAYLOAD.
+      - name: Every helper lib the installer needs resolves to shell, not HTML
+        shell: bash
+        run: |
+          set -uo pipefail
+          tmp="$(mktemp -d)"
+
+          # assert_shell_file <file> <url> — the payload must be a shell script.
+          # Two distinct failures, because they mean different things: a body
+          # starting with '<' is the soft-404 HTML (the origin is misconfigured),
+          # while a missing shebang is "something else entirely is at this URL".
+          assert_shell_file() {
+            local f="$1" url="$2" first_line
+            if [ ! -s "$f" ]; then
+              echo "::error::$url returned an EMPTY body"
+              return 1
+            fi
+            if [ "$(head -c 1 "$f")" = "<" ]; then
+              echo "::error::$url returned HTML, not shell — the origin answered a script path with the landing page at status 200 (soft 404). A piped install sources this AS SHELL."
+              echo "    first 3 lines:"; head -n 3 "$f" | sed 's/^/      /'
+              # In payload mode the whole origin is a subpath the site publisher
+              # creates, so "HTML at 200" has a second, much likelier cause than
+              # a regressed deploy: the route simply does not exist yet. Say so —
+              # an RC gate that reds with a bare "returned HTML" reads as a
+              # production incident when it is really "nothing published here".
+              if [ "${FD_MODE:-full}" = "payload" ]; then
+                echo "    NOTE: this is the RC front door. Every path under $FRONT_DOOR/ answers with the landing page at 200 when the RC copy of the installer has not been published there — check that the site publisher uploaded install.sh + scripts/lib/*.sh under $FRONT_DOOR/ for THIS release candidate before treating this as an origin regression."
+              fi
+              return 1
+            fi
+            first_line="$(head -n 1 "$f")"
+            case "$first_line" in
+              '#!'*) ;;
+              *)
+                echo "::error::$url has no '#!' shebang on line 1 — it is not a shell script"
+                echo "    first 3 lines:"; head -n 3 "$f" | sed 's/^/      /'
+                return 1
+                ;;
+            esac
+            printf '    OK  %-58s %8s bytes  %s\n' "$url" "$(wc -c < "$f" | tr -d ' ')" "$first_line"
+            return 0
+          }
+
+          echo "==> Fetching the advertised installer"
+          curl -fsSL "$FRONT_DOOR/install.sh" -o "$tmp/install.sh" \
+            || { echo "::error::could not fetch $FRONT_DOOR/install.sh"; exit 1; }
+          assert_shell_file "$tmp/install.sh" "$FRONT_DOOR/install.sh" || exit 1
+
+          # ── the RC origin must be serving THIS release candidate ──────────────
+          # Only on an rc/** push, where the branch name pins the version we are
+          # gating (release.sh force-pushes the stripped tree to rc/<version>).
+          # Without this, the previous RC's copy — still sitting at the same URL —
+          # satisfies every payload check and the gate goes green having verified
+          # last release's installer. That is the "passes for the wrong reason"
+          # failure this whole job exists to avoid, so it is fatal, not a warning.
+          if [ "${GITHUB_EVENT_NAME:-}" = "push" ]; then
+            case "${GITHUB_REF_NAME:-}" in
+              rc/?*) rc_version="${GITHUB_REF_NAME#rc/}" ;;
+              *) echo "::error::this job only runs on a push for an rc/<version> branch, got '${GITHUB_REF_NAME:-}'"; exit 1 ;;
+            esac
+            # The baked constant is what a piped install actually resolves (no
+            # checkout ⇒ no adjacent RELEASE file), so it is the right thing to
+            # compare — and it is rewritten by release.sh in the same step that
+            # bumps RELEASE, so it pins the candidate exactly.
+            served_version="$(sed -n 's/^LUCIDOS_DEFAULT_VERSION="\([^"]*\)".*/\1/p' "$tmp/install.sh" | head -n 1)"
+            if [ -z "$served_version" ]; then
+              echo "::error::could not parse LUCIDOS_DEFAULT_VERSION out of the served $FRONT_DOOR/install.sh — this check must never silently pass, so it fails closed"
+              grep -n '^LUCIDOS_DEFAULT_VERSION=' "$tmp/install.sh" || true
+              exit 1
+            fi
+            if [ "$served_version" != "$rc_version" ]; then
+              echo "::error::$FRONT_DOOR/install.sh bakes version $served_version, but this push is $GITHUB_REF_NAME (expected $rc_version) — the RC front door is serving a DIFFERENT release candidate. Either the site publisher has not published this RC's installer yet, or it published another one; gating against it would verify the wrong tree."
+              exit 1
+            fi
+            echo "    OK  the RC front door serves $served_version, matching $GITHUB_REF_NAME"
+          fi
+
+          # Which libs, from where — both READ OUT of the installer we just
+          # fetched, so this stays correct when the set changes.
+          #
+          # Names: install.sh declares them in two places — `LUCIDOS_LIBS=` (the
+          # download path) and the `_source_libs` call inside source_service_lib
+          # (the launch/register path). Scrape *.sh tokens off exactly those
+          # lines rather than pinning a list here.
+          libs="$(grep -E '^LUCIDOS_LIBS=|_source_libs ' "$tmp/install.sh" \
+                  | grep -oE '[A-Za-z0-9_]+\.sh' | sort -u)"
+          lib_count="$(printf '%s\n' "$libs" | grep -c . || true)"
+          # Fail closed on a broken scrape: a parser that silently finds nothing
+          # would make this whole job report green against a dead front door.
+          # A floor, not a pinned list — install.sh sources 4 libs today.
+          if [ "${lib_count:-0}" -lt 2 ]; then
+            echo "::error::parsed only ${lib_count:-0} helper lib name(s) from install.sh — its lib declaration changed shape and this parser needs updating (it must never silently check nothing)"
+            grep -nE '^LUCIDOS_LIBS=|_source_libs ' "$tmp/install.sh" || true
+            exit 1
+          fi
+
+          # Base URL: the same expression _source_libs uses —
+          # ${LUCIDOS_INSTALL_URL%/install.sh}/scripts/lib — resolved from the
+          # baked LUCIDOS_INSTALL_URL in the copy we were just served. Reading it
+          # instead of assuming keeps rung 1 pointed at the URLs a piped install
+          # will REALLY hit; hardcoding the origin here could check one place
+          # while the installer fetches from another.
+          install_url="$(grep -m1 '^LUCIDOS_INSTALL_URL=' "$tmp/install.sh" | sed -e 's/.*:-//' -e 's/}"$//')"
+          case "$install_url" in
+            http*://*/install.sh) ;;
+            *) echo "::error::could not parse LUCIDOS_INSTALL_URL out of the served install.sh (got '$install_url')"; exit 1 ;;
+          esac
+          lib_base="${install_url%/install.sh}/scripts/lib"
+
+          echo "==> Helper libs the installer will fetch when piped"
+          echo "    lib base: $lib_base"
+          echo "    libs:     $(echo "$libs" | tr '\n' ' ')"
+          # The publisher is supposed to rewrite the baked URL to this origin. If
+          # it did not, the libs resolve to GitHub (which always has them) and
+          # rung 1 passes without having tested the front door at all — a hollow
+          # pass that must never read as coverage.
+          #
+          # EQUALITY, not a prefix match. `"$FRONT_DOOR"/*` was vacuous the moment
+          # a second origin existed under the same apex: with FRONT_DOOR set to
+          # https://lucidos.dev, an installer wrongly pinned to the RC copy gives
+          # lib_base=https://lucidos.dev/rc/scripts/lib, which prefix-matches and
+          # passes silently while rung 1 checks the RC's libs instead of
+          # production's. Both real origins produce exactly "<origin>/scripts/lib",
+          # so demand exactly that.
+          expected_lib_base="$FRONT_DOOR/scripts/lib"
+          if [ "$lib_base" != "$expected_lib_base" ]; then
+            # Fatal in payload mode, loud in full mode — and the asymmetry is the
+            # point, not an oversight. In full mode rungs 2-4 still drive a real
+            # install against this origin, so the run has other teeth and a
+            # warning is proportionate. In payload mode rung 1 is the ONLY rung:
+            # a lib base pointing somewhere else means the job verified nothing
+            # about the origin it was asked to gate, which must not be green.
+            msg="the served install.sh points its helper-lib fetch at $lib_base, NOT $expected_lib_base — rung 1 is not exercising this origin's script paths"
+            if [ "$FD_MODE" = "payload" ]; then
+              echo "::error::$msg, and payload mode has no other rung to fall back on. Refusing to report green on a check that never touched $FRONT_DOOR."
+              exit 1
+            fi
+            echo "::warning::$msg"
+          fi
+
+          fail=0
+          for name in $libs; do
+            url="$lib_base/$name"
+            if ! curl -fsSL "$url" -o "$tmp/$name"; then
+              echo "::error::could not fetch $url (HTTP error)"
+              fail=1
+              continue
+            fi
+            assert_shell_file "$tmp/$name" "$url" || fail=1
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::at least one helper lib does not resolve to a shell script — 'curl -fsSL $FRONT_DOOR/install.sh | sh' would source that payload as shell and die on a fresh machine"
+            exit 1
+          fi
+          echo "rung 1 OK — all $lib_count helper libs resolve to shell at $lib_base"
+
+          # Be explicit about where a payload-mode run stops and what that green
+          # does NOT mean, so nobody reads it as "the RC installs cleanly".
+          if [ "$FD_MODE" = "payload" ]; then
+            echo
+            echo "PAYLOAD MODE — stopping here, green."
+            echo "  verified:     $FRONT_DOOR serves an installer and all $lib_count helper libs it declares as SHELL, not the landing page (the 2026-07-29 soft-404 class)."
+            echo "  NOT verified: that the install completes. It cannot be: an RC installer resolves its tarball to"
+            echo "                https://github.com/lucidos-dev/lucidos/releases/download/v<version>/… and that tag does not"
+            echo "                exist during an RC (Phase A publishes only an rc-<version> prerelease, DMG + .sig, no tarballs)."
+            echo "                Wiring the install here would 404 every single run. The full ladder runs against the real"
+            echo "                origin post-publish (dispatch) and daily (cron)."
+          fi
+
+      # ── rungs 2-4: FULL MODE ONLY ─────────────────────────────────────────────
+      # Everything below drives a REAL install, which downloads the headless
+      # tarball from the v<version> release. That tag does not exist during an RC,
+      # so these steps are gated OFF in payload mode — see the long note on the
+      # job. Removing the guard makes the rc/** gate permanently red; it does not
+      # make it stronger.
+      #
+      # The advertised command, verbatim. With no service manager in a container
+      # install.sh degrades to a FOREGROUND launch (by design) and never returns,
+      # so background it and poll — same shape as the smoke job.
+      - name: Run the advertised command (background — the gateway holds the foreground)
+        if: env.FD_MODE == 'full'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The origin is passed as an ARGUMENT, not spliced into the `sh -c`
+          # string: it can originate in a dispatch input, and a string-interpolated
+          # value would be parsed as shell by the very command we are constructing.
+          # The validation step already rejects anything that is not plainly a URL;
+          # this is the second lock on the same door.
+          echo "==> curl -fsSL $FRONT_DOOR/install.sh | sh"
+          # The single quotes are load-bearing: "$0" must reach the inner shell
+          # UNEXPANDED so it resolves to the argument below, which is the whole
+          # point of not interpolating the origin.
+          # shellcheck disable=SC2016
+          nohup sh -c 'curl -fsSL "$0/install.sh" | sh' "$FRONT_DOOR" \
+            > "$RUNNER_TEMP/install.log" 2>&1 &
+          echo "INSTALL_PID=$!" >> "$GITHUB_ENV"
+          echo "Installer started (pid $!). Log: $RUNNER_TEMP/install.log"
+
+      - name: Verify the front door installed a working Lucidos
+        if: env.FD_MODE == 'full'
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/install.log"
+          dump() { echo "--- installer log (tail 200) ---"; tail -n 200 "$log" 2>/dev/null || true; }
+
+          # ── rung 2: the installer must never source a NON-SHELL payload ───────
+          # The 2026-07-29 failure surfaces exactly here — '<!DOCTYPE html>' echoed
+          # by the shell plus a syntax error from the sourced lib. Terminal the
+          # moment it appears; there is nothing to wait for after it.
+          #
+          # The pattern is the SHELL-PARSE signature, not a bare 'syntax error':
+          # this log also carries the gateway's entire foreground stdout (it execs
+          # into this same fd), so a plain substring would red a perfectly healthy
+          # install the first time embedded Postgres logs "syntax error at or
+          # near". Both shells that can parse the payload are covered — bash says
+          # "syntax error near unexpected token", dash says "Syntax error: <what>
+          # unexpected" — and neither matches Postgres's wording.
+          HTML_PAYLOAD_RE='DOCTYPE|syntax error near|syntax error:'
+          assert_no_html_payload() {
+            grep -qiE "$HTML_PAYLOAD_RE" "$log" 2>/dev/null || return 0
+            echo "::error::the installer sourced a NON-SHELL payload — the origin answered a script path with HTML (soft 404)"
+            grep -inE "$HTML_PAYLOAD_RE" "$log" | head -n 10 | sed 's/^/      /'
+            dump
+            exit 1
+          }
+
+          # ── rung 3: the gateway answers /health (polled) ──────────────────────
+          # The gateway lives in the sigil namespace: a bare /api/v1/health would
+          # resolve as a workspace slug and 404. The port comes from the launch
+          # banner — install.sh auto-picks the first free port from its default
+          # upward, so read what it chose instead of assuming.
+          echo "Polling the gateway (timeout ${GW_HEALTH_TIMEOUT_SECS}s)…"
+          deadline=$(( $(date +%s) + GW_HEALTH_TIMEOUT_SECS ))
+          port="$GW_DEFAULT_PORT"
+          body=""
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            assert_no_html_payload
+            banner_port="$(sed -n 's|.*http://localhost:\([0-9][0-9]*\)/.*|\1|p' "$log" 2>/dev/null | head -n 1)"
+            [ -n "$banner_port" ] && port="$banner_port"
+            body="$(curl -fsS --max-time 5 "http://localhost:$port/~/api/v1/health" 2>/dev/null || true)"
+            echo "$body" | grep -q '"status":"ok"' && break
+            # Unquoted-default deliberately absent: `kill -0 0` targets the whole
+            # process group and ALWAYS succeeds, so a `${INSTALL_PID:-0}` fallback
+            # would silently disable this fast-fail. `set -u` is the right failure
+            # here — the launch step always exports it or the job never got here.
+            if ! kill -0 "$INSTALL_PID" 2>/dev/null; then
+              echo "::error::the installer exited before the gateway became healthy"
+              assert_no_html_payload      # names the cause when it is the HTML one
+              dump
+              exit 1
+            fi
+            sleep 5
+          done
+          assert_no_html_payload
+          echo "$body" | grep -q '"status":"ok"' \
+            || { echo "::error::the gateway never reported healthy within ${GW_HEALTH_TIMEOUT_SECS}s"; dump; exit 1; }
+          echo "$body" | grep -q '"role":"gateway"' \
+            || { echo "::error::/~/api/v1/health did not answer as the gateway: $body"; dump; exit 1; }
+          echo "rung 2 + 3 OK — installed cleanly, gateway healthy on port $port: $body"
+
+          # ── rung 4: the frontend is served ────────────────────────────────────
+          code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "http://localhost:$port/" || echo 000)"
+          [ "$code" = "200" ] \
+            || { echo "::error::frontend http://localhost:$port/ returned HTTP $code"; dump; exit 1; }
+          echo "rung 4 OK — frontend serves 200 at http://localhost:$port/"
+
+          echo "OK — 'curl -fsSL $FRONT_DOOR/install.sh | sh' works on a fresh ubuntu:22.04 box."
+
+      # The cause is always in this log; make it readable in the Actions output
+      # rather than only in an artifact (this job has no checkout and uploads none).
+      # Full mode only: payload mode never launches an installer, so there is no
+      # log — and an unconditional dump would answer a rung-1 failure with a
+      # misleading "(no installer log — it never started)".
+      - name: Dump the installer log
+        if: failure() && env.FD_MODE == 'full'
+        shell: bash
+        run: |
+          echo "=== full installer log ==="
+          cat "$RUNNER_TEMP/install.log" 2>/dev/null || echo "(no installer log — it never started)"
+
+      # `if: always()` means this also runs when an EARLIER rung failed and the
+      # installer never launched. Guard on a non-empty pid: a bare `kill 0`
+      # (which `${INSTALL_PID:-0}` would expand to) signals this shell's entire
+      # process group, killing the teardown step itself and burying the real
+      # failure under a spurious one.
+      - name: Stop the gateway
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${INSTALL_PID:-}" ]; then
+            kill "$INSTALL_PID" 2>/dev/null || true
+          fi
 

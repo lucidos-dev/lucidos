@@ -87,6 +87,23 @@ impl LucidosEngine {
             return;
         };
 
+        // The embedding model loads in the background (see `memory::EmbedderSlot`).
+        // A rebuild DELETES entries before re-indexing (force → clear all;
+        // re_extract_stale → delete stale-version rows), and every re-index would
+        // error EMBEDDER_UNAVAILABLE while the model isn't ready — clearing memory
+        // it cannot rebuild. Refuse until the model lands so a rebuild triggered
+        // during the load window can't wipe memory (the HTTP handler pre-checks
+        // this too; this is the fail-fast floor for every caller). The background
+        // loader runs the reembed sweep itself once the model installs.
+        if !self.embedder.is_ready() {
+            log!(
+                @Memory,
+                "Embedding model not ready yet — refusing memory rebuild (would clear entries it can't re-index); retry once memory is active"
+            );
+            self.rebuilding_memory.store(false, Ordering::SeqCst);
+            return;
+        }
+
         let send_progress = |processed: usize, total: usize| {
             if let Some(ref bus) = event_bus {
                 let pct = if total > 0 {

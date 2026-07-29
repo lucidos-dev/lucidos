@@ -825,7 +825,7 @@ export function ThreadView() {
                 {/* tabindex makes the transcript a keyboard-focusable scroll
                     region: once focused (via Tab or the ⌘↑/⌘↓ turn shortcuts) the
                     native Arrow/PageUp/PageDown/Home/End/Space keys scroll it. */}
-                <div class="thread-content visible" ref={areaRef} tabIndex={0} role="region" aria-label="Conversation transcript">
+                <div class="thread-content visible" ref={areaRef} tabIndex={0} role="region" aria-label="Thread transcript">
                     <MobileThreadTitleBar />
 
                     {exchanges.length === 0 ? (

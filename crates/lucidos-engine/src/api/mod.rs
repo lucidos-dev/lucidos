@@ -27,6 +27,7 @@ mod presence;
 pub mod presence_pong;
 pub(crate) mod proxy;
 pub(crate) mod proxy_auth_layer;
+pub(crate) mod proxy_builtin;
 pub(crate) mod proxy_hex;
 pub(crate) mod proxy_hmac_layer;
 pub mod proxy_migration;
@@ -543,6 +544,20 @@ pub struct EmailAccountSettings {
     pub require_send_confirmation: bool,
 }
 
+/// Deserialize an `Option<T>` field into `Option<Option<T>>` so a handler can
+/// tell "key absent" (`None`) from "key present and null" (`Some(None)`).
+///
+/// `#[serde(default)]` alone collapses both to `None`. Pair this with
+/// `#[serde(default)]` on a nullable PATCH field whose `null` must mean *clear
+/// it* rather than *leave it alone*.
+pub fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer).map(Some)
+}
+
 // Model registry types
 #[derive(Serialize)]
 pub struct ModelsListResponse {
@@ -563,6 +578,11 @@ pub struct CreateModelRequest {
     /// Display order; omitted user models sort after the builtins.
     #[serde(default)]
     pub sort_order: Option<i32>,
+    /// Context window in tokens. Omit to let the engine infer it from the model
+    /// id — only worth setting for ids the id-shape fallback gets wrong (every
+    /// OpenRouter / Gemini / local model, which otherwise takes 200k).
+    #[serde(default)]
+    pub context_window: Option<i32>,
 }
 
 /// PUT body for a model. For builtin rows only `enabled` is applied (disable-only);
@@ -577,6 +597,12 @@ pub struct UpdateModelRequest {
     pub sort_order: Option<i32>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Context window in tokens. Absent keeps the stored value; an explicit
+    /// `null` CLEARS it, handing the model back to the id-shape fallback. The
+    /// double `Option` is what distinguishes those two cases — serde maps a
+    /// missing key to `None` and a literal `null` to `Some(None)`.
+    #[serde(default, deserialize_with = "crate::api::deserialize_some")]
+    pub context_window: Option<Option<i32>>,
 }
 
 /// Generic success/error response used by credential, preference, and trigger endpoints.
@@ -852,7 +878,9 @@ async fn serve_frontend(static_dir: PathBuf, req: axum::extract::Request) -> Res
     }
 
     let prefix = base_path::forwarded_prefix(req.headers());
-    let path = req.uri().path();
+    // Own the path because `ServeDir::oneshot` consumes the request before the
+    // missing-asset branch decides whether SPA fallback is legal.
+    let path = req.uri().path().to_string();
 
     if path.starts_with("/api/") {
         return StatusCode::NOT_FOUND.into_response();
@@ -868,6 +896,7 @@ async fn serve_frontend(static_dir: PathBuf, req: axum::extract::Request) -> Res
     let service = ServeDir::new(&static_dir);
     match service.oneshot(req).await {
         Ok(resp) if resp.status() != StatusCode::NOT_FOUND => resp.map(axum::body::Body::new),
+        _ if path.starts_with("/assets/") => StatusCode::NOT_FOUND.into_response(),
         _ => serve_shell(&static_dir, &prefix),
     }
 }
@@ -1094,6 +1123,30 @@ mod tests {
         for value in [Some("1"), Some("true"), Some("yes"), Some("on")] {
             assert!(permissive_cors_enabled_value(value), "value: {value:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn missing_hashed_frontend_asset_is_404_not_html_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            "<!doctype html><html><head></head><body>shell</body></html>",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("assets")).unwrap();
+
+        let request = axum::extract::Request::builder()
+            .uri("/assets/index-oldhash.js")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = serve_frontend(dir.path().to_path_buf(), request).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_ne!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/html; charset=utf-8")),
+            "a missing module must never receive index.html as JavaScript"
+        );
     }
 
     #[test]

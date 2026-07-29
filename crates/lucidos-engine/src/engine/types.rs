@@ -96,6 +96,57 @@ mod tests {
         assert_eq!(section.role, ContextRole::User);
         assert!(section.group.is_none());
     }
+
+    /// A session whose run loop still owns `msg_rx` is live.
+    #[test]
+    fn session_with_running_loop_is_live() {
+        let (session, _msg_rx) = AgentSession::for_test();
+        assert!(session.is_live());
+    }
+
+    /// Regression (2026-07-28): the run future was dropped rather than
+    /// completed, so nothing set `process_exited` — but `msg_rx` went with it.
+    /// The entry must read as dead anyway, because the loop that would ever
+    /// service it is gone. This is the phantom that wedged thread `293f96d5`.
+    #[test]
+    fn session_whose_loop_was_dropped_is_not_live() {
+        let (session, msg_rx) = AgentSession::for_test();
+        drop(msg_rx);
+
+        assert!(
+            !session.process_exited,
+            "precondition: a dropped future never gets to set this flag"
+        );
+        assert!(
+            !session.is_live(),
+            "a session whose receiver is gone must not read as live — \
+             it fooled worktree cleanup, the chat fast path, and the resume guard"
+        );
+    }
+
+    /// The normal exit path still works: the loop sets `process_exited` before
+    /// the map entry is removed, and that alone marks it dead.
+    #[test]
+    fn session_with_exited_process_is_not_live() {
+        let (mut session, _msg_rx) = AgentSession::for_test();
+        session.process_exited = true;
+        assert!(!session.is_live());
+    }
+
+    /// `is_in_flight` is layered on `is_live`, so a phantom mid-turn session
+    /// (`is_waiting == false`) must not report an in-flight response either.
+    #[test]
+    fn phantom_mid_turn_session_is_not_in_flight() {
+        let (mut session, msg_rx) = AgentSession::for_test();
+        session.is_waiting = false;
+        assert!(session.is_in_flight(), "live mid-turn session is in flight");
+
+        drop(msg_rx);
+        assert!(
+            !session.is_in_flight(),
+            "a phantom must never report an in-flight response"
+        );
+    }
 }
 
 /// CC can't expose its system prompt body or tool schemas via the
@@ -299,6 +350,17 @@ pub struct AgentSession {
     /// graceful interrupt → Result event → classify_result(is_shutdown=true)
     /// path emits a duplicate `ResponseAborted` 3s after the pre-emit.
     pub external_terminal_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the external watchdog (alongside `external_terminal_emitted`,
+    /// before it cancels the session) when the "terminal" it emitted is a
+    /// recovery `ContinuationRequested{auto_recovery_after_hang}` — i.e. an
+    /// auto-recovery continuation of this very turn is in flight. The
+    /// suppression flag alone is ambiguous (a restart abort or a concurrent
+    /// cancel also sets it), and a conflict-resolution session must
+    /// distinguish: the wedged loop's completion reads this to HAND OFF the
+    /// merge duty (`ConflictResolutionCleanupAction::HandOff`) instead of
+    /// aborting the apply and tearing down the merge worktree underneath the
+    /// continuation the watchdog just dispatched.
+    pub external_continuation_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Channel for sending control requests (set_model, set_permission_mode, etc.)
     /// from outside the event loop. The event loop forwards them to the runtime.
     pub control_tx: tokio::sync::mpsc::UnboundedSender<crate::runtime::ControlRequest>,
@@ -383,7 +445,88 @@ impl AgentSession {
     /// True when the session has an in-flight response: process alive and
     /// not waiting at a turn boundary.
     pub fn is_in_flight(&self) -> bool {
-        !self.process_exited && !self.is_waiting
+        self.is_live() && !self.is_waiting
+    }
+
+    /// True when this entry still has a running session loop behind it.
+    ///
+    /// **Membership in `agent_sessions` is not liveness.** `run_session` owns
+    /// the receiving half of [`Self::msg_tx`], so a run future that is dropped
+    /// rather than completed — a cancelled caller, an aborted task — closes the
+    /// channel the instant it goes away, while the map entry it inserted
+    /// survives untouched with `process_exited == false` (nothing on the
+    /// cancellation path clears it). That leftover is a *phantom session*.
+    ///
+    /// One fooled three independent readers at once on 2026-07-28: worktree
+    /// cleanup skipped the thread forever ("live agent session active"), the
+    /// chat fast path sent a follow-up into a dead channel, and the resume
+    /// guard refused every follow-up with "A coding agent is already running
+    /// for this thread" — wedging the thread until the engine restarted. All
+    /// three had asked `!process_exited`, which only the *loop* ever sets.
+    ///
+    /// `msg_tx.is_closed()` is the self-maintaining half of the answer: it is
+    /// already correct with no cleanup having run at all. `run_session`'s
+    /// drop-guard still reaps the entry, but liveness must never depend on that
+    /// having happened yet — the guard's cleanup is asynchronous, so there is
+    /// always a window where the entry outlives its loop.
+    pub fn is_live(&self) -> bool {
+        !self.process_exited && !self.msg_tx.is_closed()
+    }
+}
+
+/// Test-only `AgentSession` builder, colocated with the type so the field list
+/// lives in one place instead of being re-spelled in every test module.
+///
+/// Hands the receiver back deliberately: an `AgentSession` whose `msg_rx` has
+/// been dropped is a phantom (see [`AgentSession::is_live`]), so a builder that
+/// dropped it internally would silently hand every test a dead session. Bind it
+/// (`let (session, _rx) = …`) for the lifetime of the test.
+#[cfg(test)]
+impl AgentSession {
+    pub(crate) fn for_test() -> (Self, tokio::sync::mpsc::UnboundedReceiver<AgentUserInput>) {
+        let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel::<AgentUserInput>();
+        (Self::for_test_with_sender(msg_tx), msg_rx)
+    }
+
+    /// Same, for a test that already owns the channel pair (and therefore keeps
+    /// the receiver alive itself).
+    pub(crate) fn for_test_with_sender(
+        msg_tx: tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
+    ) -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32};
+        use std::sync::Arc;
+        Self {
+            msg_tx,
+            is_waiting: true,
+            has_changes: false,
+            requires_restart: false,
+            pending_stop: None,
+            cancel_actor: None,
+            redirect_followup: false,
+            stop: Arc::new(tokio::sync::Notify::new()),
+            interrupt: Arc::new(tokio::sync::Notify::new()),
+            idle_notify: Arc::new(tokio::sync::Notify::new()),
+            apply_now_in_progress: false,
+            process_exited: false,
+            worktree_path: None,
+            branch_name: None,
+            repo_root: None,
+            cc_session_id: None,
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            external_terminal_emitted: Arc::new(AtomicBool::new(false)),
+            external_continuation_requested: Arc::new(AtomicBool::new(false)),
+            control_tx: tokio::sync::mpsc::unbounded_channel().0,
+            builtin_commands: vec![],
+            skill_commands: vec![],
+            current_model: None,
+            current_reasoning_effort: None,
+            last_event_at: Arc::new(AtomicI64::new(0)),
+            pending_followups: Arc::new(AtomicU32::new(0)),
+            question_resume_pending: false,
+            tools_in_flight: Arc::new(AtomicI32::new(0)),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            agent_cancel: tokio_util::sync::CancellationToken::new(),
+        }
     }
 }
 

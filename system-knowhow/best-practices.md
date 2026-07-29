@@ -81,7 +81,7 @@ Engine-read JSON files. Currently:
 
 ## Every subprocess call is a fresh process
 
-`run_bash`, `run_bash_background`, `run_python`, and `run_python_background` each spawn a **brand-new process** (bash runs via `/bin/sh -c`). **No shell state carries over between calls** — an `export VAR=…`, a `cd somewhere`, and any shell functions you set in one call are gone by the next.
+`run_bash`, `run_bash_background`, `run_python`, and `run_python_background` each spawn a **brand-new process** (bash runs via `bash -o pipefail -c`, so a failing stage of a pipeline is never masked by a later succeeding one). **No shell state carries over between calls** — an `export VAR=…`, a `cd somewhere`, and any shell functions you set in one call are gone by the next.
 
 ```bash
 # call 1
@@ -138,6 +138,8 @@ Setup is **partly interactive** — you can set the variables, but the user must
    - **Persistent bulk reference corpora the user wants to keep but not in the workspace** → `~/.lucidos/data/{name}/` (sibling to `~/.lucidos/knowhow/`, cross-workspace, persistent, agent-discoverable). Pin the absolute path in the relevant app's knowhow so converter scripts can find it. Use `lucidos data-store add {name} {source-dir}` to move an existing directory there.
    - **Intermediate / debug / one-shot render output** (e.g. cropping tiles, OMR debug pixmaps, scratch PNGs from a one-time analysis) does NOT belong in `artifacts/imported/` at all. Use `.lucidos/tmp/` and delete after the analysis.
    - **Inherited cruft from earlier sessions** — if you find unexplained files under `data/artifacts/imported/` that don't appear in the consuming app's source, scripts, or knowhow, verify each one (grep app + scripts + knowhow), ask the user about ambiguous cases, then `git rm` the dead files in a single commit with before/after artifact counts in the message.
+9. **Chained edits use post-edit content** — when you `edit_file` the same file a second time in one turn, build `old_string` from what the previous `edit_file` call returned (or from the content the error body echoes back), never from the read you took before the first edit and never from your own memory of the text you just wrote. Otherwise the call fails with "The file was likely modified by a previous edit". A file needing 3+ edits in one turn → one `write_file` rewrite instead of chained `edit_file` calls.
+10. **`read_file` is `data/`-only** — every path resolves under the workspace's `data/` directory (an untyped path is silently rewritten to `artifacts/<path>`, which is why the miss reads `file not found: artifacts/…`); `..` and absolute paths are rejected outright, and `system-knowhow/…` is the only prefix that reaches outside. To read engine source, or anything else outside the workspace, use `run_bash` (`sed -n`, `cat`). The Lucidos repo is at `~/projects/lucidos` — it is NOT under `data/artifacts/`.
 
 ## Images posted in a thread
 

@@ -63,6 +63,26 @@ for IDE integrations.
    permission cards, no AskUserQuestion — those stay CC-only features wired
    through CC's PreToolUse hook.
 
+   *Update 2026-07-26 — the workspace `data/` tree is a second writable
+   root.* The shared git dir was the only `--add-dir`, so writes to the
+   PARENT workspace's `data/` — which is the *documented* contract for a
+   coding-agent thread (`lucidos data write` / `lucidos data path` resolve
+   under `<workspace>/data/`, and workspace knowhow tells agents to log
+   follow-ups to `artifacts/work-tracker/data.json`) — were outside every
+   writable root and the macOS seatbelt refused them with `EPERM (os error
+   1)`. That silently broke the 2026-07-26 nightly's Codex security pass,
+   which lost two high-severity findings; Claude Code runs unsandboxed and
+   never hit it, so the contract looked like it worked. `CodexConfig` now
+   carries a `sandbox_writable_roots: Vec<PathBuf>` (resolved by
+   `codex::sandbox_writable_roots`) holding the git dir **and**
+   `<workspace>/data`, emitted as `--add-dir` on exec and
+   `sandbox_workspace_write.writable_roots` on app-server. Scoped to
+   `data/`, deliberately **not** the workspace root: the root also holds
+   `.lucidos/` (engine runtime, logs, gateway registry) and every sibling
+   worktree. The sandbox stays the guard for everything else; a new entry in
+   that list is a reviewable widening, pinned by tests asserting the set is
+   exactly the configured roots.
+
    *Update 2026-06-12:* both halves have since been closed. AskUserQuestion
    landed as the `ask_user_question` MCP tool (`lucidos
    mcp-permission-server`, hitting the same blocking internal endpoint CC's

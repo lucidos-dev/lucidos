@@ -115,6 +115,71 @@ pub fn continue_should_open_resume_exchange(reason: Option<&str>) -> bool {
     )
 }
 
+/// What the spawn consumer must do after a `SpawnRequest::Continue`'s
+/// `run_direct_agent` returns. See [`continue_recovery`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinueRecovery {
+    /// The turn ran; the run loop emitted its own terminal. Nothing to do.
+    Nothing,
+    /// Stale resume on the FIRST attempt — re-run once with a fresh session
+    /// (no resume sid) and the conversation reconstructed into the prompt.
+    RetryFresh,
+    /// Errored with no retry left. Settle the projection so the thread cannot
+    /// sit at `running` with no live subprocess.
+    Settle,
+}
+
+/// Decide the spawn consumer's next move for a continuation, from the error the
+/// run returned (if any) and whether the fresh-session retry has already been
+/// spent.
+///
+/// Extracted as a pure function because the consumer's async shell needs a full
+/// `LucidosEngine` and cannot be exercised in a test — same reason
+/// [`continue_should_open_resume_exchange`] and
+/// `external_watchdog::external_watchdog_decision` are shaped this way. The
+/// wiring bug this encodes was invisible precisely because the decision lived
+/// inline in that untestable shell.
+///
+/// Two properties are load-bearing:
+///
+/// - **A stale resume MUST be retried, not just logged.** `run_session` bails on
+///   a stale resume WITHOUT a terminal event — deliberately, so the projection
+///   stays `running` across the retry window instead of flashing "Aborted". That
+///   only holds if a retry actually follows. When it didn't, thread `cb503361`
+///   wedged at `running` for 8 minutes (2026-07-29) with no live subprocess: the
+///   stale-resume arm also drops the `agent_sessions` entry, and that map is the
+///   only thing `ExternalWatchdog` scans.
+/// - **The retry is one-shot.** `retried == true` settles even on another
+///   `STALE_RESUME_ERROR`, so an engine-driven continuation can never loop. (It
+///   is unreachable anyway — the retry passes no resume sid and
+///   `is_stale_resume_signal` requires one — but crash-safety here is a floor,
+///   not an inference.)
+///
+/// The ONE error that must NOT settle is `AGENT_ALREADY_RUNNING_ERROR`: the
+/// spawn guard rejected us because a **live** session already owns the thread,
+/// so this continuation owns nothing and the `running` projection is TRUE — it
+/// belongs to the turn that won the race. Settling there would emit a terminal
+/// against a working session and make the projection lie in the opposite
+/// direction, which is strictly worse than the wedge this backstop exists to
+/// prevent. Reachable whenever a continuation races a user message: the
+/// consumer dispatches off an event subscriber with no lock on the thread.
+///
+/// Every other error settles: the failure modes that skip their own terminal are
+/// exactly the ones we cannot enumerate, and settling is idempotent
+/// (`settle_stuck_running_thread` re-checks `running` first).
+pub fn continue_recovery(error: Option<&str>, retried: bool) -> ContinueRecovery {
+    match error {
+        None => ContinueRecovery::Nothing,
+        Some(e) if e == crate::engine::claude_code::AGENT_ALREADY_RUNNING_ERROR => {
+            ContinueRecovery::Nothing
+        }
+        Some(e) if !retried && e == crate::engine::claude_code::STALE_RESUME_ERROR => {
+            ContinueRecovery::RetryFresh
+        }
+        Some(_) => ContinueRecovery::Settle,
+    }
+}
+
 /// User message the spawn consumer hands to `run_direct_agent` when actuating
 /// a `SpawnRequest::Continue`. **Must be non-empty.**
 ///
@@ -133,6 +198,24 @@ pub fn continue_should_open_resume_exchange(reason: Option<&str>) -> bool {
 /// this call site later; until then this constant guarantees the non-empty
 /// stdin precondition.
 pub const CONTINUE_RESUME_USER_MESSAGE: &str = "Continue from where you left off.";
+
+/// Input for the spawn consumer's **one-shot stale-resume retry** of a
+/// `SpawnRequest::Continue`: the thread's conversation reconstructed from events,
+/// followed by [`CONTINUE_RESUME_USER_MESSAGE`].
+///
+/// The retry runs with `resume_session_id: None` — the sid we just proved dead
+/// cannot be reused — so the fresh subprocess starts with zero context. Without
+/// the recap it would "continue from where you left off" with no idea where that
+/// was. Same shape as the chat handler's stale-resume retry
+/// (`chat::process_cc`), which is the path this one was missing.
+pub(crate) async fn continue_retry_input(pool: &sqlx::PgPool, thread_id: Uuid) -> String {
+    crate::engine::agent_session::prepend_reconstruction(
+        pool,
+        thread_id,
+        CONTINUE_RESUME_USER_MESSAGE,
+    )
+    .await
+}
 
 /// Remove a stale (duplicate-recovery) worktree, deleting its branch ONLY when
 /// fully merged (no unique commits). NEVER force-deletes a branch that still

@@ -97,7 +97,12 @@ describe('shouldReloadForStaleChunk loop guard', () => {
   });
 
   it('returns false (no auto-reload) when sessionStorage is unavailable', () => {
-    const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+    // Spy on the live global — the object `shouldReloadForStaleChunk` actually
+    // calls — not on `Storage.prototype`. The prototype route only worked while
+    // the test env happened to hand us a real `Storage` instance; test-setup.ts
+    // now always installs a plain in-memory stub (so touching Node's built-in
+    // Web Storage can't warn), which no longer inherits from that prototype.
+    const spy = vi.spyOn(globalThis.sessionStorage, 'getItem').mockImplementation(() => {
       throw new Error('opaque origin');
     });
     try {

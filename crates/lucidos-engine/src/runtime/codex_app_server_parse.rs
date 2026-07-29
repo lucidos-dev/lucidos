@@ -207,6 +207,14 @@ pub(super) struct AppServerTracker {
     /// Approval-gated command/file items whose visible `ToolUse` must wait
     /// until the user accepts the permission card.
     approval_gates: HashMap<String, ApprovalGate>,
+    /// Last plan snapshot emitted from `turn/plan/updated`, for dedup —
+    /// mirrors the exec tracker's `last_todo_items`. Deliberately NOT reset
+    /// in [`begin_turn`]: the plan persists across turns, so a new turn's
+    /// first update carrying the unchanged list must not re-emit a card.
+    last_plan_items: Option<serde_json::Value>,
+    /// Monotonic id source for the synthesized plan tool pairs —
+    /// `turn/plan/updated` is a turn-level notification with no item id.
+    plan_seq: u64,
 }
 
 #[derive(Debug)]
@@ -464,6 +472,53 @@ impl AppServerTracker {
                 };
                 self.map_item(item, completed)
             }
+            // The plan tool (codex's TodoWrite analog). Normalized to the
+            // exec protocol's `todo_list` shape (`{items: [{text, completed}]}`
+            // from `{plan: [{step, status}]}`) and emitted as the same
+            // synthesized ToolUse/ToolResult pair per *distinct* list, so the
+            // timeline shows live plan progress on the default protocol too —
+            // previously these notifications were dropped and Codex plan usage
+            // was invisible (exec-driver and CC-TodoWrite parity gap).
+            "turn/plan/updated" => {
+                let items: Vec<serde_json::Value> = params
+                    .get("plan")
+                    .and_then(|p| p.as_array())
+                    .map(|steps| {
+                        steps
+                            .iter()
+                            .map(|s| {
+                                serde_json::json!({
+                                    "text": str_field(s, "step"),
+                                    "completed": s.get("status").and_then(|v| v.as_str())
+                                        == Some("completed"),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if items.is_empty() {
+                    return Vec::new();
+                }
+                let items = serde_json::Value::Array(items);
+                if self.last_plan_items.as_ref() == Some(&items) {
+                    return Vec::new();
+                }
+                self.last_plan_items = Some(items.clone());
+                self.plan_seq += 1;
+                let id = format!("plan_{}", self.plan_seq);
+                vec![
+                    AgentEvent::ToolUse {
+                        name: "todo_list".to_string(),
+                        input: serde_json::json!({ "items": items }),
+                        id: id.clone(),
+                    },
+                    AgentEvent::ToolResult {
+                        output: String::new(),
+                        status: "success".to_string(),
+                        id,
+                    },
+                ]
+            }
             _ => Vec::new(),
         }
     }
@@ -622,9 +677,10 @@ impl AppServerTracker {
                     },
                 ]
             }
-            // userMessage echoes our own input; reasoning summaries and plan
-            // items have no slot in the coding-agent timeline (same call the
-            // exec tracker makes for `reasoning`).
+            // userMessage echoes our own input; completed reasoning items
+            // already streamed via `item/reasoning/*` deltas; plan progress
+            // arrives via `turn/plan/updated` (mapped in `map_notification`),
+            // not as items.
             _ => Vec::new(),
         }
     }

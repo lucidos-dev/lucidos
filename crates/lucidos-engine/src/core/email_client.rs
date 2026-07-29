@@ -1,10 +1,64 @@
 //! EmailClient (SMTP/IMAP) implementation, split out of email.rs.
 use super::*;
 
+/// Hard wall-clock bound for one SMTP send (connect + handshake + auth + data).
+/// lettre's async transport enforces its own 60s default only on the TCP
+/// connect; every later phase is unbounded, so without this outer bound a
+/// server that accepts the connection and stalls hangs the send forever.
+/// Generous because the budget also covers the DATA upload of multi-MB
+/// attachments on slow uplinks — common failures (unreachable route, refused
+/// auth) surface much earlier on their own. The frontend's email-send request
+/// timeout (`EMAIL_SEND_TIMEOUT_MS` in
+/// `crates/lucidos-app/src/api/client/settings.ts`) must stay ABOVE this value
+/// PLUS the 30s OAuth-refresh bound that precedes the send (`bounded_http_client`
+/// in `core/oauth.rs`) so the engine's specific error reaches the user instead
+/// of a generic client-side "request timed out".
+const SMTP_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(80);
+
+/// Hard wall-clock bound for one complete IMAP operation (session setup +
+/// select + search/fetch + logout). `IMAP_CONNECT_TIMEOUT` (email.rs) bounds
+/// only session setup with a sharper error; async-imap's post-auth command
+/// phase is equally unbounded, so a server that stalls AFTER login would
+/// otherwise hang the calling chat turn indefinitely. Deliberately generous:
+/// the budget also covers a full RFC822 download (attachments run to ~25MB),
+/// so it's a stall backstop for the chat turn, not a UX-latency bound — no
+/// frontend request timeout depends on it.
+const IMAP_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Error for an IMAP operation that exceeded `IMAP_OP_TIMEOUT` — names the
+/// operation and endpoint per the errors-name-the-entity rule.
+fn imap_op_timed_out(account: &EmailAccount, op: &str) -> BoxError {
+    format!(
+        "IMAP {} via {}:{} did not complete within {}s — the server may be stalled, \
+         or the message is too large for the current connection",
+        op,
+        account.imap_host,
+        account.imap_port,
+        IMAP_OP_TIMEOUT.as_secs()
+    )
+    .into()
+}
+
 impl EmailClient {
     /// Read email summaries from an IMAP folder.
     /// If `oauth_access_token` is provided, uses XOAUTH2 instead of password login.
     pub async fn read_emails(
+        account: &EmailAccount,
+        folder: Option<&str>,
+        limit: Option<u32>,
+        search: Option<&str>,
+        since: Option<&str>,
+        oauth_access_token: Option<&str>,
+    ) -> Result<Vec<EmailSummary>, BoxError> {
+        tokio::time::timeout(
+            IMAP_OP_TIMEOUT,
+            Self::read_emails_unbounded(account, folder, limit, search, since, oauth_access_token),
+        )
+        .await
+        .map_err(|_| imap_op_timed_out(account, "read"))?
+    }
+
+    async fn read_emails_unbounded(
         account: &EmailAccount,
         folder: Option<&str>,
         limit: Option<u32>,
@@ -162,6 +216,20 @@ impl EmailClient {
         folder: Option<&str>,
         oauth_access_token: Option<&str>,
     ) -> Result<EmailMessage, BoxError> {
+        tokio::time::timeout(
+            IMAP_OP_TIMEOUT,
+            Self::read_email_unbounded(account, uid, folder, oauth_access_token),
+        )
+        .await
+        .map_err(|_| imap_op_timed_out(account, "read"))?
+    }
+
+    async fn read_email_unbounded(
+        account: &EmailAccount,
+        uid: u32,
+        folder: Option<&str>,
+        oauth_access_token: Option<&str>,
+    ) -> Result<EmailMessage, BoxError> {
         let folder = folder.unwrap_or("INBOX");
 
         let mut session = imap_connect(account, oauth_access_token).await?;
@@ -222,6 +290,21 @@ impl EmailClient {
         folder: Option<&str>,
         oauth_access_token: Option<&str>,
     ) -> Result<(String, String, Vec<u8>), BoxError> {
+        tokio::time::timeout(
+            IMAP_OP_TIMEOUT,
+            Self::fetch_attachment_unbounded(account, uid, attachment_index, folder, oauth_access_token),
+        )
+        .await
+        .map_err(|_| imap_op_timed_out(account, "attachment fetch"))?
+    }
+
+    async fn fetch_attachment_unbounded(
+        account: &EmailAccount,
+        uid: u32,
+        attachment_index: usize,
+        folder: Option<&str>,
+        oauth_access_token: Option<&str>,
+    ) -> Result<(String, String, Vec<u8>), BoxError> {
         use mail_parser::MimeHeaders;
 
         let folder = folder.unwrap_or("INBOX");
@@ -276,6 +359,35 @@ impl EmailClient {
         in_reply_to: Option<&str>,
         oauth_access_token: Option<&str>,
         attachments: &[EmailAttachment],
+    ) -> Result<String, BoxError> {
+        Self::send_email_with_timeout(
+            account,
+            to,
+            subject,
+            body,
+            cc,
+            bcc,
+            in_reply_to,
+            oauth_access_token,
+            attachments,
+            SMTP_SEND_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `send_email` with an explicit wall-clock bound (tests pass a short one).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_email_with_timeout(
+        account: &EmailAccount,
+        to: &str,
+        subject: &str,
+        body: &str,
+        cc: Option<&str>,
+        bcc: Option<&str>,
+        in_reply_to: Option<&str>,
+        oauth_access_token: Option<&str>,
+        attachments: &[EmailAttachment],
+        send_timeout: std::time::Duration,
     ) -> Result<String, BoxError> {
         use lettre::message::Mailbox;
         use lettre::transport::smtp::authentication::{Credentials, Mechanism};
@@ -406,7 +518,19 @@ impl EmailClient {
             tb.build()
         };
 
-        transport.send(message).await?;
+        // Outer wall-clock bound — see `SMTP_SEND_TIMEOUT`'s doc for why the
+        // transport can't be trusted to time out on its own.
+        tokio::time::timeout(send_timeout, transport.send(message))
+            .await
+            .map_err(|_| {
+                format!(
+                    "SMTP send via {}:{} timed out after {}s — the server did not respond \
+                     (network may block outbound SMTP, or the server is stalled)",
+                    account.smtp_host,
+                    account.smtp_port,
+                    send_timeout.as_secs()
+                )
+            })??;
 
         let auth_method = if oauth_access_token.is_some() {
             "XOAUTH2"

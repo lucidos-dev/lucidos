@@ -1,3 +1,5 @@
+import { recordIpcOutcome } from './ipcHealth';
+
 declare global {
   interface Window {
     __TAURI_INTERNALS__?: {
@@ -9,9 +11,28 @@ declare global {
   }
 }
 
-/** Invoke a Tauri command via IPC. Only call when isTauri() is true. */
+/** Invoke a Tauri command via IPC. Only call when isTauri() is true.
+ *
+ *  Every command goes through here, so this is where the health of the bridge
+ *  itself is observed: outcomes feed `recordIpcOutcome`, which writes a durable
+ *  `[Client/ipc]` line to the engine log when calls start failing and another
+ *  when they recover. Individual call sites are free to keep swallowing their own
+ *  rejection (`.catch(() => {})` on the heartbeat, `console.warn` in the
+ *  native-push handlers) — that no longer costs us the signal, which is what let
+ *  a total ACL-driven bridge failure run silently for a month. See
+ *  utils/ipcHealth. The returned promise is untouched: reporting must not change
+ *  what callers see. */
 export function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  return window.__TAURI_INTERNALS__!.invoke<T>(cmd, args);
+  return window.__TAURI_INTERNALS__!.invoke<T>(cmd, args).then(
+    (value) => {
+      recordIpcOutcome(cmd);
+      return value;
+    },
+    (error: unknown) => {
+      recordIpcOutcome(cmd, error ?? new Error('rejected with no error'));
+      throw error;
+    },
+  );
 }
 
 /**

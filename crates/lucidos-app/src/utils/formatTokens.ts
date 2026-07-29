@@ -18,6 +18,15 @@ export function estimateTokens(chars: number): number {
   return Math.round((chars * 2) / 3);
 }
 
+/** Render a model's declared context window for the Settings → Models row.
+ *  `null` means the engine infers it from the id — worth saying out loud,
+ *  because that fallback only knows Claude and GPT-5 ids and silently treats
+ *  everything else as 200k. */
+export function formatContextWindow(tokens: number | null): string {
+  if (tokens === null) return 'context window: inferred';
+  return `context window: ${formatTokens(tokens)}`;
+}
+
 /** Percent of the context window consumed, clamped 0..100. Returns 0 when
  *  `window` is 0 to avoid NaN; the modal hides the bar in that case. */
 export function contextPercent(used: number, window: number): number {

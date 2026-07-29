@@ -18,10 +18,10 @@ pass() { echo "  ok:   $*"; PASS=$((PASS+1)); }
 
 VERSION="0.14.0"
 TRIPLE="aarch64-apple-darwin"
-NAMES=(lucidos-engine lucidos-gateway lucidos frontend postgres sdk)
+NAMES=(lucidos-engine lucidos-gateway lucidos frontend postgres sdk system-knowhow)
 
-# A fake resources dir shaped like the real .app Contents/Resources: two loose
-# "binaries", two static dirs, and a relocatable-PG-like nested tree with a
+# A fake resources dir shaped like the real .app Contents/Resources: three loose
+# "binaries", three static dirs, and a relocatable-PG-like nested tree with a
 # symlink (to exercise ditto's symlink/dir handling).
 new_resources() {
     local dir
@@ -32,6 +32,7 @@ new_resources() {
     chmod +x "$dir/lucidos-engine" "$dir/lucidos-gateway" "$dir/lucidos"
     mkdir -p "$dir/frontend" && printf '<html>\n' > "$dir/frontend/index.html"
     mkdir -p "$dir/sdk"      && printf 'sdk\n'     > "$dir/sdk/sdk.js"
+    mkdir -p "$dir/system-knowhow" && printf '# glossary\n' > "$dir/system-knowhow/glossary.md"
     mkdir -p "$dir/postgres/bin" "$dir/postgres/lib"
     printf 'postgres\n' > "$dir/postgres/bin/postgres"
     chmod +x "$dir/postgres/bin/postgres"
@@ -43,7 +44,7 @@ new_resources() {
 # ── stem naming ──────────────────────────────────────────────────────────────
 echo "test: headless_tarball_stem builds lucidos-<version>-<triple>"
 got="$(headless_tarball_stem "$VERSION" "$TRIPLE")"
-[ "$got" = "lucidos-$VERSION-$TRIPLE" ] && pass "stem = $got" || fail "stem wrong: '$got'"
+if [ "$got" = "lucidos-$VERSION-$TRIPLE" ]; then pass "stem = $got"; else fail "stem wrong: '$got'"; fi
 
 # ── happy path: tarball + sidecar + contents ─────────────────────────────────
 echo ""
@@ -57,9 +58,9 @@ else
     fail "emit failed (rc=$rc)"
 fi
 STEM="lucidos-$VERSION-$TRIPLE"
-[ "$TARBALL" = "$OUT/$STEM.tar.gz" ] && pass "tarball path = $TARBALL" || fail "unexpected path: '$TARBALL'"
-[ -f "$OUT/$STEM.tar.gz" ]        && pass "tarball exists"  || fail "tarball missing"
-[ -f "$OUT/$STEM.tar.gz.sha256" ] && pass "sidecar exists"  || fail "sidecar missing"
+if [ "$TARBALL" = "$OUT/$STEM.tar.gz" ]; then pass "tarball path = $TARBALL"; else fail "unexpected path: '$TARBALL'"; fi
+if [ -f "$OUT/$STEM.tar.gz" ]; then pass "tarball exists"; else fail "tarball missing"; fi
+if [ -f "$OUT/$STEM.tar.gz.sha256" ]; then pass "sidecar exists"; else fail "sidecar missing"; fi
 
 echo ""
 echo "test: tarball members live under one <stem>/ prefix with the 6 resources"
@@ -72,8 +73,11 @@ for name in "${NAMES[@]}"; do
     fi
 done
 # The nested PG tree + symlink must come through.
-echo "$members" | grep -q "^$STEM/postgres/bin/postgres$" \
-    && pass "contains nested postgres/bin/postgres" || fail "missing nested postgres binary"
+if echo "$members" | grep -q "^$STEM/postgres/bin/postgres$"; then
+    pass "contains nested postgres/bin/postgres"
+else
+    fail "missing nested postgres binary"
+fi
 
 echo ""
 echo "test: no AppleDouble (._*) members in the tarball"
@@ -117,7 +121,7 @@ if [ $rc -ne 0 ] && echo "$out" | grep -qi "missing"; then
 else
     fail "expected missing-resource refusal (rc=$rc): $out"
 fi
-[ -f "$OUT/$STEM.tar.gz" ] && fail "tarball should not exist after a refusal" || pass "no tarball written on refusal"
+if [ -f "$OUT/$STEM.tar.gz" ]; then fail "tarball should not exist after a refusal"; else pass "no tarball written on refusal"; fi
 rm -rf "$RES" "$OUT"
 
 echo ""

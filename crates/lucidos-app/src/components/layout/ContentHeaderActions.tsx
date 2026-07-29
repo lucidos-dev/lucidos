@@ -1,6 +1,6 @@
 import { Fragment } from 'preact';
 import type { ComponentChild } from 'preact';
-import { useState, useEffect } from 'preact/hooks';
+import { useState, useEffect, useRef } from 'preact/hooks';
 import { NotificationsBell } from '../notifications/NotificationsBell';
 import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, diffWholeFile, diffWholeFileEffective, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen } from '../../store/store';
 import { closeUrl, refreshFilePreview } from '../../store/actions/artifacts';
@@ -11,6 +11,88 @@ import { isTauri, isIOSPwa } from '../../utils/platform';
 import { webviewReload } from '../../utils/tauri';
 import { openFileSearch } from '../files/fileSearchActions';
 import { pushOverlay, removeOverlay } from '../../store/overlayStack';
+import { OverflowMenu, type OverflowMenuContext } from '../shared/OverflowMenu';
+import { useHeaderActionCollapse } from '../../hooks/useHeaderActionCollapse';
+
+/** One context action as DATA, so the same record renders either as a
+ *  full-size header icon button or as a row inside the collapsed ⋯ overflow
+ *  menu. `icon` is a thunk — the header and the menu each need their own
+ *  vnode. The notifications bell is NOT one of these: it's the always-visible,
+ *  never-overflowed anchor and renders separately. */
+interface HeaderActionSpec {
+  key: string;
+  /** aria-label, tooltip, and the ⋯ menu row text. */
+  label: string;
+  icon: () => ComponentChild;
+  onClick?: (e: MouseEvent) => void;
+  /** Renders an `<a target="_blank">` instead of a button (open-in-tab). */
+  href?: string | null;
+  /** Extra class(es) on the header button, e.g. `app-fullscreen`. */
+  extraClass?: string;
+  /** Toggled-on state — adds `filter-active` (apps/plugins search). */
+  active?: boolean;
+  /** Disabled with an explanatory tooltip (diff-pinned refresh). */
+  disabledTooltip?: string;
+}
+
+/** Full-size header rendering — markup identical to the pre-collapse version. */
+function renderHeaderAction(a: HeaderActionSpec): ComponentChild {
+  const cls = `icon-btn header-icon${a.extraClass ? ` ${a.extraClass}` : ''}${a.active ? ' filter-active' : ''}`;
+  if (a.href !== undefined) {
+    return (
+      <a class={cls} href={a.href ?? undefined} target="_blank" rel="noopener noreferrer" aria-label={a.label} data-tooltip={a.label}>
+        {a.icon()}
+      </a>
+    );
+  }
+  if (a.disabledTooltip) {
+    // Override .icon-btn:disabled { pointer-events: none } so the tooltip
+    // (which relies on hover events) can still explain why the button is off.
+    return (
+      <button class={cls} disabled aria-label={a.disabledTooltip} data-tooltip={a.disabledTooltip} style="pointer-events: auto;">
+        {a.icon()}
+      </button>
+    );
+  }
+  return (
+    <button class={cls} onClick={a.onClick} aria-label={a.label} data-tooltip={a.label}>
+      {a.icon()}
+    </button>
+  );
+}
+
+/** Collapsed rendering — a ⋯ menu row with the same label + handler. `ctx.run`
+ *  closes the menu before firing (links keep their native navigation — `run`
+ *  doesn't preventDefault). */
+function renderMenuAction(a: HeaderActionSpec, ctx: OverflowMenuContext): ComponentChild {
+  if (a.href !== undefined) {
+    return (
+      <a key={a.key} class="thread-overflow-item" role="menuitem" href={a.href ?? undefined} target="_blank" rel="noopener noreferrer" onClick={ctx.run(() => {})}>
+        {a.icon()}
+        {a.label}
+      </a>
+    );
+  }
+  if (a.disabledTooltip) {
+    // aria-disabled, NOT the disabled attribute: a disabled <button> can't take
+    // focus, and when this row is the FIRST [role="menuitem"] (diff-pinned
+    // refresh collapses first) OverflowMenu's keyboard-open would focus a
+    // no-op target and strand the arrow-key roving outside the panel. An
+    // aria-disabled row stays focusable/perceivable and simply has no onClick.
+    return (
+      <button key={a.key} type="button" class="thread-overflow-item" role="menuitem" aria-disabled="true" data-tooltip={a.disabledTooltip}>
+        {a.icon()}
+        {a.label}
+      </button>
+    );
+  }
+  return (
+    <button key={a.key} type="button" class="thread-overflow-item" role="menuitem" onClick={(e: MouseEvent) => ctx.run(() => a.onClick?.(e))(e)}>
+      {a.icon()}
+      {a.label}
+    </button>
+  );
+}
 
 /** Shared action buttons for the content side of the header (used by both mobile and desktop). */
 export function ContentHeaderActions() {
@@ -86,30 +168,17 @@ export function ContentHeaderActions() {
   }
 
   // ── Build ordered action list — each key claimed exactly once ──
-  const actions: Array<{ key: string; el: ComponentChild }> = [];
+  const actions: HeaderActionSpec[] = [];
   const claimed = new Set<string>();
 
-  function addAction(key: string, el: ComponentChild) {
-    if (claimed.has(key)) throw new Error(`Header action "${key}" already claimed`);
-    claimed.add(key);
-    actions.push({ key, el });
+  function addAction(spec: HeaderActionSpec) {
+    if (claimed.has(spec.key)) throw new Error(`Header action "${spec.key}" already claimed`);
+    claimed.add(spec.key);
+    actions.push(spec);
   }
 
-  function reloadButton(onClick: () => void, label: 'Refresh' | 'Reload' = 'Refresh', disabledTooltip?: string) {
-    if (disabledTooltip) {
-      // Override .icon-btn:disabled { pointer-events: none } so the tooltip
-      // (which relies on hover events) can still explain why the button is off.
-      return (
-        <button class="icon-btn header-icon" disabled aria-label={disabledTooltip} data-tooltip={disabledTooltip} style="pointer-events: auto;">
-          <ReloadIcon />
-        </button>
-      );
-    }
-    return (
-      <button class="icon-btn header-icon" onClick={onClick} aria-label={label} data-tooltip={label}>
-        <ReloadIcon />
-      </button>
-    );
+  function reloadSpec(key: string, onClick: () => void, label: 'Refresh' | 'Reload' = 'Refresh', disabledTooltip?: string): HeaderActionSpec {
+    return { key, label, icon: () => <ReloadIcon />, onClick, disabledTooltip };
   }
 
   // Context-specific actions — mutually exclusive via if/else
@@ -118,31 +187,35 @@ export function ContentHeaderActions() {
     // currently pointed at, including WIP. Apply landing on disk and direct
     // file-source edits still drop WIP — those paths call refreshAppUI()
     // with the default options.
-    addAction('refresh', reloadButton(() => void refreshAppUI(undefined, { preserveWip: true })));
+    addAction(reloadSpec('refresh', () => void refreshAppUI(undefined, { preserveWip: true })));
     // iOS standalone PWA cannot open same-origin links in an external browser
     // (all WebKit-based browsers on iOS share this limitation).
     if (!isIOSPwa()) {
-      const appFrameSrc = getAppFrameSrc();
-      addAction('open-in-tab',
-        <a class="icon-btn header-icon app-open-in-tab" href={appFrameSrc ?? undefined} target="_blank" rel="noopener noreferrer" aria-label="Open in new tab" data-tooltip="Open in new tab">
-          <PopOutIcon />
-        </a>,
-      );
+      addAction({
+        key: 'open-in-tab',
+        label: 'Open in new tab',
+        icon: () => <PopOutIcon />,
+        href: getAppFrameSrc(),
+        extraClass: 'app-open-in-tab',
+      });
     }
-    addAction('fullscreen',
-      <button class="icon-btn header-icon app-fullscreen" onClick={toggleFullscreen} aria-label={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'} data-tooltip={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}>
-        {isFullscreen ? <ExitFullscreenIcon /> : <FullscreenIcon />}
-      </button>,
-    );
+    addAction({
+      key: 'fullscreen',
+      label: isFullscreen ? 'Exit fullscreen' : 'Fullscreen',
+      icon: () => (isFullscreen ? <ExitFullscreenIcon /> : <FullscreenIcon />),
+      onClick: toggleFullscreen,
+      extraClass: 'app-fullscreen',
+    });
   } else if (overlay?.type === 'url-preview') {
-    addAction('reload', reloadButton(() => {
+    addAction(reloadSpec('reload', () => {
       if (isTauri()) { const url = panelUrl.value; if (url) webviewReload(url); }
     }, 'Reload'));
-    addAction('close',
-      <button class="icon-btn header-icon" onClick={closeUrl} aria-label="Close browser" data-tooltip="Close browser">
-        <CloseIcon />
-      </button>,
-    );
+    addAction({
+      key: 'close',
+      label: 'Close browser',
+      icon: () => <CloseIcon />,
+      onClick: closeUrl,
+    });
   } else if (overlay?.type === 'file-preview') {
     const ext = overlay.path.split('.').pop()?.toLowerCase() || '';
     const repo = parseRepoPath(overlay.path);
@@ -159,7 +232,8 @@ export function ContentHeaderActions() {
     // refresh/source-toggle would fight the draft — so the header drops them and
     // keeps only the global actions.
     if (!editing) {
-      addAction('refresh', reloadButton(
+      addAction(reloadSpec(
+        'refresh',
         refreshFilePreview,
         'Refresh',
         isDiff ? 'Diff is fixed to this change' : undefined,
@@ -170,69 +244,73 @@ export function ContentHeaderActions() {
       // matches what's shown, and write the inverse as an explicit override.
       if (isDiff) {
         const wholeFile = diffWholeFileEffective.value;
-        addAction('diff-whole-file',
-          <button
-            class="icon-btn header-icon diff-whole-file-toggle"
-            onClick={() => { diffWholeFile.value = !wholeFile; }}
-            aria-label={wholeFile ? 'Show diff' : 'Show full file'}
-            data-tooltip={wholeFile ? 'Show diff' : 'Show full file'}
-          >
-            {wholeFile ? <DiffIcon /> : <FileIcon />}
-          </button>,
-        );
+        addAction({
+          key: 'diff-whole-file',
+          label: wholeFile ? 'Show diff' : 'Show full file',
+          icon: () => (wholeFile ? <DiffIcon /> : <FileIcon />),
+          onClick: () => { diffWholeFile.value = !wholeFile; },
+          extraClass: 'diff-whole-file-toggle',
+        });
       }
       if (hasRendered) {
         const isSource = filePreviewSource.value;
-        addAction('source-toggle',
-          <button
-            class="icon-btn header-icon"
-            onClick={() => { filePreviewSource.value = !isSource; }}
-            aria-label={isSource ? 'Show rendered' : 'Show source'}
-            data-tooltip={isSource ? 'Show rendered' : 'Show source'}
-          >
-            {isSource ? <EyeIcon /> : <CodeIcon />}
-          </button>,
-        );
+        addAction({
+          key: 'source-toggle',
+          label: isSource ? 'Show rendered' : 'Show source',
+          icon: () => (isSource ? <EyeIcon /> : <CodeIcon />),
+          onClick: () => { filePreviewSource.value = !isSource; },
+        });
       }
       if (editable) {
-        addAction('edit',
-          <button
-            class="icon-btn header-icon file-edit-btn"
-            onClick={() => { filePreviewEditing.value = true; }}
-            aria-label="Edit file"
-            data-tooltip="Edit file"
-          >
-            <EditIcon />
-          </button>,
-        );
+        addAction({
+          key: 'edit',
+          label: 'Edit file',
+          icon: () => <EditIcon />,
+          onClick: () => { filePreviewEditing.value = true; },
+          extraClass: 'file-edit-btn',
+        });
       }
     }
   } else if (!overlay && activeMenuItem.value === 'files') {
-    addAction('search',
-      <button class="icon-btn header-icon file-search-btn" onClick={(e) => openFileSearch(e.currentTarget)} aria-label="Search files" data-tooltip="Search files">
-        <SearchIcon />
-      </button>,
-    );
+    addAction({
+      key: 'search',
+      label: 'Search files',
+      icon: () => <SearchIcon />,
+      onClick: (e) => openFileSearch(e.currentTarget as HTMLElement),
+      extraClass: 'file-search-btn',
+    });
   } else if (!overlay && (activeMenuItem.value === 'apps' || activeMenuItem.value === 'plugins')) {
-    const searchLabel = activeMenuItem.value === 'plugins' ? 'Search plugins' : 'Search apps';
-    addAction('search',
-      <button
-        class={`icon-btn header-icon apps-search-btn${appSearchOpen.value ? ' filter-active' : ''}`}
-        onClick={toggleAppSearch}
-        aria-label={searchLabel}
-        data-tooltip={searchLabel}
-      >
-        <SearchIcon />
-      </button>,
-    );
+    addAction({
+      key: 'search',
+      label: activeMenuItem.value === 'plugins' ? 'Search plugins' : 'Search apps',
+      icon: () => <SearchIcon />,
+      onClick: toggleAppSearch,
+      extraClass: 'apps-search-btn',
+      active: appSearchOpen.value,
+    });
   }
 
-  // Global actions — always present
-  addAction('notifications', <NotificationsBell />);
+  // ── Progressive collapse (desktop only — inert inside the mobile header) ──
+  // When the 3-zone header row runs out of room the LEADING context actions
+  // (nearest the title) move into a ⋯ overflow menu, two first and then one
+  // more per step, until only ⋯ + the bell remain; the title starts
+  // ellipsizing only after that. The ⋯ trigger sits nearest the title.
+  const hostRef = useRef<HTMLDivElement>(null);
+  const collapsedCount = useHeaderActionCollapse(hostRef, actions.length);
+  const collapsed = actions.slice(0, collapsedCount);
+  const visible = actions.slice(collapsedCount);
 
   return (
-    <div class="content-header-actions">
-      {actions.map(({ key, el }) => <Fragment key={key}>{el}</Fragment>)}
+    <div class="content-header-actions" ref={hostRef}>
+      {collapsed.length > 0 && (
+        <OverflowMenu
+          ariaLabel="More actions"
+          extraClass="content-header-more"
+          items={(ctx) => collapsed.map((a) => renderMenuAction(a, ctx))}
+        />
+      )}
+      {visible.map((a) => <Fragment key={a.key}>{renderHeaderAction(a)}</Fragment>)}
+      <NotificationsBell />
     </div>
   );
 }

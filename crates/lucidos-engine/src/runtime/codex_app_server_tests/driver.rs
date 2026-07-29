@@ -72,7 +72,7 @@ fn stub_driver(turn_body: &str, resume: Option<&str>, continuation: bool) -> Stu
         system_prompt: Some("SYSPROMPT".into()),
         model: None,
         reasoning_effort: None,
-        git_common_dir: None,
+        sandbox_writable_roots: Vec::new(),
         env: vec![(
             std::ffi::OsString::from("STUB_LOG"),
             requests_log.clone().into_os_string(),
@@ -517,7 +517,7 @@ done
         system_prompt: Some("SYSPROMPT".into()),
         model: None,
         reasoning_effort: None,
-        git_common_dir: None,
+        sandbox_writable_roots: Vec::new(),
         env: vec![(
             std::ffi::OsString::from("STUB_LOG"),
             requests_log.clone().into_os_string(),

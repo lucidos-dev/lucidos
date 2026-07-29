@@ -5,6 +5,7 @@ import {
   wasSwUpdateDismissed,
   noteUpdateBuildId,
 } from '../../hooks/sw-update';
+import { isUnstampedBuildId } from '../../utils/buildId';
 import { CLIENT_BUILD_ID } from 'virtual:build-id';
 
 const UPDATE_TOAST_KEY = 'update-available';
@@ -77,7 +78,7 @@ function surfaceUpdateToast(servedBuildId: string): void {
  *  (`__…__`) carries no signal, and an indeterminate served id (offline /
  *  transient — `getServedBuildId` returns null) leaves things as-is. */
 export async function syncClientUpdateFromBuild(): Promise<void> {
-  if (CLIENT_BUILD_ID.startsWith('__')) return; // un-stamped dev build — no signal
+  if (isUnstampedBuildId(CLIENT_BUILD_ID)) return; // un-stamped dev build — no signal
   // The refresh dismissal is now a GLOBAL preference (not synchronous
   // localStorage), so until preferences load we can't tell whether this build was
   // already dismissed. Skip rather than fail-open into a flash of an

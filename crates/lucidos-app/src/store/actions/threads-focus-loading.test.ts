@@ -1046,7 +1046,7 @@ describe('loadAllThreads — compose preservation', () => {
   // focused here — focus alone must not preserve a draft the user never typed.
   // The non-empty focus guard (test at "preserves local composeText when textarea
   // is focused") is unaffected. A locally-edited draft is still protected by
-  // stageDraftFromApi's hasLocalDraftEdit guard (the failed-PUT test above).
+  // stageDraftFromApi's hasUnsentLocalDraft guard (the failed-PUT test above).
   it('clears a focused server-originated draft when the resync snapshot is empty (peer sent elsewhere)', async () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', { meta: { state: 'active', composeText: 'follow-up drafted on my other device' } }));

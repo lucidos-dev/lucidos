@@ -451,22 +451,48 @@ At parity, the chat agent has the grouped `env_vars` LLM tool (`list` / `set` /
 `delete`) — the retired `set_environment_variable` name still works as a
 back-compat alias for `set`.
 
-### `lucidos models list | add --id <id> --provider <p> [--label L] [--sort-order N] | update --id <id> [...] | delete --id <id>`
+### `lucidos models list | add --id <id> --provider <p> [--label L] [--sort-order N] [--context-window N] | update --id <id> [...] | delete --id <id>`
 
 Manage the chat-model registry (Settings → Models) — the models in the Lucidos
 Agent's picker.
 
 ```bash
 $ lucidos models list
-$ lucidos models add --id z-ai/glm-5.2 --provider openrouter --label "GLM 5.2"
+$ lucidos models add --id z-ai/glm-5.2 --provider openrouter --label "GLM 5.2" \
+    --context-window 1048576
+$ lucidos models update --id z-ai/glm-5.2 --context-window 1048576
 $ lucidos models update --id z-ai/glm-5.2 --enabled false   # disable
 $ lucidos models delete --id z-ai/glm-5.2                   # user models only
 ```
 
 `provider` is one of `vertex`, `anthropic`, `openai`, `openrouter`, `local`.
-Builtin models can be disabled (`update --enabled false`) but not deleted. To
-switch the **active** model, set the `chat_model` preference instead. Mirrors the
-chat agent's `manage_models` tool.
+
+**`--context-window` is worth setting on every model you add.** It's the model's
+context window in tokens, and it sizes the engine's context budget. Omit it and
+the engine falls back to guessing from the model id (`claude-*` → 200k unless the
+id carries `[1m]`, `gpt-5*` → 400k, anything else → 200k). That guess has no rule
+at all for OpenRouter, Gemini, or local ids, so they are treated as 200k however
+large they really are — a 1M model gets its context trimmed at a fifth of what it
+could hold.
+
+Set it to the window your model actually serves for the request being made, not
+its headline maximum. Every guess errs low on purpose: under-declaring only trims
+early, whereas over-declaring makes the engine pack a prompt the provider then
+rejects. (This is why bare `claude-*` ids sit at 200k rather than the 1M those
+models advertise — Lucidos requests 1M mode only for the `[1m]` variants.)
+
+`list` shows each model's window, or `inferred from id` when it has none.
+Builtins ship with theirs already declared. Builtins accept a window correction
+too — the vendor can raise a model's window, and a seeded value can be wrong.
+(Clearing one back to inferred is API-only — send `"context_window": null` to
+`PUT /api/v1/models`; there's no CLI flag for it.)
+
+Builtin models can be disabled (`update --enabled false`) and can have their
+context window corrected, but they can't be renamed, re-providered, or deleted —
+their identity is engine-owned. To
+change the **default** chat model for new threads, set the `chat_model`
+preference instead (a thread that's already running reuses its own last-used
+model — see `preferences.md`). Mirrors the chat agent's `manage_models` tool.
 
 ### `lucidos changes list`
 
@@ -508,6 +534,8 @@ The response carries:
 | `conflict_thread_id` / `review_thread_id` | Thread to focus when `status` is `conflict` / `hardening` |
 
 The CLI prints the JSON verbatim on stdout. Exit non-zero on transport / 4xx with the engine's error body on stderr — match `--fail` semantics from `lucidos proxy`.
+
+Two 409s are refusals rather than errors, and both name the resolution: the change's thread is still working (wait for it to idle), or the change has **no file changes left** (`file_count` is 0 — its branch's commits cancelled out, so there is nothing to merge; discard it with the Discard button instead). A script driving a build → apply pipeline should treat a zero-`file_count` entry in `lucidos changes list` as "nothing to apply", not as a change to retry.
 
 #### Why use the CLI instead of hand-rolled urllib / curl
 

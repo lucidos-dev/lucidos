@@ -24,7 +24,6 @@ pub struct RoutingProvider {
 }
 
 impl RoutingProvider {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         vertex: Option<VertexProvider>,
         openai: Option<OpenAiProvider>,

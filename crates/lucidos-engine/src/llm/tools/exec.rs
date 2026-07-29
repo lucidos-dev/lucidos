@@ -93,7 +93,7 @@ pub(super) fn exec_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Shell command to execute (passed to /bin/sh -c). NOT for writing to data/ — use run_python."
+                        "description": "Shell command to execute (passed to `bash -o pipefail -c`, so a failing stage of a pipeline is not masked by a later succeeding one). NOT for writing to data/ — use run_python."
                     },
                     "timeout_secs": {
                         "type": "integer",
@@ -118,7 +118,7 @@ pub(super) fn exec_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Shell command to execute (passed to /bin/sh -c)."
+                        "description": "Shell command to execute (passed to `bash -o pipefail -c`, so a failing stage of a pipeline is not masked by a later succeeding one)."
                     },
                     "timeout_secs": {
                         "type": "integer",
@@ -134,8 +134,13 @@ pub(super) fn exec_tools() -> Vec<ToolDefinition> {
                 "Fetch incremental stdout/stderr from a background task created by run_bash_background OR run_python_background. \
                 Returns only output emitted since the previous bash_output call (drain semantics) — call repeatedly to follow a stream. \
                 When the task finishes, returns the final tail with finished=true: STOP polling at this point — subsequent calls fall back to the event store and return the FULL final stdout/stderr again, which wastes context. \
-                exit_code is null while the task is running, after a watchdog timeout (timed_out=true), and after bash_kill (killed=true). \
-                Pass `wait_secs: N` (1–{max}) to BLOCK server-side until new output arrives OR the task finishes OR N seconds pass — use this INSTEAD OF hand-rolling `time.sleep(N)` polling in a fresh run_python (which wastes two tool calls per wait, doubles context, and stalls the turn). With `wait_secs` set you typically need 0–2 calls per task (one optional initial drain, one with `wait_secs` that returns when finished=true). Default 0 = legacy non-blocking drain.",
+                SUCCESS TEST: exit_code == 0, nothing weaker. exit_code carries the NORMAL exit status and only that; it is null while the task is running, when the child died on a signal (see `signal`), and when the engine could not obtain a status at all. A null exit_code is NEVER success. \
+                `signal` is the Unix signal that killed the SHELL the engine spawned, when one did — 9 SIGKILL (also what a watchdog timeout and bash_kill use, alongside timed_out / killed), 11 SIGSEGV. It is null for a normal exit AND when a signal killed a stage inside your pipeline: that arrives as an exit_code of 128+signum (e.g. 141 = SIGPIPE). \
+                `status` is the rendered one-line phrase (\"exit code 101\", \"killed by SIGKILL (signal 9)\", \"exit code 141 (probable SIGPIPE)\", \"exit code unknown\") and is the same phrase the completion summary uses — read it if you want one field instead of three. \
+                Commands run under `bash -o pipefail`, so a failing stage is NEVER masked by a later succeeding one: `cargo clippy … | tee build.log` reports clippy's 101, not tee's 0. You do NOT need a sidecar file to detect a failure inside a pipeline. Precisely: the status is that of the RIGHTMOST failing stage (`sh -c 'exit 42' | sh -c 'exit 7'` reports 7), so split a pipeline whose stages can each fail if you need to attribute which one did. (Consequence: a producer SIGPIPE'd by an early-closing consumer, e.g. `yes | head -1`, reports exit_code 141 rather than 0.) \
+                Pass `wait_secs: N` (1–{max}) to BLOCK server-side for the FULL N seconds unless the task finishes first — use this INSTEAD OF hand-rolling `time.sleep(N)` polling in a fresh run_python (which wastes two tool calls per wait, doubles context, and stalls the turn). New output does NOT end the wait early: one call gives you the whole N-second window at once, so following a 40-minute build is ~20 calls at wait_secs=120, not hundreds. A user message DOES end it early, so their follow-up isn't stuck behind your block. Default 0 = non-blocking drain. \
+                `elapsed_secs` (how long the task has been running, or its total runtime once finished) and `waited_secs` (how long THIS call actually blocked) are the ONLY trustworthy clock you have — read them instead of estimating elapsed time from how long you asked to wait, or you will tell the user \"about 20 minutes in\" 90 seconds into a build. `elapsed_secs` may be null for a task that finished long ago. \
+                Oversized windows keep the TAIL (newest output) with a leading `[truncated — N earlier bytes dropped]` marker, so the failure at the end of a build log is never the part that gets dropped.",
                 max = crate::engine::tools::bash_background::BASH_OUTPUT_MAX_WAIT_SECS
             ),
             parameters: json!({
@@ -148,7 +153,7 @@ pub(super) fn exec_tools() -> Vec<ToolDefinition> {
                     "wait_secs": {
                         "type": "integer",
                         "description": format!(
-                            "Server-side block ceiling, in seconds. Omit or pass 0 for the legacy non-blocking drain. Pass 1..={max} to BLOCK until new output arrives OR the task finishes OR N seconds pass (max {max} — values above are clamped down silently). Typical: 30–60s for long-running backtests / builds, 0 for a quick liveness check. Non-integer values (strings, floats) are rejected with an error.",
+                            "How long to block, in seconds. Omit or pass 0 for a non-blocking drain. Pass 1..={max} to BLOCK for the FULL duration unless the task finishes first (max {max} — values above are clamped down silently). New output does NOT cut the wait short. Typical: {max} for a long build or backtest you're following, 30–60 for something you expect to finish soon, 0 for a quick liveness check. Non-integer values (strings, floats) are rejected with an error.",
                             max = crate::engine::tools::bash_background::BASH_OUTPUT_MAX_WAIT_SECS
                         )
                     }

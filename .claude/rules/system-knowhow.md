@@ -1,5 +1,5 @@
 ---
-globs:
+paths:
   - "system-knowhow/**"
   - "docs/taxonomy.md"
   - "docs/glossary.md"

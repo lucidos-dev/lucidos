@@ -570,8 +570,8 @@ fn skip_if_vanished_only_swallows_not_found() {
     assert!(matches!(r, Ok(Some(42))));
 }
 
-/// A file enumerated by the walk can be deleted before tar opens it — the
-/// workspace's autoresearch loop constantly tears down worktrees under .git/.
+/// A file enumerated by the walk can be deleted before tar opens it — a
+/// workspace's background jobs constantly tear down worktrees under .git/.
 /// `append_file` must skip such a vanished file instead of aborting the backup.
 #[test]
 fn append_file_skips_vanished_file() {

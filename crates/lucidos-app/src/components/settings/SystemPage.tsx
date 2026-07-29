@@ -21,11 +21,12 @@ import {
 import { initiateEngineRestart } from '../../store/actions/chat-changes';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { requestServiceWorkerBuildId, refreshClient } from '../../hooks/sw-update';
+import { isUnstampedBuildId } from '../../utils/buildId';
 import { isNewerVersion } from '../../utils/version';
 import { formatShortTime } from '../../utils/formatTime';
 import { isTauri } from '../../utils/platform';
 import { invoke } from '../../utils/tauri';
-import { ENGINE_VERSION } from 'virtual:engine-version';
+import { CLIENT_BUILD_ID } from 'virtual:build-id';
 import { BackupSection } from './BackupSection';
 import { CodingAgentBinariesSection } from './CodingAgentBinariesSection';
 import { LocaleSection } from './LocaleSection';
@@ -39,6 +40,13 @@ import { ThreadQueueView } from '../thread-queue/ThreadQueueView';
 /** The SPA origin, read lazily so importing this module never touches the DOM. */
 function getApiUrl(): string {
   return typeof window !== 'undefined' && window.location ? window.location.origin : '';
+}
+
+/** Display form of a stamped build id. The live dev server leaves the
+ *  `__LUCIDOS_BUILD_ID__` placeholder (the `lucidos-sw-stamp` plugin is inert
+ *  there), which is noise to show verbatim — say "dev" instead. */
+function formatBuildId(id: string): string {
+  return isUnstampedBuildId(id) ? 'dev' : id;
 }
 
 export type SystemPanel = 'overview' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'network-access' | 'debugging';
@@ -85,9 +93,7 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
   const restart = restartRequired.value;
   const update = updateAvailable.value;
   const swBuildId = serviceWorkerBuildId.value;
-  const buildLabel = swBuildId
-    ? (swBuildId.startsWith('__') ? 'dev' : swBuildId)
-    : null;
+  const swBuildLabel = swBuildId ? formatBuildId(swBuildId) : null;
 
   useEffect(() => {
     requestServiceWorkerBuildId();
@@ -129,7 +135,15 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
 
   const hasEngineUpdate = engineVer && latestEngineVer && isNewerVersion(latestEngineVer, engineVer);
   const tauriClientVersion = window.__LUCIDOS_APP_VERSION__;
-  const clientVersion = tauriClientVersion ?? ENGINE_VERSION;
+  // What identifies the CLIENT differs by platform. The Tauri shell updates as a
+  // versioned unit, so its app version is a real client version with a real
+  // updater behind it. The web client has no such version — it is identified by
+  // the build that produced the code executing right now (`CLIENT_BUILD_ID`),
+  // which is exactly what the refresh badge compares against the served build.
+  // Deliberately NOT the engine's CalVer: baking that in froze it at bundle-build
+  // time and drifted from the running engine on every engine-only Apply, showing
+  // two disagreeing numbers no user action could reconcile (see vite.config.ts).
+  const clientVersion = tauriClientVersion ?? formatBuildId(CLIENT_BUILD_ID);
   const tauriHasUpdate = !!(tauriClientVersion && latestTauriVer && isNewerVersion(latestTauriVer, tauriClientVersion));
   const clientBehind = tauriClientVersion ? tauriHasUpdate : update;
   const clientBehindLabel = tauriClientVersion ? ` (latest: ${latestTauriVer})` : ' (update available)';
@@ -214,10 +228,14 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
                 </span>
               </div>
             )}
-            {buildLabel && (
+            {swBuildLabel && (
               <div class="system-info-row">
-                <span class="system-info-label">Build</span>
-                <span class="system-info-value">{buildLabel}</span>
+                {/* The build the controlling service worker was installed from —
+                    normally identical to Client above, and different exactly
+                    while a swap is mid-flight or the worker is wedged. Labelled
+                    distinctly so the two build ids can't be read as one. */}
+                <span class="system-info-label">Service worker</span>
+                <span class="system-info-value">{swBuildLabel}</span>
               </div>
             )}
             {startedAt && (

@@ -50,10 +50,13 @@ means "no new output within the retrieval window" — the underlying task is
 fine. Don't tear it down, restart it, or tight-loop re-poll: each immediate
 re-poll burns a turn for nothing. Pass a longer retrieval `timeout`
 (30000–60000 ms) AND wait at least 30s before re-polling. The canonical
-slow case is the e2e workspace probe (`./scripts/web-dev.sh -w e2e-test -b`,
-"Starting e2e workspace (LUCIDOS_MODEL=mock)... Probing") — the first build
-can take several minutes before the probe responds; full `cargo build`
-behaves the same way.
+slow case is the e2e workspace probe — `ensure_workspace_running` in
+`scripts/lib/e2e.sh` printing "Starting e2e workspace (LUCIDOS_MODEL=mock)...
+Probing" while it builds and boots the engine. The first build can take several
+minutes before the probe responds; full `cargo build` behaves the same way.
+(The e2e scripts boot that workspace themselves — never pre-start it with
+`web-dev.sh`, which launches the machine-global gateway and is refused from a
+coding-agent worktree. See ADR 0021.)
 
 ## Targeted sub-scripts
 

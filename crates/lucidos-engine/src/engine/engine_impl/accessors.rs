@@ -29,6 +29,28 @@ impl LucidosEngine {
         }
     }
 
+    /// The Google Cloud project id resolved at boot for Vertex AI (env
+    /// `VERTEX_PROJECT_ID` → ADC file → gcloud config). Empty when Vertex is
+    /// not configured. Reused by the builtin `vertex` proxy so an app can reach
+    /// Vertex without knowing the project id (`api::proxy_builtin`).
+    pub fn vertex_project_id(&self) -> &str {
+        &self.vertex_project_id
+    }
+
+    /// Live Vertex AI region handle (tracks the `vertex_region` preference via
+    /// `spawn_vertex_region_subscriber`). Reused by the builtin `vertex` proxy
+    /// to build the engine-owned URL prefix.
+    pub fn vertex_location(&self) -> &crate::llm::vertex::LocationHandle {
+        &self.vertex_location
+    }
+
+    /// The shared Vertex access-token cache (present iff Vertex was configured
+    /// at boot). Reused by the builtin `vertex` proxy so proxied requests share
+    /// warm access tokens with the Vertex LLM provider.
+    pub fn vertex_token_cache(&self) -> Option<crate::llm::vertex::TokenCache> {
+        self.vertex_token_cache.clone()
+    }
+
     /// Resolve a data-relative path, returning both the normalized data-relative path and
     /// the absolute filesystem path. Normalization rules live in [`normalize_data_path`].
     pub(crate) fn resolve_data_path(
@@ -78,6 +100,15 @@ impl LucidosEngine {
             .expect("self_arc not initialized")
             .upgrade()
             .expect("engine dropped while in use")
+    }
+
+    /// `Arc<Self>` when the self-reference has been installed (`set_self_arc`,
+    /// done once in `main.rs`), else `None`. Unlike [`Self::clone_arc`] this
+    /// never panics — for `&self` side effects that only make sense on a fully
+    /// wired engine (the dev background rebuild) and must simply no-op in unit
+    /// tests that construct a bare `LucidosEngine`.
+    pub(crate) fn try_clone_arc(&self) -> Option<Arc<LucidosEngine>> {
+        self.self_arc.get().and_then(std::sync::Weak::upgrade)
     }
 
     /// Get the workspace path
@@ -173,7 +204,9 @@ impl LucidosEngine {
         self.user_dir.as_ref().map(|ud| ud.join("knowhow"))
     }
 
-    /// Get the engine-shipped system knowhow directory (`<repo_root>/system-knowhow/`).
+    /// Get the engine-shipped system knowhow directory (the staged
+    /// `LUCIDOS_SYSTEM_KNOWHOW_DIR` on packaged builds, `<repo_root>/system-knowhow/`
+    /// on a dev checkout).
     pub fn system_knowhow_dir(&self) -> Option<&std::path::Path> {
         self.system_knowhow_dir.as_deref()
     }
@@ -311,6 +344,28 @@ impl LucidosEngine {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// The currently-installed web-search chain. Same short-read-guard clone
+    /// contract as [`Self::current_provider`] — the credential subscriber swaps
+    /// this handle too, and a search must not hold the lock across its `.await`.
+    pub fn current_web_search(&self) -> Arc<crate::llm::WebSearchChain> {
+        self.web_search
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Context window (tokens) for `model`: the window declared on its `models`
+    /// registry row, else the id-shape guess in
+    /// [`crate::engine::context::context_window_from_prefix`].
+    ///
+    /// Every context-budget and `ContextCaptured` site goes through here rather
+    /// than calling the prefix map directly — the prefix map has no rule for
+    /// OpenRouter / Gemini / local ids and silently hands them 200k, which is
+    /// what made the trim loop evict context at ~8% of kimi-k3's real 1M window.
+    pub(crate) fn context_window_for(&self, model: &str) -> usize {
+        crate::llm::model_registry::context_window_for(&self.model_registry, model)
     }
 
     /// Whether the installed LLM provider can actually serve calls. `false` only

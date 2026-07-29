@@ -1,12 +1,16 @@
 import { toggleThreads } from '../../store/actions/pane';
 import { tooltipWithShortcut } from '../../store/actions/keybindings';
+import { shortcutDef } from '../../utils/shortcuts';
 import { ThreadsIcon } from './icons';
 
 interface Props {
   class?: string;
 }
 
-const LABEL = 'Show or hide thread drawer';
+/** Same wording as the ⌘⇧1 registry entry, derived rather than copied so a
+ *  glossary-driven rename of the shortcut label can't leave this button's
+ *  tooltip and aria-label on the old name while Settings shows the new one. */
+const LABEL = shortcutDef('toggleThreadDrawer').label;
 
 export function ThreadToggleButton({ class: cls }: Props) {
   return (

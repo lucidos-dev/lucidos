@@ -15,14 +15,18 @@ use uuid::Uuid;
 pub(super) const RESPONSE_TOKEN_RESERVE: usize = 8_000;
 
 /// Per-request char budget for `(system_prompt + tools + messages)`, derived
-/// from the model's actual context window. JSON-heavy tool calls average
+/// from the model's resolved context window. JSON-heavy tool calls average
 /// ~1.5 chars/token (prose is ~3.5); the 3/2 multiplier picks the
 /// conservative end so the char total never under-counts the token total.
-/// The 1M-token Opus build (`[1m]`) gets ~1.49M chars; the default 200k
-/// Claude gets ~288k chars (close to the previous hardcoded 300k); GPT-5 at
-/// 400k gets ~588k chars. Callers subtract their own prompt overhead
-/// (system prompt + tool definitions) before handing the remainder to
-/// `trim_context_if_needed`.
+/// A 1M-token model gets ~1.49M chars; the default 200k Claude gets ~288k
+/// chars (close to the previous hardcoded 300k); GPT-5 at 400k gets ~588k
+/// chars. Callers subtract their own prompt overhead (system prompt + tool
+/// definitions) before handing the remainder to `trim_context_if_needed`.
+///
+/// Takes the already-resolved window rather than a model string: the window
+/// now comes from the `models` registry when the row declares one, and only
+/// falls back to [`context_window_from_prefix`] when it doesn't. Resolution
+/// lives in `llm::model_registry::context_window_for`.
 ///
 /// Why this exists: the old `AGENT_CONTEXT_CHAR_BUDGET = 300_000` constant
 /// was calibrated for the 200k-token default Claude and ignored the 1M
@@ -30,8 +34,8 @@ pub(super) const RESPONSE_TOKEN_RESERVE: usize = 8_000;
 /// drop the original user message in long tool loops even though the model
 /// could easily have held the whole thread. Per-model derivation lets us
 /// actually use the headroom we paid for.
-pub(super) fn agent_context_char_budget(model: &str) -> usize {
-    let usable_tokens = context_window_for(model).saturating_sub(RESPONSE_TOKEN_RESERVE);
+pub(super) fn agent_context_char_budget(context_window: usize) -> usize {
+    let usable_tokens = context_window.saturating_sub(RESPONSE_TOKEN_RESERVE);
     // 3/2 = 1.5 chars/token (integer math).
     usable_tokens.saturating_mul(3) / 2
 }
@@ -158,6 +162,29 @@ pub(super) fn sanitize_file_content_for_llm(content: String, path: &str, offset:
     )
 }
 
+/// Flat per-tool overhead for the JSON scaffolding around a tool definition
+/// (braces, key names, the `input_schema` wrapper) that isn't in the name /
+/// description / parameters strings themselves.
+const TOOL_DEF_OVERHEAD_CHARS: usize = 100;
+
+/// Total chars the tool definitions contribute to the request.
+///
+/// Tool schemas are sent on EVERY request and are a large fixed cost (~70 tools
+/// in a chat turn). Both the trim budget and the `ContextCaptured` estimate must
+/// account for them, which is why this lives in one place: the budget used to
+/// subtract them while the reported `estimated_total_tokens` ignored them
+/// entirely, so the LLM Context Viewer under-reported the real prompt and
+/// disagreed with the engine's own accounting.
+pub(crate) fn tool_definitions_chars(tools: &[crate::llm::provider::ToolDefinition]) -> usize {
+    tools
+        .iter()
+        .map(|t| {
+            t.name.len() + t.description.len() + t.parameters.to_string().len()
+                + TOOL_DEF_OVERHEAD_CHARS
+        })
+        .sum()
+}
+
 /// Per-image char cost used by [`estimate_message_chars`] for budget sizing.
 ///
 /// An image's base64 `data.len()` is NOT its cost to the model: providers
@@ -198,25 +225,6 @@ pub(super) fn estimate_message_chars(message: &Message) -> usize {
     }
 }
 
-/// Per-model prompt-token budget. The ContextCaptured modal uses this to
-/// render the budget bar's denominator. Anthropic's 1M-context Opus build
-/// is signalled by the `[1m]` suffix the engine pins when invoking it; the
-/// bare model id stays at the default 200k. OpenAI's `gpt-5` family is 400k.
-/// Unknown models fall back to 200k — slight under-report on a 1M-context
-/// fork is preferable to over-promising headroom we can't deliver.
-pub fn context_window_for(model: &str) -> usize {
-    if model.contains("[1m]") {
-        return 1_000_000;
-    }
-    if model.starts_with("claude-") {
-        return 200_000;
-    }
-    if model.starts_with("gpt-5") {
-        return 400_000;
-    }
-    200_000
-}
-
 /// Replace every `ContentBlock::Image` in `blocks` with a text placeholder
 /// produced by `placeholder()`. Returns total base64 bytes removed (used for
 /// logging by callers).
@@ -236,10 +244,34 @@ pub(super) fn replace_image_blocks(
     stripped
 }
 
+/// What a [`trim_context_if_needed`] call actually did to the messages.
+///
+/// Both fields mean the LLM saw less than the assembled context. They are kept
+/// separate because pass 2's `messages_removed` also shifts the caller's tracked
+/// message indices, whereas truncation does not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct TrimOutcome {
+    /// Messages evicted by pass 2.
+    pub messages_removed: usize,
+    /// Content cut in place by pass 1 / 1.5 — `ToolResult` bodies replaced with
+    /// a truncation note, plus oversized `ToolUse` argument strings.
+    pub blocks_truncated: usize,
+}
+
+impl TrimOutcome {
+    /// Whether anything was dropped at all. This is what `ContextCaptured.trimmed`
+    /// reports — it used to be `messages_removed > 0` alone, which silently
+    /// under-reported every turn where passes 1/1.5 gutted tool results but pass
+    /// 2 never had to evict a message.
+    pub fn any(&self) -> bool {
+        self.messages_removed > 0 || self.blocks_truncated > 0
+    }
+}
+
 /// Trim the agent loop message history to fit within a character budget.
 ///
 /// Three passes:
-/// 0. Strip image bytes from every message except the last and `keep_image_idx`.
+/// 0. Strip image bytes from every message except the last and `keep_image_idxs`.
 /// 1. Truncate large tool results/inputs in old messages.
 /// 2. If still over budget, remove oldest message pairs from index 1 onward.
 ///
@@ -250,31 +282,42 @@ pub(super) fn replace_image_blocks(
 /// user message — once tool iterations push it out of the last
 /// `PRESERVE_RECENT_MESSAGES` slots, the recent-tail rule alone no longer
 /// covers it and pass 2 would otherwise drop the original request (and, with
-/// `keep_image_idx` pinning it, the attached image) from the prompt.
+/// the image pins covering it, the attached image) from the prompt.
 ///
-/// If `keep_image_idx` is `Some(i)`, pass 0 preserves the image bytes on the
-/// message at index `i` (the current turn's user message) in addition to the
-/// literal last message. The freshly-attached image must stay visible for the
-/// WHOLE turn: once the model makes a tool call the user message is no longer
-/// last, and stripping its image there blinds the model to it for the rest of
-/// the turn (the "the bot can't see my attached image" bug).
+/// `keep_image_idxs` lists every message whose image bytes pass 0 must preserve,
+/// in addition to the literal last message. Callers pin two kinds of message:
+/// the turn's user messages (the initial one plus any mid-turn injection that
+/// carried images), and tool results holding an image the model *explicitly
+/// asked to see* (`view_image`, `read_file` on an image file). Both must stay
+/// visible for the WHOLE turn: once the model makes another tool call the
+/// message is no longer last, and stripping its image there blinds the model
+/// for the rest of the turn — the "the bot can't see my attached image" bug,
+/// and the reason a `view_image` call used to be undone by the very next tool
+/// call. Ambient captures (`capture_app`, `browser_screenshot`) are
+/// deliberately NOT pinned: they snapshot state that changes under the model,
+/// so they must age out after one call.
 ///
-/// Returns the number of messages removed in pass 2.
+/// The two roles stay distinct: pass 2's eviction floor derives from the
+/// *minimum* pinned index only. Pinning a later tool result therefore never
+/// weakens eviction — and because every pin sits at or above that floor, no
+/// pinned message can be removed, so the caller's index bookkeeping stays exact.
+///
+/// Returns what the trim actually did — see [`TrimOutcome`].
 pub(super) fn trim_context_if_needed(
     messages: &mut Vec<Message>,
     budget: usize,
     protected_idx: Option<usize>,
-    keep_image_idx: Option<usize>,
-) -> usize {
+    keep_image_idxs: &[usize],
+) -> TrimOutcome {
     // The current user message is the LAST entry on the first iteration —
     // `chat::process` builds `messages = resume_tool_blocks;
     // messages.push(current_user_message)`. As the tool loop appends pairs it
-    // is no longer last, so `keep_image_idx` pins its image too. Every other
-    // message's images were already seen by the LLM on prior turns / iterations.
+    // is no longer last, so the pins keep its image too. Every other message's
+    // images were already seen by the LLM on prior turns / iterations.
     let mut image_bytes_stripped = 0usize;
     let last_idx = messages.len().saturating_sub(1);
     for (idx, msg) in messages.iter_mut().enumerate() {
-        if idx == last_idx || Some(idx) == keep_image_idx {
+        if idx == last_idx || keep_image_idxs.contains(&idx) {
             continue;
         }
         if let MessageContent::Blocks(blocks) = &mut msg.content {
@@ -291,9 +334,10 @@ pub(super) fn trim_context_if_needed(
 
     let total: usize = messages.iter().map(estimate_message_chars).sum();
     if total <= budget {
-        return 0;
+        return TrimOutcome::default();
     }
 
+    let mut blocks_truncated = 0usize;
     let len = messages.len();
     let preserve_start = if len > PRESERVE_RECENT_MESSAGES {
         len - PRESERVE_RECENT_MESSAGES
@@ -313,10 +357,11 @@ pub(super) fn trim_context_if_needed(
                         if content.len() > TRUNCATION_THRESHOLD {
                             let orig_len = content.len();
                             *content = format!("[content truncated — was {} chars]", orig_len);
+                            blocks_truncated += 1;
                         }
                     }
                     ContentBlock::ToolUse { input, .. } => {
-                        truncate_large_json_strings(input);
+                        blocks_truncated += truncate_large_json_strings(input);
                     }
                     _ => {}
                 }
@@ -330,7 +375,10 @@ pub(super) fn trim_context_if_needed(
             estimate_tokens_from_chars(total) / 1000, estimate_tokens_from_chars(total_after_pass1) / 1000,
             total, total_after_pass1, messages.len(), estimate_tokens_from_chars(budget) / 1000
         );
-        return 0;
+        return TrimOutcome {
+            messages_removed: 0,
+            blocks_truncated,
+        };
     }
 
     // Pass 1.5: if still over budget, truncate large ToolResult blocks in the
@@ -354,6 +402,7 @@ pub(super) fn trim_context_if_needed(
                         if content.len() > TAIL_TRUNCATION_THRESHOLD {
                             let orig_len = content.len();
                             *content = format!("[content truncated — was {} chars]", orig_len);
+                            blocks_truncated += 1;
                         }
                     }
                 }
@@ -365,7 +414,10 @@ pub(super) fn trim_context_if_needed(
                 estimate_tokens_from_chars(total_after_pass1) / 1000, estimate_tokens_from_chars(total_after_truncation) / 1000,
                 total_after_pass1, total_after_truncation, estimate_tokens_from_chars(budget) / 1000
             );
-            return 0;
+            return TrimOutcome {
+                messages_removed: 0,
+                blocks_truncated,
+            };
         }
     }
 
@@ -385,13 +437,15 @@ pub(super) fn trim_context_if_needed(
     // stop — losing the pinned request is worse than going over budget.
     //
     // Protect down to the LOWER of `protected_idx` (the latest user input) and
-    // `keep_image_idx` (the image-bearing message). They're equal in the common
-    // case, but a mid-turn prompt injection moves `protected_idx` to the new
-    // last message while the image stays at a lower index — pass 0 keeps the
-    // image bytes, but pass 2 must also refuse to remove that whole message, or
-    // the image (and the original request) is lost anyway. Stopping at the min
-    // keeps both: everything from that index up survives.
-    let mut protected = match (protected_idx, keep_image_idx) {
+    // the LOWEST image pin. They're equal in the common case, but a mid-turn
+    // prompt injection moves `protected_idx` to the new last message while the
+    // image stays at a lower index — pass 0 keeps the image bytes, but pass 2
+    // must also refuse to remove that whole message, or the image (and the
+    // original request) is lost anyway. Stopping at the min keeps both:
+    // everything from that index up survives — which is also what makes every
+    // *other* pin safe from eviction without protecting them individually.
+    let lowest_image_pin = keep_image_idxs.iter().min().copied();
+    let mut protected = match (protected_idx, lowest_image_pin) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, None) => a,
         (None, b) => b,
@@ -449,11 +503,16 @@ pub(super) fn trim_context_if_needed(
         );
     }
 
-    removed
+    TrimOutcome {
+        messages_removed: removed,
+        blocks_truncated,
+    }
 }
 
-/// Recursively truncate large string values in a JSON Value.
-pub(super) fn truncate_large_json_strings(value: &mut serde_json::Value) {
+/// Recursively truncate large string values in a JSON Value. Returns how many
+/// strings were cut, so the caller can report the content loss — a truncated
+/// tool-call argument is just as invisible to the LLM as a dropped message.
+pub(super) fn truncate_large_json_strings(value: &mut serde_json::Value) -> usize {
     match value {
         serde_json::Value::String(s) => {
             if s.len() > TRUNCATION_THRESHOLD {
@@ -463,19 +522,18 @@ pub(super) fn truncate_large_json_strings(value: &mut serde_json::Value) {
                     "{}...\n[truncated — full value was {} chars]",
                     preview, orig_len
                 );
+                return 1;
             }
+            0
         }
-        serde_json::Value::Object(map) => {
-            for (_k, v) in map.iter_mut() {
-                truncate_large_json_strings(v);
-            }
-        }
+        serde_json::Value::Object(map) => map
+            .iter_mut()
+            .map(|(_k, v)| truncate_large_json_strings(v))
+            .sum(),
         serde_json::Value::Array(arr) => {
-            for v in arr.iter_mut() {
-                truncate_large_json_strings(v);
-            }
+            arr.iter_mut().map(truncate_large_json_strings).sum()
         }
-        _ => {}
+        _ => 0,
     }
 }
 
@@ -851,17 +909,72 @@ mod history_format_tests;
 mod sanitize_file_content_tests;
 
 #[cfg(test)]
-mod context_window_tests {
-    use super::{agent_context_char_budget, context_window_for};
+mod tool_definition_sizing_tests {
+    use super::{estimate_tokens_from_chars, tool_definitions_chars, TOOL_DEF_OVERHEAD_CHARS};
+    use crate::llm::provider::ToolDefinition;
+
+    fn tool(name: &str, description: &str, params: serde_json::Value) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: description.to_string(),
+            parameters: params,
+        }
+    }
 
     #[test]
-    fn context_window_for_known_models() {
-        assert_eq!(context_window_for("claude-opus-4-7[1m]"), 1_000_000);
-        assert_eq!(context_window_for("claude-opus-4-7"), 200_000);
-        assert_eq!(context_window_for("claude-sonnet-4-6"), 200_000);
-        assert_eq!(context_window_for("gpt-5"), 400_000);
-        assert_eq!(context_window_for("unknown-model"), 200_000);
+    fn sums_name_description_schema_and_per_tool_overhead() {
+        let t = tool("read_file", "Read a file", serde_json::json!({"a": 1}));
+        let schema_len = serde_json::json!({"a": 1}).to_string().len();
+        assert_eq!(
+            tool_definitions_chars(std::slice::from_ref(&t)),
+            "read_file".len() + "Read a file".len() + schema_len + TOOL_DEF_OVERHEAD_CHARS
+        );
+        // And it scales with the list — the real chat turn ships ~70 of these.
+        assert_eq!(
+            tool_definitions_chars(&[t.clone(), t.clone()]),
+            tool_definitions_chars(std::slice::from_ref(&t)) * 2
+        );
     }
+
+    #[test]
+    fn empty_tool_list_costs_nothing() {
+        assert_eq!(tool_definitions_chars(&[]), 0);
+    }
+
+    /// `ContextCaptured.estimated_total_tokens` used to be computed from the
+    /// system prompt + messages only, while the trim budget subtracted the tool
+    /// schemas as well — so the number shown in the LLM Context Viewer was
+    /// smaller than the prompt the engine actually sent and budgeted for. This
+    /// pins the direction of the fix: including the schemas can only raise the
+    /// reported total.
+    #[test]
+    fn including_tool_definitions_raises_the_reported_total() {
+        let tools: Vec<ToolDefinition> = (0..70)
+            .map(|i| {
+                tool(
+                    &format!("tool_{i}"),
+                    "does a thing",
+                    serde_json::json!({"type": "object", "properties": {}}),
+                )
+            })
+            .collect();
+        let system_chars = 77_636; // measured system prompt from the kimi-k3 thread
+        let context_chars = 120_000;
+        let without = estimate_tokens_from_chars(system_chars + context_chars);
+        let with = estimate_tokens_from_chars(
+            system_chars + tool_definitions_chars(&tools) + context_chars,
+        );
+        assert!(
+            with > without,
+            "tool schemas must count toward the reported total ({with} vs {without})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod context_window_tests {
+    use super::agent_context_char_budget;
+    use crate::llm::model_registry::context_window_from_prefix;
 
     /// The budget for the 1M-token Opus build must be substantially larger
     /// than the budget for the 200k default — that's the entire point of
@@ -870,8 +983,8 @@ mod context_window_tests {
     /// 4× the old default to be a real fix.
     #[test]
     fn opus_1m_budget_is_much_larger_than_default_claude() {
-        let opus_1m = agent_context_char_budget("claude-opus-4-7[1m]");
-        let default_claude = agent_context_char_budget("claude-opus-4-7");
+        let opus_1m = agent_context_char_budget(context_window_from_prefix("claude-opus-4-7[1m]"));
+        let default_claude = agent_context_char_budget(context_window_from_prefix("claude-opus-4-7"));
         assert!(
             opus_1m >= default_claude * 4,
             "1M Opus budget ({}) must be ≥ 4× default Claude budget ({})",
@@ -883,6 +996,21 @@ mod context_window_tests {
         assert!(opus_1m > 1_000_000, "Opus 1M budget too small: {}", opus_1m);
     }
 
+    /// A registry-declared window drives the budget directly — the whole point
+    /// of the `context_window` column. kimi-k3's declared 1,048,576 must yield
+    /// a ~1.56M-char budget, not the 288k its id shape would have produced.
+    #[test]
+    fn declared_window_budget_dwarfs_the_prefix_fallback() {
+        let declared = agent_context_char_budget(1_048_576);
+        let fallback = agent_context_char_budget(context_window_from_prefix("moonshotai/kimi-k3"));
+        assert_eq!(declared, (1_048_576 - 8_000) * 3 / 2);
+        assert_eq!(fallback, 288_000);
+        assert!(
+            declared >= fallback * 5,
+            "declared 1M budget ({declared}) must be ≥ 5× the 200k fallback ({fallback})"
+        );
+    }
+
     /// Pin the exact formula output for the default 200k Claude. The fuzzy
     /// "close to 300k" range invited silent drift; the exact value
     /// `(200_000 - 8_000) * 3 / 2 = 288_000` documents the math and trips
@@ -890,12 +1018,12 @@ mod context_window_tests {
     /// a deliberate update here.
     #[test]
     fn default_claude_budget_matches_formula() {
-        assert_eq!(agent_context_char_budget("claude-opus-4-7"), 288_000);
+        assert_eq!(agent_context_char_budget(200_000), 288_000);
     }
 
     /// And the same pin for the 1M Opus build — the regression scenario.
     #[test]
     fn opus_1m_budget_matches_formula() {
-        assert_eq!(agent_context_char_budget("claude-opus-4-7[1m]"), 1_488_000);
+        assert_eq!(agent_context_char_budget(1_000_000), 1_488_000);
     }
 }

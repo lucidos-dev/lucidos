@@ -1,11 +1,13 @@
 //! Best-effort boot-phase reporting to the workspace gateway (ADR 0014 §11).
 //!
-//! A cold engine boot — especially the first ever, where the embedding model is
-//! downloaded (hundreds of MB) before HTTP binds — keeps the gateway's boot
-//! splash up for a long time. The gateway can't see *inside* our startup (our
-//! HTTP server isn't up yet), so we tell it which phase we're in by POSTing the
-//! gateway's boot-phase control endpoint. The gateway renders the matching label
-//! on the splash (see `lucidos-gateway/src/boot_phase.rs`).
+//! A cold engine boot — migrations plus the recovery sweeps — keeps the
+//! gateway's boot splash up until our HTTP server binds. The gateway can't see
+//! *inside* our startup (our HTTP server isn't up yet), so we tell it which
+//! phase we're in by POSTing the gateway's boot-phase control endpoint. The
+//! gateway renders the matching label on the splash (see
+//! `lucidos-gateway/src/boot_phase.rs`). (The embedding model is NOT a boot
+//! phase — it loads in the background and never blocks boot; see
+//! `memory::EmbedderSlot`.)
 //!
 //! This is pure telemetry: fire-and-forget, short timeout, all errors swallowed,
 //! and a **no-op when not spawned by the gateway** (`LUCIDOS_GATEWAY_PORT` /
@@ -19,7 +21,6 @@ use std::time::Duration;
 /// (`BootPhase::from_wire`). Engine-reported phases only — the gateway sets the
 /// `provisioning-database` / `starting-engine` phases itself.
 pub const MIGRATING: &str = "migrating";
-pub const DOWNLOADING_MEMORY_MODEL: &str = "downloading-memory-model";
 pub const RECOVERING: &str = "recovering";
 
 /// Report the current cold-boot `phase` to the gateway, if we were spawned by

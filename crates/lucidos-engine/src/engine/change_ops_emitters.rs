@@ -180,35 +180,118 @@ impl LucidosEngine {
             .flatten()
             .flatten(),
         };
-        self.event_bus
-            .emit_or_log(
-                BusEvent::Thread {
-                    thread_id,
-                    event: ThreadEvent::ChangeApplied {
-                        change_id: change_id.to_string(),
-                        requires_restart,
-                        client_update,
-                        commits,
-                        thread_title,
-                        actor,
-                        pre_merge_sha,
-                        post_merge_sha,
-                        path: String::new(),
-                    },
-                    meta: EventMeta::NONE,
+        // `emit` rather than `emit_or_log` because the post-apply refresh below
+        // MUST see whether this emit was accepted. The bus runs a single-fire
+        // guard for `ChangeApplied` (`FOR UPDATE` on the change row) and returns
+        // `Ok(None)` for a recognized duplicate — the double-fire race, an
+        // Apply-All retry, the conflict-recovery cleanup, a post-restart re-emit.
+        // Firing the refresh on the DUPLICATE would coalesce (abort) the rebuild
+        // the ACCEPTED emit just started, and the replacement build can then read
+        // `SkippedLocked` and fall back to `Idle` — no build running at all,
+        // which is the exact failure this funnel exists to prevent.
+        let accepted = match self
+            .event_bus
+            .emit(BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::ChangeApplied {
+                    change_id: change_id.to_string(),
+                    requires_restart,
+                    client_update,
+                    commits,
+                    thread_title,
+                    actor,
+                    pre_merge_sha,
+                    post_merge_sha,
+                    path: String::new(),
                 },
-                "[Changes] ChangeApplied",
-            )
-            .await;
+                meta: EventMeta::NONE,
+            })
+            .await
+        {
+            Ok(res) => res.is_some(),
+            Err(e) => {
+                // Same message shape `emit_or_log` produced, so the existing
+                // `[EventBus] [Changes] ChangeApplied emit failed: …` stays greppable.
+                log!("[EventBus] [Changes] ChangeApplied emit failed: {}", e);
+                false
+            }
+        };
         // Feed the Apply-All driver. Non-member ids are no-ops; batch
         // members advance the registry and (if more remain) trigger the
         // next apply. Non-blocking — the channel send hands off to the
         // driver task, never holds a lock.
+        //
+        // Deliberately NOT gated on `accepted`, unlike the refresh below: batch
+        // member status is first-write-wins, so a duplicate `Applied` is already
+        // idempotent here — while withholding it on a suppressed duplicate could
+        // strand a batch whose only signal was that duplicate.
         self.notify_apply_all(
             crate::engine::apply_all_driver::ApplyAllDriveMsg::Applied(change_id),
         );
+        if accepted {
+            self.post_apply_dev_refresh(thread_id, requires_restart, client_update)
+                .await;
+        }
     }
 
+    /// Advance what dev serves after a change LANDED on main — the single
+    /// funnel for both halves of the *Switch to new version* flow.
+    ///
+    /// Lives here, next to the `ChangeApplied` emit, because that emit is the
+    /// one thing every merge path performs exactly once: the `apply_change`
+    /// tiers, the already-merged fast path, the live in-place merge
+    /// (`apply_now_success`), the async in-place conflict recovery, and the
+    /// Tier-2/3 conflict-resolution cleanup in `run_session/completion.rs`.
+    /// It used to hang off the `apply_change` wrapper alone, so the three
+    /// paths that bypass that wrapper merged an engine-affecting change
+    /// without ever starting a rebuild — no build, no spinner, and a "Switch
+    /// to new version" pointing at a binary that predates the merge.
+    ///
+    /// No-op when the engine self-reference isn't installed (unit tests) and,
+    /// inside each helper, when packaged (packaged never rebuilds from source).
+    async fn post_apply_dev_refresh(
+        &self,
+        thread_id: Uuid,
+        requires_restart: bool,
+        client_update: bool,
+    ) {
+        let Some(engine) = self.try_clone_arc() else {
+            // `main.rs` installs the self-reference immediately after `Arc::new`,
+            // long before the HTTP server binds — so in a real engine this is
+            // unreachable and only unit tests take it. Log it anyway: a silently
+            // skipped rebuild is precisely the failure this funnel exists to
+            // stop, and it must not be invisible if the wiring ever moves.
+            log!(
+                "[Changes] post-apply refresh skipped for change on thread {} — engine self-reference not installed",
+                thread_id
+            );
+            return;
+        };
+        // One indexed `thread_summaries` lookup, on a user-initiated action —
+        // and it gates BOTH arms, so it can't be skipped for the restart case.
+        let is_lucidos_source =
+            crate::engine::change_ops::load_apply_kind_context(self.pool(), Some(thread_id))
+                .await
+                .is_lucidos_source();
+        // Log the DECISION, not just the action. Diagnosing the bug this funnel
+        // fixes meant comparing binary mtimes against merge times, because the
+        // log recorded the merge succeeding and then said nothing about whether
+        // a rebuild had been asked for.
+        let decision = post_apply_refresh(requires_restart, client_update, is_lucidos_source);
+        log!(
+            "[Changes] post-apply refresh: {:?} (requires_restart={}, client_update={})",
+            decision,
+            requires_restart,
+            client_update
+        );
+        match decision {
+            PostApplyRefresh::RebuildEngine => engine.trigger_background_rebuild(),
+            PostApplyRefresh::ReSnapshotFrontend => {
+                engine.refresh_served_frontend_after_rebuild()
+            }
+            PostApplyRefresh::Nothing => {}
+        }
+    }
     /// Scan files touched by an applied change and emit per-entity events
     /// (`AppCreated`/`AppUpdated`/`AppDeleted`,
     /// `ArtifactCreated`/`ArtifactUpdated`/`ArtifactDeleted`) so cached
@@ -539,11 +622,117 @@ fn read_app_name(workspace_path: &std::path::Path, app_id: &str) -> Option<Strin
         .map(|s| s.to_string())
 }
 
+/// What dev has to do to start serving a change that just merged into main.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostApplyRefresh {
+    /// Engine-affecting change: kick the background `cargo build` so the
+    /// on-disk binary advances and "New version available → Switch to new
+    /// version" surfaces. Apply itself never restarts the engine.
+    RebuildEngine,
+    /// Frontend-only Lucidos-source change (engine binary unchanged): the
+    /// switch flow won't run, so re-snapshot the rebuilt `dist/` in-process.
+    ReSnapshotFrontend,
+    /// Nothing to advance — an app / external-repo change, or a diff that
+    /// touches neither the engine nor the served client.
+    Nothing,
+}
+
+/// Decide the post-apply refresh from the merged change's shape — the pure
+/// core of [`LucidosEngine::post_apply_dev_refresh`].
+///
+/// `is_lucidos_source` gates BOTH arms: only Lucidos's own source can rebuild
+/// Lucidos's engine binary or its served `dist/`. That gate is load-bearing for
+/// the RESTART arm, not just cosmetic — an *external-repo coding-agent thread*
+/// computes `requires_restart` with the same `files_require_restart` file
+/// heuristic against SOMEONE ELSE'S tree, so a change touching a `.rs` file in
+/// a user-registered repo arrives here flagged restart-requiring. App changes
+/// are already forced to `requires_restart == false` upstream; external-repo
+/// ones are not, and rebuilding Lucidos because an unrelated repo has Rust in
+/// it would be plainly wrong.
+fn post_apply_refresh(
+    requires_restart: bool,
+    client_update: bool,
+    is_lucidos_source: bool,
+) -> PostApplyRefresh {
+    if !is_lucidos_source {
+        PostApplyRefresh::Nothing
+    } else if requires_restart {
+        PostApplyRefresh::RebuildEngine
+    } else if client_update {
+        PostApplyRefresh::ReSnapshotFrontend
+    } else {
+        PostApplyRefresh::Nothing
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    /// An engine-affecting change ALWAYS rebuilds, whatever else it touched.
+    /// This is the arm that regressed: a mixed Rust+TS Apply from a live
+    /// coding-agent session merged and then sat there with no build running,
+    /// no spinner, and a Switch offer pointing at the pre-merge binary.
+    #[test]
+    fn restart_requiring_change_rebuilds_the_engine() {
+        for client_update in [false, true] {
+            assert_eq!(
+                post_apply_refresh(true, client_update, true),
+                PostApplyRefresh::RebuildEngine,
+                "requires_restart wins outright (client_update={client_update})"
+            );
+        }
+    }
+
+    /// Frontend-only Lucidos-source change: no new binary to switch onto, so
+    /// the served `dist/` snapshot has to advance in-process instead.
+    #[test]
+    fn frontend_only_lucidos_source_change_resnapshots_the_served_frontend() {
+        assert_eq!(
+            post_apply_refresh(false, true, true),
+            PostApplyRefresh::ReSnapshotFrontend
+        );
+    }
+
+    /// App / external-repo changes never advance the host's engine binary or
+    /// its served client — their `.ts`/`.css` files live in the data tree.
+    #[test]
+    fn non_lucidos_source_change_advances_nothing() {
+        assert_eq!(
+            post_apply_refresh(false, true, false),
+            PostApplyRefresh::Nothing
+        );
+    }
+
+    /// The kind gate binds the RESTART arm too. An *external-repo coding-agent
+    /// thread* derives `requires_restart` from `files_require_restart` run over
+    /// someone else's tree, so a user-registered repo that merely contains Rust
+    /// arrives here flagged restart-requiring — rebuilding Lucidos's own engine
+    /// for it would be plainly wrong. (App changes are forced to `false`
+    /// upstream; external-repo ones are not, which is why this can't lean on
+    /// the caller's kind adjustment.)
+    #[test]
+    fn external_repo_change_never_rebuilds_the_lucidos_engine() {
+        assert_eq!(
+            post_apply_refresh(true, false, false),
+            PostApplyRefresh::Nothing
+        );
+        assert_eq!(
+            post_apply_refresh(true, true, false),
+            PostApplyRefresh::Nothing
+        );
+    }
+
+    /// A docs-only / data-only Lucidos-source change touches neither surface.
+    #[test]
+    fn change_touching_neither_surface_advances_nothing() {
+        assert_eq!(
+            post_apply_refresh(false, false, true),
+            PostApplyRefresh::Nothing
+        );
+    }
 
     /// Initialise a fresh git repo at `path` and commit an empty `data/.keep`
     /// so the tree has a root and we can take its SHA. Returns the initial

@@ -2,7 +2,7 @@
 //
 // Replaces `vite build --watch`. That command keeps ONE long-lived Rollup
 // incremental cache alive for the life of the process, and a watch that survives
-// many engine-only Apply restarts (it does — see `.claude/rules/scripts.md`) can
+// many engine-only Apply restarts (it does — see `.claude/rules/dev-runtime.md`) can
 // WEDGE that cache: it re-emits fresh JS from changed source while serving a
 // FROZEN, stale CSS bundle. The engine then serves styles that no longer match
 // the source — silently, for hours, with no health check able to see it. (This

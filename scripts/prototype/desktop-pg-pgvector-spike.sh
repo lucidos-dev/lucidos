@@ -158,6 +158,7 @@ echo "--- HNSW index (the real ANN path):"
 PSQL "CREATE INDEX ON items USING hnsw (embedding vector_l2_ops);" >/dev/null
 PLAN="$(PSQL "SET enable_seqscan=off;
               EXPLAIN (COSTS off) SELECT id FROM items ORDER BY embedding <-> '[1,1,1]' LIMIT 1;")"
+# shellcheck disable=SC2001 # per-line indent of a multi-line block; ${//} cannot anchor to ^
 echo "$PLAN" | sed 's/^/    /'
 echo "$PLAN" | grep -q "Index Scan using" || { echo "FAIL: planner did not use the HNSW index"; exit 1; }
 

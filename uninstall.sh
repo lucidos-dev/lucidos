@@ -83,7 +83,7 @@ source_service_lib() {
     local self_dir base tmp
     self_dir="$(uninstall_self_dir)"
     if [ -n "$self_dir" ] && [ -f "$self_dir/scripts/lib/service.sh" ]; then
-        # shellcheck disable=SC1091
+        # shellcheck source=scripts/lib/service.sh
         . "$self_dir/scripts/lib/service.sh" || die "Could not source $self_dir/scripts/lib/service.sh"
         return 0
     fi
@@ -93,7 +93,9 @@ source_service_lib() {
     info "$base/service.sh"
     curl -fsSL "$base/service.sh" -o "$tmp/service.sh" || die "Could not fetch service.sh from $base"
     [ -s "$tmp/service.sh" ] || die "Fetched service.sh from $base is empty."
-    # shellcheck disable=SC1090
+    # The fetched copy IS scripts/lib/service.sh from the same ref, so point
+    # ShellCheck at the in-repo original rather than the runtime temp path.
+    # shellcheck source=scripts/lib/service.sh
     . "$tmp/service.sh" || die "Could not source the fetched service.sh."
 }
 
@@ -152,12 +154,15 @@ remove_instance() {
         plist="$(service_launchd_plist_path "$HOME" "$slug")"
         uid="$(id -u)"
         if service_launchd_is_loaded "$uid" "$label"; then
-            service_launchd_unload "$uid" "$label" && ok "Stopped launchd agent $label" \
-                || warn "Could not bootout $label (try: launchctl bootout gui/$uid/$label)"
+            if service_launchd_unload "$uid" "$label"; then
+                ok "Stopped launchd agent $label"
+            else
+                warn "Could not bootout $label (try: launchctl bootout gui/$uid/$label)"
+            fi
             removed=1
         fi
         if [ -f "$plist" ]; then
-            rm -f "$plist" && ok "Removed $plist" || warn "Could not remove $plist"
+            if rm -f "$plist"; then ok "Removed $plist"; else warn "Could not remove $plist"; fi
             removed=1
         fi
     fi
@@ -188,7 +193,7 @@ remove_instance() {
         service_stopped=0
     fi
     if [ -f "$unit_path" ]; then
-        rm -f "$unit_path" && ok "Removed $unit_path" || warn "Could not remove $unit_path"
+        if rm -f "$unit_path"; then ok "Removed $unit_path"; else warn "Could not remove $unit_path"; fi
         [ "$bus_ok" = "1" ] && { systemctl --user daemon-reload >/dev/null 2>&1 || true; }
         removed=1
     fi
@@ -213,7 +218,7 @@ remove_instance() {
         while IFS= read -r t; do
             [ -n "$t" ] || continue
             if [ -e "$t" ]; then
-                rm -rf "$t" && ok "Deleted $t" || warn "Could not delete $t"
+                if rm -rf "$t"; then ok "Deleted $t"; else warn "Could not delete $t"; fi
             fi
         done <<EOF
 $(service_uninstall_purge_targets "$data")
@@ -284,7 +289,7 @@ run_uninstall() {
     if [ -n "$LUCIDOS_ALL" ] && [ -n "$LUCIDOS_PURGE" ]; then
         local runtime="$LUCIDOS_PREFIX/runtime"
         if [ -e "$runtime" ]; then
-            rm -rf "$runtime" && ok "Deleted the shared runtime $runtime" || warn "Could not delete $runtime"
+            if rm -rf "$runtime"; then ok "Deleted the shared runtime $runtime"; else warn "Could not delete $runtime"; fi
         fi
     fi
 

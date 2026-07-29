@@ -496,18 +496,19 @@
 }
 
 /* One toast look for every type — the plain theme bg framed by the toast's own
-   CATEGORY colour (success=green, info=blue, warning=softened amber, error=red).
+   CATEGORY colour (success=green, info=blue, warning=sand, error=red).
    Each type sets --toast-accent once; the border AND the icon both read it (see
    the `.toast-icon` rule above), so the frame and the icon always match. The fill
    is just the theme background, inherited from the base `.toast` rule above
    (--bg-tertiary) — no tint. Same specificity as the base `.toast` rule above —
    border-color wins on source order (overrides only the colour of the `.toast`
-   border shorthand). Warning mixes the raw gold --accent-yellow toward the muted
-   --text-secondary so it desaturates and calms down against the dark UI, local to
-   the toast and leaving the global --accent-yellow token untouched. */
+   border shorthand). Every type reads its token straight: warning used to mix
+   --accent-yellow toward --text-secondary to desaturate the old raw gold, and
+   light mode needed a further hardcoded override because that mix muddied to
+   brown. --accent-yellow is a muted sand now, so both patches are gone. */
 .toast-success { --toast-accent: var(--accent-green); }
 .toast-info    { --toast-accent: var(--accent); }
-.toast-warning { --toast-accent: color-mix(in srgb, var(--accent-yellow) 70%, var(--text-secondary)); }
+.toast-warning { --toast-accent: var(--accent-yellow); }
 .toast-error   { --toast-accent: var(--accent-red); }
 
 /* Light-mode fill override: the bg ladder INVERTS between themes. In dark mode
@@ -517,12 +518,6 @@
    gray slab. Elevation in light mode is toward white, so the toast sits on the
    brightest surface (--bg-primary) and floats on its shadow + category border. */
 html[data-theme="light"] .toast { background: var(--bg-primary); }
-
-/* Light-mode warning override: the default mix muddies to brown in light mode
-   because --text-secondary is dark there (#656d76) and --accent-yellow is already
-   a dark gold (#9a6700), so mixing them yields a muddy brown. Light mode uses a
-   muted gold directly, which stays clearly gold on the near-white toast. */
-html[data-theme="light"] .toast-warning { --toast-accent: #caa53d; }
 
 .toast-success,
 .toast-info,
@@ -653,8 +648,12 @@ html[data-theme="light"] .toast-warning { --toast-accent: #caa53d; }
     font-size: var(--font-size-xs);
 }
 
+/* The ONE source of tree indentation. A folder's children are nested inside its
+ * `.folder-contents`, so the DOM nesting already accumulates — the offset here is
+ * one constant unit per level, never a running total. (A per-row offset applied
+ * on top of this nesting compounds into 1, 3, 6, 10 … rem.) */
 .folder-contents {
-    margin-left: 0;
+    margin-left: 1rem;
 }
 
 .file-item {
@@ -665,6 +664,13 @@ html[data-theme="light"] .toast-warning { --toast-accent: #caa53d; }
     cursor: pointer;
     border-radius: 0.25rem;
     transition: background-color 0.15s;
+}
+
+/* A file row inside the tree sits further right than a sibling folder row, to
+ * clear that row's disclosure arrow. Scoped to the tree so the flat changed-files
+ * list (`.file-item.repo-changed-file`) keeps the base 0.5rem gutter. */
+.tree-file-item {
+    padding-left: 1.25rem;
 }
 
 @media (hover: hover) {

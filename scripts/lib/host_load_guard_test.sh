@@ -199,12 +199,293 @@ test_zero_ncpu_fail_open() {
     assert_eq "0" "$rc" "guard with an empty core count proceeds (fails open)"
 }
 
+# ── the mid-run sampler ─────────────────────────────────────────────────────
+# The launch gate only knows about the instant it fired. These cover the second
+# half: sampling THROUGH the run and classifying a failing run whose host went
+# saturated afterwards, without retrying it or touching its exit code.
+export HOST_LOAD_SAMPLES_FILE="$SANDBOX/samples"
+export HOST_LOAD_SAMPLER_PIDFILE="$SANDBOX/sampler.pid"
+
+# Write a synthetic sample series: N lines, INTERVAL seconds apart, each with the
+# given load. Lets the report tests describe a 10-minute saturation in a
+# millisecond instead of waiting for one.
+write_samples() {
+    local start="$1" interval="$2" count="$3" load="$4" i=0 ts
+    while [ "$i" -lt "$count" ]; do
+        ts=$((start + i * interval))
+        printf '%s %s\n' "$ts" "$load" >> "$HOST_LOAD_SAMPLES_FILE"
+        i=$((i + 1))
+    done
+}
+
+test_sampler_records_and_stops() {
+    echo "test: the sampler records samples during the run and stops cleanly"
+    local pid lines
+    rm -f "$HOST_LOAD_SAMPLES_FILE" "$HOST_LOAD_SAMPLER_PIDFILE"
+    HOST_LOAD_OVERRIDE=40 HOST_LOAD_POLL_SECS=1 start_host_load_sampler >"$OUT/sampler.out" 2>&1
+    pid="$HOST_LOAD_SAMPLER_PID"
+    sleep 2
+    stop_host_load_sampler
+
+    if [ -n "$pid" ]; then pass "sampler started (pid=$pid)"; else fail "sampler did not start"; fi
+    lines="$(wc -l < "$HOST_LOAD_SAMPLES_FILE" | tr -d ' ')"
+    if [ "${lines:-0}" -ge 2 ]; then
+        pass "recorded $lines samples in ~2s at a 1s interval"
+    else
+        fail "recorded only ${lines:-0} samples"
+    fi
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        fail "sampler still alive after stop (pid=$pid)"
+        kill "$pid" 2>/dev/null || true
+    else
+        pass "sampler process gone after stop"
+    fi
+    if [ -f "$HOST_LOAD_SAMPLER_PIDFILE" ]; then fail "pidfile left behind"; else pass "pidfile removed"; fi
+    # Samples survive the stop — the report drains them, not the teardown.
+    if [ -f "$HOST_LOAD_SAMPLES_FILE" ]; then
+        pass "samples kept for the report"
+    else
+        fail "samples deleted before the report could read them"
+    fi
+}
+
+test_sampler_start_truncates_previous_run() {
+    echo "test: starting the sampler discards a crashed predecessor's samples"
+    rm -f "$HOST_LOAD_SAMPLER_PIDFILE"
+    write_samples 1000 15 40 400      # a previous run's saturation
+    HOST_LOAD_OVERRIDE=1.0 HOST_LOAD_POLL_SECS=1 start_host_load_sampler >/dev/null 2>&1
+    stop_host_load_sampler
+    if grep -q " 400$" "$HOST_LOAD_SAMPLES_FILE" 2>/dev/null; then
+        fail "stale samples from a previous run survived"
+    else
+        pass "previous run's samples were truncated"
+    fi
+    rm -f "$HOST_LOAD_SAMPLES_FILE"
+}
+
+test_failed_run_with_sustained_saturation_banners() {
+    echo "test: a FAILED run with sustained mid-run saturation gets the loud banner"
+    local rc
+    rm -f "$HOST_LOAD_SAMPLES_FILE"
+    # 40 samples, 15s apart = 585s over cap: 100/18 = 5.56x, well over 1.5x.
+    write_samples 1000 15 40 100
+    HOST_NCPU_OVERRIDE=18 HOST_LOAD_MAX_RATIO=1.5 HOST_LOAD_SUSTAINED_MIN_SECS=120 \
+        report_host_load_saturation 1 >"$OUT/banner.out" 2>&1
+    rc=$?
+
+    assert_eq "0" "$rc" "the reporter itself returns 0 (it reports, it does not decide)"
+    if grep -q "HOST WAS SATURATED MID-RUN" "$OUT/banner.out"; then
+        pass "printed the saturation banner"
+    else
+        fail "no banner on a failed, saturated run"; cat "$OUT/banner.out"
+    fi
+    # 5.56x is load/cores, NOT a multiple of the 1.5x cap — the banner must not
+    # conflate the two ("5.56x the 1.50x cap" would claim 8.34x).
+    if grep -q "peak load 100.00 on 18 cores = 5.56x, against a 1.50x cap" "$OUT/banner.out" \
+        && grep -q "sustained above that cap for 10 min" "$OUT/banner.out"; then
+        pass "banner quantifies the peak and the sustained duration, without conflating ratio and cap"
+    else
+        fail "banner missing peak/duration, or misstates the ratio"; cat "$OUT/banner.out"
+    fi
+    if grep -q "RE-RUN ON AN IDLE HOST" "$OUT/banner.out" \
+        && grep -q "exit code is unchanged (1)" "$OUT/banner.out" \
+        && grep -q "has NOT been retried" "$OUT/banner.out"; then
+        pass "banner says re-run, and that nothing was retried or suppressed"
+    else
+        fail "banner missing the re-run / no-suppression wording"; cat "$OUT/banner.out"
+    fi
+    if [ -f "$HOST_LOAD_SAMPLES_FILE" ]; then fail "samples not drained"; else pass "samples drained"; fi
+}
+
+test_failed_run_with_brief_spike_does_not_banner() {
+    echo "test: a FAILED run with only a brief load spike is NOT blamed on the host"
+    rm -f "$HOST_LOAD_SAMPLES_FILE"
+    write_samples 1000 15 20 10       # 0.56x — quiet
+    write_samples 1300 15 3  100      # 30s over cap — a spike, not saturation
+    write_samples 1400 15 20 10
+    HOST_NCPU_OVERRIDE=18 HOST_LOAD_MAX_RATIO=1.5 HOST_LOAD_SUSTAINED_MIN_SECS=120 \
+        report_host_load_saturation 1 >"$OUT/spike.out" 2>&1
+
+    if grep -q "HOST WAS SATURATED MID-RUN" "$OUT/spike.out"; then
+        fail "banner fired on a 30s spike (would cry wolf on real failures)"
+        cat "$OUT/spike.out"
+    else
+        pass "no banner for a spike shorter than the sustained window"
+    fi
+    if grep -q "mid-run host load: peak 100.00" "$OUT/spike.out"; then
+        pass "still printed the one-line load summary as evidence"
+    else
+        fail "no load summary"; cat "$OUT/spike.out"
+    fi
+}
+
+test_passing_run_never_banners() {
+    echo "test: a PASSING run never gets the banner, however saturated the host was"
+    rm -f "$HOST_LOAD_SAMPLES_FILE"
+    write_samples 1000 15 40 100
+    HOST_NCPU_OVERRIDE=18 HOST_LOAD_MAX_RATIO=1.5 HOST_LOAD_SUSTAINED_MIN_SECS=120 \
+        report_host_load_saturation 0 >"$OUT/green.out" 2>&1
+
+    if grep -q "HOST WAS SATURATED MID-RUN" "$OUT/green.out"; then
+        fail "banner fired on a green run — it explains failures, it doesn't warn"
+    else
+        pass "no banner on a green run"
+    fi
+    if grep -q "mid-run host load: peak" "$OUT/green.out"; then
+        pass "load summary still recorded for the log"
+    else
+        fail "no load summary on a green run"
+    fi
+}
+
+test_banner_uses_the_launch_gate_threshold() {
+    echo "test: the banner keys on HOST_LOAD_MAX_RATIO — the same cap as the launch gate"
+    rm -f "$HOST_LOAD_SAMPLES_FILE"
+    write_samples 1000 15 40 100      # 5.56x on 18 cores
+    # Raise the ONE cap above the observed ratio: the same samples must now be
+    # judged fine. If the sampler had its own private threshold, this would fail.
+    HOST_NCPU_OVERRIDE=18 HOST_LOAD_MAX_RATIO=10 HOST_LOAD_SUSTAINED_MIN_SECS=120 \
+        report_host_load_saturation 1 >"$OUT/cap.out" 2>&1
+
+    if grep -q "HOST WAS SATURATED MID-RUN" "$OUT/cap.out"; then
+        fail "banner ignored the raised HOST_LOAD_MAX_RATIO cap"; cat "$OUT/cap.out"
+    else
+        pass "raising HOST_LOAD_MAX_RATIO suppressed the banner (one shared cap)"
+    fi
+    if grep -q "0/40 samples over the 10.00x cap" "$OUT/cap.out"; then
+        pass "summary reports against the same cap"
+    else
+        fail "summary did not use the configured cap"; cat "$OUT/cap.out"
+    fi
+}
+
+test_report_fails_open_without_samples() {
+    echo "test: the report fails open when it cannot measure"
+    local rc
+    rm -f "$HOST_LOAD_SAMPLES_FILE"
+    # No samples file at all (sampler never started / disabled).
+    report_host_load_saturation 1 >"$OUT/nofile.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "no samples file → returns 0, prints nothing"
+    if [ -s "$OUT/nofile.out" ]; then fail "printed output with no samples"; else pass "silent with no samples"; fi
+
+    # An empty / garbage sample set is also not evidence of anything.
+    printf 'garbage\n\n' > "$HOST_LOAD_SAMPLES_FILE"
+    HOST_NCPU_OVERRIDE=18 report_host_load_saturation 1 >"$OUT/garbage.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "unusable samples → returns 0"
+    if grep -q "HOST WAS SATURATED" "$OUT/garbage.out"; then
+        fail "bannered on unparseable samples"
+    else
+        pass "no banner on unparseable samples"
+    fi
+
+    # Unreadable core count → say so, don't guess.
+    write_samples 1000 15 40 100
+    HOST_NCPU_OVERRIDE=0 report_host_load_saturation 1 >"$OUT/noncpu.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "unreadable core count → returns 0"
+    if grep -q "core count unreadable" "$OUT/noncpu.out"; then
+        pass "logged that it could not classify"
+    else
+        fail "silent about an unreadable core count"; cat "$OUT/noncpu.out"
+    fi
+}
+
+test_sampler_disabled_with_the_guard() {
+    echo "test: HOST_LOAD_GUARD_DISABLE also disables the mid-run sampler"
+    rm -f "$HOST_LOAD_SAMPLES_FILE" "$HOST_LOAD_SAMPLER_PIDFILE"
+    HOST_LOAD_SAMPLER_PID=""
+    # Assert on the PIDFILE, not on $HOST_LOAD_SAMPLER_PID. A `VAR=x func` prefix
+    # assignment is restored when the function returns, so reading the variable
+    # afterwards says "empty" even if a sampler really spawned — a check that can
+    # only ever pass. The pidfile is written by the real start path, so it is the
+    # honest witness.
+    HOST_LOAD_GUARD_DISABLE=1 HOST_LOAD_OVERRIDE=999 \
+        start_host_load_sampler >"$OUT/sdis.out" 2>&1
+    if [ -f "$HOST_LOAD_SAMPLER_PIDFILE" ]; then
+        fail "sampler started while the guard was disabled (pidfile written)"
+        stop_host_load_sampler
+    else
+        pass "sampler not started while the guard was disabled (no pidfile)"
+    fi
+    if grep -q "disabled" "$OUT/sdis.out"; then
+        pass "logged the disabled sampler"
+    else
+        fail "did not log the disabled sampler"
+    fi
+}
+
+test_disabled_run_cannot_inherit_a_predecessors_samples() {
+    echo "test: a disabled run never reports a crashed predecessor's saturation"
+    # stop_host_load_sampler deliberately keeps the samples for the report, so an
+    # interrupted run leaves a saturated file on disk. A later run with the guard
+    # disabled must not pick it up and banner about load it never experienced.
+    rm -f "$HOST_LOAD_SAMPLER_PIDFILE"
+    write_samples 1000 15 40 100
+
+    HOST_LOAD_GUARD_DISABLE=1 start_host_load_sampler >/dev/null 2>&1
+    if [ -f "$HOST_LOAD_SAMPLES_FILE" ]; then
+        fail "predecessor's samples survived the disabled start"
+    else
+        pass "disabled start discarded the predecessor's samples"
+    fi
+
+    # Belt and braces: even if a file reappears, the report refuses to classify
+    # while the guard is disabled.
+    write_samples 1000 15 40 100
+    HOST_NCPU_OVERRIDE=18 HOST_LOAD_GUARD_DISABLE=1 \
+        report_host_load_saturation 1 >"$OUT/disrep.out" 2>&1
+    if [ -s "$OUT/disrep.out" ]; then
+        fail "the report spoke while the guard was disabled"; cat "$OUT/disrep.out"
+    else
+        pass "the report stayed silent while the guard was disabled"
+    fi
+    if [ -f "$HOST_LOAD_SAMPLES_FILE" ]; then
+        fail "stale samples left for the next run"
+    else
+        pass "stale samples discarded"
+    fi
+}
+
+test_start_reaps_an_orphaned_predecessor() {
+    echo "test: starting the sampler reaps an orphan left by a SIGKILLed run"
+    # The loop is disowned, so a killed e2e-browser.sh leaves it appending
+    # forever; two samplers interleaving into one file would describe a run that
+    # never happened.
+    rm -f "$HOST_LOAD_SAMPLES_FILE"
+    sleep 120 &
+    local orphan=$!
+    echo "$orphan" > "$HOST_LOAD_SAMPLER_PIDFILE"
+    HOST_LOAD_SAMPLER_PID="" HOST_LOAD_OVERRIDE=1.0 HOST_LOAD_POLL_SECS=1 \
+        start_host_load_sampler >/dev/null 2>&1
+    stop_host_load_sampler
+
+    if kill -0 "$orphan" 2>/dev/null; then
+        fail "orphan from the pidfile survived the new start (pid=$orphan)"
+        kill "$orphan" 2>/dev/null || true
+    else
+        pass "orphan recorded in the pidfile was reaped before starting"
+    fi
+    rm -f "$HOST_LOAD_SAMPLES_FILE"
+}
+
 test_under_threshold_immediate
 test_never_recovers_saturated
 test_recovers_mid_wait
 test_disable_knob
 test_float_compare_exactness
 test_zero_ncpu_fail_open
+test_sampler_records_and_stops
+test_sampler_start_truncates_previous_run
+test_failed_run_with_sustained_saturation_banners
+test_failed_run_with_brief_spike_does_not_banner
+test_passing_run_never_banners
+test_banner_uses_the_launch_gate_threshold
+test_report_fails_open_without_samples
+test_sampler_disabled_with_the_guard
+test_disabled_run_cannot_inherit_a_predecessors_samples
+test_start_reaps_an_orphaned_predecessor
 
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"

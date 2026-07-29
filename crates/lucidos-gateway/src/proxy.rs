@@ -88,17 +88,23 @@ pub async fn proxy(
 
     // Forward request headers verbatim except HOST (reqwest sets it), the
     // framing headers (hop-by-hop + content-length — reqwest re-frames the
-    // streamed body), and any inbound `x-forwarded-prefix`. The last is
-    // LOAD-BEARING for security: the gateway is the trust boundary and sets this
-    // header authoritatively below, but reqwest's `.header()` *appends* rather
-    // than replaces — so a client-spoofed `X-Forwarded-Prefix` left in here would
-    // sit FIRST, and the engine's `forwarded_prefix` reads `headers.get(...)`
-    // (the first value). Stripping it makes the gateway's the only value.
+    // streamed body), and any inbound `x-forwarded-prefix` / `x-forwarded-host`.
+    // Stripping those two forwarding headers is the trust boundary: a
+    // client-forged value must never reach the engine or a configured upstream.
+    //   - `x-forwarded-prefix` is LOAD-BEARING and re-injected below with the
+    //     gateway's own value. reqwest's `.header()` *appends* rather than
+    //     replaces, so a client-spoofed one left here would sit FIRST and the
+    //     engine's `forwarded_prefix` reads `headers.get(...)` (the first value).
+    //   - `x-forwarded-host` is NOT re-injected — the engine's credentialed-proxy
+    //     guard uses `Sec-Fetch-Site`, not a reconstructed host — but it is still
+    //     stripped so a forged value can't pass through to an upstream that trusts
+    //     it for URL generation / host-based authz.
     let mut builder = client.request(method.clone(), &url);
     for (name, value) in req.headers() {
         if name == header::HOST
             || name == header::CONTENT_LENGTH
             || name.as_str().eq_ignore_ascii_case("x-forwarded-prefix")
+            || name.as_str().eq_ignore_ascii_case("x-forwarded-host")
             || is_hop_by_hop(name)
         {
             continue;
@@ -467,6 +473,35 @@ mod proxy_tests {
         assert!(
             !got.contains("/evil/"),
             "a client-spoofed x-forwarded-prefix must be stripped; upstream saw:\n{got}"
+        );
+    }
+
+    #[tokio::test]
+    async fn strips_client_spoofed_forwarded_host() {
+        // Trust-boundary hygiene: the gateway no longer injects x-forwarded-host
+        // (the engine's credentialed-proxy guard uses Sec-Fetch-Site, not a
+        // reconstructed host), but a client-forged inbound value must still be
+        // stripped so it can't reach an upstream that trusts it. Unlike
+        // x-forwarded-prefix, nothing is put back in its place.
+        let (port, captured) = capturing_upstream().await;
+        let target = format!("http://127.0.0.1:{port}");
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/dev/")
+            .header("host", "gateway.example:5251")
+            .header("x-forwarded-host", "evil.example")
+            .body(Body::empty())
+            .unwrap();
+        let resp = proxy(&build_client(), &target, "dev", DEFAULT_LABEL, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = captured.lock().await.to_lowercase();
+        assert!(
+            !got.contains("x-forwarded-host"),
+            "a client-spoofed x-forwarded-host must be stripped and not re-injected; upstream saw:\n{got}"
+        );
+        assert!(
+            !got.contains("evil.example"),
+            "the forged forwarded-host value must not reach the upstream; upstream saw:\n{got}"
         );
     }
 

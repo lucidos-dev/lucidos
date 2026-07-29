@@ -66,9 +66,12 @@ What each piece does — include only what you need:
 
 The user's UI font is **`--font-ui`** — that's the canonical token, set live to the
 user's font choice. You rarely need to apply it yourself: `sdk-iframe.css` already
-sets `body { font-family: var(--font-ui) }` (and on inputs/buttons), so any element
-that inherits gets the right font for free. Only re-declare `font-family` when you
-deliberately override it, and then use `var(--font-ui)`. As a safety net,
+sets `body { font-family: var(--font-ui) }` — plus inputs and `.action-btn`, since
+form controls don't inherit the page font on their own — so any element that
+inherits gets the right font for free. (A *bare* unclassed `<button>` is the gap:
+it keeps the browser's own control font. One more reason to use `.action-btn`.)
+Only re-declare `font-family` when you deliberately override it, and then use
+`var(--font-ui)`. As a safety net,
 `--font-family` and `--font` are tolerated **aliases** of `--font-ui` (so the
 intuitive guess still resolves to the user's font instead of silently dropping to a
 hardcoded fallback) — but `--font-ui` is the name to write.
@@ -375,16 +378,49 @@ const res = await lucidos.proxy('comfort').fetch('/api/v1/devices', {
 const data = await res.json();
 ```
 
+### Built-in model-provider proxies (no `apis.json` entry needed)
+
+The engine already holds working credentials + routing for every model provider in the model registry (Settings → Models). Those are exposed as **built-in provider proxies** under the SAME route, so an app can call an LLM / image provider without the workspace re-entering the credential in `apis.json`. When `<name>` matches a model-registry provider and has no `apis.json` entry, the engine forwards to that provider's API root and injects its credential server-side:
+
+| `proxy(name)` | Base URL | Injected server-side | You send |
+|---|---|---|---|
+| `openai` | `https://api.openai.com/v1` | `Authorization: Bearer <key>` | path as-is, e.g. `/chat/completions`, `/images/generations` |
+| `openrouter` | `https://openrouter.ai/api/v1` | `Authorization: Bearer <key>` | path as-is, e.g. `/chat/completions` |
+| `anthropic` | `https://api.anthropic.com/v1` | `x-api-key: <key>` (or `Authorization: Bearer` for an OAuth credential) | path as-is, e.g. `/messages` — set your own `anthropic-version` header |
+| `local` | your configured local base (Ollama default `http://localhost:11434/v1`) | `Authorization: Bearer <key>` (omitted if keyless) | path as-is, e.g. `/chat/completions` |
+| `vertex` | `https://<region>-aiplatform.googleapis.com/v1/projects/<project>/locations/<region>` (engine-owned prefix) | `Authorization: Bearer <access-token>` (minted + refreshed server-side) | ONLY the suffix, e.g. `/publishers/anthropic/models/claude-opus-4-8@default:rawPredict` |
+
+- **Only the credential is injected.** The layer adds just the auth header (the secret the iframe must never see). `Content-Type`, `anthropic-version`, and any attribution headers stay yours to set in `init`.
+- **`apis.json` overrides the builtin.** An entry with the same name in `data/config/apis.json` is used instead — so you can still point `openai` at a mock/gateway or add extra auth layers.
+- **Vertex is addressed by suffix.** The engine owns the `…/projects/<project>/locations/<region>` prefix (project + region from its own Vertex config, region default `europe-west1`) and mints the OAuth token — so the app never needs the project id or a token. Send only `/publishers/<publisher>/models/<model>:<method>`. The region is fixed to the engine's configured region; a model that must run in another location (e.g. a `global`-only Gemini variant) needs an `apis.json` override.
+- **Not configured → 404.** If the provider has no credential/config (and no `apis.json` entry), the call returns 404 naming what to set.
+
+```js
+// Chat via the built-in OpenAI proxy — no apis.json, no key in the app
+const res = await lucidos.proxy('openai').fetch('/chat/completions', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ model: 'gpt-5.6-sol', messages: [{ role: 'user', content: 'hi' }] }),
+});
+
+// Claude on Vertex — the app sends only the publisher/model suffix
+const res = await lucidos.proxy('vertex').fetch(
+  '/publishers/anthropic/models/claude-opus-4-8@default:rawPredict',
+  { method: 'POST', headers: { 'Content-Type': 'application/json' }, body },
+);
+```
+
 ### When to use which
 
 | Want to … | Use |
 |---|---|
 | Read/write workspace files | `lucidos.data.*` |
 | Emit/query domain events | `lucidos.events.*` |
-| Call an external HTTP API | `lucidos.proxy(name).fetch(path, init)` |
+| Call a model provider the engine already has (LLM / image) | `lucidos.proxy('openai' \| 'vertex' \| 'openrouter' \| 'anthropic' \| 'local').fetch(...)` — no `apis.json` needed |
+| Call any other external HTTP API | `lucidos.proxy(name).fetch(path, init)` + an `apis.json` entry |
 | Hit the engine's own `/api/v1/*` | Plain `fetch` (same origin, no proxy needed) |
 
-If the iframe needs an external API the workspace doesn't have a proxy entry for, add one to `data/config/apis.json` rather than embedding the credential in the app.
+If the iframe needs a model provider the engine already has, use its built-in proxy name above — no config. For any other external API the workspace doesn't have a proxy entry for, add one to `data/config/apis.json` rather than embedding the credential in the app.
 
 ## lucidos.oauth — OAuth Token Access
 
@@ -778,7 +814,7 @@ interface ThreadSummary {
   created_at: string;
   last_activity: string;
   /** When the user last drove the thread forward (message/answer/permission/
-   *  change apply-or-discard). The UI drawer sorts by this; agent churn does
+   *  change apply-or-discard). The thread drawer sorts by this; agent churn does
    *  not bump it. */
   last_user_action: string;
   /** When the agent (or trigger) last did something — streaming, a terminal

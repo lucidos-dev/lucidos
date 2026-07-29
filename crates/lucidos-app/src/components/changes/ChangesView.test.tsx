@@ -4,7 +4,7 @@ vi.mock('../../store/actions/threads', () => ({
   focusThreadOrBootstrap: vi.fn(),
 }));
 
-import { openChangeThread } from './ChangesView';
+import { openChangeThread, applyBlockedReason, THREAD_ACTIVE_TIP } from './ChangesView';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import type { Change } from '../../api/client';
 
@@ -47,5 +47,30 @@ describe('openChangeThread', () => {
   it('is a no-op when the change has no originating thread', () => {
     openChangeThread(makeChange({ thread_id: null }));
     expect(focusThreadOrBootstrap).not.toHaveBeenCalled();
+  });
+});
+
+describe('applyBlockedReason — the UI mirror of the server-side Apply gates', () => {
+  it('allows Apply on an ordinary pending change', () => {
+    expect(applyBlockedReason(makeChange())).toBeNull();
+  });
+
+  it('blocks Apply while the coding agent is still working', () => {
+    expect(applyBlockedReason(makeChange({ thread_active: true }))).toBe(THREAD_ACTIVE_TIP);
+  });
+
+  it('blocks Apply on a change reconciled to zero files, steering to Discard', () => {
+    // Its branch commits cancelled out, so the Diff is empty. Merging would
+    // only push no-op commits and could spend a harden run on nothing; the
+    // per-change endpoint 409s it and Apply All filters it out.
+    const reason = applyBlockedReason(makeChange({ file_count: 0, files: [] }));
+    expect(reason).toBe('This change has no file changes left — discard it');
+  });
+
+  it('reports the live thread first when a change is both empty and mid-turn', () => {
+    // Wait-for-the-agent is the actionable instruction; the file count may
+    // still change before it idles.
+    const reason = applyBlockedReason(makeChange({ file_count: 0, thread_active: true }));
+    expect(reason).toBe(THREAD_ACTIVE_TIP);
   });
 });

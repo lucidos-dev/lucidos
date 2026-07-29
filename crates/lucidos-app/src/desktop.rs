@@ -89,6 +89,11 @@ const ENGINE_RESOURCE_NAME: &str = "lucidos-engine";
 const FRONTEND_RESOURCE_NAME: &str = "frontend";
 const SDK_RESOURCE_NAME: &str = "sdk";
 const POSTGRES_RESOURCE_NAME: &str = "postgres";
+/// The engine-shipped reference knowhow dir (`system-knowhow/`), staged as the
+/// 7th resource. The engine resolves it by absolute path via
+/// `LUCIDOS_SYSTEM_KNOWHOW_DIR` (set in `spawn_gateway`); without it a packaged
+/// install silently loses the entire engine-facing reference set.
+const SYSTEM_KNOWHOW_RESOURCE_NAME: &str = "system-knowhow";
 /// The `lucidos` CLI binary (cargo package `lucidos-cli` → bin `lucidos`),
 /// staged flat next to the engine. Backs the coding-agent permission/question
 /// MCP servers, the CC hooks, and chat-script `lucidos …` calls; the engine
@@ -227,6 +232,7 @@ struct BundledResources {
     cli_bin: PathBuf,
     frontend: PathBuf,
     sdk: PathBuf,
+    system_knowhow: PathBuf,
     pg_bin: PathBuf,
     pg_lib: PathBuf,
 }
@@ -239,6 +245,7 @@ fn bundled_resources(resources: &Path) -> BundledResources {
         cli_bin: resources.join(CLI_RESOURCE_NAME),
         frontend: resources.join(FRONTEND_RESOURCE_NAME),
         sdk: resources.join(SDK_RESOURCE_NAME),
+        system_knowhow: resources.join(SYSTEM_KNOWHOW_RESOURCE_NAME),
         pg_bin: postgres.join("bin"),
         pg_lib: postgres.join("lib"),
     }
@@ -288,6 +295,66 @@ pub fn engine_port() -> u16 {
     app_data_dir_from_env()
         .map(|d| resolve_engine_port(&d))
         .unwrap_or(DEFAULT_ENGINE_PORT)
+}
+
+// ── The gateway origin and its ACL capability ────────────────────────────────
+
+/// The URL a packaged client window is pointed at: the always-on gateway on this
+/// install's stable port. The ONE place this string is built, because the
+/// window's resulting origin has to match [`gateway_capability`]'s URL pattern
+/// exactly — if the two ever drift, every IPC call from that window is denied.
+pub fn gateway_url(port: u16) -> String {
+    format!("http://localhost:{port}")
+}
+
+/// Permissions granted on the gateway origin. Deliberately identical to the set
+/// `capabilities/default.json` grants on the LOCAL app URL: it is the same
+/// frontend, just reached over http instead of off the bundled assets. Kept in
+/// step by `gateway_capability_grants_what_the_default_capability_grants`.
+const GATEWAY_PERMISSIONS: &[&str] = &[
+    "allow-app-ipc",
+    "core:default",
+    "core:webview:allow-create-webview",
+    "core:webview:allow-webview-close",
+    "core:webview:allow-set-webview-position",
+    "core:webview:allow-set-webview-size",
+    "core:webview:allow-webview-show",
+    "core:webview:allow-webview-hide",
+    "core:webview:allow-set-webview-focus",
+    "dialog:default",
+    "updater:default",
+];
+
+/// The ACL capability that lets the packaged window talk to the app at all.
+///
+/// `frontendDist` makes the Tauri app URL `tauri://localhost`, but [`launch`]
+/// navigates the window to the gateway ([`gateway_url`]). Since tauri 2.11
+/// (`Webview::on_message`: `plugin_command.is_some() || has_app_acl_manifest ||
+/// !is_local`) every IPC request from a non-local URL is ACL-checked as
+/// `Origin::Remote`, so without this capability EVERY command — ours and the
+/// plugins' — is rejected with `Command <x> not allowed by ACL`. That is the
+/// 2.10.2 → 2.11.4 regression this exists to close; the upstream change is
+/// deliberate hardening, so we grant the origin explicitly rather than pin the
+/// old version.
+///
+/// Scoping, tightest the ACL schema allows:
+///  * the URL pattern carries the **resolved port**, not `localhost:*` — the port
+///    is per-install (`<app-data>/config/engine-port`), so it can only be pinned
+///    at runtime, and a wildcard would hand IPC to any other local HTTP server
+///    the window could be navigated to.
+///  * `webviews`, never `windows` — a `windows: ["main"]` entry enables a
+///    capability on every webview of that window, and the `url-preview-*`
+///    webviews showing arbitrary third-party sites live inside the main window.
+///  * `local(false)` — the local app URL is `capabilities/default.json`'s job;
+///    this capability speaks only for the gateway origin.
+pub(crate) fn gateway_capability(port: u16) -> tauri::ipc::CapabilityBuilder {
+    GATEWAY_PERMISSIONS.iter().fold(
+        tauri::ipc::CapabilityBuilder::new("gateway")
+            .local(false)
+            .remote(gateway_url(port))
+            .webviews(["main", "window-*"]),
+        |capability, permission| capability.permission(*permission),
+    )
 }
 
 // ── Client role: ensure the service is up, then point the window at it ───────
@@ -367,6 +434,28 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
         };
         let port = resolve_engine_port(&app_data);
 
+        // Grant the gateway origin its IPC permissions BEFORE anything can put a
+        // window on it — the ACL is consulted per invoke, so registering it here
+        // covers the navigation below and every later New Window (which inherits
+        // the main window's URL).
+        //
+        // The realistic failure — a permission identifier that doesn't resolve —
+        // is caught at TEST time, not here: `acl_tests` resolves this exact
+        // capability through tauri's own resolver, and tauri would `unwrap` the
+        // resolve error rather than hand us an `Err`. So this arm is a backstop.
+        // It logs and still navigates on purpose: a reachable UI with a dead
+        // bridge beats stranding the user on the "Starting Lucidos…" splash with
+        // no explanation, and the page's own IPC telemetry (utils/ipcHealth.ts)
+        // then reports the dead bridge to the engine log — where it is visible
+        // without a debugger, unlike this line.
+        if let Err(e) = handle.add_capability(gateway_capability(port)) {
+            eprintln!(
+                "[desktop] FAILED to register the gateway ACL capability for {} — every Tauri IPC \
+                 call from the window will be rejected by the ACL: {e}",
+                gateway_url(port)
+            );
+        }
+
         // Keep the service up and navigate the window the moment the gateway is
         // healthy — NEVER permanently give up. A slow post-forced-shutdown start
         // (Postgres WAL crash recovery + embedding warmup) or a transient
@@ -390,7 +479,7 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
             );
         }
 
-        let url = format!("http://localhost:{port}");
+        let url = gateway_url(port);
         match (handle.get_webview_window("main"), url.parse::<tauri::Url>()) {
             (Some(win), Ok(parsed)) => {
                 if let Err(e) = win.navigate(parsed) {
@@ -978,7 +1067,8 @@ fn applescript_escape(s: &str) -> String {
 /// registry, provisions one embedded shared Postgres cluster with one database
 /// per workspace, and spawns each workspace's engine (by path via
 /// `LUCIDOS_ENGINE_BIN`, inheriting `LUCIDOS_STATIC_DIR` /
-/// `LUCIDOS_SDK_DIR` / `LUCIDOS_BOOT_WITHOUT_PROVIDER` from this env), and
+/// `LUCIDOS_SDK_DIR` / `LUCIDOS_SYSTEM_KNOWHOW_DIR` /
+/// `LUCIDOS_BOOT_WITHOUT_PROVIDER` from this env), and
 /// reverse-proxies `/<slug>/`. First run creates no workspace — the smart root
 /// serves the picker so the user names their first one.
 /// `LUCIDOS_BOOT_WITHOUT_PROVIDER` lets engines boot before the user has
@@ -1011,6 +1101,12 @@ fn spawn_gateway(resources: &Path, app_data: &Path, port: u16) -> io::Result<Gat
         .env("LUCIDOS_CLI_BIN", &bundle.cli_bin)
         .env("LUCIDOS_STATIC_DIR", &bundle.frontend)
         .env("LUCIDOS_SDK_DIR", &bundle.sdk)
+        // Absolute path to the bundled engine-shipped reference knowhow
+        // (`system-knowhow/`). The engine resolves it here (via
+        // `resolve_system_knowhow_dir`) so `load_knowhow('system-knowhow/…')`,
+        // `GET /api/v1/knowhow`, and the data-API read path all work in a
+        // packaged install (the gateway passes its env to engines).
+        .env("LUCIDOS_SYSTEM_KNOWHOW_DIR", &bundle.system_knowhow)
         .env("FASTEMBED_CACHE_DIR", &fastembed_cache)
         .env("LUCIDOS_BOOT_WITHOUT_PROVIDER", "1")
         // Tell the gateway it's a packaged build so the picker hides the dev-only
@@ -1132,8 +1228,13 @@ mod tests {
 
         assert_eq!(bundle.gateway_bin, resources.join(GATEWAY_RESOURCE_NAME));
         assert_eq!(bundle.engine_bin, resources.join(ENGINE_RESOURCE_NAME));
+        assert_eq!(bundle.cli_bin, resources.join(CLI_RESOURCE_NAME));
         assert_eq!(bundle.frontend, resources.join(FRONTEND_RESOURCE_NAME));
         assert_eq!(bundle.sdk, resources.join(SDK_RESOURCE_NAME));
+        assert_eq!(
+            bundle.system_knowhow,
+            resources.join(SYSTEM_KNOWHOW_RESOURCE_NAME)
+        );
         assert_eq!(
             bundle.pg_bin,
             resources.join(POSTGRES_RESOURCE_NAME).join("bin")

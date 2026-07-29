@@ -168,11 +168,11 @@ acquire_e2e_lock() {
         return 0
     fi
 
-    # File exists — read all metadata in one pass (IFS== keeps everything after
+    # File exists — read all metadata in one pass (IFS='=' keeps everything after
     # the first '=' in $val, so worktree paths containing '=' survive).
     local existing_pid="" existing_thread="" existing_wt="" existing_started="" existing_script=""
     local key val
-    while IFS== read -r key val; do
+    while IFS='=' read -r key val; do
         case "$key" in
             PID)       existing_pid="$val" ;;
             THREAD_ID) existing_thread="$val" ;;

@@ -10,7 +10,15 @@ use crate::llm::provider::{LlmProvider, LlmResponse, Message, TokenCallback, Too
 use async_trait::async_trait;
 use std::time::Duration;
 
-mod chat;
+/// `pub(crate)` so `llm::web_search::anthropic` can share this module's auth
+/// header and API-version constants instead of restating them.
+pub(crate) mod chat;
+
+/// Beta flag that authorizes a Claude subscription OAuth bearer token to call
+/// the Messages API. Required alongside `Authorization: Bearer` for OAuth auth —
+/// shared by the direct provider (`chat.rs`) and the builtin `anthropic` proxy
+/// (`api::proxy_builtin`), so an OAuth credential works through either path.
+pub const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 
 /// Authentication for the direct Anthropic API. The two kinds map to different
 /// HTTP headers (see `chat.rs`):

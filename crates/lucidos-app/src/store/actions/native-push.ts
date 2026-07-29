@@ -94,7 +94,10 @@ async function dismissNativeBanner(payload: NativePushDismissRequestedPayload): 
     // frame without user intent. A failed dismiss is non-fatal — the stale OS
     // banner just persists until the user swipes it (the pre-dismiss behaviour),
     // and the bell badge (NotificationRead SSE) already reflects the read state.
-    // A toast would be wrong: the user isn't looking at the app.
+    // A toast would be wrong: the user isn't looking at the app. The durable
+    // record is not this warn — `invoke` reports IPC failures to the engine log
+    // itself (utils/ipcHealth → `[Client/ipc]`), which is what makes a dead
+    // bridge visible on a packaged build that has no console.
     console.warn('[NativePush] Failed to dismiss native notification:', err);
   }
 }
@@ -120,7 +123,11 @@ async function showNativeBanner(payload: NativePushRequestedPayload): Promise<vo
     // frame without user intent. A failed native banner is non-fatal — the bell
     // badge (NotificationCreated) is the durable signal and the next
     // notification re-attempts. A toast here would be wrong: the user isn't
-    // looking at the app (that's exactly why we chose the OS surface).
+    // looking at the app (that's exactly why we chose the OS surface). The
+    // failure is still recorded durably: `invoke` reports it to the engine log
+    // (utils/ipcHealth → `[Client/ipc]`). Silence here is precisely how the
+    // tauri 2.11 ACL regression hid — every banner was rejected for a month and
+    // the only trace was a console warning nobody could see.
     console.warn('[NativePush] Failed to show native notification:', err);
   }
 }

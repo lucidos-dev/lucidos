@@ -19,12 +19,16 @@ use super::helpers::*;
 
 impl LucidosEngine {
     /// After the first LLM call, emit the derived `ImageDescribed` fact(s) for
-    /// the turn's attached images. The actual image bytes are deliberately KEPT
-    /// in the user message for the whole turn — `trim_context_if_needed`'s
-    /// `keep_image_idx` preserves them so the model can still see the image
-    /// after intervening tool calls. The Flash description is recorded as a
-    /// past-tense fact (for memory + the "what was shown" record), not used to
-    /// replace the bytes.
+    /// the turn's attached images — see [`emit_image_descriptions`] for what
+    /// lands and when it no-ops.
+    ///
+    /// What this wrapper adds is the turn context: the actual image bytes are
+    /// deliberately KEPT in the user message for the whole turn (preserved by
+    /// `trim_context_if_needed`'s image pins) so the model can still see the
+    /// image after intervening tool calls. The description is a record of what
+    /// was shown, never a substitute for the bytes. Callers run this only at
+    /// `iterations == 1`, and `take()` empties the handle, so a second call is
+    /// a no-op.
     async fn emit_image_descriptions_after_first_llm_call(
         &self,
         image_description_handle: &mut Option<
@@ -34,77 +38,15 @@ impl LucidosEngine {
         thread_id: Uuid,
         meta: &crate::engine::thread_events::EventMeta,
     ) {
-        // Resolve the Flash description (should be done by now — Flash is much
-        // faster than the main model's first response). The handle yields
-        // `(description, model)` so we can stamp the producing model on
-        // the emitted `ImageDescribed` event.
-        let described = if let Some(handle) = image_description_handle.take() {
-            match handle.await {
-                Ok(opt) => opt.filter(|(d, _)| !is_bad_image_description(d)),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-
-        // Emit one `ImageDescribed` event per attached hash so the
-        // description is preserved as a derived past-tense fact — who
-        // (model) saw what (hash) and when (event timestamp). The hashes
-        // come from the persisted MessageReceived row so failed-decode
-        // images dropped at emit time are NOT re-included here. Idempotent
-        // on retries: this helper only runs when `iterations == 1`.
-        if let Some((desc, model)) = described {
-            let hashes = match self.event_store.get_event_by_id(origin_id).await {
-                Ok(Some(row)) => row
-                    .payload
-                    .get("user_image_hashes")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|h| h.as_str().map(str::to_string))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default(),
-                Ok(None) => {
-                    log!(
-                        "[AgentLoop] ImageDescribed: origin event {} not found, skipping emit",
-                        origin_id
-                    );
-                    Vec::new()
-                }
-                Err(e) => {
-                    log!(
-                        "[AgentLoop] ImageDescribed: failed to load origin event {}: {}",
-                        origin_id, e
-                    );
-                    Vec::new()
-                }
-            };
-            for hash in hashes {
-                self.event_bus
-                    .emit_or_log(
-                        crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event: crate::engine::thread_events::ThreadEvent::ImageDescribed {
-                                source_event_id: origin_id,
-                                hash,
-                                description: desc.clone(),
-                                model: model.clone(),
-                            },
-                            // Engine-internal enrichment; inherit the turn's
-                            // channel but drop request_event_id (this isn't a
-                            // response to the user's request, it's a derived
-                            // fact about the request itself).
-                            meta: crate::engine::thread_events::EventMeta {
-                                channel: meta.channel,
-                                ..crate::engine::thread_events::EventMeta::NONE
-                            },
-                        },
-                        "[AgentLoop] ImageDescribed",
-                    )
-                    .await;
-            }
-        }
+        emit_image_descriptions(
+            &self.event_store,
+            &self.event_bus,
+            thread_id,
+            origin_id,
+            meta.channel,
+            image_description_handle.take(),
+        )
+        .await;
     }
 
     /// The agentic loop: call LLM → parse response → execute tools → repeat.
@@ -134,6 +76,10 @@ impl LucidosEngine {
         reasoning_effort: Option<&str>,
         cancel_token: &CancellationToken,
         injection_rx: &mut mpsc::UnboundedReceiver<super::super::InjectedPrompt>,
+        // This turn's registration generation, so a drain reported after a
+        // force-evict can't decrement a newer turn's unread count. Travels
+        // with `injection_rx` — the two describe the same registration.
+        injection_generation: u64,
         // Set to true at every terminator emission so the post-loop guard
         // in `chat::process` can skip its `payload->>'request_event_id'`
         // existence check on the success path. The check has no functional
@@ -158,7 +104,7 @@ impl LucidosEngine {
         let model_str = model_override.unwrap_or(provider.default_model());
         let effective_model = (!model_str.is_empty()).then(|| model_str.to_string());
         let effective_effort = reasoning_effort.map(|s| s.to_string());
-        let capture_window = super::super::context::context_window_for(capture_seed.model);
+        let capture_window = self.context_window_for(capture_seed.model);
 
         // Command guard (ADR 0002): off unless the workspace turned on the
         // `command_guard` preference. Read once per response — the toggles can't
@@ -186,7 +132,24 @@ impl LucidosEngine {
         // Maintained across iterations: trim pass 2 may remove older messages, which
         // shifts the captured index down by the number removed (handled below).
         let mut user_message_idx = messages.len().saturating_sub(1);
-        let mut original_user_message_idx = user_message_idx;
+        // Messages whose image bytes must survive trim pass 0 for the whole turn.
+        // Split by provenance because only one side needs a bound:
+        //
+        // `user_image_idxs` — the turn's user message plus any mid-turn injection
+        // that carried images. The user's own content; bounded by how many
+        // messages they send in one turn, so it needs no cap.
+        //
+        // `explicit_image_idxs` — tool results holding an image the model asked
+        // to see (`view_image` / `read_file`). Capped, because the model can
+        // issue up to MAX_ITERATIONS of these in one turn and pinned images are
+        // exempt from pass 0 by construction; a "describe every photo in this
+        // folder" turn would otherwise accumulate hundreds of un-strippable
+        // images and blow the context window.
+        //
+        // Without these pins an image went blind on the model's very next tool
+        // call — see the trim doc comment.
+        let mut user_image_idxs: Vec<usize> = vec![user_message_idx];
+        let mut explicit_image_idxs: Vec<usize> = Vec::new();
         let mut images: Vec<String> = Vec::new(); // Track screenshots created during this request
         let mut last_tool_call: Option<(String, String)> = None; // (tool_name, key) - key derived by derive_call_key
         let mut consecutive_same_call = 0;
@@ -256,25 +219,37 @@ impl LucidosEngine {
             }
 
             // Pin the current turn's user message so pass 2 cannot drop it
-            // (`Some(user_message_idx)`), and keep its attached image bytes for
-            // the whole turn (`Some(original_user_message_idx)`). The recent-tail
-            // rule alone fails once enough tool iterations shift the message out
-            // of the last PRESERVE_RECENT_MESSAGES slots; losing it strips the
-            // request line from every subsequent call (model reports "I lost
-            // track of what you asked"), and stripping its image blinds the
-            // model to what the user attached.
-            let removed_count = trim_context_if_needed(
+            // (`Some(user_message_idx)`), and keep every tracked image-bearing
+            // message's bytes for the whole turn (`keep_image_idxs`). The
+            // recent-tail rule alone fails once enough tool iterations shift a
+            // message out of the last PRESERVE_RECENT_MESSAGES slots; losing it
+            // strips the request line from every subsequent call (model reports
+            // "I lost track of what you asked"), and stripping its image blinds
+            // the model to what it was looking at.
+            let mut keep_image_idxs = user_image_idxs.clone();
+            keep_image_idxs.extend_from_slice(&explicit_image_idxs);
+            let trim_outcome = trim_context_if_needed(
                 messages,
                 message_budget,
                 Some(user_message_idx),
-                Some(original_user_message_idx),
+                &keep_image_idxs,
             );
-            let trimmed = removed_count > 0;
+            let removed_count = trim_outcome.messages_removed;
+            // `trimmed` reports ANY content loss, not just pass-2 eviction —
+            // passes 1/1.5 replace tool-result bodies with a truncation note,
+            // which the UI previously showed as an untrimmed turn.
+            let trimmed = trim_outcome.any();
             // Pass 2 of trim removes oldest messages from index 1; the protected
             // index guard ensures every removal sits strictly below
             // user_message_idx, so it shifts down by removed_count.
             user_message_idx = user_message_idx.saturating_sub(removed_count);
-            original_user_message_idx = original_user_message_idx.saturating_sub(removed_count);
+            // Every pin sits at or above pass 2's eviction floor (which is the
+            // minimum over the pins), so none of them was removed — the uniform
+            // shift stays exact and no pin can end up aliasing a different
+            // message.
+            for idx in user_image_idxs.iter_mut().chain(explicit_image_idxs.iter_mut()) {
+                *idx = idx.saturating_sub(removed_count);
+            }
             // Safety net: validate tool_use/tool_result pairing after trimming.
             // The primary fix ensures correct block ordering, but this catches any
             // edge case where pairing breaks (trimming bugs, injection ordering, etc.)
@@ -519,12 +494,30 @@ impl LucidosEngine {
                 role: crate::engine::ContextRole::User,
                 group: None,
             };
-            let estimated_total_tokens: usize =
-                estimate_tokens_from_chars(system_chars + context_chars);
+            // Tool schemas are part of every request and the trim budget already
+            // subtracts them, so the reported total must include them too —
+            // otherwise the Context Viewer under-reports what was actually sent.
+            let estimated_total_tokens: usize = estimate_tokens_from_chars(
+                system_chars + capture_seed.tool_defs_chars + context_chars,
+            );
+            // Surface the schemas as their own row so the section tree still
+            // adds up to `estimated_total_tokens`. Counting them in the total
+            // without showing them would leave a user auditing a near-full
+            // context unable to see where a large fixed chunk went. No body —
+            // the schemas are generated, and dumping ~70 of them would dwarf
+            // the capture.
+            let tool_definitions = crate::engine::ContextSection {
+                name: format!("Tool Definitions ({})", capture_seed.tools.len()),
+                content: None,
+                char_count: capture_seed.tool_defs_chars,
+                role: crate::engine::ContextRole::System,
+                group: None,
+            };
             let iter_sections: Vec<_> = capture_seed
                 .sections
                 .iter()
                 .cloned()
+                .chain(std::iter::once(tool_definitions))
                 .chain(std::iter::once(conversation))
                 .collect();
             let usage = response.input_tokens.map(|input_tokens| {
@@ -535,6 +528,33 @@ impl LucidosEngine {
                     cache_creation_tokens: response.cache_creation_tokens.unwrap_or(0),
                 }
             });
+            // Calibration breadcrumb for the chars/token assumption baked into
+            // `estimate_tokens_from_chars`. The ratio is a single hardcoded 1.5
+            // that has never been measured across models — and the one time it
+            // was eyeballed from a single capture, the sample was misleading
+            // (two OpenRouter routes in one thread reported the same prompt as
+            // 2.76 and 1.79 chars/token). Logging estimate-vs-actual per turn is
+            // what makes a future retune evidence-based instead of a guess.
+            // `estimated` deliberately includes the tool schemas, matching what
+            // the budget subtracts, so the comparison is like-for-like.
+            if let Some(u) = usage {
+                let counted_chars = system_chars + capture_seed.tool_defs_chars + context_chars;
+                log!(
+                    "[Context] calibration model={} estimated={} actual_input={} \
+                     cache_read={} cache_creation={} chars={} implied_chars_per_token={:.2}",
+                    capture_seed.model,
+                    estimated_total_tokens,
+                    u.input_tokens,
+                    u.cache_read_tokens,
+                    u.cache_creation_tokens,
+                    counted_chars,
+                    if u.input_tokens > 0 {
+                        counted_chars as f64 / u.input_tokens as f64
+                    } else {
+                        0.0
+                    }
+                );
+            }
             self.event_bus
                 .emit_or_log(
                     crate::engine::event_bus::BusEvent::Thread {
@@ -769,6 +789,7 @@ impl LucidosEngine {
                 while let Ok(prompt) = injection_rx.try_recv() {
                     injected_prompts.push(prompt);
                 }
+                self.note_injections_drained(thread_id, injection_generation, injected_prompts.len());
                 let injected_prompts =
                     filter_removed_queued_prompts(&self.pool, thread_id, injected_prompts).await;
                 if !injected_prompts.is_empty() {
@@ -783,15 +804,16 @@ impl LucidosEngine {
                             content: MessageContent::Text(answer),
                         });
                     }
-                    if append_injected_prompts_to_messages(
+                    let appended = append_injected_prompts_to_messages(
                         &self.event_bus,
                         thread_id,
                         &meta,
                         messages,
                         injected_prompts,
                     )
-                    .await
-                    {
+                    .await;
+                    user_image_idxs.extend(appended.image_message_idxs);
+                    if appended.appended {
                         user_message_idx = messages.len().saturating_sub(1);
                         if iterations == 1 {
                             self.emit_image_descriptions_after_first_llm_call(
@@ -1657,7 +1679,8 @@ impl LucidosEngine {
                 {
                     result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
-                        content: "[Image file displayed to you below]".to_string(),
+                        content: crate::engine::tools::files::EXPLICIT_IMAGE_RESULT_TEXT
+                            .to_string(),
                     });
                     // No fit_for_llm here: read_file's encode_image_for_read already
                     // fit the image before emitting the IMAGE_CONTENT marker, so this
@@ -1680,10 +1703,17 @@ impl LucidosEngine {
                 text: instruction.to_string(),
             });
 
+            // Pin before the move: an image the model explicitly asked to see
+            // must stay in vision for the rest of the turn, not just until its
+            // next tool call.
+            let pin_images = holds_explicitly_requested_image(&result_blocks);
             messages.push(Message {
                 role: "user".to_string(),
                 content: MessageContent::Blocks(result_blocks),
             });
+            if pin_images {
+                push_explicit_image_pin(&mut explicit_image_idxs, messages.len() - 1);
+            }
 
             // Check for injected prompts (mid-flight user corrections or system events).
             // Drain all pending injections and add them as user messages before the next LLM call.
@@ -1692,24 +1722,26 @@ impl LucidosEngine {
                 while let Ok(prompt) = injection_rx.try_recv() {
                     injected_prompts.push(prompt);
                 }
+                self.note_injections_drained(thread_id, injection_generation, injected_prompts.len());
                 let injected_prompts =
                     filter_removed_queued_prompts(&self.pool, thread_id, injected_prompts).await;
-                if append_injected_prompts_to_messages(
+                let appended = append_injected_prompts_to_messages(
                     &self.event_bus,
                     thread_id,
                     &meta,
                     messages,
                     injected_prompts,
                 )
-                .await
-                {
+                .await;
+                user_image_idxs.extend(appended.image_message_idxs);
+                if appended.appended {
                     user_message_idx = messages.len().saturating_sub(1);
                 }
             }
 
             // After the first LLM call, emit the derived `ImageDescribed` fact(s)
             // for any attached images. The actual image bytes STAY in the user
-            // message (preserved by trim's `keep_image_idx`) so the model can
+            // message (preserved by trim's image pins) so the model can
             // still see the image after intervening tool calls — the description
             // is only recorded as a past-tense fact, never swapped in for the bytes.
             if iterations == 1 {

@@ -1,8 +1,9 @@
 {
   "identifier": "default",
-  "description": "Default capabilities for the Lucidos desktop app",
-  "windows": ["main"],
+  "description": "Default capabilities for the Lucidos desktop app, on the LOCAL app URL only (dev's `devUrl`, and the bundled `tauri://localhost` splash the packaged client shows before it navigates to the gateway). The packaged window's gateway origin is a REMOTE origin as far as tauri's ACL is concerned and is granted separately, at runtime and pinned to the resolved port, by `desktop::gateway_capability`.",
+  "webviews": ["main", "window-*"],
   "permissions": [
+    "allow-app-ipc",
     "core:default",
     "core:webview:allow-create-webview",
     "core:webview:allow-webview-close",

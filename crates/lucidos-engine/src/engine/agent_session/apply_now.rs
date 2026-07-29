@@ -39,9 +39,7 @@ pub(crate) fn decide_in_place_merge_claim(
 ) -> InPlaceMergeClaim {
     match session {
         None => InPlaceMergeClaim::NoLiveSession,
-        Some(s) if s.process_exited || s.worktree_path.is_none() => {
-            InPlaceMergeClaim::NoLiveSession
-        }
+        Some(s) if !s.is_live() || s.worktree_path.is_none() => InPlaceMergeClaim::NoLiveSession,
         Some(s) if s.apply_now_in_progress => InPlaceMergeClaim::AlreadyInProgress,
         Some(_) => InPlaceMergeClaim::Claim,
     }
@@ -114,8 +112,15 @@ impl LucidosEngine {
         let (worktree_path, branch_name, repo_root, idle_notify, msg_tx, last_event_at) = {
             let mut guard = self.agent_sessions.lock().await;
             match guard.get_mut(&thread_id) {
+                // `is_live` gates the claim for the same reason
+                // `decide_in_place_merge_claim` does: driving a phantom (or an
+                // exited) session means sending the review/merge prompt into a
+                // dead `msg_tx` and failing the apply with "Session channel
+                // closed", when falling through to the no-live-session path
+                // below would have applied the pending change cleanly.
                 Some(session)
-                    if session.worktree_path.is_some()
+                    if session.is_live()
+                        && session.worktree_path.is_some()
                         && session.branch_name.is_some()
                         && session.repo_root.is_some() =>
                 {
@@ -342,11 +347,7 @@ impl LucidosEngine {
                 Ok(()) => return Ok(()),
                 Err(_) => {
                     let guard = self.agent_sessions.lock().await;
-                    if guard
-                        .get(&thread_id)
-                        .map(|s| s.process_exited)
-                        .unwrap_or(true)
-                    {
+                    if guard.get(&thread_id).map(|s| !s.is_live()).unwrap_or(true) {
                         return Err(format!("Coding agent session ended while {}", context).into());
                     }
                 }
@@ -1031,13 +1032,10 @@ impl LucidosEngine {
                     actor,
                 )
                 .await;
-                // Frontend-only Lucidos-source live Apply (engine binary unchanged):
-                // re-snapshot the rebuilt dist/ so the served client advances without
-                // a respawn (dev). Mirrors the `change_ops::apply_change` wrapper;
-                // `is_lucidos_source()` is false for app/external threads.
-                if !requires_restart && client_update && kind_ctx.is_lucidos_source() {
-                    self.refresh_served_frontend_after_rebuild();
-                }
+                // The dev post-apply refresh (background engine rebuild /
+                // served-dist re-snapshot) is NOT done here — `emit_change_applied`
+                // above owns it for every merge path. See
+                // `change_ops_emitters::post_apply_dev_refresh`.
             }
             Ok(None) => {
                 log!(
@@ -1152,50 +1150,24 @@ pub(crate) async fn probe_merge_conflicts(worktree_path: &Path) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::engine::AgentSession;
-    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32};
-    use tokio::sync::{mpsc, Notify};
+    use tokio::sync::mpsc;
 
     /// Build a minimal `AgentSession` for claim-decision tests. `worktree` and
     /// `process_exited` / `apply_now_in_progress` are the fields the claim state
-    /// machine reads; everything else is inert defaults.
+    /// machine reads; everything else is inert defaults. The receiver comes back
+    /// with it — drop it and the session is a phantom, which the claim treats as
+    /// no live session (see `AgentSession::is_live`).
     fn claim_test_session(
         process_exited: bool,
         worktree: Option<&str>,
         apply_now_in_progress: bool,
-    ) -> AgentSession {
-        let (msg_tx, _msg_rx) = mpsc::unbounded_channel::<AgentUserInput>();
-        let (control_tx, _control_rx) = mpsc::unbounded_channel();
-        AgentSession {
-            msg_tx,
-            is_waiting: !process_exited,
-            has_changes: false,
-            requires_restart: false,
-            pending_stop: None,
-            cancel_actor: None,
-            redirect_followup: false,
-            stop: Arc::new(Notify::new()),
-            interrupt: Arc::new(Notify::new()),
-            idle_notify: Arc::new(Notify::new()),
-            apply_now_in_progress,
-            process_exited,
-            worktree_path: worktree.map(std::path::PathBuf::from),
-            branch_name: None,
-            repo_root: None,
-            cc_session_id: None,
-            shutting_down: Arc::new(AtomicBool::new(false)),
-            external_terminal_emitted: Arc::new(AtomicBool::new(false)),
-            control_tx,
-            builtin_commands: vec![],
-            skill_commands: vec![],
-            current_model: None,
-            current_reasoning_effort: None,
-            last_event_at: Arc::new(AtomicI64::new(0)),
-            pending_followups: Arc::new(AtomicU32::new(0)),
-            question_resume_pending: false,
-            tools_in_flight: Arc::new(AtomicI32::new(0)),
-            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
-            agent_cancel: tokio_util::sync::CancellationToken::new(),
-        }
+    ) -> (AgentSession, mpsc::UnboundedReceiver<AgentUserInput>) {
+        let (mut session, msg_rx) = AgentSession::for_test();
+        session.is_waiting = !process_exited;
+        session.process_exited = process_exited;
+        session.apply_now_in_progress = apply_now_in_progress;
+        session.worktree_path = worktree.map(std::path::PathBuf::from);
+        (session, msg_rx)
     }
 
     #[test]
@@ -1208,7 +1180,7 @@ mod tests {
 
     #[test]
     fn claim_none_when_process_exited() {
-        let s = claim_test_session(true, Some("/wt"), false);
+        let (s, _msg_rx) = claim_test_session(true, Some("/wt"), false);
         assert_eq!(
             decide_in_place_merge_claim(Some(&s)),
             InPlaceMergeClaim::NoLiveSession
@@ -1217,7 +1189,7 @@ mod tests {
 
     #[test]
     fn claim_none_when_no_worktree() {
-        let s = claim_test_session(false, None, false);
+        let (s, _msg_rx) = claim_test_session(false, None, false);
         assert_eq!(
             decide_in_place_merge_claim(Some(&s)),
             InPlaceMergeClaim::NoLiveSession
@@ -1229,7 +1201,7 @@ mod tests {
         // A live session already mid-apply must not be claimed again — this is
         // the guard against the LLM calling `apply_change` twice and starting
         // two in-place merges on one session.
-        let s = claim_test_session(false, Some("/wt"), true);
+        let (s, _msg_rx) = claim_test_session(false, Some("/wt"), true);
         assert_eq!(
             decide_in_place_merge_claim(Some(&s)),
             InPlaceMergeClaim::AlreadyInProgress
@@ -1238,7 +1210,7 @@ mod tests {
 
     #[test]
     fn claim_ok_when_live_idle_with_worktree() {
-        let s = claim_test_session(false, Some("/wt"), false);
+        let (s, _msg_rx) = claim_test_session(false, Some("/wt"), false);
         assert_eq!(
             decide_in_place_merge_claim(Some(&s)),
             InPlaceMergeClaim::Claim

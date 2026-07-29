@@ -1,12 +1,6 @@
----
-globs:
-  - "**/*.md"
-  - "**/*.rs"
-  - "**/*.ts"
-  - "**/*.tsx"
----
-
 # Canonical Terms
+
+**Always loaded** (no `paths:` frontmatter): the canonical-term rule governs prose, chat replies, and commit messages as well as code, so it cannot be gated on a touched file path.
 
 Lucidos has two glossaries. Use the canonical term from them — never a synonym.
 

@@ -154,6 +154,26 @@ impl LucidosEngine {
             .await;
     }
 
+    /// Emit the transient `FrontendUpdateStranded` UI signal — a frontend-only
+    /// Apply that rebuilt but can never reach the served client, because the
+    /// `dist/` this engine serves is not the one being republished. Deliberately
+    /// NOT `FrontendUpdateDeferred`: that one promises "arrives on Switch", which
+    /// here would be false.
+    async fn emit_frontend_update_stranded(&self, served_dir: &Path, in_worktree: bool) {
+        self.event_bus
+            .emit_or_log(
+                crate::engine::event_bus::BusEvent::System(
+                    crate::engine::event_bus::SystemEvent::FrontendUpdateStranded {
+                        served_dir: served_dir.display().to_string(),
+                        served_in_worktree: in_worktree,
+                        sent_at_ms: crate::engine::now_epoch_millis(),
+                    },
+                ),
+                "[Frontend] FrontendUpdateStranded",
+            )
+            .await;
+    }
+
     /// INV-A gate for the in-process served-frontend advance — see
     /// [`frontend_advance_is_safe`]. Reads the live build state + on-disk engine
     /// build id (the latter behind its mtime cache, so it's cheap on the steady
@@ -307,10 +327,38 @@ impl LucidosEngine {
                 break;
             }
             if Instant::now() >= deadline {
-                crate::log!(
-                    "[Frontend] frontend-only Apply: dist/ did not republish within {}s — served snapshot unchanged",
-                    REBUILD_WAIT_TIMEOUT.as_secs()
-                );
+                // Not a benign no-op: the user applied a frontend change and it
+                // has not appeared. Until 2026-07-26 this returned in silence,
+                // which is how a stack serving a worktree-pinned dist/ swallowed
+                // every frontend Apply for hours while looking healthy.
+                //
+                // Two different situations, and only one is permanent — don't
+                // conflate them. A worktree-pinned source can NEVER receive the
+                // rebuild (the build-watch republishes a different directory), so
+                // it needs operator action. Any other timeout is recoverable: a
+                // build slower than the wait, or a briefly-stopped watch, still
+                // lands eventually and the ~10s peer sync advances the snapshot on
+                // its own. Claiming "will never arrive" there would be wrong.
+                let in_worktree = crate::paths::path_is_in_cc_worktree(&source);
+                if in_worktree {
+                    crate::log!(
+                        "[Frontend] frontend-only Apply STRANDED: {} is inside a coding-agent \
+                         worktree, so the build-watch republishes a different directory and the \
+                         served client can NEVER advance — relaunch the stack from the real \
+                         checkout",
+                        source.display()
+                    );
+                } else {
+                    crate::log!(
+                        "[Frontend] frontend-only Apply: {} did not republish within {}s — not \
+                         advancing the served client yet. Recoverable: the periodic sync picks \
+                         it up if the rebuild lands. Is the build-watch running?",
+                        source.display(),
+                        REBUILD_WAIT_TIMEOUT.as_secs()
+                    );
+                }
+                self.emit_frontend_update_stranded(&source, in_worktree)
+                    .await;
                 return;
             }
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -413,6 +461,43 @@ impl LucidosEngine {
     /// workspace's frontend-only Apply without a manual restart — the applying
     /// engine advances only its own snapshot. No advance / no emit when a mixed
     /// change is pending (the Switch flow handles that peer instead).
+    /// Warn ONCE per process when the `dist/` this engine serves lives inside a
+    /// coding-agent worktree — a configuration that can never track `main`, so
+    /// every future frontend-only Apply will strand.
+    ///
+    /// This is deliberately a config check, not a build-id comparison. The
+    /// obvious "is what I serve older than the source?" test is already
+    /// [`sync_served_frontend_if_safe`]'s own trigger and self-heals, so it can
+    /// never fire for this failure; and because `repo_root()` resolves from
+    /// `current_exe()`, a worktree-pinned engine's repo root IS the worktree, so
+    /// comparing against the checkout's `dist/` finds no divergence either. The
+    /// one thing reliably knowable from inside the pinned process is the shape of
+    /// the path it was handed.
+    ///
+    /// Fires from the periodic tick rather than boot so it lands after the event
+    /// bus has subscribers; latched so a ~10s cadence doesn't log forever. Log
+    /// only — the user-facing event belongs to an actual stranded Apply
+    /// ([`emit_frontend_update_stranded`]), which carries the same flag.
+    fn warn_once_if_frontend_worktree_pinned(&self, source: &Path) {
+        if !crate::paths::path_is_in_cc_worktree(source) {
+            return;
+        }
+        if self
+            .frontend_worktree_pin_warned
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        crate::log!(
+            "[Frontend] WARNING: serving dist/ from a coding-agent worktree ({}). \
+             A worktree is a throwaway checkout pinned to one commit, and the build-watch \
+             republishes the real checkout's dist/, so frontend changes will NOT appear here. \
+             Relaunch the stack from the real checkout (./scripts/web-dev.sh -w <workspace> -b). \
+             See docs/plans/2026-07-26-worktree-pinned-stack-guard.md",
+            source.display()
+        );
+    }
+
     async fn sync_served_frontend_if_safe(self: &Arc<Self>) {
         if crate::runtime::is_packaged() {
             return;
@@ -423,6 +508,9 @@ impl LucidosEngine {
         ) else {
             return; // frontend not served (headless) — nothing to advance
         };
+        // Announce a structurally broken serving config even when nothing has been
+        // applied yet, so it is diagnosable before it eats someone's change.
+        self.warn_once_if_frontend_worktree_pinned(&source);
         // Cheap first: has the source `dist/` diverged from what we serve? Avoids
         // the git fork on the steady (unchanged) path — the common case per tick.
         let served_dir = handle.read().unwrap().clone();

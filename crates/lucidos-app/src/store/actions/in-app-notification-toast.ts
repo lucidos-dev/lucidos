@@ -14,6 +14,7 @@ import {
   resolveDeepLink,
   type DeepLinkTarget,
 } from './notification-deeplink';
+import { composeToastMessage } from '../../components/shared/toastMessage';
 import { dismissToast, showToast, toasts, focusedThreadId, threadMap, threadsLoaded } from '../store';
 import { isInViewport } from '../../utils/viewport';
 import { isPageActive } from '../../utils/pageActive';
@@ -134,7 +135,9 @@ export function showInAppNotificationToast({ title, body, target }: InAppNotific
   }
 
   const safeTitle = title.length > 0 ? title : 'Lucidos';
-  const message = body ? `${safeTitle}: ${body}` : safeTitle;
+  // The title is the toast's HEADING, never glued onto the body's first line —
+  // see composeToastMessage for why a structured body has to start on line 2.
+  const message = composeToastMessage(safeTitle, body);
   const toastKey = notifId ? `${NOTIFICATION_TOAST_PREFIX}${notifId}` : undefined;
 
   // A `modal` or `navigate` notification gets a single [Open] button (rendered

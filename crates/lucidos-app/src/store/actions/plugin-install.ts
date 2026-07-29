@@ -13,7 +13,9 @@ import { refreshPluginCatalog } from './plugin-marketplaces';
  *  panel resolves via Confirm/Cancel POSTs to the engine. Reveals the content
  *  pane — this fires from an engine SSE event, so without it a mobile user (or
  *  a desktop user with a collapsed split) never sees the panel that just
- *  appeared. Mirrors the credential-request path (landOnAccountsWithOverlay). */
+ *  appeared. Same shape as `openEmailConfirmRequest`. (NOT the credential-request
+ *  path: `landOnAccountsWithOverlay` additionally switches to Settings →
+ *  Accounts, which is right for a credential and wrong for everything else.) */
 export function openPluginInstallRequest(request: PluginInstallRequest): void {
   panelOverlay.value = { type: 'form', form: { type: 'plugin-install', request } };
   pushNavState();

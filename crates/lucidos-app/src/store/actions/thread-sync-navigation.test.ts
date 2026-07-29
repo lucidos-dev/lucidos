@@ -29,7 +29,7 @@ const navigateToTrigger = vi.fn();
 vi.mock('./triggers', () => ({ navigateToTrigger, loadTriggers: vi.fn() }));
 
 const pushNavState = vi.fn();
-vi.mock('./navigation', () => ({ pushNavState }));
+vi.mock('./navigation', () => ({ pushNavState, replaceNavState: vi.fn() }));
 
 // Mock pane helper so we can assert handleNavigationRequest reveals the
 // content pane on EVERY content-landing target — directly (for branches

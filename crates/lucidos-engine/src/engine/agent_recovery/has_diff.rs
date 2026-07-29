@@ -395,7 +395,7 @@ pub async fn refresh_coding_agent_has_diff_on_startup(
 /// `POST /internal/seed-change-for-test`. See thread
 /// `c1cec485-b1d0-483d-b31d-e2ba21dd76fb` / `7f971704-75cf-4a9e-8280-973eb2bea45d`.
 ///
-/// With the gate gone, `should_propose_change_at_idle` fires for every clean
+/// With the gate gone, `may_touch_change_state_at_idle` fires for every clean
 /// idle, so this sweep is a no-op in steady state — it only does work on the
 /// restart that lands the gate removal, and as a general safety net for any
 /// future missed idle-proposal.
@@ -553,7 +553,7 @@ async fn propose_one_held_back_change(
         return Ok(false);
     }
     // Only re-propose threads whose last turn ended cleanly (Generated),
-    // mirroring `should_propose_change_at_idle`'s terminal-kind gate. This
+    // mirroring `may_touch_change_state_at_idle`'s terminal-kind gate. This
     // sweep exists to un-wedge threads that FINISHED cleanly but whose
     // per-idle `propose_change` never landed (the removed bg-bash gate, or
     // an engine death between idle and proposal). A thread whose latest turn
@@ -640,5 +640,62 @@ async fn propose_one_held_back_change(
         )
         .await;
     Ok(true)
+}
+
+/// Engine-startup sweep for the mirror of `propose_held_back_changes_on_startup`:
+/// a pending change EXISTS but its branch diff has since gone empty.
+///
+/// The live path reconciles such a row at the next clean idle, which covers the
+/// common case (the same session commits the revert). It cannot cover a row
+/// that went stale while no session was running — the branch was emptied by an
+/// engine-side apply, a hand-run `git` in the worktree, or a session that died
+/// before idling. Those rows sit in Review advertising files the Diff button no
+/// longer shows (real change `2cc8391f`), so reconcile them before the frontend
+/// makes its first SSE connection.
+///
+/// Reads `repo_root` off each change row rather than guessing a root, so
+/// Lucidos-source, app, and external-repo changes are all handled by the same
+/// pass. Every per-row decision — pending row exists, git could actually
+/// answer, the diff really is empty — belongs to
+/// `reconcile_emptied_pending_change`; this function only enumerates and skips
+/// the rows that obviously can't need work.
+///
+/// Deliberately NOT gated on the thread's last turn having ended cleanly (which
+/// `propose_one_held_back_change` does check). That gate exists to avoid
+/// *surfacing* half-finished work as a new Apply card; here there is no new
+/// card — an existing row is being corrected to match committed git state, the
+/// same state the Diff button renders. Uncommitted work in a crashed session's
+/// worktree is in neither surface, and the next real proposal restores the file
+/// list.
+pub async fn reconcile_emptied_changes_on_startup(engine: &crate::engine::LucidosEngine) {
+    let started = std::time::Instant::now();
+    let pending = match engine.changes().list_pending().await {
+        Ok(p) => p,
+        Err(e) => {
+            log!("[Recovery] emptied-change sweep: list_pending: {} — skipping", e);
+            return;
+        }
+    };
+    for change in pending {
+        // Nothing to correct on a row that already reads empty, and a change
+        // with no thread can't carry a `ChangeProposed` (a thread event).
+        if change.file_count == 0 && !change.requires_restart {
+            continue;
+        }
+        let Some(thread_id) = change.thread_id else {
+            continue;
+        };
+        engine
+            .reconcile_emptied_pending_change(
+                thread_id,
+                Path::new(&change.repo_root),
+                &change.branch_name,
+            )
+            .await;
+    }
+    log!(
+        "[Recovery] emptied-change sweep finished in {}ms",
+        started.elapsed().as_millis()
+    );
 }
 

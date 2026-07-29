@@ -124,14 +124,15 @@
         d.setAttribute('data-theme', resolved);
         var bg = resolved === 'light' ? '#ffffff' : '#07172e';
         d.style.setProperty('--bg-primary', bg);
-        // Paint the boot-splash brand gradient on the root during boot (solid
-        // #0a4ea8 fallback + fixed attachment). This covers TWO gaps at once:
+        // Paint the boot-splash brand gradient on the document canvas during boot
+        // (solid #0a4ea8 fallback + fixed attachment). This covers TWO gaps:
         //   1. the WKWebView white flash on iOS PWA cold-restart (what the
         //      previous solid-`bg` inline covered), and
         //   2. the iOS standalone bottom safe-area strip that the fixed
-        //      `inset:0` .boot-splash element leaves bare — otherwise the dark
-        //      var(--bg-primary) root shows through as a black band under the
-        //      splash. Same fixed-attachment-gradient technique the gateway
+        //      `inset:0` .boot-splash element leaves bare. The body gets the same
+        //      paint below: in light mode its own background otherwise wins in
+        //      that uncovered strip and shows white despite this root paint.
+        //      Same fixed-attachment-gradient technique the gateway
         //      splash uses (crates/lucidos-gateway/src/proxy.rs `.mark`/html bg).
         // dismissBootSplash() (src/utils/bootSplash.ts) reverts this to
         // var(--bg-primary) once the splash is gone, so no blue lingers behind
@@ -274,8 +275,9 @@
         justify-content: center;
         gap: 1.5rem;
         background: radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%);
-        /* Decorative: the app shell loads + is interactive behind it the whole
-           time, so the splash must never intercept pointer events. */
+        /* Decorative during normal boot: the app shell loads + is interactive
+           behind it, so the splash does not intercept pointer events. The
+           guarded terminal-recovery state deliberately enables a tap below. */
         pointer-events: none;
       }
       .boot-splash-mark {
@@ -332,6 +334,7 @@
         transition: opacity 0.3s ease;
       }
       .boot-splash-status.boot-splash-status-shown { opacity: 1; }
+      .boot-splash.boot-splash-stalled { pointer-events: auto; cursor: pointer; }
       .boot-splash-leaving { animation: boot-splash-out 0.45s ease forwards; }
       @keyframes boot-mark-reveal {
         from { opacity: 0; transform: scale(0.86); }
@@ -350,7 +353,7 @@
       }
     </style>
 </head>
-<body style="background:var(--bg-primary, #07172e)">
+<body style="background:#0a4ea8 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed">
     <div class="boot-splash" aria-hidden="true">
       <svg class="boot-splash-mark" viewBox="0 0 100 100">
         <g transform="translate(11 11) scale(0.78)" fill="#ffffff">
@@ -394,6 +397,62 @@
       })();
     </script>
     <div id="app"></div>
+    <script>
+      /* lucidos-boot-watchdog-start
+         The application module normally takes ownership immediately below. If
+         its content-hashed entry is stale/missing, none of the module-owned
+         status or safety timers can run, so keep the recovery floor in this
+         classic inline script. Retry automatically once; a second failure stops
+         with a tappable action instead of reload-looping forever. */
+      (function () {
+        var RETRY_KEY = 'lucidos-boot-retry';
+        var base = document.querySelector('base');
+        var baseHref = base && base.getAttribute('href');
+        var workspaceSlug = baseHref && baseHref !== '/' && baseHref !== '/~/'
+          ? baseHref.replace(/^\/+|\/+$/g, '')
+          : null;
+        function wsKey(name) { return workspaceSlug ? 'ws:' + workspaceSlug + ':' + name : name; }
+        var timer = window.setTimeout(function () {
+          var tried = false;
+          try { tried = sessionStorage.getItem(wsKey(RETRY_KEY)) === '1'; } catch (e) {}
+          if (!tried) {
+            try { sessionStorage.setItem(wsKey(RETRY_KEY), '1'); } catch (e) {}
+            var retryUrl = new URL(location.href);
+            retryUrl.searchParams.set('_boot_retry', '1');
+            location.replace(retryUrl.toString());
+            return;
+          }
+          var splash = document.querySelector('.boot-splash');
+          var status = splash && splash.querySelector('.boot-splash-status');
+          if (status) {
+            status.textContent = 'Tap to retry';
+            status.classList.add('boot-splash-status-shown');
+          }
+          if (splash) {
+            splash.classList.add('boot-splash-stalled');
+            splash.setAttribute('aria-hidden', 'false');
+            splash.addEventListener('click', function () {
+              try { sessionStorage.removeItem(wsKey(RETRY_KEY)); } catch (e) {}
+              location.reload();
+            }, { once: true });
+          }
+        }, 15000);
+
+        window.__lucidosBootLoaded = function () {
+          window.clearTimeout(timer);
+          try { sessionStorage.removeItem(wsKey(RETRY_KEY)); } catch (e) {}
+          try {
+            var current = new URL(location.href);
+            if (current.searchParams.has('_boot_retry')) {
+              current.searchParams.delete('_boot_retry');
+              history.replaceState(history.state, '', current.toString());
+            }
+          } catch (e) {}
+          delete window.__lucidosBootLoaded;
+        };
+      })();
+      /* lucidos-boot-watchdog-end */
+    </script>
     <script type="module" src="/src/main.tsx"></script>
 </body>
 </html>

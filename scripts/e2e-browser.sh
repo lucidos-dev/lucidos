@@ -89,13 +89,33 @@ export E2E_WORKSPACE
 # retries:1, not a replacement.
 #
 # Teardown: in standalone mode setup_e2e_session's teardown_e2e (which calls
-# stop_webkit_reaper) already owns the EXIT trap. Under the umbrella ($LUCIDOS_E2E_UMBRELLA)
-# setup_e2e_session installs no trap, so register one here that stops the reaper
-# when this browser phase exits — before the umbrella's wasm/embedder phases.
+# stop_e2e_background_guards) already owns the EXIT trap. Under the umbrella
+# ($LUCIDOS_E2E_UMBRELLA) setup_e2e_session installs no trap, so register one here
+# that stops both run-scoped loops — the reaper and the host-load sampler below —
+# when this browser phase exits, before the umbrella's wasm/embedder phases.
 start_webkit_reaper
+
+# Mid-run host-load sampler. wait_for_host_load above only knows about the
+# instant it fired; during the 2026-07-26 nightly an external daemon burst pinned
+# the host at load 83-227 for ~40 minutes AFTER that gate passed, starving the
+# browsers into timeouts that read exactly like product failures. The sampler
+# records load throughout the run so `finish` can classify such a run instead of
+# letting it pass for a product verdict. It never retries and never alters the
+# exit code (see report_host_load_saturation).
+start_host_load_sampler
+
 if [ -n "${LUCIDOS_E2E_UMBRELLA:-}" ]; then
-    trap stop_webkit_reaper EXIT
+    trap stop_e2e_background_guards EXIT
 fi
+
+# Every exit path funnels through here so the sampler is drained and the run is
+# classified exactly once, whichever branch below ran.
+finish() {
+    local rc="$1"
+    stop_host_load_sampler
+    report_host_load_saturation "$rc"
+    exit "$rc"
+}
 
 CMD=(npx playwright test)
 [ -n "$TEST_FILE" ] && CMD+=("$TEST_FILE")
@@ -103,12 +123,47 @@ CMD=(npx playwright test)
 
 # Detect whether the caller already pinned a project (via --webkit or `-- --project=`).
 # If so, run once. Otherwise, loop through every project with a clean DB between
-# each — the workspace DB is not isolated across projects.
+# each — the workspace DB is not isolated across projects. The same pass notes a
+# caller-pinned --output so set_output_dir never silently overrides it.
 USER_PINNED_PROJECT=""
+USER_PINNED_OUTPUT=""
 [ -n "$USE_WEBKIT" ] && USER_PINNED_PROJECT=1
 for arg in "${PW_ARGS[@]:-}"; do
-    case "$arg" in --project=*|--project) USER_PINNED_PROJECT=1 ;; esac
+    case "$arg" in
+        --project=*|--project) USER_PINNED_PROJECT=1 ;;
+        --output=*|--output) USER_PINNED_OUTPUT=1 ;;
+    esac
 done
+
+# Failure-trace retention across a whole run. Playwright DELETES its output dir at
+# the START of every `playwright test` invocation (createRemoveOutputDirsTask), and
+# the default is the entire `test-results/` tree — but one suite run makes MANY
+# invocations: one per project, plus one per mobile-webkit chunk. On the default
+# each pass therefore erased the previous pass's retained traces + screenshots and
+# only the LAST project's survived, so an unattended nightly failure left nothing to
+# triage with. Fix: wipe ONE root here, then give every invocation its own subdir
+# under it (set_output_dir) — nothing is wiped mid-run. (These are Playwright's
+# "output artifacts", NOT Lucidos *artifacts* — they're ephemeral, gitignored test
+# output, so the naming here stays on `output` to keep the glossary term clean.)
+if [ -n "$TEST_FILE" ] || [ "${#PW_ARGS[@]}" -gt 0 ]; then
+    # Targeted repro: clear only its own corner, so a preceding full run's evidence
+    # — usually the very thing you're reproducing against — stays intact.
+    PW_OUTPUT_ROOT="test-results/targeted"
+    rm -rf "$PW_OUTPUT_ROOT"
+else
+    # Full run: clean slate for the whole tree, which also clears any leftover
+    # targeted dirs and the earlier flat layout.
+    PW_OUTPUT_ROOT="test-results/full"
+    rm -rf test-results
+fi
+
+# Per-invocation --output, kept as an array so "pinned by the caller" passes no
+# argument at all rather than an empty one.
+OUTPUT_ARG=()
+set_output_dir() {
+    OUTPUT_ARG=()
+    [ -n "$USER_PINNED_OUTPUT" ] || OUTPUT_ARG=(--output="$PW_OUTPUT_ROOT/$1")
+}
 
 # Run a browser project. For mobile-webkit, split the run into two ordered
 # phases — navigation/UI specs (no Claude Code subprocess spawns) FIRST, then the
@@ -146,11 +201,10 @@ run_specs_chunked() {
         chunk_no=$(( chunk_no + 1 ))
         local chunk=("${specs[@]:start:size}")
         echo "── mobile-webkit $label chunk $chunk_no/$nchunks: ${#chunk[@]} specs (fresh browser) ──"
-        # Per-chunk --output dir: Playwright wipes its outputDir at the start of
-        # every invocation, so without this each chunk would erase the previous
-        # chunk's failure traces/screenshots (only the LAST chunk's would survive).
-        # Isolating them keeps every chunk's artifacts for triage.
-        "${CMD[@]}" --project="$project" --output="test-results/webkit-$label-$chunk_no" "${chunk[@]}" || rc=$?
+        # Own output dir per chunk (see set_output_dir) — otherwise each chunk
+        # would erase the previous chunk's failure traces/screenshots.
+        set_output_dir "$project-$label-$chunk_no"
+        "${CMD[@]}" --project="$project" "${OUTPUT_ARG[@]}" "${chunk[@]}" || rc=$?
         start=$(( start + size ))
     done
     return "$rc"
@@ -197,7 +251,10 @@ run_browser_project() {
             return "$rc"
         fi
     fi
-    "${CMD[@]}" --project="$project" || rc=$?
+    # Own output dir per project (see set_output_dir) — otherwise the NEXT
+    # project's invocation would wipe this one's, chunk dirs included.
+    set_output_dir "$project"
+    "${CMD[@]}" --project="$project" "${OUTPUT_ARG[@]}" || rc=$?
     return "$rc"
 }
 
@@ -208,11 +265,17 @@ if [ -n "$USE_WEBKIT" ] && [ -z "$TEST_FILE" ] && [ "${#PW_ARGS[@]}" -eq 0 ]; th
     # `--`/positional arg) still falls through to the single-pass branch below —
     # run_browser_project's own guard would single-pass it anyway, but keeping it
     # here avoids appending --project twice.
-    run_browser_project mobile-webkit
-    exit $?
+    webkit_rc=0
+    run_browser_project mobile-webkit || webkit_rc=$?
+    finish "$webkit_rc"
 elif [ -n "$USER_PINNED_PROJECT" ]; then
     [ -n "$USE_WEBKIT" ] && CMD+=(--project=mobile-webkit)
-    "${CMD[@]}"
+    set_output_dir pinned
+    # Capture rather than letting `set -e` exit here, so a failing pinned run
+    # still gets drained + classified by finish.
+    pinned_rc=0
+    "${CMD[@]}" "${OUTPUT_ARG[@]}" || pinned_rc=$?
+    finish "$pinned_rc"
 else
     # Run every project even if an earlier one failed, so the user sees all
     # results in one run. Aggregate exit status so the script still exits
@@ -223,6 +286,9 @@ else
     # happen before chromium/mobile add two more passes of CC-subprocess churn to
     # the host. A DB reset runs before each *subsequent* project (the workspace DB
     # isn't isolated across projects); mobile-webkit gets the freshly-booted state.
+    # Each reset recreates the database and restarts the engine on it — on the
+    # same binary, since build_e2e_engine_once never recompiles mid-suite — so
+    # every project sees a brand-new workspace database, seeds included.
     PROJECTS=(mobile-webkit chromium mobile)
     PROJECT_RCS=()
     overall_rc=0
@@ -237,13 +303,22 @@ else
         echo "── Running project: $project ──"
         rc=0
         run_browser_project "$project" || rc=$?
-        PROJECT_RCS[$i]=$rc
+        # APPEND — never PROJECT_RCS[i]=. The body above calls into the e2e lib,
+        # and any lib function that leaks a loop variable named `i` (that was the
+        # 2026-07-26 bug: ensure_workspace_running's readiness counter) would make
+        # an indexed write land in the wrong slot, leaving a hole at the last
+        # project. Appending in lockstep with PROJECTS can't produce a hole.
+        PROJECT_RCS+=("$rc")
         [ "$rc" -ne 0 ] && overall_rc=$rc
     done
-    echo ""
-    echo "── Per-project exit codes ──"
+
+    # Pair each project with its recorded rc; a short array (or a stray empty
+    # entry) surfaces as UNKNOWN and forces a non-zero exit inside the reporter.
+    PROJECT_ENTRIES=()
     for i in "${!PROJECTS[@]}"; do
-        echo "  ${PROJECTS[$i]}: ${PROJECT_RCS[$i]}"
+        PROJECT_ENTRIES+=("${PROJECTS[$i]}:${PROJECT_RCS[$i]:-}")
     done
-    exit "$overall_rc"
+    final_rc=0
+    report_project_exit_codes "$overall_rc" "${PROJECT_ENTRIES[@]}" || final_rc=$?
+    finish "$final_rc"
 fi

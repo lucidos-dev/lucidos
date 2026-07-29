@@ -49,23 +49,24 @@ export function setBootStatus(text: string): void {
 export function dismissBootSplash(): void {
   if (dismissed) return;
   dismissed = true;
-  // Revert the root background the boot script (index.html) painted with the
-  // brand gradient for iOS safe-area coverage, so the app shell's own
-  // var(--bg-primary) (base.css `html { background: var(--bg-primary); }`)
-  // shows once the splash is gone — otherwise the blue gradient lingers behind
+  // Revert the html + body backgrounds the boot document painted with the brand
+  // gradient for iOS safe-area coverage, so the app shell's own
+  // var(--bg-primary) backgrounds show once the splash is gone — otherwise the
+  // blue gradient lingers behind
   // the app's bottom safe-area inset. Done ONLY after the splash node is
   // actually removed: reverting during the `.boot-splash-leaving` fade would
   // expose the uncovered bottom safe-area strip (reverting it to dark
   // --bg-primary) while the splash is still visibly fading, briefly flashing
   // the very black band this whole change removes.
-  const revertRootBackground = () => {
+  const revertDocumentBackground = () => {
     if (typeof document !== 'undefined' && document.documentElement) {
       document.documentElement.style.background = '';
+      if (document.body) document.body.style.background = '';
     }
   };
   const el = document.querySelector(SPLASH_SELECTOR);
   if (!el) {
-    revertRootBackground();
+    revertDocumentBackground();
     return;
   }
   el.classList.add(LEAVING_CLASS);
@@ -74,7 +75,7 @@ export function dismissBootSplash(): void {
     if (removed) return;
     removed = true;
     el.remove();
-    revertRootBackground();
+    revertDocumentBackground();
   };
   el.addEventListener('animationend', remove, { once: true });
   // Fallback: if the fade animation is suppressed (no animationend), still remove.

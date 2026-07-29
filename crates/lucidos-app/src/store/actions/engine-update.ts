@@ -1,4 +1,4 @@
-import { showToast, dismissToast, removeToast, engineVersionReady, engineBuilding, engineRestarting, preferences, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
+import { showToast, dismissToast, removeToast, engineVersionReady, engineBuilding, engineRestarting, preferences, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
 import { initiateEngineRestart } from './chat-changes';
 import { noteSwitchBuildId, wasSwitchDismissed } from '../../hooks/sw-update';
@@ -75,18 +75,32 @@ export async function checkEngineVersion(): Promise<void> {
   // A prior failure cleared once a build starts / succeeds.
   dismissToast(BUILD_FAILED_TOAST_KEY);
 
-  // While a build is actively in progress, never announce "new version
-  // available" — wait for THIS build to flip build_state to 'ready'.
-  // `update_available` compares the on-disk binary's build-id to the running
-  // one, and the on-disk binary can already differ mid-build (a prior build
-  // wrote it, or it's being rewritten right now), which would surface the switch
-  // "before it could have been built yet". `build_state === 'ready'` is the
-  // honest signal for a freshly-finished rebuild; `update_available` is the
-  // backstop for a newer binary sitting on disk when no build is running (e.g.
-  // after an engine restart resets build_state to 'idle').
-  const ready =
-    status.build_state === 'ready' ||
-    (status.update_available && status.build_state !== 'building');
+  // A background rebuild of the shared binary is in flight — this engine's own
+  // (build_state === 'building') OR a CO-LOCATED peer's. Co-located workspaces
+  // share ONE target/ + ONE build lock, so a peer's build advances the binary
+  // THIS engine serves. When THIS workspace lost the lock its own rebuild
+  // `SkippedLocked` → build_state fell back to 'idle', but a build IS running:
+  // show the building spinner (below) and withhold the manual "Rebuild" toast,
+  // exactly as we do for our own build.
+  const sharedBuilding = status.shared_build_in_progress === true;
+
+  // A new version is announced ONLY when there is genuinely something newer to
+  // switch onto — `update_available`, which the engine now derives from "the
+  // on-disk binary is readable, differs from the running one, and is not
+  // provably OLDER than it" (engine_version::disk_binary_is_upgrade).
+  //
+  // `build_state === 'ready'` deliberately does NOT count on its own. A rebuild
+  // can finish successfully and produce nothing new — a no-op cargo run, or one
+  // whose uplifted binary predates the running engine — and announcing that as a
+  // new version offers a Switch that respawns onto the same (or an older) binary.
+  // That is half of the 2026-07-26 endless-toast loop: the ~10s self-heal driver
+  // cycled build_state idle → building → ready forever, and every `ready` re-showed
+  // the toast (docs/plans/2026-07-26-downgrade-switch-toast-loop.md).
+  //
+  // The `!== 'building'` term stays: the on-disk binary can already differ
+  // mid-build (a prior build wrote it, or it is being rewritten right now), and
+  // switching then respawns onto a half-written binary.
+  const ready = status.update_available && status.build_state !== 'building';
   // Badge (engineVersionReady, read by the ControlPanel badge) = readiness ALONE:
   // the persistent "switch available" affordance that survives a dismiss (the
   // user can still switch from the reload badge). On ARRIVAL it appears with the
@@ -115,20 +129,34 @@ export async function checkEngineVersion(): Promise<void> {
         onClick: () => { void initiateEngineRestart(); },
       },
     });
-  } else if (status.source_behind_head && !status.update_available && status.build_state === 'idle') {
+  } else if (status.source_behind_head && !status.update_available && status.build_state !== 'building' && !sharedBuilding) {
     // A new engine version exists in source but no fresh binary is on disk yet
-    // (a mixed Apply's rebuild failed / never ran). The engine's self-heal driver
-    // retries automatically, but surface a manual escape so the Switch is never a
-    // dead-end. The `!update_available` guard is load-bearing: after a SUCCESSFUL
-    // rebuild both `update_available` (disk binary differs) AND `source_behind_head`
-    // (running engine's commit still behind HEAD) are true — that state belongs to
-    // the ready→Switch branch above (and its per-build dismissal), NOT here; without
-    // the guard a dismissed Switch would re-nag as "Rebuild" every poll. So this
-    // fires ONLY when no switchable binary exists. Reuses NEW_VERSION_TOAST_KEY so
-    // it transitions in place to the Switch toast once the rebuild lands. This state
-    // is short-lived — self-heal flips it to `building` within a tick — so no
-    // persistent "Later" (there's no on-disk build id to key a dismissal on anyway);
-    // the X just hides it and the next poll re-derives it.
+    // AND nothing is building it (a mixed Apply's rebuild failed / never ran, and
+    // no co-located peer holds the shared build lock). The engine's self-heal
+    // driver retries automatically, but surface a manual escape so the Switch is
+    // never a dead-end. Two load-bearing guards:
+    //  - `!update_available`: after a SUCCESSFUL rebuild both `update_available`
+    //    (disk binary differs) AND `source_behind_head` (running engine's commit
+    //    still behind HEAD) are true — that state belongs to the ready→Switch
+    //    branch above (and its per-build dismissal), NOT here; without the guard a
+    //    dismissed Switch would re-nag as "Rebuild" every poll.
+    //  - `!sharedBuilding`: a co-located peer building the shared binary is NOT a
+    //    stuck state — its build WILL advance the binary → Switch. In the
+    //    multi-workspace case a lost-the-lock workspace has build_state 'idle' but
+    //    a build is in flight; showing "Rebuild" there is wrong (it'd just
+    //    SkippedLock again) and misleading. That case shows the spinner instead
+    //    (engineBuilding below); the pending toast is reserved for genuinely stuck.
+    // So this fires ONLY when no switchable binary exists and nothing is building.
+    // `!== 'building'` rather than `=== 'idle'` deliberately ('failed' already
+    // returned above via the build-failed toast, so this admits idle + ready): a
+    // rebuild that COMPLETED without producing anything newer leaves build_state
+    // 'ready' forever, and that is the most stuck state there is. Gating on 'idle'
+    // would answer it with silence — hiding both the pending version and this
+    // escape hatch (docs/plans/2026-07-26-downgrade-switch-toast-loop.md, INV-5b).
+    // Reuses NEW_VERSION_TOAST_KEY so it transitions in place to the Switch toast
+    // once a rebuild lands. Short-lived (self-heal / a peer build flips it) so no
+    // persistent "Later" (no on-disk build id to key a dismissal on anyway); the X
+    // just hides it and the next poll re-derives it.
     showToast('New engine version pending.', 'info', {
       key: NEW_VERSION_TOAST_KEY,
       action: {
@@ -146,8 +174,19 @@ export async function checkEngineVersion(): Promise<void> {
   }
   engineVersionReady.value = ready;
   // A background rebuild is in flight (Apply kicked it off) but not yet ready to
-  // switch onto — drives the spinning-refresh brand badge.
-  engineBuilding.value = status.build_state === 'building';
+  // switch onto — drives the spinning-refresh brand badge. True for THIS engine's
+  // own build (build_state === 'building') OR when a co-located peer is building
+  // the shared binary this workspace is waiting on: source behind, no fresh binary
+  // yet, and our own build_state fell back to 'idle' (lost the shared lock →
+  // SkippedLocked). The `!update_available` term drops the spinner the instant a
+  // switchable binary lands, even within a probe window, handing off to the
+  // ready→Switch surface above.
+  engineBuilding.value =
+    status.build_state === 'building' ||
+    (sharedBuilding &&
+      status.source_behind_head === true &&
+      !status.update_available &&
+      status.build_state === 'idle');
 }
 
 /** SSE handler for the engine's `EngineBuildStateChanged` poke. The engine emits
@@ -189,6 +228,16 @@ export function stopEngineUpdateChecks(): void {
 export const DEFERRED_HINT_STALE_AFTER_MS = 10_000;
 
 export interface FrontendUpdateDeferredPayload {
+  /** Engine wall-clock (ms) at emit time. Drives the freshness gate. */
+  sent_at_ms: number;
+}
+
+export interface FrontendUpdateStrandedPayload {
+  /** Absolute path of the dist/ the engine serves from. */
+  served_dir: string;
+  /** Whether that path lies inside a coding-agent worktree — the known cause,
+   *  and the one with a specific fix, so it gets a specific message. */
+  served_in_worktree: boolean;
   /** Engine wall-clock (ms) at emit time. Drives the freshness gate. */
   sent_at_ms: number;
 }
@@ -235,4 +284,42 @@ export function handleFrontendUpdateDeferred(payload: FrontendUpdateDeferredPayl
       },
     },
   );
+}
+
+/** SSE handler for the engine's `FrontendUpdateStranded` signal — a frontend-only
+ *  Apply whose rebuild did not reach this client within the engine's wait
+ *  (engine::frontend_refresh). Distinct from the deferred hint above in the one way
+ *  that matters: no Switch is coming that will deliver it, so it must not say there is.
+ *
+ *  **Only the worktree case is permanent, and the wording must respect that.** A
+ *  worktree-pinned `dist/` can never receive the rebuild — the build-watch
+ *  republishes a different directory — so that message says "will not appear" and
+ *  asks for operator action. Any other timeout is *recoverable*: a build slower than
+ *  the wait, or a briefly-stopped watch, still lands and the engine's ~10s peer sync
+ *  advances the snapshot by itself. Telling the user their change is lost there would
+ *  be false, so that branch says "hasn't arrived yet" and names the likely cause.
+ *
+ *  Both are `warning` rather than `info`: an applied change that isn't visible is
+ *  never normal, even when it self-heals. Before 2026-07-26 the engine returned
+ *  silently here and the only symptom was "my change did nothing"
+ *  (docs/plans/2026-07-26-worktree-pinned-stack-guard.md).
+ *
+ *  Same freshness gate as the deferred hint: a late SSE-queue flush arriving after
+ *  the stack was already fixed shouldn't raise a now-false alarm. */
+export function handleFrontendUpdateStranded(payload: FrontendUpdateStrandedPayload): void {
+  if (Date.now() - payload.sent_at_ms > DEFERRED_HINT_STALE_AFTER_MS) {
+    return;
+  }
+  const message = payload.served_in_worktree
+    ? `Frontend change applied but it will not appear: the engine is serving a coding-agent worktree (${payload.served_dir}), which the build-watch never rebuilds. Relaunch the stack from the real checkout.`
+    : `Frontend change applied but not served yet — ${payload.served_dir} hasn't rebuilt. It will appear on its own if the build lands; if it doesn't, check the build-watch.`;
+  showToast(message, 'warning', {
+    key: FRONTEND_UPDATE_STRANDED_TOAST_KEY,
+    noAutofocus: true,
+    dismissable: false,
+    action: {
+      label: 'OK',
+      onClick: () => { dismissToast(FRONTEND_UPDATE_STRANDED_TOAST_KEY); },
+    },
+  });
 }

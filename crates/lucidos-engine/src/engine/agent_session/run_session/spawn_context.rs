@@ -86,6 +86,11 @@ pub(super) struct SpawnWorktreeContext {
 }
 
 impl LucidosEngine {
+    /// Resolves which worktree + branch this spawn runs in, returning the
+    /// [`SpawnWorktreeContext`] whose `*_created` flags the failure-path cleanup
+    /// depends on. The parameter list mirrors the caller's already-destructured
+    /// spawn request one-to-one — bundling it into a struct here would only move
+    /// the same fields, so the arity lint is allowed rather than worked around.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn resolve_run_worktree_context(
         &self,
@@ -370,6 +375,11 @@ impl LucidosEngine {
             // worktrees dir as a blast-radius guard. (The inverse residue — git
             // has the path registered but the directory is GONE — is auto-healed
             // inside `worktree_add` via `git worktree prune`.)
+            // Git-truth from the sparse app helper: did it `-b`-create the
+            // branch, or adopt an existing one? Feeds `branch_created` below
+            // so failure cleanup can never delete a branch this spawn merely
+            // reused. `None` = the app create path didn't run.
+            let mut app_branch_created: Option<bool> = None;
             if existing_worktree.is_none() {
                 if wt_path.exists()
                     && wt_path.starts_with(crate::engine::git_ops::worktrees_dir(
@@ -388,7 +398,7 @@ impl LucidosEngine {
                             "Internal: is_app_spawn set without app_spawn_id".into()
                         );
                     };
-                    if let Err(e) = crate::engine::git_ops::create_sparse_app_worktree(
+                    match crate::engine::git_ops::create_sparse_app_worktree(
                         repo_root,
                         app_id,
                         &branch_name,
@@ -396,18 +406,25 @@ impl LucidosEngine {
                     )
                     .await
                     {
-                        log!("[AgentSession] Failed to create sparse app worktree: {}", e);
-                        return Err(format!(
-                            "Failed to create sparse-checkout app worktree: {e}"
-                        )
-                        .into());
+                        Err(e) => {
+                            log!("[AgentSession] Failed to create sparse app worktree: {}", e);
+                            return Err(format!(
+                                "Failed to create sparse-checkout app worktree: {e}"
+                            )
+                            .into());
+                        }
+                        Ok(created) => {
+                            app_branch_created = Some(created);
+                            log!(
+                                "[AgentSession] {} sparse app worktree at {} on {} branch {} (app={})",
+                                if created { "Created" } else { "Resumed" },
+                                wt_path.display(),
+                                if created { "new" } else { "existing" },
+                                branch_name,
+                                app_id
+                            );
+                        }
                     }
-                    log!(
-                        "[AgentSession] Created sparse app worktree at {} on branch {} (app={})",
-                        wt_path.display(),
-                        branch_name,
-                        app_id
-                    );
                 } else {
                 let wt_extra: Vec<&str> = if reusing_branch {
                     vec![&branch_name]
@@ -681,10 +698,14 @@ impl LucidosEngine {
             // What did THIS call create? `existing_worktree.is_none()` means
             // the create path ran (worktree_add / sparse app worktree);
             // `!reusing_branch` on top means the branch was born here too
-            // (`-b`). A reused branch (resume) or reused worktree must
-            // survive a failed spawn — see `cleanup_failed_spawn`.
+            // (`-b`). The sparse app helper reports the split from git truth
+            // (it adopts an existing branch even when the caller expected a
+            // fresh one), so prefer its answer when it ran. A reused branch
+            // (resume) or reused worktree must survive a failed spawn — see
+            // `cleanup_failed_spawn`.
             let worktree_created = existing_worktree.is_none();
-            let branch_created = worktree_created && !reusing_branch;
+            let branch_created = worktree_created
+                && app_branch_created.unwrap_or(!reusing_branch);
             (
                 cwd,
                 system_prompt,

@@ -27,7 +27,7 @@ The other Settings stores have their own tools — don't try to reach them throu
 | Want to change… | Use |
 |---|---|
 | A preference below | `set_preference` |
-| Which models appear in the picker | `manage_models` |
+| Which models appear in the picker, or a model's context window | `manage_models` |
 | An API key / secret | `request_credential` (never put secrets in a preference) |
 | A non-secret env var | `env_vars` (`action: set`) |
 | A registered repo | `manage_repositories` |
@@ -43,6 +43,19 @@ persisted **`PreferencesChanged`** event (or `LanguageSet` / `TimezoneSet` for
 locale). Open Lucidos pages live-apply on those events, so a change the agent
 makes shows up without a reload. No transient event, no restart.
 
+**`chat_model` / `chat_reasoning_effort` are the default for NEW threads only.**
+These two are the exception to "shows up right away everywhere": a Lucidos Agent
+thread reuses the model + reasoning effort it last ran with (*per-thread model
+memory*), so a thread that's already running — **including the thread you're in
+when you make the change** — keeps its current model/effort (whatever it last
+used), independent of this preference. Changing `chat_model` does NOT switch the
+current/running thread's model on its next turn; it only sets the fallback a
+brand-new thread's first message uses. (Resolution order per turn: explicit
+per-request override → the thread's last recorded value → this preference →
+provider default.) The one way to change a *running* thread's model/effort is its
+in-thread model picker in the compose bar, which writes a per-thread value and
+never touches this account default.
+
 **Device scope.** Device-scoped keys (theme, font-family, ui-scale,
 push_notifications) are stored per-device and override the global value on the
 device that set them. `set_preference` automatically targets the calling device —
@@ -56,8 +69,8 @@ globally does nothing on a device that has its own `theme=light` override. Use
 |---|---|---|---|---|
 | `language` | global | text | (detected from conversation) | Language for responses + session summaries (e.g. "English", "Norwegian"). |
 | `timezone` | global | IANA timezone | (unset) | Timezone for triggers + time display (e.g. "Europe/Oslo"). Set before creating triggers. |
-| `chat_model` | global | a model id from the registry | `claude-opus-4-8@default` | Active chat model. Use `manage_models(action='list')` to see options. |
-| `chat_reasoning_effort` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `high` | Thinking budget (clamped per model). |
+| `chat_model` | global | a model id from the registry | `claude-opus-5@default` | Default chat model for NEW threads (a running thread reuses its own last-used model — see "How a write propagates"). Use `manage_models(action='list')` to see options. |
+| `chat_reasoning_effort` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `high` | Default thinking budget for NEW threads (a running thread reuses its own last-used effort; clamped per model). |
 | `image_model` | global | `auto` \| `imagen-4` \| `gpt-image-1` \| `gpt-image-1.5` \| `gpt-image-2` | `auto` | Model used by `generate_image`. |
 | `model_title` | global | a model id | `gemini-3-flash-preview` | Background model for thread titles. |
 | `model_image_description` | global | a model id | `gemini-3-flash-preview` | Background model that describes uploaded images. |

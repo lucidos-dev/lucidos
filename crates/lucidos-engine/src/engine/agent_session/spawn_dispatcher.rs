@@ -25,7 +25,24 @@
 //! Idempotency is keyed on the trigger event id: the same trigger never
 //! produces two spawns, even across engine restarts (the in-memory set is
 //! seeded by `backfill_pending_triggers_on_startup`, which scans the events
-//! table for triggers already followed by a CC lifecycle event).
+//! table for triggers already followed by a CC lifecycle event, and
+//! `dispatch_spawn` gates the send on atomically claiming the id).
+//!
+//! Delivery is guaranteed two ways:
+//!
+//! - **Live path** — [`SpawnDispatcher::spawn`] opens the broadcast
+//!   subscription SYNCHRONOUSLY, before the startup backfill runs and before
+//!   it returns. A broadcast `Receiver` buffers events from the moment of
+//!   `subscribe()`, so a trigger emitted while the backfill query runs (e.g.
+//!   `resume_pending_switches()`'s `ContinuationRequested`, which `main.rs`
+//!   emits moments after `spawn()` returns) is delivered when `run()` drains
+//!   the receiver — never broadcast to zero subscribers and lost.
+//! - **Durable floor** — `redispatch_orphaned_continuations_on_startup` scans
+//!   the events table for any `ContinuationRequested` that was emitted but
+//!   never actuated (no subsequent CC lifecycle or terminal event, thread
+//!   still `running`) and re-drives it onto the same durable mpsc channel, so
+//!   a request lost by an older engine build — a zombie thread stuck
+//!   "running" with no subprocess — heals on the next boot.
 //!
 //! Phase 3 (`PermissionResolved`) is still blocked by the spike outcome
 //! documented in `docs/plans/2026-04-24-cc-resume-spike-q7.md`. Until then
@@ -42,8 +59,37 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
-use crate::engine::event_bus::{BusEvent, EventBus};
+use crate::engine::event_bus::{BusEvent, EmittedEvent, EventBus};
 use crate::engine::thread_events::{EventChannel, ThreadEvent};
+
+/// SQL fragment listing the CC lifecycle events whose presence AFTER a trigger
+/// event implies the trigger was already picked up (CC clearly ran in response).
+/// Shared by [`has_cc_event_after`], the startup backfill, and the orphaned-
+/// continuation scan so the three predicates can't drift apart.
+///
+/// `ContinuationStarted` belongs here: the spawn consumer emits it BEFORE
+/// invoking `run_direct_agent` on every recovery-shaped resume, so it is the
+/// earliest actuation marker — and treating a request it follows as
+/// unactuated would re-dispatch mid-cold-start resumes and defeat the crash
+/// loop-breaker (`switch_was_user_initiated` counts it as a start for the
+/// same reason).
+const CC_LIFECYCLE_EVENTS_SQL: &str = "'SessionStarted', 'CodingAgentIdled', \
+    'SessionEnded', 'CodingAgentToolCalled', 'CodingAgentTextStreamed', \
+    'CodingAgentUserMessageSent', 'ContinuationStarted'";
+
+/// SQL fragment for "this `ContinuationRequested` is no longer live": any CC
+/// lifecycle event (actuated), a LATER `ContinuationRequested` (superseded —
+/// this yields newest-per-thread for free), or a terminal response event (the
+/// thread was settled after the request — e.g. by
+/// `settle_orphaned_running_coding_agent_threads` — and must stay settled with
+/// its manual Continue affordance). Shared by the orphan scan and
+/// [`thread_has_unactuated_continuation`].
+fn continuation_superseded_events_sql() -> String {
+    format!(
+        "{CC_LIFECYCLE_EVENTS_SQL}, 'ContinuationRequested', 'ResponseAborted', \
+         'ResponseCanceled', 'ResponseFailed', 'ResponseGenerated'"
+    )
+}
 
 /// Concrete spawn instruction emitted by the dispatcher and consumed by
 /// the engine-side receiver task. Variants stay parallel to
@@ -106,7 +152,6 @@ impl SpawnTrigger {
 /// `UserMessage` (see module-level docs).
 pub struct SpawnDispatcher {
     pool: PgPool,
-    bus: Arc<EventBus>,
     /// Outbound channel — the dispatcher sends [`SpawnRequest`]s here and a
     /// receiver task on `LucidosEngine` calls `run_direct_agent` for each.
     /// `Unbounded` because dropping a continuation request would leave a
@@ -124,14 +169,9 @@ pub struct SpawnDispatcher {
 }
 
 impl SpawnDispatcher {
-    pub(crate) fn new(
-        pool: PgPool,
-        bus: Arc<EventBus>,
-        spawn_tx: UnboundedSender<SpawnRequest>,
-    ) -> Self {
+    pub(crate) fn new(pool: PgPool, spawn_tx: UnboundedSender<SpawnRequest>) -> Self {
         Self {
             pool,
-            bus,
             spawn_tx,
             spawned_for_event: Arc::new(Mutex::new(HashSet::new())),
             dispatch_count: Arc::new(AtomicUsize::new(0)),
@@ -147,6 +187,16 @@ impl SpawnDispatcher {
     /// Build dispatcher and start the run loop on a tokio task. Returns the
     /// receiver end of the `SpawnRequest` channel so the caller can wire it
     /// to the engine-side actuator.
+    ///
+    /// The broadcast subscription is acquired HERE, synchronously, before this
+    /// function returns — NOT lazily inside `run()`. The receiver buffers
+    /// events from the moment of `subscribe()`, so a trigger emitted right
+    /// after `spawn()` returns (while the seconds-long startup backfill query
+    /// is still running) is delivered when `run()` drains the receiver.
+    /// Subscribing after the backfill lost exactly that emit — the EventBus
+    /// has no history replay, so `resume_pending_switches()`'s
+    /// `ContinuationRequested` was broadcast to zero subscribers and the
+    /// thread stayed a "running" zombie until a manual Continue.
     pub fn spawn(
         pool: PgPool,
         bus: Arc<EventBus>,
@@ -155,7 +205,8 @@ impl SpawnDispatcher {
         tokio::sync::mpsc::UnboundedReceiver<SpawnRequest>,
     ) {
         let (spawn_tx, spawn_rx) = tokio::sync::mpsc::unbounded_channel();
-        let dispatcher = Self::new(pool, bus, spawn_tx);
+        let rx = bus.subscribe();
+        let dispatcher = Self::new(pool, spawn_tx);
         let handle = tokio::spawn(async move {
             // Best-effort backfill — log and continue if it fails so a
             // partial DB state can't permanently disable the dispatcher.
@@ -165,15 +216,29 @@ impl SpawnDispatcher {
                     e
                 );
             }
-            dispatcher.run().await;
+            // Durable safety net — re-drive any ContinuationRequested that was
+            // emitted but never actuated (see the method docs). Best-effort
+            // for the same reason as the backfill; the subscription above is
+            // the primary delivery path.
+            if let Err(e) = dispatcher
+                .redispatch_orphaned_continuations_on_startup()
+                .await
+            {
+                log!(
+                    "[SpawnDispatcher] redispatch_orphaned_continuations_on_startup failed: {}",
+                    e
+                );
+            }
+            dispatcher.run(rx).await;
         });
         (handle, spawn_rx)
     }
 
-    /// Subscribe to the bus and dispatch spawns for each classified trigger.
-    /// Lives for the duration of the engine process.
-    pub(crate) async fn run(self) {
-        let rx = self.bus.subscribe();
+    /// Dispatch spawns for each classified trigger arriving on `rx` — the
+    /// broadcast subscription [`Self::spawn`] opened before the startup
+    /// backfill (so nothing emitted since then is lost). Lives for the
+    /// duration of the engine process.
+    pub(crate) async fn run(self, rx: tokio::sync::broadcast::Receiver<EmittedEvent>) {
         log!("[SpawnDispatcher] starting (Continue=actuating, UserMessage=shadow)");
         let stream = BroadcastStream::new(rx);
         tokio::pin!(stream);
@@ -279,12 +344,22 @@ impl SpawnDispatcher {
     ///   channel for the engine-side receiver to actuate.
     /// - `UserMessage`: shadow only — log + counter bump. The chat HTTP
     ///   handler still owns spawning for this trigger.
+    ///
+    /// Atomic mark-and-send: the insert into the idempotency set IS the claim.
+    /// A trigger observed by two paths — the startup orphan re-dispatch and
+    /// the buffered broadcast drain both see a `ContinuationRequested`
+    /// persisted mid-startup — produces at most ONE `SpawnRequest`, whichever
+    /// path claims the id first.
     pub(crate) async fn dispatch_spawn(&self, trigger: SpawnTrigger) {
-        self.dispatch_count.fetch_add(1, Ordering::SeqCst);
-        self.spawned_for_event
+        if !self
+            .spawned_for_event
             .lock()
             .await
-            .insert(trigger.event_id());
+            .insert(trigger.event_id())
+        {
+            return;
+        }
+        self.dispatch_count.fetch_add(1, Ordering::SeqCst);
 
         match trigger {
             SpawnTrigger::ContinuationRequested {
@@ -347,7 +422,7 @@ impl SpawnDispatcher {
         // subsequent CC lifecycle event, mark it spawned. The "any subsequent
         // event" predicate is generous: we want to *avoid* re-dispatching;
         // the live event stream will surface anything truly unhandled.
-        let rows: Vec<(Uuid,)> = sqlx::query_as(
+        let rows: Vec<(Uuid,)> = sqlx::query_as(&format!(
             "SELECT e.id FROM events e \
              JOIN thread_summaries t ON t.thread_id = e.aggregate_id::uuid \
              WHERE e.event_type = 'MessageReceived' \
@@ -357,13 +432,10 @@ impl SpawnDispatcher {
                    SELECT 1 FROM events e2 \
                    WHERE e2.aggregate_id = e.aggregate_id \
                      AND e2.sequence > e.sequence \
-                     AND e2.event_type IN ('SessionStarted', 'CodingAgentIdled', \
-                                            'SessionEnded', 'CodingAgentToolCalled', \
-                                            'CodingAgentTextStreamed', \
-                                            'CodingAgentUserMessageSent') \
+                     AND e2.event_type IN ({CC_LIFECYCLE_EVENTS_SQL}) \
                ) \
-             ORDER BY e.sequence DESC LIMIT $1",
-        )
+             ORDER BY e.sequence DESC LIMIT $1"
+        ))
         .bind(LOOKBACK_LIMIT)
         .fetch_all(&self.pool)
         .await?;
@@ -379,6 +451,115 @@ impl SpawnDispatcher {
         );
         Ok(())
     }
+
+    /// Startup safety net (durable): re-dispatch every `ContinuationRequested`
+    /// that was emitted but never actuated — per thread, the NEWEST request
+    /// with no subsequent CC lifecycle event, no later `ContinuationRequested`
+    /// (a newer request supersedes older ones), no terminal response event
+    /// (a thread something settled after the request must stay settled), and
+    /// the projection still showing `status = 'running'` (the zombie
+    /// fingerprint: the request's projection arm flips status to running, so
+    /// an unactuated request leaves it there).
+    ///
+    /// Why it exists: the broadcast bus has no history replay, so a request
+    /// whose live delivery was lost (emitted before the dispatcher subscribed,
+    /// on an engine build predating the synchronous subscribe in
+    /// [`Self::spawn`]) left the thread a permanent zombie — `running` in the
+    /// projection, no CC subprocess, and nothing ever rechecking it. This scan
+    /// is the durable floor under the subscription: each still-live request is
+    /// pushed onto the SAME durable mpsc channel as the live path, through the
+    /// same [`Self::already_spawned`] guard.
+    ///
+    /// Crash contract: a crash-interrupted thread never gets a
+    /// `ContinuationRequested` (recovery emits `CodingAgentIdled` and keeps
+    /// the manual Continue affordance — see `switch_was_user_initiated`), so
+    /// this scan cannot auto-resume work that may have crashed the engine.
+    pub(crate) async fn redispatch_orphaned_continuations_on_startup(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // No LIMIT on purpose: a silent cap would strand any orphan beyond it
+        // for the lifetime of the process (this scan only runs at startup).
+        // The predicate itself bounds the result — one row per zombie thread —
+        // and both outer filters are index-backed (`idx_events_type_created`,
+        // `idx_events_aggregate_id`).
+        let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(&format!(
+            "SELECT e.id, e.aggregate_id::uuid FROM events e \
+             JOIN thread_summaries t ON t.thread_id = e.aggregate_id::uuid \
+             WHERE e.event_type = 'ContinuationRequested' \
+               AND e.aggregate = 'thread' \
+               AND t.source = 'claude_code' \
+               AND t.status = 'running' \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM events e2 \
+                   WHERE e2.aggregate_id = e.aggregate_id \
+                     AND e2.sequence > e.sequence \
+                     AND e2.event_type IN ({}) \
+               ) \
+             ORDER BY e.sequence ASC",
+            continuation_superseded_events_sql()
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+        log!(
+            "[SpawnDispatcher] re-dispatching {} orphaned ContinuationRequested event(s)",
+            rows.len()
+        );
+        // No `already_spawned` pre-check: the scan's NOT-EXISTS set is a
+        // superset of `has_cc_event_after`'s, so the DB fallback is provably
+        // false for every row, and `dispatch_spawn`'s atomic insert is the
+        // claim that dedupes against the buffered broadcast drain.
+        for (event_id, thread_id) in rows {
+            self.dispatch_spawn(SpawnTrigger::ContinuationRequested {
+                thread_id,
+                event_id,
+            })
+            .await;
+        }
+        Ok(())
+    }
+}
+
+/// True when the thread's newest `ContinuationRequested` is still live — no
+/// subsequent CC lifecycle event, later request, or terminal response, and the
+/// thread still `running` — i.e. a resume was requested but never actuated.
+/// `resume_pending_switches` consults this before emitting: the startup orphan
+/// re-dispatch ([`SpawnDispatcher::redispatch_orphaned_continuations_on_startup`])
+/// owns driving the existing request, and a second request event id for the
+/// same thread would slip past the per-EVENT idempotency guard and
+/// double-spawn.
+///
+/// Deliberately the SAME predicate (filters included) as the orphan scan, so
+/// "skip the emit" implies "the scan will drive it" — a `true` here with the
+/// scan excluding the row would strand the thread with no resume at all.
+/// Errors default to `false` (emit anyway): a transient DB failure must not
+/// silently drop a user's auto-resume.
+pub(crate) async fn thread_has_unactuated_continuation(pool: &PgPool, thread_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(&format!(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM events e \
+             JOIN thread_summaries t ON t.thread_id = e.aggregate_id::uuid \
+             WHERE e.aggregate_id = $1 \
+               AND e.event_type = 'ContinuationRequested' \
+               AND e.aggregate = 'thread' \
+               AND t.source = 'claude_code' \
+               AND t.status = 'running' \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM events e2 \
+                   WHERE e2.aggregate_id = e.aggregate_id \
+                     AND e2.sequence > e.sequence \
+                     AND e2.event_type IN ({}) \
+               ) \
+         )",
+        continuation_superseded_events_sql()
+    ))
+    .bind(thread_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false)
 }
 
 /// Returns true when the events table contains a CC lifecycle event whose
@@ -389,18 +570,15 @@ async fn has_cc_event_after(
     pool: &PgPool,
     trigger_event_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
-    let row: Option<(bool,)> = sqlx::query_as(
+    let row: Option<(bool,)> = sqlx::query_as(&format!(
         "SELECT EXISTS ( \
              SELECT 1 FROM events e2 \
              JOIN events trig ON trig.id = $1 \
              WHERE e2.aggregate_id = trig.aggregate_id \
                AND e2.sequence > trig.sequence \
-               AND e2.event_type IN ('SessionStarted', 'CodingAgentIdled', \
-                                      'SessionEnded', 'CodingAgentToolCalled', \
-                                      'CodingAgentTextStreamed', \
-                                      'CodingAgentUserMessageSent') \
-         )",
-    )
+               AND e2.event_type IN ({CC_LIFECYCLE_EVENTS_SQL}) \
+         )"
+    ))
     .bind(trigger_event_id)
     .fetch_optional(pool)
     .await?;

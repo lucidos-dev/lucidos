@@ -69,7 +69,7 @@ impl LucidosEngine {
                         Ok(format!(
                             "Created app '{}' at {} (commit: {})",
                             name,
-                            path.display(),
+                            crate::core::home_path::abbreviate(&path),
                             &commit[..commit.floor_char_boundary(8)]
                         ))
                     }

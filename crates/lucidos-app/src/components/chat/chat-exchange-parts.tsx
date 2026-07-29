@@ -11,6 +11,7 @@ import type { Exchange } from '../../store/thread-events';
 import type { Loadable, ResponseEvent } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import { errorDetail } from '../../utils/errorDetail';
+import { formatFileCount } from '../../utils/formatFileCount';
 import { contextPercent, formatTokens } from '../../utils/formatTokens';
 import { ClaudeIcon, CodexIcon } from '../shared/icons';
 import { highlightEllipsis } from './highlightEllipsis';
@@ -113,7 +114,7 @@ export function ChangeBody({ changeId, error, seedDescription, seedFileCount }: 
     <div class="change-body">
       {desc && <div class="change-body-desc">{desc}</div>}
       {fileCount != null && (
-        <div class="change-body-meta">{fileCount} file{fileCount !== 1 ? 's' : ''}</div>
+        <div class="change-body-meta">{formatFileCount(fileCount)}</div>
       )}
       {error && <div class="change-body-error">{error}</div>}
       {lazyFailedError && <div class="change-body-error">{lazyFailedError}</div>}

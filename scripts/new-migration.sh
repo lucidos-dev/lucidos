@@ -25,7 +25,7 @@ description="$*"
 slug="$(echo "$description" | tr '[:upper:] ' '[:lower:]_' | tr -cd 'a-z0-9_')"
 
 ts="$(date +%Y%m%d%H%M%S)"
-while ls "$MIGRATIONS_DIR"/${ts}_*.sql >/dev/null 2>&1; do
+while ls "$MIGRATIONS_DIR/${ts}"_*.sql >/dev/null 2>&1; do
   ts=$(printf "%014d" $((10#$ts + 1)))
 done
 

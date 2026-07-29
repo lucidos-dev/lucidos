@@ -1,6 +1,6 @@
 /** Default chat model when no preference is set.
  *  Mirrored on the backend in `crates/lucidos-engine/src/core/preferences.rs`. */
-export const DEFAULT_CHAT_MODEL = 'claude-opus-4-8@default';
+export const DEFAULT_CHAT_MODEL = 'claude-opus-5@default';
 
 /** Fallback chat model options shown before the DB-backed registry (`/models`)
  *  loads, and used by tests + label lookups. The live picker reads the loaded
@@ -10,6 +10,8 @@ export const DEFAULT_CHAT_MODEL = 'claude-opus-4-8@default';
 export const MODELS = [
   { value: 'claude-fable-5', label: 'Fable 5' },
   { value: 'claude-fable-5[1m]', label: 'Fable 5 (1M)' },
+  { value: 'claude-opus-5@default', label: 'Opus 5' },
+  { value: 'claude-opus-5@default[1m]', label: 'Opus 5 (1M)' },
   { value: 'claude-opus-4-8@default', label: 'Opus 4.8' },
   { value: 'claude-opus-4-8@default[1m]', label: 'Opus 4.8 (1M)' },
   { value: 'claude-opus-4-7', label: 'Opus 4.7' },
@@ -19,6 +21,9 @@ export const MODELS = [
   { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
   { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
   { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
+  { value: 'gpt-5.6-sol', label: 'GPT-5.6 Sol' },
+  { value: 'gpt-5.6-terra', label: 'GPT-5.6 Terra' },
+  { value: 'gpt-5.6-luna', label: 'GPT-5.6 Luna' },
   { value: 'gpt-5.5-pro', label: 'GPT-5.5 Pro' },
   { value: 'gpt-5.5', label: 'GPT-5.5' },
   { value: 'gpt-5.4', label: 'GPT-5.4' },
@@ -39,16 +44,20 @@ export const REASONING_LEVELS = [
 const REASONING_ORDER = REASONING_LEVELS.map(l => l.value);
 
 /** Filter REASONING_LEVELS to those the given model actually supports.
- *  - OpenAI: drops `max` (its top tier is `xhigh`, so `max` would be a duplicate).
- *  - Fable 5 / Opus 4.7+: full set (the adaptive Anthropic family that natively supports `xhigh`).
+ *  - GPT-5.6 (Sol / Terra / Luna): full set — the family adds a distinct `max`
+ *    reasoning tier (Sol's headline "Max reasoning effort").
+ *  - Other OpenAI: drops `max` (their top tier is `xhigh`, so `max` would be a duplicate).
+ *  - Fable 5 / Opus 4.7+ (incl. Opus 5): full set (the adaptive Anthropic family that natively supports `xhigh`).
  *  - Other Claude / Gemini: drops `xhigh` (not a distinct tier on those backends). */
 export function availableReasoningLevels(model: string): typeof REASONING_LEVELS {
   if (model.startsWith('gpt-')) {
+    if (model.startsWith('gpt-5.6')) return REASONING_LEVELS;
     return REASONING_LEVELS.filter(l => l.value !== 'max');
   }
   if (
     model.startsWith('claude-opus-4-7') ||
     model.startsWith('claude-opus-4-8') ||
+    model.startsWith('claude-opus-5') ||
     model.startsWith('claude-fable-5')
   ) {
     return REASONING_LEVELS;

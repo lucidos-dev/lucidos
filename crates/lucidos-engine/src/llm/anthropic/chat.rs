@@ -7,18 +7,19 @@ use crate::llm::anthropic_wire::{
 };
 use crate::llm::provider::{LlmResponse, Message, TokenCallback, ToolDefinition};
 
-const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 /// Body API version sent as an HTTP header on the direct API (Vertex sends its
-/// own value in the body instead).
-const ANTHROPIC_VERSION: &str = "2023-06-01";
-/// Beta flag that authorizes a Claude subscription OAuth bearer token to call
-/// the Messages API.
-const OAUTH_BETA: &str = "oauth-2025-04-20";
+/// own value in the body instead). Shared with the `web_search` backend in
+/// `llm::web_search::anthropic`, which hits the same `/v1/messages` endpoint.
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// The (header name, header value) pair that authenticates the request.
 /// API keys go on `x-api-key`; OAuth subscription tokens go on
 /// `Authorization: Bearer`.
-fn auth_header(auth: &AnthropicAuth) -> (&'static str, String) {
+///
+/// `pub(crate)` so the `web_search` backend authenticates identically — two
+/// copies of this mapping would silently diverge the moment a third auth kind
+/// is added.
+pub(crate) fn auth_header(auth: &AnthropicAuth) -> (&'static str, String) {
     match auth {
         AnthropicAuth::ApiKey(key) => ("x-api-key", key.clone()),
         AnthropicAuth::OAuthBearer(token) => ("Authorization", format!("Bearer {}", token)),
@@ -31,7 +32,7 @@ fn auth_header(auth: &AnthropicAuth) -> (&'static str, String) {
 fn anthropic_beta_header(auth: &AnthropicAuth, is_1m: bool) -> Option<String> {
     let mut betas: Vec<&str> = Vec::new();
     if matches!(auth, AnthropicAuth::OAuthBearer(_)) {
-        betas.push(OAUTH_BETA);
+        betas.push(super::ANTHROPIC_OAUTH_BETA);
     }
     if is_1m {
         betas.push(ANTHROPIC_BETA_1M_CONTEXT);
@@ -65,6 +66,7 @@ impl AnthropicProvider {
 
         let (auth_name, auth_value) = auth_header(&self.auth);
         let beta = anthropic_beta_header(&self.auth, is_1m);
+        let messages_url = format!("{}/messages", crate::llm::ANTHROPIC_API_BASE_URL);
 
         // Retry loop for connection errors, retryable HTTP status codes, and
         // mid-stream overload errors. Content is accumulated internally by
@@ -75,7 +77,7 @@ impl AnthropicProvider {
 
             let mut builder = self
                 .streaming_client
-                .post(ANTHROPIC_MESSAGES_URL)
+                .post(&messages_url)
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .header("Content-Type", "application/json")
                 .header(auth_name, &auth_value);
@@ -175,7 +177,7 @@ mod tests {
     fn oauth_no_1m_sends_only_oauth_beta() {
         assert_eq!(
             anthropic_beta_header(&AnthropicAuth::OAuthBearer("t".into()), false),
-            Some(OAUTH_BETA.to_string())
+            Some(crate::llm::anthropic::ANTHROPIC_OAUTH_BETA.to_string())
         );
     }
 
@@ -183,7 +185,11 @@ mod tests {
     fn oauth_with_1m_sends_both_betas_comma_joined() {
         assert_eq!(
             anthropic_beta_header(&AnthropicAuth::OAuthBearer("t".into()), true),
-            Some(format!("{},{}", OAUTH_BETA, ANTHROPIC_BETA_1M_CONTEXT))
+            Some(format!(
+                "{},{}",
+                crate::llm::anthropic::ANTHROPIC_OAUTH_BETA,
+                ANTHROPIC_BETA_1M_CONTEXT
+            ))
         );
     }
 }

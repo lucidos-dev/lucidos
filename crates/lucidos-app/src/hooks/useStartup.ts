@@ -2,6 +2,7 @@ import { useEffect } from 'preact/hooks';
 import { checkConnection, handleResume, bounceToPickerIfStranded } from '../store/actions/connection';
 import { loadArtifacts, openUrl } from '../store/actions/artifacts';
 import { loadUnreadNotifications, loadNotifications } from '../store/actions/notifications';
+import { syncWorkspaceAppBadge } from '../store/actions/app-badge';
 import { loadApps } from '../store/actions/apps';
 import { loadCredentials } from '../store/actions/credentials';
 import { loadDevices, registerCurrentDevice } from '../store/actions/devices';
@@ -25,7 +26,7 @@ import { refreshChangesState, restoreRestartToast } from '../store/actions/chat-
 import { restoreRepoSelectionFromStorage } from '../store/actions/repositories';
 import { openThreadAcrossWorkspaces } from '../store/actions/cross-workspace';
 import { CHECK_ICON, COPY_ICON } from '../utils/markedConfig';
-import { activeMenuItem, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, showConfirm, showPrompt, FOCUSED_THREAD_KEY, setFocusedThread } from '../store/store';
+import { activeMenuItem, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, showConfirm, showPrompt, FOCUSED_THREAD_KEY, setFocusedThread } from '../store/store';
 import { installContentPaneIframeFocusTracking } from '../components/layout/paneFocus';
 import { requestServiceWorkerBuildId } from './sw-update';
 import { syncClientUpdateFromBuild } from '../store/actions/client-update';
@@ -83,8 +84,13 @@ export function useStartup(): void {
     // Cold-start: load the unread set so the bell badge is correct.
     void loadUnreadNotifications();
     loadPreferences().then(() => {
-      // Notifications must load after preferences so the persisted filter is applied
-      if (activeMenuItem.value === 'notifications') loadNotifications();
+      // Notifications must load after preferences so the persisted filter is
+      // applied. The "Unread" tab renders `unreadNotifications` (loaded above via
+      // loadUnreadNotifications), so only the "All" tab needs the paginated
+      // browse list loaded here.
+      if (activeMenuItem.value === 'notifications' && notificationsFilter.value === 'all') {
+        loadNotifications();
+      }
       // The version-update dismissals are now GLOBAL preferences, so the update
       // surfaces skip while preferences are still loading (they can't yet know if
       // this build was dismissed). Re-derive now that preferences are known: the
@@ -280,7 +286,7 @@ export function useStartup(): void {
       // system-knowhow/notifications.md §4.5) and the liveness pong.
       navigator.serviceWorker.addEventListener('message', onServiceWorkerMessage);
 
-      // Surface the active SW's BUILD_ID in the control panel (debugging aid for
+      // Surface the active SW's BUILD_ID on the System page (debugging aid for
       // "did the new build's SW take over?"). Query now, and again whenever a new
       // SW claims the page so the shown id tracks the live worker.
       requestServiceWorkerBuildId();
@@ -288,8 +294,8 @@ export function useStartup(): void {
 
       // Light/clear the update badge for THIS load by comparing the running
       // bundle's build id against the served sw.js. Independent of the SW
-      // build-id reply above (that drives the "Build" debug row) — this is the
-      // honest "is my loaded code stale?" check, also re-run on resume.
+      // build-id reply above (that drives the "Service worker" debug row) — this
+      // is the honest "is my loaded code stale?" check, also re-run on resume.
       void syncClientUpdateFromBuild();
     }
 
@@ -322,7 +328,7 @@ export function useStartup(): void {
       }
       if (data.type === 'lucidos:build-id') {
         if (typeof data.buildId === 'string') {
-          serviceWorkerBuildId.value = data.buildId; // control-panel "Build" row
+          serviceWorkerBuildId.value = data.buildId; // System page "Service worker" row
           // A reply also arrives on controllerchange (a SW swap), so re-check
           // whether the running bundle is now stale vs the served build. The
           // check itself reads CLIENT_BUILD_ID, not this controller id.
@@ -458,8 +464,14 @@ export function useStartup(): void {
       // the sync to the 5s health poll (which calls checkConnection, which
       // picks up the deferred resume once the engine is back).
       handleResume();
+      // The app-icon badge was writable by the OS while we were away (iOS sets
+      // it from the push payload's `app_badge`; the SW sets it on Chrome), so
+      // re-assert ours the moment we're back — before the reload, so the icon
+      // agrees with the bell even if the engine is unreachable.
+      syncWorkspaceAppBadge();
       // Reload the unread set on resume so the bell badge reflects anything that
-      // arrived while backgrounded. The OS push tap delivers the deep link itself
+      // arrived while backgrounded (the load re-asserts the icon again from the
+      // fresh set). The OS push tap delivers the deep link itself
       // (absolute-navigate URL on iOS, notificationclick elsewhere), so there's
       // no in-app rescue toast to surface here.
       void loadUnreadNotifications();
@@ -524,6 +536,12 @@ export function useStartup(): void {
     // WKWebView crash recovery: send periodic heartbeats to the Tauri Rust side.
     // If heartbeats stop (content process crashed → white screen), the Rust
     // watchdog reloads the webview automatically.
+    //
+    // The `catch` is a local no-op, not a swallowed signal: `invoke` reports
+    // every failure to the engine log itself (utils/ipcHealth → `[Client/ipc]`).
+    // There is nothing useful to do here per-beat — the next beat is 15s away
+    // and the Rust watchdog is the recovery path — and a toast would be wrong on
+    // a timer the user never started.
     const heartbeatInterval = isTauri()
       ? setInterval(() => { invoke('heartbeat').catch(() => {}); }, 15_000)
       : null;

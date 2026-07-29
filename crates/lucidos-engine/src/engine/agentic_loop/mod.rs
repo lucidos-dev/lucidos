@@ -52,5 +52,9 @@ mod question_reask_unit_tests;
 mod failure_breaker_unit_tests;
 
 #[cfg(test)]
+#[path = "../agentic_loop_unit_tests/image_pins.rs"]
+mod image_pins_unit_tests;
+
+#[cfg(test)]
 #[path = "../agentic_loop_tests.rs"]
 mod agentic_loop_db_tests;

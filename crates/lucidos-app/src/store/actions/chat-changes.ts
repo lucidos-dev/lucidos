@@ -1,9 +1,9 @@
-import { showToast, dismissToast, removeToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineStartedAt, engineVersion, latestEngineVersion, enginePackaged, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
+import { showToast, dismissToast, removeToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineStartedAt, engineVersion, latestEngineVersion, engineNewVersionReady, enginePackaged, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
 import { changeToastMessage } from './changeToast';
 import { toFailed } from '../types';
 import type { Loadable } from '../types';
 import type { RestartGroup } from '../store';
-import { applyChange as apiApply, discardChange as apiDiscard, applyAllChanges as apiApplyAll, cancelApplyAllChanges as apiCancelApplyAll, discardAllChanges as apiDiscardAll, revertChange as apiRevert, fetchChanges as apiFetchChanges, getChangeById as apiGetChangeById, restartEngine, ApiError } from '../../api/client';
+import { applyChange as apiApply, discardChange as apiDiscard, applyAllChanges as apiApplyAll, cancelApplyAllChanges as apiCancelApplyAll, discardAllChanges as apiDiscardAll, revertChange as apiRevert, fetchChanges as apiFetchChanges, getChangeById as apiGetChangeById, restartEngine, ApiError, isTransportError } from '../../api/client';
 import { isTauri } from '../../utils/platform';
 import { invoke } from '../../utils/tauri';
 import { isNewerVersion } from '../../utils/version';
@@ -34,14 +34,16 @@ export const RESTART_IN_FLIGHT_LS_KEY = 'lucidos-restart-in-flight';
 
 interface RestartInFlight {
   startedAt: string | null;
-  packaged: boolean;
+  /** Whether this restart delivers a new engine version — restores the correct
+   *  progress-toast wording (new-version vs. plain) on a mid-restart reload. */
+  newVersion: boolean;
 }
 
 /** Persist that a restart just started. Called from initiateEngineRestart. */
-function markRestartInFlight(): void {
+function markRestartInFlight(newVersion: boolean): void {
   const payload: RestartInFlight = {
     startedAt: engineStartedAt.value,
-    packaged: enginePackaged.value,
+    newVersion,
   };
   localStorage.setItem(RESTART_IN_FLIGHT_LS_KEY, JSON.stringify(payload));
 }
@@ -62,7 +64,7 @@ function readRestartInFlight(): RestartInFlight | null {
     const parsed = JSON.parse(raw) as Partial<RestartInFlight>;
     return {
       startedAt: typeof parsed.startedAt === 'string' ? parsed.startedAt : null,
-      packaged: parsed.packaged === true,
+      newVersion: parsed.newVersion === true,
     };
   } catch {
     localStorage.removeItem(RESTART_IN_FLIGHT_LS_KEY);
@@ -116,14 +118,20 @@ function persistRestartGroups(): void {
   }
 }
 
-/** Progress text for the in-flight switch status toast. In the new-version /
- *  switch flow the binary is ALREADY built (Apply rebuilt it in the background /
- *  the updater installed it), so the switch only respawns — there is no build
- *  phase at switch time. Both constants now read "Starting new version…"; the
- *  two names are kept because `connection.ts` / `restoreRestartToast` still
- *  reference them across the build→swap phase transition. */
-export const RESTART_BUILD_MESSAGE = 'Starting new version…';
-export const RESTART_SWAP_MESSAGE = 'Starting new version…';
+/** Progress text for the in-flight restart status toast. The restart only respawns
+ *  (Apply rebuilt the binary in the background / the updater already installed it),
+ *  so there is no build phase at restart time and the message stays stable for the
+ *  whole window. Its wording depends on whether the restart actually delivers a NEW
+ *  engine version vs. a plain respawn of the running one — a plain restart (the
+ *  reload glyph / SystemPage "Restart engine?" with nothing pending) must NOT claim
+ *  "Starting new version…". */
+const RESTART_NEW_VERSION_MESSAGE = 'Starting new version…';
+const RESTART_PLAIN_MESSAGE = 'Restarting engine…';
+
+/** The progress message for a restart, chosen by whether it delivers a new version. */
+function restartProgressMessage(newVersion: boolean): string {
+  return newVersion ? RESTART_NEW_VERSION_MESSAGE : RESTART_PLAIN_MESSAGE;
+}
 
 /** Set restarting state, show info toast, and trigger the engine restart.
  *
@@ -157,26 +165,33 @@ export async function initiateEngineRestart(): Promise<void> {
   // the progress toast rather than leaving it stacked. removeToast (structural),
   // not dismissToast, for the same acting-not-deferring reason as above.
   removeToast(FRONTEND_UPDATE_DEFERRED_TOAST_KEY);
+  // Decide the progress wording from the SAME predicate that drives the switch
+  // badge (engineNewVersionReady) — so the toast can never disagree with the badge,
+  // and can only claim a new version when the engine's own version check says the
+  // running binary and the one we'll respawn onto actually differ: in dev the
+  // running build-id vs the on-disk build-id (version-status `update_available`,
+  // once the rebuild is ready); packaged, the installed vs latest release. A plain
+  // restart (reload glyph / SystemPage with nothing newer) reads "Restarting
+  // engine…"; a genuine switch reads "Starting new version…". No lies.
+  const newVersion = engineNewVersionReady();
   engineRestarting.value = true;
   // Persist the in-flight state so a page reload mid-restart restores the
   // PROGRESS toast (restoreRestartToast) instead of the pre-restart warning.
   // Records the pre-restart started_at so reconnect detection still fires after
-  // the reload (the everOrRestarting gate in connection.ts). Cleared at every
-  // engineRestarting flip-false site below + in connection.ts.
-  markRestartInFlight();
+  // the reload (the everOrRestarting gate in connection.ts), plus `newVersion` so
+  // the restored toast keeps the correct wording. Cleared at every engineRestarting
+  // flip-false site below + in connection.ts.
+  markRestartInFlight(newVersion);
   // Light, dismissible status toast — the UI is NOT deactivated during a restart
   // anymore (the gateway boot splash + GET-gate + SSE reconnect make it a
   // recoverable non-event), so this is just a "why is it briefly unresponsive"
   // hint the user can dismiss. It carries a spinner (spinning: true) to signal
-  // ongoing work, and reports progress in two phases — this build phase, then
-  // the swap phase advanced from checkConnection() when the old engine goes
-  // unreachable. Packaged restarts have no build step, so they start on the
-  // swap phase. showDuringRestart: true keeps it visible past the central
-  // suppression in showToast (which still eats read-path / SW-update noise
-  // during the window); the key de-dupes and lets started_at detection dismiss
-  // it on reconnect.
-  const initialMessage = enginePackaged.value ? RESTART_SWAP_MESSAGE : RESTART_BUILD_MESSAGE;
-  showToast(initialMessage, 'info', { key: RESTART_TOAST_KEY, showDuringRestart: true, spinning: true });
+  // ongoing work. The wording is stable for the whole window (no build phase at
+  // restart time) and is chosen by `newVersion` above. showDuringRestart: true
+  // keeps it visible past the central suppression in showToast (which still eats
+  // read-path / SW-update noise during the window); the key de-dupes and lets
+  // started_at detection dismiss it on reconnect.
+  showToast(restartProgressMessage(newVersion), 'info', { key: RESTART_TOAST_KEY, showDuringRestart: true, spinning: true });
   try {
     if (enginePackaged.value && isTauri()) {
       // Drive launchd directly from the desktop shell — works even if the
@@ -221,7 +236,7 @@ function isEngineOutdated(): boolean {
  *  It does NOT show a pre-switch toast, and (in dev) does NOT light the
  *  "New version available" badge at Apply time. That whole engine surface — the
  *  poll-driven engine-new-version toast (engine-update.ts) AND the control-panel
- *  badge / reload-glyph highlight (`engineNewVersionReady()` in ControlPanel.tsx)
+ *  badge / reload-glyph highlight (`engineNewVersionReady()` in store.ts)
  *  — fires only once the background rebuild is actually `ready`, so nothing can
  *  claim "available" before the build finishes. `restartRequired` here still
  *  drives the restart-pending persistence + the client-refresh ordering guard
@@ -289,12 +304,11 @@ export function restoreRestartToast(): void {
     // (see the everOrRestarting gate in connection.ts), so completion still fires
     // and the flag can't hang.
     engineStartedAt.value = inFlight.startedAt;
-    // Mirror initiateEngineRestart's initial phase; checkConnection advances
-    // build→swap when the old engine goes unreachable, and clears it all on
-    // reconnect. syncRestartToast is intentionally NOT called — the
-    // engineRestarting guard would suppress it anyway.
-    const message = inFlight.packaged ? RESTART_SWAP_MESSAGE : RESTART_BUILD_MESSAGE;
-    showToast(message, 'info', { key: RESTART_TOAST_KEY, showDuringRestart: true, spinning: true });
+    // Restore the same stable progress wording initiateEngineRestart chose (from
+    // the persisted `newVersion`); checkConnection clears it all on reconnect.
+    // syncRestartToast is intentionally NOT called — the engineRestarting guard
+    // would suppress it anyway.
+    showToast(restartProgressMessage(inFlight.newVersion), 'info', { key: RESTART_TOAST_KEY, showDuringRestart: true, spinning: true });
     return;
   }
 
@@ -352,19 +366,27 @@ function reconcileApplyingNow(pending: Change[], applied: Change[]): void {
 }
 
 /** Fetch changes from backend and update all related signals.
- *  On TimeoutError (10s client timeout) we retry once before bothering the user:
- *  the iOS PWA fires this from `runResumeSync` after every visibilitychange,
- *  and the cellular/Wi-Fi radio just-waking case can hang the first request
- *  past the timeout even when the engine is responding fast.
+ *  On a transient wake failure — a TimeoutError (10s client timeout) OR a
+ *  transport-layer TypeError (Safari "Load failed" on a stale HTTP/2 connection)
+ *  — we retry once before bothering the user: the iOS PWA fires this from
+ *  `runResumeSync` after every visibilitychange, and the cellular/Wi-Fi/Tailscale
+ *  radio just-waking case can hang or drop the first request even when the engine
+ *  is responding fast; the retry lands on a now-warm connection.
  *
- *  A browser-cancelled AbortError is swallowed silently (see the final catch):
- *  this path has no manual AbortController, so an AbortError means the browser
- *  killed the in-flight fetch on an iOS PWA freeze / radio handoff — transient
- *  page-lifecycle noise the next runResumeSync re-syncs, not a real failure. */
+ *  A browser-cancelled AbortError AND a transport TypeError that fails even the
+ *  retry are swallowed silently (see the final catch): this path has no manual
+ *  AbortController, so both are the browser failing an in-flight fetch on an iOS
+ *  PWA freeze / radio handoff / Tailscale reconnect — transient page-lifecycle
+ *  noise. The engine is reachable via SSE (which keeps the list live) and the next
+ *  runResumeSync re-syncs; the connection dot (connection.ts, debounced ~20s) is
+ *  the honest sustained-outage surface, so a per-fetch toast here is just noise.
+ *  A TimeoutError that survives the retry still surfaces — that's the stronger
+ *  "waited the full window and got nothing" signal. Mirrors `refreshThreadEvents`
+ *  (thread-loading.ts). */
 export function refreshChangesState(): void {
   apiFetchChanges({ limit: 15 })
     .catch(e => {
-      if (e instanceof DOMException && e.name === 'TimeoutError') {
+      if ((e instanceof DOMException && e.name === 'TimeoutError') || isTransportError(e)) {
         return apiFetchChanges({ limit: 15 });
       }
       throw e;
@@ -405,13 +427,17 @@ export function refreshChangesState(): void {
       syncRestartToast();
     })
     .catch(e => {
-      // Browser-cancelled fetch (iOS PWA freeze / radio handoff): no manual
-      // AbortController on this path, so an AbortError is page-lifecycle noise,
-      // not an outage. Leave the already-loaded list intact (don't paint a
-      // spurious "Failed to fetch changes: request cancelled" or flip the view
-      // to a failed state) — the next runResumeSync re-syncs, and SSE keeps the
-      // list live while connected.
-      if (isAbortError(e)) return;
+      // Browser-cancelled fetch (AbortError) OR a transport-layer TypeError
+      // (Safari "Load failed") that failed even the retry above: no manual
+      // AbortController on this path, so both are page-lifecycle / reachability
+      // noise on an iOS PWA wake over a flaky link (radio handoff, Tailscale
+      // reconnect), not a real outage. Leave the already-loaded list intact
+      // (don't paint a spurious "Failed to fetch changes: Load failed" or flip
+      // the view to a failed state) — the next runResumeSync re-syncs, SSE keeps
+      // the list live while connected, and the connection dot is the honest
+      // sustained-outage surface. A TimeoutError still surfaces (see the retry
+      // doc above). Mirrors `refreshThreadEvents`.
+      if (isAbortError(e) || isTransportError(e)) return;
       changes.value = toFailed<Change[]>(e);
       appliedChanges.value = toFailed<Change[]>(e);
       showToast(`Failed to fetch changes: ${errorDetail(e)}`, 'error');

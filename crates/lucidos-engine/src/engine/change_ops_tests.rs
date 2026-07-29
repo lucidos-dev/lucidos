@@ -691,3 +691,102 @@ async fn discard_round_trip_branch_can_advance_again() {
     let main_sha = rev_parse(&repo, "main").await;
     assert_eq!(branch_sha, main_sha);
 }
+
+/// Regression guard for the 2026-07-28 Apply-over-mobile incident.
+///
+/// `apply_change_inner`'s Tier 2 used to `await` a whole coding-agent merge
+/// session inline, so the session's lifetime was the *caller's* lifetime. For
+/// the HTTP callers that meant an axum handler: when iOS Safari dropped the
+/// connection 72 s into a conflict resolution on thread `293f96d5`, hyper
+/// dropped the handler future, the subprocess died mid-tool
+/// (`interruptedByShutdown` in its own transcript), and the `agent_sessions`
+/// entry it left behind wedged the thread.
+///
+/// Every other CC-assisted merge path already detaches — Tier 1 via
+/// `spawn_in_place_conflict_recovery`, Tier 3 via `spawn_merge_session`. This
+/// pins Tier 2 to the same rule.
+///
+/// Source-text assertion for the reason given on
+/// `run_merge_session_tier2_routes_through_start_merge_and_get_prompt`: nothing
+/// in this crate constructs a live `LucidosEngine` outside `main.rs`, so the
+/// spawn boundary can't be observed at runtime here. Brittle to formatting,
+/// resilient to the regression that matters.
+#[test]
+fn tier2_merge_session_is_detached_from_the_caller_future() {
+    let source = include_str!("change_ops/apply.rs");
+
+    let call = source
+        .find("run_merge_session_tier2(")
+        .expect("Tier 2 must still drive a merge session");
+    let spawn = source
+        .find("spawn_cc_task_guarded(")
+        .expect("the Tier-2 merge must be handed to a spawned task");
+
+    assert!(
+        spawn < call,
+        "the Tier-2 merge session must be spawned, not awaited inline — an HTTP \
+         handler's future must never own a coding-agent session (the caller \
+         disconnecting would kill the merge and leave a phantom session behind)"
+    );
+
+    // The immediate return is the other half: having spawned, Tier 2 must hand
+    // the caller a Conflict result rather than waiting for the merge. The
+    // outcome reaches the user through ChangeApplied / ChangeApplyFailed.
+    let tail = &source[call..];
+    let window_end = tail
+        .find("// Tier 3: No worktree")
+        .unwrap_or(tail.len());
+    let after_spawn = &tail[..window_end];
+    assert!(
+        after_spawn.contains("ApplyResult::conflict("),
+        "after spawning the merge, Tier 2 must return ApplyResult::conflict so \
+         the caller stops waiting. Body was:\n{}",
+        after_spawn
+    );
+
+    // Detaching moved the merge past `apply_change`'s `ApplyStatus::Applied`
+    // gate, so the spawned task has to run the orphan-sibling reconcile itself
+    // — and gate it on the row actually reaching `applied`, or a failed merge
+    // would discard a newer sibling's work. Caught in review after the first
+    // cut of the detach silently dropped it.
+    assert!(
+        after_spawn.contains("discard_orphaned_pending_siblings"),
+        "the detached Tier-2 task must reconcile orphaned sibling pending changes — \
+         apply_change's gate can't, because this path returns Conflict before the \
+         merge lands. Body was:\n{}",
+        after_spawn
+    );
+    assert!(
+        after_spawn.contains(r#"c.status == "applied""#),
+        "the detached reconcile must be gated on the change really applying, not on \
+         the merge task merely finishing. Body was:\n{}",
+        after_spawn
+    );
+}
+
+/// The other half of the same invariant, checked at the API boundary: no axum
+/// handler may drive a coding-agent session itself.
+///
+/// A handler's future dies with its client. Sessions therefore belong to
+/// spawned tasks that report through events; handlers may only *start* them.
+/// The 2026-07-28 incident reached a session from a handler transitively
+/// (`claude_code_apply_now` → `apply_now` → `apply_change` → Tier 2), which no
+/// single-file check can see — but a direct call in `api/` is the shape that
+/// would make the transitive case easy to reintroduce, so it stays banned.
+#[test]
+fn api_handlers_never_drive_a_coding_agent_session_directly() {
+    // Every `api/*.rs` that could plausibly reach a session.
+    for (name, source) in [
+        ("api/chat.rs", include_str!("../api/chat.rs")),
+        ("api/claude_code.rs", include_str!("../api/claude_code.rs")),
+        ("api/changes.rs", include_str!("../api/changes.rs")),
+        ("api/history.rs", include_str!("../api/history.rs")),
+    ] {
+        assert!(
+            !source.contains("run_direct_agent("),
+            "{name} calls run_direct_agent directly — an HTTP handler must never own a \
+             coding-agent session; hand it to a spawned task and answer the caller \
+             immediately (see the Tier-2 detach in change_ops/apply.rs)"
+        );
+    }
+}

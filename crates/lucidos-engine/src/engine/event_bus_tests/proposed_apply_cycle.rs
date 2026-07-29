@@ -875,6 +875,91 @@ fn apply_time_reconcile_lives_in_apply_change_gated_not_in_handler_or_emitter() 
     );
 }
 
+/// Guard where the apply-time dev refresh (background engine rebuild /
+/// served-`dist` re-snapshot) lives.
+///
+/// The mirror image of the reconcile guard above: this one must live in EXACTLY
+/// ONE place — hanging off the shared `emit_change_applied`, the single emit
+/// every merge path performs exactly once. It used to sit on the `apply_change`
+/// wrapper instead, which three merge paths bypass (`apply_now_success` for the
+/// live in-place merge, the async in-place conflict recovery, and the Tier-2/3
+/// conflict-resolution cleanup in `run_session/completion.rs`) — so an
+/// engine-affecting Apply from a live coding-agent session merged with no
+/// rebuild started, no building spinner, and a "Switch to new version" offering
+/// a binary older than the merge.
+///
+/// A SECOND trigger site is not merely redundant, it re-breaks the feature:
+/// `trigger_background_rebuild` coalesces by aborting the in-flight build, and
+/// the aborted task's `flock` guard may not have dropped before the replacement
+/// probes it — the replacement then reads `SkippedLocked`, falls back to
+/// `BuildState::Idle`, and no build runs at all.
+#[test]
+fn apply_time_dev_refresh_lives_only_on_the_shared_change_applied_emit() {
+    let emitters = include_str!("../change_ops_emitters.rs");
+    assert!(
+        emitters.contains("post_apply_dev_refresh"),
+        "emit_change_applied must drive the post-apply dev refresh — it is the one emit \
+         every merge path performs exactly once"
+    );
+    for (label, src) in [
+        ("change_ops/apply.rs", include_str!("../change_ops/apply.rs")),
+        (
+            "agent_session/apply_now.rs",
+            include_str!("../agent_session/apply_now.rs"),
+        ),
+        (
+            "agent_session/run_session/completion.rs",
+            include_str!("../agent_session/run_session/completion.rs"),
+        ),
+        ("api/changes.rs", include_str!("../../api/changes.rs")),
+    ] {
+        assert!(
+            !src.contains("trigger_background_rebuild()")
+                && !src.contains("refresh_served_frontend_after_rebuild()"),
+            "{label} must NOT trigger the rebuild / frontend re-snapshot directly — \
+             emit_change_applied owns it. A second trigger site can abort the first \
+             build into a SkippedLocked no-op, leaving no build running at all."
+        );
+    }
+}
+
+/// Guard that the post-apply dev refresh runs only for the ACCEPTED
+/// `ChangeApplied`, never for a duplicate the bus suppressed.
+///
+/// The bus's single-fire guard `FOR UPDATE`-locks the change row and returns
+/// `Ok(None)` for a recognized duplicate — which is a routine occurrence, not a
+/// pathology: the ~0.6s double-fire race, Apply-All retries, the
+/// conflict-recovery cleanup, and post-restart re-emits all hit it. `emit_or_log`
+/// throws that verdict away, so emitting through it and then refreshing
+/// unconditionally would let the DUPLICATE coalesce (abort) the rebuild the
+/// ACCEPTED emit just started — and the replacement can read `SkippedLocked` and
+/// fall back to `BuildState::Idle`, leaving no build running. That is the very
+/// symptom this funnel was added to fix, re-entered through another door.
+#[test]
+fn post_apply_refresh_runs_only_for_the_accepted_change_applied() {
+    let emitters = include_str!("../change_ops_emitters.rs");
+    let emit_pos = emitters
+        .find("ThreadEvent::ChangeApplied {")
+        .expect("emit_change_applied must emit ChangeApplied");
+    let tail = &emitters[emit_pos..];
+    assert!(
+        tail.contains("Ok(res) => res.is_some()"),
+        "emit_change_applied must emit via `emit` (not `emit_or_log`) and read the \
+         Ok(Some)/Ok(None) verdict — `emit_or_log` discards the single-fire guard's \
+         suppression, so a duplicate would still fire the refresh"
+    );
+    let accepted_pos = tail
+        .find("if accepted {")
+        .expect("the post-apply refresh must be gated on the emit being accepted");
+    let refresh_pos = tail
+        .find("post_apply_dev_refresh(")
+        .expect("emit_change_applied must call the post-apply refresh");
+    assert!(
+        accepted_pos < refresh_pos,
+        "the `accepted` gate must wrap the post_apply_dev_refresh call, not follow it"
+    );
+}
+
 /// Guard that `discard_change` feeds the Apply-All driver a terminal signal.
 ///
 /// When the sibling reconcile (or a concurrent user discard) drops a change that

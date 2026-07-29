@@ -106,8 +106,8 @@ describe('SSE MessageReceived preserves user-typed compose text', () => {
   it('keeps composeText when MessageReceived arrives while user is genuinely typing here (locally edited)', () => {
     focusPromptOnThread('t-1');
     // "User is typing" == a draft THIS device authored — stamp composeEditedAt,
-    // as every local mutation (updateCompose) does. This is what hasLocalDraftEdit
-    // keys off, NOT DOM focus.
+    // as every local mutation (updateCompose) does. This is what
+    // hasUnsentLocalDraft keys off, NOT DOM focus.
     composeEditedAt.set('t-1', Date.now());
 
     handleThreadEvent({
@@ -125,7 +125,7 @@ describe('SSE MessageReceived preserves user-typed compose text', () => {
     // (applyRemoteCompose / stageDraftFromApi → no composeEditedAt stamp). When
     // the peer SENDS it, this device must clear the stale synced draft. It was
     // being PRESERVED because the compose-clear was gated on isComposeFocusedHere
-    // rather than authorship (hasLocalDraftEdit) — so a focused textarea kept a
+    // rather than authorship (hasUnsentLocalDraft) — so a focused textarea kept a
     // draft the user never typed. The draft from beforeEach is setDraft-created
     // (not locally edited), i.e. server-originated.
     focusPromptOnThread('t-1');

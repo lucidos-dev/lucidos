@@ -49,8 +49,6 @@ impl LucidosEngine {
         self: &std::sync::Arc<Self>,
         actor: Option<crate::engine::thread_events::MessageOrigin>,
     ) {
-        use crate::engine::thread_events::{self, EventChannel, EventMeta};
-
         // Stop the scheduler firing event-triggers before we emit the abort
         // events below — those would otherwise fan out to triggers whose
         // scripts hit the API mid-restart and fail.
@@ -99,20 +97,21 @@ impl LucidosEngine {
             }))
             .await;
         for (thread_id, originating_event_id) in chat_thread_ids.iter().zip(chat_originating_ids) {
-            thread_events::emit_response_aborted(
+            // Same preserve guard as the coding-agent branch below: a chat thread
+            // parked on an unanswered question is preserved (no boundary abort) so
+            // its card stays answerable and answering resumes. The chat agent's
+            // `ask_user_question` blocks the loop on the same wait registry as CC,
+            // so a question-parked chat thread is still in `processing_thread_ids()`
+            // and would otherwise get the device "Restarted" abort here (the
+            // reproduced chat screenshot). `None` channel = chat bucket.
+            emit_teardown_abort_unless_question_parked(
+                &self.pool,
                 &self.event_bus,
                 *thread_id,
-                thread_events::AbortCause::EngineShutdown,
+                None,
                 "This response was interrupted by an engine restart.".to_string(),
-                vec![],
-                None,
-                None,
-                EventMeta {
-                    request_event_id: originating_event_id,
-                    actor: actor.clone(),
-                    ..EventMeta::NONE
-                },
-                "[Restart] ResponseAborted (chat)",
+                originating_event_id,
+                actor.clone(),
             )
             .await;
             // Drop the thread from `active_threads` so the subsequent
@@ -143,49 +142,59 @@ impl LucidosEngine {
         // `EventMeta::request_event_id = Some(origin_id)` on every CC event.
         // `CC_ORIGINATING_EVENT_TYPES` is the chat list + CCUMS, so it covers
         // both regular CC follow-ups and wake-from-child.
-        let cc_originating_ids: Vec<Option<uuid::Uuid>> =
-            futures::future::join_all(cc_thread_ids.iter().map(|tid| {
-                crate::engine::agent_session::latest_originating_event_id(
-                    &self.pool,
-                    *tid,
-                    crate::engine::agent_session::CC_ORIGINATING_EVENT_TYPES,
-                )
-            }))
-            .await;
-        for ((thread_id, originating_event_id), flag) in cc_thread_ids
-            .iter()
-            .zip(cc_originating_ids)
-            .zip(external_emitted_flags)
-        {
-            thread_events::emit_response_aborted(
-                &self.event_bus,
-                *thread_id,
-                thread_events::AbortCause::EngineShutdown,
-                String::new(),
-                vec![],
-                None,
-                None,
-                EventMeta {
-                    channel: Some(EventChannel::ClaudeCode),
-                    request_event_id: originating_event_id,
-                    actor: actor.clone(),
-                    ..EventMeta::NONE
-                },
-                "[Restart] ResponseAborted (cc)",
-            )
-            .await;
-            // Set AFTER the emit lands so any Result arriving from this point
-            // on observes the flag and skips its own duplicate emit.
-            flag.store(true, std::sync::atomic::Ordering::Release);
-        }
+        //
+        // Per-thread work runs concurrently — same rationale as the chat
+        // lookups above (sequential awaits would serialize N round-trips on a
+        // busy restart), and each thread's chain needs two queries now: the
+        // originating-id lookup plus the question-parked check inside
+        // `emit_teardown_abort_unless_question_parked`. Within one thread's
+        // future the order is fixed: the flag is set AFTER the emit lands so
+        // any Result arriving from that point on observes it and skips its own
+        // duplicate emit. Set on the question-parked skip too: the shutdown
+        // interrupt still makes CC produce a Result that classifies
+        // `Aborted(EngineShutdown)`, and the stop arm's `stop_terminal_kind`
+        // does the same — without the flag, either in-loop path would land the
+        // very abort the skip just avoided.
+        futures::future::join_all(cc_thread_ids.iter().zip(external_emitted_flags).map(
+            |(thread_id, flag)| {
+                let actor = actor.clone();
+                async move {
+                    let originating_event_id =
+                        crate::engine::agent_session::latest_originating_event_id(
+                            &self.pool,
+                            *thread_id,
+                            crate::engine::agent_session::CC_ORIGINATING_EVENT_TYPES,
+                        )
+                        .await;
+                    emit_teardown_abort_unless_question_parked(
+                        &self.pool,
+                        &self.event_bus,
+                        *thread_id,
+                        Some(crate::engine::thread_events::EventChannel::ClaudeCode),
+                        String::new(),
+                        originating_event_id,
+                        actor,
+                    )
+                    .await;
+                    flag.store(true, std::sync::atomic::Ordering::Release);
+                }
+            },
+        ))
+        .await;
     }
 
     /// Emit ResponseAborted for all active non-CC threads during engine shutdown.
     /// CC threads are handled separately by `shutdown_agent_sessions`.
     ///
     /// After emitting, cancels all threads so their tasks can clean up. The
-    /// agentic loop may also emit ResponseCanceled on cancellation — having both
-    /// is harmless (ResponseAborted takes precedence in status derivation).
+    /// agentic loop may also emit ResponseCanceled on cancellation, and the
+    /// idempotency gate in `emit_response_canceled` can't suppress it here (the
+    /// abort above carries no `request_event_id` to match on). Having both is
+    /// harmless: the exchange label prefers Aborted over Canceled regardless of
+    /// order, and the `thread_summaries.status` column — which IS last-write-wins
+    /// — keeps the abort's `'failed'` because the `ResponseCanceled` projection
+    /// arm is `preserving_failed`. Both halves are load-bearing; the status half
+    /// used to be missing, which erased the interrupted thread's red error dot.
     ///
     /// Stamps `actor: System` so the AbortPanel renders ⚙ System — the host
     /// system killed these in-flight responses (engine shutdown). The
@@ -201,6 +210,20 @@ impl LucidosEngine {
         let all_cc_thread_ids: std::collections::HashSet<uuid::Uuid> =
             self.agent_sessions.lock().await.keys().copied().collect();
         for thread_id in partition_chat_thread_ids(&active_ids, &all_cc_thread_ids) {
+            // Preserve guard (defense-in-depth): a thread parked on an unanswered
+            // question is a resumable checkpoint, never aborted. `abort_in_flight_for_restart`
+            // already skips + evicts these on the user-switch path; this covers a
+            // thread that reached `processing_thread_ids()` after that pre-emit.
+            // Same shared predicate as every other restart-abort path.
+            if crate::engine::agent_recovery::thread_has_unanswered_question(&self.pool, thread_id)
+                .await
+            {
+                log!(
+                    "[Shutdown] Preserving thread {} — parked on an unanswered question",
+                    thread_id
+                );
+                continue;
+            }
             log!(
                 "[Shutdown] Emitting ResponseAborted for active thread {}",
                 thread_id
@@ -311,3 +334,73 @@ impl LucidosEngine {
     }
 
 }
+
+/// Teardown boundary emit for one in-flight thread — coding-agent OR chat:
+/// emits the `ResponseAborted { cause: EngineShutdown, actor }` that
+/// post-restart recovery reads as "user-initiated switch" — UNLESS the thread
+/// is parked on an unanswered question, which is preserved instead.
+///
+/// A question-parked thread is a stable, resumable checkpoint (decision 7 of
+/// `docs/plans/2026-07-01-new-engine-version-switch-flow.md`): it survives any
+/// restart as `waiting_for_user_answer` with its card answerable, and answering
+/// resumes (coding agents via `ContinuationRequested` → `--resume`; chat via
+/// the answer-resume path in `answer_pending_question`). The session cannot be
+/// filtered out by `is_in_flight()` — the subprocess/loop is alive MID-TURN,
+/// blocked inside the AskUserQuestion hook / `walk_question_batch` — so without
+/// this check the boundary abort landed on every user switch: it rendered
+/// "interrupted" over the live card and, worse, counted as a terminal in
+/// recovery's `thread_has_unanswered_question`, defeating the preserve guard.
+///
+/// `channel` selects the bucket: `Some(EventChannel::ClaudeCode)` for a
+/// coding-agent thread (empty `text`), `None` for a chat thread (which carries
+/// the human-readable interrupted text). Both consult the SAME shared
+/// `thread_has_unanswered_question` predicate — the DRY guard so a chat and a
+/// coding-agent restart can't diverge on what "parked" means.
+///
+/// Returns whether the abort was emitted. For coding-agent threads the caller
+/// must set the session's `external_terminal_emitted` flag in BOTH cases — the
+/// preserved session's run loop still sees the shutdown interrupt (both the
+/// Result classify and the stop arm produce `Aborted(EngineShutdown)`), and
+/// only that flag keeps those in-loop paths from landing the abort this skip
+/// just avoided.
+pub(crate) async fn emit_teardown_abort_unless_question_parked(
+    pool: &sqlx::PgPool,
+    event_bus: &crate::engine::event_bus::EventBus,
+    thread_id: uuid::Uuid,
+    channel: Option<crate::engine::thread_events::EventChannel>,
+    text: String,
+    originating_event_id: Option<uuid::Uuid>,
+    actor: Option<crate::engine::thread_events::MessageOrigin>,
+) -> bool {
+    use crate::engine::thread_events::{self, EventMeta};
+
+    if crate::engine::agent_recovery::thread_has_unanswered_question(pool, thread_id).await {
+        log!(
+            "[Restart] Preserving thread {} — parked on an unanswered question, no boundary abort",
+            thread_id
+        );
+        return false;
+    }
+    thread_events::emit_response_aborted(
+        event_bus,
+        thread_id,
+        thread_events::AbortCause::EngineShutdown,
+        text,
+        vec![],
+        None,
+        None,
+        EventMeta {
+            channel,
+            request_event_id: originating_event_id,
+            actor,
+            ..EventMeta::NONE
+        },
+        "[Restart] ResponseAborted (teardown)",
+    )
+    .await;
+    true
+}
+
+#[cfg(test)]
+#[path = "shutdown_tests.rs"]
+mod shutdown_tests;

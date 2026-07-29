@@ -358,23 +358,14 @@ fn unquote_git_path_passthrough_when_unquoted() {
 fn browse_rejects_path_traversal() {
     assert!(super::is_dangerous_browse_path("../etc"));
     assert!(super::is_dangerous_browse_path("/foo/../bar"));
-        assert!(super::is_dangerous_browse_path(""));
+    assert!(super::is_dangerous_browse_path(""));
     assert!(!super::is_dangerous_browse_path("/Users/me/projects"));
     assert!(!super::is_dangerous_browse_path("/tmp"));
 }
 
-#[test]
-fn expand_tilde_handles_all_cases() {
-    let home = std::env::var("HOME").unwrap();
-    assert_eq!(super::expand_tilde("~"), home);
-    assert!(super::expand_tilde("~/projects").starts_with(&home));
-    assert_eq!(
-        super::expand_tilde("~/projects"),
-        format!("{}/projects", home)
-    );
-    assert_eq!(super::expand_tilde("/absolute/path"), "/absolute/path");
-    assert_eq!(super::expand_tilde("relative"), "relative");
-}
+// Tilde expansion moved to `core::home_path` (shared with the
+// `manage_repositories` tool and coding-agent `folder` resolution) and is
+// covered by `core::home_path::tests`.
 
 /// End-to-end of the worktree-diff helpers against a real git repo +
 /// linked worktree on a feature branch with one extra commit. Asserts

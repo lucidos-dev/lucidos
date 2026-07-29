@@ -226,9 +226,22 @@ impl LucidosEngine {
             PrefScope::Device => " for this device",
             PrefScope::Global => "",
         };
+        // `chat_model` / `chat_reasoning_effort` are the DEFAULT for NEW Lucidos
+        // Agent threads only — a thread that's already running reuses its own
+        // last-used model/effort, independent of this preference (per-thread model
+        // memory; see `PreferenceStore::resolve_chat_overrides_for_thread`). So the
+        // generic "open views pick this up" note would be misleading here: it must
+        // NOT imply this preference switches the current/running thread on its next
+        // turn. (The in-thread picker CAN change a running thread — that path writes
+        // a per-thread value, not this account default.)
+        let effect_note = match key {
+            "chat_model" => " This is the default for NEW Lucidos Agent threads. A thread that's already running — including this one — keeps its current model (whatever it last used), so this preference change does NOT switch the current thread's model on its next turn. To change a running thread's model, use its in-thread model picker.",
+            "chat_reasoning_effort" => " This is the default for NEW Lucidos Agent threads. A thread that's already running — including this one — keeps its current reasoning effort (whatever it last used), so this preference change does NOT change the current thread's effort on its next turn. To change a running thread's effort, use its in-thread picker.",
+            _ => " Open Lucidos views pick this up automatically.",
+        };
         Ok(format!(
-            "[ACTION COMPLETED] {} set to '{}'{}. Open Lucidos views pick this up automatically.",
-            spec.label, value, scope_note
+            "[ACTION COMPLETED] {} set to '{}'{}.{}",
+            spec.label, value, scope_note, effect_note
         ))
     }
 

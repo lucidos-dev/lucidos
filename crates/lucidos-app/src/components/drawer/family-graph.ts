@@ -541,7 +541,3 @@ export const draftThreadCount = computed<number>(() => {
     }
     return count;
 });
-
-/** Whether the drafts view would render at least one row. Drives drafts-icon
- *  visibility in the thread headers: no drafts → no icon. */
-export const hasDrafts = computed<boolean>(() => draftThreadCount.value > 0);

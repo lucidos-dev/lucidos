@@ -613,6 +613,21 @@ impl LucidosEngine {
             let bus = engine.event_bus.clone();
             let engine = engine.clone();
             async move {
+                // Same preserve rule as the `to_recover` loop below: a thread
+                // parked on an unanswered question is a stable checkpoint, and
+                // the `CodingAgentIdled` this closure emits is in the
+                // predicate's exclusion list — idling here would expire the
+                // card and defeat the guard. Even with the worktree/branch
+                // unrecoverable, answering still resumes via the
+                // no-live-subprocess `ContinuationRequested` → `--resume` path
+                // (which re-resolves or recreates the worktree).
+                if thread_has_unanswered_question(engine.pool(), thread_id).await {
+                    log!(
+                        "[Recovery] Preserving stuck thread {} — parked on an unanswered question (no idle emitted)",
+                        thread_id
+                    );
+                    return;
+                }
                 let coding_agent = engine.thread_coding_agent(thread_id).await;
                 bus.emit_or_log(
                     crate::engine::event_bus::BusEvent::Thread {
@@ -1072,35 +1087,79 @@ impl LucidosEngine {
 /// resumable checkpoint: recovery must preserve it (no abort, no idle) across a
 /// restart so the card stays answerable; answering resumes via the existing
 /// no-live-subprocess `ContinuationRequested` → `--resume` path
-/// (`ensure_resume_after_answer`). Holds for both a user switch (the teardown emit
-/// skips `is_waiting` sessions, so no boundary lands) and a crash (SIGKILL emits
-/// nothing) — a pending question survives either way.
-async fn thread_has_unanswered_question(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS ( \
+/// (`ensure_resume_after_answer`). Holds for both a user switch and a crash
+/// (SIGKILL emits nothing) — a pending question survives either way.
+///
+/// Shared predicate for BOTH sides of that invariant. The teardown emit
+/// (`emit_teardown_abort_unless_question_parked`) consults it to skip the
+/// boundary `ResponseAborted` — a question-parked session is still MID-TURN
+/// (subprocess alive, blocked in the AskUserQuestion hook), so the
+/// `is_in_flight()` filter cannot exclude it — and this recovery pass consults
+/// it to skip the abort/idle pair. One definition keeps "no boundary lands at
+/// teardown" and "recovery preserves" from drifting apart: a `ResponseAborted`
+/// in the exclusion list below flips this to false, so a teardown that emitted
+/// one would defeat the preserve guard on the very next boot.
+pub(crate) async fn thread_has_unanswered_question(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
+    // `$1` is bound as the thread id (text). One shared fragment (below) so this
+    // per-thread bool check and every set-based sweep filter key on the SAME
+    // "parked on an unanswered question" definition — the DRY anchor for the
+    // preserve guard across teardown + both recovery sweeps.
+    let sql = format!("SELECT {}", unanswered_question_exists_sql("$1"));
+    sqlx::query_scalar::<_, bool>(&sql)
+        .bind(thread_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false)
+}
+
+/// Canonical "thread is parked on an unanswered `AskUserQuestion`" predicate, as
+/// a correlated SQL `EXISTS(...)` body. `id_expr` is a SQL expression yielding
+/// the thread's `aggregate_id` (text): `"$1"` for the single-thread bool check
+/// ([`thread_has_unanswered_question`]), or a column reference such as
+/// `"pt.aggregate_id"` / `"e.thread_id::text"` for a set-based sweep filter.
+///
+/// This is the SINGLE source of truth for the preserve guard. Every restart
+/// abort/cleanup path — the teardown boundary emit
+/// (`emit_teardown_abort_unless_question_parked`), the chat orphan sweep
+/// (`recover_orphaned_threads`), the orphan-tool-call sweep
+/// (`recover_orphan_tool_calls`), and the coding-agent recovery pass — resolves
+/// through this fragment, so "parked on a question ⇒ never aborted, card stays
+/// answerable" cannot drift between paths. A `ResponseAborted` (or any terminal)
+/// after the `UserQuestionAsked` flips it to false, so a path that wrongly
+/// emitted one would defeat every OTHER path's guard on the next boot — which is
+/// exactly why all of them must consult this one fragment.
+pub(crate) fn unanswered_question_exists_sql(id_expr: &str) -> String {
+    format!(
+        "EXISTS ( \
             SELECT 1 FROM events uqa \
-            WHERE uqa.aggregate_id = $1 AND uqa.event_type = 'UserQuestionAsked' \
+            WHERE uqa.aggregate_id = {id} AND uqa.event_type = 'UserQuestionAsked' \
               AND NOT EXISTS ( \
                   SELECT 1 FROM events later \
-                  WHERE later.aggregate_id = $1 AND later.sequence > uqa.sequence \
+                  WHERE later.aggregate_id = {id} AND later.sequence > uqa.sequence \
                     AND later.event_type IN ( \
                         'UserQuestionAnswered', 'ResponseAborted', 'CodingAgentIdled', \
                         'ResponseGenerated', 'SessionEnded') \
               ) \
          )",
+        id = id_expr
     )
-    .bind(thread_id.to_string())
-    .fetch_one(pool)
-    .await
-    .unwrap_or(false)
 }
 
 /// True when the newest `ResponseAborted` (after the thread's last start-or-resume)
-/// carries a **device** actor — the fingerprint of a user-initiated *Switch to new
-/// version* (the teardown boundary emit stamps the device that clicked switch onto
-/// in-flight threads). A crash (SIGKILL) emits no teardown boundary, so this is
-/// false → the thread keeps the manual "Continue" affordance and is NOT
-/// auto-resumed: work that may have crashed the engine can't loop.
+/// is an **engine-shutdown teardown carrying a device actor** — the fingerprint of a
+/// user-initiated *Switch to new version* (the teardown boundary emit stamps the
+/// device that clicked switch onto in-flight threads). A crash (SIGKILL) emits no
+/// teardown boundary, so this is false → the thread keeps the manual "Continue"
+/// affordance and is NOT auto-resumed: work that may have crashed the engine can't
+/// loop.
+///
+/// **Both halves of the fingerprint are load-bearing.** The device actor alone is not
+/// enough: `AbortCause::StaleSettle` deliberately carries the actor of the user button
+/// that exposed a stuck row (Stop / Apply / Discard / Archive / Interrupt — see
+/// `claude_code::settle_stuck_running_thread`), so an actor-only predicate reads a user
+/// *Stop* as a *Switch* and auto-resumes work the user just abandoned. Only
+/// `EngineShutdown` is a teardown boundary; every other cause is either a crash-shaped
+/// terminal or a projection cleanup, and none of them should resume.
 ///
 /// The start set includes `ContinuationStarted` / `OrphanRecoveryStarted` — a
 /// prior auto-resume's start — so once a switch-abort has been consumed by a
@@ -1108,22 +1167,40 @@ async fn thread_has_unanswered_question(pool: &sqlx::PgPool, thread_id: Uuid) ->
 /// crashes the engine again *before* emitting any lifecycle event (so
 /// `already_recovered` doesn't yet cover it), the next boot sees the resume start
 /// as newer than the device abort → this returns false → manual Continue.
+///
+/// Shared by the coding-agent resume gate (`recover_orphaned_worktrees`) and the
+/// chat/trigger one (`chat::recovery::switch_resume_candidates`) — the single
+/// definition of "was this a user switch", so the two can never drift.
 pub(crate) async fn switch_was_user_initiated(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
-    sqlx::query_scalar::<_, bool>(
+    sqlx::query_scalar::<_, bool>(&format!(
         "SELECT EXISTS ( \
             SELECT 1 FROM events WHERE aggregate_id = $1 \
-              AND event_type = 'ResponseAborted' \
-              AND payload->'actor'->>'kind' = 'device' \
+              AND {SWITCH_TEARDOWN_ABORT_SQL} \
               AND sequence > COALESCE( \
                   (SELECT MAX(sequence) FROM events WHERE aggregate_id = $1 \
-                     AND event_type IN ('MessageReceived','CodingAgentUserMessageSent', \
-                         'TriggerStarted','ContinuationStarted','OrphanRecoveryStarted')), 0))",
-    )
+                     AND event_type IN ({THREAD_START_EVENTS_SQL})), 0))"
+    ))
     .bind(thread_id.to_string())
     .fetch_one(pool)
     .await
     .unwrap_or(false)
 }
+
+/// SQL predicate matching the teardown boundary abort of a user-initiated *Switch to
+/// new version*: an `EngineShutdown` `ResponseAborted` stamped with the device that
+/// clicked switch. Assumes the row is already scoped to one thread's events.
+///
+/// Shared by [`switch_was_user_initiated`] and the chat candidate scan so "what a
+/// switch abort looks like" is defined exactly once.
+pub(crate) const SWITCH_TEARDOWN_ABORT_SQL: &str = "event_type = 'ResponseAborted' \
+     AND payload->'actor'->>'kind' = 'device' \
+     AND payload->>'cause' = 'engine_shutdown'";
+
+/// SQL list of the events that begin (or restart) a thread's turn. A switch abort
+/// only counts while no newer start supersedes it — the resume loop-breaker.
+pub(crate) const THREAD_START_EVENTS_SQL: &str = "'MessageReceived',\
+    'CodingAgentUserMessageSent','TriggerStarted','ContinuationStarted',\
+    'OrphanRecoveryStarted'";
 
 /// Settle any coding-agent thread still `running` in the projection that boot
 /// recovery neither resumed (in `recovering`) nor settled. After a restart

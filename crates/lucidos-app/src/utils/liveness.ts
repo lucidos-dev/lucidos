@@ -13,7 +13,7 @@
 
 import { focusedThreadId } from '../store/store';
 import { composeDrafts } from '../store/composeDrafts';
-import { API } from '../api/client';
+import { postClientLog } from './clientLog';
 import { isIOSPwa } from './platform';
 
 const HEARTBEAT_KEY = 'lucidos-liveness-heartbeat';
@@ -112,19 +112,10 @@ function getNavigationStartMs(): number {
   return Date.now();
 }
 
-/** Fire-and-forget POST to the engine's client-log breadcrumb endpoint. */
-export function postClientLog(category: string, message: string, data: Record<string, unknown>): void {
-  try {
-    fetch(`${API}/internal/client-log`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ category, message, data }),
-      keepalive: true,
-    }).catch(() => { /* fire-and-forget */ });
-  } catch {
-    /* telemetry must never break the app */
-  }
-}
+/** Re-exported from the leaf `utils/clientLog` so this module stays the place
+ *  callers reach for breadcrumbs, while low-level utilities (utils/ipcHealth,
+ *  reached from utils/tauri) can post without importing the store through here. */
+export { postClientLog };
 
 export function reportStartupKind(): void {
   const prior = readPriorHeartbeat();

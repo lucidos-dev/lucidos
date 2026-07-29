@@ -76,6 +76,18 @@ pub struct SourceBehindCache {
     behind: bool,
 }
 
+/// Memoized ancestry verdict for the on-disk binary — see
+/// [`LucidosEngine::disk_binary_is_upgrade`]. Keyed by the on-disk build id
+/// (the RUNNING id is a compile-time constant, so the pair is fully identified
+/// by the disk side). `is_strict_ancestor` is the cached
+/// `git merge-base --is-ancestor <disk> <running>` answer; `None` means git
+/// couldn't tell (unknown commit, no repo, command failure).
+#[derive(Default)]
+pub struct DiskDirectionCache {
+    disk_id: Option<String>,
+    is_strict_ancestor: Option<bool>,
+}
+
 /// Per-HEAD self-heal attempt bookkeeping — see
 /// [`LucidosEngine::self_heal_engine_version_if_needed`]. `head` is the HEAD the
 /// attempts were counted for; when HEAD moves the counter resets.
@@ -111,6 +123,18 @@ pub struct VersionStatus {
     /// surface a pending new version + drive self-heal so the Switch can't be a
     /// dead-end. Always false packaged / when git is unavailable.
     pub source_behind_head: bool,
+    /// True (dev only) when the checkout-shared engine-build lock is currently
+    /// held — a background rebuild of the shared binary is in flight, by a
+    /// CO-LOCATED peer engine's `run_engine_build` OR by this engine's own build.
+    /// Co-located workspaces share ONE `target/` + ONE build lock, so a peer's
+    /// build advances the binary THIS engine serves; without this flag a workspace
+    /// that lost the lock (its own rebuild `SkippedLocked` → `build_state` back to
+    /// `idle`) can't tell a build is running and wrongly shows the manual
+    /// "Rebuild" escape hatch instead of the building spinner. Named "shared" (not
+    /// "peer") because the probe can't distinguish this engine's own held lock
+    /// from a peer's; the frontend disambiguates via `build_state`. Always false
+    /// packaged (never rebuilds from source).
+    pub shared_build_in_progress: bool,
 }
 
 impl LucidosEngine {
@@ -136,13 +160,35 @@ impl LucidosEngine {
 
     /// Emit `ContinuationRequested` for every thread recovery queued for
     /// auto-resume after a user-initiated switch, so the spawn dispatcher boots a
-    /// `--resume`. Called by `main.rs` AFTER the dispatcher subscribes — recovery
-    /// runs before it, so the emit can't happen inside recovery. Engine-attributed
+    /// `--resume`. Called by `main.rs` AFTER `SpawnDispatcher::spawn()` — which
+    /// opens the broadcast subscription synchronously before it returns, so these
+    /// emits are buffered by the receiver even while the dispatcher's startup
+    /// backfill is still running (recovery itself runs before the dispatcher
+    /// exists, so the emit can't happen inside recovery). Engine-attributed
     /// (`actor: None`): the resume is a recovery consequence, not a device click,
     /// and the "Resumed" boundary keeps the Lucidos-mark chip.
     pub async fn resume_pending_switches(&self) {
         let ids = std::mem::take(&mut *self.pending_switch_resumes.lock().unwrap());
         for thread_id in ids {
+            // A prior boot may have left this thread an unactuated
+            // ContinuationRequested (emitted but never spawned — the zombie
+            // state). The dispatcher's startup orphan re-dispatch drives that
+            // existing request; emitting a second one here would put two
+            // request event ids on one thread — past the per-EVENT idempotency
+            // guard — and double-spawn.
+            if crate::engine::agent_session::spawn_dispatcher::thread_has_unactuated_continuation(
+                self.pool(),
+                thread_id,
+            )
+            .await
+            {
+                log!(
+                    "[Recovery] thread {} already has an unactuated ContinuationRequested — \
+                     the dispatcher's startup orphan re-dispatch owns the resume; skipping duplicate emit",
+                    thread_id
+                );
+                continue;
+            }
             crate::engine::thread_events::emit_continuation_requested_or_log(
                 &self.event_bus,
                 thread_id,
@@ -202,12 +248,109 @@ impl LucidosEngine {
         disk_id
     }
 
+    /// Is the on-disk binary a genuine UPGRADE target for this running engine —
+    /// i.e. is switching onto it a step FORWARD?
+    ///
+    /// The naive test is `disk_build_id != ENGINE_BUILD_ID`, but *different* is not
+    /// *newer*. Co-located dev workspaces share one checkout and one published
+    /// launch binary (`target/<profile>/launch/<variant>/lucidos-engine`, ADR 0022),
+    /// so the binary on disk is routinely written by something other than this
+    /// workspace — a peer's `--engine-build`, or a build whose `build.rs` ran
+    /// before an Apply moved HEAD. When what lands is OLDER than the running
+    /// engine, the difference test announces "New version available" for a
+    /// **downgrade**: switching respawns onto the old binary, which is then
+    /// genuinely behind HEAD, so self-heal rebuilds every 10s, re-surfaces the
+    /// switch, and the pair ping-pongs forever (the 2026-07-26 endless-toast loop;
+    /// `docs/plans/2026-07-26-downgrade-switch-toast-loop.md`). Publishing per
+    /// build variant removed the *wrong-configuration* half of that (ADR 0022 /
+    /// `docs/plans/2026-07-27-launch-binary-published-per-variant.md`); this guard
+    /// remains the authority on direction.
+    ///
+    /// So direction is decided by git ancestry over the two ids' commit prefixes:
+    /// a disk commit that is a STRICT ANCESTOR of the running commit is provably
+    /// older and vetoes the update. Everything indeterminate — unrelated commits, a
+    /// `src-…` (no-git) id, an unparseable id, git unavailable — falls back to the
+    /// difference test, so this removes a false positive without adding a way to
+    /// MISS a real update (a missed update strands the user on an old engine, which
+    /// is the worse failure).
+    ///
+    /// Cheap: the ancestry answer is memoized per on-disk build id
+    /// ([`DiskDirectionCache`]) — the running id is a compile-time constant, so the
+    /// pair is identified by the disk side alone — and only consulted when the ids
+    /// actually differ. `git merge-base` therefore runs at most once per distinct
+    /// on-disk binary, not once per ~4s poll.
+    pub async fn disk_binary_is_upgrade(&self) -> bool {
+        let disk = self.engine_disk_build_id().await;
+        self.disk_id_is_upgrade(disk.as_deref()).await
+    }
+
+    /// [`Self::disk_binary_is_upgrade`] for an on-disk id the caller already read,
+    /// so `version_status` reports the id and the verdict from ONE read — they
+    /// can't straddle an mtime change and disagree.
+    async fn disk_id_is_upgrade(&self, disk: Option<&str>) -> bool {
+        let Some(disk) = disk else {
+            return false; // packaged / unreadable — nothing to switch onto
+        };
+        if disk == crate::ENGINE_BUILD_ID {
+            return false; // identical build — no update, no git needed
+        }
+        disk_upgrade_verdict(Some(disk), crate::ENGINE_BUILD_ID, self.disk_is_older(disk).await)
+    }
+
+    /// Cached `git merge-base --is-ancestor <disk-commit> <running-commit>`:
+    /// `Some(true)` = the on-disk binary is provably OLDER, `Some(false)` = it
+    /// isn't, `None` = git couldn't tell. Logs the downgrade case once per distinct
+    /// on-disk build id (the cache makes that natural) so the wedge is diagnosable
+    /// from the engine log rather than only from a `version-status` fetch.
+    async fn disk_is_older(&self, disk_id: &str) -> Option<bool> {
+        {
+            let cache = self.disk_direction_cache.lock().unwrap();
+            if cache.disk_id.as_deref() == Some(disk_id) {
+                return cache.is_strict_ancestor;
+            }
+        }
+        let verdict = match (build_id_commit(disk_id), build_id_commit(crate::ENGINE_BUILD_ID)) {
+            (Some(disk_commit), Some(running_commit)) if disk_commit != running_commit => {
+                match crate::paths::repo_root() {
+                    Ok(root) => commit_is_strict_ancestor(&root, disk_commit, running_commit).await,
+                    Err(_) => None,
+                }
+            }
+            // Same commit (differing only in the uncommitted-diff suffix) → the disk
+            // binary is not an older COMMIT; a rebuilt dirty tree is a real update.
+            (Some(_), Some(_)) => Some(false),
+            // A `src-…` / empty id on either side → no commit to compare.
+            _ => None,
+        };
+        if verdict == Some(true) {
+            crate::log!(
+                "[Rebuild] on-disk engine binary ({}) is OLDER than the running engine ({}) — \
+                 not offering a downgrade as a new version. Something rebuilt an earlier checkout \
+                 state over target/debug; `web-dev.sh -w <ws> -b` rebuilds it forward.",
+                disk_id,
+                crate::ENGINE_BUILD_ID
+            );
+        }
+        let mut cache = self.disk_direction_cache.lock().unwrap();
+        cache.disk_id = Some(disk_id.to_string());
+        cache.is_strict_ancestor = verdict;
+        verdict
+    }
+
     /// Whether the engine SOURCE is behind HEAD by a restart-requiring change —
     /// a NEW engine version exists in source even if no fresh binary is on disk
     /// yet. Reuses [`Self::engine_source_matches_head`] (the SAME git classifier
     /// the frontend-only-Apply veto uses), so this signal and that veto agree by
     /// construction. TTL-cached ([`SOURCE_BEHIND_TTL`]) so the `git diff` runs at
     /// most once per interval across all polling clients. Dev-only: false packaged.
+    ///
+    /// Direction-guarded for the same reason [`Self::disk_binary_is_upgrade`] is:
+    /// `engine_source_matches_head` compares the two trees with a two-dot
+    /// `git diff <running-commit> HEAD`, which is symmetric — it reports a
+    /// difference whether HEAD is ahead of the running engine or *behind* it. An
+    /// engine running a commit that HEAD is an ancestor of is not behind anything,
+    /// so claiming otherwise would pin a permanent "New engine version pending"
+    /// toast and a 10s self-heal build storm on a workspace that is already current.
     pub async fn source_behind_head(&self) -> bool {
         if crate::runtime::is_packaged() {
             return false;
@@ -221,28 +364,53 @@ impl LucidosEngine {
         // `Some(false)` = a restart-requiring change is pending between the running
         // engine's commit and HEAD (a new engine version). `Some(true)`/`None`
         // (frontend-only / git unavailable) → not behind.
-        let behind = self.engine_source_matches_head().await == Some(false);
+        let behind =
+            self.engine_source_matches_head().await == Some(false) && !self.running_is_ahead_of_head().await;
         let mut cache = self.source_behind_cache.lock().unwrap();
         cache.checked_at = Some(Instant::now());
         cache.behind = behind;
         behind
     }
 
+    /// Is the running engine's commit a strict DESCENDANT of HEAD — i.e. is this
+    /// engine ahead of the checkout rather than behind it? The direction guard for
+    /// [`Self::source_behind_head`]; `false` whenever git can't tell, so an
+    /// indeterminate answer leaves today's behavior untouched.
+    async fn running_is_ahead_of_head(&self) -> bool {
+        let Some(running_commit) = build_id_commit(crate::ENGINE_BUILD_ID) else {
+            return false; // `src-…` / unstamped id — no commit to compare
+        };
+        let Ok(root) = crate::paths::repo_root() else {
+            return false;
+        };
+        let Some(head) = current_head_sha().await else {
+            return false;
+        };
+        commit_is_strict_ancestor(&root, &head, running_commit).await == Some(true)
+    }
+
     /// Full version status for `GET /api/v1/engine/version-status`. A newer engine
-    /// is available when the on-disk build id is readable and differs from the
-    /// running one (always false in packaged, where `disk_build_id` is `None`).
+    /// is available when the on-disk binary is readable, differs from the running
+    /// one, and is not provably OLDER than it ([`Self::disk_binary_is_upgrade`] —
+    /// always false in packaged, where `disk_build_id` is `None`).
     pub async fn version_status(&self) -> VersionStatus {
         let disk_build_id = self.engine_disk_build_id().await;
+        let update_available = self.disk_id_is_upgrade(disk_build_id.as_deref()).await;
         let source_behind_head = self.source_behind_head().await;
+        // Cheap non-blocking flock try (a couple of syscalls) — no TTL cache
+        // needed, unlike `source_behind_head` which forks `git`. False packaged.
+        // Uses the fail-OPEN-to-false probe (an indeterminate probe must not read
+        // as "a build is running" — that would hide the Rebuild escape hatch).
+        let shared_build_in_progress =
+            !crate::runtime::is_packaged() && shared_engine_build_lock_held();
         VersionStatus {
             build_id: crate::ENGINE_BUILD_ID.to_string(),
-            update_available: disk_build_id
-                .as_deref()
-                .is_some_and(|id| id != crate::ENGINE_BUILD_ID),
+            update_available,
             disk_build_id,
             packaged: crate::runtime::is_packaged(),
             build_state: self.build_state().as_wire(),
             source_behind_head,
+            shared_build_in_progress,
         }
     }
 
@@ -256,10 +424,16 @@ impl LucidosEngine {
     /// Coordinated + bounded:
     /// - Skips when a co-located engine is already building (shared-lock probe),
     ///   so the N workspaces don't stampede the shared `target/`.
-    /// - Skips when a fresh binary IS on disk (`disk != running`) — the Switch is
-    ///   already surfaced via `update_available`; switching, not rebuilding, is next.
+    /// - Skips when a genuine UPGRADE is already on disk
+    ///   ([`Self::disk_binary_is_upgrade`]) — the Switch is already surfaced via
+    ///   `update_available`; switching, not rebuilding, is next. Deliberately the
+    ///   SAME question `update_available` asks, so the two can never disagree: a
+    ///   bare `disk != running` here would also read an OLDER on-disk binary as
+    ///   "fresh" and suppress the very rebuild that would fix it.
     /// - Bounded to [`SELF_HEAL_MAX_ATTEMPTS_PER_HEAD`] per HEAD so a genuinely
     ///   broken `main` can't spin builds forever; the count resets when HEAD moves.
+    /// - Gives up immediately once a rebuild it triggered SUCCEEDED without
+    ///   advancing the binary ([`self_heal_is_wedged`]) — retrying cannot fix that.
     ///
     /// No-op packaged / when git is unavailable. Driven by the dev periodic loop
     /// (`frontend_refresh::spawn_served_frontend_sync`).
@@ -276,23 +450,48 @@ impl LucidosEngine {
         if self.build_state() == BuildState::Building {
             return;
         }
-        // A fresh binary is already on disk → the Switch is surfaced via
-        // `update_available`; don't rebuild (switching is the next step). `None`
-        // (binary mid-rewrite / unreadable) → retry next tick.
-        match self.engine_disk_build_id().await {
-            Some(disk) if disk != crate::ENGINE_BUILD_ID => return,
-            None => return,
-            _ => {} // disk == running → the binary is stale; a rebuild is needed.
+        // An upgrade is already on disk → the Switch is surfaced via
+        // `update_available`; don't rebuild (switching is the next step). An
+        // unreadable disk id reads as "no upgrade" and falls through to the rebuild,
+        // which is the safe direction: at worst we rebuild a binary that was already
+        // fine, and the attempt cap bounds it.
+        if self.disk_binary_is_upgrade().await {
+            return;
         }
         let head = current_head_sha().await;
+        // Read the build state at DECISION time, not before the awaits above — a
+        // rebuild can start (Apply) or finish during them, and judging "did my
+        // rebuild succeed?" from a stale value would give up on a live build.
+        let build_state = self.build_state();
         {
             let mut sh = self.self_heal_state.lock().unwrap();
             if sh.head != head {
                 sh.head = head;
                 sh.attempts = 0;
             }
+            // Budget spent for this HEAD → stay silent until a new commit lands.
+            // Checked BEFORE the wedge branch below so the give-up is announced
+            // exactly once: the wedge condition stays true on every later tick
+            // (nothing clears Ready), and re-evaluating it first would re-log the
+            // same line every 10s — the very noise this whole change removes.
             if sh.attempts >= SELF_HEAL_MAX_ATTEMPTS_PER_HEAD {
-                return; // gave up for this HEAD until a new commit lands.
+                return;
+            }
+            // A rebuild we triggered for this HEAD finished successfully and STILL
+            // left no upgrade on disk. That is a wedged build configuration (a
+            // no-op cargo run whose uplifted binary predates the running engine, a
+            // peer overwriting `target/debug` from an older checkout state), and no
+            // number of retries fixes it — burn the budget and say so once instead
+            // of rebuilding every 10s forever (the 152-build storm of 2026-07-26).
+            if self_heal_is_wedged(sh.attempts, &build_state) {
+                sh.attempts = SELF_HEAL_MAX_ATTEMPTS_PER_HEAD;
+                crate::log!(
+                    "[Rebuild] self-heal: a rebuild succeeded but the on-disk binary is still not \
+                     newer than the running engine ({}) — giving up for this HEAD. Rebuild \
+                     manually with `web-dev.sh -w <ws> -b`.",
+                    crate::ENGINE_BUILD_ID
+                );
+                return;
             }
             // Don't stampede a peer that's already building (racy probe; the
             // in-build lock in `run_engine_build` is the real guard). Quick
@@ -424,6 +623,9 @@ fn try_lock_file(lock_path: &std::path::Path) -> Option<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
+        // The file is a pure `flock` handle — nothing is ever written into it,
+        // so never truncate: a peer may already hold this same path open.
+        .truncate(false)
         .open(lock_path)
         .ok()?;
     fs2::FileExt::try_lock_exclusive(&file).ok()?;
@@ -443,6 +645,147 @@ fn engine_build_in_progress_elsewhere() -> bool {
             false
         }
         None => true,
+    }
+}
+
+/// Whether the checkout-shared engine-build lock is **definitely** held right now
+/// — a build IS running (this engine's own or a co-located peer's). Drives the
+/// `shared_build_in_progress` version-status field.
+///
+/// Deliberately the INVERSE fail-mode of [`engine_build_in_progress_elsewhere`]:
+/// that one treats a probe it can't run (unresolvable repo root, unopenable lock
+/// file) as "busy" so the self-heal driver errs toward NOT stampeding a peer.
+/// This one **fails open to `false`** — the wire field suppresses the manual
+/// "Rebuild" escape hatch and shows the building spinner, so an *indeterminate*
+/// probe must never read as "a build is running": that would hide the escape
+/// hatch indefinitely while no build can advance the binary (the genuinely-stuck
+/// case must still surface Rebuild). Returns `true` ONLY when the non-blocking
+/// `flock` fails with `WouldBlock` (the lock is genuinely held); a free lock or
+/// any probe failure (no checkout, unopenable / unlockable-for-other-reasons
+/// file) returns `false`.
+fn shared_engine_build_lock_held() -> bool {
+    match engine_build_lock_path() {
+        Some(path) => lock_held_at(&path),
+        None => false, // no checkout to coordinate on → not a shared build
+    }
+}
+
+/// Path-parameterized core of [`shared_engine_build_lock_held`] — split out so the
+/// held/free/indeterminate detection is unit-testable without a repo checkout.
+/// Returns `true` ONLY when a non-blocking `flock` fails with `WouldBlock` (the
+/// lock is genuinely held by some open file description). A free lock, an
+/// unopenable file, or any other lock error returns `false` (fail open — see the
+/// caller's doc comment).
+fn lock_held_at(path: &std::path::Path) -> bool {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        // Probe-only open: never truncate the lock file a peer may be holding.
+        .truncate(false)
+        .open(path)
+    else {
+        return false; // can't open the probe file → indeterminate → fail open
+    };
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            // Acquired → held by no one; release immediately.
+            let _ = fs2::FileExt::unlock(&file);
+            false
+        }
+        // WouldBlock == another open file description holds it → genuinely busy.
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+        // Any other error is indeterminate → fail open so Rebuild stays available.
+        Err(_) => false,
+    }
+}
+
+/// The commit prefix of an engine build id, or `None` when there isn't one.
+///
+/// `build.rs` stamps `<short-sha>` for a clean tree and `<short-sha>-<diffhash>`
+/// when engine source is dirty, falling back to `src-<hash>` with no git. Only the
+/// commit is comparable across two binaries, so split at the first `-` and reject
+/// the no-git / unstamped forms. Pure — the ancestry decision's parsing half.
+fn build_id_commit(id: &str) -> Option<&str> {
+    if id.is_empty() || id.starts_with("src") {
+        return None;
+    }
+    let commit = id.split('-').next().unwrap_or("");
+    (!commit.is_empty()).then_some(commit)
+}
+
+/// Is the on-disk binary a genuine upgrade, given its id, the running id, and the
+/// ancestry answer (`Some(true)` = disk commit is a strict ancestor of the running
+/// commit, i.e. provably older; `None` = git couldn't tell)?
+///
+/// Pure so the whole decision is unit-testable without a repo. The rule: an
+/// upgrade is a readable, DIFFERENT id that is not provably older. Indeterminate
+/// ancestry keeps the historical difference test — missing a real update (the user
+/// stranded on an old engine with no Switch) is worse than the occasional
+/// unresolvable id being offered.
+fn disk_upgrade_verdict(
+    disk_id: Option<&str>,
+    running_id: &str,
+    disk_is_strict_ancestor: Option<bool>,
+) -> bool {
+    match disk_id {
+        Some(disk) => disk != running_id && disk_is_strict_ancestor != Some(true),
+        None => false,
+    }
+}
+
+/// Has self-heal proved that rebuilding cannot help for this HEAD? True when it
+/// already triggered a rebuild in this process (`attempts > 0`) and that rebuild
+/// finished SUCCESSFULLY (`Ready`) — the caller only reaches this after
+/// establishing that no upgrade is on disk, so a successful build that produced
+/// nothing newer is a wedged configuration, not a transient miss.
+///
+/// `Failed` deliberately does NOT count: a compile error is exactly what self-heal
+/// exists to retry (`docs/plans/2026-07-03-engine-version-switch-selfheal.md`), and
+/// it keeps the per-HEAD attempt cap. Pure.
+fn self_heal_is_wedged(attempts: u32, build_state: &BuildState) -> bool {
+    attempts > 0 && *build_state == BuildState::Ready
+}
+
+/// Is `ancestor` a STRICT ancestor of `descendant` (`git merge-base
+/// --is-ancestor`, plus the two being different commits)? `None` when git can't
+/// answer — no repo, an unknown commit (shallow clone, force-pushed away), or a
+/// command failure — so callers can distinguish "provably older" from "don't know".
+///
+/// The gateway carries a hand-synced copy of this (and of [`build_id_commit`] /
+/// [`disk_upgrade_verdict`]) in `crates/lucidos-gateway/src/build_id.rs` — ADR
+/// 0014 §1 keeps that crate free of any dependency on the engine. **Keep the two
+/// in step**, as with `path_is_in_cc_worktree`'s three copies.
+///
+/// Takes `root` rather than resolving it internally so the tests can drive it
+/// against a throwaway repo.
+///
+/// STRICT is enforced here, not by git: `git merge-base --is-ancestor X X` exits 0
+/// (a commit is its own ancestor), so the same commit must be screened out first.
+/// The screen is prefix-aware because the two sides arrive at different lengths —
+/// build ids carry git's SHORT sha while `current_head_sha` returns the full one —
+/// and a plain `==` would let `aa7075ee2` vs `aa7075ee2e8e…` through as "older".
+async fn commit_is_strict_ancestor(
+    root: &std::path::Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Option<bool> {
+    if ancestor.starts_with(descendant) || descendant.starts_with(ancestor) {
+        return Some(false); // same commit (possibly abbreviated) — not OLDER
+    }
+    let out = tokio::process::Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(root)
+        .output()
+        .await
+        .ok()?;
+    match out.status.code() {
+        Some(0) => Some(true),  // is an ancestor
+        Some(1) => Some(false), // is not an ancestor
+        // Any other code is an error (bad object, not a repo) — not a verdict.
+        _ => None,
     }
 }
 
@@ -528,7 +871,37 @@ async fn run_engine_build(workspace: &std::path::Path) -> EngineBuildOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::try_lock_file;
+    use super::{
+        build_id_commit, commit_is_strict_ancestor, disk_upgrade_verdict, lock_held_at,
+        self_heal_is_wedged, try_lock_file, BuildState,
+    };
+
+    /// Poll `cond` until it holds, up to ~2 s.
+    ///
+    /// Releasing an `flock` is only *eventually* observable in a process that
+    /// spawns subprocesses. The lock belongs to the open file description, and
+    /// `fork` hands the child a reference to that same description — so until
+    /// the child reaches `exec` (where `O_CLOEXEC` drops it) the lock stays
+    /// alive even though the owner closed its own fd. The suite forks
+    /// constantly (`engine::tools::bash`, `runtime::python`, `core::shell`), and
+    /// under full-suite load a forked child can be descheduled between fork and
+    /// exec for long enough to be caught by a probe fired microseconds after a
+    /// drop. That made both lock tests flake roughly one full run in three.
+    ///
+    /// The retry is not a weakened assertion: nothing about the release path is
+    /// instantaneous by contract, and production agrees — the real consumer
+    /// (`engine_build_in_progress_elsewhere`) treats an un-acquirable lock as
+    /// "a peer is building, skip this tick and retry". The *held* direction is
+    /// still asserted immediately; only the released direction is given time.
+    fn eventually(cond: impl Fn() -> bool) -> bool {
+        for _ in 0..200 {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
 
     /// The load-bearing single-builder invariant: while one holder has the build
     /// lock, no other acquire succeeds; the lock releases on drop. `flock` is
@@ -541,14 +914,191 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".lucidos-engine-build.lock");
 
-        let held = try_lock_file(&path).expect("first acquire succeeds");
+        let held = eventually_acquire(&path);
         assert!(
             try_lock_file(&path).is_none(),
             "a second acquire must fail while the lock is held (single builder)"
         );
         drop(held);
-        let reacquired = try_lock_file(&path).expect("acquire succeeds again after release");
-        drop(reacquired);
+        assert!(
+            eventually(|| try_lock_file(&path).is_some()),
+            "the lock must become acquirable again after release"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Take the lock, tolerating a transient hold by a concurrently-forked
+    /// child that hasn't reached `exec` yet. See [`eventually`].
+    fn eventually_acquire(path: &std::path::Path) -> std::fs::File {
+        for _ in 0..200 {
+            if let Some(file) = try_lock_file(path) {
+                return file;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("could not acquire {} within 2 s", path.display());
+    }
+
+    /// The `shared_build_in_progress` fail-OPEN contract: the held-detection probe
+    /// reports `true` ONLY while the lock is genuinely held, and `false` on a free
+    /// lock — so an idle/free (or indeterminate) probe can never hide the manual
+    /// "Rebuild" escape hatch behind a phantom spinner.
+    #[test]
+    fn lock_held_at_reports_held_only_while_genuinely_locked() {
+        let dir =
+            std::env::temp_dir().join(format!("lucidos-heldprobe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".lucidos-engine-build.lock");
+
+        // Free lock → not held (fail open: escape hatch stays available).
+        assert!(
+            eventually(|| !lock_held_at(&path)),
+            "an unlocked path must read as NOT held"
+        );
+        // Held by another open file description → genuinely busy (WouldBlock).
+        // This direction is immediate — nothing can make a held lock look free.
+        let held = eventually_acquire(&path);
+        assert!(
+            lock_held_at(&path),
+            "a held lock must read as held (flock WouldBlock)"
+        );
+        // Released → free again (see `eventually`: a forked child can hold the
+        // inherited description for a beat after we close ours).
+        drop(held);
+        assert!(
+            eventually(|| !lock_held_at(&path)),
+            "a released lock must read as NOT held again"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_id_commit_takes_the_sha_and_rejects_the_no_git_forms() {
+        assert_eq!(build_id_commit("aa7075ee2"), Some("aa7075ee2"));
+        // Dirty tree: `<sha>-<diffhash>` — only the sha is comparable.
+        assert_eq!(build_id_commit("aa7075ee2-0badc0ffee123456"), Some("aa7075ee2"));
+        // No git (shipped build) / unstamped → nothing to compare.
+        assert_eq!(build_id_commit("src-0123456789abcdef"), None);
+        assert_eq!(build_id_commit(""), None);
+        assert_eq!(build_id_commit("-abc"), None);
+    }
+
+    /// The 2026-07-26 loop in one assertion set: a DIFFERENT on-disk binary is an
+    /// update only when it isn't provably OLDER. Everything indeterminate keeps the
+    /// historical difference test, so this can only remove a false positive.
+    #[test]
+    fn disk_upgrade_verdict_offers_only_a_step_forward() {
+        // The live bug: disk `71c8d39b1` is an ancestor of running `aa7075ee2`.
+        assert!(
+            !disk_upgrade_verdict(Some("71c8d39b1"), "aa7075ee2", Some(true)),
+            "an older on-disk binary is a DOWNGRADE and must not be offered"
+        );
+        // The normal case: a newer binary was built (not an ancestor).
+        assert!(disk_upgrade_verdict(Some("bb1122334"), "aa7075ee2", Some(false)));
+        // Same id → nothing to switch onto, whatever git says.
+        assert!(!disk_upgrade_verdict(Some("aa7075ee2"), "aa7075ee2", Some(false)));
+        // Unreadable disk id (packaged / mid-rewrite) → no update.
+        assert!(!disk_upgrade_verdict(None, "aa7075ee2", None));
+        // Indeterminate ancestry (unrelated commits, no repo, unknown object) →
+        // fall back to "different is an update": never MISS a real one.
+        assert!(disk_upgrade_verdict(Some("cc9988776"), "aa7075ee2", None));
+        // Same commit, different uncommitted diff → a real rebuild, so an update.
+        assert!(disk_upgrade_verdict(
+            Some("aa7075ee2-0badc0ffee123456"),
+            "aa7075ee2",
+            Some(false)
+        ));
+    }
+
+    /// Retrying a rebuild is only futile once one has SUCCEEDED without advancing
+    /// the binary. A failed build keeps its retry budget — that is the case
+    /// self-heal exists for.
+    #[test]
+    fn self_heal_gives_up_only_after_a_successful_build_changed_nothing() {
+        assert!(self_heal_is_wedged(1, &BuildState::Ready));
+        assert!(self_heal_is_wedged(3, &BuildState::Ready));
+        // Nothing tried yet this process (e.g. a fresh start, or a peer built) →
+        // the Ready state isn't ours to conclude from.
+        assert!(!self_heal_is_wedged(0, &BuildState::Ready));
+        // A compile error is retryable, not wedged.
+        assert!(!self_heal_is_wedged(1, &BuildState::Failed));
+        // Idle: no build outcome to judge (the caller already excluded Building).
+        assert!(!self_heal_is_wedged(1, &BuildState::Idle));
+        // Deliberately still true at the cap: nothing clears `Ready`, so the
+        // predicate stays hot on every later tick. That is WHY the caller checks
+        // the spent budget FIRST — otherwise the give-up line would re-log every
+        // 10s instead of once. Reordering those two checks reintroduces a log storm.
+        assert!(self_heal_is_wedged(super::SELF_HEAL_MAX_ATTEMPTS_PER_HEAD, &BuildState::Ready));
+    }
+
+    /// The real git probe behind the direction check, against a throwaway repo:
+    /// ancestor → `Some(true)`, the reverse → `Some(false)`, an unknown object →
+    /// `None` (so an unresolvable id can't be mistaken for "provably older").
+    #[tokio::test]
+    async fn commit_is_strict_ancestor_reads_history_direction() {
+        let dir = std::env::temp_dir().join(format!(
+            "lucidos-ancestry-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git runs in the test environment")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "first"]);
+        let first = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        std::fs::write(dir.join("a.txt"), "two").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "second"]);
+        let second = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        assert_eq!(
+            commit_is_strict_ancestor(&dir, &first, &second).await,
+            Some(true),
+            "the earlier commit IS a strict ancestor of the later one"
+        );
+        assert_eq!(
+            commit_is_strict_ancestor(&dir, &second, &first).await,
+            Some(false),
+            "the later commit is NOT an ancestor of the earlier one"
+        );
+        assert_eq!(
+            commit_is_strict_ancestor(&dir, &first, &first).await,
+            Some(false),
+            "a commit is not a STRICT ancestor of itself"
+        );
+        // The abbreviation trap: build ids carry the SHORT sha while HEAD arrives
+        // full, and `git merge-base --is-ancestor X X` exits 0 — so without the
+        // prefix-aware screen the same commit would read as "provably older".
+        assert_eq!(
+            commit_is_strict_ancestor(&dir, &second[..9], &second).await,
+            Some(false),
+            "the same commit abbreviated is still not a strict ancestor of itself"
+        );
+        assert_eq!(
+            commit_is_strict_ancestor(&dir, "0000000000000000000000000000000000000000", &second)
+                .await,
+            None,
+            "an unknown object is indeterminate, never 'provably older'"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

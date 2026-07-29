@@ -47,9 +47,17 @@ export type InlineForm =
   | { type: 'app-edit'; appId: string }
   | { type: 'new-app' }
   | { type: 'trigger'; triggerId?: string }
-  | { type: 'email-confirm'; request: EmailConfirmRequest }
+  | { type: 'email-confirm'; request: EmailConfirmRequest; sentAt?: string }
   | { type: 'plugin-install'; request: PluginInstallRequest }
   | { type: 'plugin-uninstall'; request: PluginUninstallRequest };
+
+/** The email confirmation panel, before or after the send. `sentAt` (an ISO
+ *  timestamp) present ⇒ the email went out and the panel is a read-only receipt;
+ *  one field rather than a `sent` boolean + timestamp pair, so the two can't
+ *  desync. The marker lives on the form — persisted panel state — rather than in
+ *  component state, so an already-sent email can never present a Send button
+ *  again after a remount (a Back/Forward walk onto the entry, or a reload). */
+export type EmailConfirmForm = Extract<InlineForm, { type: 'email-confirm' }>;
 
 // --- Panel overlay (discriminated union replacing 6 independent signals) ---
 export type PanelOverlay =
@@ -1533,6 +1541,34 @@ export const engineVersionReady = signal(false);
 // brand badge. Always false in packaged builds (no background build there).
 export const engineBuilding = signal(false);
 
+/** Whether a new engine version is actually READY to switch onto — the honest
+ *  "ready for the switch" signal that agrees with the background-build scheme.
+ *  Lives here (not in a component) so BOTH the control-panel badge/reload-glyph
+ *  AND the restart progress-toast wording (chat-changes.ts `initiateEngineRestart`)
+ *  derive from the SAME predicate — the toast must never disagree with the badge —
+ *  without a chat-changes ↔ ControlPanel import cycle (same reasoning as
+ *  NEW_VERSION_TOAST_KEY below).
+ *
+ *  In **dev** this is `engineVersionReady` alone: Apply is non-disruptive and
+ *  kicks off a background rebuild, so a freshly-applied restart-requiring change
+ *  (`restartRequired`) does NOT mean a new version exists yet — the switch only
+ *  becomes available once that build finishes and the on-disk binary differs
+ *  (the version-status poll flips `engineVersionReady`, see engine-update.ts).
+ *  Restarting during the build window respawns the OLD binary, so keying off
+ *  `restartRequired` here would falsely claim a new version.
+ *
+ *  In **packaged** there is no background build — a newer GitHub release is
+ *  immediately installable — so `restartRequired` (set from the outdated-release
+ *  check in connection.ts) IS the ready signal; `engineVersionReady` never fires
+ *  there (the poll no-ops for packaged builds).
+ *
+ *  Note: `restartRequired` deliberately still gates the client-refresh ordering
+ *  (client-update.ts holds a refresh until after the engine switch, even during
+ *  the build window) — that is a different concern from this visible signal. */
+export function engineNewVersionReady(): boolean {
+  return engineVersionReady.value || (enginePackaged.value && restartRequired.value);
+}
+
 // Toast key for the poll-driven "New version available → Switch to new version"
 // info toast (store/actions/engine-update.ts). Lives here (not in engine-update.ts)
 // so `initiateEngineRestart` (chat-changes.ts) can dismiss it when a switch begins
@@ -1549,6 +1585,13 @@ export const NEW_VERSION_TOAST_KEY = 'engine-new-version';
 // so initiateEngineRestart (chat-changes.ts) can collapse it into the switch
 // progress toast without an import cycle — same pattern as NEW_VERSION_TOAST_KEY.
 export const FRONTEND_UPDATE_DEFERRED_TOAST_KEY = 'engine-frontend-update-deferred';
+
+// Sibling of the key above for the STRANDED case (handleFrontendUpdateStranded):
+// the frontend change rebuilt but the engine serves a dist/ that will never
+// receive it, so no Switch will deliver it. A separate key so a stranded warning
+// can't be coalesced into — or dismissed by — the "arrives on Switch" hint, which
+// would be actively misleading.
+export const FRONTEND_UPDATE_STRANDED_TOAST_KEY = 'engine-frontend-update-stranded';
 
 // --- Service worker build id ---
 /** BUILD_ID of the active service worker (stamped into sw.js by the

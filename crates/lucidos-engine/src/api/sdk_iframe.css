@@ -83,7 +83,11 @@ html, html[data-theme="dark"] {
        toward --accent. Keep in sync with base.css. */
     --accent-action: color-mix(in srgb, var(--brand-blue) 82%, var(--accent));
     --accent-green: #3fb950;
-    --accent-yellow: #d29922;
+    /* Caution. Muted sand, not a saturated gold — the previous #d29922 read as
+       brown on the navy theme. Keep in sync with base.css. (The host also has
+       --accent-notable for neutral "notable state" markers; it is deliberately
+       NOT served to apps, so don't reference it from shared-components.css.) */
+    --accent-yellow: #d9c48f;
     --accent-red: #f85149;
     --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.3);
     --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.4);
@@ -110,7 +114,9 @@ html[data-theme="light"] {
        base.css. */
     --accent-action: var(--brand-blue);
     --accent-green: #1a7f37;
-    --accent-yellow: #9a6700;
+    /* Caution — light-mode sand, darkened to clear AA on white. Keep in sync
+       with base.css. */
+    --accent-yellow: #8a6d2f;
     --accent-red: #cf222e;
     --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.08);
     --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.1);

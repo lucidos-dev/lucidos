@@ -7,6 +7,13 @@
     height: 100dvh;
     width: 100vw;
     overflow: hidden;
+    /* Opaque base surface so the panes (which are transparent and would
+       otherwise show the document background) never reveal the boot-splash brand
+       gradient painted on <html>/<body>. That gradient is reverted to
+       var(--bg-primary) only AFTER the splash node is removed at the end of its
+       fade-out (bootSplash.ts / index.html), so without this the panels flash
+       blue for the ~0.45s the splash spends fading. */
+    background: var(--bg-primary);
 }
 
 /* Reclaimed macOS title-bar band. Under the packaged macOS Tauri build
@@ -19,7 +26,11 @@
    `titlebar_inset_script` in src-tauri lib.rs); everywhere else (web, PWA,
    non-macOS) the var is unset, so the strip is 0px tall and the layout is
    byte-for-byte identical to before. The header and everything below it are
-   untouched — only this band is added on top. */
+   untouched — only this band is added on top.
+
+   This background is the BASE color only: the focused pane's .header-focus-wash
+   rises out of the header and tints its own segment of this band too (see that
+   rule), so the focused pane reads as painted to the very top of the window. */
 .titlebar-strip {
     flex: none;
     height: var(--titlebar-inset, 0px);
@@ -452,15 +463,18 @@
         opacity: 0;
     }
 
-    /* Content-side header region — a flex container pinned between the split
-       divider and the header's right padding. panel-nav (left) and the action
-       icons (right) sit at the two edges (space-between); the title is
-       absolutely centered between them (below) so it lines up with the focus
-       pill on the pane's true middle, instead of centering in the leftover gap. */
+    /* Content-side header region — a TRUE 3-zone flex row pinned between the
+       split divider and the header's right padding: panel-nav (flex-shrink:0)
+       | title zone (flex:1, min-width:0) | action icons (flex-shrink:0). The
+       title is a flex CHILD between its siblings, so it structurally cannot
+       overlap them — it shrinks and ellipsizes instead (see
+       .pane-header-content-title below). Don't reintroduce absolutely-
+       positioned children with hardcoded width reservations here (the old
+       translate(-50%) title + `max-width: calc(100% - 12rem)` reserve let the
+       title slide under the icons). */
     .app-header .content-header-elements {
         display: flex;
         align-items: center;
-        justify-content: space-between;
         gap: 0.25rem;
         position: absolute;
         left: calc(var(--divider-x) + var(--divider-width));
@@ -550,11 +564,14 @@
 
     /* Title fills the space after the Filter button (flex:1, so the search icon
        stays pinned right) and CENTERS in that gap — i.e. midway between the
-       Filter button on its left and the Search icon on its right. The
+       Filter button on its left and the Search icon on its right. min-width:0
+       lets it shrink below its text so it ellipsizes in a narrow drawer instead
+       of colliding with the buttons (which are flex-shrink:0 below). The
        needs-attention badge is absolutely positioned so it can't shift the
        title as the count appears/clears. */
     .threads-header-title {
         flex: 1;
+        min-width: 0;
         font-size: var(--font-size-lg);
         font-weight: 600;
         color: var(--text-primary);
@@ -562,6 +579,11 @@
         text-align: center;
         overflow: hidden;
         text-overflow: ellipsis;
+    }
+
+    /* The filter/search buttons never shrink — the title gives way instead. */
+    .threads-header .threads-header-btn {
+        flex-shrink: 0;
     }
 
     /* Brand area spans from drawer edge to split divider. Children flow
@@ -593,7 +615,13 @@
        The reserve on
        each side clears the nav-group / actions clusters. pointer-events:none lets
        the transparent box pass clicks through to those clusters and the brand's
-       own focus-on-click; the visible children re-enable pointer events. */
+       own focus-on-click; the visible children re-enable pointer events.
+       overflow-x:clip guarantees horizontal non-overlap at narrow chat-pane
+       widths: content that can't shrink further (badge, status dot) clips at the
+       box edges — which sit inside the side reserves — instead of spilling over
+       the clusters. overflow-y stays visible (matching the parent .pane-header-brand
+       above) so the brand-badge's upward `top:-0.25rem` superscript shift isn't
+       clipped at the box's top edge — plain `overflow:hidden` cropped it. */
     .app-header .pane-header-brand .pane-header-brand-label {
         position: absolute;
         left: 50%;
@@ -601,6 +629,8 @@
         transform: translate(-50%, -50%);
         width: calc(100% - 2 * var(--collapsed-thread-actions-width));
         justify-content: center;
+        overflow-x: clip;
+        overflow-y: visible;
         pointer-events: none;
     }
 
@@ -608,30 +638,25 @@
         pointer-events: auto;
     }
 
-    /* Panel title absolutely centered on the content pane's true middle. The
-       +--header-padding-x/2 nudge compensates for this region stopping
-       --header-padding-x short of the header's right edge while the content pane
-       spans to the header edge — without it the title sits half the padding left
-       of the pane's true center. max-width reserves room each side for panel-nav
-       and the action icons; the title ellipsizes before reaching them.
-       pointer-events:none (with auto children) keeps the icons beneath it live. */
+    /* Panel title — the middle flex zone of the 3-zone row above. flex:1 +
+       min-width:0 are the structural non-overlap guarantee: the zone shrinks
+       between panel-nav and the action icons instead of bleeding under them.
+       justify-content:center centers the title in the zone while it fits;
+       once the text outgrows the zone, the inner span (a min-width:0 flex
+       item) shrinks to the zone's width and clips with an ellipsis on its
+       RIGHT edge — the left edge always stays clear of the nav buttons. */
     .app-header .pane-header-content-title {
-        position: absolute;
-        left: calc(50% + var(--header-padding-x) / 2);
-        top: 50%;
-        transform: translate(-50%, -50%);
-        max-width: calc(100% - 12rem);
+        flex: 1 1 auto;
+        min-width: 0;
         display: flex;
         align-items: center;
         justify-content: center;
         gap: var(--dot-gap);
-        pointer-events: none;
         font-size: var(--font-size-lg);
         font-weight: 600;
         color: var(--text-primary);
         white-space: nowrap;
         overflow: hidden;
-        text-overflow: ellipsis;
     }
 
     .app-header .pane-header-content-title .pane-header-title-text,
@@ -639,7 +664,6 @@
         min-width: 0;
         overflow: hidden;
         text-overflow: ellipsis;
-        pointer-events: auto;
     }
 
     /* Focused-pane wash: a faint lighter-blue overlay filling the focused pane's
@@ -660,7 +684,19 @@
     .header-focus-wash {
         display: block;
         position: absolute;
-        top: 0;
+        /* Rise OUT of the header, up through the reclaimed macOS title-bar band,
+           so the focused pane is painted all the way to the top edge of the
+           window (traffic-light band included) rather than stopping at the
+           header's top and leaving an unwashed strip above it. --titlebar-inset
+           is the .titlebar-strip height — set only by the macOS Tauri build
+           (`titlebar_inset_script` in lib.rs) and unset everywhere else, so on
+           web / PWA / non-macOS this is `top: 0` and the wash is unchanged.
+           Painting over the strip works without a z-index: .app-header is
+           position:relative here and .titlebar-strip is a static sibling, so the
+           header's whole subtree paints after the strip's background. The strip
+           keeps its solid --titlebar-strip-bg as the base — this only tints the
+           focused pane's segment of it, matching the header below. */
+        top: calc(-1 * var(--titlebar-inset, 0px));
         bottom: 0;
         left: 0;
         width: 0;

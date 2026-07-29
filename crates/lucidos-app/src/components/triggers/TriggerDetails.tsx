@@ -13,6 +13,7 @@ import { fetchEventTypes } from '../../api/client';
 import { resizeTextarea, useFontMetricsResize } from '../chat/promptResize';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
+import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 
 const NEW_GROUP_SENTINEL = '__new_group__';
 
@@ -350,6 +351,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
               onInput={(e) => setName((e.target as HTMLInputElement).value)}
               placeholder="e.g. Morning Brief"
               required
+              {...PROSE_TEXT_ATTRS}
             />
           </div>
 
@@ -368,6 +370,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                 autoFocus
                 value={newGroupDraft}
                 placeholder="New group name"
+                {...PROSE_TEXT_ATTRS}
                 onInput={e => setNewGroupDraft((e.target as HTMLInputElement).value)}
                 onBlur={commitNewGroupDraft}
                 onKeyDown={e => {
@@ -552,6 +555,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                   onInput={(e) => setIntentText((e.target as HTMLTextAreaElement).value)}
                   placeholder="e.g. Check my calendar and send me a summary of today's events"
                   rows={1}
+                  {...PROSE_TEXT_ATTRS}
                 />
               </div>
             </div>

@@ -14,7 +14,7 @@ import { toFailed } from '../types';
 import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { postClientLog } from '../../utils/liveness';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
-import { pendingComposePuts, composeEditedAt, composePutSettledAt, hasLocalDraftEdit } from './compose';
+import { pendingComposePuts, composeEditedAt, composePutSettledAt, hasUnsentLocalDraft, clearSupersededDraft, noteServerDraft } from './compose';
 
 /** Buffer for batched compose draft writes during loadAllThreads — hundreds
  *  of threads through the upsertThread loop should land in one signal write,
@@ -104,6 +104,12 @@ function stageDraftFromApi(info: ThreadSummary, batch?: DraftBatch): void {
   // The backend column is still named `compose_images` (Phase 5 cleanup
   // will rename it); post-migration the JSONB array contains hash strings.
   const image_hashes = info.compose_images || [];
+  // The snapshot is the server telling us what it holds — record it before any
+  // guard, since the guard below may keep a local draft the server no longer
+  // has, and that difference is exactly what `serverDraft` exists to state.
+  // Callers gate this whole function on the staleness guards, so a snapshot
+  // known to predate a local write never lands here.
+  noteServerDraft(info.thread_id, text, image_hashes);
   const mode = info.compose_mode ?? null;
   const isEmpty = composeSnapshotIsEmpty(info);
   // A bulk loadAllThreads/upsert snapshot must NEVER clear a non-empty draft
@@ -115,13 +121,15 @@ function stageDraftFromApi(info: ThreadSummary, batch?: DraftBatch): void {
   // composeEditedAt / composePutSettledAt) catch that post-settle stale-empty
   // read, so without this it blanks the just-typed draft (the value='' face of
   // mobile-webkit drafts.spec.ts:65 — and a real way a transient sync failure
-  // silently drops an unsent draft). Gate on `composeEditedAt.has` so this only
-  // protects locally-authored drafts: a server-ORIGINATED draft (cross-device,
-  // never edited here) can still be cleared by a snapshot, and a peer's clear
-  // still flows through the SSE `ThreadComposeChanged` path. The kept draft is
-  // local-view only — it schedules no PUT, so it never resurrects server-side
-  // unless the user resumes editing it.
-  if (isEmpty && hasLocalDraftEdit(info.thread_id)) {
+  // silently drops an unsent draft). Gate on `hasUnsentLocalDraft` so this only
+  // protects locally-authored drafts that are genuinely unsent: a
+  // server-ORIGINATED draft (cross-device, never edited here) can still be
+  // cleared by a snapshot, a draft the thread's history shows was already
+  // submitted is cleared too, and a peer's clear still flows through the SSE
+  // `ThreadComposeChanged` path. The kept draft is local-view only — it
+  // schedules no PUT, so it never resurrects server-side unless the user
+  // resumes editing it.
+  if (isEmpty && hasUnsentLocalDraft(info.thread_id)) {
     return;
   }
   // Rehydrate the per-draft dropdown selection from the DB (the authoritative
@@ -239,10 +247,12 @@ export function upsertThread(
     // SessionStarted / ThreadDiscarded. Focus must NOT block that clear, or a
     // synced-from-peer draft stays as a ghost in a focused-but-untyped textarea
     // (the same authorship-vs-focus bug fixed in the SSE ThreadComposeChanged /
-    // MessageReceived paths). A locally-authored draft is still protected: the
-    // other staleness guards below AND stageDraftFromApi's own hasLocalDraftEdit
-    // empty-guard both keep it. A NON-empty snapshot keeps the focus guard so a
-    // background refresh can't move the cursor / overwrite what the user sees.
+    // MessageReceived paths). Unsent locally-authored work is still protected:
+    // the other staleness guards below AND stageDraftFromApi's own
+    // hasUnsentLocalDraft empty-guard both keep it (a draft whose text has since
+    // been submitted is NOT such work and clears). A NON-empty snapshot keeps
+    // the focus guard so a background refresh can't move the cursor / overwrite
+    // what the user sees.
     const snapshotIsEmpty = composeSnapshotIsEmpty(info);
     const userIsTypingHere = isFocusedThread && isComposeFocusedHere(info.thread_id) && !snapshotIsEmpty;
     // `>=` because both timestamps come from Date.now() (1ms resolution) — a
@@ -847,5 +857,14 @@ function applyEventRows(
   // subscriber would read — but `channel` only changes via the per-row
   // `isChannelDefiningEvent` branch above, which requires `rows.length > 0`.
   // So aggregate-only refreshes wake no useful work via the bump path.
-  if (rows.length > 0) bumpThreadEvents(threadId);
+  if (rows.length > 0) {
+    bumpThreadEvents(threadId);
+    // Replay is the ONLY path that learns about a submission made while this
+    // device was asleep / disconnected, and it runs LAST: `resyncLoadedThreads`
+    // fires `loadAllThreads` (whose empty-compose snapshot has no evidence yet)
+    // before `refreshThreadEvents` brings the missed messages in. Without this
+    // reconcile, a draft submitted from another device during the gap would
+    // never be re-examined and would sit in the composer indefinitely.
+    clearSupersededDraft(threadId);
+  }
 }

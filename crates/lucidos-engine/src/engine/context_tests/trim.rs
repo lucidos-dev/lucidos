@@ -1,4 +1,5 @@
 use super::*;
+use crate::llm::model_registry::context_window_from_prefix;
 use crate::llm::{ContentBlock, Message, MessageContent};
 
 fn text_msg(role: &str, text: &str) -> Message {
@@ -38,7 +39,7 @@ fn test_no_trim_under_budget() {
         text_msg("user", "How are you?"),
     ];
     let original_len = messages.len();
-    let removed = trim_context_if_needed(&mut messages, 500_000, None, None);
+    let removed = trim_context_if_needed(&mut messages, 500_000, None, &[]).messages_removed;
     assert_eq!(removed, 0);
     assert_eq!(messages.len(), original_len);
     // Content should be unchanged
@@ -62,7 +63,7 @@ fn test_pass1_truncates_large_tool_results() {
     ];
     let original_len = messages.len();
     // Budget smaller than total (~10K) but large enough that pass 1 truncation suffices
-    let removed = trim_context_if_needed(&mut messages, 5_000, None, None);
+    let removed = trim_context_if_needed(&mut messages, 5_000, None, &[]).messages_removed;
 
     assert_eq!(removed, 0, "pass 2 should not be needed");
     assert_eq!(messages.len(), original_len, "no messages removed");
@@ -113,7 +114,7 @@ fn test_pass2_removes_old_pairs() {
     let initial_len = messages.len();
     // Set a very small budget to force pass 2
     let budget = 200;
-    let removed = trim_context_if_needed(&mut messages, budget, None, None);
+    let removed = trim_context_if_needed(&mut messages, budget, None, &[]).messages_removed;
 
     assert!(removed > 0, "should have removed messages in pass 2");
     // The returned count must match the actual length delta — `agentic_loop`
@@ -163,7 +164,7 @@ fn test_preserves_initial_and_recent() {
 
     // Budget that requires trimming the old pairs
     let budget = 1_000;
-    trim_context_if_needed(&mut messages, budget, None, None);
+    trim_context_if_needed(&mut messages, budget, None, &[]);
 
     // message[0] must always be preserved
     assert_eq!(messages[0].content.as_text(), "important initial context");
@@ -211,7 +212,7 @@ fn test_pass0_strips_images_from_older_messages() {
     ];
 
     // Budget large enough that no other trimming is needed after stripping
-    trim_context_if_needed(&mut messages, 500_000, None, None);
+    trim_context_if_needed(&mut messages, 500_000, None, &[]);
 
     // Older image at index 0 should be replaced with placeholder
     if let MessageContent::Blocks(blocks) = &messages[0].content {
@@ -272,7 +273,7 @@ fn test_pass0_preserves_current_message_image_with_resume_blocks() {
         image_msg("user", "Request: what is in this screenshot?", 100),
     ];
 
-    trim_context_if_needed(&mut messages, 500_000, None, None);
+    trim_context_if_needed(&mut messages, 500_000, None, &[]);
 
     let last_idx = messages.len() - 1;
     if let MessageContent::Blocks(blocks) = &messages[last_idx].content {
@@ -324,7 +325,7 @@ fn test_image_block_char_estimate_is_fixed_not_base64_len() {
 /// The core regression for "the bot can't see my attached image": once the
 /// model makes a tool call, the current-turn user message (with the image) is
 /// no longer the LAST entry. Pass 0 must still keep its image bytes — driven by
-/// `keep_image_idx` — so the model can reason about the image after gathering
+/// an image pin — so the model can reason about the image after gathering
 /// context. Without the fix the image was replaced with a text placeholder and
 /// the model went blind mid-turn.
 #[test]
@@ -340,7 +341,7 @@ fn test_pass0_keeps_current_turn_image_when_not_last() {
         tool_result_msg("t2", "notes"),
     ];
 
-    trim_context_if_needed(&mut messages, 500_000, Some(img_idx), Some(img_idx));
+    trim_context_if_needed(&mut messages, 500_000, Some(img_idx), &[img_idx]);
 
     // The image bytes must survive on the (now non-last) current-turn message.
     if let MessageContent::Blocks(blocks) = &messages[img_idx].content {
@@ -361,9 +362,236 @@ fn test_pass0_keeps_current_turn_image_when_not_last() {
     }
 }
 
-/// Without `keep_image_idx`, a non-last image-bearing message is still stripped
-/// (older images the model already saw). This pins the "only the current turn's
-/// image is exempt" boundary.
+/// Pass 0 honours EVERY pinned index, not just one. Three image-bearing
+/// messages, two pinned and one not — only the unpinned one loses its bytes.
+///
+/// One pin was the whole bug behind "the agent can't see the image": with a
+/// single slot, an image the model re-loaded via `view_image` (or one the user
+/// attached to a mid-turn injected message) had nowhere to be recorded, so pass
+/// 0 stripped it on the model's very next tool call.
+#[test]
+fn test_pass0_keeps_every_pinned_image_message() {
+    let mut messages = vec![
+        image_msg("user", "Request: why won't this part fit?", 100), // 0 — pinned
+        tool_use_msg("t1", "capture_app", serde_json::json!({})),
+        image_msg("user", "app capture", 100), // 2 — ambient, NOT pinned
+        tool_use_msg("t2", "view_image", serde_json::json!({"image": "thread:1"})),
+        image_msg("user", "re-loaded thread image", 100), // 4 — pinned
+        tool_use_msg("t3", "grep_files", serde_json::json!({"pattern": "x"})),
+        tool_result_msg("t3", "match"),
+    ];
+
+    trim_context_if_needed(&mut messages, 500_000, Some(0), &[0, 4]);
+
+    for idx in [0usize, 4] {
+        let MessageContent::Blocks(blocks) = &messages[idx].content else {
+            panic!("expected Blocks content at pinned index {}", idx);
+        };
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. })),
+            "pinned message {} must keep its image bytes",
+            idx
+        );
+    }
+
+    let MessageContent::Blocks(blocks) = &messages[2].content else {
+        panic!("expected Blocks content at the unpinned capture");
+    };
+    assert!(
+        !blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. })),
+        "an unpinned ambient capture must still age out"
+    );
+}
+
+/// The exact message the agentic loop builds for a `view_image` result: the
+/// explicit-view `ToolResult` text, the lifted image block, and the trailing
+/// instruction. `parse_app_capture_marker`'s branch writes the page's DOM text
+/// as its `ToolResult` content instead, which is what `capture_app_result_msg`
+/// mirrors.
+fn view_image_result_msg(tool_use_id: &str, image_kb: usize) -> Message {
+    Message {
+        role: "user".to_string(),
+        content: MessageContent::Blocks(vec![
+            ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: crate::engine::tools::files::EXPLICIT_IMAGE_RESULT_TEXT.to_string(),
+            },
+            ContentBlock::Image {
+                source_type: "base64".to_string(),
+                media_type: "image/png".to_string(),
+                data: "x".repeat(image_kb * 1024),
+            },
+            ContentBlock::Text {
+                text: "Results above.".to_string(),
+            },
+        ]),
+    }
+}
+
+fn capture_app_result_msg(tool_use_id: &str, image_kb: usize) -> Message {
+    Message {
+        role: "user".to_string(),
+        content: MessageContent::Blocks(vec![
+            ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: "Habit Tracker\nStreak: 4 days".to_string(),
+            },
+            ContentBlock::Image {
+                source_type: "base64".to_string(),
+                media_type: "image/png".to_string(),
+                data: "x".repeat(image_kb * 1024),
+            },
+        ]),
+    }
+}
+
+/// Regression for the reported bug: the agent called `view_image` on a thread
+/// image, made a few more tool calls, called `view_image` on the SAME reference
+/// again, and still ended the turn telling the user it could not see the image.
+///
+/// `view_image` exists solely to bring an aged-out image back into vision, but
+/// its result was pinned by nothing — so it survived only while it happened to
+/// be the last message, and the model's very next tool call replaced it with
+/// `[image from earlier in conversation]`. The tool could never do its one job.
+///
+/// Asserts the whole chain the loop relies on: the built message is recognised
+/// as holding an explicitly-requested image, and once pinned its bytes survive
+/// several later tool pairs.
+#[test]
+fn test_view_image_result_stays_visible_across_later_tool_calls() {
+    use crate::engine::agentic_loop::holds_explicitly_requested_image;
+
+    let mut messages = vec![
+        text_msg("user", "Request: what is wrong in this screenshot?"),
+        tool_use_msg("v1", "view_image", serde_json::json!({"image": "thread:3"})),
+        view_image_result_msg("v1", 100),
+    ];
+    let view_idx = messages.len() - 1;
+
+    // The loop derives the pin from the built blocks — assert that link holds,
+    // otherwise the pin below is testing a fiction.
+    let MessageContent::Blocks(blocks) = &messages[view_idx].content else {
+        panic!("expected Blocks content for the view_image result");
+    };
+    assert!(
+        holds_explicitly_requested_image(blocks),
+        "the loop must recognise a view_image result as an explicitly-requested image"
+    );
+
+    // Several more tool calls, so the view_image result is far from last.
+    for i in 0..4 {
+        let id = format!("later{}", i);
+        messages.push(tool_use_msg(&id, "grep_files", serde_json::json!({"pattern": "x"})));
+        messages.push(tool_result_msg(&id, "match"));
+    }
+
+    trim_context_if_needed(&mut messages, 500_000, Some(0), &[0, view_idx]);
+
+    let MessageContent::Blocks(blocks) = &messages[view_idx].content else {
+        panic!("expected the view_image result to survive with its Blocks content");
+    };
+    assert!(
+        blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. })),
+        "a re-loaded thread image must stay visible for the rest of the turn, \
+         not just until the model's next tool call"
+    );
+}
+
+/// The other side of the boundary: an ambient `capture_app` screenshot is NOT
+/// recognised as explicitly requested, so it stays unpinned and ages out after
+/// one call. Screenshots snapshot state that changes under the model — keeping
+/// them would let it reason about a UI that no longer exists, which is the
+/// reason pass 0 strips images at all.
+#[test]
+fn test_capture_app_result_is_not_pinned() {
+    use crate::engine::agentic_loop::holds_explicitly_requested_image;
+
+    let mut messages = vec![
+        text_msg("user", "Request: check the app"),
+        tool_use_msg("c1", "capture_app", serde_json::json!({"app_id": "habit-tracker"})),
+        capture_app_result_msg("c1", 100),
+    ];
+    let capture_idx = messages.len() - 1;
+
+    let MessageContent::Blocks(blocks) = &messages[capture_idx].content else {
+        panic!("expected Blocks content for the capture_app result");
+    };
+    assert!(
+        !holds_explicitly_requested_image(blocks),
+        "an ambient capture must not be treated as an explicitly-requested image"
+    );
+
+    messages.push(tool_use_msg("c2", "grep_files", serde_json::json!({"pattern": "x"})));
+    messages.push(tool_result_msg("c2", "match"));
+
+    // Pinning only the user message — exactly what the loop does for a capture.
+    trim_context_if_needed(&mut messages, 500_000, Some(0), &[0]);
+
+    let MessageContent::Blocks(blocks) = &messages[capture_idx].content else {
+        panic!("expected Blocks content at the capture message");
+    };
+    assert!(
+        !blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. })),
+        "an ambient capture must age out once it is no longer the last message"
+    );
+}
+
+/// Pass 2's eviction floor derives from the LOWEST pin only. Pinning a later
+/// tool-result image (what `view_image` now does) must not make trimming any
+/// weaker — otherwise every re-viewed image would ratchet the floor upward and
+/// a long turn could no longer evict enough to fit the budget.
+#[test]
+fn test_pass2_floor_ignores_pins_above_the_lowest() {
+    // Build the same over-budget history twice and trim with different pin sets.
+    let build = || {
+        let large = "x".repeat(2_000);
+        let mut messages = vec![text_msg("user", "workspace context")];
+        for i in 0..10 {
+            let id = format!("resume{}", i);
+            messages.push(tool_use_msg(&id, "read_file", serde_json::json!({"path": "x.rs"})));
+            messages.push(tool_result_msg(&id, &large));
+        }
+        messages.push(image_msg("user", "Request: what is this?", 100)); // the low pin
+        for i in 0..4 {
+            let id = format!("recent{}", i);
+            messages.push(tool_use_msg(&id, "grep", serde_json::json!({"pattern": "y"})));
+            messages.push(tool_result_msg(&id, "ok"));
+        }
+        messages
+    };
+    let low_pin = 21;
+    let high_pin = 25;
+
+    let mut baseline = build();
+    let baseline_removed =
+        trim_context_if_needed(&mut baseline, 1_000, Some(low_pin), &[low_pin]).messages_removed;
+
+    let mut with_high_pin = build();
+    let with_high_removed =
+        trim_context_if_needed(&mut with_high_pin, 1_000, Some(low_pin), &[low_pin, high_pin])
+            .messages_removed;
+
+    assert!(
+        baseline_removed > 0,
+        "the fixture must actually force pass 2 to evict, or this proves nothing"
+    );
+    assert_eq!(
+        with_high_removed, baseline_removed,
+        "a pin above the floor must not reduce how much pass 2 can evict"
+    );
+}
+
+/// With no pins, a non-last image-bearing message is still stripped (older
+/// images the model already saw). This pins the "only pinned images are exempt"
+/// boundary.
 #[test]
 fn test_pass0_strips_non_last_image_when_not_kept() {
     let mut messages = vec![
@@ -372,20 +600,20 @@ fn test_pass0_strips_non_last_image_when_not_kept() {
         tool_result_msg("t1", "files"),
     ];
 
-    trim_context_if_needed(&mut messages, 500_000, None, None);
+    trim_context_if_needed(&mut messages, 500_000, None, &[]);
 
     if let MessageContent::Blocks(blocks) = &messages[0].content {
         assert!(
             !blocks
                 .iter()
                 .any(|b| matches!(b, ContentBlock::Image { .. })),
-            "a non-last image with no keep_image_idx must still be stripped"
+            "a non-last image with no pin must still be stripped"
         );
     }
 }
 
 /// After a mid-turn prompt injection the protected index (latest user input)
-/// moves ABOVE the image-bearing message, so `keep_image_idx < protected_idx`.
+/// moves ABOVE the image-bearing message, so the image pin sits below `protected_idx`.
 /// Pass 0 keeps the image bytes, but Pass 2 must ALSO refuse to remove that
 /// whole message — it protects down to the lower of the two indices — or the
 /// image (and the original request) is lost despite Pass 0 preserving its bytes.
@@ -420,9 +648,9 @@ fn test_pass2_keeps_image_message_below_protected_after_injection() {
     );
 
     // Tight budget forces pass 2 to remove many old pairs; protected_idx points
-    // at the injected prompt, keep_image_idx at the (lower) image message.
-    let removed =
-        trim_context_if_needed(&mut messages, 1_000, Some(injected_idx), Some(img_idx));
+    // at the injected prompt, the image pin at the (lower) image message.
+    let removed = trim_context_if_needed(&mut messages, 1_000, Some(injected_idx), &[img_idx])
+        .messages_removed;
 
     // The image message must survive at its post-removal position, image intact.
     let post_img = img_idx.saturating_sub(removed);
@@ -450,7 +678,7 @@ fn test_pass2_keeps_image_message_below_protected_after_injection() {
 /// promise true: with `protected_idx = Some(user_message_idx)`, pass 2
 /// stops before removing the user message even at the cost of staying over
 /// budget. (The attached image on that message is preserved separately by
-/// `keep_image_idx` — see `test_pass0_keeps_current_turn_image_when_not_last`.)
+/// its image pin — see `test_pass0_keeps_current_turn_image_when_not_last`.)
 #[test]
 fn test_pass2_does_not_remove_protected_user_message() {
     // Layout: m0 = workspace context, then many resume tool pairs (turn 1's
@@ -479,7 +707,7 @@ fn test_pass2_does_not_remove_protected_user_message() {
     }
 
     // Tight budget forces pass 2 to remove many messages.
-    let removed = trim_context_if_needed(&mut messages, 1_000, Some(protected), None);
+    let removed = trim_context_if_needed(&mut messages, 1_000, Some(protected), &[]).messages_removed;
 
     // The user message must survive at its post-removal position.
     let post_protected = protected.saturating_sub(removed);
@@ -516,7 +744,7 @@ fn test_pass2_stops_when_protected_lands_at_index_one() {
     // Tiny budget — pass 2 would remove everything between m0 and the
     // protected entry, then would want to remove the protected entry itself
     // to keep going. The guard must stop instead.
-    let removed = trim_context_if_needed(&mut messages, 10, Some(protected), None);
+    let removed = trim_context_if_needed(&mut messages, 10, Some(protected), &[]).messages_removed;
 
     // Protected index hasn't shifted (nothing between m0 and it was removed
     // since it was already at index 1).
@@ -565,7 +793,7 @@ fn test_pass1_5_trims_large_tail_tool_results() {
         "test premise: total must exceed budget"
     );
 
-    let _removed = trim_context_if_needed(&mut messages, budget, None, None);
+    let _removed = trim_context_if_needed(&mut messages, budget, None, &[]).messages_removed;
 
     // The second-to-last preserved tool result (recent1's, at index len-3)
     // sits inside the tail BUT NOT in the very last message — pass 1.5
@@ -603,7 +831,7 @@ fn test_pass1_5_preserves_very_last_message() {
     ];
 
     let budget = TAIL_TRUNCATION_THRESHOLD;
-    let _ = trim_context_if_needed(&mut messages, budget, None, None);
+    let _ = trim_context_if_needed(&mut messages, budget, None, &[]);
 
     let last_idx = messages.len() - 1;
     if let MessageContent::Blocks(blocks) = &messages[last_idx].content {
@@ -665,7 +893,7 @@ fn test_pass1_5_then_pass2_uses_post_truncation_total() {
     messages.push(tool_result_msg("r2", "small")); // last, preserved verbatim
 
     let budget = 1_500;
-    let removed = trim_context_if_needed(&mut messages, budget, None, None);
+    let removed = trim_context_if_needed(&mut messages, budget, None, &[]).messages_removed;
 
     // With the bug (`current_total = total_after_pass1`) Pass 2 would
     // remove every old pair until the message-count guard fires
@@ -696,6 +924,100 @@ fn test_pass1_5_then_pass2_uses_post_truncation_total() {
     }
 }
 
+/// `ContextCaptured.trimmed` is derived from `TrimOutcome::any()`, so a turn
+/// where pass 1 gutted a tool result but pass 2 evicted nothing must still
+/// report as trimmed. Before this it reported `trimmed: false` — the UI showed
+/// a clean turn while the LLM had been handed
+/// "[content truncated — was N chars]" in place of the real data.
+#[test]
+fn test_pass1_truncation_alone_counts_as_trimmed() {
+    let large_content = "x".repeat(10_000);
+    let mut messages = vec![
+        text_msg("user", "initial"),
+        tool_use_msg("t1", "read_file", serde_json::json!({"path": "foo.rs"})),
+        tool_result_msg("t1", &large_content),
+        tool_use_msg("t2", "read_file", serde_json::json!({"path": "bar.rs"})),
+        tool_result_msg("t2", "small result"),
+        tool_use_msg("t3", "write_file", serde_json::json!({"path": "out.rs"})),
+        tool_result_msg("t3", "ok"),
+        text_msg("assistant", "Done"),
+        text_msg("user", "Thanks"),
+    ];
+    let original_len = messages.len();
+    // Same budget as the pass-1 test above: enough that truncation alone fits.
+    let outcome = trim_context_if_needed(&mut messages, 5_000, None, &[]);
+
+    assert_eq!(outcome.messages_removed, 0, "pass 2 should not be needed");
+    assert_eq!(messages.len(), original_len);
+    assert!(
+        outcome.blocks_truncated > 0,
+        "pass 1 truncated a tool result, so it must be counted"
+    );
+    assert!(
+        outcome.any(),
+        "content WAS dropped — `trimmed` must report true"
+    );
+}
+
+/// Pass 1 also truncates oversized `ToolUse` ARGUMENT strings, not just tool
+/// results. That is content the LLM can no longer see, so it must count too —
+/// otherwise a turn whose only loss was a gutted tool argument still reports
+/// `trimmed: false`.
+#[test]
+fn test_truncated_tool_arguments_count_as_trimmed() {
+    let big_arg = "z".repeat(5_000);
+    let mut messages = vec![
+        text_msg("user", "initial"),
+        // Old message with a huge tool ARGUMENT but a small result — only the
+        // ToolUse branch of pass 1 can fire here.
+        tool_use_msg("t1", "write_file", serde_json::json!({ "content": big_arg })),
+        tool_result_msg("t1", "ok"),
+        text_msg("assistant", "a"),
+        text_msg("user", "b"),
+        text_msg("assistant", "c"),
+        text_msg("user", "d"),
+    ];
+    let outcome = trim_context_if_needed(&mut messages, 2_000, None, &[]);
+
+    assert!(
+        outcome.blocks_truncated > 0,
+        "a truncated tool argument is content loss and must be counted"
+    );
+    assert!(outcome.any(), "`trimmed` must report true");
+}
+
+/// `truncate_large_json_strings` counts every string it cuts, at any depth, and
+/// reports zero when nothing needed cutting.
+#[test]
+fn test_truncate_large_json_strings_counts_what_it_cut() {
+    let big = "q".repeat(TRUNCATION_THRESHOLD + 1);
+    let mut nested = serde_json::json!({
+        "small": "fine",
+        "big": big,
+        "nested": { "also_big": big, "arr": [big, "short"] },
+    });
+    // Three oversized strings: `big`, `nested.also_big`, `nested.arr[0]`.
+    // `small` and `arr[1]` are under the threshold and left alone.
+    assert_eq!(truncate_large_json_strings(&mut nested), 3);
+
+    let mut untouched = serde_json::json!({ "a": "short", "b": [1, 2, 3] });
+    assert_eq!(truncate_large_json_strings(&mut untouched), 0);
+}
+
+/// The complement: a turn that fits keeps every field zero, so an untouched
+/// context never reports as trimmed.
+#[test]
+fn test_untouched_context_reports_nothing_trimmed() {
+    let mut messages = vec![
+        text_msg("user", "Hello"),
+        text_msg("assistant", "Hi there"),
+        text_msg("user", "How are you?"),
+    ];
+    let outcome = trim_context_if_needed(&mut messages, 500_000, None, &[]);
+    assert_eq!(outcome, TrimOutcome::default());
+    assert!(!outcome.any());
+}
+
 /// `estimate_tokens_from_chars` must be the exact inverse of the budget's
 /// chars/token assumption — otherwise the displayed "Context: N tokens"
 /// drifts from the trim budget and gives a false reading. If
@@ -705,9 +1027,9 @@ fn test_pass1_5_then_pass2_uses_post_truncation_total() {
 #[test]
 fn test_token_estimate_matches_budget_ratio() {
     for model in ["claude-opus-4-7", "claude-opus-4-7[1m]", "gpt-5"] {
-        let window = context_window_for(model);
+        let window = context_window_from_prefix(model);
         let usable = window - RESPONSE_TOKEN_RESERVE;
-        let budget_chars = agent_context_char_budget(model);
+        let budget_chars = agent_context_char_budget(window);
         let estimated_tokens = estimate_tokens_from_chars(budget_chars);
         // Round-trip should land within 1 of usable (integer-division loss).
         assert!(
@@ -737,7 +1059,7 @@ fn test_pass2_skips_pair_removal_that_would_drop_protected() {
     ];
     let protected = 2;
 
-    let _ = trim_context_if_needed(&mut messages, 100, Some(protected), None);
+    let _ = trim_context_if_needed(&mut messages, 100, Some(protected), &[]);
 
     // Find the protected text — it must still be present somewhere.
     let still_present = messages

@@ -138,20 +138,51 @@ export function isExchangeStartEvent(type: string): boolean {
   return EXCHANGE_START_TYPES.has(type);
 }
 
-/** Boundary userEvent types that PAUSE a chat/CC turn awaiting a user action.
- *  A turn parked on one of these owns its own post-resolution continuation
- *  (the answer + the agent's reply route back to the divider by id), so a
- *  `ChildThreadCompleted` landing while the turn is parked must NOT steal the
- *  request-id redirect away from the divider — the reply belongs with the card
- *  the user is answering, not below an unrelated child completion. */
-const DIVIDER_USER_EVENT_TYPES: ReadonlySet<string> = new Set([
-  'UserQuestionAsked',
-  'CodingAgentPermissionRequest',
-  'CommandPermissionRequested',
-  'McpPermissionRequested',
-  'CredentialRequested',
-  'McpConsentRequested',
-]);
+/** True when `exchange` is a divider still PARKED awaiting a user action — its
+ *  resolution (answer / grant) hasn't landed as a step yet.
+ *
+ *  A parked divider owns its own post-resolution continuation (the resolution
+ *  and the agent's reply route back to it by id), so a `ChildThreadCompleted`
+ *  landing while it waits must NOT steal the request-id redirect away — the
+ *  reply belongs with the card the user is answering, not below an unrelated
+ *  child completion. Ordering is handled the other way round: when the
+ *  resolution lands, `reanchorResolvedDivider` moves the DIVIDER below that
+ *  boundary, so the reply stays with its card AND still reads last.
+ *
+ *  The check is on the divider's STATE, not just its type: once resolved, the
+ *  turn is an ordinary in-flight response again and a child completion must
+ *  advance the redirect like any other (otherwise the post-completion work
+ *  routes back up into the answered card while the stepless completion card
+ *  sits last spinning 'Requesting' — the same stuck-looking thread, reached by
+ *  the child finishing AFTER the answer instead of before it).
+ *
+ *  `CredentialRequested` / `McpConsentRequested` have no resolution event in the
+ *  ThreadEvent union, so they can never be observed as resolved and stay parked.
+ *  Add the resolution arm here if one is ever introduced. */
+function dividerStillAwaitsUser(exchange: Exchange): boolean {
+  const userEvent = exchange.userEvent;
+  switch (userEvent.type) {
+    case 'UserQuestionAsked':
+      return !findQuestionAnswer(exchange, userEvent.tool_use_id);
+    case 'CodingAgentPermissionRequest':
+      return !exchange.steps.some(s =>
+        s.event.type === 'CodingAgentPermissionResolved'
+        && s.event.request_id === userEvent.request_id);
+    case 'CommandPermissionRequested':
+      return !exchange.steps.some(s =>
+        s.event.type === 'CommandPermissionResolved'
+        && s.event.request_id === userEvent.request_id);
+    case 'McpPermissionRequested':
+      return !exchange.steps.some(s =>
+        s.event.type === 'McpPermissionResolved'
+        && s.event.request_id === userEvent.request_id);
+    case 'CredentialRequested':
+    case 'McpConsentRequested':
+      return true;
+    default:
+      return false;
+  }
+}
 
 /** Pure bookkeeping metadata events that belong to no exchange. Without this
  *  filter, such an event arriving after a boundary started a new (still-empty)
@@ -650,6 +681,70 @@ function foldSorted(sorted: SequencedEvent[]): GroupFoldState {
   return state;
 }
 
+/** Re-anchor `exchange` to the end of the timeline — the position it should
+ *  occupy now that the agent has actually engaged with it. Used by the two
+ *  "the exchange was created earlier than it was engaged with" paths: the
+ *  mid-flight `UserPromptInjected` absorb and `reanchorResolvedDivider`. No-op
+ *  when it is already last, which is the common case for both.
+ *
+ *  Position is not part of an Exchange's own state, so callers relying on
+ *  position-derived props must not need a `touched` bump: the render pass
+ *  recomputes `isLast` / `hasPriorActive` / `imageOffset` for every exchange and
+ *  `chatExchangePropsEqual` compares each of them, so a reorder re-renders the
+ *  affected panels on its own. */
+function moveExchangeToEnd(exchanges: Exchange[], exchange: Exchange): void {
+  const idx = exchanges.indexOf(exchange);
+  if (idx === -1 || idx === exchanges.length - 1) return;
+  exchanges.splice(idx, 1);
+  exchanges.push(exchange);
+}
+
+/** A divider just received its resolution (answer / permission grant). If a
+ *  boundary exchange was appended while the card sat on screen — the shape is
+ *  a spawned sub-thread finishing and emitting `ChildThreadCompleted` between
+ *  the question and the answer (real thread 8144b43e) — the divider is no
+ *  longer last, yet it still OWNS the turn's continuation via `reqIdRedirect`.
+ *  Left in place, every post-answer step renders ABOVE that intervening card:
+ *  the user sees the agent's live work in the middle of the timeline while the
+ *  bottom of the thread is a stepless completion card frozen on 'Requesting',
+ *  which reads as a stuck agent. (Both halves are one bug — `exchangeStatus`
+ *  keeps a stepless `ChildThreadCompleted` spinning precisely while it is
+ *  `isLast` on a running thread, because it normally expects the continuation
+ *  to land in it.)
+ *
+ *  So re-anchor the divider to its RESOLUTION point: move it to the end and
+ *  make it `current`. Same move, same reason as the mid-flight `UserPromptInjected`
+ *  absorb above — the exchange is repositioned to where the agent actually
+ *  engages with it, so its forthcoming reply renders below the boundaries that
+ *  landed while it waited (and the superseded card falls to `!isLast` → 'done').
+ *
+ *  Gated on the divider being a `reqIdRedirect` target, which is exactly the
+ *  in-process chat dividers (`UserQuestionAsked`, `CommandPermissionRequested`,
+ *  `McpPermissionRequested`) whose continuation routes back here by request id.
+ *  A CC `CodingAgentPermissionRequest` is never a redirect target — CC events
+ *  aren't request-id routed, so its continuation flows through `current` to the
+ *  intervening boundary and moving the card would strand it. No-op in the
+ *  common case: with no boundary between, the divider is already last and
+ *  already `current`. */
+function reanchorResolvedDivider(
+  state: GroupFoldState,
+  divider: Exchange,
+  current: Exchange | null,
+): Exchange | null {
+  let ownsContinuation = false;
+  for (const target of state.reqIdRedirect.values()) {
+    if (target === divider) {
+      ownsContinuation = true;
+      break;
+    }
+  }
+  if (!ownsContinuation) return current;
+  moveExchangeToEnd(state.exchanges, divider);
+  // The resolved divider is the live turn again (see `Exchange.continuationMoved`).
+  divider.continuationMoved = false;
+  return divider;
+}
+
 /** Fold one event into the state. `isLegacySupersededAbort` is decided by
  *  the caller (the one-shot path precomputes it positionally-blind over the
  *  whole array; the incremental path derives the terminal-before-abort
@@ -786,6 +881,7 @@ function foldEvent(
       if (dividerOwner) {
         dividerOwner.steps.push({ seq, event });
         touched?.add(dividerOwner);
+        current = reanchorResolvedDivider(state, dividerOwner, current);
         return;
       }
     }
@@ -798,6 +894,7 @@ function foldEvent(
       if (dividerOwner) {
         dividerOwner.steps.push({ seq, event });
         touched?.add(dividerOwner);
+        current = reanchorResolvedDivider(state, dividerOwner, current);
         return;
       }
     }
@@ -812,13 +909,13 @@ function foldEvent(
       // otherwise the reply renders above the intervening question card (real
       // thread ab70366f). No-op when it's already last (the common case: no
       // boundary intervened), which keeps the simple absorb paths unchanged.
-      const idx = exchanges.indexOf(absorbTarget);
-      if (idx !== -1 && idx !== exchanges.length - 1) {
-        exchanges.splice(idx, 1);
-        exchanges.push(absorbTarget);
-      }
+      moveExchangeToEnd(exchanges, absorbTarget);
       absorbTarget.steps.push({ seq, event });
       touched?.add(absorbTarget);
+      // It owns the turn again — a handoff recorded while it sat in the queue
+      // (a divider raised with this uningested message as `previousCurrent`)
+      // no longer holds. See `Exchange.continuationMoved`.
+      absorbTarget.continuationMoved = false;
       current = absorbTarget;
       if (event.type === 'UserPromptInjected') {
         const absorbedReqId = requestEventIdOf(event);
@@ -868,18 +965,29 @@ function foldEvent(
       // advancing the redirect it routes back to the pre-completion exchange,
       // which sits ABOVE the card, so the continued "Thinking / Running …"
       // renders before the card it follows (real thread 4d193da8). EXCEPTION:
-      // when the turn is parked at a question / permission divider (real thread
-      // 3e54cacb), that divider owns its own post-answer continuation — leave
-      // the redirect on it so the reply stays with the card the user is
-      // answering, not below an unrelated child completion.
+      // when the turn is parked at a question / permission divider that is
+      // STILL awaiting the user (real thread 3e54cacb), that divider owns its
+      // own post-answer continuation — leave the redirect on it so the reply
+      // stays with the card the user is answering, not below an unrelated child
+      // completion. The divider is then moved BELOW the card when the answer
+      // lands (`reanchorResolvedDivider`), which is what keeps the continuation
+      // rendering last. An ALREADY-resolved divider gets no exception — see
+      // `dividerStillAwaitsUser`.
       const advancesRedirect =
         event.type === 'UserQuestionAsked'
         || event.type === 'CommandPermissionRequested'
         || event.type === 'McpPermissionRequested'
         || (event.type === 'ChildThreadCompleted'
           && !!previousCurrent
-          && !DIVIDER_USER_EVENT_TYPES.has(previousCurrent.userEvent.type));
+          && !dividerStillAwaitsUser(previousCurrent));
       if (advancesRedirect && previousCurrent) {
+        // The turn now belongs to `current`, so nothing else will land in
+        // `previousCurrent` — a `Thinking` marker left pending there can never
+        // resolve on its own events. Record the handoff so rendering finalizes
+        // it instead of shimmering an old step half a screen above the work
+        // (real thread 8144b43e). See `Exchange.continuationMoved`.
+        previousCurrent.continuationMoved = true;
+        touched?.add(previousCurrent);
         // Move any redirect that pointed at the previous current (the turn kept
         // an ANCESTOR's req_id — e.g. a mid-response child completion keeps the
         // originating MR's id) AND, unconditionally, map the previous current's
@@ -921,6 +1029,16 @@ function foldEvent(
           || event.type === 'McpPermissionRequested')
         && state.lastChatTurnReqId
       ) {
+        // Whoever held that req_id just lost the turn — normally
+        // `previousCurrent` (marked above), but the queued-follow-up shape has
+        // them be different exchanges, and the handoff mark belongs on the one
+        // the redirect is actually moved OFF. See `Exchange.continuationMoved`.
+        const priorOwner = reqIdRedirect.get(state.lastChatTurnReqId)
+          ?? findExchangeByAnchorId(exchanges, state.lastChatTurnReqId);
+        if (priorOwner && priorOwner !== current) {
+          priorOwner.continuationMoved = true;
+          touched?.add(priorOwner);
+        }
         reqIdRedirect.set(state.lastChatTurnReqId, current);
       }
     } else if (event.type === 'CodingAgentUserMessageSent') {

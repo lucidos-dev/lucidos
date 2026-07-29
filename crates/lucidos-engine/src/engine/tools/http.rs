@@ -264,7 +264,7 @@ impl LucidosEngine {
                 if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
                     return Ok(format!(
                         "Error: failed to create tmp dir {}: {}",
-                        tmp_dir.display(),
+                        crate::core::home_path::abbreviate(&tmp_dir),
                         e
                     ));
                 }
@@ -273,7 +273,7 @@ impl LucidosEngine {
                     if let Err(e) = std::fs::create_dir_all(parent) {
                         return Ok(format!(
                             "Error: failed to create parent dir {}: {}",
-                            parent.display(),
+                            crate::core::home_path::abbreviate(parent),
                             e
                         ));
                     }
@@ -281,7 +281,7 @@ impl LucidosEngine {
                 if let Err(e) = std::fs::write(&full_path, &body_text) {
                     return Ok(format!(
                         "Error: failed to write {}: {}",
-                        full_path.display(),
+                        crate::core::home_path::abbreviate(&full_path),
                         e
                     ));
                 }

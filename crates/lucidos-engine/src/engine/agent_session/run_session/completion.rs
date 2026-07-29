@@ -1,8 +1,9 @@
 use super::idle_snapshot::CodingAgentIdleSnapshot;
 use crate::engine::agent_session::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
 use crate::engine::agent_session::lifecycle::{
-    classify_session_end_action, conflict_resolution_cleanup_action,
-    should_auto_commit_on_cleanup, ConflictResolutionCleanupAction, SessionEndAction, TerminalKind,
+    classify_session_end_action, conflict_abort_deletes_temp_state,
+    conflict_resolution_cleanup_action, should_auto_commit_on_cleanup,
+    ConflictResolutionCleanupAction, SafetyNetAction, SessionEndAction, TerminalKind,
 };
 use crate::engine::agent_session::resume::change_description_fallback;
 use crate::engine::change_ops::branch_is_hardened;
@@ -43,6 +44,7 @@ impl LucidosEngine {
         cc_reasoning_effort: Option<String>,
         last_terminal_kind: Option<TerminalKind>,
         external_terminal_emitted: Arc<std::sync::atomic::AtomicBool>,
+        external_continuation_requested: Arc<std::sync::atomic::AtomicBool>,
         agent_cancel: &tokio_util::sync::CancellationToken,
         emitted_terminal_event: bool,
         watchdog_fired: bool,
@@ -99,16 +101,16 @@ impl LucidosEngine {
             thread_id,
             "safety net",
         );
-        match crate::engine::agent_session::lifecycle::safety_net_action(
+        let net_action = crate::engine::agent_session::lifecycle::safety_net_action(
             safety_net_fired,
             watchdog_fired,
             external_already,
             killed_by_signal,
             engine_cancelled,
-        ) {
-            crate::engine::agent_session::lifecycle::SafetyNetAction::Nothing
-            | crate::engine::agent_session::lifecycle::SafetyNetAction::Skip => {}
-            crate::engine::agent_session::lifecycle::SafetyNetAction::EmitContinuationRequested => {
+        );
+        match net_action {
+            SafetyNetAction::Nothing | SafetyNetAction::Skip => {}
+            SafetyNetAction::EmitContinuationRequested => {
                 crate::engine::thread_events::emit_continuation_requested_or_log(
                     &self.event_bus,
                     thread_id,
@@ -118,7 +120,7 @@ impl LucidosEngine {
                 )
                 .await;
             }
-            crate::engine::agent_session::lifecycle::SafetyNetAction::EmitAbortedSafetyNet => {
+            SafetyNetAction::EmitAbortedSafetyNet => {
                 let mut emit_meta = meta.clone();
                 Self::stamp_system_actor_if_aborted(&mut emit_meta, true);
                 crate::engine::thread_events::emit_response_aborted(
@@ -208,137 +210,195 @@ impl LucidosEngine {
 
         if let Some(change) = conflict_change {
             // Conflict resolution cleanup — merge happened in a worktree, ff-merge to main.
-            // The HTTP Apply call that triggered this CC merge returned long ago; the
-            // user's actor was parked in `pending_apply_actors` at apply_change Tier 3
-            // entry. Take it back here so the resulting ChangeApplied / ChangeApplyFailed
-            // carries the device that clicked Apply instead of falling through to None
-            // (which renders as "Lucidos Engine" in the chat chip).
-            let apply_actor = self.pending_apply_actors.take(change.id);
-
             let has_unmerged = git_cmd(&["diff", "--name-only", "--diff-filter=U"], &cwd)
                 .await
                 .map(|o| !o.stdout.is_empty())
                 .unwrap_or(true);
 
             let wt_str = cwd.to_string_lossy();
-            let temp_branch = change
-                .merge_temp_branch
-                .as_deref()
-                .unwrap_or(&change.branch_name);
 
-            if let ConflictResolutionCleanupAction::Abort { message } =
-                conflict_resolution_cleanup_action(has_unmerged, &last_terminal_kind)
-            {
-                let _ = git_cmd(&["merge", "--abort"], &cwd).await;
-                log!(
-                    "[AgentSession] Conflict resolution not applied for {}: {}",
-                    change.branch_name,
-                    message
-                );
-                let _ = git_cmd(&["worktree", "remove", "--force", &wt_str], &repo_root).await;
-                let _ = git_cmd(&["branch", "-D", temp_branch], &repo_root).await;
-                self.emit_merge_resolution_cleared(
-                    change.thread_id.unwrap_or(thread_id),
-                    change.id,
-                    "[ConflictResolution] MergeResolutionCleared",
-                )
-                .await;
-                self.emit_apply_failed(
-                    change.thread_id.unwrap_or(thread_id),
-                    change.id,
-                    message,
-                    apply_actor,
-                )
-                .await;
-            } else {
-                // Ensure merge is committed
-                let merge_committed = git_cmd(&["rev-parse", "MERGE_HEAD"], &cwd)
-                    .await
-                    .map(|o| !o.status.success())
-                    .unwrap_or(false);
-                if !merge_committed {
-                    // ff_merge_to_main below will surface the user-visible failure
-                    // if the merge stays uncommitted, but the log here preserves
-                    // the original git stderr so a stuck merge can be triaged
-                    // without re-running.
-                    if let Err(e) = git_commit_no_edit(&cwd).await {
-                        log!(
-                            "[ConflictResolution] {} (change {}, branch {})",
-                            e,
-                            change.id,
-                            change.branch_name
-                        );
-                    }
+            // Two continuation shapes hand off: the in-loop safety net about
+            // to emit `ContinuationRequested` (stray kill / in-loop watchdog),
+            // and the EXTERNAL watchdog, which already emitted one and set the
+            // suppression flag before cancelling us — so `net_action` reads
+            // `Skip` there, and only its dedicated flag distinguishes that
+            // recovery from a restart abort / concurrent cancel (which must
+            // still Abort).
+            let cleanup_action = conflict_resolution_cleanup_action(
+                has_unmerged,
+                &last_terminal_kind,
+                net_action == SafetyNetAction::EmitContinuationRequested
+                    || external_continuation_requested.load(std::sync::atomic::Ordering::Acquire),
+            );
+            // Both non-HandOff arms take the parked apply actor: the HTTP
+            // Apply call that triggered this CC merge returned long ago; the
+            // user's actor was parked in `pending_apply_actors` at
+            // apply_change Tier-2/3 entry, and taking it here stamps the
+            // resulting ChangeApplied / ChangeApplyFailed with the device
+            // that clicked Apply instead of falling through to None (which
+            // renders as "Lucidos Engine" in the chat chip). HandOff leaves
+            // it parked for the continuation's own completion.
+            match cleanup_action {
+                ConflictResolutionCleanupAction::HandOff => {
+                    // An auto-recovery continuation resumes this very merge
+                    // turn via `--resume`. Aborting here would fail the apply
+                    // the user is watching and race destructive git cleanup
+                    // against the continuation spawn that's concurrently
+                    // re-adopting the same worktree (the 2026-07-10
+                    // stray-SIGTERM incident). Leave everything — merge state,
+                    // worktree, branch, the parked apply actor, and the open
+                    // MergeConflictDetected pairing — for the continuation,
+                    // whose spawn re-attaches the duty via
+                    // `pending_conflict_change_for_thread` and whose own
+                    // completion then applies or aborts for real.
+                    log!(
+                        "[AgentSession] Conflict resolution for {} handed off to auto-recovery continuation — change {} stays pending, merge state preserved",
+                        change.branch_name,
+                        change.id
+                    );
                 }
-
-                // Remove worktree and ff-merge to main
-                match ff_merge_to_main(&repo_root, &wt_str, temp_branch, &change.branch_name).await {
-                    Ok((pre_sha, post_sha)) => {
-                        let commits = commits_in_range(&repo_root, &pre_sha, &post_sha).await;
-                        // Mirror the kind-aware overrides apply_change applies
-                        // for app threads: never claim requires_restart for an
-                        // app change, and emit AppUiRefreshRequested so open
-                        // iframes reload after a conflict-resolution apply
-                        // (the Tier-1/2/3 happy-path branches in change_ops.rs
-                        // already do this; the cleanup path used to skip it).
-                        let kind_ctx = crate::engine::change_ops::load_apply_kind_context(
-                            &self.pool,
-                            change.thread_id,
-                        )
-                        .await;
-                        let requires_restart_effective =
-                            change.requires_restart && !kind_ctx.is_app();
-                        self.emit_change_applied(
-                            change.thread_id.unwrap_or(thread_id),
-                            change.id,
-                            requires_restart_effective,
-                            files_have_client_update(&change.files),
-                            commits,
-                            change.thread_title.clone(),
-                            apply_actor.clone(),
-                            Some(pre_sha.clone()),
-                            Some(post_sha.clone()),
-                        )
-                        .await;
-                        self.maybe_emit_app_ui_refresh(
-                            &kind_ctx,
-                            &change.files,
-                            apply_actor.as_ref(),
-                        )
-                        .await;
-                        self.emit_entity_events_for_change_apply(
-                            &change.files,
-                            Some(&pre_sha),
-                            Some(&post_sha),
-                            apply_actor,
-                        )
-                        .await;
-                        self.emit_merge_resolution_cleared(
-                            change.thread_id.unwrap_or(thread_id),
-                            change.id,
-                            "[ConflictResolution] MergeResolutionCleared",
-                        )
-                        .await;
-                        log!(
-                            "[AgentSession] Conflict resolution complete — change {} applied via ff-merge",
-                            change.id
-                        );
+                ConflictResolutionCleanupAction::Abort { message } => {
+                    let apply_actor = self.pending_apply_actors.take(change.id);
+                    let _ = git_cmd(&["merge", "--abort"], &cwd).await;
+                    log!(
+                        "[AgentSession] Conflict resolution not applied for {}: {}",
+                        change.branch_name,
+                        message
+                    );
+                    // Delete only what the merge attempt created: the Tier-3
+                    // temp worktree + temp branch, and only when THIS session
+                    // actually ran on them (a stale row after a pruned-temp
+                    // re-attach must not condemn the thread worktree). A
+                    // Tier-2 merge ran in the thread's OWN worktree on the
+                    // REAL change branch — `merge --abort` is the whole
+                    // cleanup there; deleting would destroy the user's
+                    // committed work (rust.md failure-path-cleanup rule).
+                    if conflict_abort_deletes_temp_state(
+                        change.merge_temp_branch.as_deref(),
+                        &branch_name,
+                    ) {
+                        let _ =
+                            git_cmd(&["worktree", "remove", "--force", &wt_str], &repo_root).await;
+                        let _ = git_cmd(&["branch", "-D", &branch_name], &repo_root).await;
                     }
-                    Err(e) => {
-                        self.emit_merge_resolution_cleared(
-                            change.thread_id.unwrap_or(thread_id),
-                            change.id,
-                            "[ConflictResolution] MergeResolutionCleared",
-                        )
-                        .await;
-                        log!("[AgentSession] ff-merge failed after conflict resolution: {}", e);
-                        self.emit_apply_failed(
-                            change.thread_id.unwrap_or(thread_id),
-                            change.id,
-                            &format!("Merge failed after conflict resolution: {}", e),
-                            apply_actor,
-                        )
-                        .await;
+                    self.emit_merge_resolution_cleared(
+                        change.thread_id.unwrap_or(thread_id),
+                        change.id,
+                        "[ConflictResolution] MergeResolutionCleared",
+                    )
+                    .await;
+                    self.emit_apply_failed(
+                        change.thread_id.unwrap_or(thread_id),
+                        change.id,
+                        message,
+                        apply_actor,
+                    )
+                    .await;
+                }
+                ConflictResolutionCleanupAction::Apply => {
+                    let apply_actor = self.pending_apply_actors.take(change.id);
+                    // Ensure merge is committed
+                    let merge_committed = git_cmd(&["rev-parse", "MERGE_HEAD"], &cwd)
+                        .await
+                        .map(|o| !o.status.success())
+                        .unwrap_or(false);
+                    if !merge_committed {
+                        // ff_merge_to_main below will surface the user-visible
+                        // failure if the merge stays uncommitted, but the log
+                        // here preserves the original git stderr so a stuck
+                        // merge can be triaged without re-running.
+                        if let Err(e) = git_commit_no_edit(&cwd).await {
+                            log!(
+                                "[ConflictResolution] {} (change {}, branch {})",
+                                e,
+                                change.id,
+                                change.branch_name
+                            );
+                        }
+                    }
+
+                    // Remove worktree and ff-merge to main. The merge source
+                    // is the branch THIS session ran on (`branch_name`): the
+                    // temp branch for an original Tier-3 session, the change
+                    // branch for Tier-2 and for a pruned-temp re-attach —
+                    // where the row's recorded `merge_temp_branch` is stale
+                    // and would ff the dead attempt's sha instead of the
+                    // resolution the session just committed.
+                    match ff_merge_to_main(&repo_root, &wt_str, &branch_name, &change.branch_name)
+                        .await
+                    {
+                        Ok((pre_sha, post_sha)) => {
+                            let commits = commits_in_range(&repo_root, &pre_sha, &post_sha).await;
+                            // Mirror the kind-aware overrides apply_change
+                            // applies for app threads: never claim
+                            // requires_restart for an app change, and emit
+                            // AppUiRefreshRequested so open iframes reload
+                            // after a conflict-resolution apply (the
+                            // Tier-1/2/3 happy-path branches in change_ops.rs
+                            // already do this; the cleanup path used to skip
+                            // it).
+                            let kind_ctx = crate::engine::change_ops::load_apply_kind_context(
+                                &self.pool,
+                                change.thread_id,
+                            )
+                            .await;
+                            let requires_restart_effective =
+                                change.requires_restart && !kind_ctx.is_app();
+                            self.emit_change_applied(
+                                change.thread_id.unwrap_or(thread_id),
+                                change.id,
+                                requires_restart_effective,
+                                files_have_client_update(&change.files),
+                                commits,
+                                change.thread_title.clone(),
+                                apply_actor.clone(),
+                                Some(pre_sha.clone()),
+                                Some(post_sha.clone()),
+                            )
+                            .await;
+                            self.maybe_emit_app_ui_refresh(
+                                &kind_ctx,
+                                &change.files,
+                                apply_actor.as_ref(),
+                            )
+                            .await;
+                            self.emit_entity_events_for_change_apply(
+                                &change.files,
+                                Some(&pre_sha),
+                                Some(&post_sha),
+                                apply_actor,
+                            )
+                            .await;
+                            self.emit_merge_resolution_cleared(
+                                change.thread_id.unwrap_or(thread_id),
+                                change.id,
+                                "[ConflictResolution] MergeResolutionCleared",
+                            )
+                            .await;
+                            log!(
+                                "[AgentSession] Conflict resolution complete — change {} applied via ff-merge",
+                                change.id
+                            );
+                        }
+                        Err(e) => {
+                            self.emit_merge_resolution_cleared(
+                                change.thread_id.unwrap_or(thread_id),
+                                change.id,
+                                "[ConflictResolution] MergeResolutionCleared",
+                            )
+                            .await;
+                            log!(
+                                "[AgentSession] ff-merge failed after conflict resolution: {}",
+                                e
+                            );
+                            self.emit_apply_failed(
+                                change.thread_id.unwrap_or(thread_id),
+                                change.id,
+                                &format!("Merge failed after conflict resolution: {}", e),
+                                apply_actor,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
@@ -586,6 +646,18 @@ impl LucidosEngine {
                                 effective_branch
                             );
                         }
+                        // Not proposing is not the same as leaving a stale row
+                        // behind: if this branch already carries a pending
+                        // change, re-sync it to zero files so its card stops
+                        // advertising work the branch no longer has. Never
+                        // discards, and never creates a row for a branch that
+                        // has none — see `reconcile_emptied_pending_change`.
+                        self.reconcile_emptied_pending_change(
+                            thread_id,
+                            &repo_root,
+                            effective_branch,
+                        )
+                        .await;
                     }
                 }
             }

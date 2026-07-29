@@ -3,7 +3,7 @@ import { panelOverlay, wipPreviewThreadId, threadMap, activeMenuItem, settingsSu
 import type { App } from '../../../store/types';
 import { MENU_ITEMS } from '../../../store/types';
 import { makeOptimisticThreadState, PENDING_TITLE_PLACEHOLDER } from '../../../store/thread-events';
-import { CHANNEL_OPTIONS, getContentTitle } from '../headerHelpers';
+import { CHANNEL_OPTIONS, getContentTitle, navEntryTitle } from '../headerHelpers';
 
 vi.mock('../../../api/client', () => ({
   listAppsApi: vi.fn().mockResolvedValue([]),
@@ -93,6 +93,38 @@ describe('getContentTitle — notification detail', () => {
       notification: { ...fakeNotification, title: '' },
     };
     expect(getContentTitle()).toBe('Notification');
+  });
+});
+
+describe('getContentTitle — email confirm', () => {
+  const request = {
+    to: ['recipient@example.com'],
+    subject: 'Quarterly numbers',
+    body: 'Body',
+    account: 'work',
+    from: 'me@example.com',
+  };
+
+  beforeEach(() => {
+    panelOverlay.value = null;
+    activeMenuItem.value = 'files';
+  });
+
+  it('a pending draft reads "Confirm Email"', () => {
+    panelOverlay.value = { type: 'form', form: { type: 'email-confirm', request } };
+    expect(getContentTitle()).toBe('Confirm Email');
+  });
+
+  it('a sent receipt reads "Email Sent" — the same label its nav-history row carries', () => {
+    const form = { type: 'email-confirm' as const, request, sentAt: '2026-07-29T09:15:00.000Z' };
+    panelOverlay.value = { type: 'form', form };
+    expect(getContentTitle()).toBe('Email Sent');
+    expect(navEntryTitle({
+      menuItem: 'files',
+      settingsSubview: 'main',
+      overlay: { type: 'form', form },
+      wipPreviewThreadId: null,
+    })).toBe('Email Sent');
   });
 });
 

@@ -1,6 +1,7 @@
 import { useRef, useEffect } from 'preact/hooks';
 import {
   notifications,
+  unreadNotifications,
   notificationsFilter,
   notificationsHasMore,
   notificationsLoadingMore,
@@ -13,21 +14,48 @@ import {
 } from '../../store/actions/notifications';
 import { stripHtml } from '../../utils/escapeHtml';
 import { formatTimeAgo, formatNotificationDate } from '../../utils/formatTime';
-import { loadedOr, type Notification } from '../../store/types';
+import { loadedOr, type Loadable, type Notification } from '../../store/types';
 import { renderMarkdown } from '../../utils/renderMarkdown';
-import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 
+/** The Loadable the Notifications view renders for a given filter — the single
+ *  source of truth that makes the badge and the unread list impossible to
+ *  disagree. The "Unread" tab returns the SAME `unreadNotifications` set the bell
+ *  badge / PWA app-icon badge / page title project from (store.ts `unreadCount`),
+ *  so its length IS the badge count — one array, no second fetch to drift. The
+ *  "All" tab returns the paginated `notifications` browse list. Pure + exported
+ *  so the invariant is unit-testable (and a future edit can't silently point the
+ *  "Unread" tab back at the browse list without failing a test). */
+export function notificationsTabSource(
+  filter: 'all' | 'unread',
+  unread: Loadable<Notification[]>,
+  all: Loadable<Notification[]>,
+): Loadable<Notification[]> {
+  return filter === 'unread' ? unread : all;
+}
+
 export function NotificationsView() {
   const sentinelRef = useRef<HTMLDivElement>(null);
 
-  const loadable = notifications.value;
-  const items = loadedOr(loadable, []);
-  const showLoading = useDelayedLoading(loadable);
   const filter = notificationsFilter.value;
-  const hasMore = notificationsHasMore.value;
+  const loadable = notificationsTabSource(filter, unreadNotifications.value, notifications.value);
+  const items = loadedOr(loadable, []);
+  // The "All" browse list transitions through 'loading' (loadNotifications). The
+  // unread set never does — `loadUnreadNotifications` applies in place so the bell
+  // badge never blinks to 0 on a reload — so on the "Unread" tab, treat the
+  // first-load 'not-loaded' state as loading too. Delay-gated either way, so a
+  // fast load shows nothing rather than a flash; a slow first load shows the
+  // skeleton instead of a blank panel.
+  const showLoading = useDelayedFlag(
+    loadable.status === 'loading' || (filter === 'unread' && loadable.status === 'not-loaded'),
+  );
+  // Pagination applies to the "All" browse list only — the unread set is loaded
+  // whole (bounded by UNREAD_LOAD_LIMIT; a larger backlog already renders as
+  // "99+" on the badge), so there is no "load more" on the "Unread" tab.
+  const hasMore = filter === 'all' && notificationsHasMore.value;
   const loadingMore = notificationsLoadingMore.value;
 
   // Infinite scroll: observe a sentinel at the bottom of the list. The real

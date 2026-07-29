@@ -12,6 +12,18 @@ pub struct TriggerEventRow {
     pub created: DateTime<Utc>,
 }
 
+/// The row's *recorded run time* — the engine-clock instant the engine recorded
+/// for the run, falling back to the DB-clock `created` for legacy rows.
+///
+/// Thin adapter over [`super::run_history::recorded_run_time`], which owns the
+/// rule and documents why the two clocks must not be mixed.
+fn recorded_run_time(row: &TriggerEventRow) -> DateTime<Utc> {
+    super::run_history::recorded_run_time(
+        row.payload.get("last_run").and_then(|v| v.as_str()),
+        row.created,
+    )
+}
+
 /// Replay a sequence of trigger lifecycle events to rebuild in-memory state.
 /// Events must be in chronological order (oldest first).
 pub fn replay_trigger_events(events: Vec<TriggerEventRow>) -> HashMap<String, TriggerConfig> {
@@ -54,7 +66,7 @@ pub fn replay_trigger_events(events: Vec<TriggerEventRow>) -> HashMap<String, Tr
             }
             "TriggerExecuted" => {
                 if let Some(config) = triggers.get_mut(&trigger_id) {
-                    config.last_run = Some(row.created);
+                    config.last_run = Some(recorded_run_time(&row));
                     // The `status` field rides the payload as of the last-run-status
                     // change. A legacy `TriggerExecuted` without it leaves
                     // `last_run_status` untouched (→ None, "timestamp only"); an
@@ -71,7 +83,7 @@ pub fn replay_trigger_events(events: Vec<TriggerEventRow>) -> HashMap<String, Tr
                 // but carries no outcome — the trailing `TriggerExecuted` sets the
                 // status. Leave `last_run_status` as-is here.
                 if let Some(config) = triggers.get_mut(&trigger_id) {
-                    config.last_run = Some(row.created);
+                    config.last_run = Some(recorded_run_time(&row));
                 }
             }
             _ => {}
@@ -234,6 +246,88 @@ mod tests {
         assert_eq!(
             ok.get("t2").unwrap().last_run_status,
             Some(TriggerRunStatus::Ok)
+        );
+    }
+
+    /// Build a `TriggerExecuted` row whose DB-clock `created` and engine-clock
+    /// `payload.last_run` deliberately disagree.
+    fn executed_with_clocks(id: &str, created: &str, payload_last_run: Option<&str>) -> TriggerEventRow {
+        let mut payload = json!({ "trigger_id": id, "status": "ok" });
+        if let Some(lr) = payload_last_run {
+            payload["last_run"] = json!(lr);
+        }
+        TriggerEventRow {
+            event_type: "TriggerExecuted".into(),
+            payload,
+            created: DateTime::parse_from_rfc3339(created)
+                .unwrap()
+                .with_timezone(&Utc),
+        }
+    }
+
+    #[test]
+    fn replay_executed_prefers_engine_clock_last_run_over_db_created() {
+        // Regression (2026-07-29 double-fire): `events.created` is the Postgres
+        // server clock, `payload.last_run` is the engine clock the scheduler
+        // compares its slots against. A macOS sleep left the Docker-hosted
+        // Postgres clock 280 s behind, so the 07:45 slot's 07:49 run landed with
+        // `created = 05:44:35Z` — BEFORE the slot it had just served. Replaying
+        // that as `last_run` made the startup catch-up re-fire the slot and send
+        // a second push. The payload timestamp must win.
+        //
+        // These are the exact timestamps from the incident.
+        let triggers = replay_trigger_events(vec![
+            make_event("TriggerCreated", created_payload("t1", "Morning reminder")),
+            executed_with_clocks(
+                "t1",
+                "2026-07-29T05:44:35.649839Z",
+                Some("2026-07-29T05:49:15.783780Z"),
+            ),
+        ]);
+        let last_run = triggers.get("t1").unwrap().last_run.unwrap();
+        assert_eq!(
+            last_run.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            "2026-07-29T05:49:15.783780Z",
+            "engine-clock payload.last_run must win over the DB-clock created"
+        );
+        let slot = DateTime::parse_from_rfc3339("2026-07-29T05:45:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(
+            last_run >= slot,
+            "the 07:49 run must register as having served the 07:45 slot"
+        );
+    }
+
+    #[test]
+    fn replay_executed_falls_back_to_created_without_payload_last_run() {
+        // Legacy rows from before `record_trigger_executed` stamped the payload
+        // still have to yield a timestamp — `created` is the only one they carry.
+        let triggers = replay_trigger_events(vec![
+            make_event("TriggerCreated", created_payload("t1", "Legacy")),
+            executed_with_clocks("t1", "2026-07-29T05:44:35Z", None),
+        ]);
+        assert_eq!(
+            triggers.get("t1").unwrap().last_run.unwrap(),
+            DateTime::parse_from_rfc3339("2026-07-29T05:44:35Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+    }
+
+    #[test]
+    fn replay_executed_falls_back_to_created_on_malformed_last_run() {
+        // A non-RFC-3339 `last_run` must degrade to `created`, never wedge the
+        // replay or leave `last_run` unset.
+        let triggers = replay_trigger_events(vec![
+            make_event("TriggerCreated", created_payload("t1", "Garbled")),
+            executed_with_clocks("t1", "2026-07-29T05:44:35Z", Some("not-a-timestamp")),
+        ]);
+        assert_eq!(
+            triggers.get("t1").unwrap().last_run.unwrap(),
+            DateTime::parse_from_rfc3339("2026-07-29T05:44:35Z")
+                .unwrap()
+                .with_timezone(&Utc)
         );
     }
 

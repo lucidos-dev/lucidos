@@ -1,6 +1,7 @@
 import { signal } from '@preact/signals';
 import { CLIENT_BUILD_ID } from 'virtual:build-id';
 import { withBase } from '../utils/basePath';
+import { isUnstampedBuildId } from '../utils/buildId';
 import { preferences, showToast } from '../store/store';
 import { setPreference } from '../api/client';
 import { errorDetail } from '../utils/errorDetail';
@@ -176,7 +177,7 @@ export async function bustShellCaches(): Promise<void> {
  *  false, so we fall back to the conservative swap + bust path. */
 export function isRunningServedBuild(servedBuildId: string | null): boolean {
   return servedBuildId !== null
-    && !CLIENT_BUILD_ID.startsWith('__')
+    && !isUnstampedBuildId(CLIENT_BUILD_ID)
     && servedBuildId === CLIENT_BUILD_ID;
 }
 
@@ -330,7 +331,7 @@ export async function getServedBuildId(): Promise<string | null> {
     const resp = await fetch(withBase('/sw.js'), { cache: 'no-store' });
     if (!resp.ok) return null;
     const id = SW_BUILD_ID_RE.exec(await resp.text())?.[1];
-    if (!id || id.startsWith('__')) return null;
+    if (!id || isUnstampedBuildId(id)) return null;
     return id;
   } catch {
     // Offline / transient — the next load/resume check (or the browser's own SW

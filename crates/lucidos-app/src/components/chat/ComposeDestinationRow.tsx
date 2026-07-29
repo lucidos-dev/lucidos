@@ -73,6 +73,23 @@ export function handleComposeCodingAgentSelection(
   deps.focusPrompt();
 }
 
+type ListRetryDeps = { loadRepos: () => void; loadAppsList: () => void };
+
+/** Retry a destination list whose load FAILED, on the user's gesture of opening
+ *  the picker. Nothing else refetches a failed list: the render-path kick-off
+ *  below only fires on `not-loaded`, and the SSE refresh only re-fires a list
+ *  that is already `loaded` — so one transient failure (a browser-cancelled
+ *  fetch, a deadline that fired while the engine was still booting) left the
+ *  picker showing a red "Failed to load repositories" row until the user
+ *  mutated the repository list by hand. Both loaders single-flight, so at most
+ *  one fetch per open, and only for a list that actually failed. */
+export function retryFailedDestinationLists(
+  deps: ListRetryDeps = { loadRepos: loadRepositories, loadAppsList: loadApps },
+): void {
+  if (repositories.value.status === 'failed') deps.loadRepos();
+  if (appsList.value.status === 'failed') deps.loadAppsList();
+}
+
 /** The compose destination picker — its consequence caption,
  *  and the hand-off hint. Lives in its own component so the signal
  *  subscriptions (repositories, appsList, selectedScope, selectedCodingAgent,
@@ -145,6 +162,9 @@ export function ComposeDestinationRow({ threadId, toggleMode, fading }: {
             handleComposeDestinationSelection(threadId, v);
           }}
           class="compose-destination-picker"
+          // Opening the picker retries a list that failed to load — see
+          // retryFailedDestinationLists.
+          onOpen={retryFailedDestinationLists}
           restoreFocusOnSelect={false}
           // The trigger already shows the current destination; the last-used
           // target is irrelevant when picking a fresh one, so don't mark it in

@@ -78,12 +78,39 @@ report that distinctly.
 
 ## Documented #[ignore] exceptions
 
-Two tests in `crates/lucidos-engine/src/engine/thread_lifecycle_tests/contract.rs`
-are intentionally `#[ignore]`d as contract-artifact generators
-(`generate_typescript_file` and `generate_cross_validation_fixture_file`).
-Running them rewrites generated source files; sibling non-ignored tests
-verify staleness. Expect `Ignored: 2` matching these names — anything
-else is a real skip and must be fixed.
+Expect **`5 ignored` in the lib run and `1 ignored` in the doctest run**
+— and nothing else. Any other ignored test is a real skip and must be
+fixed. (`crates/lucidos-engine/tests/` — the integration binaries — has
+no `#[ignore]` at all.)
+
+**The 5 lib-level ones are all codegen writers**, and every one of them
+is paired with a *non-ignored* staleness guard that fails `cargo test`
+when the generated file on disk no longer matches what the writer would
+produce. That pairing is the whole reason the `#[ignore]` is legitimate:
+the writer is `#[ignore]`d because *running* it rewrites a checked-in
+source file (a test must not mutate the tree), while the guard means a
+stale artifact still reds the suite. Rust stays the source of truth; the
+generated file is a build product that happens to be committed. So this
+is not a skipped test — it is a test split into "check" (always runs)
+and "regenerate" (run on demand). Don't re-litigate it, and don't
+"fix" it by un-ignoring the writers.
+
+| `#[ignore]` writer | Non-ignored staleness guard |
+|---|---|
+| `capability_manifest::codegen::generate_cli_commands_file` | `generated_cli_commands_is_up_to_date` |
+| `capability_manifest::codegen::generate_sdk_capabilities_file` | `generated_sdk_capabilities_is_up_to_date` |
+| `engine::thread_lifecycle::contract_tests::generate_typescript_file` | the contract-staleness assert in `thread_lifecycle_tests/contract.rs` |
+| `engine::thread_lifecycle::contract_tests::generate_cross_validation_fixture_file` | same file's fixture-staleness assert |
+| `llm::tools::misc::navigate_targets_codegen::generate_navigate_targets_file` | `generated_navigate_targets_is_up_to_date` |
+
+When a guard fails it prints the exact regeneration command; run that,
+then re-run the suite. `cargo test -p lucidos-engine --lib -- --ignored --list`
+prints the live list if you need to re-check the set.
+
+**The 1 doctest** is a ```` ```ignore ```` fenced example in
+`crates/lucidos-engine/src/engine/event_bus/mod.rs` — illustrative usage,
+not a compilable snippet. It is the crate's only doctest, so the doc run
+reports `0 passed; 1 ignored`.
 
 If a future change introduces a *new* `#[ignore]`, it must come with
 either (a) a sibling non-ignored verification test, or (b) a script

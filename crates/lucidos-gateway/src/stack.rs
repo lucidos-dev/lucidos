@@ -18,6 +18,39 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+/// Does `path` lie inside a coding-agent worktree — one of the
+/// `<workspace>/.lucidos/worktrees/<thread>/` copies the engine creates per
+/// coding-agent thread?
+///
+/// A worktree is a throwaway checkout pinned to one commit. Anything long-lived
+/// that resolves into one (an engine/gateway binary, a served `dist/`) is frozen
+/// at that commit forever, which on 2026-07-26 made every frontend-only Apply
+/// silently serve a stale build. The bash side has the same predicate
+/// (`path_is_in_cc_worktree` in `scripts/lib/workspace.sh`) — keep the two in
+/// step; see `docs/plans/2026-07-26-worktree-pinned-stack-guard.md`.
+///
+/// A pure path test on purpose: it must stay correct for an ORPHANED worktree
+/// whose directory is already gone, which is exactly when it matters most.
+/// Matches on the `.lucidos/worktrees` component pair so a directory merely
+/// *named* `worktrees` (or a `~/worktrees/lucidos` checkout) is not caught.
+pub(crate) fn path_is_in_cc_worktree(path: &Path) -> bool {
+    let comps: Vec<_> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    comps
+        .windows(2)
+        .any(|w| w[0] == ".lucidos" && w[1] == "worktrees")
+}
+
+// NOTE: there is deliberately NO `LUCIDOS_ALLOW_WORKTREE_STACK` escape hatch in
+// this crate. The opt-out exists only for a session-scoped DIRECT engine (the
+// e2e harness, which calls `start_engine` and never starts a gateway). Every
+// path in the gateway is by definition the machine-global daemon — it outlives
+// the shell that launched it and propagates its env into every engine it spawns
+// — so honouring an inherited opt-out here would re-open exactly the 2026-07-26
+// hole the guards close. See ADR 0021 § "the opt-out stops at the gateway".
+
 /// Per-workspace health, surfaced on the control API and rendered in the picker.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -130,6 +163,27 @@ pub fn spawn_engine(
         .env("LUCIDOS_WORKSPACE_ID", &ws.id)
         .env("LUCIDOS_GATEWAY_PORT", gateway_port.to_string())
         .env("FASTEMBED_CACHE_DIR", &fastembed_cache);
+
+    // Never hand a spawned engine a frontend pinned to a coding-agent worktree.
+    // This inherit is precisely what made the 2026-07-26 pin self-perpetuating:
+    // a gateway launched from a worktree passed that worktree's dist/ into every
+    // engine it spawned, so the stack kept serving a frozen build across restarts
+    // and every frontend-only Apply silently did nothing. Dropping the var makes
+    // the engine serve nothing rather than something stale — a visible failure
+    // beats an invisible one, and `LUCIDOS_STATIC_DIR` is already optional
+    // (headless engines run without it).
+    if let Some(dir) = std::env::var_os("LUCIDOS_STATIC_DIR") {
+        if path_is_in_cc_worktree(Path::new(&dir)) {
+            crate::log!(
+                "[Gateway] refusing to pass worktree-pinned LUCIDOS_STATIC_DIR to engine \
+                 '{}': {} — relaunch the stack from the real checkout \
+                 (see docs/plans/2026-07-26-worktree-pinned-stack-guard.md)",
+                ws.id,
+                Path::new(&dir).display()
+            );
+            cmd.env_remove("LUCIDOS_STATIC_DIR");
+        }
+    }
     if loopback {
         // Packaged: loopback only — the gateway is the sole network-facing
         // surface and terminates TLS, so the engine serves plain HTTP on
@@ -299,6 +353,60 @@ pub async fn fetch_unread_count(client: &reqwest::Client, scheme: &str, port: u1
 mod tests {
     use super::*;
     use crate::registry::Workspace;
+
+    /// Regression cover for the 2026-07-26 incident: the live stack was running
+    /// out of an ORPHANED coding-agent worktree, so it served a frozen `dist/`
+    /// and every frontend-only Apply silently did nothing.
+    #[test]
+    fn detects_coding_agent_worktree_paths() {
+        for p in [
+            "/Users/me/workspaces/dev/.lucidos/worktrees/thread-abc",
+            "/Users/me/workspaces/dev/.lucidos/worktrees/thread-abc/crates/lucidos-app/dist",
+            "/Users/me/workspaces/dev/.lucidos/worktrees/thread-abc/target/debug/lucidos-engine",
+        ] {
+            assert!(
+                path_is_in_cc_worktree(Path::new(p)),
+                "should be flagged as a worktree path: {p}"
+            );
+        }
+    }
+
+    /// Must not fire on a real checkout — including paths that merely contain
+    /// the word "worktrees", which a naive substring match would catch.
+    #[test]
+    fn leaves_real_checkout_paths_alone() {
+        for p in [
+            "/Users/me/projects/lucidos",
+            "/Users/me/projects/lucidos/crates/lucidos-app/dist",
+            "/Users/me/projects/lucidos/target/debug/lucidos-engine",
+            "/Users/me/worktrees/lucidos/crates/lucidos-app/dist",
+            "/Users/me/projects/lucidos/.lucidos/served-frontend/0",
+        ] {
+            assert!(
+                !path_is_in_cc_worktree(Path::new(p)),
+                "should NOT be flagged as a worktree path: {p}"
+            );
+        }
+    }
+
+    /// The pair must be adjacent — `.lucidos/<x>/worktrees` is not a CC worktree.
+    #[test]
+    fn requires_adjacent_lucidos_worktrees_components() {
+        assert!(!path_is_in_cc_worktree(Path::new(
+            "/w/.lucidos/cache/worktrees/thread-abc"
+        )));
+        assert!(path_is_in_cc_worktree(Path::new("/w/.lucidos/worktrees")));
+    }
+
+    /// The predicate must not touch the filesystem: an orphaned worktree's
+    /// directory is often already gone, and that is exactly when the guard has
+    /// to keep firing.
+    #[test]
+    fn does_not_require_the_path_to_exist() {
+        assert!(path_is_in_cc_worktree(Path::new(
+            "/definitely/not/here/.lucidos/worktrees/thread-gone/crates"
+        )));
+    }
 
     /// The picker binds its per-workspace auto-start toggle to this field, so the
     /// status JSON must ALWAYS carry `autostart` (no skip).

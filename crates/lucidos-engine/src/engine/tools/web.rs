@@ -1,4 +1,5 @@
 use super::super::LucidosEngine;
+use crate::llm::WebSearchProvider;
 use std::time::Duration;
 
 impl LucidosEngine {
@@ -126,22 +127,18 @@ impl LucidosEngine {
                     return Ok("Error: query is required".to_string());
                 }
 
-                // Use Gemini Google Search grounding via Vertex AI
-                match &self.extractor {
-                    Some(extractor) => {
-                        match extractor
-                            .provider()
-                            .search_with_grounding(query, max_results)
-                            .await
-                        {
-                            Ok(result) => Ok(result),
-                            Err(e) => Ok(format!("Error: Search failed: {}", e)),
-                        }
-                    }
-                    None => Ok(
-                        "Error: web_search requires Vertex AI configuration (VERTEX_PROJECT_ID)"
-                            .to_string(),
-                    ),
+                // Resolved over the configured provider set — NOT over the chat
+                // model's provider, so a user whose chat provider has no search
+                // tool still searches via another configured one. The chain
+                // itself owns backend selection, fallthrough, and the
+                // nothing-configured message; see `llm::web_search`.
+                match self
+                    .current_web_search()
+                    .search(query, max_results)
+                    .await
+                {
+                    Ok(result) => Ok(result),
+                    Err(e) => Ok(format!("Error: Search failed: {}", e)),
                 }
             }
             _ => Ok(format!("Unknown web tool: {}", name)),

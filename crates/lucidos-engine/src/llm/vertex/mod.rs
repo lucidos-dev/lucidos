@@ -198,6 +198,29 @@ impl VertexProvider {
         model.starts_with("claude")
     }
 
+    /// Gemini `:generateContent` endpoint pinned to `locations/global`,
+    /// ignoring the configured region entirely.
+    ///
+    /// Two callers need this, for different reasons:
+    /// - `gemini-3*` models are only published globally.
+    /// - Grounded web search (`search_with_grounding`), because Google Search
+    ///   grounding is a global-endpoint feature.
+    ///
+    /// Pinning matters because the configured region is the *chat* region, and a
+    /// workspace legitimately pins one that serves no Gemini models at all: the
+    /// `eu` / `us` multi-regions carry Anthropic publisher models (so
+    /// `vertex_region = eu` is the right setting to reach Claude there) but no
+    /// Google ones, so any Gemini call routed to them 404s with
+    /// `Publisher model … was not found`.
+    fn global_gemini_endpoint(&self, model: &str) -> String {
+        format!(
+            "https://{}/v1/projects/{}/locations/global/publishers/google/models/{}:generateContent",
+            vertex_host("global"),
+            self.project_id,
+            model
+        )
+    }
+
     fn endpoint_for_model(&self, model: &str) -> String {
         let location = self.current_location();
         let host = vertex_host(&location);
@@ -207,10 +230,7 @@ impl VertexProvider {
                 host, self.project_id, location, model
             )
         } else if model.starts_with("gemini-3") {
-            format!(
-                "https://aiplatform.googleapis.com/v1/projects/{}/locations/global/publishers/google/models/{}:generateContent",
-                self.project_id, model
-            )
+            self.global_gemini_endpoint(model)
         } else {
             format!(
                 "https://{}/v1/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
@@ -356,6 +376,71 @@ mod tests {
         assert_eq!(
             vertex_host("europe-west1"),
             "europe-west1-aiplatform.googleapis.com"
+        );
+    }
+
+    /// Grounded web search must ALWAYS hit `locations/global`, whatever region
+    /// the workspace is pinned to.
+    ///
+    /// Regression for the 2026-07-03 break: `search_with_grounding` routed its
+    /// `gemini-2.5-flash-lite` call through `endpoint_for_model`, which sends
+    /// any non-`gemini-3*` model to the configured *chat* region. A workspace on
+    /// `vertex_region = eu` (the correct setting to reach Claude Opus 5 there)
+    /// therefore asked a multi-region that publishes no Google models for a
+    /// Gemini one, and every search 404'd with `Publisher model
+    /// projects/…/locations/eu/… was not found`. Verified against the live API:
+    /// grounding returns 200 on `global` and on `europe-west1`, and 404 on both
+    /// the `eu` and `us` multi-regions.
+    #[test]
+    fn grounding_endpoint_is_global_for_every_region() {
+        // Every shape `vertex_host` distinguishes: the two multi-regions (which
+        // serve no Gemini models at all), a specific region, and global itself.
+        for region in ["eu", "us", "europe-west1", "global"] {
+            let provider = VertexProvider::new(
+                "my-project".into(),
+                region.into(),
+                "claude-opus-5".into(),
+            )
+            .unwrap();
+            assert_eq!(
+                provider.global_gemini_endpoint("gemini-2.5-flash-lite"),
+                "https://aiplatform.googleapis.com/v1/projects/my-project/locations/global\
+                 /publishers/google/models/gemini-2.5-flash-lite:generateContent",
+                "grounding must ignore the configured region, got region={region}"
+            );
+        }
+    }
+
+    /// The `gemini-3*` carve-out routes through the same global builder, so the
+    /// two callers can't drift apart.
+    #[test]
+    fn gemini_3_models_use_the_global_endpoint_builder() {
+        let provider =
+            VertexProvider::new("my-project".into(), "eu".into(), "gemini-3.5-flash".into())
+                .unwrap();
+        assert_eq!(
+            provider.endpoint_for_model("gemini-3.5-flash"),
+            provider.global_gemini_endpoint("gemini-3.5-flash"),
+        );
+    }
+
+    /// The region-following path is deliberately unchanged: a Gemini model that
+    /// is NOT grounding and NOT `gemini-3*` still resolves against the
+    /// configured region. Guards the fix from over-reaching into a blanket
+    /// "all Gemini is global" rule, which would silently move chat traffic.
+    #[test]
+    fn non_grounding_gemini_still_follows_the_configured_region() {
+        let provider = VertexProvider::new(
+            "my-project".into(),
+            "europe-west1".into(),
+            "gemini-2.5-flash".into(),
+        )
+        .unwrap();
+        let url = provider.endpoint_for_model("gemini-2.5-flash");
+        assert!(
+            url.starts_with("https://europe-west1-aiplatform.googleapis.com/")
+                && url.contains("/locations/europe-west1/"),
+            "non-grounding Gemini must still follow the region: {url}"
         );
     }
 

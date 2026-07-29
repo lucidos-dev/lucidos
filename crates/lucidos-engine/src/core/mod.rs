@@ -10,6 +10,7 @@ pub mod devices;
 pub mod email;
 pub mod environment_variables;
 pub mod events;
+pub mod home_path;
 pub mod image_described_backfill;
 pub mod image_migration;
 pub mod intents;
@@ -23,6 +24,7 @@ pub mod plugins;
 pub mod preference_catalog;
 pub mod preferences;
 pub mod repositories;
+pub mod shell;
 pub mod store;
 pub mod system_knowhow;
 pub mod user_dir;
@@ -197,7 +199,8 @@ pub use intents::{Intent, IntentStore};
 pub use knowhow::{Knowhow, KnowhowDirs, KnowhowStore, KnowhowSummary};
 pub use oauth::{OAuthAccount, OAuthAccountInfo, OAuthStore};
 pub use pinned_apps::{PinnedAppStore, PinnedAppUi};
-pub use system_knowhow::{is_system_knowhow_path, SystemKnowhowStore};
+pub use shell::{command_shell, TaskOutcome};
+pub use system_knowhow::{is_system_knowhow_path, resolve_system_knowhow_dir, SystemKnowhowStore};
 
 /// Migrate legacy `prompts/` directories to `intents/` across the workspace.
 ///
@@ -830,8 +833,9 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             "Setting environment variable {}...",
             args["name"].as_str().unwrap_or("variable")
         ),
-        // set_language / set_timezone / enable_push_notifications above are kept
-        // for replaying historical events; new writes go through set_preference.
+        // The flat set_language / set_timezone / enable_push_notifications arms
+        // are kept for replaying historical events; new writes go through
+        // set_preference.
         "set_preference" => format!(
             "Updating {} setting...",
             args["key"].as_str().unwrap_or("preference")

@@ -463,7 +463,7 @@ pub(super) struct SeedChangeForTestRequest {
 /// Used only by the api e2e tests in `crates/lucidos-e2e/tests/api_support/changes_test.rs`.
 /// Production code emits the aggregate `ChangeProposed` exclusively via the
 /// agent session's end-of-turn aggregation (`propose_change`, gated by
-/// `should_propose_change_at_idle`). This endpoint exists so those tests can
+/// `may_touch_change_state_at_idle`). This endpoint exists so those tests can
 /// exercise the apply endpoint against a real projection-resident change
 /// without recreating the entire CC turn flow.
 ///

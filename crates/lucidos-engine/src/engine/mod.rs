@@ -124,7 +124,34 @@ pub enum InjectedPromptKind {
 /// Per-thread state: cancellation token + injection channel for mid-flight prompts.
 pub struct ThreadHandle {
     pub token: CancellationToken,
-    pub injection_tx: mpsc::UnboundedSender<InjectedPrompt>,
+    /// Private so every send from outside this module goes through
+    /// [`ThreadHandle::inject`], which also counts and wakes. A bare `.send()`
+    /// would enqueue the user's message without waking a tool parked waiting
+    /// for it. (The module's own tests do drive the raw channel — they're
+    /// exercising the channel plumbing itself, a level below `inject`.)
+    injection_tx: mpsc::UnboundedSender<InjectedPrompt>,
+    /// Fires whenever a prompt is injected into this thread. The agentic
+    /// loop picks injections up with `try_recv` *between* iterations, so a
+    /// tool that blocks — `bash_output(wait_secs=120)` is the one that
+    /// really can — would otherwise sit on its full budget while the user's
+    /// follow-up waits. Blocking tools select on this and come back early.
+    /// `notify_waiters` is right here (not `notify_one`): a stored permit
+    /// would make the NEXT wait return instantly for an injection the loop
+    /// has already consumed.
+    ///
+    /// A notification alone is not enough — see [`Self::pending_injections`].
+    pub injection_notify: Arc<tokio::sync::Notify>,
+    /// Prompts delivered to `injection_tx` that the loop has not drained yet.
+    ///
+    /// `notify_waiters` reaches only waiters that are *already* registered, so
+    /// on its own it covers the narrow "injected during the wait" case and
+    /// misses the wide one: a message that arrives while the LLM call is in
+    /// flight sits in the channel until the next iteration's `try_recv`, and a
+    /// blocking tool started in *this* iteration would see no notification at
+    /// all and sit out its whole budget. A blocking tool therefore registers
+    /// its waiter first and then reads this counter, so an injection either
+    /// shows up here or wakes the registered waiter — never neither.
+    pub pending_injections: Arc<std::sync::atomic::AtomicUsize>,
     /// Monotonic generation counter — incremented on each registration.
     /// Used by ThreadGuard::drop to avoid removing a newer registration.
     pub generation: u64,
@@ -133,6 +160,69 @@ pub struct ThreadHandle {
     /// once via `take_cancel_actor` to avoid reusing a stale device across
     /// requests. The `CancellationToken` itself remains signal-only.
     pub cancel_actor: Arc<std::sync::Mutex<Option<thread_events::MessageOrigin>>>,
+}
+
+impl ThreadHandle {
+    pub fn new(
+        token: CancellationToken,
+        injection_tx: mpsc::UnboundedSender<InjectedPrompt>,
+        generation: u64,
+    ) -> Self {
+        ThreadHandle {
+            token,
+            injection_tx,
+            injection_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_injections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            generation,
+            cancel_actor: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Deliver a prompt to the running agentic loop and wake anything
+    /// blocking on this thread. Returns false when the receiver is gone
+    /// (the turn ended between the caller's lookup and this send) — the
+    /// caller then falls back to starting a fresh turn.
+    ///
+    /// Count BEFORE sending, and wake after. Both orderings are load-bearing:
+    ///
+    /// - **Count before send.** `send` publishes the prompt to the loop at
+    ///   once, so a drain can report it consumed before a post-send increment
+    ///   lands. The saturating decrement would then no-op against a zero
+    ///   count and the late `+1` would strand a phantom unread forever —
+    ///   every later `bash_output(wait_secs=…)` on the thread would refuse to
+    ///   block, which is the polling storm all of this exists to stop.
+    /// - **Wake after count.** A blocking tool registers its waiter and then
+    ///   reads the counter, so it must never see "no notification AND no
+    ///   pending work".
+    pub fn inject(&self, prompt: InjectedPrompt) -> bool {
+        self.pending_injections
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        if self.injection_tx.send(prompt).is_ok() {
+            self.injection_notify.notify_waiters();
+            true
+        } else {
+            // Nothing was delivered, and no drain can be racing us — the
+            // receiver is gone. Give the reservation back.
+            self.injections_drained(1);
+            false
+        }
+    }
+
+    /// Record that the agentic loop took `n` prompts off the channel.
+    /// Saturating: the counter tracks the channel, and an underflow would wrap
+    /// to `usize::MAX` and stop every later wait from blocking, forever.
+    pub fn injections_drained(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        // Infallible by construction — `fetch_update` only returns `Err` when
+        // the closure returns `None`, and this one always returns `Some`.
+        let _ = self.pending_injections.fetch_update(
+            std::sync::atomic::Ordering::Release,
+            std::sync::atomic::Ordering::Acquire,
+            |cur| Some(cur.saturating_sub(n)),
+        );
+    }
 }
 
 /// Global counter for ThreadHandle generations.
@@ -151,11 +241,20 @@ pub struct LucidosEngine {
     /// out under a short read guard (never held across an `.await`). Mirrors the
     /// `Arc<RwLock<…>>` convention of `ModelRegistry` / `LocationHandle`.
     llm: Arc<std::sync::RwLock<Arc<dyn LlmProvider>>>,
-    /// Late-binding embedder slot: holds the loaded model on a normal boot,
-    /// or stays empty when the first-run download failed (offline packaged
-    /// install) — memory features degrade descriptively and the background
-    /// retry (`spawn_embedder_retry_if_degraded`) installs the model without
-    /// a restart. See `memory::EmbedderSlot`.
+    /// Backends for the `web_search` tool, in preference order. Held behind the
+    /// same swappable handle as `llm` and rebuilt by the same credential
+    /// subscriber, so adding a provider key enables search without a restart.
+    ///
+    /// Deliberately NOT derived from the chat model's provider: search resolves
+    /// over the whole configured provider set, which is what lets a user on a
+    /// provider with no search tool (OpenRouter, a local endpoint) still search
+    /// via another configured one. See `llm::web_search`.
+    web_search: Arc<std::sync::RwLock<Arc<crate::llm::WebSearchChain>>>,
+    /// Late-binding embedder slot: boots EMPTY (so boot never waits on the
+    /// multi-hundred-MB model), and the background loader
+    /// (`spawn_embedder_load`) installs the model without a restart once it
+    /// lands. Until then memory features degrade descriptively. See
+    /// `memory::EmbedderSlot`.
     embedder: Arc<EmbedderSlot>,
     memory_index: Option<PgVectorIndex>,
     extractor: Option<MemoryExtractor>,
@@ -164,6 +263,11 @@ pub struct LucidosEngine {
     /// Shared region handle, updated in place when `vertex_region` changes.
     vertex_location: crate::llm::vertex::LocationHandle,
     vertex_token_cache: Option<crate::llm::vertex::TokenCache>,
+    /// Shared model routing map (provider + declared context window), reloaded
+    /// in place by `spawn_models_registry_subscriber` on any `Model*` event.
+    /// The engine holds it — not just `RoutingProvider` — because the context
+    /// trimmer needs the declared context window to size its budget.
+    model_registry: crate::llm::model_registry::ModelRegistry,
     openai_api_key: Option<String>,
     rebuilding_memory: AtomicBool,
     cancel_rebuild: AtomicBool,
@@ -195,6 +299,13 @@ pub struct LucidosEngine {
     /// once per TTL regardless of client count. Dev-only; always false packaged.
     /// See `engine_version::source_behind_head`.
     source_behind_cache: std::sync::Mutex<engine_version::SourceBehindCache>,
+    /// Memoized "is the on-disk binary's commit an ANCESTOR of the running
+    /// engine's?" verdict, keyed by the on-disk build id. Answers the direction
+    /// question `update_available` needs — a DIFFERENT binary is only an update
+    /// when it isn't an older one — without forking `git merge-base` on every
+    /// ~4s version-status poll. Dev-only. See
+    /// `engine_version::disk_binary_is_upgrade`.
+    disk_direction_cache: std::sync::Mutex<engine_version::DiskDirectionCache>,
     /// Self-heal bookkeeping: how many background rebuilds this engine has
     /// auto-triggered for the current HEAD, so a genuinely broken `main` can't
     /// spin builds forever (bounded per HEAD; reset when HEAD moves). Dev-only.
@@ -227,6 +338,12 @@ pub struct LucidosEngine {
     /// Handle to the in-flight served-frontend refresh task, so a later Apply can
     /// abort + supersede it. Mirrors `build_task`.
     frontend_refresh_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Has the worktree-pinned-frontend warning already fired this process? The
+    /// check runs on the ~10s peer-sync tick, so without this it would log every
+    /// tick forever. A field rather than a `static` so tests that build several
+    /// engines each get their own latch. See
+    /// `engine::frontend_refresh::warn_once_if_frontend_worktree_pinned`.
+    frontend_worktree_pin_warned: std::sync::atomic::AtomicBool,
     /// Device actor stashed by the switch handler (`/api/v1/restart`) at
     /// request time and read by the graceful-shutdown boundary emit at ACTUAL
     /// teardown — the HTTP handler has the device, the SIGUSR1 signal handler
@@ -258,7 +375,9 @@ pub struct LucidosEngine {
     repo_root: PathBuf,
     /// User-level Lucidos directory (~/.lucidos), git-tracked for shared knowhow
     user_dir: Option<PathBuf>,
-    /// Engine-shipped reference knowhow (`<repo_root>/system-knowhow/`).
+    /// Engine-shipped reference knowhow (the staged `LUCIDOS_SYSTEM_KNOWHOW_DIR`
+    /// on packaged builds, `<repo_root>/system-knowhow/` on a dev checkout —
+    /// see `core::system_knowhow::resolve_system_knowhow_dir`).
     /// Read-only; never overrideable by a workspace's local knowhow.
     system_knowhow_dir: Option<PathBuf>,
     /// User profile - always included in context for broad queries
@@ -467,6 +586,16 @@ pub struct ThreadGuard {
     generation: u64,
 }
 
+impl ThreadGuard {
+    /// The registration this guard owns. Anything that reaches back into
+    /// `active_threads` on behalf of *this* turn must check it, or it will act
+    /// on a newer registration that replaced this one — see
+    /// [`LucidosEngine::note_injections_drained`] and `Drop` below.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
 impl Drop for ThreadGuard {
     fn drop(&mut self) {
         let owned = if let Ok(mut threads) = self.active_threads.lock() {
@@ -620,6 +749,7 @@ fn spawn_models_registry_subscriber(
 fn spawn_provider_credential_subscriber(
     mut rx: tokio::sync::broadcast::Receiver<event_bus::EmittedEvent>,
     llm_handle: Arc<std::sync::RwLock<Arc<dyn crate::llm::LlmProvider>>>,
+    web_search_handle: Arc<std::sync::RwLock<Arc<crate::llm::WebSearchChain>>>,
     pool: sqlx::PgPool,
     ctx: crate::llm::ProviderBuildContext,
 ) {
@@ -653,10 +783,14 @@ fn spawn_provider_credential_subscriber(
                 continue;
             }
             match crate::llm::build_active_provider(Some(&pool), &ctx).await {
-                Ok(crate::llm::ProviderBuildOutcome::Install(provider, selection)) => {
+                Ok(crate::llm::ProviderBuildOutcome::Install {
+                    llm,
+                    web_search,
+                    selection,
+                }) => {
                     match llm_handle.write() {
                         Ok(mut guard) => {
-                            *guard = provider;
+                            *guard = llm;
                             log!(
                                 "[Providers] active LLM provider swapped to {:?} after '{}' credential change — no restart",
                                 selection,
@@ -665,6 +799,26 @@ fn spawn_provider_credential_subscriber(
                         }
                         Err(e) => {
                             log!("[Providers] provider swap skipped (lock poisoned): {}", e)
+                        }
+                    }
+                    // Swapped in the same pass as the LLM provider: adding an
+                    // Anthropic or OpenAI key must enable web_search without a
+                    // restart, exactly as it enables chat.
+                    match web_search_handle.write() {
+                        Ok(mut guard) => {
+                            let ids = web_search.backend_ids();
+                            *guard = web_search;
+                            log!(
+                                "[Providers] web search backends now: {}",
+                                if ids.is_empty() {
+                                    "none configured".to_string()
+                                } else {
+                                    ids.join(" → ")
+                                }
+                            );
+                        }
+                        Err(e) => {
+                            log!("[Providers] web search swap skipped (lock poisoned): {}", e)
                         }
                     }
                 }

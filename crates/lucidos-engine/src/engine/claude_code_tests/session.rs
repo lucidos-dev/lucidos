@@ -257,44 +257,17 @@ async fn resume_falls_back_when_branch_deleted() {
     .await;
 }
 
-/// Test helper: create a `AgentSession` with sensible defaults.
-/// Only `msg_tx` and `is_waiting` vary across tests.
+/// Test helper: create an `AgentSession` with sensible defaults. Only `msg_tx`
+/// and `is_waiting` vary across tests. The caller owns the channel pair, so it
+/// is responsible for keeping `msg_rx` alive — a dropped receiver makes the
+/// session a phantom (`AgentSession::is_live`).
 fn make_test_session(
     msg_tx: tokio::sync::mpsc::UnboundedSender<crate::engine::AgentUserInput>,
     is_waiting: bool,
 ) -> crate::engine::AgentSession {
-    use std::sync::Arc;
-    crate::engine::AgentSession {
-        msg_tx,
-        is_waiting,
-        has_changes: false,
-        requires_restart: false,
-        pending_stop: None,
-        cancel_actor: None,
-        redirect_followup: false,
-        stop: Arc::new(tokio::sync::Notify::new()),
-        interrupt: Arc::new(tokio::sync::Notify::new()),
-        idle_notify: Arc::new(tokio::sync::Notify::new()),
-        apply_now_in_progress: false,
-        process_exited: false,
-        worktree_path: None,
-        branch_name: None,
-        repo_root: None,
-        cc_session_id: None,
-        shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        external_terminal_emitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        control_tx: tokio::sync::mpsc::unbounded_channel().0,
-        builtin_commands: vec![],
-        skill_commands: vec![],
-        current_model: None,
-        current_reasoning_effort: None,
-        last_event_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        pending_followups: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        question_resume_pending: false,
-        tools_in_flight: Arc::new(std::sync::atomic::AtomicI32::new(0)),
-        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
-        agent_cancel: tokio_util::sync::CancellationToken::new(),
-    }
+    let mut s = crate::engine::AgentSession::for_test_with_sender(msg_tx);
+    s.is_waiting = is_waiting;
+    s
 }
 
 /// Validates that when a Claude Code session is idle (is_waiting=true), a follow-up

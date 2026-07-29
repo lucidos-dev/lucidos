@@ -194,7 +194,7 @@ pub enum ThreadEvent {
     },
     /// Background task spawned via `run_bash_background` (shell command) OR
     /// `run_python_background` (venv-rooted python script — the engine
-    /// wraps it as `/bin/sh -c "<venv-python> <script>"` and routes through
+    /// wraps it as `bash -o pipefail -c "<venv-python> <script>"` and routes through
     /// the same `BackgroundBashRegistry`). The `command` field captures
     /// the exact shell invocation, so a reader can tell which spawning
     /// tool produced the row. Paired with a later `BackgroundBashCompleted`.
@@ -214,9 +214,18 @@ pub enum ThreadEvent {
         /// Truncated to 200 chars for log readability; full command lives
         /// on the paired `BackgroundBashStarted`.
         command: String,
-        /// `None` when the watchdog killed the child on timeout — a
-        /// signal-only exit gives no usable code on macOS.
+        /// The child's normal exit status. `None` whenever there isn't one:
+        /// the child died on a signal (see `signal`), or the engine failed to
+        /// reap it at all. Never a stand-in number — a reader that sees
+        /// `exit_code: 0` can trust the command really exited 0.
         exit_code: Option<i32>,
+        /// Unix signal that terminated the child, when one did (9 = SIGKILL
+        /// from the watchdog timeout or `bash_kill`, 11 = SIGSEGV, 13 =
+        /// SIGPIPE from a `pipefail` pipeline, …). Mutually exclusive with
+        /// `exit_code`; both `None` means the status was unavailable.
+        /// Absent on rows written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<i32>,
         stdout: String,
         stderr: String,
         started_at: chrono::DateTime<chrono::Utc>,
@@ -613,7 +622,7 @@ pub enum ThreadEvent {
         /// orphan worktree recovery). The frontend reads this to confirm
         /// before Apply so the user knows they're landing recovered work.
         /// Live end-of-turn aggregate emits always stamp `false` because
-        /// `should_propose_change_at_idle` refuses to emit on non-`Generated`
+        /// `may_touch_change_state_at_idle` refuses to emit on non-`Generated`
         /// terminals.
         #[serde(default, skip_serializing_if = "is_false")]
         incomplete: bool,

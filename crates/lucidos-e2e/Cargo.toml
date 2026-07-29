@@ -9,10 +9,20 @@ publish = false
 path = "src/lib.rs"
 
 [dev-dependencies]
-# The `e2e-test-hooks` feature pulls in the in-process push-log writer and
-# the GET /api/_test/push-log endpoint that browser/API e2e tests assert
-# against — see system-knowhow/notifications.md §5.4.
-lucidos-engine = { path = "../lucidos-engine", features = ["e2e-test-hooks"] }
+# NEVER request `features = ["e2e-test-hooks"]` here. The hooks the suite
+# asserts against (the in-process push-log writer + `GET /api/v1/_test/push-log`
+# — system-knowhow/notifications.md §5.4) live in the engine BINARY the harness
+# builds separately with `ENGINE_BUILD_FEATURES=e2e-test-hooks`
+# (scripts/lib/e2e.sh); this crate only links the engine LIBRARY for a handful
+# of un-gated items (LUCIDOS_RELEASE, push::DEADLINE_MS, blobs::PREVIEW_MAX_EDGE,
+# ThreadStatus, image migration, __wasm_test_internals). Requesting the feature
+# here is a dev-dependency, so at workspace scope — a bare `cargo test`,
+# `cargo build --all-targets`, rust-analyzer's `cargo check --workspace
+# --all-targets` — cargo UNIFIES it into `lucidos-engine` and builds a
+# hooks-enabled engine, whose bin target cargo then uplifts over the shared
+# `target/<profile>/lucidos-engine`. That silently swapped a dev workspace onto
+# an engine with the push transport stubbed out (2026-07-26; ADR 0022).
+lucidos-engine = { path = "../lucidos-engine" }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 serde_json = "1"

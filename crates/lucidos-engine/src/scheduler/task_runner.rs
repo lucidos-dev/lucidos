@@ -260,6 +260,78 @@ async fn run_task_loop(
     }
 }
 
+/// Whether the startup catch-up should run a missed *cron slot*, and if not, why.
+///
+/// Split out from [`check_and_execute_missed`] so the decision is unit-testable
+/// without a scheduler, an engine, or a database — the 2026-07-29 double-fire
+/// was a one-line comparison nobody could assert on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatchUp {
+    /// The slot is genuinely due: the trigger existed before it and no run is
+    /// recorded at or after it.
+    Fire,
+    Skip(SkipReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    /// A run is recorded at or after the slot. A late fire counts: the 07:49 run
+    /// of an 07:45 slot means the 07:45 slot has run.
+    AlreadyRan,
+    /// The slot is older than the trigger itself — a trigger created at 07:50
+    /// must not immediately "catch up" the 07:45 slot it never existed for.
+    SlotPredatesTrigger,
+    /// The event store could not be read. Fail closed: we cannot prove the slot
+    /// hasn't run, and a duplicate push notification is worse than a skipped
+    /// catch-up.
+    HistoryUnavailable,
+}
+
+impl SkipReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AlreadyRan => "already ran for this slot",
+            Self::SlotPredatesTrigger => "slot predates the trigger",
+            Self::HistoryUnavailable => "run history unavailable",
+        }
+    }
+}
+
+/// Decide whether a missed cron slot is still due.
+///
+/// Fails closed by construction: the only path to [`CatchUp::Fire`] is a
+/// positive showing that the slot is due. A `None` `last_run` is *not* evidence
+/// of "never ran" — before this function was extracted the guard was
+/// `if let Some(last_run)`, so an absent value skipped the check entirely and
+/// fired.
+///
+/// `in_memory_last_run` is the replayed [`TriggerConfig::last_run`] and
+/// `history` is an independent read of the same durable truth. Both are
+/// engine-clock *recorded run times*; the catch-up takes the later of the two so
+/// neither a stale config nor a lagging read can authorize a re-fire.
+fn catch_up_decision(
+    slot_utc: chrono::DateTime<chrono::Utc>,
+    in_memory_last_run: Option<chrono::DateTime<chrono::Utc>>,
+    history: Result<crate::triggers::TriggerRunHistory, sqlx::Error>,
+) -> CatchUp {
+    let Ok(history) = history else {
+        return CatchUp::Skip(SkipReason::HistoryUnavailable);
+    };
+
+    let effective_last_run = match (in_memory_last_run, history.last_run) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+
+    if effective_last_run.is_some_and(|last_run| last_run >= slot_utc) {
+        return CatchUp::Skip(SkipReason::AlreadyRan);
+    }
+    if history.created_at.is_some_and(|created| created > slot_utc) {
+        return CatchUp::Skip(SkipReason::SlotPredatesTrigger);
+    }
+    CatchUp::Fire
+}
+
 /// Check if we just missed a scheduled time and execute if within grace period
 async fn check_and_execute_missed(
     schedules: &[cron::Schedule],
@@ -307,11 +379,29 @@ async fn check_and_execute_missed(
             _ => return Ok(()), // Trigger deleted or paused
         };
 
-        // Guard: skip if this occurrence was already executed
-        if let Some(last_run) = config.last_run {
-            if last_run >= missed_utc {
-                return Ok(());
-            }
+        // Guard: only fire a slot we can positively show is still due. Reached
+        // only once a missed slot has actually been found, but every path that
+        // registers a task runner — engine start, trigger create, trigger
+        // update/enable, and the health monitor's crash restart — funnels its
+        // catch-up through here, so this is the single choke point for all of
+        // them.
+        let history =
+            crate::triggers::load_trigger_run_history(engine.pool(), trigger_id).await;
+        if let Err(e) = &history {
+            log!(
+                "[Scheduler] Task '{}' run-history lookup failed: {}",
+                task_name,
+                e
+            );
+        }
+        if let CatchUp::Skip(reason) = catch_up_decision(missed_utc, config.last_run, history) {
+            log!(
+                "[Scheduler] Task '{}' missed at {} — not executing: {}",
+                task_name,
+                missed.format("%H:%M:%S"),
+                reason.as_str()
+            );
+            return Ok(());
         }
 
         log!(
@@ -842,6 +932,165 @@ mod tests {
         let tracked = Arc::new(RwLock::new(HashMap::new()));
         cancel_tracked_task(&tracked, uuid::Uuid::new_v4()).await;
         assert!(tracked.read().await.is_empty());
+    }
+
+    // ── Missed-slot catch-up decision ───────────────────────────────────────
+    //
+    // Regression suite for the 2026-07-29 double-fire: the 07:45 slot ran once
+    // at 07:49 and the 08:12 restart's catch-up ran it again, sending a second
+    // push notification for the same morning.
+
+    fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// Run history with a creation time well before any slot under test, so a
+    /// case that isn't about creation isn't accidentally decided by it.
+    fn history(
+        last_run: Option<&str>,
+    ) -> Result<crate::triggers::TriggerRunHistory, sqlx::Error> {
+        Ok(crate::triggers::TriggerRunHistory {
+            last_run: last_run.map(utc),
+            created_at: Some(utc("2026-04-08T07:00:52Z")),
+        })
+    }
+
+    const SLOT: &str = "2026-07-29T05:45:00Z";
+
+    #[test]
+    fn catch_up_skips_a_slot_that_already_ran_late() {
+        // The 07:45 slot fired at 07:49 (241s late, after a macOS sleep). A late
+        // fire still counts as that slot having run — the restart 23 minutes
+        // later must not run it again.
+        assert_eq!(
+            catch_up_decision(
+                utc(SLOT),
+                Some(utc("2026-07-29T05:49:15Z")),
+                history(Some("2026-07-29T05:49:15Z")),
+            ),
+            CatchUp::Skip(SkipReason::AlreadyRan)
+        );
+    }
+
+    #[test]
+    fn catch_up_skips_when_only_the_event_store_knows_the_true_run_time() {
+        // The exact incident shape. `events.created` (Postgres clock) was 280s
+        // behind `payload.last_run` (engine clock) because the Docker VM clock
+        // had not resynced after the host slept. If anything hands the catch-up
+        // a stale/early in-memory value, the event store's engine-clock reading
+        // must still suppress the fire — the two sources are maxed, not
+        // preferred in order.
+        assert_eq!(
+            catch_up_decision(
+                utc(SLOT),
+                Some(utc("2026-07-29T05:44:35Z")), // the DB-clock value that caused the bug
+                history(Some("2026-07-29T05:49:15Z")),
+            ),
+            CatchUp::Skip(SkipReason::AlreadyRan)
+        );
+    }
+
+    #[test]
+    fn catch_up_fires_a_genuinely_missed_slot() {
+        // Engine was down across the scheduled time and the slot never ran. The
+        // catch-up is a real feature — this is the case it exists for.
+        assert_eq!(
+            catch_up_decision(
+                utc(SLOT),
+                Some(utc("2026-07-28T05:45:08Z")), // yesterday's slot
+                history(Some("2026-07-28T05:45:08Z")),
+            ),
+            CatchUp::Fire
+        );
+    }
+
+    #[test]
+    fn catch_up_fires_when_the_trigger_has_never_run() {
+        // No run recorded anywhere, and the trigger predates the slot.
+        assert_eq!(
+            catch_up_decision(utc(SLOT), None, history(None)),
+            CatchUp::Fire
+        );
+    }
+
+    #[test]
+    fn catch_up_skips_when_last_run_is_none_but_the_event_store_says_it_ran() {
+        // A `None` `last_run` must NOT read as "safe to fire". The old guard was
+        // `if let Some(last_run)`, so `None` skipped the check entirely.
+        assert_eq!(
+            catch_up_decision(utc(SLOT), None, history(Some("2026-07-29T05:49:15Z"))),
+            CatchUp::Skip(SkipReason::AlreadyRan)
+        );
+    }
+
+    #[test]
+    fn catch_up_skips_when_the_run_history_is_unavailable() {
+        // Fail closed: unable to prove the slot hasn't run. A skipped catch-up
+        // is recoverable; a duplicate push notification is not.
+        assert_eq!(
+            catch_up_decision(utc(SLOT), None, Err(sqlx::Error::PoolClosed)),
+            CatchUp::Skip(SkipReason::HistoryUnavailable)
+        );
+        // Even with an in-memory value that looks safe to fire on.
+        assert_eq!(
+            catch_up_decision(
+                utc(SLOT),
+                Some(utc("2026-07-28T05:45:08Z")),
+                Err(sqlx::Error::PoolClosed),
+            ),
+            CatchUp::Skip(SkipReason::HistoryUnavailable)
+        );
+    }
+
+    #[test]
+    fn catch_up_skips_a_slot_older_than_the_trigger_itself() {
+        // Creating a `0 45 7 * * *` trigger at 07:50 must not fire it on the
+        // spot for the 07:45 slot it never existed for. `TriggerCreated` /
+        // `TriggerUpdated` / `TriggerEnabled` all re-register the task runner,
+        // so this path runs on every trigger edit.
+        assert_eq!(
+            catch_up_decision(
+                utc(SLOT),
+                None,
+                Ok(crate::triggers::TriggerRunHistory {
+                    last_run: None,
+                    created_at: Some(utc("2026-07-29T05:50:00Z")),
+                }),
+            ),
+            CatchUp::Skip(SkipReason::SlotPredatesTrigger)
+        );
+        // Complement: created before the slot and never ran → still catches up.
+        assert_eq!(
+            catch_up_decision(
+                utc(SLOT),
+                None,
+                Ok(crate::triggers::TriggerRunHistory {
+                    last_run: None,
+                    created_at: Some(utc("2026-07-29T05:40:00Z")),
+                }),
+            ),
+            CatchUp::Fire
+        );
+    }
+
+    #[test]
+    fn catch_up_fires_when_the_creation_time_is_unknown_but_no_run_is_recorded() {
+        // A trigger whose `TriggerCreated` row is missing (legacy / migrated
+        // data) must not lose its catch-up — the run history is the load-bearing
+        // check, the creation time only rules out pre-existence.
+        assert_eq!(
+            catch_up_decision(
+                utc(SLOT),
+                None,
+                Ok(crate::triggers::TriggerRunHistory {
+                    last_run: None,
+                    created_at: None,
+                }),
+            ),
+            CatchUp::Fire
+        );
     }
 
     #[test]

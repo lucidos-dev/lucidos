@@ -37,10 +37,10 @@ pass() { echo "  ok:   $*"; PASS=$((PASS+1)); }
 VERSION="0.14.0"
 TRIPLE="$(stage_runtime_host_triple)"   # the host triple — the artifact the download path resolves
 STEM="lucidos-$VERSION-$TRIPLE"
-NAMES=(lucidos-engine lucidos-gateway lucidos frontend postgres sdk)
+NAMES=(lucidos-engine lucidos-gateway lucidos frontend postgres sdk system-knowhow)
 
-# A fake runtime tree shaped like the staged 6-resource bundle (three "binaries",
-# two static dirs, a relocatable-PG-like nested tree) — same shape as
+# A fake runtime tree shaped like the staged 7-resource bundle (three "binaries",
+# three static dirs, a relocatable-PG-like nested tree) — same shape as
 # headless_tarball_test.sh / stage_runtime_test.sh.
 new_resources() {
     local dir; dir="$(mktemp -d)"
@@ -54,6 +54,7 @@ new_resources() {
     chmod +x "$dir/lucidos-engine" "$dir/lucidos-gateway" "$dir/lucidos"
     mkdir -p "$dir/frontend" && printf '<html>\n' > "$dir/frontend/index.html"
     mkdir -p "$dir/sdk"      && printf 'sdk\n'     > "$dir/sdk/sdk.js"
+    mkdir -p "$dir/system-knowhow" && printf '# glossary\n' > "$dir/system-knowhow/glossary.md"
     mkdir -p "$dir/postgres/bin" "$dir/postgres/lib"
     printf 'postgres\n' > "$dir/postgres/bin/postgres"; chmod +x "$dir/postgres/bin/postgres"
     printf 'libpq\n'    > "$dir/postgres/lib/libpq.5"
@@ -75,43 +76,100 @@ new_release_dir() {
 echo "test: install_default_base_url targets the GitHub Releases path for v<version>"
 got="$(install_default_base_url "$VERSION")"
 want="https://github.com/lucidos-dev/lucidos/releases/download/v$VERSION"
-[ "$got" = "$want" ] && pass "default base url = $got" || fail "base url wrong: $got"
+if [ "$got" = "$want" ]; then pass "default base url = $got"; else fail "base url wrong: $got"; fi
 
 echo ""
 echo "test: install_tarball_url = <base>/<stem>.tar.gz and matches headless_tarball_stem"
 base="https://example.test/dl"
 got="$(install_tarball_url "$base" "$VERSION" "$TRIPLE")"
 want="$base/$(headless_tarball_stem "$VERSION" "$TRIPLE").tar.gz"
-[ "$got" = "$want" ] && pass "tarball url = $got" || fail "tarball url wrong: $got (want $want)"
+if [ "$got" = "$want" ]; then pass "tarball url = $got"; else fail "tarball url wrong: $got (want $want)"; fi
 # A trailing slash on the base must not double up.
 got2="$(install_tarball_url "$base/" "$VERSION" "$TRIPLE")"
-[ "$got2" = "$want" ] && pass "trailing slash on base tolerated" || fail "trailing slash not handled: $got2"
+if [ "$got2" = "$want" ]; then pass "trailing slash on base tolerated"; else fail "trailing slash not handled: $got2"; fi
 
 echo ""
 echo "test: install_checksum_url is the tarball url + .sha256"
 got="$(install_checksum_url "$base" "$VERSION" "$TRIPLE")"
 want="$(install_tarball_url "$base" "$VERSION" "$TRIPLE").sha256"
-[ "$got" = "$want" ] && pass "checksum url = $got" || fail "checksum url wrong: $got"
+if [ "$got" = "$want" ]; then pass "checksum url = $got"; else fail "checksum url wrong: $got"; fi
 
 echo ""
 echo "test: install_resolve_version precedence (override > RELEASE file > default)"
-[ "$(install_resolve_version "9.9.9" "" "0.0.0")" = "9.9.9" ] && pass "override wins" || fail "override ignored"
+if [ "$(install_resolve_version "9.9.9" "" "0.0.0")" = "9.9.9" ]; then pass "override wins"; else fail "override ignored"; fi
 rel="$(mktemp)"; printf '0.77.0\n' > "$rel"
-[ "$(install_resolve_version "" "$rel" "0.0.0")" = "0.77.0" ] && pass "RELEASE file used + trimmed" || fail "RELEASE file ignored"
-[ "$(install_resolve_version "" "/no/such/RELEASE" "0.0.0")" = "0.0.0" ] && pass "falls back to default" || fail "default fallback wrong"
-[ "$(install_resolve_version "1.2.3" "$rel" "0.0.0")" = "1.2.3" ] && pass "override beats RELEASE file" || fail "override should beat RELEASE"
+if [ "$(install_resolve_version "" "$rel" "0.0.0")" = "0.77.0" ]; then pass "RELEASE file used + trimmed"; else fail "RELEASE file ignored"; fi
+if [ "$(install_resolve_version "" "/no/such/RELEASE" "0.0.0")" = "0.0.0" ]; then pass "falls back to default"; else fail "default fallback wrong"; fi
+if [ "$(install_resolve_version "1.2.3" "$rel" "0.0.0")" = "1.2.3" ]; then pass "override beats RELEASE file"; else fail "override should beat RELEASE"; fi
 rm -f "$rel"
+
+echo ""
+echo "test: install.sh's baked LUCIDOS_DEFAULT_VERSION equals the repo-root RELEASE"
+# The DEFAULT branch above is the one the PUBLIC one-liner takes: piped through sh
+# there is no checkout, so no RELEASE file sits next to the script and every
+# `curl … | sh` install downloads whatever this constant says. Drifted, it 404s
+# (0.14.0 shipped no headless tarball) rather than installing something merely old.
+# release.sh rewrites the line when it bumps RELEASE; this catches a hand-edit — or
+# a removed substitution — that pulls the two apart.
+baked="$(sed -n 's/^LUCIDOS_DEFAULT_VERSION="\([^"]*\)".*/\1/p' "$INSTALL" | head -1)"
+release_version="$(tr -d '[:space:]' < "$PROJECT_DIR/RELEASE" 2>/dev/null)"
+if [ -z "$baked" ]; then
+    fail "install.sh has no ^LUCIDOS_DEFAULT_VERSION=\"…\" assignment to parse"
+elif [ "$baked" = "$release_version" ]; then
+    pass "baked default = RELEASE = $baked"
+else
+    fail "install.sh LUCIDOS_DEFAULT_VERSION='$baked' != RELEASE '$release_version' — a piped 'curl | sh' install would fetch the wrong version"
+fi
+
+echo ""
+echo "test: the dash re-exec pins the version it was piped with"
+# REGRESSION (clean-machine smoke, 2026-07-28): on Debian/Ubuntu /bin/sh is dash,
+# so `curl … | sh` re-fetches the installer from LUCIDOS_INSTALL_URL and execs
+# THAT under bash. The re-fetched copy used to re-resolve its own baked default,
+# so a user who piped lucidos.dev's current installer actually installed whatever
+# older version happened to be baked into github main. The guard must carry its
+# resolved version across the re-exec. Exercised against install.sh's REAL guard
+# text, extracted verbatim, with curl+bash stubbed out.
+GUARD_DIR="$(mktemp -d)"
+# Extract from the baked-version constant through the guard's closing `fi`.
+awk '/^LUCIDOS_DEFAULT_VERSION=/{on=1} on{print} on && /^fi$/{exit}' "$INSTALL" > "$GUARD_DIR/guard.sh"
+if ! grep -q 'exec bash -c' "$GUARD_DIR/guard.sh"; then
+    fail "could not extract the re-exec guard from install.sh (shape changed)"
+else
+    cat > "$GUARD_DIR/curl" <<'SH'
+#!/bin/sh
+# Stand in for the re-fetch: the payload just reports what it inherited.
+echo 'echo "SEEN=${LUCIDOS_VERSION:-unset}"'
+SH
+    chmod +x "$GUARD_DIR/curl"
+    baked_now="$(sed -n 's/^LUCIDOS_DEFAULT_VERSION="\([^"]*\)".*/\1/p' "$INSTALL" | head -1)"
+    # `unset BASH_VERSION` + sourcing with $0 not a readable file = the piped-dash path.
+    out="$(PATH="$GUARD_DIR:$PATH" sh -c 'unset BASH_VERSION; . '"$GUARD_DIR"'/guard.sh' 2>&1 || true)"
+    if [ "$out" = "SEEN=$baked_now" ]; then
+        pass "piped re-exec carries the version across ($out)"
+    else
+        fail "piped re-exec did not pin the version: got '$out', want 'SEEN=$baked_now'"
+    fi
+    # An explicit LUCIDOS_VERSION must still win over the baked default.
+    out="$(PATH="$GUARD_DIR:$PATH" LUCIDOS_VERSION=1.2.3 sh -c 'unset BASH_VERSION; . '"$GUARD_DIR"'/guard.sh' 2>&1 || true)"
+    if [ "$out" = "SEEN=1.2.3" ]; then
+        pass "explicit LUCIDOS_VERSION still beats the baked default"
+    else
+        fail "explicit LUCIDOS_VERSION lost across the re-exec: $out"
+    fi
+fi
+rm -rf "$GUARD_DIR"
 
 echo ""
 echo "test: install_runtime_dir = <prefix>/runtime/<stem>"
 got="$(install_runtime_dir "/opt/x" "$VERSION" "$TRIPLE")"
-[ "$got" = "/opt/x/runtime/$STEM" ] && pass "runtime dir = $got" || fail "runtime dir wrong: $got"
+if [ "$got" = "/opt/x/runtime/$STEM" ]; then pass "runtime dir = $got"; else fail "runtime dir wrong: $got"; fi
 
 echo ""
 echo "test: install_ca_bundle_candidates lists the bundles rustls-native-certs reads"
 got="$(install_ca_bundle_candidates)"
-echo "$got" | grep -qx '/etc/ssl/certs/ca-certificates.crt' && pass "Debian/Ubuntu bundle listed" || fail "Debian bundle missing: $got"
-echo "$got" | grep -qx '/etc/pki/tls/certs/ca-bundle.crt' && pass "Fedora/RHEL bundle listed" || fail "RHEL bundle missing: $got"
+if echo "$got" | grep -qx '/etc/ssl/certs/ca-certificates.crt'; then pass "Debian/Ubuntu bundle listed"; else fail "Debian bundle missing: $got"; fi
+if echo "$got" | grep -qx '/etc/pki/tls/certs/ca-bundle.crt'; then pass "Fedora/RHEL bundle listed"; else fail "RHEL bundle missing: $got"; fi
 
 # ── INTEGRATION: --help + flag parsing ───────────────────────────────────────
 echo ""
@@ -119,7 +177,7 @@ echo "test: --help documents the modes, flags, and env contract"
 out="$(bash "$INSTALL" --help 2>&1)"
 for token in --dev --source --from-tarball --version --base-url --prefix --force --no-launch \
              LUCIDOS_RELEASE_BASE_URL LUCIDOS_VERSION LUCIDOS_FORCE LUCIDOS_PREFIX; do
-    echo "$out" | grep -q -- "$token" && pass "--help documents $token" || fail "--help missing $token"
+    if echo "$out" | grep -q -- "$token"; then pass "--help documents $token"; else fail "--help missing $token"; fi
 done
 
 echo ""
@@ -159,16 +217,16 @@ PREFIX="$(mktemp -d)"
 out="$(bash "$INSTALL" --from-tarball "$TARBALL" --prefix "$PREFIX" --no-launch 2>&1)"; rc=$?
 RUNTIME="$PREFIX/runtime/$STEM"
 if [ $rc -eq 0 ]; then pass "--from-tarball exits 0"; else fail "--from-tarball failed (rc=$rc): $out"; fi
-echo "$out" | grep -qi "checksum verified" && pass "checksum verified on the local path" || fail "no checksum-verified line: $out"
+if echo "$out" | grep -qi "checksum verified"; then pass "checksum verified on the local path"; else fail "no checksum-verified line: $out"; fi
 for n in "${NAMES[@]}"; do
-    [ -e "$RUNTIME/$n" ] && pass "extracted $n" || fail "missing $n under $RUNTIME"
+    if [ -e "$RUNTIME/$n" ]; then pass "extracted $n"; else fail "missing $n under $RUNTIME"; fi
 done
-[ -x "$RUNTIME/lucidos-gateway" ] && pass "lucidos-gateway is executable" || fail "gateway not executable"
-[ -L "$PREFIX/runtime/current" ] && pass "current symlink created" || fail "current symlink missing"
+if [ -x "$RUNTIME/lucidos-gateway" ]; then pass "lucidos-gateway is executable"; else fail "gateway not executable"; fi
+if [ -L "$PREFIX/runtime/current" ]; then pass "current symlink created"; else fail "current symlink missing"; fi
 
 echo ""
 echo "test: --no-launch did NOT start anything (prints how to start)"
-echo "$out" | grep -qi "installed" && pass "prints the installed banner" || fail "no installed banner: $out"
+if echo "$out" | grep -qi "installed"; then pass "prints the installed banner"; else fail "no installed banner: $out"; fi
 
 # ── INTEGRATION: idempotency (skip unless --force) ───────────────────────────
 echo ""
@@ -199,7 +257,7 @@ if [ $rc -ne 0 ] && echo "$out" | grep -qi "checksum verification failed"; then
 else
     fail "expected a checksum failure (rc=$rc): $out"
 fi
-[ -e "$PREFIX/runtime/$STEM" ] && fail "runtime should not exist after a refusal" || pass "nothing extracted on tamper"
+if [ -e "$PREFIX/runtime/$STEM" ]; then fail "runtime should not exist after a refusal"; else pass "nothing extracted on tamper"; fi
 rm -rf "$REL" "$PREFIX"
 
 # ── INTEGRATION: a MANY-ENTRY tarball installs cleanly (GNU-tar SIGPIPE guard) ─
@@ -260,7 +318,7 @@ if [ $rc -eq 0 ] && [ -x "$RUNTIME/lucidos-gateway" ]; then
 else
     fail "expected a file:// download install (rc=$rc): $out"
 fi
-echo "$out" | grep -qi "checksum verified" && pass "download path verified the checksum" || fail "download did not verify: $out"
+if echo "$out" | grep -qi "checksum verified"; then pass "download path verified the checksum"; else fail "download did not verify: $out"; fi
 rm -rf "$PREFIX"
 
 echo ""
@@ -274,7 +332,7 @@ if [ $rc -ne 0 ] && echo "$out" | grep -qi "checksum verification failed"; then
 else
     fail "expected a download checksum failure (rc=$rc): $out"
 fi
-[ -e "$PREFIX/runtime/$STEM" ] && fail "runtime should not exist after a tampered download" || pass "nothing extracted on tampered download"
+if [ -e "$PREFIX/runtime/$STEM" ]; then fail "runtime should not exist after a tampered download"; else pass "nothing extracted on tampered download"; fi
 rm -rf "$REL" "$PREFIX"
 
 echo ""
@@ -288,6 +346,75 @@ else
     fail "expected an actionable 404 message (rc=$rc): $out"
 fi
 rm -rf "$PREFIX" "$EMPTY"
+
+# ── INTEGRATION: fetched helper libs — a soft-404 HTML payload is refused ─────
+echo ""
+echo "test: a fetched helper lib that is HTML is refused and never sourced"
+# REGRESSION (clean-machine smoke, 2026-07-29): a fresh ubuntu:22.04 running
+# `curl -fsSL lucidos.dev/install.sh | sh` died with
+#   stage_runtime.sh: line 1: syntax error near unexpected token `newline'
+#   stage_runtime.sh: line 1: `<!DOCTYPE html>'
+# Cloudflare Pages answers any path it doesn't have with the landing page and a
+# 200 status, so `curl -fsSL` SUCCEEDED and the non-empty check passed — and the
+# installer sourced the landing page as a shell script. _source_libs must sniff
+# the payload BEFORE `.` runs, and fail closed. The fetch branch is taken only
+# when install.sh has no adjacent scripts/lib, so the installer is copied to a
+# checkout-less dir and the "origin" is a file:// directory.
+NOCHECKOUT="$(mktemp -d)"
+cp "$INSTALL" "$NOCHECKOUT/install.sh"
+# Every lib install.sh fetches when piped: LUCIDOS_LIBS + the lazily sourced
+# service pair (source_service_lib).
+LIBS_FETCHED="stage_runtime.sh headless_tarball.sh install_common.sh service.sh"
+for shape in doctype indented-html; do
+    LIBDIR="$(mktemp -d)"; PREFIX="$(mktemp -d)"
+    # An SPA fallback serves the landing page for EVERY unknown path, so every
+    # lib comes back as HTML — seeding just one would make the run die on the
+    # next lib's honest 404 instead of on the payload under test.
+    for f in $LIBS_FETCHED; do
+        if [ "$shape" = doctype ]; then
+            printf '<!DOCTYPE html>\n<html><head><title>Lucidos</title></head></html>\n' > "$LIBDIR/$f"
+        else
+            # Leading blank lines + indentation: the sniff looks at the first
+            # NON-BLANK line, not literally line 1.
+            printf '\n\n   <html lang="en">\n<body>not shell</body>\n' > "$LIBDIR/$f"
+        fi
+    done
+    out="$(LUCIDOS_LIB_BASE_URL="file://$LIBDIR" LUCIDOS_VERSION="$VERSION" \
+            bash "$NOCHECKOUT/install.sh" --prefix "$PREFIX" --no-launch 2>&1)"; rc=$?
+    if [ $rc -ne 0 ] && echo "$out" | grep -q "is HTML, not shell" \
+       && echo "$out" | grep -q "stage_runtime.sh" && echo "$out" | grep -qF "file://$LIBDIR"; then
+        pass "$shape payload refused, naming the lib and the origin"
+    else
+        fail "expected an HTML refusal naming lib + origin for $shape (rc=$rc): $out"
+    fi
+    # Positive proof it never reached `.`: sourcing the landing page is what
+    # produced the shell syntax error in the original failure.
+    if echo "$out" | grep -qiE "syntax error|unexpected token"; then
+        fail "the HTML lib was sourced anyway ($shape): $out"
+    else
+        pass "$shape payload never reached the shell"
+    fi
+    rm -rf "$LIBDIR" "$PREFIX"
+done
+
+echo ""
+echo "test: real helper libs fetched over file:// still source and install"
+# The other half of fail-closed: the sniff must not reject legitimate shell. This
+# is also the only coverage of _source_libs' FETCH branch end to end (the piped
+# `curl … | sh` path), driven offline over file://.
+LIBDIR="$(mktemp -d)"; PREFIX="$(mktemp -d)"; REL="$(new_release_dir)"
+for f in $LIBS_FETCHED; do
+    cp "$SCRIPT_DIR/$f" "$LIBDIR/$f"
+done
+out="$(LUCIDOS_LIB_BASE_URL="file://$LIBDIR" LUCIDOS_RELEASE_BASE_URL="file://$REL" \
+        LUCIDOS_VERSION="$VERSION" bash "$NOCHECKOUT/install.sh" \
+        --prefix "$PREFIX" --no-launch 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && [ -x "$PREFIX/runtime/$STEM/lucidos-gateway" ]; then
+    pass "fetched helper libs sourced; the piped-install path completed"
+else
+    fail "expected the fetch path to install cleanly (rc=$rc): $out"
+fi
+rm -rf "$LIBDIR" "$PREFIX" "$REL" "$NOCHECKOUT"
 
 # ── INTEGRATION: --dev routing (no compile — just assert the branch is taken) ─
 echo ""

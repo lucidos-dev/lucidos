@@ -176,6 +176,10 @@
     color: var(--text-primary);
 }
 
+/* Decorative emphasis on a hero slide — notable, not a caution. Distinct from
+   the author-driven [data-color] palette below, which is a fixed set of literal
+   colour names ("amber", "rose", …) chosen in the slide content itself and so
+   deliberately NOT mapped onto theme tokens. */
 .slides-pv-hero-badge {
     font-size: var(--font-size-2xs);
     font-weight: 600;
@@ -183,8 +187,8 @@
     letter-spacing: 0.05em;
     padding: 0.125rem 0.375rem;
     border-radius: 0.1875rem;
-    background: color-mix(in srgb, var(--accent-yellow) 15%, transparent);
-    color: var(--accent-yellow);
+    background: color-mix(in srgb, var(--accent-notable) 15%, transparent);
+    color: var(--accent-notable);
 }
 
 .slides-pv-section-badge {

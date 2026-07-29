@@ -60,8 +60,8 @@ pub(super) struct PutComposeBody {
     /// the thread is no longer in `composing`. Absent on text-only updates.
     #[serde(default)]
     pub mode: Option<String>,
-    /// Per-draft dropdown selections (target/scope, coding agent, Lucidos model
-    /// + reasoning, coding-agent model + reasoning) as a partial
+    /// Per-draft dropdown selections (target/scope, coding agent, Lucidos
+    /// model + reasoning, coding-agent model + reasoning) as a partial
     /// `ComposeSelectionOverride`-shaped object. `None` (absent) preserves the
     /// existing stored selection via SQL COALESCE — a text-only keystroke PUT
     /// must not wipe the draft's picks; a dropdown change sends the full object.
@@ -83,9 +83,9 @@ fn validate_mode(mode: &str) -> Result<(), ApiError> {
 /// `archive_state='archived'` and so flow through the `Active` arm — the
 /// gmail-like revival behavior (keystrokes lead up to the send that
 /// re-surfaces the thread) is preserved without needing a separate
-/// `Archived` value on this column. Used by the post-UPDATE branch where
-/// `state` is read back from a `RETURNING` clause to distinguish "no row"
-/// (404) from "row but wrong state" (410).
+/// `Archived` value on this column. Used by the cold path after a zero-row
+/// UPDATE, where `state` is read back via a follow-up lookup to distinguish
+/// "no row" (404) from "row but wrong state" (410).
 ///
 /// Listed exhaustively so a new `ThreadState` variant forces the author to
 /// make a deliberate accept/reject decision instead of inheriting whatever
@@ -175,7 +175,7 @@ pub(super) async fn post_thread(
 
 /// PUT /api/v1/threads/:id/compose — update compose fields.
 ///
-/// One round-trip: `UPDATE ... RETURNING state, compose_mode` folds the
+/// One round-trip: `UPDATE ... RETURNING compose_mode, …` folds the
 /// state-machine guard, the mutation, and the SSE-payload read-back into a
 /// single query. Result: hot-path keystroke cost is one DB query plus one SSE
 /// broadcast. No event row written (per design — keystroke history isn't
@@ -270,7 +270,7 @@ pub(super) async fn put_compose(
     // COALESCE($5, compose_selection) the same way: a text-only/keystroke PUT
     // (NULL bind) must preserve the draft's stored dropdown picks, while a
     // dropdown change sends the full object.
-    let row: Option<(String, Option<String>, JsonValue, Option<JsonValue>)> = sqlx::query_as(
+    let row: Option<(Option<String>, JsonValue, Option<JsonValue>)> = sqlx::query_as(
         "UPDATE thread_summaries
             SET compose_text = $2,
                 compose_images = COALESCE($3, compose_images),
@@ -284,7 +284,7 @@ pub(super) async fn put_compose(
           WHERE thread_id = $1
             AND state IN ('composing', 'active')
             AND ($4::text IS NULL OR state = 'composing')
-         RETURNING state, compose_mode, compose_images, compose_selection",
+         RETURNING compose_mode, compose_images, compose_selection",
     )
     .bind(id)
     .bind(&body.text)
@@ -295,7 +295,7 @@ pub(super) async fn put_compose(
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let (_state_str, resolved_mode, post_compose_images, post_compose_selection) = match row {
+    let (resolved_mode, post_compose_images, post_compose_selection) = match row {
         Some(r) => r,
         None => {
             // Cold path: UPDATE matched zero rows. Distinguish "no row" from

@@ -89,8 +89,26 @@ fn find_sdk_bundle() -> String {
         }
     }
 
+    const SDK_REL: &str = "packages/lucidos-sdk/dist/sdk.js";
+
+    // Dev, resolved from the CHECKOUT rather than from a fixed number of `..`
+    // hops above the binary. `paths::repo_root` walks `current_exe()`'s ancestors
+    // for `scripts/web-dev.sh`, so it is independent of how deep the engine binary
+    // sits — which matters because the dev launcher publishes it to
+    // `target/<profile>/launch/<variant>/` (ADR 0022), two levels deeper than the
+    // exe-relative `../../` fallback below could reach. The gateway spawns engines
+    // with cwd = the WORKSPACE dir, so the cwd-relative reads never hit in the
+    // normal dev topology and this is the branch that actually serves the bundle.
+    if let Ok(root) = crate::paths::repo_root() {
+        if let Ok(content) = std::fs::read_to_string(root.join(SDK_REL)) {
+            return content;
+        }
+    }
+
+    // cwd-relative (a directly-launched engine runs with cwd = the checkout) and
+    // exe-relative, kept as fallbacks for layouts `repo_root` can't resolve.
     let search_paths = [
-        "packages/lucidos-sdk/dist/sdk.js",
+        SDK_REL,
         "../packages/lucidos-sdk/dist/sdk.js",
         "../../packages/lucidos-sdk/dist/sdk.js",
     ];

@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   currentWorkspaceRefreshState,
-  engineNewVersionReady,
   controlPanelBadgeState,
   controlPanelBadgeTooltip,
   shouldActivateConfirm,
@@ -12,6 +11,7 @@ import {
   engineBuilding,
   enginePackaged,
   updateAvailable,
+  engineNewVersionReady,
 } from '../../store/store';
 
 describe('currentWorkspaceRefreshState', () => {

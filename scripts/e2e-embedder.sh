@@ -42,8 +42,10 @@ ACTUAL=$(printf '%s\n' "${GATED_TESTS[@]}" | sort -u)
 if ! diff <(echo "$EXPECTED") <(echo "$ACTUAL") >/dev/null; then
     echo "ERROR: GATED_TESTS in $0 is out of sync with #[cfg(feature = \"real-embedder-tests\")] tests in crates/lucidos-engine/src/" >&2
     echo "Expected (from source):" >&2
+    # shellcheck disable=SC2001 # per-line indent of a multi-line block; ${//} cannot anchor to ^
     echo "$EXPECTED" | sed 's/^/  /' >&2
     echo "Actual (in script):" >&2
+    # shellcheck disable=SC2001 # per-line indent of a multi-line block; ${//} cannot anchor to ^
     echo "$ACTUAL" | sed 's/^/  /' >&2
     exit 1
 fi

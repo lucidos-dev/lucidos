@@ -109,7 +109,9 @@ fn ensure_app_committed(app_id: &str, marker: &str) -> PathBuf {
 
 /// Create a sparse-checkout worktree mirroring what
 /// `git_ops::create_sparse_app_worktree` produces in production: branch from
-/// `main`, cone-mode sparse-checkout narrowed to `data/apps/<app_id>/`.
+/// `main` (the helper's fresh-branch arm; in production it reuses an
+/// existing branch on resume), cone-mode sparse-checkout narrowed to
+/// `data/apps/<app_id>/`.
 fn create_app_worktree(app_id: &str, branch: &str) -> PathBuf {
     let ws = workspace_path();
     let wt = ws

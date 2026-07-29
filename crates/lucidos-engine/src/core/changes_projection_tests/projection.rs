@@ -532,3 +532,108 @@ async fn per_commit_event_without_aggregate_is_noop() {
 
     teardown_test_db(&db).await;
 }
+
+/// The reconcile path re-emits the aggregate `ChangeProposed` for the SAME
+/// change id with an empty file list. The row must follow git: zero files, no
+/// restart, still `pending` (the engine never resolves a change on the user's
+/// behalf — commit `cca058432`), and the description refreshed. Pre-fix the row
+/// kept its snapshot, so the card read "1 file · Requires engine restart" while
+/// the Diff button rendered "No changes" (change `2cc8391f`).
+#[tokio::test]
+async fn empty_files_re_emit_zeroes_the_row_but_keeps_it_pending() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    let change_id = Uuid::new_v4();
+    start_cc_thread(&bus, thread).await;
+
+    let mut proposed = aggregate_proposed(change_id, "branch-a", "/repo");
+    if let ThreadEvent::ChangeProposed {
+        ref mut files,
+        ref mut requires_restart,
+        ..
+    } = proposed
+    {
+        *files = vec!["crates/lucidos-engine/migrations/0001_stray.sql".to_string()];
+        *requires_restart = true;
+    }
+    emit(&bus, thread, proposed).await;
+
+    let proj = ChangesProjection::new(pool.clone());
+    let before = proj.get_by_id(change_id).await.unwrap().unwrap();
+    assert_eq!(before.file_count, 1);
+    assert!(before.requires_restart);
+
+    // The branch's commits cancelled out — reconcile.
+    let mut emptied = aggregate_proposed(change_id, "branch-a", "/repo");
+    if let ThreadEvent::ChangeProposed {
+        ref mut files,
+        ref mut description,
+        ..
+    } = emptied
+    {
+        *files = vec![];
+        *description = Some("chore: drop the stray file".to_string());
+    }
+    emit(&bus, thread, emptied).await;
+
+    let after = proj.get_by_id(change_id).await.unwrap().unwrap();
+    assert_eq!(after.id, change_id, "same change, corrected in place");
+    assert_eq!(after.status, "pending", "reconcile is not a discard");
+    assert_eq!(after.file_count, 0);
+    assert!(after.files.is_empty());
+    assert!(
+        !after.requires_restart,
+        "a change with no files cannot require an engine restart"
+    );
+    assert_eq!(after.description, "chore: drop the stray file");
+
+    teardown_test_db(&db).await;
+}
+
+/// `coding_agent_has_diff` is derived from the file list the event carries, not
+/// hardcoded TRUE. Without this the reconcile would light the thread's Diff
+/// button on a branch whose live `git diff` is empty — the very disagreement
+/// the reconcile exists to remove.
+#[tokio::test]
+async fn has_diff_follows_the_proposed_file_list() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    let change_id = Uuid::new_v4();
+    start_cc_thread(&bus, thread).await;
+
+    let has_diff = |pool: sqlx::PgPool| async move {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT coding_agent_has_diff FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(thread)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+
+    // Ordinary proposal (non-empty files) — unchanged behaviour.
+    emit(
+        &bus,
+        thread,
+        aggregate_proposed(change_id, "branch-a", "/repo"),
+    )
+    .await;
+    assert!(
+        has_diff(pool.clone()).await,
+        "a proposal with files must light the Diff button"
+    );
+
+    let mut emptied = aggregate_proposed(change_id, "branch-a", "/repo");
+    if let ThreadEvent::ChangeProposed { ref mut files, .. } = emptied {
+        *files = vec![];
+    }
+    emit(&bus, thread, emptied).await;
+    assert!(
+        !has_diff(pool.clone()).await,
+        "an emptied change must NOT claim the thread has a diff"
+    );
+
+    teardown_test_db(&db).await;
+}

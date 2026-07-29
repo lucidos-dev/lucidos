@@ -54,7 +54,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 APP_DIR="$REPO_ROOT/crates/lucidos-app"
-RESOURCE_NAMES=(lucidos-engine lucidos-gateway lucidos frontend postgres sdk)
+RESOURCE_NAMES=(lucidos-engine lucidos-gateway lucidos frontend postgres sdk system-knowhow)
 
 PG_VERSION="${PG_VERSION:-18.4.0}"          # match build-dmg.sh / the dev/docker stack
 PGVECTOR_VERSION="${PGVECTOR_VERSION:-0.8.2}"
@@ -94,7 +94,8 @@ Env knobs (all optional, shared with build-dmg.sh):
   PGVECTOR_VERSION  pgvector tag to compile          (default 0.8.2)
 
 build-headless.sh emits the Tauri-free lucidos-<version>-<triple>.tar.gz (engine +
-gateway + frontend + relocatable PostgreSQL 18 + pgvector + sdk) + a .sha256 sidecar.
+gateway + frontend + relocatable PostgreSQL 18 + pgvector + sdk + system-knowhow)
++ a .sha256 sidecar.
 On Linux it is the release build path (see .github/workflows/release-tarballs.yml);
 on macOS it produces an UNSIGNED tarball (ship the signed one via
 scripts/build-dmg.sh --emit-tarball).
@@ -174,7 +175,7 @@ PG_PREFIX="$(stage_runtime_fetch_postgres "$PG_VERSION" "$PGVECTOR_VERSION" "$TR
 STAGE="$REPO_ROOT/.lucidos/headless-build/$TRIPLE/stage"
 step "Staging runtime tree → $STAGE"
 stage_runtime_assemble "$STAGE" "$ENGINE_BIN" "$GATEWAY_BIN" "$CLI_BIN" "$APP_DIR/dist" \
-    "$PG_PREFIX" "$REPO_ROOT/packages/lucidos-sdk/dist" >/dev/null \
+    "$PG_PREFIX" "$REPO_ROOT/packages/lucidos-sdk/dist" "$REPO_ROOT/system-knowhow" >/dev/null \
     || die "failed to stage the runtime tree into $STAGE"
 
 # ── 5. emit the headless tarball + .sha256 ───────────────────────────────────

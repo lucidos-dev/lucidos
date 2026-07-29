@@ -3,7 +3,6 @@
 use super::*;
 use crate::engine::AgentUserInput;
 use crate::test_support::{setup_test_db, teardown_test_db};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32};
 use uuid::Uuid;
 
 pub(crate) fn opt(id: &str, label: &str) -> QuestionOption {
@@ -21,51 +20,27 @@ pub(crate) fn cc_meta() -> EventMeta {
     }
 }
 
-pub(crate) fn make_session(process_exited: bool) -> AgentSession {
-    let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel::<AgentUserInput>();
-    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
-    AgentSession {
-        msg_tx,
-        is_waiting: !process_exited,
-        has_changes: false,
-        requires_restart: false,
-        pending_stop: None,
-        cancel_actor: None,
-        redirect_followup: false,
-        stop: Arc::new(tokio::sync::Notify::new()),
-        interrupt: Arc::new(tokio::sync::Notify::new()),
-        idle_notify: Arc::new(tokio::sync::Notify::new()),
-        apply_now_in_progress: false,
-        process_exited,
-        worktree_path: None,
-        branch_name: None,
-        repo_root: None,
-        cc_session_id: None,
-        shutting_down: Arc::new(AtomicBool::new(false)),
-        external_terminal_emitted: Arc::new(AtomicBool::new(false)),
-        control_tx,
-        builtin_commands: vec![],
-        skill_commands: vec![],
-        current_model: None,
-        current_reasoning_effort: None,
-        last_event_at: Arc::new(AtomicI64::new(0)),
-        pending_followups: Arc::new(AtomicU32::new(0)),
-        question_resume_pending: false,
-        tools_in_flight: Arc::new(AtomicI32::new(0)),
-        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
-        agent_cancel: tokio_util::sync::CancellationToken::new(),
-    }
+/// Returns the receiver alongside the session: hold it (`let (s, _rx) = …`) for
+/// the test's lifetime, or the session reads as a phantom and every
+/// `is_live()` check treats it as dead. See `AgentSession::is_live`.
+pub(crate) fn make_session(
+    process_exited: bool,
+) -> (
+    AgentSession,
+    tokio::sync::mpsc::UnboundedReceiver<AgentUserInput>,
+) {
+    let (mut session, msg_rx) = AgentSession::for_test();
+    session.is_waiting = !process_exited;
+    session.process_exited = process_exited;
+    (session, msg_rx)
 }
 
 pub(crate) async fn count_continuation_requests(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM events \
-         WHERE aggregate_id = $1 AND event_type = 'ContinuationRequested'",
-    )
-    .bind(thread_id.to_string())
-    .fetch_one(pool)
-    .await
-    .expect("count query")
+    count_events_of_type(pool, thread_id, "ContinuationRequested").await
+}
+
+pub(crate) async fn count_response_aborted(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
+    count_events_of_type(pool, thread_id, "ResponseAborted").await
 }
 
 /// SessionStarted is the lifecycle precondition for any CC-channel event;
@@ -90,15 +65,82 @@ pub(crate) async fn seed_cc_thread(bus: &EventBus, thread_id: Uuid) {
     .expect("SessionStarted persisted");
 }
 
-pub(crate) async fn count_coding_agent_prompt_sent(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
+pub(crate) async fn count_events_of_type(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    event_type: &str,
+) -> i64 {
     sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM events \
-         WHERE aggregate_id = $1 AND event_type = 'CodingAgentPromptSent'",
+        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 AND event_type = $2",
     )
     .bind(thread_id.to_string())
+    .bind(event_type)
     .fetch_one(pool)
     .await
     .expect("count query")
+}
+
+/// Bootstrap a chat thread the way the agentic loop does — `MessageReceived`
+/// (chat threads bootstrap on it; `SessionStarted` is CC-only per the lifecycle
+/// validator) — and return its event id, which IS the turn's
+/// `request_event_id`.
+pub(crate) async fn seed_chat_thread(bus: &EventBus, thread_id: Uuid, text: &str) -> Uuid {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: text.into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: crate::engine::thread_events::ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .expect("MessageReceived emit")
+    .expect("MessageReceived persisted")
+    .event_id
+}
+
+/// The chat agentic loop's `ToolCalled{ask_user_question}` — emitted right
+/// before the loop blocks on the wait registry, and stamped with the turn's
+/// `request_event_id`. `turn_request_event_id: None` reproduces a legacy row
+/// from before the loop stamped the field.
+pub(crate) async fn emit_ask_user_question_call(
+    bus: &EventBus,
+    thread_id: Uuid,
+    turn_request_event_id: Option<Uuid>,
+) -> Uuid {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ToolCalled {
+            name: crate::llm::tool_names::ASK_USER_QUESTION.to_string(),
+            args: serde_json::json!({ "questions": questions() }),
+            description: "Executing ask_user_question...".into(),
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            request_event_id: turn_request_event_id,
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .expect("ToolCalled emit")
+    .expect("ToolCalled persisted")
+    .event_id
+}
+
+pub(crate) async fn count_coding_agent_prompt_sent(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
+    count_events_of_type(pool, thread_id, "CodingAgentPromptSent").await
 }
 
 pub(crate) async fn emit_user_question(bus: &EventBus, thread_id: Uuid, tool_use_id: &str) {

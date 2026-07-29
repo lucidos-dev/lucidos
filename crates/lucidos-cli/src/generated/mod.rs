@@ -5,6 +5,11 @@
 // Each `cli = true` domain becomes one `clap::Subcommand` enum + one gateway-safe
 // `dispatch_<domain>` that routes through `crate::http` (port/cert/auth handled).
 // Wire each enum into `main.rs`'s `Command` enum + its `run()` match arm.
+//
+// Both allowed lints are inherent to the emitter, not fixable in this file:
+// variant names come verbatim from the manifest's operation names (a domain's
+// variants therefore share prefixes), and the query vector is emitted as
+// `Vec::new()` + one `push` per argument because most arguments are optional.
 #![allow(clippy::enum_variant_names, clippy::vec_init_then_push)]
 
 use crate::http::{client, send_and_print};
@@ -562,6 +567,9 @@ pub enum ModelsCmd {
         /// Optional display order (lower sorts first; user models default to 1000).
         #[arg(long)]
         sort_order: Option<i64>,
+        /// Context window in tokens (e.g. 1048576). Set it to the window the model actually serves. Omitting it falls back to guessing from the model id (claude-* → 200k unless the id ends in [1m], gpt-5* → 400k, anything else → 200k) — that guess has no rule for OpenRouter / Gemini / local ids, so they are treated as 200k however large they really are. Guesses err low on purpose: too low only trims context early, too high makes the provider reject the request.
+        #[arg(long)]
+        context_window: Option<i64>,
     },
     /// Edit a model's label/provider/sort_order/enabled (CLI generic PUT).
     Update {
@@ -580,6 +588,9 @@ pub enum ModelsCmd {
         /// Whether the model is enabled (shown in the picker).
         #[arg(long)]
         enabled: Option<bool>,
+        /// Context window in tokens (e.g. 1048576). Set it to the window the model actually serves. Omitting it falls back to guessing from the model id (claude-* → 200k unless the id ends in [1m], gpt-5* → 400k, anything else → 200k) — that guess has no rule for OpenRouter / Gemini / local ids, so they are treated as 200k however large they really are. Guesses err low on purpose: too low only trims context early, too high makes the provider reject the request.
+        #[arg(long)]
+        context_window: Option<i64>,
     },
     /// Delete a user-added model (builtins can't be removed — disable instead).
     Delete {
@@ -597,17 +608,18 @@ pub fn dispatch_models(ws: &Workspace, cmd: ModelsCmd) -> Result<(), BoxError> {
             let req = client()?.get(&url);
             send_and_print("GET", &url, req)
         }
-        ModelsCmd::Add { id, label, provider, sort_order } => {
+        ModelsCmd::Add { id, label, provider, sort_order, context_window } => {
             let url = format!("{}/api/v1/models", ws.base_url());
             let mut body = serde_json::Map::new();
             body.insert("id".into(), serde_json::json!(id));
             if let Some(v) = label { body.insert("label".into(), serde_json::json!(v)); }
             body.insert("provider".into(), serde_json::json!(provider));
             if let Some(v) = sort_order { body.insert("sort_order".into(), serde_json::json!(v)); }
+            if let Some(v) = context_window { body.insert("context_window".into(), serde_json::json!(v)); }
             let req = client()?.post(&url).json(&serde_json::Value::Object(body));
             send_and_print("POST", &url, req)
         }
-        ModelsCmd::Update { id, label, provider, sort_order, enabled } => {
+        ModelsCmd::Update { id, label, provider, sort_order, enabled, context_window } => {
             let url = format!("{}/api/v1/models", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
             query.push(("id", id.to_string()));
@@ -616,6 +628,7 @@ pub fn dispatch_models(ws: &Workspace, cmd: ModelsCmd) -> Result<(), BoxError> {
             if let Some(v) = provider { body.insert("provider".into(), serde_json::json!(v)); }
             if let Some(v) = sort_order { body.insert("sort_order".into(), serde_json::json!(v)); }
             if let Some(v) = enabled { body.insert("enabled".into(), serde_json::json!(v)); }
+            if let Some(v) = context_window { body.insert("context_window".into(), serde_json::json!(v)); }
             let req = client()?.put(&url).query(&query).json(&serde_json::Value::Object(body));
             send_and_print("PUT", &url, req)
         }

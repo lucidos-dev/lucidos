@@ -147,6 +147,46 @@ fn filter_request_headers_drops_stripped_keeps_others() {
     }
 
     #[test]
+    fn browser_proxy_guard_allows_http2_same_origin_without_host_header() {
+        // The bug being fixed: a direct-to-engine HTTP/2 request (iOS PWA, no
+        // gateway) carries the authority in the `:authority` pseudo-header, so
+        // there's NO Host header — and no x-forwarded-host either. Sec-Fetch-Site
+        // = same-origin already proves it's safe, so it must be ALLOWED even with
+        // nothing to reconstruct a host from.
+        let h = hm(&[
+            ("Origin", "https://localhost:5174"),
+            ("Sec-Fetch-Site", "same-origin"),
+        ]);
+        assert!(browser_proxy_request_allowed(&h));
+    }
+
+    #[test]
+    fn browser_proxy_guard_sec_fetch_same_origin_wins_over_mismatched_origin() {
+        // Sec-Fetch-Site is authoritative and unforgeable: when it says
+        // same-origin, the request is allowed even if Origin/Host would NOT match
+        // (behind a reverse proxy the engine's Host is the internal address, so
+        // Origin != Host is normal). No host comparison is performed at all.
+        let h = hm(&[
+            ("Host", "127.0.0.1:51811"),
+            ("Origin", "https://localhost:5251"),
+            ("Sec-Fetch-Site", "same-origin"),
+        ]);
+        assert!(browser_proxy_request_allowed(&h));
+    }
+
+    #[test]
+    fn browser_proxy_guard_legacy_allows_origin_matching_host() {
+        // Pre-Fetch-Metadata browser (no Sec-Fetch-*) still sends Origin on a
+        // same-origin POST. Those are HTTP/1.1 with a Host header, so the legacy
+        // Origin == Host comparison allows it.
+        let h = hm(&[
+            ("Host", "localhost:5173"),
+            ("Origin", "http://localhost:5173"),
+        ]);
+        assert!(browser_proxy_request_allowed(&h));
+    }
+
+    #[test]
     fn origin_authority_matches_host_normalizes_default_ports() {
         assert!(origin_authority_matches_host("https://localhost", "localhost:443"));
         assert!(origin_authority_matches_host("https://localhost", "localhost"));

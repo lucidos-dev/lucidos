@@ -35,7 +35,7 @@ fn stub_driver(jsonl_body: &str, resume: Option<&str>, continuation: bool) -> St
         system_prompt: Some("SYSPROMPT".into()),
         model: None,
         reasoning_effort: None,
-        git_common_dir: None,
+        sandbox_writable_roots: Vec::new(),
         env: Vec::new(),
     };
     let (events_tx, events_rx) = mpsc::unbounded_channel();
@@ -314,7 +314,7 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
         system_prompt: None,
         model: None,
         reasoning_effort: None,
-        git_common_dir: None,
+        sandbox_writable_roots: Vec::new(),
         env: Vec::new(),
     };
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();

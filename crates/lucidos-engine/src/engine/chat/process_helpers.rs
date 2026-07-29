@@ -232,7 +232,8 @@ pub(super) fn build_system_knowhow_section(
 /// immediately because its resume points at the just-killed conversation.
 ///
 /// Returns `true` when `agent_sessions[thread_id]` is populated with a live
-/// (non-`process_exited`) session before the deadline. Returns `false` when:
+/// session (see `AgentSession::is_live` — a phantom left by a dropped run
+/// future does not count) before the deadline. Returns `false` when:
 ///   - `active_threads[thread_id]` clears before population (chat handler
 ///     bailed without registering a session — fall through to a fresh spawn);
 ///   - the deadline elapses (caller falls through to slow path).
@@ -253,7 +254,7 @@ pub(super) async fn wait_for_cc_session_alive(
         {
             let guard = agent_sessions.lock().await;
             if let Some(s) = guard.get(&thread_id) {
-                if !s.process_exited {
+                if s.is_live() {
                     return true;
                 }
             }

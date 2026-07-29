@@ -550,7 +550,16 @@ impl LucidosEngine {
                 Ok(repos) => {
                     let mut out = format!("{} registered repositories:\n", repos.len());
                     for r in &repos {
-                        out.push_str(&format!("- **{}** — `{}`", r.name, r.path));
+                        // `~/…`, not the raw absolute path: a home dir named
+                        // `<username>@<employer-domain>` would otherwise reach
+                        // the model provider. `folder` inputs are re-expanded
+                        // on the way back in (`resolve_folder_input`), so the
+                        // abbreviated form stays usable.
+                        out.push_str(&format!(
+                            "- **{}** — `{}`",
+                            r.name,
+                            crate::core::home_path::abbreviate_str(&r.path)
+                        ));
                         if let Some(ref desc) = r.description {
                             out.push_str(&format!(" ({})", desc));
                         }
@@ -570,20 +579,14 @@ impl LucidosEngine {
                     _ => return Err("Error: 'path' is required for 'add' action".to_string()),
                 };
 
-                // Expand ~/
-                let expanded = if let Some(rest) = path.strip_prefix("~/") {
-                    if let Ok(home) = std::env::var("HOME") {
-                        format!("{}/{}", home, rest)
-                    } else {
-                        path.to_string()
-                    }
-                } else {
-                    path.to_string()
-                };
+                let expanded = crate::core::home_path::expand(path);
 
                 // Validate path exists and is a git repo
                 if !std::path::Path::new(&expanded).exists() {
-                    return Err(format!("Error: path does not exist: {}", expanded));
+                    return Err(format!(
+                        "Error: path does not exist: {}",
+                        crate::core::home_path::abbreviate_str(&expanded)
+                    ));
                 }
 
                 let git_check = tokio::process::Command::new("git")
@@ -593,7 +596,10 @@ impl LucidosEngine {
                     .await;
                 match git_check {
                     Ok(o) if !o.status.success() => {
-                        return Err(format!("Error: not a git repository: {}", expanded));
+                        return Err(format!(
+                            "Error: not a git repository: {}",
+                            crate::core::home_path::abbreviate_str(&expanded)
+                        ));
                     }
                     Err(e) => return Err(format!("Error: failed to check git repo: {}", e)),
                     _ => {}

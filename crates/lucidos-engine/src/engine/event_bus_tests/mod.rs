@@ -5,7 +5,7 @@
 
 use super::*;
 pub(crate) use crate::engine::thread_events::{
-    ActorMode, EventChannel, EventMeta, MessageOrigin, SessionEndReason, ThreadEvent,
+    ActorMode, AnswerKind, EventChannel, EventMeta, MessageOrigin, SessionEndReason, ThreadEvent,
 };
 pub(crate) use crate::test_support::{setup_test_db, start_cc_session, teardown_test_db};
 

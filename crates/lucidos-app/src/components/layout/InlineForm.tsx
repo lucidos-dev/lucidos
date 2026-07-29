@@ -30,9 +30,11 @@ export function InlineForm() {
     case 'app-edit': return <AppUiEditModal />;
     case 'new-app': return <NewAppModal />;
     case 'trigger': return <TriggerDetails key={form.triggerId ?? 'new'} />;
-    // The modal seeds subject/body useState once per mount — the key remounts it
-    // when a different draft replaces the open form (no request id exists, so the
-    // state-seeding fields are the identity; JSON keeps field boundaries unambiguous).
+    // The draft editor seeds subject/body useState once per mount — the key
+    // remounts it when a different draft replaces the open form (no request id
+    // exists, so the state-seeding fields are the identity; JSON keeps field
+    // boundaries unambiguous). The draft→receipt swap needs no key change: they
+    // are different components, so flipping `sentAt` remounts on its own.
     case 'email-confirm':
       return (
         <EmailConfirmModal

@@ -65,15 +65,20 @@ pub(super) struct ExternalWatchdogInput {
     pub is_waiting: bool,
     pub last_event_at_ms: i64,
     pub tools_in_flight: i32,
-    pub process_exited: bool,
+    /// The session's run loop is no longer running it — either the subprocess
+    /// exited (`process_exited`, loop still winding down) or the loop future
+    /// itself is gone and left a phantom behind (`!AgentSession::is_live`).
+    /// Both mean the same thing here: whatever the in-loop cleanup was going to
+    /// do, it either already started or will never happen.
+    pub loop_ended: bool,
     pub now_ms: i64,
     pub limit_ms: i64,
     pub ceiling_ms: i64,
 }
 
-/// Pure decision. For an exited session the in-loop normally owns cleanup, so
-/// skip — UNLESS it is still stale past the limit, which means the in-loop
-/// cleanup is wedged / never ran (`ResumeIfRunning`, gated on a still-running
+/// Pure decision. Once the run loop has ended it normally owns cleanup, so
+/// skip — UNLESS the session is still stale past the limit, which means that
+/// cleanup is wedged or never ran (`ResumeIfRunning`, gated on a still-running
 /// re-check at the call site). Otherwise reuse `watchdog_gate`: `Fire` →
 /// `Resume`, `FirePastCeiling` → `ResumeIfRunning`, everything else → `Skip`.
 /// Sharing the gate with the in-loop guarantees the two watchdogs agree on what
@@ -81,7 +86,7 @@ pub(super) struct ExternalWatchdogInput {
 pub(super) fn external_watchdog_decision(
     input: ExternalWatchdogInput,
 ) -> ExternalWatchdogDecision {
-    if input.process_exited {
+    if input.loop_ended {
         let stale = input.last_event_at_ms > 0
             && input.now_ms.saturating_sub(input.last_event_at_ms) > input.limit_ms;
         return if stale {
@@ -181,7 +186,7 @@ impl ExternalWatchdog {
                         is_waiting: s.is_waiting,
                         last_event_at_ms: last_ms,
                         tools_in_flight: tif,
-                        process_exited: s.process_exited,
+                        loop_ended: !s.is_live(),
                         now_ms,
                         limit_ms: self.limit_ms,
                         ceiling_ms: self.ceiling_ms,
@@ -195,6 +200,7 @@ impl ExternalWatchdog {
                         thread_id: *tid,
                         elapsed_ms: now_ms.saturating_sub(last_ms),
                         external_terminal: s.external_terminal_emitted.clone(),
+                        external_continuation: s.external_continuation_requested.clone(),
                         idle_notify: s.idle_notify.clone(),
                         agent_cancel: s.agent_cancel.clone(),
                         last_event_at: s.last_event_at.clone(),
@@ -287,6 +293,15 @@ impl ExternalWatchdog {
                 // `ContinuationRequested`. The Release store before the (itself
                 // synchronizing) `cancel()` guarantees any observer of the
                 // cancellation also sees the flag set.
+                //
+                // The continuation flag rides the same ordering: it tells the
+                // wedged loop's completion that the "external terminal" is a
+                // RECOVERY continuation (not a restart abort / concurrent
+                // cancel), so a conflict-resolution session hands its merge
+                // duty off instead of aborting the apply and tearing down the
+                // merge worktree under the continuation we're about to emit.
+                c.external_continuation
+                    .store(true, std::sync::atomic::Ordering::Release);
                 c.external_terminal
                     .store(true, std::sync::atomic::Ordering::Release);
                 c.agent_cancel.cancel();
@@ -325,6 +340,11 @@ struct StuckSession {
     thread_id: Uuid,
     elapsed_ms: i64,
     external_terminal: Arc<std::sync::atomic::AtomicBool>,
+    /// The session's `external_continuation_requested` — set alongside
+    /// `external_terminal` so a conflict-resolution session's completion can
+    /// tell this recovery apart from a restart abort (see the field doc on
+    /// `AgentSession`).
+    external_continuation: Arc<std::sync::atomic::AtomicBool>,
     idle_notify: Arc<tokio::sync::Notify>,
     /// Clone of the session's `agent_cancel` — cancelled on recovery so the
     /// driver_task tears down the (possibly wedged) subprocess's process group.
@@ -364,13 +384,13 @@ mod tests {
         last: i64,
         is_waiting: bool,
         tif: i32,
-        exited: bool,
+        loop_ended: bool,
     ) -> ExternalWatchdogInput {
         ExternalWatchdogInput {
             is_waiting,
             last_event_at_ms: last,
             tools_in_flight: tif,
-            process_exited: exited,
+            loop_ended,
             now_ms: now,
             limit_ms: EXTERNAL_WATCHDOG_LIMIT_MS,
             ceiling_ms: CEILING,

@@ -104,23 +104,36 @@ fn error_response_line(id: &serde_json::Value, code: i64, message: &str) -> Stri
 /// `developerInstructions` carries the engine's system prompt on BOTH paths
 /// (matching CC, which re-passes `--append-system-prompt` on every resume).
 /// The `config` object mirrors the exec driver's `-c` overrides: sandbox
-/// network on, the linked worktree's shared git dir writable, and the
-/// `lucidos` MCP server for `ask_user_question`.
+/// network on, the same extra writable roots the exec driver passes as
+/// `--add-dir` (see `codex::sandbox_writable_roots`), and the `lucidos` MCP
+/// server for `ask_user_question`.
 fn build_thread_request(
     config: &CodexConfig,
     resume_session_id: Option<&str>,
 ) -> (&'static str, serde_json::Value) {
     let mut sandbox_ww = serde_json::Map::new();
     sandbox_ww.insert("network_access".to_string(), true.into());
-    if let Some(git_dir) = &config.git_common_dir {
+    if !config.sandbox_writable_roots.is_empty() {
         sandbox_ww.insert(
             "writable_roots".to_string(),
-            serde_json::json!([git_dir.to_string_lossy()]),
+            serde_json::Value::Array(
+                config
+                    .sandbox_writable_roots
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned().into())
+                    .collect(),
+            ),
         );
     }
     let config_obj = serde_json::json!({
         "sandbox_workspace_write": sandbox_ww,
         "mcp_servers": { "lucidos": lucidos_mcp_server_config_json(&config.env) },
+        // Reasoning summaries + CLAUDE.md project-doc fallback — see the
+        // CODEX_REASONING_SUMMARY / CODEX_PROJECT_DOC_FALLBACKS docs in
+        // codex.rs (shared with the exec driver's `-c` overrides).
+        "model_reasoning_summary": super::codex::CODEX_REASONING_SUMMARY,
+        "project_doc_fallback_filenames": super::codex::CODEX_PROJECT_DOC_FALLBACKS,
+        "project_doc_max_bytes": super::codex::CODEX_PROJECT_DOC_MAX_BYTES,
     });
 
     let mut params = serde_json::Map::new();
@@ -176,7 +189,7 @@ fn build_turn_start_params(
     if let Some(m) = model.filter(|m| !m.is_empty() && *m != "default") {
         params.insert("model".to_string(), m.into());
     }
-    if let Some(e) = effort.filter(|e| !e.is_empty()) {
+    if let Some(e) = super::codex::validate_codex_effort(model, effort) {
         params.insert("effort".to_string(), e.into());
     }
     serde_json::Value::Object(params)

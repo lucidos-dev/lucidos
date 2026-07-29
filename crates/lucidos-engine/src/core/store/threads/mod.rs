@@ -193,8 +193,8 @@ pub struct ThreadSummary {
     /// `None` once the thread transitions out of `composing`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_mode: Option<String>,
-    /// Per-draft dropdown selections (target/scope, coding agent, Lucidos model
-    /// + reasoning, coding-agent model + reasoning) as a partial
+    /// Per-draft dropdown selections (target/scope, coding agent, Lucidos
+    /// model + reasoning, coding-agent model + reasoning) as a partial
     /// `ComposeSelectionOverride`-shaped object. `None` = no per-draft picks
     /// stored; the frontend resolves each unset field to its account default.
     /// Carried on the `/api/v1/threads` initial fetch so a reload rehydrates

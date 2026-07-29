@@ -1,5 +1,5 @@
 import { test, expect, type Page, type Locator } from './fixtures';
-import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer, openDrawerView, waitForVisibleInput, ensureOnThreadPane, clickVisibleElement, isMobileViewport, REAL_THREAD_ROW } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer, openDrawerView, waitForVisibleInput, ensureOnThreadPane, clickVisibleElement, clickThreadRow, threadRowFor, isMobileViewport } from './helpers';
 import { clearAllThreads, psql } from './db-helpers';
 
 /** Send a first message, then click Compose and type a draft. Returns the
@@ -72,6 +72,8 @@ test.describe('Per-thread drafts', () => {
 
     // Type a draft in the thread
     const input = await waitForVisibleInput(page);
+    const threadId = await input.getAttribute('data-thread-id');
+    if (!threadId) throw new Error('Active thread input missing data-thread-id');
     await input.fill('thread draft text');
 
     // Compose: opens a fresh blank draft
@@ -79,10 +81,16 @@ test.describe('Per-thread drafts', () => {
     const composeInput = await waitForVisibleInput(page);
     await expect(composeInput).toHaveValue('');
 
-    // Click the real thread row (skip any compose-draft rows the drawer renders)
+    // Back to THIS thread, BY ID. Not "the first visible real thread row": the
+    // e2e workspace is shared and `clearAllThreads()` truncates only the
+    // thread_summaries projection, so a coding-agent session still running from
+    // an earlier spec re-inserts its row mid-test with `last_activity = NOW()`
+    // and outranks ours. The old positional click then landed on that foreign
+    // thread and this test reported the resulting empty textarea as a lost
+    // draft. See `clickThreadRow` and the session-8 entry in
+    // docs/plans/2026-06-27-mobile-webkit-shard-contention.md.
     await openThreadDrawer(page);
-    const clicked = await clickVisibleElement(page, REAL_THREAD_ROW);
-    if (!clicked) throw new Error('No visible real thread row found');
+    await clickThreadRow(page, threadId);
     await ensureOnThreadPane(page);
 
     // Thread draft restored. The timeout is the suite's default `expect` timeout
@@ -97,7 +105,12 @@ test.describe('Per-thread drafts', () => {
     // surfaced as a retry-recovered flake on 2026-06-28; the draft restores
     // correctly, just slower than 5s under starvation.)
     const threadInput = await waitForVisibleInput(page);
-    const restoredThreadId = await threadInput.getAttribute('data-thread-id');
+    // IDENTITY BEFORE VALUE. An assertion about "the draft" says nothing if the
+    // app parked us on a different thread, and a wrong-thread landing must never
+    // again be reported as a lost draft — that misreading is what sent five
+    // nightly runs and a whole investigation after a nonexistent product bug.
+    // Polls (the restore re-renders), so a slow-but-correct switch still passes.
+    await expect(threadInput).toHaveAttribute('data-thread-id', threadId);
     try {
       await expect(threadInput).toHaveValue('thread draft text');
     } catch (assertErr) {
@@ -107,17 +120,16 @@ test.describe('Per-thread drafts', () => {
       // chased six unit-level fixes blind because the live failure was never
       // classified). The textarea binds to the local composeDrafts signal, so an
       // empty textarea after the full 30s is NOT a transient paint stall. Query
-      // the PERSISTED draft (thread_summaries.compose_text, written synchronously
-      // by the compose PUT) to split the two remaining faces:
+      // the PERSISTED draft of the thread we ASSERTED ON (the line above proved
+      // it is the one we typed into — querying the *restored* id was the bug that
+      // produced the bogus NOT-STORED verdict) to split the two faces:
       //   • persisted === the draft → CLOBBER: stored server-side but wiped from
       //     (or never re-synced into) the local signal — a product clear-path bug.
       //   • persisted === ''        → NOT-STORED: the PUT never landed — a
       //     fill()→updateCompose event race, or a failed/never-fired PUT.
       let persisted: string;
       try {
-        persisted = restoredThreadId
-          ? psql(`SELECT compose_text FROM thread_summaries WHERE thread_id = '${restoredThreadId}'`)
-          : '<no data-thread-id on restored input>';
+        persisted = psql(`SELECT compose_text FROM thread_summaries WHERE thread_id = '${threadId}'`);
       } catch (psqlErr) {
         persisted = `<persisted-draft query failed: ${(psqlErr as Error).message}>`;
       }
@@ -128,7 +140,7 @@ test.describe('Per-thread drafts', () => {
       throw new Error(
         `drafts:65 draft-restore FAILED — face: ${face}. ` +
         `textarea value=${JSON.stringify(domValue)}, persisted compose_text=${JSON.stringify(persisted)}, ` +
-        `thread=${restoredThreadId}. Original: ${(assertErr as Error).message}`,
+        `thread=${threadId}. Original: ${(assertErr as Error).message}`,
       );
     }
   });
@@ -247,14 +259,18 @@ test.describe('Per-thread drafts', () => {
 
     // Type a draft in this thread
     const input = await waitForVisibleInput(page);
+    const threadId = await input.getAttribute('data-thread-id');
+    if (!threadId) throw new Error('Active thread input missing data-thread-id');
     await input.fill('unsent draft');
 
     // Switch to compose so the thread's draft is saved
     await newThread(page);
 
-    // Open drawer — the thread row carries a "Draft" badge
+    // Open drawer — THIS thread's row carries a "Draft" badge. Scoped to our own
+    // row: a foreign thread's row can outrank ours in the drawer (see
+    // `threadRowFor`), and "some real row has a Draft badge" is not the claim.
     await openThreadDrawer(page);
-    const draftIndicator = page.locator(`${REAL_THREAD_ROW}:visible .draft-indicator`).first();
+    const draftIndicator = page.locator(`${threadRowFor(threadId)}:visible .draft-indicator`).first();
     await expect(draftIndicator).toBeVisible({ timeout: 5_000 });
     await expect(draftIndicator).toHaveText('Draft');
   });
@@ -314,15 +330,20 @@ test.describe('Per-thread drafts', () => {
     await sendMessage(page, `Say exactly: "${msg}"`);
     await waitForResponse(page);
 
+    const sentInput = await waitForVisibleInput(page);
+    const threadId = await sentInput.getAttribute('data-thread-id');
+    if (!threadId) throw new Error('Active thread input missing data-thread-id');
+
     await newThread(page);
 
     const input = await waitForVisibleInput(page);
     await input.fill('compose only draft');
 
     // Navigate to the thread (away from compose) via drawer so the compose
-    // draft is no longer focused — only then is it shown in Drafts on desktop
+    // draft is no longer focused — only then is it shown in Drafts on desktop.
+    // By id, not by position — see `clickThreadRow`.
     await openThreadDrawer(page);
-    await clickVisibleElement(page, REAL_THREAD_ROW);
+    await clickThreadRow(page, threadId);
     await ensureOnThreadPane(page);
 
     await openThreadDrawer(page);

@@ -396,6 +396,19 @@ pub(crate) fn change_applied_concurrently(change_status: Option<&str>) -> bool {
 /// Callers should retry with a fresh session.
 pub(crate) const STALE_RESUME_ERROR: &str = "CC_STALE_RESUME";
 
+/// Error `run_direct_agent`'s spawn guard returns when a **live** session
+/// already owns the thread — the caller lost the race and owns nothing.
+///
+/// User-facing prose (it surfaces on a rejected send), but engine callers must
+/// branch on it, so it is a shared constant rather than a duplicated literal.
+/// The distinction is load-bearing for any caller with a "settle the projection
+/// on error" backstop: this error means the turn belongs to somebody ELSE who is
+/// still working, so settling on it emits a terminal against a live session and
+/// makes the projection lie in the opposite direction. See
+/// `agent_recovery::continue_recovery`.
+pub(crate) const AGENT_ALREADY_RUNNING_ERROR: &str =
+    "A coding agent is already running for this thread. Cancel it first or wait for it to finish.";
+
 /// Marker file written to each CC worktree identifying the owning workspace.
 pub(crate) const WORKTREE_WORKSPACE_MARKER: &str = ".lucidos-workspace";
 

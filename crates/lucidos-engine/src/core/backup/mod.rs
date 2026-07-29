@@ -1297,7 +1297,7 @@ fn header_for_file(metadata: &std::fs::Metadata) -> tar::Header {
 /// mid-walk: `Ok(Some(v))` = use it, `Ok(None)` = the path was removed
 /// (`NotFound`) so skip it, `Err(e)` = a real error to propagate.
 ///
-/// The workspace's autoresearch loop constantly creates and tears down git
+/// A workspace's background jobs constantly create and tear down git
 /// worktrees under `.git/`, so a file (or directory) enumerated by the walk can
 /// disappear before tar reads it. A single vanished path must not abort the
 /// whole backup — but other error kinds (permissions, I/O) still must.

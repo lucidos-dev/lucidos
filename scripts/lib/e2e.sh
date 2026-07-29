@@ -1,11 +1,27 @@
 #!/bin/bash
 
-E2E_WORKSPACE="$HOME/workspaces/e2e-test"
+# Honor an inherited value — a hard assignment here would clobber the sandbox a
+# test pins before sourcing us, and this variable is load-bearing for signalling:
+# `e2e_workspace_env` exports it as $WORKSPACE, which resolves $ENGINE_PIDFILE,
+# which `stop_e2e_engine` sends SIGUSR1 to. Clobbered, a `source e2e.sh` from a
+# test aims that signal at the REAL e2e-test engine instead of the sandbox.
+# Same convention as `e2e_lock.sh` (`${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}`).
+# Nothing in the production path pre-sets it — `e2e-api.sh` / `e2e-browser.sh`
+# only bare-`export` it after we assign — so the default is unchanged there.
+E2E_WORKSPACE="${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}"
 
 # Resolve paths: scripts/lib/e2e.sh → scripts/lib/ → scripts/ → project root
 _E2E_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _E2E_SCRIPTS_DIR="$(dirname "$_E2E_LIB_DIR")"
 _E2E_PROJECT_DIR="$(dirname "$_E2E_SCRIPTS_DIR")"
+
+# The e2e stack is deliberately allowed to run from a coding-agent worktree: a CC
+# session's whole job is exercising the checkout it was invoked from, and the
+# e2e-test workspace is disposable. Everything else refuses a worktree-rooted
+# checkout (assert_stack_not_worktree_pinned in scripts/lib/workspace.sh), because
+# a long-lived stack pinned to a throwaway copy serves a frozen engine binary +
+# dist/ forever. This opt-in is the sanctioned exception, not a workaround.
+export LUCIDOS_ALLOW_WORKTREE_STACK=1
 
 # Use mock LLM provider by default for e2e tests (override with LUCIDOS_MODEL=... before calling)
 export LUCIDOS_MODEL="${LUCIDOS_MODEL:-mock}"
@@ -45,7 +61,6 @@ fi
 
 # Source shared infrastructure — provides detect_tls, setup_postgres, start_engine,
 # start_vite, etc. Set the globals workspace.sh expects from its caller.
-SCRIPT_DIR="$_E2E_SCRIPTS_DIR"
 PROJECT_DIR="$_E2E_PROJECT_DIR"
 FRONTEND_DIR="$_E2E_PROJECT_DIR/crates/lucidos-app"
 SCRIPT_NAME="e2e"
@@ -56,21 +71,158 @@ source "$_E2E_LIB_DIR/e2e_lock.sh"
 source "$_E2E_LIB_DIR/webkit_reaper.sh"
 source "$_E2E_LIB_DIR/host_load_guard.sh"
 
+# ── e2e_workspace_env ───────────────────────────────────────────────────
+# Resolve this workspace's globals (pidfiles, log path, PG_NAME), its ports and
+# TLS. Idempotent and cheap. Both ensure_workspace_running and
+# reset_e2e_database need it — the reset runs BEFORE the engine's first boot, so
+# it can't rely on ensure_workspace_running having gone first.
+e2e_workspace_env() {
+    export WORKSPACE="$E2E_WORKSPACE"
+    resolve_workspace
+    allocate_ports "$WORKSPACE"
+    detect_tls
+}
+
+# ── build_e2e_engine_once ───────────────────────────────────────────────
+# Build the SDK bundle and the engine binaries the suite tests — ONCE per script
+# invocation. Every database recreate restarts the engine (a fresh database is
+# only migrated at boot), and each restart lands back here; recompiling
+# mid-suite would swap the binary out from under the running tests, so later
+# calls only LOCATE what the first call built. The marker is exported so the
+# sub-scripts the umbrella (scripts/e2e.sh) spawns inherit "already built".
+build_e2e_engine_once() {
+    if [ -n "${LUCIDOS_E2E_ENGINE_BUILT:-}" ]; then
+        BUILD=""
+        build_or_find_engine
+        return 0
+    fi
+    # Apps loaded in iframes fetch /api/v1/sdk.js — without dist/sdk.js the
+    # engine serves a stub that lacks lucidos.ui/data, breaking SDK e2e tests.
+    build_sdk
+    BUILD="1"
+    build_or_find_engine
+    export LUCIDOS_E2E_ENGINE_BUILT=1
+}
+
+# ── frontend build: one shot, but never a STALE one ─────────────────────
+# The e2e run tests a FIXED build — one `vite build` up front, then every project
+# runs against exactly that dist/. That contract stays: the e2e path deliberately
+# does NOT use the `vite build --watch`-style build-watch, which is a
+# checkout-level singleton owned by the dev harness (start_frontend_built in
+# scripts/lib/workspace.sh) and would swap the frontend out from under a running
+# suite.
+#
+# What "one shot" must NOT mean is "any dist/ will do". The guard used to be
+# existence-aware (`[ ! -f dist/index.html ]`), so a checkout whose dist/ predated
+# its own frontend commits ran the WHOLE browser suite against a stale frontend
+# and reported green — the harness lying about what it tested. It is now
+# staleness-aware: rebuild when dist/index.html is missing OR older than any
+# build input.
+#
+# Cheap by construction: ONE `find … -newer … -quit`, which stops at the first
+# newer path instead of hashing the tree. mtime is trustworthy here because git
+# stamps every file it writes with the checkout/merge time, so a checkout that
+# moves frontend source forward always leaves those files newer than a dist/ built
+# before it. The failure direction is an unnecessary rebuild, never a silently
+# stale run.
+
+# _frontend_build_inputs — echo one build-input path per line. Mirrors the watch
+# list in crates/lucidos-app/dev-build-watch.mjs (the authoritative statement of
+# what a `vite build` of this app reads), plus the files only vite.config.ts
+# itself pulls in:
+#   src/, public/, index.html, vite.config.ts  — the app and its entry points
+#   tsconfig.json, package.json                — compiler options, deps, scripts
+#   packages/lucidos-sdk/src/                  — the workspace-local package the
+#                                                build aliases in as @lucidos/sdk
+#   crates/lucidos-engine/VERSION              — baked into the bundle by the
+#                                                engine-version plugin
+#   <root>/package.json + package-lock.json    — npm workspaces hoist to the root
+#                                                and `npm ci` restores node_modules
+#                                                from the root lockfile, so a dep
+#                                                bump changes the bundle without
+#                                                touching a single app file. The
+#                                                same two files _deps_fingerprint
+#                                                keys the install on.
+# Paths that don't exist are skipped by the caller, so an optional input costs
+# nothing here.
+_frontend_build_inputs() {
+    printf '%s\n' \
+        "$FRONTEND_DIR/src" \
+        "$FRONTEND_DIR/public" \
+        "$FRONTEND_DIR/index.html" \
+        "$FRONTEND_DIR/vite.config.ts" \
+        "$FRONTEND_DIR/tsconfig.json" \
+        "$FRONTEND_DIR/package.json" \
+        "$_E2E_PROJECT_DIR/packages/lucidos-sdk/src" \
+        "$_E2E_PROJECT_DIR/crates/lucidos-engine/VERSION" \
+        "$_E2E_PROJECT_DIR/package.json" \
+        "$_E2E_PROJECT_DIR/package-lock.json"
+}
+
+# _first_build_input_newer_than REF — echo the first build-input path whose mtime
+# is newer than REF, or nothing when the build is up to date.
+#
+# ALWAYS returns 0. The caller assigns this through a command substitution
+# (`newer="$(…)"`), whose status IS the assignment's status — so under the
+# callers' `set -e` a `find` that failed for any transient reason (a path removed
+# between the -e probe and the walk, an unreadable dir) would abort the entire
+# e2e run instead of just rebuilding. Failing open here means the worst case is a
+# missed staleness signal, which the missing-dist branch and the next run still
+# catch.
+_first_build_input_newer_than() {
+    local ref="$1"
+    local p
+    local -a inputs=()
+    while IFS= read -r p; do
+        [ -e "$p" ] && inputs+=("$p")
+    done < <(_frontend_build_inputs)
+    [ "${#inputs[@]}" -gt 0 ] || return 0
+    find "${inputs[@]}" -newer "$ref" -print -quit 2>/dev/null || true
+}
+
+# _run_vite_build — the one-shot production build. Its own function purely so the
+# shell test can redefine it (the repo's seam convention — see the measurement
+# seams in scripts/lib/host_load_guard.sh) and assert WHICH branch
+# ensure_frontend_built took without paying for a real build.
+_run_vite_build() {
+    (cd "$FRONTEND_DIR" && npx vite build)
+}
+
+# ensure_frontend_built — build dist/ when it is missing or stale, reuse it
+# otherwise. ALWAYS prints the branch it took, so an unattended nightly log says
+# in one line whether the suite tested a freshly built frontend or a reused one.
+ensure_frontend_built() {
+    local dist_index="$FRONTEND_DIR/dist/index.html"
+    local reason="" newer=""
+
+    if [ ! -f "$dist_index" ]; then
+        reason="no dist/index.html"
+    else
+        newer="$(_first_build_input_newer_than "$dist_index")"
+        if [ -n "$newer" ]; then
+            reason="build input newer than dist/index.html: ${newer#"$_E2E_PROJECT_DIR"/}"
+        fi
+    fi
+
+    if [ -z "$reason" ]; then
+        echo "Frontend build: REUSED existing dist/ (newer than every build input)"
+        return 0
+    fi
+
+    echo "Frontend build: REBUILDING dist/ (stale — $reason)"
+    _run_vite_build || { echo "ERROR: frontend build failed" >&2; return 1; }
+    echo "Frontend build: REBUILT dist/"
+    return 0
+}
+
 # ── ensure_workspace_running ────────────────────────────────────────────
 # Starts the e2e workspace if not running. Ensures both engine AND Vite are up.
 # Uses LUCIDOS_MODEL=mock by default so tests don't hit real LLM APIs.
 ensure_workspace_running() {
-    # Set up workspace globals (pidfiles, log path, PG_NAME)
-    export WORKSPACE="$E2E_WORKSPACE"
-    resolve_workspace
+    e2e_workspace_env
 
-    # Allocate ports and detect TLS
-    allocate_ports "$WORKSPACE"
-    detect_tls
-
-    # After allocate_ports: API_PORT = internal Vite port, VITE_PORT = engine port
+    # After allocate_ports, VITE_PORT is the engine's port (see swap_ports).
     local engine_port="$VITE_PORT"
-    local vite_port="$API_PORT"
 
     # ── Engine ──
     if curl -sk "${PROTO}://localhost:${engine_port}/api/v1/health" >/dev/null 2>&1; then
@@ -80,12 +232,7 @@ ensure_workspace_running() {
     else
         echo "Starting e2e workspace (LUCIDOS_MODEL=$LUCIDOS_MODEL)..."
         setup_postgres
-        purge_orphan_migrations
-        # Apps loaded in iframes fetch /api/v1/sdk.js — without dist/sdk.js the
-        # engine serves a stub that lacks lucidos.ui/data, breaking SDK e2e tests.
-        build_sdk
-        BUILD="1"
-        build_or_find_engine
+        build_e2e_engine_once
         swap_ports
         start_engine
     fi
@@ -93,16 +240,24 @@ ensure_workspace_running() {
     # ── Frontend (ADR 0014: the engine serves the built dist/ directly) ──
     # No Vite dev server / proxy. swap_ports exported LUCIDOS_STATIC_DIR, so the
     # legacy engine started above serves dist/ at / (base path '', no gateway).
-    # The e2e run tests a fixed build, so a one-shot `vite build` suffices.
-    if [ ! -f "$FRONTEND_DIR/dist/index.html" ]; then
-        echo "Building frontend (vite build)..."
-        (cd "$FRONTEND_DIR" && npx vite build) || { echo "ERROR: frontend build failed" >&2; return 1; }
-    fi
+    # The e2e run tests a fixed build, so a one-shot `vite build` suffices — but
+    # only a build that is actually current (see ensure_frontend_built).
+    ensure_frontend_built || return 1
 
     # Final check: the engine must serve the built frontend at / (retry up to 30s)
     echo -n "Verifying engine serves the frontend"
     local frontend_ready=""
-    for i in {1..30}; do
+    # `for _`, never `for i`. e2e-browser.sh drives its project loop on `i` and
+    # calls reset_e2e_database — which lands here — from inside that loop body,
+    # so an un-localised counter named `i` leaked back into the caller and made
+    # `PROJECT_RCS[$i]=$rc` write the WRONG slot: the last project's exit code was
+    # never recorded (the blank "mobile:" line in the 2026-07-26 nightly summary)
+    # and the previous project's was overwritten. A throwaway `_` can't leak
+    # anything a caller could rely on; a named counter must be `local`. That is
+    # enforced, not just asserted — e2e_test.sh's
+    # test_no_sourced_lib_leaks_a_loop_variable scans every lib on this call path
+    # and fails on a new leak.
+    for _ in {1..30}; do
         if curl -sk "${PROTO}://localhost:${engine_port}/" 2>/dev/null | grep -q "<!DOCTYPE" 2>/dev/null; then
             echo " ready!"
             frontend_ready="yes"
@@ -156,16 +311,41 @@ cleanup_e2e_worktrees() {
     local original_dir="$PWD"
     cd "$E2E_WORKSPACE" || return
 
+    # `git worktree list` prints RESOLVED paths, so both comparisons below must
+    # compare against a resolved $E2E_WORKSPACE or they silently never match —
+    # and "never match" fails OPEN here: the workspace's own worktrees are left
+    # registered in the canonical repo, which is exactly the stale-entry pileup
+    # that pushes engine recovery past its 30s readiness budget. Bites whenever
+    # the path traverses a symlink: a symlinked ~/workspaces, or (how this
+    # surfaced) a macOS `mktemp -d` sandbox, where /var is a symlink to
+    # /private/var.
+    #
+    # The empty-fallback below is LOAD-BEARING, not defensive boilerplate — do
+    # not "simplify" it away (the `cd` above means resolution effectively can't
+    # fail, which is exactly why it reads as dead code). An empty
+    # $e2e_ws_resolved turns the `case` pattern into `/*`, which matches EVERY
+    # absolute path, so the sweep below would `git worktree remove --force`
+    # every worktree in the SHARED canonical repo and delete their branches —
+    # the 2026-06-13 incident described in the SAFETY note further down. The
+    # skip-main guard would break the same way. Fails CLOSED instead.
+    local e2e_ws_resolved
+    e2e_ws_resolved="$(cd "$E2E_WORKSPACE" 2>/dev/null && pwd -P)" || true
+    [ -z "$e2e_ws_resolved" ] && e2e_ws_resolved="$E2E_WORKSPACE"
+
     # Prune stale worktree entries (paths that no longer exist on disk)
     git worktree prune 2>/dev/null
 
     # Remove all non-main worktrees (created by CC tests)
     local removed=0
+    # Same rule as the readiness counter in ensure_workspace_running: this
+    # function is called from inside e2e-browser.sh's project loop, so its
+    # iteration variables must not leak back into the caller.
+    local line
     while IFS= read -r line; do
         local wt_path
         wt_path=$(echo "$line" | awk '{print $1}')
         # Skip the main working tree
-        [ "$wt_path" = "$E2E_WORKSPACE" ] && continue
+        [ "$wt_path" = "$e2e_ws_resolved" ] && continue
         git worktree remove --force "$wt_path" 2>/dev/null && removed=$((removed + 1))
     done < <(git worktree list 2>/dev/null)
 
@@ -188,36 +368,111 @@ cleanup_e2e_worktrees() {
     # live user work — this force-deleted an active session's branch and wiped its
     # worktree on 2026-06-13. Delete ONLY the branch each removed e2e worktree was
     # checked out on, captured from the same `git worktree list` record.
-    cd "$_E2E_PROJECT_DIR" 2>/dev/null || { cd "$original_dir"; return; }
-    git worktree prune 2>/dev/null
-    local wt_path="" cur_branch=""
-    local -a e2e_branches=()
-    while IFS= read -r line; do
-        case "$line" in
-            "worktree "*) wt_path="${line#worktree }" ;;
-            "branch "*)   cur_branch="${line#branch refs/heads/}" ;;
-            "")
-                case "$wt_path" in
-                    "$E2E_WORKSPACE"/*)
-                        git worktree remove --force "$wt_path" 2>/dev/null && removed=$((removed + 1))
-                        [ -n "$cur_branch" ] && e2e_branches+=("$cur_branch")
-                        ;;
-                esac
-                wt_path=""; cur_branch=""
-                ;;
-        esac
-    done < <(git worktree list --porcelain 2>/dev/null; printf '\n')
-    if [ "${#e2e_branches[@]}" -gt 0 ]; then
-        local br
-        for br in "${e2e_branches[@]}"; do
-            git branch -D "$br" 2>/dev/null || true
-        done
+    # Scoped as an `if` rather than an early return: not reaching the canonical
+    # repo must skip ONLY this sweep. The cwd restore and the orphan-dir prune
+    # below are independent of it and still have to run — returning here would
+    # silently leave the caller in $E2E_WORKSPACE and skip the prune entirely.
+    if cd "$_E2E_PROJECT_DIR" 2>/dev/null; then
+        git worktree prune 2>/dev/null
+        local wt_path="" cur_branch=""
+        local -a e2e_branches=()
+        while IFS= read -r line; do
+            case "$line" in
+                "worktree "*) wt_path="${line#worktree }" ;;
+                "branch "*)   cur_branch="${line#branch refs/heads/}" ;;
+                "")
+                    case "$wt_path" in
+                        "$e2e_ws_resolved"/*)
+                            git worktree remove --force "$wt_path" 2>/dev/null && removed=$((removed + 1))
+                            [ -n "$cur_branch" ] && e2e_branches+=("$cur_branch")
+                            ;;
+                    esac
+                    wt_path=""; cur_branch=""
+                    ;;
+            esac
+        done < <(git worktree list --porcelain 2>/dev/null; printf '\n')
+        if [ "${#e2e_branches[@]}" -gt 0 ]; then
+            local br
+            for br in "${e2e_branches[@]}"; do
+                git branch -D "$br" 2>/dev/null || true
+            done
+        fi
     fi
 
-    cd "$original_dir"
+    # Warn rather than return: prune_orphan_worktree_dirs works on absolute
+    # paths under $E2E_WORKSPACE, so it is still correct from any cwd and must
+    # not be skipped just because the restore failed.
+    cd "$original_dir" || echo "Warning: could not return to $original_dir" >&2
     [ "$removed" -gt 0 ] && echo "Removed $removed worktree(s)" || true
 
     prune_orphan_worktree_dirs
+}
+
+# ── stop_e2e_background_guards ───────────────────────────────────────
+# Stop every run-scoped background helper the browser phase starts: the WebKit
+# RSS reaper and the mid-run host-load sampler. Both are idempotent no-ops when
+# nothing was started (e2e-api.sh starts neither), so this is safe in any
+# teardown path. One function so a future guard gets wired into every teardown at
+# once rather than being forgotten in one of them.
+stop_e2e_background_guards() {
+    stop_webkit_reaper
+    stop_host_load_sampler
+}
+
+# ── report_project_exit_codes ────────────────────────────────────────
+# Print the per-project exit-code table for a multi-project browser run and
+# RETURN the umbrella exit code the caller must exit with.
+#
+#   report_project_exit_codes OVERALL_RC PROJECT:RC [PROJECT:RC …]
+#
+# Lives here rather than inline in e2e-browser.sh so it is unit-testable — the
+# thing it guards against is precisely a harness bug, and a guard with no test is
+# the same bet that produced the bug.
+#
+# The guard: an entry whose rc is empty or non-numeric prints
+# "UNKNOWN (harness bug)" and forces the umbrella exit code non-zero. A harness
+# that cannot report a project's status must not report green — the 2026-07-26
+# nightly printed a blank rc for `mobile` on a run where mobile had two real
+# failures, and only the (independently computed) umbrella code kept that run
+# honest. Nothing is masked in the other direction: a real non-zero overall_rc is
+# passed through untouched.
+report_project_exit_codes() {
+    local overall="$1"; shift
+    local entry name rc unknown=""
+
+    # A non-integer overall is itself a harness bug, and `return` would reject it.
+    case "$overall" in
+        ''|*[!0-9]*)
+            echo "ERROR: umbrella exit code '$overall' is not an integer (harness bug) — forcing 1" >&2
+            overall=1
+            ;;
+    esac
+
+    echo ""
+    echo "── Per-project exit codes ──"
+    for entry in "$@"; do
+        name="${entry%%:*}"
+        rc="${entry#*:}"
+        case "$rc" in
+            ''|*[!0-9]*)
+                echo "  $name: UNKNOWN (harness bug)"
+                unknown=1
+                ;;
+            *)
+                echo "  $name: $rc"
+                ;;
+        esac
+    done
+
+    if [ -n "$unknown" ]; then
+        echo ""
+        echo "ERROR: the harness could not determine every project's exit code."
+        echo "       A run whose per-project status is unknown must not report green —"
+        echo "       forcing a non-zero exit code."
+        [ "$overall" -eq 0 ] && overall=1
+    fi
+
+    return "$overall"
 }
 
 # ── kill_orphan_simulator ────────────────────────────────────────────
@@ -235,8 +490,10 @@ kill_orphan_simulator() {
 }
 
 # ── setup_e2e_session ────────────────────────────────────────────────
-# Standard sub-script lifecycle: lock, ensure workspace running, optional
-# initial reset, and an EXIT trap teardown that mirrors the reset choice.
+# Standard sub-script lifecycle: lock, an EXIT trap teardown that mirrors the
+# reset choice, and then either a database reset (which brings the workspace up
+# on a brand-new database) or, under --no-reset, a plain ensure_workspace_running
+# on whatever is already there.
 # When invoked under the umbrella ($LUCIDOS_E2E_UMBRELLA set), defers all
 # of that to the umbrella and only refreshes port globals.
 # NO_RESET is read from the caller's env (sub-scripts already parse --no-reset).
@@ -263,34 +520,42 @@ setup_e2e_session() {
 
     acquire_e2e_lock "$label" || exit 1
     kill_orphan_simulator
-    ensure_workspace_running
 
-    # stop_webkit_reaper leads every branch so the host-memory guard started by
-    # e2e-browser.sh dies with the session. It's idempotent and a no-op when no
-    # reaper was started (e.g. e2e-api.sh), so it's safe in all branches.
+    # stop_e2e_background_guards leads every branch so the host-memory reaper and
+    # the mid-run host-load sampler started by e2e-browser.sh die with the
+    # session. Both are idempotent no-ops when nothing was started (e.g.
+    # e2e-api.sh), so it's safe in all branches.
+    # shellcheck disable=SC2329 # all three variants are invoked by `trap teardown_e2e EXIT` below
     if [ -n "${NO_RESET:-}" ]; then
         # Leave the workspace running so the next invocation starts immediately
         # instead of paying the boot cost again.
-        teardown_e2e() { stop_webkit_reaper; release_e2e_lock; }
+        teardown_e2e() { stop_e2e_background_guards; release_e2e_lock; }
     elif [ -n "$cleanup_on_teardown" ]; then
         teardown_e2e() {
-            stop_webkit_reaper
+            stop_e2e_background_guards
             cleanup_e2e_worktrees
             stop_e2e_workspace
             release_e2e_lock
         }
     else
         teardown_e2e() {
-            stop_webkit_reaper
+            stop_e2e_background_guards
             stop_e2e_workspace
             release_e2e_lock
         }
     fi
+    # Installed BEFORE the workspace comes up so a failure during the reset still
+    # releases the lock.
     trap teardown_e2e EXIT
     trap 'exit 130' INT TERM
 
-    if [ -z "${NO_RESET:-}" ]; then
+    if [ -n "${NO_RESET:-}" ]; then
+        ensure_workspace_running
+    else
         cleanup_e2e_worktrees
+        # Recreates the database from zero and boots the workspace on it. The
+        # engine must start AFTER the recreate to run the migration chain, so the
+        # reset owns the boot — don't add an ensure_workspace_running before it.
         reset_e2e_database
     fi
 }
@@ -302,56 +567,76 @@ stop_e2e_workspace() {
     # built dist/ directly and the one-shot `vite build` exits on its own.
 }
 
-# Drops the public schema if any row in _sqlx_migrations references a version
-# whose .sql file no longer exists in the source. CC branches that get abandoned
-# without merging leave orphan migrations in the e2e DB; sqlx::Migrator then
-# refuses to start the engine with VersionMissing(...).
-purge_orphan_migrations() {
-    local migrations_dir="$_E2E_PROJECT_DIR/crates/lucidos-engine/migrations"
-    local container db
-    container="$(shared_pg_container)"
-    db="$(workspace_database_name)"
-
-    local valid_versions
-    valid_versions=$(ls "$migrations_dir" 2>/dev/null | grep -oE '^[0-9]{14}' | sort -u | paste -sd, -)
-    [ -z "$valid_versions" ] && return 0
-
-    # Checking first, separately, because Postgres parses both branches of a
-    # CASE expression even when one is unreachable — a single combined query
-    # errors out on a fresh DB. Two round trips lets the count query fail
-    # loudly on a real psql/container problem instead of being masked.
-    local table_exists
-    table_exists=$(docker exec "$container" psql -U lucidos -d "$db" -At -c \
-        "SELECT to_regclass('_sqlx_migrations') IS NOT NULL;")
-    [ "$table_exists" = "t" ] || return 0
-
-    local orphan_count
-    orphan_count=$(docker exec "$container" psql -U lucidos -d "$db" -At -c \
-        "SELECT count(*) FROM _sqlx_migrations WHERE version NOT IN ($valid_versions);")
-
-    if [ "${orphan_count:-0}" -gt 0 ]; then
-        echo "Found $orphan_count orphan migration(s) from abandoned branches — resetting schema"
-        docker exec "$container" psql -U lucidos -d "$db" -q -c \
-            "DROP SCHEMA public CASCADE; CREATE SCHEMA public; CREATE EXTENSION IF NOT EXISTS vector;"
+# ── stop_e2e_engine ─────────────────────────────────────────────────────
+# Stop this workspace's engine and wait for it to release its port. SIGUSR1, not
+# SIGTERM — the engine ignores SIGTERM so an accidental `xargs kill` from a CC
+# subprocess test can't take it down (main.rs shutdown_signal). SIGUSR1 is the
+# legitimate stop, and it also ends the supervisor's restart loop, so the engine
+# stays down until we start it again. No-op when nothing is running.
+stop_e2e_engine() {
+    local pid=""
+    if [ -f "$ENGINE_PIDFILE" ]; then
+        pid="$(cat "$ENGINE_PIDFILE" 2>/dev/null || true)"
     fi
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        echo "Stopping engine (PID $pid) so the database can be recreated..."
+        kill -USR1 "$pid" 2>/dev/null || true
+        wait_for_engine_shutdown "$VITE_PORT" "$pid" || true
+    fi
+    rm -f "$ENGINE_PIDFILE"
 }
 
+# ── reset_e2e_database ──────────────────────────────────────────────────
+# Bring the e2e database up EXACTLY like a brand-new workspace's: drop it,
+# recreate it, and boot the engine on it so sqlx runs the ENTIRE migration chain
+# from zero — the seeds inside those migrations included.
+#
+# This replaces a TRUNCATE of every table except `_sqlx_migrations`, which made
+# the database long-lived rather than fresh: the surviving `_sqlx_migrations`
+# rows told sqlx every migration was already applied, so their seeds never
+# re-ran and any table whose only content is a migration seed stayed
+# permanently empty. `models` was the casualty — 0 rows instead of 26, so
+# `llm::model_registry::load_from_db` built an empty map and provider routing
+# silently fell back to the prefix heuristic for every model.
+#
+# It owns the engine lifecycle, and has to: Postgres refuses to drop a database
+# that still has open connections, and migrations, `EventStore::init_schema()`
+# and the pgvector setup all run exactly once, at engine boot (see
+# engine/engine_impl/construction.rs) — so the engine serving the tests must be
+# the one started AFTER the recreate. On return the workspace is running on a
+# genuinely fresh database.
+#
+# Deliberately NOT creating the `vector` extension here: a brand-new workspace
+# database doesn't have it either (the engine creates it at boot in
+# memory/pgvector.rs, and no migration uses a pgvector type). Adding it would
+# make the e2e database differ from the thing it is supposed to reproduce, and
+# would hide a migration that starts depending on the extension.
 reset_e2e_database() {
-    local container db
-    container="$(shared_pg_container)"
-    db="$(workspace_database_name)"
+    e2e_workspace_env
+    setup_postgres
 
-    echo "Resetting database..."
-    docker exec "$container" psql -U lucidos -d "$db" -q -c "
-        DO \$\$
-        DECLARE r RECORD;
-        BEGIN
-            FOR r IN SELECT tablename FROM pg_tables
-                WHERE schemaname = 'public' AND tablename != '_sqlx_migrations'
-            LOOP
-                EXECUTE 'TRUNCATE TABLE ' || quote_ident(r.tablename) || ' CASCADE';
-            END LOOP;
-        END \$\$;
-    "
-    echo "Database reset complete"
+    stop_e2e_engine
+
+    local db
+    db="$(workspace_database_name)"
+    echo "Recreating database $db from zero..."
+    _drop_shared_database "$db" || return 1
+    _create_shared_database "$db" || return 1
+
+    # `psql -c` without ON_ERROR_STOP exits 0 even when the statement errored, so
+    # a refused DROP (something still connected) would silently leave the OLD
+    # database in place and quietly restore the very bug this replaces. Assert
+    # the outcome instead of trusting the exit code.
+    local leftover
+    leftover=$(docker exec "$(shared_pg_container)" psql -U lucidos -d "$db" -At -c \
+        "SELECT to_regclass('_sqlx_migrations') IS NOT NULL;")
+    if [ "$leftover" != "f" ]; then
+        echo "ERROR: $db was not recreated — _sqlx_migrations is still present." >&2
+        echo "       Something still holds a connection to it." >&2
+        return 1
+    fi
+
+    # Boots the engine, which runs the whole migration chain against the empty
+    # database — seeds included.
+    ensure_workspace_running
 }

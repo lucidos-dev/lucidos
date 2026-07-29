@@ -53,7 +53,8 @@ const DEFAULT_GATEWAY_PORT: u16 = 5251;
 /// gateway-source diff). A running gateway compares this against the on-disk
 /// binary's id — obtained by spawning `current_exe --build-id` — to drive the
 /// picker's "new gateway available" badge. Deterministic for identical source so
-/// a no-op rebuild does not raise the badge. See
+/// a no-op rebuild does not raise the badge. "Available" means **newer**, not
+/// merely different — the direction check lives in [`crate::build_id`]. See
 /// `docs/plans/2026-06-18-gateway-reload-control.md`.
 pub const GATEWAY_BUILD_ID: &str = env!("GATEWAY_BUILD_ID");
 
@@ -395,13 +396,22 @@ impl GatewayState {
         self.inner.packaged
     }
 
-    /// Whether the on-disk gateway binary has a different build id than this
-    /// running process — i.e. a rebuild is waiting to be adopted via
-    /// [`Self::reload_gateway`]. Cheap on the steady path: it only forks
-    /// `current_exe --build-id` when the binary's mtime has moved since the last
-    /// check (the picker polls this every 2s). A dev `--engine-only` Apply rebuilds
-    /// the gateway binary while leaving the running gateway up, which is exactly the
-    /// state this detects (see `docs/plans/2026-06-18-gateway-reload-control.md`).
+    /// Whether the on-disk gateway binary is NEWER than this running process —
+    /// i.e. a rebuild is waiting to be adopted via [`Self::reload_gateway`].
+    /// Cheap on the steady path: it only forks `current_exe --build-id` when the
+    /// binary's mtime has moved since the last check (the picker polls this every
+    /// 2s), and the direction probe rides the same cache. A dev `--engine-only`
+    /// Apply rebuilds the gateway binary while leaving the running gateway up,
+    /// which is exactly the state this detects (see
+    /// `docs/plans/2026-06-18-gateway-reload-control.md`).
+    ///
+    /// **Newer, not merely different** ([`crate::build_id::disk_id_is_upgrade`]).
+    /// `reload_gateway` re-execs onto whatever is on disk, so a bare
+    /// `disk != running` walks the machine's only gateway BACKWARDS onto an
+    /// older binary that some other build left in `target/` — the same downgrade
+    /// the engine hit as the 2026-07-26 toast loop. Anything indeterminate keeps
+    /// the difference test, so this removes a false positive without adding a way
+    /// to miss a real update.
     pub async fn gateway_update_available(&self) -> bool {
         let Some(exe) = self.inner.exe_path.clone() else {
             return false;
@@ -427,7 +437,8 @@ impl GatewayState {
             // as "no update" and let the next poll retry once the mtime settles.
             _ => return false,
         };
-        let update_available = !disk_id.is_empty() && disk_id != GATEWAY_BUILD_ID;
+        let update_available =
+            crate::build_id::disk_id_is_upgrade(&exe, &disk_id, GATEWAY_BUILD_ID).await;
         let mut cache = self.inner.update_check.lock().unwrap();
         cache.last_mtime = mtime;
         cache.update_available = update_available;
@@ -449,6 +460,23 @@ impl GatewayState {
             .exe_path
             .clone()
             .ok_or("current_exe unavailable — cannot reload")?;
+        // Refuse to adopt a binary living in a coding-agent worktree. Unlike the
+        // shell entry points there is no operator here to read an error, so the
+        // safe move is to keep the CURRENT image and log loudly: re-exec'ing onto
+        // a worktree binary is what let the 2026-07-26 pin re-establish itself
+        // across every restart. See
+        // docs/plans/2026-07-26-worktree-pinned-stack-guard.md.
+        if crate::stack::path_is_in_cc_worktree(&exe) {
+            crate::log!(
+                "[Gateway] refusing to reload onto a coding-agent worktree binary: {} \
+                 — staying on the current image. Relaunch the stack from the real \
+                 checkout (./scripts/web-dev.sh -w <workspace> -b).",
+                exe.display()
+            );
+            return Err("gateway binary lives in a coding-agent worktree — \
+                        relaunch from the real checkout"
+                .into());
+        }
         let args: Vec<String> = std::env::args().skip(1).collect();
         crate::log!(
             "[Gateway] reload requested — re-exec {} (build id {})",
@@ -1505,6 +1533,23 @@ fn stop_engine_process(s: &mut StackRuntime) {
 /// left the workspace URL meta-refreshing the boot splash until the escape
 /// budget. Fail fast at boot with a path-bearing reason instead.
 fn validate_engine_bin(path: &Path) -> Result<(), BoxError> {
+    // An engine binary inside a coding-agent worktree pins every spawned engine
+    // to a throwaway checkout frozen at one commit — the 2026-07-26 incident,
+    // where the whole stack ran from a worktree that git had already pruned. Fail
+    // at boot with the corrective command rather than silently serving stale
+    // code forever. Unconditional: LUCIDOS_ALLOW_WORKTREE_STACK covers a
+    // session-scoped direct engine only, never the machine-global gateway.
+    if crate::stack::path_is_in_cc_worktree(path) {
+        return Err(format!(
+            "LUCIDOS_ENGINE_BIN points into a coding-agent worktree: {} — a worktree is a \
+             throwaway checkout pinned to one commit, so the stack would serve a frozen \
+             engine and frontend forever. Relaunch from the real checkout \
+             (./scripts/web-dev.sh -w <workspace> -b). There is no opt-out here: the \
+             gateway is machine-global and outlives the session that launched it.",
+            path.display()
+        )
+        .into());
+    }
     let meta = std::fs::metadata(path).map_err(|e| {
         format!(
             "LUCIDOS_ENGINE_BIN does not exist: {} ({e})",
@@ -2172,6 +2217,20 @@ fn raise_fd_limit() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worktree-rooted engine binary is refused at boot with the corrective
+    /// command — the 2026-07-26 self-perpetuating pin.
+    #[test]
+    fn validate_engine_bin_errors_on_coding_agent_worktree() {
+        let path = Path::new("/w/dev/.lucidos/worktrees/thread-abc/target/debug/lucidos-engine");
+        let err = validate_engine_bin(path).expect_err("worktree engine bin must error");
+        let msg = err.to_string();
+        assert!(msg.contains("coding-agent worktree"), "{msg}");
+        assert!(msg.contains("web-dev.sh"), "message must be actionable: {msg}");
+        // Fires before the existence check, so an already-deleted orphaned
+        // worktree still reports the real reason rather than "does not exist".
+        assert!(!msg.contains("does not exist"), "{msg}");
+    }
 
     #[test]
     fn validate_engine_bin_errors_on_missing_path() {

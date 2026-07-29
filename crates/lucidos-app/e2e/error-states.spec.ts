@@ -332,3 +332,72 @@ test.describe('Resume after restart — boundary panels', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Question-parked threads are PRESERVED across a restart (no abort): the card
+// stays answerable, and NO "Aborted / Restarted / Response interrupted /
+// Continue" boundary appears. This is the inverse of the boundary panels above
+// and the exact user-reported screenshots. The backend guard
+// (`thread_has_unanswered_question` gating every restart-abort path) is proven
+// by the engine integration tests; this seeds the post-restart state that guard
+// now guarantees — a `UserQuestionAsked` with NO trailing `ResponseAborted`,
+// status `waiting_for_user_answer` — and asserts the user-visible contract.
+// ---------------------------------------------------------------------------
+test.describe('Question-parked thread preserved across restart', () => {
+  test.beforeEach(async ({ page }) => {
+    await assertHealthy(page);
+  });
+
+  test('answerable card, no Aborted/Restarted/Continue boundary', async ({ page }) => {
+    const threadId = randomUUID();
+    const userMsgId = randomUUID();
+    const askId = randomUUID();
+    const t0 = new Date(Date.now() - 2_000).toISOString();
+    const t1 = new Date(Date.now() - 1_000).toISOString();
+
+    const userPayload = JSON.stringify({ text: 'make a story', channel: 'chat' });
+    const askPayload = JSON.stringify({
+      tool_use_id: 'toolu_e2e#q0',
+      cc_session_id: '',
+      question: 'Which illustration?',
+      options: [
+        { id: 'opt-0', label: 'Approve the image', description: 'Use it' },
+        { id: 'opt-1', label: 'Make a new one', description: 'Regenerate' },
+      ],
+      multi_select: false,
+      channel: 'chat',
+    });
+
+    try {
+      psql([
+        `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) VALUES ('${threadId}', 'Preserved question e2e', 'chat', '${t1}', 1, false, false, 'waiting_for_user_answer', 'inbox', false, 0, false, false, false)`,
+        `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${userMsgId}', 'MessageReceived', '${userPayload}'::jsonb, '${t0}', 'thread', '${threadId}', '${threadId}')`,
+        `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${askId}', 'UserQuestionAsked', '${askPayload}'::jsonb, '${t1}', 'thread', '${threadId}', '${threadId}')`,
+      ].join(';\n'));
+
+      await page.addInitScript((tid: string) => {
+        localStorage.setItem('lucidos-focused-thread', tid);
+      }, threadId);
+      await navigateToApp(page);
+
+      // The question card renders ANSWERABLE (live `.question-body`, enabled
+      // options) — NOT the disabled `.question-body-terminated` an abort/overtake
+      // would produce.
+      await expect(page.locator('.question-body').first()).toBeVisible({ timeout: 10_000 });
+      await expect(page.locator('.question-body-terminated')).toHaveCount(0);
+      const approve = page.locator('.question-option', { hasText: 'Approve the image' }).first();
+      await expect(approve).toBeVisible();
+      await expect(approve).toBeEnabled();
+
+      // No restart/abort boundary anywhere in the thread.
+      await expect(page.getByRole('button', { name: 'Continue' })).toHaveCount(0);
+      await expect(page.getByText('Response interrupted')).toHaveCount(0);
+      await expect(page.locator('.initiator-label', { hasText: 'Restarted' })).toHaveCount(0);
+    } finally {
+      psql([
+        `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
+        `DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`,
+      ].join(';\n'));
+    }
+  });
+});

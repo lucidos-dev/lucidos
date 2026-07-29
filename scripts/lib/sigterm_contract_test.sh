@@ -60,6 +60,7 @@ if [ -z "$ENGINE_KILLS" ]; then
     fail "could not locate engine kill calls in BUILD block — refactored?"
 elif echo "$ENGINE_KILLS" | grep -vq -- "-USR1"; then
     fail "kill_stale_processes BUILD block still has non-USR1 engine kills:"
+    # shellcheck disable=SC2001 # per-line indent of a multi-line block; ${//} cannot anchor to ^
     echo "$ENGINE_KILLS" | sed 's/^/      /' >&2
 else
     pass "all BUILD-block engine kills use -USR1"
@@ -78,6 +79,7 @@ if [ -z "$ENGINE_BLOCK" ]; then
     fail "could not locate engine pid block in stop.sh — refactored?"
 elif ! echo "$ENGINE_BLOCK" | grep -q "kill -USR1"; then
     fail "stop.sh engine block does not use kill -USR1:"
+    # shellcheck disable=SC2001 # per-line indent of a multi-line block; ${//} cannot anchor to ^
     echo "$ENGINE_BLOCK" | sed 's/^/      /' >&2
 else
     pass "stop.sh uses kill -USR1 for engine"

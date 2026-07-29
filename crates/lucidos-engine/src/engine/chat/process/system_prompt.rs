@@ -7,8 +7,8 @@
 
 use crate::core::PreferenceStore;
 use crate::engine::LucidosEngine;
-use crate::runtime::BrowserLogins;
 use chrono::Utc;
+use std::path::Path;
 
 use super::super::process_helpers::{
     build_system_knowhow_section, build_trigger_knowhow_section, TriggerContext, APPLY_VERIFY_RULE,
@@ -114,8 +114,11 @@ pub(crate) const ASK_USER_QUESTION_RULE: &str = "ASKING THE USER QUESTIONS:\n\
      it finishes\" — the engine has no way to wake you back up; only the \
      user can, and a wake question is the affordance for that. Don't use \
      a wake question for short waits where `wait_secs` would resolve in \
-     under 2 minutes — drain with `bash_output(task_id, wait_secs=60)` \
-     instead. Wake questions are for genuinely unbounded waits.";
+     under 2 minutes — drain with `bash_output(task_id, wait_secs=120)` \
+     instead. Wake questions are for genuinely unbounded waits. Judge \
+     \"exhausted\" from the `elapsed_secs` the drains report, not from \
+     how many calls you've made — a handful of drains is minutes, not \
+     hours.";
 
 /// Stops the chat agent from CLAIMING it performed an action it never actually
 /// invoked the tool for — the single most common way the agent lies to the
@@ -254,28 +257,11 @@ TIMEZONE HANDLING:
             )
         };
 
-        let workspace_name = self.workspace_name();
-
-        let system_prompt = format!(
-            r#"You are managing Lucidos, a personal assistant running in the "{workspace_name}" workspace. You help users organize their life and work through natural conversation.
-
-WORKSPACE: {workspace_name} ({workspace_path})
-All threads, events, artifacts, and data you access belong to this workspace. When the user refers to "my threads", "events", or other data, it means data in this workspace.
-
-{}
-
-{}
-
-PERSONAL DATA ACCESS:
-This is the user's PRIVATE workspace containing THEIR OWN personal documents, files, and data.
-The user has FULL rights to access, view, and discuss ANY information in their workspace.
-This includes personal identifiers (SSN, ID numbers, addresses, phone numbers, etc.) from their own documents.
-When the user asks about content in their files, provide it - this is their data, not a privacy violation.
-Do NOT refuse to discuss the user's own personal information from their own files."#,
-            timezone_section,
-            language_section,
-            workspace_name = workspace_name,
-            workspace_path = self.workspace_path.display()
+        let system_prompt = workspace_identity_section(
+            &self.workspace_name(),
+            &self.workspace_path,
+            &timezone_section,
+            &language_section,
         );
 
         let system_prompt_base = r#"
@@ -523,8 +509,8 @@ LONG-RUNNING SHELL COMMANDS:
 - run_bash AND run_python are synchronous with a 300s ceiling — they WILL kill anything longer mid-stream.
 - For long-running shell work (HTTP polling, builds, scrapers, npm/cargo installs, large repo scans): use run_bash_background(command, timeout_secs?) to spawn and get a task_id immediately.
 - For long-running Python that needs scientific packages (numpy/pandas/scipy/scikit-learn/statsmodels/etc.) AND may exceed 300s — backtests, sweeps, training, batch processing: use run_python_background(code, packages?, timeout_secs?). Same per-workspace venv as run_python, same env-var injection (CRED_*/OAUTH_*/LUCIDOS_WORKSPACE), packages auto-installed before spawn.
-- Both return a task_id; drain output with `bash_output(task_id, wait_secs=N)` — server blocks up to N seconds (max 120) until new output arrives, the task finishes, or N elapses. Returns only what's new since the last call. Cancel with `bash_kill(task_id)`. The two background tools share the same registry, so bash_output and bash_kill work transparently on either kind of task_id.
-- When YOU are waiting for a background task to finish (no live user report needed), use `bash_output(task_id, wait_secs=60)` — never sleep loops inside run_python (that's what the background trio + wait_secs replaces, and the same-bucket guard will trip you anyway). One drain with wait_secs is usually enough: it returns with `finished: true` when the task ends.
+- Both return a task_id; drain output with `bash_output(task_id, wait_secs=N)` — the server blocks for the FULL N seconds (max 120) unless the task finishes first. New output does NOT end the wait early, so one call hands you the whole N-second window. Returns only what's new since the last call. Cancel with `bash_kill(task_id)`. The two background tools share the same registry, so bash_output and bash_kill work transparently on either kind of task_id.
+- When YOU are waiting for a background task to finish (no live user report needed), use `bash_output(task_id, wait_secs=120)` — never sleep loops inside run_python (that's what the background trio + wait_secs replaces, and the same-bucket guard will trip you anyway). One drain with wait_secs is usually enough: it returns with `finished: true` when the task ends.
 
 REPEATED-TOOL GUARD (you cannot see it fire, you have to know it's there):
 - The engine watches consecutive same-target tool calls and intervenes after enough repeats: at 3-4 same-bucket calls the engine REPLACES the call's result with a STOP message telling you to stop and answer now (the call itself never runs); at 5 the engine force-ends your turn with a canned "I tried repeatedly" response. You won't get warned ahead of time — heed the STOP the first time it appears, or your fifth call ends the turn.
@@ -533,7 +519,11 @@ REPEATED-TOOL GUARD (you cannot see it fire, you have to know it's there):
 - edit_file, write_file, web_search, and browser_* remain EXEMPT from the same-bucket guard — calling them repeatedly is fine.
 
 WAITING ON A BACKGROUND TASK — USE `bash_output(task_id, wait_secs=N)`:
-- After spawning a long-running task via `run_python_background` or `run_bash_background`, drain with `bash_output(task_id, wait_secs=N)`. The server BLOCKS up to N seconds (max 120) until new output arrives OR the task finishes OR N elapses, then returns whatever's there. Typically 0–2 drain calls per task: one with `wait_secs=60` (or similar) that returns with `finished: true`, done.
+- After spawning a long-running task via `run_python_background` or `run_bash_background`, drain with `bash_output(task_id, wait_secs=N)`. The server BLOCKS for the FULL N seconds (max 120) unless the task finishes first, then returns everything that accumulated. New output does NOT wake you early — that is deliberate, so following a chatty build costs one call per N seconds instead of one per line.
+- USE THE FULL 120 FOR ANYTHING LONG (a release build, a notarization, a training run). Draining a 40-minute build at `wait_secs=120` is ~20 calls; at `wait_secs=5` it is ~480, each one burning a model turn and a slab of context for three more lines of `Compiling`.
+- READ `elapsed_secs` AND `waited_secs` — NEVER ESTIMATE ELAPSED TIME YOURSELF. You have no clock. `elapsed_secs` is how long the task has been running (its total runtime once finished); `waited_secs` is how long this one call actually blocked. If you count wall-clock by adding up the `wait_secs` values you requested, you WILL tell the user "about 20 minutes in" when it has been 90 seconds. Quote `elapsed_secs` or say nothing about timing.
+- A `waited_secs` far below what you asked for, with `finished: false`, means THE USER SENT A MESSAGE — the engine cuts the block short so their follow-up isn't stuck behind it. Read and answer it, then drain again. It is not a malfunction and not a reason to shorten your next `wait_secs`.
+- Very long output keeps the TAIL, marked with a leading `[truncated — N earlier bytes dropped]`. The newest lines survive; if you need earlier ones, have the task `tee` to a log file and `read_file` it.
 - DO NOT spawn `run_python(code="import time; time.sleep(N)")` to wait for a background task. That burns two tool calls per wait, doubles your context, and now also trips the same-bucket guard (the first actionable line `time.sleep(N)` collides on verbatim retries).
 - For tasks that need genuine in-script periodic action (NOT waiting on background work) — e.g. the user asks "ping me every 60s for the next 4 minutes" — use ONE `run_python` call with an internal `for _ in range(4): print(bar()); time.sleep(60)` loop and stream a summary when it returns. The first actionable line `for _ in range(4):` is unique to that workflow so the guard won't trip on it.
 - For waits that are genuinely unbounded (sweep may run all night, backtest results in hours not minutes): after a couple of `wait_secs=120` drains with no end in sight, step aside with a WAKE QUESTION — call `ask_user_question` with a single option whose label is the user-perspective wake prompt (e.g. `["Show results"]`, `["Stop sweep"]`). The thread parks with a "?" attention status until the user taps. Do NOT end your turn with prose like "I'll report when it finishes" — the engine has no way to wake you back up. See ASKING THE USER QUESTIONS § WAKE QUESTION above for the full rule.
@@ -579,7 +569,7 @@ You have two tools for spawning Lucidos threads:
 - run_thread: Start a Lucidos thread for non-code tasks (research, analysis, drafting)
 Both accept an optional `relation` argument (default `"child"`):
 - `relation: "child"` — child thread. Runs independently; when it completes a callback resumes this thread with its result. Use for delegated subtasks whose outcome you need yourself. (`"sub"` is accepted as a back-compat alias.)
-- `relation: "top"` — top-thread. Independent top-level thread; this thread does NOT resume when it finishes. Use when the spawn is for the user to follow themselves (e.g. "do this in a separate thread", report-style work the user reads later).
+- `relation: "top"` — top-thread. Independent top-level thread; this thread does NOT resume when it finishes. Use ONLY when the user asked for the work to happen in a separate thread they will follow themselves (e.g. "do this in a separate thread", "spawn a session for this and I'll check in later").
 The callback only works for SAME-workspace child threads spawned via these tools. POSTs to another workspace's /api/v1/chat/stream are always fire-and-forget — see the cross-workspace knowhow.
 For pipelines where step N depends on step N-1's outcome, spawn one child thread per response and wait for the callback before spawning the next — do not batch sequential spawns in one response.
 
@@ -640,18 +630,17 @@ __REPEATED_ACTION_RULE__"#;
         let system_prompt = format!("{}\n\nThe Lucidos client the user is talking to you from is at {}. To see App UIs, use capture_app_ui — never browser_open.",
             system_prompt, frontend_url);
 
-        // Add browser login list to system prompt
-        let system_prompt = if let Ok(logins) = BrowserLogins::list(&self.pool).await {
-            if !logins.is_empty() {
-                let domains: Vec<&str> = logins.iter().map(|(d, _)| d.as_str()).collect();
-                format!("{}\n\nSites with probable saved browser sessions (auto-detected, may include false positives): {}",
-                    system_prompt, domains.join(", "))
-            } else {
-                system_prompt
-            }
-        } else {
-            system_prompt
-        };
+        // NO auto-detected browser-login domain list here, deliberately. The
+        // `browser_logins` table is populated by `runtime::browser::session`
+        // from whatever the user's persistent browser profile happens to hold
+        // a session for — unfiltered browsing data, including work/employer
+        // sites. Pasting it into the prompt shipped that list to the model
+        // provider on EVERY turn, and nothing consumed it: the BROWSER TOOLS
+        // section already tells the agent to retry with `visible=true` when a
+        // site redirects to a login page, and `browser_forget_login` takes an
+        // explicit domain from the user. The table and both browser tools
+        // stay; only this prompt section is gone. See
+        // `.claude/rules/no-private-data.md`.
 
         // Add available apps to system prompt
         let apps_section = if let Ok(apps) = self.app_manager.list_apps() {
@@ -777,5 +766,97 @@ __REPEATED_ACTION_RULE__"#;
         };
 
         (system_prompt, missing_pref_keys, image_provider_available)
+    }
+}
+
+/// Build the prompt's opening identity block: who the agent is, which
+/// workspace it runs in, the timezone section, the language section, and the
+/// personal-data-access framing. Pure so the workspace line's path rendering
+/// is unit-testable without standing up a `LucidosEngine`.
+///
+/// The workspace path is rendered through [`crate::core::home_path::abbreviate`]:
+/// on an MDM-managed fleet the home dir is named `<username>@<employer-domain>`,
+/// so the raw absolute path shipped the user's employer to the model provider
+/// on every turn. `~/…` keeps the path's shape without the identity. The
+/// engine's own path handling is unaffected — this is display text only.
+fn workspace_identity_section(
+    workspace_name: &str,
+    workspace_path: &Path,
+    timezone_section: &str,
+    language_section: &str,
+) -> String {
+    format!(
+        r#"You are managing Lucidos, a personal assistant running in the "{workspace_name}" workspace. You help users organize their life and work through natural conversation.
+
+WORKSPACE: {workspace_name} ({workspace_path})
+All threads, events, artifacts, and data you access belong to this workspace. When the user refers to "my threads", "events", or other data, it means data in this workspace.
+
+{timezone_section}
+
+{language_section}
+
+PERSONAL DATA ACCESS:
+This is the user's PRIVATE workspace containing THEIR OWN personal documents, files, and data.
+The user has FULL rights to access, view, and discuss ANY information in their workspace.
+This includes personal identifiers (SSN, ID numbers, addresses, phone numbers, etc.) from their own documents.
+When the user asks about content in their files, provide it - this is their data, not a privacy violation.
+Do NOT refuse to discuss the user's own personal information from their own files."#,
+        workspace_name = workspace_name,
+        workspace_path = crate::core::home_path::abbreviate(workspace_path),
+        timezone_section = timezone_section,
+        language_section = language_section,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workspace_identity_section;
+    use std::path::{Path, PathBuf};
+
+    /// The regression test for the leak this section was built to stop: the
+    /// prompt's WORKSPACE line must never carry a `$HOME`-rooted absolute
+    /// path. Runs against the REAL `$HOME` (read-only — no env mutation, so it
+    /// is safe under the parallel test runner), which is what makes it a true
+    /// regression test: on an MDM-managed fleet the home dir is literally
+    /// named `<username>@<employer-domain>`, so a regression here fails on the
+    /// very machine that would leak.
+    #[test]
+    fn workspace_line_abbreviates_home_and_leaks_no_absolute_home_path() {
+        let home = std::env::var("HOME").expect("HOME must be set to run this test");
+        let workspace = PathBuf::from(&home).join("workspaces/myws");
+
+        let section = workspace_identity_section(
+            "myws",
+            &workspace,
+            "CURRENT TIME: now",
+            "USER LANGUAGE: English",
+        );
+
+        // The workspace is still identified — by name, and by the shape of its
+        // path — so the agent loses no usable context.
+        assert!(section.contains("WORKSPACE: myws (~/workspaces/myws)"));
+        // …but the home dir's own name never reaches the model provider.
+        assert!(
+            !section.contains(&home),
+            "identity section still carries the home-rooted absolute path {home}:\n{section}"
+        );
+
+        // The surrounding sections are still spliced in.
+        assert!(section.contains("CURRENT TIME: now"));
+        assert!(section.contains("USER LANGUAGE: English"));
+        assert!(section.contains("PERSONAL DATA ACCESS:"));
+    }
+
+    /// Abbreviation is a `$HOME`-prefix collapse, not a blanket redaction — a
+    /// workspace mounted outside the home dir keeps its real path.
+    #[test]
+    fn workspace_outside_home_keeps_its_absolute_path() {
+        let outside = Path::new("/srv/lucidos/ws");
+        // Guard the (absurd but cheap to rule out) case of $HOME being /srv.
+        let home = std::env::var("HOME").expect("HOME must be set to run this test");
+        assert!(!outside.starts_with(&home), "test fixture overlaps $HOME");
+
+        let section = workspace_identity_section("shared", outside, "", "");
+        assert!(section.contains("WORKSPACE: shared (/srv/lucidos/ws)"));
     }
 }

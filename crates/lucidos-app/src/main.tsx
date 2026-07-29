@@ -33,6 +33,12 @@ import './styles/drawer.css';
 import './store/effects';
 import './store/actions/wipPreview';
 
+// The inline pre-hydration watchdog owns the failure case where this module
+// graph never evaluates (for example, a stale hashed entry bundle). Reaching
+// this line proves the graph is live; hand normal readiness/dismissal back to
+// the application and clear the watchdog's guarded retry state.
+(window as Window & { __lucidosBootLoaded?: () => void }).__lucidosBootLoaded?.();
+
 if (isTouchDevice()) {
   document.body.classList.add('is-touch');
 }
@@ -117,6 +123,11 @@ function recoverFromBrokenContext(): boolean {
  *  ~60s while we wait. */
 function stayOnStartingSplash(): void {
   setBootStatus('Starting Lucidos…');
+  // As in useStartup: the `catch` is a local no-op, and `invoke` reports bridge
+  // failures to the engine log on its own (utils/ipcHealth). Note this splash
+  // runs on the bundled `tauri://localhost` origin, which the ACL treats as
+  // LOCAL — so a heartbeat working here says nothing about whether it will keep
+  // working after desktop::launch navigates to the (remote) gateway origin.
   invoke('heartbeat').catch(() => {});
   window.setInterval(() => { invoke('heartbeat').catch(() => {}); }, 15_000);
 }

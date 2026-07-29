@@ -56,15 +56,15 @@ describe('Toast close button — gated by dismissable flag', () => {
 });
 
 describe('initiateEngineRestart raises a light dismissible status toast', () => {
-  it('the build-phase status toast spins but stays dismissible (UI not deactivated during restart)', async () => {
+  it('the status toast spins but stays dismissible (UI not deactivated during restart)', async () => {
     // Don't await — restartEngine() will try to hit the network and reject;
     // we only need the synchronous showToast that runs before the await.
     void initiateEngineRestart().catch(() => {});
     const toast = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
     expect(toast).toBeDefined();
-    // The switch shows the "Starting new version…" progress toast (the binary is
-    // already built — Apply rebuilt it in the background; the switch only respawns).
-    expect(toast!.message).toBe('Starting new version…');
+    // No new-version signals are set in this test → a plain respawn, so the
+    // progress toast reads "Restarting engine…", not "Starting new version…".
+    expect(toast!.message).toBe('Restarting engine…');
     expect(toast!.dismissable).not.toBe(false);
     expect(toast!.spinning).toBe(true);
     // And the rendered tree shows the close button so the user can dismiss it.

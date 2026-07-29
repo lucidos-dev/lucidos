@@ -52,9 +52,14 @@
 
 .memory-importance-segment.dimmed { opacity: 0.2; }
 
+/* An ordered escalation ramp, NOT a set of state markers: each step must read
+   as hotter than the one before it. That is why `high` is warm (--accent-orange)
+   rather than the cool --accent-notable used for neutral markers elsewhere —
+   a cool hue here lands between the grey and blue steps and flattens the ramp.
+   Don't "consistency-fix" this onto --accent-notable. */
 .memory-importance-segment.low { background: var(--text-muted); }
 .memory-importance-segment.medium { background: var(--accent); }
-.memory-importance-segment.high { background: var(--accent-yellow); }
+.memory-importance-segment.high { background: var(--accent-orange); }
 .memory-importance-segment.critical { background: var(--accent-red); }
 
 .memory-actions {
@@ -147,9 +152,10 @@
     flex-shrink: 0;
 }
 
+/* Same ordered ramp as .memory-importance-segment above — keep the two in step. */
 .memory-importance-dot.low { background: var(--text-muted); }
 .memory-importance-dot.medium { background: var(--accent); }
-.memory-importance-dot.high { background: var(--accent-yellow); }
+.memory-importance-dot.high { background: var(--accent-orange); }
 .memory-importance-dot.critical { background: var(--accent-red); }
 
 .memory-source-badge {
@@ -166,9 +172,10 @@
     background: color-mix(in srgb, var(--accent-green) 15%, transparent);
 }
 
+/* Provenance, not severity — "came from an artifact" is a neutral fact. */
 .memory-source-badge.artifact {
-    color: var(--accent-yellow);
-    background: color-mix(in srgb, var(--accent-yellow) 15%, transparent);
+    color: var(--accent-notable);
+    background: color-mix(in srgb, var(--accent-notable) 15%, transparent);
 }
 
 .memory-entry-details {

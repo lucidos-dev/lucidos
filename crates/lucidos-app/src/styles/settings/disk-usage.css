@@ -84,6 +84,11 @@
     background: transparent;
 }
 
+/* A categorical chart palette with a legend, not a semantic scale: c2's only job
+   is to stay distinguishable from the other five slots. It keeps --accent-yellow
+   for that reason — the cool --accent-notable used for neutral markers elsewhere
+   would put three blues in a six-slot palette (c0, c4, and it). Don't
+   "consistency-fix" this one either. */
 .disk-usage-segment-c0 { background: var(--accent); }
 .disk-usage-segment-c1 { background: var(--accent-orange); }
 .disk-usage-segment-c2 { background: var(--accent-yellow); }

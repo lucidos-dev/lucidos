@@ -227,6 +227,31 @@ fn frontend_update_deferred_is_transient_on_engine_aggregate() {
 }
 
 #[test]
+fn frontend_update_stranded_is_transient_on_engine_aggregate() {
+    // Sibling of FrontendUpdateDeferred, and deliberately NOT the same event: a
+    // stranded Apply is never arriving, so it must not reuse a message that
+    // promises "on Switch". Transient, `engine` aggregate, same wire shape.
+    let e = SystemEvent::FrontendUpdateStranded {
+        served_dir: "/w/dev/.lucidos/worktrees/thread-abc/crates/lucidos-app/dist".into(),
+        served_in_worktree: true,
+        sent_at_ms: 1_700_000_000_000,
+    };
+    assert!(!e.is_persisted());
+    assert_eq!(e.aggregate(), "engine");
+    assert_eq!(e.event_type(), "FrontendUpdateStranded");
+    assert_eq!(e.aggregate_id(), "global");
+    let json = serde_json::to_value(&e).unwrap();
+    assert_eq!(json["type"], "FrontendUpdateStranded");
+    // The page needs BOTH the path and the cause flag to give correct advice.
+    assert_eq!(
+        json["data"]["served_dir"],
+        "/w/dev/.lucidos/worktrees/thread-abc/crates/lucidos-app/dist"
+    );
+    assert_eq!(json["data"]["served_in_worktree"], true);
+    assert_eq!(json["data"]["sent_at_ms"], 1_700_000_000_000_i64);
+}
+
+#[test]
 fn served_frontend_advanced_is_transient_on_engine_aggregate() {
     // Transient UI signal — broadcast to SSE, never written to events. Emitted
     // when a dev engine advances its served-frontend snapshot to the shared dist/

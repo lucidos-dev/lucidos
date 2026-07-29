@@ -465,13 +465,13 @@ export function BackupSection() {
       </div>
 
       {providerInfo && !providerInfo.connected && (
-        <div style="font-size: 0.6875rem; color: var(--accent-red); margin-bottom: 0.5rem;">
+        <div style="font-size: var(--font-size-xs); color: var(--accent-red); margin-bottom: 0.5rem;">
           Connect your {providerInfo.name} account in Settings → Accounts to enable backups.
         </div>
       )}
 
       {providerInfo && providerInfo.connected && !providerInfo.ready && (
-        <div style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.6875rem; color: var(--accent-red);">
+        <div style="display: flex; align-items: center; gap: 0.5rem; font-size: var(--font-size-xs); color: var(--accent-red);">
           <span>{providerInfo.name} access not granted.</span>
           <button
             class="action-btn action-btn-confirm"
@@ -522,7 +522,7 @@ export function BackupSection() {
         )}
       </div>
       {scheduleLoaded && schedule !== 'off' && (
-        <div style="font-size: 0.6875rem; color: var(--text-muted); margin-top: 0.25rem;">
+        <div style="font-size: var(--font-size-xs); color: var(--text-muted); margin-top: 0.25rem;">
           Scheduled backups run at the selected time in your timezone (set in Settings → System → Locale).
         </div>
       )}
@@ -539,7 +539,7 @@ export function BackupSection() {
         </button>
         {showKey && keyInfo && (
           <>
-            <span style="font-size: 0.6875rem; color: var(--text-muted); font-family: var(--font-mono); user-select: all;">
+            <span style="font-size: var(--font-size-xs); color: var(--text-muted); font-family: var(--font-mono); user-select: all;">
               {keyInfo.key}
             </span>
             <button class="action-btn" onClick={copyKey}>Copy</button>
@@ -547,7 +547,7 @@ export function BackupSection() {
         )}
       </div>
       {showKey && keyInfo && (
-        <div style="font-size: 0.6875rem; color: var(--accent-red); margin-top: 0.25rem;">
+        <div style="font-size: var(--font-size-xs); color: var(--accent-red); margin-top: 0.25rem;">
           Store this key somewhere safe right now — you need it to restore, and it cannot be recovered.
           You restore a backup from the workspace picker.
         </div>

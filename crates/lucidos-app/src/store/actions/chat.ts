@@ -14,14 +14,18 @@ import {
   removingQueuedMessageIds,
   queuedMessageRemovalKey,
   setFocusedThread,
+  effectiveThreadStatus,
 } from '../store';
 import type { ChatContext } from './chatContext';
 import type { ChatRequestBody } from '../../api/types';
-import { submitChat, cancelChat, stopClaudeCode, isTransportError, removeQueuedMessage as removeQueuedMessageRequest, type CodingAgentModelValue, type CodingAgentReasoningEffort } from '../../api/client';
+import { submitChat, cancelChat, stopClaudeCode, isTransportError, removeQueuedMessage as removeQueuedMessageRequest, ApiError, type CodingAgentModelValue, type CodingAgentReasoningEffort } from '../../api/client';
 import { getUnreachableEngineMsg } from './connection';
 import { getDeviceId } from './devices';
 import { generateUuid } from '../../utils/uuid';
-import { handleEvent, makeOptimisticThreadState, type StoredEvent } from '../thread-events';
+import { handleEvent, makeOptimisticThreadState, computeExchanges, queuedMessagesFromExchanges, type StoredEvent, type QueuedMessage } from '../thread-events';
+import { getDraft } from '../composeDrafts';
+import { updateCompose } from './compose';
+import { requestPromptOverrideSync } from '../../components/chat/promptValueSync';
 import { bumpThreadEvents } from '../threadActivity';
 import { getThreadModelOverride, clearThreadModelOverride } from '../threadModelSelections';
 import { pushThreadNavState, removeThreadNavEntries } from './thread-navigation';
@@ -82,23 +86,59 @@ function restorePendingMessage(threadId: string, removed: RemovedPendingMessage 
   bumpThreadEvents(threadId);
 }
 
-export async function removeQueuedMessage(threadId: string, messageId: string): Promise<void> {
+/** Outcome of a single queued-message retract: `removed` (tombstone persisted),
+ *  `already-injected` (the loop consumed it first — 409; it's now part of the
+ *  running response), or `failed` (transport/other). */
+export type QueuedRemovalOutcome = 'removed' | 'already-injected' | 'failed';
+
+type QueuedRemovalResult = { outcome: QueuedRemovalOutcome; error?: unknown };
+
+/** In-flight retract promises keyed by `queuedMessageRemovalKey`, so a second
+ *  retract for the same message (trash-then-Stop, or a double click) AWAITS the
+ *  first's real outcome instead of assuming success. Assuming success let Stop
+ *  append the text to compose + cancel while the removal was still pending — if
+ *  that removal then failed/409'd, the message re-ran or duplicated. */
+const inFlightQueuedRemovals = new Map<string, Promise<QueuedRemovalResult>>();
+
+/** Retract one queued message via the `QueuedMessageRemoved` tombstone. Shared
+ *  by the per-message trash button (`removeQueuedMessage`) and the
+ *  Stop-clears-queue path (`clearQueuedMessagesToCompose`). Optimistically drops
+ *  the pending row and rolls it back on failure; returns the outcome (never
+ *  throws) so each caller decides how to surface it. Deduped + awaited across
+ *  concurrent callers so the outcome a caller sees is the ACTUAL request result. */
+function retractQueuedMessage(threadId: string, messageId: string): Promise<QueuedRemovalResult> {
   const key = queuedMessageRemovalKey(threadId, messageId);
-  if (removingQueuedMessageIds.value.has(key)) return;
+  const existing = inFlightQueuedRemovals.get(key);
+  if (existing) return existing;
 
-  removingQueuedMessageIds.value = new Set([...removingQueuedMessageIds.value, key]);
-  const removedPending = removePendingMessage(threadId, messageId);
+  const run = (async (): Promise<QueuedRemovalResult> => {
+    removingQueuedMessageIds.value = new Set([...removingQueuedMessageIds.value, key]);
+    const removedPending = removePendingMessage(threadId, messageId);
+    try {
+      await removeQueuedMessageRequest(threadId, messageId);
+      return { outcome: 'removed' };
+    } catch (err) {
+      const next = new Set(removingQueuedMessageIds.value);
+      next.delete(key);
+      removingQueuedMessageIds.value = next;
+      restorePendingMessage(threadId, removedPending);
+      const alreadyInjected = err instanceof ApiError && err.httpCode === 409;
+      return { outcome: alreadyInjected ? 'already-injected' : 'failed', error: err };
+    } finally {
+      inFlightQueuedRemovals.delete(key);
+    }
+  })();
+  inFlightQueuedRemovals.set(key, run);
+  return run;
+}
 
-  try {
-    await removeQueuedMessageRequest(threadId, messageId);
-  } catch (err) {
-    const next = new Set(removingQueuedMessageIds.value);
-    next.delete(key);
-    removingQueuedMessageIds.value = next;
-    restorePendingMessage(threadId, removedPending);
-    void refreshThreadEvents(threadId).catch(() => {});
-    showToast(`Failed to remove queued message: ${errorDetail(err)}`, 'error');
-  }
+export async function removeQueuedMessage(threadId: string, messageId: string): Promise<void> {
+  const { outcome, error } = await retractQueuedMessage(threadId, messageId);
+  if (outcome === 'removed') return;
+  // Non-success (transport error OR a 409 race where the loop injected it just
+  // now): re-sync so the row reflects truth and tell the user it didn't take.
+  void refreshThreadEvents(threadId).catch(() => {});
+  showToast(`Failed to remove queued message: ${errorDetail(error)}`, 'error');
 }
 
 /** Remove pending messages older than PENDING_MESSAGE_SAFETY_MS.
@@ -455,6 +495,59 @@ export async function sendMessage(
  *   - 'failed'   — the API call itself failed (a toast was already shown). */
 export type CancelOutcome = 'canceled' | 'noop' | 'failed';
 
+/** The thread's queued (un-injected) chat follow-ups in FIFO order — the set a
+ *  user Stop returns to compose. Chat-only: CC/Codex follow-ups go to stdin and
+ *  are never queued. Derived from the same `queuedFollowupRun` the UI renders
+ *  "Queued" bubbles from, so Stop clears exactly what the user saw queued. */
+function getQueuedMessages(threadId: string): QueuedMessage[] {
+  const thread = threadMap.value.get(threadId);
+  if (!thread || thread.meta.channel === 'claude_code') return [];
+  const status = effectiveThreadStatus(thread);
+  const threadBusy = status === 'running' || status === 'waiting_for_user_answer';
+  // Exclude messages already being trashed — the UI hides them from the queued
+  // group the same way (CreateThreadView `removedQueuedIndices`), so Stop clears
+  // exactly what the user still sees queued and never resurfaces a just-trashed
+  // message into compose (its own removal already owns it).
+  const removing = removingQueuedMessageIds.value;
+  return queuedMessagesFromExchanges(computeExchanges(thread), threadBusy, false)
+    .filter(q => !removing.has(queuedMessageRemovalKey(threadId, q.id)));
+}
+
+/** Append retracted queued-message texts (FIFO) to the thread's compose draft,
+ *  after any existing draft (blank-line separated), and force the prompt input
+ *  to show it (the compose→textarea sync skips a focused non-empty input, so a
+ *  programmatic append needs the explicit override — as `applySuggestion` does). */
+function appendQueuedTextToCompose(threadId: string, texts: string[]): void {
+  if (texts.length === 0) return;
+  const existing = getDraft(threadId).text;
+  const addition = texts.join('\n\n');
+  const combined = existing.trim().length > 0 ? `${existing}\n\n${addition}` : addition;
+  updateCompose(threadId, { text: combined });
+  requestPromptOverrideSync();
+}
+
+/** On a user Stop of a chat thread, return un-injected queued follow-ups to the
+ *  compose box instead of letting them re-run as a new response after the cancel
+ *  (the bug where a queued message streamed above "Response canceled"). Retracts
+ *  each via the `QueuedMessageRemoved` tombstone so the backend's
+ *  `filter_removed_queued_prompts` drops it at loop finalize — see
+ *  `docs/plans/2026-07-19-stop-clears-queued-messages.md`. MUST run BEFORE
+ *  `cancelChat` so the tombstones persist before the loop finalizes. Messages
+ *  the loop already injected (409) stay under the cancelled exchange and are NOT
+ *  moved to compose. */
+async function clearQueuedMessagesToCompose(threadId: string): Promise<void> {
+  const queued = getQueuedMessages(threadId);
+  if (queued.length === 0) return;
+  const removedTexts: string[] = [];
+  for (const q of queued) {
+    const { outcome } = await retractQueuedMessage(threadId, q.id);
+    if (outcome === 'removed') removedTexts.push(q.text);
+    // 'already-injected' → now part of the cancelled response; 'failed' →
+    // stays queued (user can trash it). Neither goes to compose.
+  }
+  appendQueuedTextToCompose(threadId, removedTexts);
+}
+
 /**
  * Cancel a thread's in-flight exchange. Routes to the chat or CC endpoint
  * based on thread channel. Pinning the threadId at call time matters: the
@@ -465,9 +558,23 @@ export async function cancelCurrentExchange(threadId?: string): Promise<CancelOu
   const tid = threadId ?? focusedThreadId.value ?? undefined;
   try {
     const thread = tid ? threadMap.value.get(tid) : undefined;
-    const canceled = thread?.meta.channel === 'claude_code'
-      ? await stopClaudeCode(undefined, tid)
-      : await cancelChat(tid);
+    if (thread?.meta.channel === 'claude_code') {
+      const canceled = await stopClaudeCode(undefined, tid);
+      return canceled ? 'canceled' : 'noop';
+    }
+    // Chat (Lucidos Agent): return any un-injected queued follow-ups to compose
+    // and retract them BEFORE cancelling, so they don't re-run as a new response
+    // above the "Response canceled" marker. Best-effort — a queue-clear hiccup
+    // must never block the actual cancel (a still-queued message stays visible
+    // and trashable; telemetry carve-out per .claude/rules/frontend.md).
+    if (tid) {
+      try {
+        await clearQueuedMessagesToCompose(tid);
+      } catch (e) {
+        console.warn('[cancel] failed to clear queued messages to compose', e);
+      }
+    }
+    const canceled = await cancelChat(tid);
     return canceled ? 'canceled' : 'noop';
   } catch (err) {
     showToast(`Failed to cancel: ${errorDetail(err)}`, 'error');

@@ -4,6 +4,7 @@ import { showToast } from '../../store/store';
 import { errorDetail } from '../../utils/errorDetail';
 import { viewportIsMobile } from '../../utils/viewport';
 import { autoResizeTextarea } from '../../utils/dom';
+import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 
 interface Props {
   threadId: string;
@@ -183,6 +184,7 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
           onBlur={editing ? handleBlur : undefined}
           data-escape-self
           tabIndex={editing ? 0 : -1}
+          {...PROSE_TEXT_ATTRS}
         />
       ) : (
         <input
@@ -206,6 +208,7 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
           // editing so it doesn't pop over the rename field.
           data-tooltip={editing ? undefined : 'Edit thread name (can suggest new name)'}
           tabIndex={editing ? 0 : -1}
+          {...PROSE_TEXT_ATTRS}
         />
       )}
       {/* Suggestion sits below the input but is taken out of flow (absolute, see

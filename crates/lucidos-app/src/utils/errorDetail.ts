@@ -17,9 +17,14 @@ export function errorDetail(err: unknown): string {
  *  request when an iOS PWA freezes/backgrounds mid-fetch or the connection
  *  resets on a radio handoff. That carries no reachability signal and the next
  *  resume re-syncs, so those callers suppress it instead of surfacing
- *  "request cancelled" or counting it as an outage. A real client-side timeout
- *  fires `TimeoutError` (distinct, still surfaces); a genuine unreachable engine
- *  fires `TimeoutError` or a transport `TypeError` (see `isTransportError`). */
+ *  "request cancelled" or counting it as an outage. Those same background paths
+ *  treat a transport `TypeError` (Safari "Load failed" on a stale connection —
+ *  see `isTransportError`) identically: it's the same iOS-PWA-wake / radio-handoff
+ *  / Tailscale-reconnect noise, healed by the retry or the next resync, with the
+ *  debounced connection dot owning genuine sustained outages. A real client-side
+ *  timeout fires `TimeoutError` (distinct — it survives the retry and still
+ *  surfaces/escalates as the stronger "waited the full window and got nothing"
+ *  signal). */
 export function isAbortError(err: unknown): boolean {
   return err instanceof DOMException && err.name === 'AbortError';
 }

@@ -12,20 +12,6 @@ use super::AppState;
 use crate::core::repositories::{Repository, RepositoryStore};
 use crate::engine::event_bus::SystemEvent;
 
-fn expand_tilde(path: &str) -> String {
-    if path == "~" {
-        std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            format!("{home}/{rest}")
-        } else {
-            path.to_string()
-        }
-    } else {
-        path.to_string()
-    }
-}
-
 pub async fn list_repositories(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Repository>>, (StatusCode, String)> {
@@ -53,7 +39,7 @@ pub async fn add_repository(
     headers: HeaderMap,
     Json(req): Json<AddRepositoryRequest>,
 ) -> Result<(StatusCode, Json<Repository>), (StatusCode, String)> {
-    let expanded_path = expand_tilde(&req.path);
+    let expanded_path = crate::core::home_path::expand(&req.path);
 
     // Validate path exists
     let path = std::path::Path::new(&expanded_path);
@@ -841,7 +827,7 @@ pub async fn browse_directories(
     Query(query): Query<BrowseQuery>,
 ) -> Result<Json<BrowseResult>, (StatusCode, String)> {
     let raw_path = query.path.unwrap_or_else(|| "~".to_string());
-    let expanded = expand_tilde(&raw_path);
+    let expanded = crate::core::home_path::expand(&raw_path);
 
     if is_dangerous_browse_path(&expanded) {
         return Err((StatusCode::BAD_REQUEST, "Invalid path".into()));

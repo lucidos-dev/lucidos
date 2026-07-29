@@ -212,6 +212,12 @@ export interface EngineVersionStatus {
    *  so the Switch is never a dead-end. Absent/false when packaged or git is
    *  unavailable. */
   source_behind_head?: boolean;
+  /** Dev only: the checkout-shared engine-build lock is currently held — a
+   *  background rebuild of the shared binary is in flight (a co-located peer
+   *  workspace's build OR this engine's own). Lets a workspace that lost the
+   *  shared lock show the building spinner instead of the manual "Rebuild"
+   *  escape hatch. Absent/false when packaged. */
+  shared_build_in_progress?: boolean;
 }
 
 export async function engineVersionStatus(): Promise<EngineVersionStatus> {

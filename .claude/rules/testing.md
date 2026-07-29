@@ -1,5 +1,5 @@
 ---
-globs:
+paths:
   - "crates/lucidos-app/e2e/**"
   - "crates/lucidos-app/src/**/*.test.ts"
   - "crates/lucidos-app/src/**/*.spec.ts"
@@ -28,6 +28,26 @@ to avoid a host OOM during codegen. Test-only seams that production must not exp
 `cfg!(any(debug_assertions, feature = "e2e-test-hooks"))` so they survive the
 release e2e build — which passes `--features e2e-test-hooks` — while a plain
 `cargo build --release` / `cargo tauri build` (no feature) still 404s them.
+
+**The e2e workspace database is rebuilt from zero on every run.**
+`reset_e2e_database` (`scripts/lib/e2e.sh`) drops and recreates it instead of
+truncating, so the engine's next boot runs the whole sqlx migration chain against
+an empty database — **migration seeds included**, which a truncate that spared
+`_sqlx_migrations` silently skipped (that left `models` permanently empty in e2e).
+So e2e tests may assert on seeded data, e.g. the builtin model registry. Two rules
+follow:
+
+- **The reset owns the engine lifecycle** — it stops the engine, recreates the
+  database, and starts it again, because migrations / `EventStore::init_schema()`
+  / the pgvector setup run only at boot. Call `reset_e2e_database` **instead of**
+  `ensure_workspace_running`, never before it.
+- **Registry-style seeded rows are shared state within a run.** A test that
+  mutates one (a builtin's `context_window`, say) must restore it; the database is
+  recreated per run, not per test.
+
+`--no-reset` skips the reset entirely and reuses the running workspace. Rationale
+and the rejected template-database alternative: `docs/e2e-test-decisions.md`
+§ "The e2e database is rebuilt from zero, never truncated".
 
 ## Browser E2E (Playwright)
 
@@ -131,9 +151,13 @@ cargo test -p lucidos-engine --features real-embedder-tests   # All lib tests + 
 ```
 
 The `e2e-embedder.sh` script keeps a hand-maintained list of the gated test
-names and passes them as substring filters so it runs ~8 tests instead of
-~1933. When you add a new `#[cfg(feature = "real-embedder-tests")]` test, add
-its name to `GATED_TESTS` at the top of the script.
+names and passes them as substring filters, so it runs **5** tests instead of
+the whole lib suite. `GATED_TESTS` at the top of the script is the source of
+truth for that number — don't restate the count elsewhere, read it from there.
+When you add a new `#[cfg(feature = "real-embedder-tests")]` test, add its name
+to `GATED_TESTS`; the script's own drift check (it re-extracts the gated test
+names from the source and diffs them against the list) fails loudly if you
+forget, so the count cannot silently go stale again.
 
 **Network resilience (warm cache + graceful skip).** These tests must never red
 the suite on a transient huggingface.co outage (a real failure mode — a

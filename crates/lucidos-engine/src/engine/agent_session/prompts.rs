@@ -14,7 +14,10 @@ pub(super) fn workspace_preamble(workspace_name: &str) -> String {
 fn process_safety_rule(include_lucidos_scripts: bool) -> String {
     let scripts = if include_lucidos_scripts {
         " To stop a specific workspace: `./scripts/stop.sh -w <workspace-path>`. \
-         To restart for e2e tests: `./scripts/web-dev.sh -w e2e-test -b` (handles its own cleanup)."
+         For e2e, run `./scripts/e2e.sh` directly — it builds and boots its own \
+         session-scoped engine and cleans up after itself. Do NOT pre-start with \
+         `./scripts/web-dev.sh`: that launches the machine-global gateway, which is \
+         refused from a worktree (ADR 0021)."
     } else {
         ""
     };
@@ -153,9 +156,25 @@ const TASK_LIFECYCLE_RULE: &str = "TASK LIFECYCLE: After a background task ends,
 /// true for the standalone CLI, false here — so it kicks off a long build in the
 /// background, ends the turn, and the build is killed; the next `--resume` turn
 /// starts it over. This bit us in a real DMG-build thread (three restarts, no
-/// artifact). The fix is guidance: foreground long commands, or poll them to
-/// completion within the same turn. Applies to chat-style prompts only (grouped
-/// with `TASK_LIFECYCLE_RULE`); merge-conflict sessions don't run builds.
+/// artifact). The fix is guidance: foreground long commands, or wait them out
+/// within the same turn.
+///
+/// The second half of the rule is about the COST of that wait. "Wait inside the
+/// turn" on its own reads as "tick until done", and the agent's cheapest-looking
+/// tick is the tool default — 120000 ms on CC's Bash tool — so a 40-minute
+/// release build turned into ~20 round-trips, each dragging a log tail into
+/// context. Both waits can block instead: a foreground command accepts an
+/// explicit `timeout` up to 600000 ms, and `TaskOutput` takes `block: true` with
+/// the same ceiling and returns the moment the task exits. Naming those two
+/// ceilings is what turns ~20 polls into ~4. Spell the numbers the same way here
+/// as in the prompt string and the test needles (`600000`, not `600 000`) so one
+/// grep finds every site when a ceiling moves.
+///
+/// The foreground half carries a trap worth naming in the prompt: overrunning
+/// the tool timeout KILLS the command, so "max out the timeout" is only safe
+/// when the run fits — an uncertain estimate should go to the background path,
+/// which has no such cliff. Applies to chat-style prompts only (grouped with
+/// `TASK_LIFECYCLE_RULE`); merge-conflict sessions don't run builds.
 const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN: When your turn \
     ends (you go idle), the Lucidos engine terminates your whole process group — you and every \
     process you spawned. A command started with `run_in_background` (or `&` / `nohup` / any \
@@ -164,9 +183,19 @@ const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN
     off a long-running command in the background and then end your turn expecting to be woken \
     with its result — you won't be. Instead: run the command in the FOREGROUND (that keeps your \
     turn open while it runs), or, for work too long for a single foreground command's tool \
-    timeout, start it in the background and POLL it to completion WITHIN THE SAME TURN (loop \
-    `sleep 30; tail <logfile>` until it finishes) before you end the turn. Only finish once you \
-    actually have the command's result.";
+    timeout, start it in the background and wait it out WITHIN THE SAME TURN. Only finish once \
+    you actually have the command's result. WAIT IN AS FEW CALLS AS YOU CAN — having to wait is \
+    not a reason to poll on a short tick. Foreground: set the timeout EXPLICITLY to its maximum \
+    (Claude Code's Bash tool takes `timeout: 600000`, i.e. 10 minutes; its 120000 ms DEFAULT is \
+    what silently cuts a long build off at 2 minutes) so one blocking call covers the whole run \
+    — but OVERRUNNING that ceiling kills the command and throws the work away, so send anything \
+    that might exceed 10 minutes to the background instead of gambling on the estimate. \
+    Background: call `TaskOutput` with `block: true` and `timeout: 600000` — it returns the \
+    instant the task exits, or after 10 minutes; re-issue it until the task is done, with no \
+    cliff if you guessed the duration wrong. A 40-minute build costs ~4 blocking calls that way, \
+    versus ~20 polls at the 2-minute default, each one a full round-trip that floods your \
+    context with log tails. Tick on a short interval only when you deliberately want live \
+    progress or an early abort — never as the default way to wait.";
 
 /// Encourage the coding agent to ask via the structured `AskUserQuestion` tool
 /// — which the Lucidos UI renders as clickable buttons — for the DECISIONS it
@@ -322,6 +351,28 @@ const CODEX_CLI_RULE: &str = "\n\n\
     --title ...` — spawn a new Lucidos thread. Use `--codex` when the user asks for Codex \
     (always ask the user before spawning).";
 
+/// Codex-only slash-command mapping appended by [`append_backend_rules`]
+/// alongside [`CODEX_CLI_RULE`]. Lucidos prompts name Claude Code slash
+/// commands — the shared [`HARDENING_RULE`] ("run `/harden`"), the
+/// merge-conflict prompt's harden step, and the engine's auto-harden
+/// follow-up (`AUTO_HARDEN_MESSAGE`, "Run /harden now.") — but Codex has no
+/// slash-command runtime, so without this mapping it has to guess what
+/// `/harden` means. It guessed badly in practice: 17% of Codex changes hit
+/// Apply with no harden marker vs 0.6% for CC (dev workspace, 2026-06/07),
+/// each one paying the synchronous Apply-time hardening wait. Appended (not
+/// a replace) so it defines the mapping once for every mention in any prompt
+/// flavor, including the hardening-session override and merge prompts.
+const CODEX_SLASH_COMMANDS_RULE: &str = "\n\n\
+    SLASH COMMANDS: Prompts here may tell you to run a slash command such as `/harden`. That \
+    is Claude Code skill syntax; you have no slash-command runtime — each one is a repo-owned \
+    playbook file you execute by reading it and following its steps: `/harden` = \
+    `.claude/commands/harden.md`, `/code-review` = `.claude/skills/code-review/SKILL.md` (the \
+    general shape: `.claude/commands/<name>.md` or `.claude/skills/<name>/SKILL.md`). Running \
+    `/harden` to completion is what records the hardened marker (the playbook uses the \
+    `lucidos hardened` CLI; check state with `lucidos hardened query`) — never claim hardening \
+    is done while that marker is missing. Skip a playbook step \
+    only when the playbook itself says it does not apply to a Codex-backed run.";
+
 /// Codex replacement for [`ASK_USER_QUESTION_RULE`]. Codex sessions do not
 /// have Claude Code's native `AskUserQuestion` tool; their clickable-question
 /// path is the Lucidos MCP server's `ask_user_question` tool. This replaces
@@ -353,8 +404,11 @@ const CODEX_ASK_USER_QUESTION_RULE: &str = "\
 /// when summarized display is requested in headless `stream-json` mode (an
 /// upstream CC limitation — see `runtime/claude_code_parse.rs` and the
 /// `cc-reasoning-dormant` investigation in `docs/temporary-measures.md`), and
-/// Codex reasoning is dropped at parse. So anything the model parks in its
-/// reasoning is invisible to the user. Without this rule the agent drafts
+/// Codex streams only a lossy reasoning *summary* (`model_reasoning_summary`
+/// — see `CODEX_REASONING_SUMMARY` in `runtime/codex.rs`), never the full
+/// reasoning. So anything the model parks in its
+/// reasoning is invisible (CC) or unreliably summarized (Codex) for the
+/// user. Without this rule the agent drafts
 /// user-facing content there and then references it as if shown — the real
 /// "Caption copy: do the six lines above work?" card whose six lines never
 /// appeared. We cannot extract the reasoning text (it is a summary at best, and
@@ -397,7 +451,7 @@ pub(super) fn append_backend_rules(
         crate::runtime::CodingAgent::ClaudeCode => format!("{prompt}{PERMISSION_CONFIG_RULE}"),
         crate::runtime::CodingAgent::Codex => {
             let prompt = prompt.replace(ASK_USER_QUESTION_RULE, CODEX_ASK_USER_QUESTION_RULE);
-            format!("{prompt}{CODEX_CLI_RULE}")
+            format!("{prompt}{CODEX_CLI_RULE}{CODEX_SLASH_COMMANDS_RULE}")
         }
     }
 }
@@ -416,14 +470,22 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
          ISOLATION RULES: Your worktree is your entire world. ALL file edits, builds, and \
          test runs MUST happen inside your worktree directory (your cwd). Never `cd` to or \
          modify files in the main repository. Never reference absolute paths to the main repo. \
-         The scripts (`scripts/web-dev.sh`, `scripts/e2e-browser.sh`, etc.) resolve paths \
+         The scripts (`scripts/e2e.sh`, `scripts/e2e-browser.sh`, etc.) resolve paths \
          relative to where they live — running them from your worktree uses your worktree's \
-         code, which is correct. `cargo build` and `cargo test` from your worktree compile \
-         your worktree's source (Cargo resolves from `Cargo.toml` in cwd). \
-         If you need to run e2e tests against your changes: build the engine in your worktree \
-         (`cargo build -p lucidos-engine`), start the e2e workspace from your worktree \
-         (`./scripts/web-dev.sh -w e2e-test -b`), then run tests (`./scripts/e2e.sh` for full \
-         API + browser, or `./scripts/e2e-api.sh` / `./scripts/e2e-browser.sh` for one suite). \
+         code, which is what you want. `cargo build` and `cargo test` from your worktree \
+         compile your worktree's source (Cargo resolves from `Cargo.toml` in cwd). \
+         E2E: just run `./scripts/e2e.sh` (full API + browser) or `./scripts/e2e-api.sh` / \
+         `./scripts/e2e-browser.sh` for one suite. Each builds the engine + SDK and boots its \
+         own session-scoped engine for the disposable `e2e-test` workspace, then cleans up — \
+         there is NO separate start step. \
+         NEVER run `./scripts/web-dev.sh` (or `run.sh` / `tauri-dev.sh`) from your worktree. \
+         Unlike the e2e scripts, `web-dev.sh` starts the MACHINE-GLOBAL gateway — and `-b` \
+         stops the user's running one and relaunches it from whatever checkout invoked it. \
+         Rooted in your worktree it would outlive your session, adopt every workspace, and \
+         serve them all a frontend frozen at your commit, so every later Apply would silently \
+         appear to do nothing. It is refused with an actionable message (ADR 0021); do not \
+         try to work around the refusal. Restarting the user's workspace is their action, from \
+         their own checkout — not yours. \
          All commands run from your worktree directory.\n\n\
          {implementation_plan}\n\n\
          {apply_restart}\n\n\
@@ -1103,9 +1165,16 @@ mod tests {
                 "BACKGROUND PROCESSES DON'T SURVIVE A TURN",
                 "run_in_background",
                 // The two workable patterns must both survive a rewrite:
-                // foreground, or poll-to-completion inside the same turn.
+                // foreground, or wait-to-completion inside the same turn.
                 "FOREGROUND",
                 "WITHIN THE SAME TURN",
+                // …and so must the half that makes the wait cheap. Without the
+                // 600000 ms ceiling named for BOTH shapes, "wait inside the
+                // turn" degrades back into ticking on the 120000 ms Bash
+                // default — ~20 round-trips for one release build.
+                "WAIT IN AS FEW CALLS AS YOU CAN",
+                "`timeout: 600000`",
+                "`block: true`",
             ] {
                 assert!(
                     prompt.contains(needle),
@@ -1198,6 +1267,53 @@ mod tests {
         assert!(
             codex.contains("ask_user_question` tool (on the `lucidos` MCP"),
             "Codex prompt must still swap in the MCP ask_user_question rule",
+        );
+    }
+
+    /// Codex has no slash-command runtime, yet prompts across every flavor
+    /// tell it to "run `/harden`" — the shared [`HARDENING_RULE`], the
+    /// merge-conflict prompt's harden step, and the engine's auto-harden
+    /// follow-up ("Run /harden now."). Without an explicit mapping it must
+    /// guess, and it guessed badly in practice: 17% of Codex changes hit
+    /// Apply unhardened vs 0.6% for CC. The Codex arm of
+    /// `append_backend_rules` therefore defines the slash-command → playbook
+    /// file mapping once, on every prompt flavor (a hardening-session
+    /// override and a merge prompt need it just as much as a fresh turn).
+    #[test]
+    fn codex_prompts_map_slash_commands_to_playbook_files() {
+        let flavors: &[(&str, String)] = &[
+            ("worktree", worktree_system_prompt("feature/x", "dev")),
+            ("recovery", recovery_system_prompt("feature/x", "dev")),
+            (
+                "conflict_resolution",
+                conflict_resolution_system_prompt().to_string(),
+            ),
+            // Stand-in for the hardening-session `system_prompt_override` —
+            // backend rules ride overrides through the same chokepoint.
+            ("override", "HARDENING SESSION: run /harden".to_string()),
+        ];
+        for (label, base) in flavors {
+            let codex =
+                append_backend_rules(base.clone(), crate::runtime::CodingAgent::Codex);
+            for needle in [
+                "SLASH COMMANDS:",
+                ".claude/commands/harden.md",
+                "lucidos hardened query",
+            ] {
+                assert!(
+                    codex.contains(needle),
+                    "{label} (Codex) must map slash commands to playbook files (`{needle}`)",
+                );
+            }
+        }
+        // CC has a real slash-command runtime — the mapping would be noise.
+        let cc = append_backend_rules(
+            worktree_system_prompt("feature/x", "dev"),
+            crate::runtime::CodingAgent::ClaudeCode,
+        );
+        assert!(
+            !cc.contains("SLASH COMMANDS:"),
+            "CC prompt must not carry the Codex slash-command mapping",
         );
     }
 

@@ -41,6 +41,7 @@ import { prefersReducedMotion } from '../../utils/platform';
 import { createTapGate } from '../../utils/tapGesture';
 import { errorDetail } from '../../utils/errorDetail';
 import { extractPasteUrl, escapeMarkdownLinkText } from '../../utils/extractPasteUrl';
+import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 import { attachedImagesForCurrentThread, getAttachedImages, removeAttachedImage, type AttachedImage } from './pastedImages';
 import { getPendingUploads, hasInFlightUploads, removePendingUpload, pendingUploads } from '../../store/pendingUploads';
 import { attachImageToActiveDraft } from './attachToDraft';
@@ -916,6 +917,7 @@ export function PromptInput() {
             class="prompt-textarea"
             data-role="prompt-input"
             data-thread-id={tid ?? ''}
+            {...PROSE_TEXT_ATTRS}
             placeholder={focusedThreadId.value ? 'Post a follow up…' : 'What can I help with?'}
             rows={1}
             onInput={handleInput}

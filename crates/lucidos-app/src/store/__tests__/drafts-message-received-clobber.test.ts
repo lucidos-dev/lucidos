@@ -9,7 +9,7 @@
  * ONE inbound compose-clear path missing the "never blank a non-empty,
  * locally-edited draft" invariant that `stageDraftFromApi` (thread-loading.ts),
  * `applyRemoteCompose` (compose.ts), and `upsertThread`'s compose overwrite all
- * enforce via `hasLocalDraftEdit`. The handler's own comment claims a "layer 2:
+ * enforce via `hasUnsentLocalDraft`. The handler's own comment claims a "layer 2:
  * when this user is mid-keystroke, drop the inbound clear" but only checked
  * `isComposeFocusedHere` (a *composing* thread), so an active thread with a typed
  * follow-up draft was unprotected.

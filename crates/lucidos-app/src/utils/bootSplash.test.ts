@@ -111,7 +111,7 @@ describe('bootSplash controller', () => {
     expect(() => c.dismissBootSplash()).not.toThrow();
   });
 
-  it('dismiss reverts the root background only AFTER the splash node is removed (not mid-fade)', async () => {
+  it('dismiss reverts the boot background only AFTER the splash node is removed (not mid-fade)', async () => {
     fake = installFakeSplash(true);
     const doc = (globalThis as any).document;
     // Boot script (index.html) paints the brand gradient on <html> to cover the
@@ -143,6 +143,62 @@ describe('bootSplash controller', () => {
 describe('index.html inline boot splash', () => {
   const html = readFileSync(resolve(__dirname, '../../index.html'), 'utf-8');
 
+  function runInlineWatchdog(initialRetry = false) {
+    const source = html.match(
+      /\/\* lucidos-boot-watchdog-start[\s\S]*?\*\/([\s\S]*?)\/\* lucidos-boot-watchdog-end \*\//,
+    )?.[1];
+    if (!source) throw new Error('inline boot watchdog not found');
+
+    const values = new Map<string, string>();
+    if (initialRetry) values.set('lucidos-boot-retry', '1');
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    };
+    const statusClasses = new Set<string>();
+    const status = {
+      textContent: 'Opening your workspace…',
+      classList: { add: (name: string) => statusClasses.add(name) },
+    };
+    let click: (() => void) | undefined;
+    const splashClasses = new Set<string>();
+    const splash = {
+      querySelector: () => status,
+      classList: { add: (name: string) => splashClasses.add(name) },
+      setAttribute: vi.fn(),
+      addEventListener: (_type: string, fn: () => void) => { click = fn; },
+    };
+    const location = {
+      href: initialRetry
+        ? 'https://example.com/?thread=abc&_boot_retry=1'
+        : 'https://example.com/?thread=abc',
+      replace: vi.fn(),
+      reload: vi.fn(),
+    };
+    const history = { state: null, replaceState: vi.fn() };
+    const fakeWindow: Record<string, unknown> = {
+      setTimeout: window.setTimeout.bind(window),
+      clearTimeout: window.clearTimeout.bind(window),
+    };
+    const fakeDocument = {
+      querySelector: (selector: string) => selector === 'base' ? null : splash,
+    };
+    new Function('window', 'document', 'sessionStorage', 'location', 'history', 'URL', source)(
+      fakeWindow, fakeDocument, storage, location, history, URL,
+    );
+    return {
+      fakeWindow,
+      history,
+      location,
+      splashClasses,
+      status,
+      statusClasses,
+      storage,
+      click: () => click?.(),
+    };
+  }
+
   it('ships the splash node so it paints before the JS bundle loads', () => {
     const splashIdx = html.indexOf('class="boot-splash"');
     const moduleIdx = html.indexOf('<script type="module"');
@@ -160,15 +216,78 @@ describe('index.html inline boot splash', () => {
     expect(html).toContain('pointer-events: none');
   });
 
-  it('paints the brand gradient on the root so the iOS bottom safe-area strip is covered', () => {
+  it('paints the brand gradient on both canvas layers so the iOS bottom safe-area strip is covered', () => {
     // A fixed `inset:0` .boot-splash does not reach the iOS standalone bottom
     // safe-area strip, so the boot script must paint the brand gradient (solid
-    // #0a4ea8 fallback + fixed attachment) on <html> behind it — otherwise the
-    // dark var(--bg-primary) root shows as a black band under the splash. Mirrors
-    // the gateway splash (crates/lucidos-gateway/src/proxy.rs).
+    // #0a4ea8 fallback + fixed attachment) on <html> behind it. The body must
+    // carry the same paint: its light-theme inline background otherwise owns the
+    // uncovered strip and shows white despite the root paint.
     expect(html).toMatch(
       /d\.style\.background\s*=\s*['"]#0a4ea8 radial-gradient\([^'"]*\) no-repeat fixed['"]/,
     );
+    expect(html).toMatch(
+      /<body style="background:#0a4ea8 radial-gradient\([^";]*\) no-repeat fixed">/,
+    );
+  });
+
+  it('owns boot from the inline document and bounds a missing-module hang', () => {
+    const watchdogIdx = html.indexOf('lucidos-boot-watchdog-start');
+    const moduleIdx = html.indexOf('<script type="module"');
+    expect(watchdogIdx).toBeGreaterThan(-1);
+    expect(watchdogIdx).toBeLessThan(moduleIdx);
+    expect(html).toContain('__lucidosBootLoaded');
+    expect(html).toContain('lucidos-boot-retry');
+    expect(html).toContain('Tap to retry');
+    expect(html).toContain('}, 15000);');
+  });
+
+  it('reloads once with a cache-busting query when the module never takes ownership', () => {
+    vi.useFakeTimers();
+    try {
+      const watchdog = runInlineWatchdog();
+      vi.advanceTimersByTime(15_000);
+      expect(watchdog.storage.getItem('lucidos-boot-retry')).toBe('1');
+      expect(watchdog.location.replace).toHaveBeenCalledWith(
+        'https://example.com/?thread=abc&_boot_retry=1',
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops retry-looping and offers a tap after the guarded reload also fails', () => {
+    vi.useFakeTimers();
+    try {
+      const watchdog = runInlineWatchdog(true);
+      vi.advanceTimersByTime(15_000);
+      expect(watchdog.location.replace).not.toHaveBeenCalled();
+      expect(watchdog.status.textContent).toBe('Tap to retry');
+      expect(watchdog.splashClasses.has('boot-splash-stalled')).toBe(true);
+      watchdog.click();
+      expect(watchdog.storage.getItem('lucidos-boot-retry')).toBe(null);
+      expect(watchdog.location.reload).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels recovery and cleans its retry query when the module loads', () => {
+    vi.useFakeTimers();
+    try {
+      const watchdog = runInlineWatchdog(true);
+      const loaded = watchdog.fakeWindow.__lucidosBootLoaded as () => void;
+      loaded();
+      vi.advanceTimersByTime(15_000);
+      expect(watchdog.location.replace).not.toHaveBeenCalled();
+      expect(watchdog.history.replaceState).toHaveBeenCalledWith(
+        null,
+        '',
+        'https://example.com/?thread=abc',
+      );
+      expect(watchdog.storage.getItem('lucidos-boot-retry')).toBe(null);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('bakes a default, shown status so it never vanishes across the reload', () => {

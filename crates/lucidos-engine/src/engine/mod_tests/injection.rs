@@ -2,6 +2,225 @@ use super::*;
 use super::common::*;
 use uuid::Uuid;
 
+fn test_prompt(text: &str) -> InjectedPrompt {
+    InjectedPrompt {
+        text: text.into(),
+        event_id: None,
+        mode: thread_events::ActorMode::Human,
+        spawning_event_id: None,
+        images: None,
+        origin: None,
+        kind: crate::engine::InjectedPromptKind::UserText,
+    }
+}
+
+/// A blocking tool (`bash_output(wait_secs=120)` is the one that really
+/// blocks) parks on `injection_notify` so a follow-up doesn't sit unread
+/// for two minutes — the agentic loop only `try_recv`s injections BETWEEN
+/// iterations, so nothing else would wake it.
+#[tokio::test]
+async fn inject_wakes_a_tool_blocked_on_this_thread() {
+    let threads = make_threads();
+    let tid = Uuid::new_v4();
+    let (_token, mut rx, _guard) = register(&threads, tid);
+
+    let notify = {
+        let map = threads.lock().unwrap();
+        map.get(&tid).unwrap().injection_notify.clone()
+    };
+
+    // Park first, exactly as the drain does, then inject.
+    let waiter = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified())
+            .await
+            .is_ok()
+    });
+    tokio::task::yield_now().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let injected = {
+        let map = threads.lock().unwrap();
+        map.get(&tid).unwrap().inject(test_prompt("also open the site"))
+    };
+    assert!(injected);
+    assert!(waiter.await.unwrap(), "a parked tool must wake on inject");
+    // The prompt itself still reaches the loop — waking is in addition to
+    // delivery, not instead of it.
+    assert_eq!(rx.try_recv().unwrap().text, "also open the site");
+}
+
+/// The wide window a bare notification misses: the user types while the LLM
+/// call is in flight, so the prompt is already queued by the time the tool
+/// call it produced starts blocking. No waiter existed when `notify_waiters`
+/// fired, and it leaves no permit — the unread count is the only evidence,
+/// and a blocking tool must refuse to block on it.
+#[test]
+fn pending_count_survives_an_injection_with_nobody_listening() {
+    let threads = make_threads();
+    let tid = Uuid::new_v4();
+    let (_token, mut rx, _guard) = register(&threads, tid);
+
+    let pending = {
+        let map = threads.lock().unwrap();
+        let handle = map.get(&tid).unwrap();
+        handle.inject(test_prompt("stop, the site is wrong"));
+        handle.pending_injections.clone()
+    };
+    assert_eq!(
+        pending.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "an injection nobody was waiting for must still be visible as unread"
+    );
+
+    // The loop drains it on its next iteration and reports what it took.
+    let drained = {
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        n
+    };
+    threads.lock().unwrap().get(&tid).unwrap().injections_drained(drained);
+    assert_eq!(
+        pending.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "a drained injection is no longer unread — later waits must block normally"
+    );
+}
+
+/// A failed send must leave no reservation behind. `inject` counts before
+/// sending (a drain can otherwise report a prompt consumed before a
+/// post-send increment lands, stranding a phantom unread that would stop
+/// every later wait from blocking) — so the failure path has to give the
+/// reservation back, or a dead thread's handle poisons nothing but is still
+/// a lie about unread work.
+#[test]
+fn failed_inject_rolls_back_its_reservation() {
+    let threads = make_threads();
+    let tid = Uuid::new_v4();
+    let (_token, rx, _guard) = register(&threads, tid);
+    drop(rx); // the turn ended — the receiver is gone
+
+    let map = threads.lock().unwrap();
+    let handle = map.get(&tid).unwrap();
+    assert!(
+        !handle.inject(test_prompt("too late")),
+        "inject must report failure once the receiver is gone"
+    );
+    assert_eq!(
+        handle
+            .pending_injections
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "a prompt that was never delivered must not count as unread"
+    );
+}
+
+/// A drain reported by a force-evicted turn must not touch the turn that
+/// replaced it. `register_thread_queued` evicts a turn stuck for 60 s and
+/// registers a new handle under the same thread_id while the old loop is
+/// still unwinding; if the old loop's drain decremented by thread_id alone
+/// it would erase the NEW turn's unread follow-up, and `bash_output` would
+/// block straight through the user's message. Same generation guard
+/// `ThreadGuard::drop` uses.
+#[test]
+fn a_stale_generations_drain_cannot_erase_the_new_turns_unread_count() {
+    let engine_threads = make_threads();
+    let tid = Uuid::new_v4();
+
+    // Turn 1 registers, then is force-evicted and replaced by turn 2 —
+    // re-registering overwrites the map entry with a fresh generation.
+    let (_t1, _rx1, guard1) = register(&engine_threads, tid);
+    let stale_generation = guard1.generation();
+    let (_t2, _rx2, guard2) = register(&engine_threads, tid);
+    assert_ne!(
+        stale_generation,
+        guard2.generation(),
+        "a re-registration must take a fresh generation"
+    );
+    // Turn 1's guard drops late (its loop is still unwinding). Its own
+    // generation check already stops it removing turn 2's registration.
+    drop(guard1);
+    assert!(
+        engine_threads.lock().unwrap().contains_key(&tid),
+        "the stale guard must leave the live registration in place"
+    );
+
+    // The user types into turn 2.
+    let pending = {
+        let map = engine_threads.lock().unwrap();
+        let handle = map.get(&tid).unwrap();
+        handle.inject(test_prompt("wait, stop"));
+        handle.pending_injections.clone()
+    };
+
+    // Turn 1's loop finally drains its own (old) receiver and reports it.
+    let stale = {
+        let map = engine_threads.lock().unwrap();
+        map.get(&tid)
+            .filter(|h| h.generation == stale_generation)
+            .map(|h| h.injections_drained(1))
+    };
+    assert!(
+        stale.is_none(),
+        "the stale generation must not resolve to the live handle"
+    );
+    assert_eq!(
+        pending.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "turn 2's follow-up is still unread — a blocking tool must not sit on it"
+    );
+}
+
+/// The counter tracks the channel and must never wrap: an over-report (a
+/// drain site double-counting, or a prompt filtered out before delivery)
+/// saturates at zero instead of underflowing to usize::MAX, which would
+/// make every subsequent wait return instantly forever.
+#[test]
+fn injections_drained_saturates_instead_of_wrapping() {
+    let threads = make_threads();
+    let tid = Uuid::new_v4();
+    let (_token, _rx, _guard) = register(&threads, tid);
+
+    let map = threads.lock().unwrap();
+    let handle = map.get(&tid).unwrap();
+    handle.inject(test_prompt("one"));
+    handle.injections_drained(5);
+    assert_eq!(
+        handle
+            .pending_injections
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+}
+
+/// `notify_waiters`, not `notify_one`: a stored permit would make the very
+/// next `wait_secs` block return instantly for a message the loop has
+/// already consumed — reintroducing the polling storm one drain later.
+#[tokio::test]
+async fn inject_leaves_no_permit_for_a_later_wait() {
+    let threads = make_threads();
+    let tid = Uuid::new_v4();
+    let (_token, mut rx, _guard) = register(&threads, tid);
+
+    let notify = {
+        let map = threads.lock().unwrap();
+        let handle = map.get(&tid).unwrap();
+        // Nobody is parked yet — this notification has no waiter to wake.
+        handle.inject(test_prompt("early"));
+        handle.injection_notify.clone()
+    };
+    assert_eq!(rx.try_recv().unwrap().text, "early");
+
+    let woke = tokio::time::timeout(std::time::Duration::from_millis(200), notify.notified())
+        .await
+        .is_ok();
+    assert!(
+        !woke,
+        "a consumed injection must not leave a permit that cuts the next wait short"
+    );
+}
+
 #[test]
 fn injection_channel_delivers_to_active_thread() {
     let threads = make_threads();

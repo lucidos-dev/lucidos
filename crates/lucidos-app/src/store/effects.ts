@@ -1,12 +1,10 @@
 import { effect, untracked } from '@preact/signals';
-import { pageTitle, unreadCount, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, diffWholeFile, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY } from './store';
+import { pageTitle, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, diffWholeFile, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY } from './store';
 import { clientRefreshing } from '../hooks/sw-update';
 import { cancelApplyAllBatch } from './actions/chat-changes';
 import { handleRestartTimeout } from './actions/connection';
 import { onNotificationDetailClosed } from './actions/notifications';
-import { applyAppBadge } from './actions/app-badge';
-import { IS_PICKER } from '../utils/basePath';
-import { isTauri } from '../utils/platform';
+import { syncWorkspaceAppBadge } from './actions/app-badge';
 
 // Sync page title with unread count
 effect(() => {
@@ -14,16 +12,20 @@ effect(() => {
 });
 
 // Per-workspace PWA app-icon badge: mirror THIS workspace's unread count onto
-// the installed PWA icon (a workspace PWA badges its own workspace). Not on the
-// gateway picker — that context sets the aggregate total across running
-// workspaces itself — and not under Tauri, where the desktop process drives a
-// native dock badge from the gateway total. Live while the app is open; the
-// service worker keeps a CLOSED PWA fresh via the push payload's `app_badge`.
-if (!IS_PICKER && !isTauri()) {
-  effect(() => {
-    applyAppBadge(unreadCount.value);
-  });
-}
+// the installed PWA icon (a workspace PWA badges its own workspace). The context
+// gates (picker / Tauri) live inside `syncWorkspaceAppBadge`, which also runs at
+// module init here — clearing an icon badge a push left behind before the unread
+// set has loaded. Live while the app is open; the service worker keeps a CLOSED
+// PWA fresh via the push payload's `app_badge`.
+//
+// This effect covers only count CHANGES — a computed doesn't notify when its
+// recomputed value is equal. The no-change case (a reload landing the same
+// count, a mark-read for a row this device never had) is covered by the explicit
+// re-asserts in actions/notifications.ts and on resume; see the
+// `syncWorkspaceAppBadge` doc comment for why both are needed.
+effect(() => {
+  syncWorkspaceAppBadge();
+});
 
 // Clean up stale localStorage keys — model/effort are now per-thread, not persisted
 localStorage.removeItem('lucidos-model');

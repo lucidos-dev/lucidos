@@ -12,12 +12,16 @@ import {
 } from '../store';
 import type { Notification, Loadable } from '../types';
 
-// Mock the API client to prevent real HTTP calls
+// Mock the API client to prevent real HTTP calls. `isTransportError` is inlined
+// to the real matcher (mirrors plugin-marketplaces.test.ts) so the transport-blip
+// suppression path is exercised, not stubbed away.
 vi.mock('../../api/client', () => ({
   getNotifications: vi.fn().mockResolvedValue({ notifications: [], unread_count: 0, has_more: false }),
   getNotification: vi.fn(),
   markNotificationRead: vi.fn().mockResolvedValue({ success: true }),
   markAllNotificationsRead: vi.fn(),
+  isTransportError: (err: unknown) =>
+    err instanceof TypeError && /Load failed|Failed to fetch|NetworkError/i.test(err.message),
 }));
 
 // viewNotification reveals the content pane and pushes a nav-history entry as a
@@ -37,6 +41,13 @@ vi.mock('../../utils/tauri', async (importActual) => ({
   ...(await importActual<typeof import('../../utils/tauri')>()),
   nudgeDockBadge: vi.fn(),
 }));
+// The app-icon badge re-assert is a side effect of every path that
+// (re)establishes the unread truth. Spy on it here; app-badge.test.ts pins that
+// it writes `unreadCount` onto the Badging API.
+vi.mock('./app-badge', () => ({
+  syncWorkspaceAppBadge: vi.fn(),
+  applyAppBadge: vi.fn(),
+}));
 
 const {
   handleNotificationSSE,
@@ -51,6 +62,7 @@ const {
 const { getNotifications, getNotification, markNotificationRead, markAllNotificationsRead } = await import('../../api/client');
 const { isTauri } = await import('../../utils/platform');
 const { nudgeDockBadge } = await import('../../utils/tauri');
+const { syncWorkspaceAppBadge } = await import('./app-badge');
 
 type Mock = ReturnType<typeof vi.fn>;
 type NotifResponse = { notifications: Notification[]; unread_count: number; has_more: boolean };
@@ -86,8 +98,9 @@ function seedUnread(items: Notification[]): void {
 describe('handleNotificationSSE', () => {
   beforeEach(() => {
     activeMenuItem.value = 'notifications';
-    notificationsFilter.value = 'unread';
+    notificationsFilter.value = 'all';
     panelOverlay.value = null;
+    seedUnread([]);
     notifications.value = {
       status: 'loaded',
       data: [
@@ -96,41 +109,64 @@ describe('handleNotificationSSE', () => {
         makeNotification('c', false),
       ],
     };
+    (getNotifications as Mock).mockReset();
+    (getNotifications as Mock).mockResolvedValue({ notifications: [], unread_count: 0, has_more: false });
   });
 
-  it('does NOT reload the inbox list when a notification detail is open in the panel', () => {
-    // User is viewing a notification detail in the content pane
-    panelOverlay.value = { type: 'notification-detail', notification: makeNotification('a', true) };
+  it('ALWAYS reloads the unread set (bell + app-icon badge AND the Unread tab, one source)', () => {
+    // The unread set is the single source the badge and the Unread tab both
+    // project from — it must refresh on every notification event regardless of
+    // which tab is visible or whether a detail is open.
+    handleNotificationSSE();
+    expect(getNotifications).toHaveBeenCalledWith(expect.objectContaining({ filter: 'unread' }));
+  });
 
-    // SSE event arrives (e.g. NotificationRead)
+  it('reloads the "All" browse list when it is the visible tab with no detail open', () => {
     handleNotificationSSE();
 
-    // The browse list should NOT be reloaded — items must stay intact for navigation
+    // The paginated browse list is refetched with the 'all' filter...
+    expect(getNotifications).toHaveBeenCalledWith(expect.objectContaining({ filter: 'all' }));
+    // ...and existing data stays visible through the round-trip (no loading flash).
+    expect(notifications.value.status).toBe('loaded');
+  });
+
+  it('does NOT reload the "All" browse list when a notification detail is open', () => {
+    // Detail open: the browse list must stay intact so prev/next navigation works.
+    panelOverlay.value = { type: 'notification-detail', notification: makeNotification('a', true) };
+
+    handleNotificationSSE();
+
+    // The unread set (badge) still refreshes...
+    expect(getNotifications).toHaveBeenCalledWith(expect.objectContaining({ filter: 'unread' }));
+    // ...but the browse list is NOT reloaded.
+    expect(getNotifications).not.toHaveBeenCalledWith(expect.objectContaining({ filter: 'all' }));
     expect(notifications.value.status).toBe('loaded');
     if (notifications.value.status === 'loaded') {
-      expect(notifications.value.data).toHaveLength(3);
       expect(notifications.value.data.map((n) => n.id)).toEqual(['a', 'b', 'c']);
     }
   });
 
-  it('reloads the inbox list when no detail is open and panel is active', () => {
-    panelOverlay.value = null;
-    (getNotifications as Mock).mockClear();
-
-    handleNotificationSSE();
-
-    // Existing data stays visible through the refetch round-trip.
-    expect(notifications.value.status).toBe('loaded');
-    expect(getNotifications).toHaveBeenCalled();
-  });
-
-  it('does NOT reload the inbox list when notifications panel is not active', () => {
+  it('does NOT reload the "All" browse list when the notifications panel is not active', () => {
     activeMenuItem.value = 'files';
 
     handleNotificationSSE();
 
-    // Should not reload — still 'loaded' with original data
+    // The badge's unread set still refreshes regardless of the active panel...
+    expect(getNotifications).toHaveBeenCalledWith(expect.objectContaining({ filter: 'unread' }));
+    // ...but the browse list is not reloaded off-panel.
+    expect(getNotifications).not.toHaveBeenCalledWith(expect.objectContaining({ filter: 'all' }));
     expect(notifications.value.status).toBe('loaded');
+  });
+
+  it('on the "Unread" tab refreshes ONLY the unread set — never the browse list', () => {
+    // The Unread tab renders `unreadNotifications`, so there is no separate browse
+    // fetch to keep in sync (and none that could drift from the badge).
+    notificationsFilter.value = 'unread';
+
+    handleNotificationSSE();
+
+    expect(getNotifications).toHaveBeenCalledWith(expect.objectContaining({ filter: 'unread' }));
+    expect(getNotifications).not.toHaveBeenCalledWith(expect.objectContaining({ filter: 'all' }));
   });
 
   it('nudges the native dock badge under Tauri (instant desktop badge update)', () => {
@@ -386,6 +422,77 @@ describe('the bell badge is derived from the unread set', () => {
   });
 });
 
+describe('the app-icon badge is re-asserted, not diffed', () => {
+  // Regression: the PWA app-icon badge used to be written ONLY by the
+  // `unreadCount` effect, i.e. only when the count CHANGED. But the icon badge
+  // is written behind the page's back — iOS sets it from the push payload's
+  // `app_badge` in its parent process, the SW `push` handler sets it on
+  // Chrome/Android — so a count that never transitions (read on another device,
+  // or an already-dropped row) left the icon showing 1 next to a bell showing 0.
+  // Every path that (re)establishes the unread truth must re-assert the icon.
+  beforeEach(() => {
+    seedUnread([]);
+    notifications.value = { status: 'not-loaded' };
+    (getNotifications as Mock).mockReset();
+    (getNotifications as Mock).mockResolvedValue({ notifications: [], unread_count: 0, has_more: false });
+    (markNotificationRead as Mock).mockReset();
+    (markNotificationRead as Mock).mockResolvedValue({ success: true });
+    (markAllNotificationsRead as Mock).mockReset();
+    (markAllNotificationsRead as Mock).mockResolvedValue({ success: true });
+    (syncWorkspaceAppBadge as Mock).mockClear();
+  });
+
+  it('a reload landing the SAME count still re-asserts (the resume case)', async () => {
+    // The set was already loaded-empty and the server still says empty — the
+    // count doesn't move, so the effect can't fire. This is the exact shape of
+    // a resume-time reload after the notification was read on another device.
+    await loadUnreadNotifications();
+
+    expect(unreadCount.value).toBe(0);
+    expect(syncWorkspaceAppBadge).toHaveBeenCalled();
+  });
+
+  it('marking read re-asserts even when the row was not in the unread set', () => {
+    // Cold/frozen page: the row never made it into this device's unread set, so
+    // the local drop is a no-op and the count stays 0 — but the icon may still
+    // carry the 1 the push wrote.
+    markReadOptimistic('never-loaded-here');
+
+    expect(unreadCount.value).toBe(0);
+    expect(syncWorkspaceAppBadge).toHaveBeenCalled();
+  });
+
+  it('markAllRead re-asserts', async () => {
+    seedUnread(makeUnread(3));
+    (syncWorkspaceAppBadge as Mock).mockClear();
+
+    await markAllRead();
+
+    expect(unreadCount.value).toBe(0);
+    expect(syncWorkspaceAppBadge).toHaveBeenCalled();
+  });
+
+  it('a superseded load never writes the badge', async () => {
+    // Same monotonic guard the unread set itself has: an out-of-order load must
+    // not paint the icon with a set it was not allowed to apply.
+    const stale = deferred<NotifResponse>();
+    (getNotifications as Mock)
+      .mockReturnValueOnce(stale.promise)
+      .mockResolvedValueOnce({ notifications: [], unread_count: 0, has_more: false });
+
+    const first = loadUnreadNotifications();   // seq N
+    const second = loadUnreadNotifications();  // seq N+1 — supersedes the first
+    await second;
+    (syncWorkspaceAppBadge as Mock).mockClear();
+
+    stale.resolve({ notifications: makeUnread(4), unread_count: 4, has_more: false });
+    await first;
+
+    expect(unreadCount.value).toBe(0);
+    expect(syncWorkspaceAppBadge).not.toHaveBeenCalled();
+  });
+});
+
 describe('loadUnreadNotifications failure handling', () => {
   beforeEach(async () => {
     toasts.value = [];
@@ -430,10 +537,29 @@ describe('loadUnreadNotifications failure handling', () => {
     // No manual AbortController on this path — an AbortError is the browser
     // cancelling the in-flight fetch on an iOS PWA freeze / radio handoff. It
     // carries no reachability signal, so it must not push the counter toward the
-    // "Unread count is stale — couldn't reach the engine" escalation. A genuine
-    // unreachable engine fires TimeoutError / a transport TypeError, which still
-    // counts (covered by the threshold test above).
+    // "Unread count is stale — couldn't reach the engine" escalation. Non-abort /
+    // non-transport rejections still count — the threshold test above proves that
+    // with a plain Error; a client-side TimeoutError is in that same countable
+    // bucket (isAbortError / isTransportError both reject it).
     (getNotifications as Mock).mockRejectedValue(new DOMException('aborted', 'AbortError'));
+
+    await loadUnreadNotifications();
+    await loadUnreadNotifications();
+    await loadUnreadNotifications();
+    await loadUnreadNotifications();
+    await loadUnreadNotifications();
+
+    expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(0);
+  });
+
+  it('does not count a transport-layer TypeError ("Load failed") toward the threshold', async () => {
+    // The iOS-PWA-over-Tailscale case: on wake the stale HTTP/2 connection fails
+    // the fetch at the transport layer (Safari "Load failed"). It's the same
+    // page-lifecycle / reachability noise as an AbortError, not a definitive
+    // "engine is down" (the debounced connection dot owns that), so it must not
+    // trip the "Unread count is stale — couldn't reach the engine after 3 tries"
+    // escalation. This is the fix for the reported spurious iOS-PWA toast.
+    (getNotifications as Mock).mockRejectedValue(new TypeError('Load failed'));
 
     await loadUnreadNotifications();
     await loadUnreadNotifications();
@@ -533,5 +659,43 @@ describe('unread set is resilient to out-of-order responses', () => {
 
     // The superseded reload must not resurrect the pre-read set.
     expect(unreadCount.value).toBe(0);
+  });
+
+  it('supersedes the stale load AND reconciles when the set is NOT loaded (cold-start deep-link)', async () => {
+    // The reported badge=1 / empty-Unread-list class. Cold start: the unread set
+    // has never loaded and the startup loadUnreadNotifications is in flight — it
+    // WOULD resolve with the PRE-read row. Before it lands, the push-tapped row is
+    // opened and marked read. removeFromUnread supersedes that stale load even
+    // though the set is 'not-loaded' (no phantom), and because an idempotent read
+    // emits no NotificationRead SSE, markReadOptimistic reloads once the read
+    // settles — so the badge AND the Unread tab (one source) reach the true unread
+    // set instead of sticking 'not-loaded'/0 or surfacing the read row.
+    unreadNotifications.value = { status: 'not-loaded' };
+    (markNotificationRead as Mock).mockResolvedValue({ success: true });
+    const startup = deferred<NotifResponse>();
+    (getNotifications as Mock)
+      .mockReturnValueOnce(startup.promise) // #1 stale startup load (would return the pre-read set)
+      .mockResolvedValueOnce({              // #2 reconciling load: the genuine unread set
+        notifications: [makeNotification('y', false)], unread_count: 1, has_more: false,
+      });
+
+    const inFlight = loadUnreadNotifications(); // seq N; set still 'not-loaded'
+    markReadOptimistic('x');                    // invalidates seq N; schedules a reconcile after the read
+
+    startup.resolve({ notifications: [makeNotification('x', false)], unread_count: 1, has_more: false });
+    await inFlight;                             // the stale load lands and is discarded (seq superseded)
+
+    // The reconcile (fired from the read POST's resolution) reaches server truth:
+    // the read row 'x' is gone AND the genuinely-unread 'y' is present — proving it
+    // neither stuck at 0/not-loaded nor stranded the phantom 'x'.
+    await vi.waitFor(() => expect(unreadCount.value).toBe(1));
+    // Cast defeats TS flow-narrowing: the last direct assignment above was
+    // `{ status: 'not-loaded' }`, but the reconcile mutated it across the awaits.
+    const set = unreadNotifications.value as Loadable<Notification[]>;
+    if (set.status === 'loaded') {
+      expect(set.data.map((n) => n.id)).toEqual(['y']);
+    } else {
+      throw new Error('expected the unread set to be reconciled to loaded');
+    }
   });
 });

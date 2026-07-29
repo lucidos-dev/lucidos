@@ -63,6 +63,16 @@ pub enum AbortCause {
     /// flows through as the actor, but no real response was canceled — the
     /// thread is just being cleaned up.
     StaleSettle,
+    /// The `run_session` future was dropped instead of completed — its caller
+    /// was cancelled, so the whole session went with it mid-turn. The classic
+    /// source is an HTTP handler that awaited a session inline and lost its
+    /// client (the 2026-07-28 Apply-over-mobile incident: the merge session
+    /// died 72 s in when iOS Safari dropped the connection). Distinct from
+    /// `ProcessKilled` (the subprocess died under a live loop) and from
+    /// `SafetyNet` (the loop ran to EOF without a `Result`): here the loop
+    /// itself never got to run its cleanup, so the abort is emitted by the
+    /// session entry's drop-guard.
+    SessionDropped,
     /// Pre-typed-cause legacy event or unrecognized cause string. Never emit
     /// fresh.
     #[serde(other)]

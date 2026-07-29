@@ -122,10 +122,18 @@ pub(crate) fn framed_injected_prompt(prompt: &InjectedPrompt) -> String {
     }
 }
 
-pub(crate) fn coalesced_user_text_message(prompts: &[InjectedPrompt]) -> Message {
-    let has_images = prompts
+/// Whether any prompt in the batch carries image bytes. Drives both the
+/// blocks-vs-text shape of the coalesced message and the caller's decision to
+/// pin that message against trim pass 0 — the two must agree, so they read the
+/// same predicate.
+pub(crate) fn prompts_have_images(prompts: &[InjectedPrompt]) -> bool {
+    prompts
         .iter()
-        .any(|prompt| prompt.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
+        .any(|prompt| prompt.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
+}
+
+pub(crate) fn coalesced_user_text_message(prompts: &[InjectedPrompt]) -> Message {
+    let has_images = prompts_have_images(prompts);
 
     let content = if prompts.len() == 1 && !has_images {
         MessageContent::Text(framed_injected_prompt(&prompts[0]))
@@ -239,14 +247,27 @@ pub(crate) async fn filter_removed_queued_prompts(
     filtered
 }
 
+/// What [`append_injected_prompts_to_messages`] added to the message list.
+#[derive(Debug, Default)]
+pub(crate) struct AppendedInjections {
+    /// At least one message was appended, so the caller re-points
+    /// `user_message_idx` at the new last message.
+    pub appended: bool,
+    /// Indices of appended messages that carry image bytes. The caller pins
+    /// these against trim pass 0: an image the user attached mid-turn is every
+    /// bit as explicit as one attached to the message that opened the turn, and
+    /// without a pin it went blind on the model's very next tool call.
+    pub image_message_idxs: Vec<usize>,
+}
+
 pub(crate) async fn append_injected_prompts_to_messages(
     bus: &crate::engine::event_bus::EventBus,
     thread_id: Uuid,
     meta: &crate::engine::thread_events::EventMeta,
     messages: &mut Vec<Message>,
     prompts: Vec<InjectedPrompt>,
-) -> bool {
-    let mut appended = false;
+) -> AppendedInjections {
+    let mut result = AppendedInjections::default();
     for group in group_injected_prompts(prompts) {
         match group {
             InjectedPromptGroup::WakeFromChild(prompt) => {
@@ -255,11 +276,12 @@ pub(crate) async fn append_injected_prompts_to_messages(
                     prompt.spawning_event_id,
                     thread_id
                 );
+                // Child-completion wakes are text-only, so there is nothing to pin.
                 messages.push(Message {
                     role: "user".to_string(),
                     content: MessageContent::Text(prompt.text),
                 });
-                appended = true;
+                result.appended = true;
             }
             InjectedPromptGroup::UserText(batch) => {
                 for prompt in &batch {
@@ -271,12 +293,16 @@ pub(crate) async fn append_injected_prompts_to_messages(
                     );
                     emit_user_prompt_injected_event(bus, thread_id, meta, prompt).await;
                 }
+                let has_images = prompts_have_images(&batch);
                 messages.push(coalesced_user_text_message(&batch));
-                appended = true;
+                result.appended = true;
+                if has_images {
+                    result.image_message_idxs.push(messages.len() - 1);
+                }
             }
         }
     }
-    appended
+    result
 }
 
 /// Cross-provider classification of a completion's finish reason. Providers
@@ -905,6 +931,144 @@ pub(crate) async fn emit_user_prompt_injected_event(
     .await;
 }
 
+/// How many tool-result images the model explicitly asked to see stay pinned in
+/// vision at once. Beyond this the oldest pin is released and that image reverts
+/// to the usual "strip once it is no longer last" rule; the model can call
+/// `view_image` again to bring it back.
+///
+/// A cap is needed because pinned images are exempt from trim pass 0 by
+/// construction and the model may issue up to `MAX_ITERATIONS` image reads in a
+/// single turn — a "describe every photo in this folder" turn would otherwise
+/// accumulate hundreds of un-strippable images (~1600 tokens each, see
+/// `context::IMAGE_BUDGET_TOKEN_ESTIMATE`) and blow the context window.
+///
+/// Eight is chosen to cover the realistic reason to hold several at once —
+/// comparing a handful of images — at a worst case near 13k tokens, which is
+/// small against any supported context window and is honestly counted by
+/// `estimate_message_chars`, so the other trim passes compensate for it.
+pub(crate) const MAX_PINNED_EXPLICIT_IMAGES: usize = 8;
+
+/// Record `idx` as holding an explicitly-requested image, releasing the oldest
+/// pin once [`MAX_PINNED_EXPLICIT_IMAGES`] is exceeded.
+pub(crate) fn push_explicit_image_pin(pins: &mut Vec<usize>, idx: usize) {
+    pins.push(idx);
+    if pins.len() > MAX_PINNED_EXPLICIT_IMAGES {
+        pins.remove(0);
+    }
+}
+
+/// Whether a freshly-built tool-result message holds an image the model
+/// explicitly asked to see (`view_image`, or `read_file` on an image file).
+/// Those messages get pinned so trim pass 0 keeps the bytes for the rest of the
+/// turn — otherwise the model's very next tool call blinds it again, which is
+/// what made `view_image` unable to do its one job.
+///
+/// Detected via the `EXPLICIT_IMAGE_RESULT_TEXT` block the loop substitutes for
+/// the `[IMAGE_CONTENT:…]` sentinel, which is the only marker distinguishing an
+/// explicit request from an ambient capture (`capture_app` writes the page's DOM
+/// text as its result instead, and stays unpinned so it can age out).
+///
+/// A message can carry both when the model batches an explicit view alongside a
+/// capture; pinning is per-message, so the capture rides along. Rare, bounded,
+/// and preferable to dropping the image the model actually asked for.
+pub(crate) fn holds_explicitly_requested_image(blocks: &[ContentBlock]) -> bool {
+    blocks.iter().any(|b| {
+        matches!(
+            b,
+            ContentBlock::ToolResult { content, .. }
+                if content == crate::engine::tools::files::EXPLICIT_IMAGE_RESULT_TEXT
+        )
+    })
+}
+
+/// Await a pending Flash image-description task and emit one `ImageDescribed`
+/// per hash attached to `origin_id`'s message.
+///
+/// A free function taking cloned handles rather than a `&LucidosEngine` method,
+/// because it has two callers with different lifetimes: the agentic loop awaits
+/// it inline after the first LLM call, while the chat injection fast-path — which
+/// returns to the HTTP caller immediately and never reaches the loop — spawns it
+/// as a detached task. Before that second caller existed, an image attached to a
+/// message that arrived mid-turn produced no `ImageDescribed` at all, so once its
+/// bytes aged out of context the thread held no record of what had been shown.
+///
+/// Hashes come from the persisted `MessageReceived` row so images whose decode
+/// failed at emit time are not re-included. Emitting nothing when the
+/// description is missing, empty, or judged bad is the intended no-op.
+pub(crate) async fn emit_image_descriptions(
+    event_store: &crate::core::EventStore,
+    bus: &crate::engine::event_bus::EventBus,
+    thread_id: Uuid,
+    origin_id: Uuid,
+    channel: Option<crate::engine::thread_events::EventChannel>,
+    handle: Option<tokio::task::JoinHandle<Option<(String, String)>>>,
+) {
+    // Resolve the Flash description (should be done by now — Flash is much
+    // faster than the main model's first response). The handle yields
+    // `(description, model)` so we can stamp the producing model on the
+    // emitted `ImageDescribed` event.
+    let Some((desc, model)) = (match handle {
+        Some(h) => match h.await {
+            Ok(opt) => opt.filter(|(d, _)| !is_bad_image_description(d)),
+            Err(_) => None,
+        },
+        None => None,
+    }) else {
+        return;
+    };
+
+    let hashes = match event_store.get_event_by_id(origin_id).await {
+        Ok(Some(row)) => row
+            .payload
+            .get("user_image_hashes")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|h| h.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        Ok(None) => {
+            crate::log!(
+                "[AgentLoop] ImageDescribed: origin event {} not found, skipping emit",
+                origin_id
+            );
+            Vec::new()
+        }
+        Err(e) => {
+            crate::log!(
+                "[AgentLoop] ImageDescribed: failed to load origin event {}: {}",
+                origin_id,
+                e
+            );
+            Vec::new()
+        }
+    };
+
+    for hash in hashes {
+        bus.emit_or_log(
+            crate::engine::event_bus::BusEvent::Thread {
+                thread_id,
+                event: crate::engine::thread_events::ThreadEvent::ImageDescribed {
+                    source_event_id: origin_id,
+                    hash,
+                    description: desc.clone(),
+                    model: model.clone(),
+                },
+                // Engine-internal enrichment; inherit the turn's channel but
+                // drop request_event_id (this isn't a response to the user's
+                // request, it's a derived fact about the request itself).
+                meta: crate::engine::thread_events::EventMeta {
+                    channel,
+                    ..crate::engine::thread_events::EventMeta::NONE
+                },
+            },
+            "[AgentLoop] ImageDescribed",
+        )
+        .await;
+    }
+}
+
 /// Defensive post-loop guard: emits `ResponseAborted` if no terminator
 /// landed for `request_event_id`. Catches future regressions in the
 /// loop's many return paths — every existing path emits explicitly, but
@@ -964,6 +1128,12 @@ pub(crate) async fn ensure_terminator_emitted(
 pub(crate) struct ContextCaptureSeed<'a> {
     pub sections: &'a [crate::engine::ContextSection],
     pub tools: &'a [String],
+    /// Total chars of the tool DEFINITIONS (schemas), as opposed to `tools`
+    /// which is just their names. Counted into `estimated_total_tokens` because
+    /// the schemas are sent on every request and the trim budget already
+    /// subtracts them — omitting them here made the reported context size
+    /// disagree with the budget the engine was actually enforcing.
+    pub tool_defs_chars: usize,
     pub model: &'a str,
     pub capture_body: bool,
 }

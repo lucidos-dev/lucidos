@@ -10,14 +10,64 @@
 
 use uuid::Uuid;
 
-use super::super::{BusEvent, EventBus, CLEAR_CODING_AGENT_FLAGS, STATUS_FROM_PROPOSED_CHANGE};
+use super::super::{
+    preserving_failed, BusEvent, EventBus, CLEAR_CODING_AGENT_FLAGS, STATUS_FROM_PROPOSED_CHANGE,
+};
 use super::propagation::{
     load_blocking_sample, propagate_blocking_change, reconcile_parent_active_children_count,
     reconcile_proposal_lifecycle_end, reincrement_parent_active_count_if_revived,
 };
 use crate::core::store::LegacyInitiator;
-use crate::engine::thread_events::{ActorMode, EventMeta, MessageOrigin, ThreadEvent};
+use crate::engine::thread_events::{
+    ActorMode, AnswerKind, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+};
 use crate::engine::thread_lifecycle::{resolve_transition, ArchiveState};
+
+/// Whitespace `btrim` must strip when matching a submitted answer against the
+/// stored draft, so the comparison agrees with the client's `String.prototype
+/// .trim()`. Bound as a parameter because one-argument `btrim` strips spaces
+/// only — a textarea's trailing newline would otherwise defeat the match.
+const COMPOSE_TRIM_CHARS: &str = " \t\n\r\u{000b}\u{000c}";
+
+/// Announce that the thread's stored draft is gone. Every projection arm that
+/// empties the compose fields owes one of these: the clear is otherwise silent,
+/// and a device holding the same draft keeps showing it until its next
+/// thread-summary reload. A thread event won't do — delivery can lag
+/// arbitrarily behind the transaction, so the frontend only treats a compose
+/// REPORT as evidence of the server's current state (`serverDraft` in
+/// `store/actions/compose.ts`). `origin_device_id: None` because this is the
+/// server's own report, not any device's echo, so nobody suppresses it.
+fn compose_cleared_broadcast(thread_id: Uuid) -> BusEvent {
+    BusEvent::System(
+        crate::engine::event_bus::SystemEvent::ThreadComposeChanged {
+            id: thread_id,
+            text: String::new(),
+            image_hashes: Vec::new(),
+            mode: None,
+            selection: None,
+            origin_device_id: None,
+        },
+    )
+}
+
+/// Whether the thread currently holds a draft that a compose-clearing arm is
+/// about to wipe — so the arm knows whether it has anything to announce. One
+/// cheap in-tx read per submitted message; the alternative (broadcasting
+/// unconditionally) would claim a change on every message for threads that
+/// never had a draft.
+async fn thread_holds_a_draft(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    thread_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let held: Option<bool> = sqlx::query_scalar(
+        "SELECT compose_text <> '' OR COALESCE(compose_images, '[]'::jsonb) <> '[]'::jsonb \
+         FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(held.unwrap_or(false))
+}
 
 impl EventBus {
     /// Returns side-effect events to emit after the main transaction commits,
@@ -91,6 +141,12 @@ impl EventBus {
                 // one is agent activity. Drives which attributed-recency column
                 // the follow-up UPDATE bumps below.
                 let human = matches!(mode, ActorMode::Human);
+                // Read BEFORE the upsert below wipes the compose fields: the
+                // send is what ends the draft's life, and peers must be told
+                // (see `compose_cleared_broadcast`). `sendCompose` cancels its
+                // own compose PUT and relies on exactly this clear, so nothing
+                // else on that path would report it.
+                let had_draft = thread_holds_a_draft(tx, thread_id).await?;
                 // Compute child depth and inherit initiator from parent —
                 // a non-Human parent forces "system" on its descendants.
                 let (child_depth, initiator) = if let Some(pid) = parent_thread_id {
@@ -179,12 +235,42 @@ impl EventBus {
                     }
                 }
 
-                Vec::new()
+                if had_draft {
+                    vec![compose_cleared_broadcast(thread_id)]
+                } else {
+                    Vec::new()
+                }
             }
-            // Claude Code session lifecycle — session start/continuation don't update last_activity
-            // (the first real activity event will set it).
+            // Session lifecycle — session start/continuation don't update
+            // last_activity (the first real activity event will set it).
             ThreadEvent::SessionStarted { .. } | ThreadEvent::ContinuationStarted { .. } => {
-                let source = meta.channel.as_ref().map(|c| c.as_str()).unwrap_or("claude_code");
+                // Does this event assert coding-agent identity? `SessionStarted`
+                // inherently does — only an agent session emits it.
+                // `ContinuationStarted` does NOT: it is the resume boundary for
+                // chat and trigger threads too (`chat/rerun.rs`'s
+                // `emit_resume_anchor`, reached from `continue_chat` via
+                // `POST /api/v1/threads/:id/continue` and from the chat
+                // answer-resume path), so it speaks for a coding agent only on
+                // the ClaudeCode channel. This arm used to hardcode
+                // `is_coding_agent = TRUE`, which permanently relabeled a chat
+                // thread on its first Continue click — and since
+                // `continue_thread` dispatches on that flag, the NEXT click then
+                // took the coding-agent branch and never reached `continue_chat`
+                // at all.
+                let is_coding_agent_event = matches!(event, ThreadEvent::SessionStarted { .. })
+                    || meta.channel == Some(EventChannel::ClaudeCode);
+                // Gated by `$7` below, so the fallback is load-bearing only on
+                // the INSERT path (row absent) — where the row's channel still
+                // has to come from somewhere. A channel-less
+                // `ContinuationStarted` can no longer stamp 'claude_code' onto
+                // an existing chat thread.
+                let source = meta.channel.as_ref().map(|c| c.as_str()).unwrap_or(
+                    if is_coding_agent_event {
+                        "claude_code"
+                    } else {
+                        "chat"
+                    },
+                );
                 // Extract repo_id + coding-agent-kind fields from SessionStarted;
                 // ContinuationStarted carries none of these (it's a marker for
                 // a fresh CC subprocess on an existing thread — the kind/folder
@@ -215,9 +301,18 @@ impl EventBus {
                 };
                 sqlx::query(
                     r#"INSERT INTO thread_summaries (thread_id, source, is_coding_agent, created_at, last_activity, message_count, status, last_revived_at, cc_repo_id, coding_agent_kind, coding_agent_folder, coding_agent, state)
-                       VALUES ($1, $2, TRUE, NOW(), NOW(), 0, 'running', NOW(), $3, $4, $5, $6, 'active')
+                       VALUES ($1, $2, $7, NOW(), NOW(), 0, 'running', NOW(), $3, $4, $5, $6, 'active')
                        ON CONFLICT (thread_id) DO UPDATE
-                       SET is_coding_agent = TRUE, source = $2,
+                       -- Monotone: a coding-agent event sets the flag and
+                       -- nothing here clears it, so no ordering of events can
+                       -- downgrade a real coding-agent thread. Repairing rows
+                       -- the old hardcoded TRUE already corrupted is the
+                       -- migration's job, not the projection's.
+                       SET is_coding_agent = thread_summaries.is_coding_agent OR $7,
+                           -- Only a coding-agent event may (re)assert the
+                           -- thread's channel; a chat/trigger resume boundary
+                           -- says nothing about it.
+                           source = CASE WHEN $7 THEN $2 ELSE thread_summaries.source END,
                            initiator = COALESCE(thread_summaries.initiator, 'unknown'),
                            -- Existing value wins: a thread's repo is locked at first SessionStarted.
                            -- The chat handler enforces that follow-ups can't pick a different repo,
@@ -230,10 +325,17 @@ impl EventBus {
                            -- between Claude Code and Codex mid-conversation.
                            coding_agent = COALESCE(thread_summaries.coding_agent, $6),
                            state = 'active',
-                           compose_text = '',
-                           compose_images = '[]'::jsonb,
-                           compose_mode = NULL,
-                           compose_selection = NULL
+                           -- Gated too: a coding-agent session start consumes
+                           -- the thread's prompt, but a chat/trigger Continue
+                           -- consumes nothing — the user clicked Continue, they
+                           -- did not send — so their draft must survive. It also
+                           -- has to: this arm emits no `compose_cleared_broadcast`
+                           -- (see the fn's doc), so a clear here is invisible to
+                           -- peer devices, which would keep showing the ghost draft.
+                           compose_text = CASE WHEN $7 THEN '' ELSE thread_summaries.compose_text END,
+                           compose_images = CASE WHEN $7 THEN '[]'::jsonb ELSE thread_summaries.compose_images END,
+                           compose_mode = CASE WHEN $7 THEN NULL ELSE thread_summaries.compose_mode END,
+                           compose_selection = CASE WHEN $7 THEN NULL ELSE thread_summaries.compose_selection END
                        -- Defense in depth (see MessageReceived above for rationale).
                        WHERE thread_summaries.state != 'discarded'"#,
                 )
@@ -243,6 +345,7 @@ impl EventBus {
                 .bind(session_kind)
                 .bind(session_folder)
                 .bind(session_agent)
+                .bind(is_coding_agent_event)
                 .execute(&mut **tx)
                 .await?;
                 Vec::new()
@@ -354,27 +457,29 @@ impl EventBus {
                 // means the Diff button is enabled the moment CC idles with
                 // a diff, regardless of whether `ChangeProposed` has fired.
                 //
-                // The `status` CASE preserves a `failed` status: a CC turn that
+                // `preserving_failed` keeps a `failed` verdict: a CC turn that
                 // ends in failure emits `ResponseFailed` (→ status='failed')
                 // immediately followed by this `CodingAgentIdled` in the SAME
                 // turn (`classify_result` returns `emit_idle=true` for every
-                // non-shutdown Result, including the Failed kind). Without the
-                // CASE this bookkeeping idle would downgrade 'failed' → 'idle'
-                // and erase the red error dot in the thread list. The terminal
-                // event owns the turn's status; this idle only parks the thread
-                // when the turn didn't already fail. A later follow-up
-                // (`CodingAgentUserMessageSent` → 'running') clears 'failed'
-                // before the next idle, so the failure can't wedge the thread.
-                // Mirrors the `CASE WHEN status='running'` preservation the
-                // `ChangeProposed` arm uses for the same class of reason.
+                // non-shutdown Result, including the Failed kind), and an
+                // interrupted turn emits `ResponseAborted` then this idle.
+                // Without the guard this bookkeeping idle would downgrade
+                // 'failed' → 'idle' and erase the red error dot in the thread
+                // list. The terminal event owns the turn's status; this idle
+                // only parks the thread when the turn didn't already fail. A
+                // later follow-up (`CodingAgentUserMessageSent` → 'running')
+                // clears 'failed' before the next idle, so the failure can't
+                // wedge the thread. Mirrors the `CASE WHEN status='running'`
+                // preservation the `ChangeProposed` arm uses for the same
+                // class of reason.
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_agent_action = NOW(), \
                      has_response = TRUE, \
                      coding_agent_is_external_repo = $2, \
                      coding_agent_has_diff = $3, \
-                     status = CASE WHEN status = 'failed' THEN 'failed' \
-                                   ELSE {STATUS_FROM_PROPOSED_CHANGE} END \
+                     status = {} \
                      WHERE thread_id = $1",
+                    preserving_failed(STATUS_FROM_PROPOSED_CHANGE)
                 ))
                 .bind(thread_id)
                 .bind(is_external_repo)
@@ -574,12 +679,26 @@ impl EventBus {
 
             // Events that update status but no other metadata.
             ThreadEvent::ResponseCanceled { .. } => {
-                // User canceled — go idle (or waiting if there's a pending proposal).
-                // Set has_response so the thread appears in archive (a canceled
-                // response is still a response — the user should see the thread).
+                // User canceled — go idle. Set has_response so the thread
+                // appears in archive (a canceled response is still a response —
+                // the user should see the thread).
+                //
+                // `preserving_failed` covers the shutdown sweep's ordering:
+                // `shutdown_active_threads` emits `ResponseAborted` (→ 'failed')
+                // with NO `request_event_id`, then cancels the loop, whose own
+                // `ResponseCanceled` DOES carry one — so `emit_response_canceled`'s
+                // idempotency gate can't match the two and the phantom cancel
+                // lands on top. `ResponseAborted` "taking precedence" holds for
+                // the exchange label (`exchangeStatus` checks aborted before
+                // canceled, order-independently) but the status column is
+                // last-write-wins, so without this guard the sweep walked an
+                // interrupted chat thread's red dot back to 'idle'. A cancel of
+                // a genuinely new turn is preceded by a start event that already
+                // cleared 'failed', so a real Stop still settles the thread.
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET has_response = TRUE, \
-                     status = {STATUS_FROM_PROPOSED_CHANGE} WHERE thread_id = $1"
+                     status = {} WHERE thread_id = $1",
+                    preserving_failed(STATUS_FROM_PROPOSED_CHANGE)
                 ))
                 .bind(thread_id)
                 .execute(&mut **tx)
@@ -615,10 +734,18 @@ impl EventBus {
                 // handler is about to spawn a fresh session within the same
                 // request. Flipping to terminal here would render the exchange
                 // as "Aborted" until the retry's SessionStarted lands.
+                //
+                // `preserving_failed` for the same reason as `CodingAgentIdled`
+                // above: the session teardown that follows a failed or
+                // interrupted turn is bookkeeping, and must not walk the red
+                // error dot back to 'idle'. `SessionEnded` is coding-agent-only,
+                // so without the guard an interrupted coding-agent thread lost
+                // the verdict an interrupted Lucidos Agent thread keeps.
                 if !reason.is_transient() {
                     sqlx::query(&format!(
                         "UPDATE thread_summaries SET has_response = TRUE, \
-                         status = {STATUS_FROM_PROPOSED_CHANGE} WHERE thread_id = $1"
+                         status = {} WHERE thread_id = $1",
+                        preserving_failed(STATUS_FROM_PROPOSED_CHANGE)
                     ))
                     .bind(thread_id)
                     .execute(&mut **tx)
@@ -675,14 +802,23 @@ impl EventBus {
                     // is an artifact for review, not a parked loop. The
                     // pending-review state is carried by coding_agent_proposed,
                     // not by `status = 'waiting'`.
+                    //
+                    // `coding_agent_has_diff` is derived from the file list the
+                    // event actually carries, not hardcoded TRUE: every ordinary
+                    // proposal carries a non-empty list (unchanged), while
+                    // `reconcile_emptied_pending_change` re-emits with an empty
+                    // one to record that the branch's diff cancelled out — and
+                    // that must NOT light the thread's Diff button on a branch
+                    // whose live `git diff` is empty.
                     sqlx::query(
                         "UPDATE thread_summaries SET coding_agent_proposed = TRUE, \
-                         coding_agent_requires_restart = $2, coding_agent_has_diff = TRUE, \
+                         coding_agent_requires_restart = $2, coding_agent_has_diff = $3, \
                          status = CASE WHEN status = 'running' THEN status ELSE 'idle' END \
                          WHERE thread_id = $1",
                     )
                     .bind(thread_id)
                     .bind(*requires_restart)
+                    .bind(!files.is_empty())
                     .execute(&mut **tx)
                     .await?;
                     ChangesProjection::write_proposed_aggregate(
@@ -828,6 +964,23 @@ impl EventBus {
                 // way. Mirrors `status_transitions()` for these event types — see
                 // `thread_lifecycle.rs`.
                 //
+                // The bump is `preserving_failed`, so it can revive a thread
+                // that drifted to 'idle'/'waiting' but never one whose turn
+                // already carries a terminal `failed` verdict. That case is
+                // routine for a coding agent and impossible for the Lucidos
+                // Agent, which is why only the latter used to keep its error
+                // dot after an interruption: the restart teardown emits
+                // `ResponseAborted` while the subprocess is still alive, and
+                // `external_terminal_emitted` suppresses only the duplicate
+                // TERMINAL — the drain keeps forwarding
+                // `CodingAgentTextStreamed` / `CodingAgentToolResult` for
+                // milliseconds afterwards. Those landed here, wrote 'running'
+                // over the verdict, and the `CodingAgentIdled` closing the turn
+                // then read a non-'failed' row and settled it to 'idle'. The
+                // chat loop emits nothing after its own terminator, so its
+                // 'failed' survived. Reviving on trailing output is wrong on
+                // its own terms too: the turn is over, nothing is running.
+                //
                 // Exception: `MessageOrigin::System` activity events are
                 // backfill from the recovery sweeps (see
                 // `recover_orphan_tool_calls` in `engine/chat/recovery.rs` —
@@ -851,14 +1004,19 @@ impl EventBus {
                     .execute(&mut **tx)
                     .await?;
                 } else {
-                    sqlx::query(
+                    // `last_revived_at` tracks the bump, so it must skip
+                    // exactly the rows the bump skips — a preserved 'failed'
+                    // thread was not revived and must not reshuffle the
+                    // IN PROGRESS sort order.
+                    sqlx::query(&format!(
                         "UPDATE thread_summaries SET last_activity = NOW(), \
                          last_agent_action = NOW(), \
-                         last_revived_at = CASE WHEN status != 'running' THEN NOW() \
-                                                ELSE last_revived_at END, \
-                         status = 'running' \
+                         last_revived_at = CASE WHEN status NOT IN ('running', 'failed') \
+                                                THEN NOW() ELSE last_revived_at END, \
+                         status = {} \
                          WHERE thread_id = $1",
-                    )
+                        preserving_failed("'running'")
+                    ))
                     .bind(thread_id)
                     .execute(&mut **tx)
                     .await?;
@@ -891,7 +1049,7 @@ impl EventBus {
             // an AskUserQuestion after the thread parked spawns a `--resume`
             // (see `agent_question.rs`, `ANSWERED_AFTER_IDLE_REASON`). So it must
             // flip `idle -> running` UNCONDITIONALLY.
-            ThreadEvent::UserQuestionAnswered { .. } => {
+            ThreadEvent::UserQuestionAnswered { answer, .. } => {
                 sqlx::query(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), \
                      status = 'running', last_revived_at = NOW() WHERE thread_id = $1",
@@ -899,7 +1057,61 @@ impl EventBus {
                 .bind(thread_id)
                 .execute(&mut **tx)
                 .await?;
-                Vec::new()
+                // Text typed into the composer to answer a question IS a
+                // submitted draft — but this path never emits `MessageReceived`
+                // (chat/process/run.rs reroutes typed text straight to the
+                // answer), so the send arm's compose clear above never runs for
+                // it. Left unhandled, the draft survives in the projection and
+                // re-syncs to every device the moment the submitting client's
+                // own compose PUT fails to land.
+                //
+                // Scoped to the draft that was ACTUALLY submitted — the client
+                // trims before submitting, the stored draft may not be, so both
+                // sides are trimmed. The character set is bound explicitly
+                // because one-argument `btrim` strips SPACES ONLY, which would
+                // miss the trailing newline a textarea leaves behind. Unlike a
+                // send, which replaces the composer's contents by definition, an
+                // answer says nothing about different text a peer is still
+                // writing — so an unrelated draft must survive. An answer
+                // carries no image hashes (the composer refuses to submit one
+                // with attachments), so a stored draft WITH images is likewise
+                // not the thing that was submitted and keeps them — same
+                // text-plus-hashes match the client's supersede rule uses. A
+                // click-only answer submits no composer text and clears nothing.
+                let submitted_text = match answer {
+                    AnswerKind::FreeText { text } => Some(text.as_str()),
+                    // Multi-select folds the prompt textarea's text in alongside
+                    // the toggled options.
+                    AnswerKind::MultiSelected { text: Some(text), .. } => Some(text.as_str()),
+                    _ => None,
+                }
+                // Blank text submits no draft, and would match a row whose
+                // compose_text is already empty — clearing that row's stored
+                // `compose_selection` for nothing.
+                .filter(|t| !t.trim().is_empty());
+                let mut cleared_draft = false;
+                if let Some(text) = submitted_text {
+                    cleared_draft = sqlx::query(
+                        "UPDATE thread_summaries \
+                         SET compose_text = '', compose_images = '[]'::jsonb, \
+                             compose_mode = NULL, compose_selection = NULL \
+                         WHERE thread_id = $1 \
+                           AND btrim(compose_text, $3) = btrim($2, $3) \
+                           AND COALESCE(compose_images, '[]'::jsonb) = '[]'::jsonb",
+                    )
+                    .bind(thread_id)
+                    .bind(text)
+                    .bind(COMPOSE_TRIM_CHARS)
+                    .execute(&mut **tx)
+                    .await?
+                    .rows_affected()
+                        > 0;
+                }
+                if cleared_draft {
+                    vec![compose_cleared_broadcast(thread_id)]
+                } else {
+                    Vec::new()
+                }
             }
             // A permission resolution only ever unblocks an in-memory broadcast
             // waiter (cc_permission / command_permission / mcp_permission) — it

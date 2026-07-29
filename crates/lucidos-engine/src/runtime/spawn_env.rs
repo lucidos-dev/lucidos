@@ -524,7 +524,9 @@ mod tests {
         isolate_in_process_group(&mut cmd);
         cmd.kill_on_drop(true);
         let Ok(mut child) = cmd.spawn() else {
-            eprintln!("SKIP graceful_kill_force_kills_a_sigterm_ignoring_group: perl unavailable");
+            crate::log!(
+                "[SpawnEnv] SKIP graceful_kill_force_kills_a_sigterm_ignoring_group: perl unavailable"
+            );
             return;
         };
         let pid = child.id().expect("child pid");

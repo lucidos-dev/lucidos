@@ -38,7 +38,7 @@ sudo -u postgres /usr/lib/postgresql/18/bin/pg_ctl -D "$PGDATA" -l "$PGDATA/post
 
 # Wait for PostgreSQL to be ready
 echo "Waiting for PostgreSQL..."
-for i in {1..30}; do
+for _ in {1..30}; do
     if sudo -u postgres /usr/lib/postgresql/18/bin/pg_isready -q; then
         break
     fi

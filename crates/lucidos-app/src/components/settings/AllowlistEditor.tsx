@@ -56,13 +56,17 @@ function AllowlistRow({ pattern, placeholder, onInput, onDelete }: {
   return (
     <div class="allowlist-row">
       <SkBlock w="100%" h="2.25rem" round>
+        {/* autocorrect/autocapitalize are deliberately NOT declared here: the
+            global stamp (utils/noAutofill.ts) already turns both off for every
+            field, and declaring autocorrect="off" in JSX would actually turn it
+            ON — Preact assigns it as a DOM property, and `autocorrect`'s IDL
+            attribute is a boolean, so the non-empty string "off" coerces to
+            true. The stamp's setAttribute writes the literal keyword instead. */}
         <input
           class="allowlist-row-input"
           type="text"
           spellcheck={false}
           autocomplete="off"
-          autocorrect="off"
-          autocapitalize="off"
           placeholder={placeholder}
           value={pattern}
           onInput={(e) => onInput?.((e.target as HTMLInputElement).value)}

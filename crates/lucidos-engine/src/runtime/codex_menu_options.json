@@ -1,15 +1,19 @@
 {
-  "_note": "Source of truth for the Codex coding-agent /model and /effort pickers. Hand-maintained like cc_menu_options.json — the Codex CLI's `exec --json` stream does not expose available models programmatically (https://github.com/openai/codex/issues/14736). Current lineup per https://developers.openai.com/codex/models (checked 2026-06-12). include_str!() baked at compile time, parsed once via LazyLock — no runtime IO cost.",
+  "_note": "Source of truth for the Codex coding-agent /model and /effort pickers. Hand-maintained like cc_menu_options.json — the Codex CLI's `exec --json` stream does not expose available models programmatically (https://github.com/openai/codex/issues/14736). Current lineup and effort matrix verified via app-server model/list on codex-cli 0.144.4 (2026-07-14). include_str!() baked at compile time, parsed once via LazyLock — no runtime IO cost. Efforts without supported_models are universal; restricted efforts are filtered in the frontend and pair-validated by both drivers so stale settings cannot fail a turn (see docs/code-review-priors.md).",
   "models": [
-    { "value": "default",      "label": "Default",      "description": "Use your Codex config's default model" },
-    { "value": "gpt-5.5",      "label": "GPT-5.5",      "description": "Most capable — current flagship" },
-    { "value": "gpt-5.4",      "label": "GPT-5.4",      "description": "Previous flagship with native computer use" },
-    { "value": "gpt-5.4-mini", "label": "GPT-5.4 mini", "description": "Faster, lower-cost for lighter tasks" }
+    { "value": "default",       "label": "Default",       "description": "Use your Codex config's default model" },
+    { "value": "gpt-5.6-sol",   "label": "GPT-5.6 Sol",   "description": "Most capable — current flagship" },
+    { "value": "gpt-5.6-terra", "label": "GPT-5.6 Terra", "description": "Balanced capability and speed" },
+    { "value": "gpt-5.6-luna",  "label": "GPT-5.6 Luna",  "description": "Fastest, lower-cost for lighter tasks" },
+    { "value": "gpt-5.5",       "label": "GPT-5.5",       "description": "Prior flagship" },
+    { "value": "gpt-5.4",       "label": "GPT-5.4",       "description": "Older flagship with native computer use" },
+    { "value": "gpt-5.4-mini",  "label": "GPT-5.4 mini",  "description": "Faster, lower-cost for lighter tasks" }
   ],
   "reasoning_efforts": [
     { "value": "low",    "label": "Low",        "description": "Minimal thinking · Fastest responses" },
     { "value": "medium", "label": "Medium",     "description": "Balanced thinking · Default" },
     { "value": "high",   "label": "High",       "description": "Deep thinking · Most thorough" },
-    { "value": "xhigh",  "label": "Extra High", "description": "Extra deep thinking · Higher than High" }
+    { "value": "xhigh",  "label": "Extra High", "description": "Extra deep thinking · Higher than High" },
+    { "value": "max",    "label": "Max",        "description": "Maximum thinking · Hardest problems", "supported_models": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] }
   ]
 }

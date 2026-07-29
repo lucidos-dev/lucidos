@@ -20,8 +20,10 @@ import {
 import { addRestartGroup } from './chat-changes';
 import {
   handleFrontendUpdateDeferred,
+  handleFrontendUpdateStranded,
   handleEngineBuildStateChanged,
   type FrontendUpdateDeferredPayload,
+  type FrontendUpdateStrandedPayload,
 } from './engine-update';
 import { changeToastMessage } from './changeToast';
 import { scheduleServiceWorkerUpdateChecks } from '../../hooks/sw-update';
@@ -33,8 +35,7 @@ import { clearWipIfMatches } from './wipPreview';
 import { openCredentialRequest } from './credentials';
 import { openPluginInstallRequest } from './plugin-install';
 import { openPluginUninstallRequest } from './plugin-uninstall';
-import { landOnAccountsWithOverlay } from './menu';
-import { pushNavState } from './navigation';
+import { openEmailConfirmRequest } from './email-confirm';
 import { initPushSubscription } from './push';
 import { getDeviceId, toggleDevicePush } from './devices';
 import { scrollToBottom } from '../../components/chat/scrollState';
@@ -43,7 +44,7 @@ import { formatThreadLabel } from './thread-label';
 import { refreshRepoView } from './repositories';
 import { processSSEForReferences } from './entityReferences';
 import { loadAllThreads, refreshThreadEvents, loadThreadEvents } from './thread-loading';
-import { applyRemoteCompose, pendingComposePuts, hasLocalDraftEdit } from './compose';
+import { applyRemoteCompose, pendingComposePuts, hasUnsentLocalDraft, clearSupersededDraft } from './compose';
 import type { ComposeSelectionOverride } from '../composeSelections';
 import { clearDraft, setDraft } from '../composeDrafts';
 import { removeThreadNavEntries } from './thread-navigation';
@@ -470,24 +471,41 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   //      sendCompose/discardCompose already mutated local compose state
   //      synchronously. The SSE echo arrives later and would blank any text
   //      the user has started typing for the next message — drop it.
-  //   2. Locally-edited draft: a non-empty draft this device authored is the
-  //      user's unsent intent and must never be blanked by an inbound echo —
-  //      the same `hasLocalDraftEdit` empty-clear invariant stageDraftFromApi
-  //      and applyRemoteCompose enforce. This covers the ACTIVE-thread
-  //      follow-up draft the old `isComposeFocusedHere`-only guard missed: an
-  //      echoed MessageReceived whose device_id didn't match (e2e / cross-device)
-  //      wiped a just-typed follow-up after the user navigated away — the
-  //      value='' face of drafts.spec.ts:65 (docs/plans/2026-06-27-mobile-webkit-shard-contention.md).
+  //   2. Unsent local draft: a non-empty draft this device authored, whose text
+  //      has NOT since been submitted, is the user's unsent intent and must
+  //      never be blanked by an inbound echo — the same `hasUnsentLocalDraft`
+  //      empty-clear invariant stageDraftFromApi and applyRemoteCompose enforce.
+  //      This covers the ACTIVE-thread follow-up draft the old
+  //      `isComposeFocusedHere`-only guard missed: an echoed MessageReceived
+  //      whose device_id didn't match (e2e / cross-device) wiped a just-typed
+  //      follow-up after the user navigated away — the value='' face of
+  //      drafts.spec.ts:65 (docs/plans/2026-06-27-mobile-webkit-shard-contention.md).
+  //      A SUPERSEDED draft (this very message carries its text) is not unsent
+  //      work and does clear — that's how a draft submitted from another device
+  //      stops haunting this one.
   // Deliberately NOT gated on `isComposeFocusedHere`: a focus guard also keeps a
   // SERVER-ORIGINATED (synced-from-peer) draft the user never typed — so a
   // follow-up drafted on device A, synced here, then sent by A stayed as a ghost
-  // draft in this device's focused textarea. hasLocalDraftEdit is the correct
+  // draft in this device's focused textarea. hasUnsentLocalDraft is the correct
   // line (it's false for a synced draft, true the moment the user types), so the
   // backend's own compose_text='' clear on MessageReceived is mirrored here
   // regardless of focus.
   if (event.type === 'MessageReceived') {
     if (thread.meta.state !== 'active') { thread.meta.state = 'active'; metaChanged = true; }
-    if (!isFromThisDevice(event) && !hasLocalDraftEdit(threadId)) clearDraft(threadId);
+    if (!isFromThisDevice(event) && !hasUnsentLocalDraft(threadId)) clearDraft(threadId);
+  }
+  // A free-form answer to a pending question is a submitted draft that never
+  // becomes a MessageReceived — chat/process/run.rs reroutes the typed text
+  // straight to UserQuestionAnswered — so the arm above never sees it, and
+  // without this the draft that was answered with would linger. Scoped to the
+  // superseded case: unlike a send, a question answer does not clear the
+  // thread's shared draft server-side unless the submitted text IS that draft
+  // (see the projection's UserQuestionAnswered arm), so an unrelated draft here
+  // must survive rather than diverge from the server. The server's paired
+  // ThreadComposeChanged supplies the other half of the supersede test; whichever
+  // of the two frames lands second completes the clear.
+  if (event.type === 'UserQuestionAnswered' && seq !== null) {
+    clearSupersededDraft(threadId);
   }
   if (event.type === 'ThreadDiscarded') {
     if (thread.meta.state !== 'discarded') { thread.meta.state = 'discarded'; metaChanged = true; }
@@ -825,6 +843,15 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       handleFrontendUpdateDeferred(data as unknown as FrontendUpdateDeferredPayload);
       break;
 
+    case 'FrontendUpdateStranded':
+      // Dev-only transient signal: a frontend-only Apply rebuilt, but the engine
+      // serves a dist/ that nothing republishes into, so the change can never
+      // reach this client and no Switch will deliver it
+      // (engine::frontend_refresh's rebuild wait timed out). Warn, with the
+      // served path, instead of the pre-2026-07-26 silence.
+      handleFrontendUpdateStranded(data as unknown as FrontendUpdateStrandedPayload);
+      break;
+
     case 'ServedFrontendAdvanced':
       // Dev-only transient signal: THIS engine advanced its served-frontend
       // snapshot to the checkout-shared dist/ after a PEER workspace's
@@ -987,7 +1014,8 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
     //      EMPTY clear, though: that's the "follow-up sent/discarded elsewhere"
     //      signal, and gating it on focus left the peer's draft preserved in a
     //      focused-but-untyped textarea. applyRemoteCompose's own
-    //      hasLocalDraftEdit guard still protects a draft THIS device authored.
+    //      hasUnsentLocalDraft guard still protects unsent work THIS device
+    //      authored.
     case 'ThreadComposeChanged': {
       const originDeviceId = data.origin_device_id as string | undefined;
       if (originDeviceId && originDeviceId === getDeviceId()) break;
@@ -1074,9 +1102,7 @@ function handleTransientSideEffects(event: ThreadEvent | TransientEvent, sourceT
 
     case 'EmailConfirmRequested':
       try {
-        const request = JSON.parse((event as { payload: string }).payload);
-        landOnAccountsWithOverlay({ type: 'form', form: { type: 'email-confirm', request } });
-        pushNavState();
+        openEmailConfirmRequest(JSON.parse((event as { payload: string }).payload));
       } catch (e) {
         console.error('Failed to parse email confirm request:', e);
         showToast('Failed to handle email confirm request from engine', 'error');

@@ -132,6 +132,35 @@ describe('incremental grouping ≡ full grouping', () => {
     ]);
   });
 
+  it('question divider re-anchored below a ChildThreadCompleted that landed while it waited', () => {
+    // The 8144b43e shape. The answer re-orders the exchange array in place
+    // (`reanchorResolvedDivider`), which the incremental fold must reproduce
+    // exactly — a splice is the one mutation that could desync the cached
+    // array from a from-scratch pass.
+    replay([
+      { seq: 1, event: { type: 'MessageReceived', text: 'do the release' } as ThreadEvent },
+      { seq: 2, event: { type: 'ToolCalled', name: 'ask_user_question', args: {}, request_event_id: 'evt-1' } as ThreadEvent },
+      { seq: 3, event: { type: 'UserQuestionAsked', tool_use_id: 'q-1', cc_session_id: '', question: 'pick', options: [] } as ThreadEvent },
+      { seq: 4, event: { type: 'ChildThreadCompleted', child_thread_id: 'c-1', status: 'success', summary: 'done' } as ThreadEvent },
+      { seq: 5, event: { type: 'UserQuestionAnswered', tool_use_id: 'q-1', answer: { kind: 'Selected', option_id: 'a' } } as ThreadEvent },
+      { seq: 6, event: { type: 'TextStreamed', text: 'resuming', request_event_id: 'evt-1' } as ThreadEvent },
+      { seq: 7, event: { type: 'ResponseGenerated', text: 'resuming', request_event_id: 'evt-1' } as ThreadEvent },
+    ]);
+  });
+
+  it('child completion mid-thought hands the turn over (continuationMoved)', () => {
+    // The handoff sets a flag on the exchange the turn LEFT, which the
+    // incremental fold must set at the same event as the from-scratch pass —
+    // it decides whether an orphaned Thinking marker still renders.
+    replay([
+      { seq: 1, event: { type: 'MessageReceived', text: 'do the release' } as ThreadEvent },
+      { seq: 2, event: { type: 'ThoughtStreamed', text: 'planning', request_event_id: 'evt-1' } as ThreadEvent },
+      { seq: 3, event: { type: 'ChildThreadCompleted', child_thread_id: 'c-1', status: 'canceled', summary: 'canceled' } as ThreadEvent },
+      { seq: 4, event: { type: 'ToolCalled', name: 'run_bash', args: {}, request_event_id: 'evt-1' } as ThreadEvent },
+      { seq: 5, event: { type: 'ThoughtStreamed', text: 'still going', request_event_id: 'evt-1' } as ThreadEvent },
+    ]);
+  });
+
   it('abort opens a boundary exchange', () => {
     replay([
       { seq: 1, event: { type: 'MessageReceived', text: 'go' } as ThreadEvent },

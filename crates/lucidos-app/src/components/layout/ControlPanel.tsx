@@ -1,7 +1,7 @@
 import { createPortal } from 'preact/compat';
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { signal, useSignal } from '@preact/signals';
-import { connectionStatus, restartRequired, updateAvailable, engineVersionReady, engineBuilding, enginePackaged, workspaceName } from '../../store/store';
+import { connectionStatus, restartRequired, updateAvailable, engineVersionReady, engineBuilding, engineNewVersionReady, workspaceName } from '../../store/store';
 import { initiateEngineRestart } from '../../store/actions/chat-changes';
 import { refreshClient } from '../../hooks/sw-update';
 import { useLongPress } from '../../hooks/useLongPress';
@@ -122,28 +122,6 @@ export function toggleControlPanelAtClick(e: MouseEvent & { currentTarget: Event
     ? { x: e.clientX, y: e.clientY }
     : { x: rect.left + rect.width / 2, y: rect.bottom };
   controlPanelOpen.value = !controlPanelOpen.value;
-}
-
-/** Whether a new engine version is actually READY to switch onto — the honest
- *  "ready for the switch" signal that agrees with the background-build scheme.
- *
- *  In **dev** this is `engineVersionReady` alone: Apply is non-disruptive and
- *  kicks off a background rebuild, so a freshly-applied restart-requiring change
- *  (`restartRequired`) does NOT mean a new version exists yet — the switch only
- *  becomes available once that build finishes and the on-disk binary differs
- *  (the version-status poll flips `engineVersionReady`, see engine-update.ts).
- *  Surfacing it at Apply time lit the badge before anything could have been built.
- *
- *  In **packaged** there is no background build — a newer GitHub release is
- *  immediately installable — so `restartRequired` (set from the outdated-release
- *  check in connection.ts) IS the ready signal; `engineVersionReady` never fires
- *  there (the poll no-ops for packaged builds).
- *
- *  Note: `restartRequired` deliberately still gates the client-refresh ordering
- *  (client-update.ts holds a refresh until after the engine switch, even during
- *  the build window) — that is a different concern from this visible badge. */
-export function engineNewVersionReady(): boolean {
-  return engineVersionReady.value || (enginePackaged.value && restartRequired.value);
 }
 
 /** Visible state of the brand-title badge.

@@ -1,3 +1,5 @@
+import { errorDetail } from '../utils/errorDetail';
+
 // --- Async data loading ---
 // Every piece of async data must be in one of these states.
 // Components must handle all four (and both loaded sub-states: empty vs hits).
@@ -21,7 +23,11 @@ export function toFailed<T>(error: unknown): Loadable<T> {
   if (error instanceof Error && 'httpCode' in error && 'reason' in error) {
     return { status: 'failed', error: (error as { reason: string }).reason, httpCode: (error as { httpCode: number }).httpCode };
   }
-  return { status: 'failed', error: error instanceof Error ? error.message : String(error) };
+  // `errorDetail`, not `error.message`: the raw browser strings for a cancelled
+  // or timed-out fetch ("Fetch is aborted", "Load failed") are engine-specific
+  // jargon, and this text is rendered to the user beside a "Failed to load …"
+  // label. Toasts already go through the same formatter.
+  return { status: 'failed', error: errorDetail(error) };
 }
 
 /** Flip a signal to `loading` only if it isn't already `loaded`. Used by

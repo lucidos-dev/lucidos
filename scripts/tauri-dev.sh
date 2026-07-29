@@ -14,6 +14,10 @@ source "$SCRIPT_DIR/lib/ports.sh"
 source "$SCRIPT_DIR/lib/workspace.sh"
 source "$SCRIPT_DIR/lib/preflight.sh"
 
+# See the same guard in web-dev.sh — a worktree-rooted PROJECT_DIR pins the whole
+# stack to a throwaway checkout.
+assert_stack_not_worktree_pinned "$PROJECT_DIR" || exit 1
+
 cd "$PROJECT_DIR"
 
 parse_dev_args "$@"

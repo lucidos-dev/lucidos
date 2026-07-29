@@ -20,59 +20,25 @@ const keyFile = resolveTlsFile('key.pem', process.env.LUCIDOS_TLS_KEY);
 const hasCerts = !!(certFile && keyFile);
 
 /**
- * Bake the engine's CalVer VERSION into the client bundle as the virtual module
- * `virtual:engine-version`. The engine and client ship together — comparing the
- * bundled value against the running engine's reported version surfaces drift
- * after engine-only restarts (engine new, loaded JS old → user needs refresh)
- * and after Vite rebuilds (client new, engine old → user needs restart).
+ * The engine's CalVer VERSION is deliberately NOT baked into the client bundle.
  *
- * Re-reads on each module load and invalidates when VERSION changes, so the
- * engine-only restart path (which doesn't restart Vite) still picks up bumps —
- * in BOTH run modes: `addWatchFile` in `load` registers VERSION as a build
- * dependency so `vite build --watch` (the `--built` dev mode) re-runs `load`
- * and re-bakes ENGINE_VERSION on a bump, and `configureServer` does the same
- * for the live `--hmr` dev server. Without the `addWatchFile`, Rollup's watch
- * treated the virtual module as dependency-free and cached it forever, freezing
- * the bundled Client version at whatever VERSION was when the watch started —
- * so the control panel showed a permanent "Client (latest: …)" that no refresh
- * could clear, since every rebuilt bundle still carried the stale value.
+ * A `virtual:engine-version` plugin used to do exactly that, so the System page
+ * could show it as the "Client" version. It was a lie by construction: the value
+ * froze at whatever VERSION happened to be when the bundle was last built, while
+ * the running engine's own VERSION kept bumping on every engine-only Apply — two
+ * numbers on one page that could disagree with nothing the user could do about it
+ * (no reload changes a baked string). The `addWatchFile` that was supposed to
+ * re-bake it went inert when the `--built` dev mode replaced `vite build --watch`
+ * with `dev-build-watch.mjs`'s one-shot builds, which don't watch VERSION anyway.
+ *
+ * Keeping them in sync is worse than dropping the row: re-baking on every VERSION
+ * bump makes each engine-only change produce a byte-different bundle → a new
+ * sw.js BUILD_ID → a "New version available — refresh to sync" toast whose entire
+ * payload is a version string. Today an engine-only Switch correctly surfaces
+ * nothing (see store/actions/connection.ts). The client's honest identity is its
+ * own `CLIENT_BUILD_ID` (`virtual:build-id`, below) — that is what the System
+ * page shows and what the refresh badge compares.
  */
-function engineVersionPlugin(): Plugin {
-  const engineVersionFile = resolve(__dirname, '../lucidos-engine/VERSION');
-  const moduleId = 'virtual:engine-version';
-  const resolvedId = '\0' + moduleId;
-  function readVersion(): string {
-    try {
-      return fs.readFileSync(engineVersionFile, 'utf-8').trim();
-    } catch {
-      return '0.0.0-dev';
-    }
-  }
-  return {
-    name: 'engine-version',
-    resolveId(id) {
-      if (id === moduleId) return resolvedId;
-    },
-    load(id) {
-      if (id === resolvedId) {
-        // Declare the dependency so `vite build --watch` re-runs this load (and
-        // rebuilds the bundle → new asset hashes → new sw.js BUILD_ID → update
-        // toast) whenever VERSION changes on disk.
-        this.addWatchFile(engineVersionFile);
-        return `export const ENGINE_VERSION = ${JSON.stringify(readVersion())};`;
-      }
-    },
-    configureServer(server) {
-      server.watcher.add(engineVersionFile);
-      server.watcher.on('change', (path) => {
-        if (path === engineVersionFile) {
-          const mod = server.moduleGraph.getModuleById(resolvedId);
-          if (mod) server.moduleGraph.invalidateModule(mod);
-        }
-      });
-    },
-  };
-}
 
 /**
  * Suppress Vite full-reload during git merge bursts.
@@ -295,7 +261,7 @@ export default defineConfig({
   // engine static-serve, `vite preview`, and Tauri. In `vite serve` (HMR) a
   // relative base falls back to `/`, so the dev server is unaffected.
   base: './',
-  plugins: [engineVersionPlugin(), buildIdVirtualModule(), suppressMergeReload(), syncPublicDir(), stampServiceWorker(), preact(), atomicDistPublish()],
+  plugins: [buildIdVirtualModule(), suppressMergeReload(), syncPublicDir(), stampServiceWorker(), preact(), atomicDistPublish()],
   build: {
     // The eager entry chunk is the first-paint-critical app core (shell, store,
     // SSE/event handling, signals, layout) — ~517 kB minified / ~154 kB gzipped,

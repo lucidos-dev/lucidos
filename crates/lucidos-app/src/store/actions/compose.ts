@@ -35,7 +35,7 @@ import {
   type ComposeSelectionOverride,
 } from '../composeSelections';
 import type { ComposeDestination } from '../composeDestination';
-import { makeOptimisticThreadState, type ThreadMeta } from '../thread-events';
+import { makeOptimisticThreadState, type StoredEvent, type ThreadMeta } from '../thread-events';
 import { clearDraft, composeDrafts, draftIsEmpty, getDraft, patchDraft, setDraft, type ComposeDraft } from '../composeDrafts';
 import { API, ApiError, ensureThreadStarted, putComposeOnThread, deleteThread } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
@@ -157,24 +157,174 @@ export const composeEditedAt = new Map<string, number>();
  *  later refresh captures a request time AFTER the last local PUT settled. */
 export const composePutSettledAt = new Map<string, number>();
 
-function markLocallyEdited(threadId: string): void {
-  composeEditedAt.set(threadId, Date.now());
+/** Per-thread SERVER-time watermark captured at the last local compose edit:
+ *  the newest `thread_summaries.last_activity` this device had seen for the
+ *  thread at that moment (`meta.updatedAt`). Stamped together with
+ *  `composeEditedAt` by `markLocallyEdited`, and what makes a *superseded
+ *  draft* decidable WITHOUT ever comparing a client clock to a server clock —
+ *  both sides of the test (`draftIsSuperseded`) are server timestamps. Absent =
+ *  this device never authored the draft, so there is no reference point and
+ *  nothing can supersede it (the existing clear paths own that case). */
+export const composeEditWatermark = new Map<string, string>();
+
+/** What the server holds for a thread's draft — the compose fields the
+ *  supersede rule compares, minus the mode/selection it ignores. */
+export interface ServerDraft {
+  text: string;
+  imageHashes: string[];
 }
 
-/** True when this device holds a non-empty draft it locally authored for the
- *  thread — the shared invariant guard for every INBOUND compose EMPTY-clear
- *  path: the bulk `loadAllThreads` empty snapshot (`stageDraftFromApi`), an
- *  empty SSE `ThreadComposeChanged` (`applyRemoteCompose`), and the SSE
- *  `MessageReceived` echo's clear (`clearComposeIfUnfocused` in thread-sync).
- *  Such a draft is the user's unsent intent and must never be blanked by an
- *  inbound echo/snapshot — only a send/discard FROM THIS DEVICE clears it.
+/** This device's knowledge of the draft the SERVER currently holds for the
+ *  thread. Written ONLY where the server itself reports it: our own compose PUT
+ *  succeeding (the server now holds exactly what we sent), a thread-summary
+ *  snapshot, and a `ThreadComposeChanged` broadcast. Absent = never heard, so
+ *  nothing is known.
+ *
+ *  It is the second half of the supersede rule, and the half that keeps a
+ *  RE-TYPE safe when this device hadn't yet seen the submission: if the server
+ *  still holds our draft, our PUT landed AFTER the submission cleared compose,
+ *  so the draft is deliberate new work rather than the submission itself.
+ *  Server-event ordering alone cannot tell those apart — the watermark is stale
+ *  in exactly that case.
+ *
+ *  Deliberately NOT written from thread events, even though the projection
+ *  clears the compose fields in the same transaction as `MessageReceived`: an
+ *  event can be *delivered* long after it was written (a lagging stream, a
+ *  throttled tab, replay on wake), so it is no evidence of what the server holds
+ *  NOW — and letting a late one overwrite a newer PUT ack would re-open the very
+ *  hole this map closes. Only a report the server made about its CURRENT compose
+ *  state counts. */
+export const serverDraft = new Map<string, ServerDraft>();
+
+/** Record a server report of the thread's stored draft. Copies the hash array:
+ *  callers hand over an array they also stage into the local draft, and the two
+ *  records must not alias. */
+export function noteServerDraft(threadId: string, text: string, imageHashes: readonly string[]): void {
+  serverDraft.set(threadId, { text, imageHashes: [...imageHashes] });
+}
+
+function markLocallyEdited(threadId: string): void {
+  composeEditedAt.set(threadId, Date.now());
+  // `.peek()`, not `.value`: this runs from input/event handlers on the
+  // keystroke path, and subscribing the caller to `threadMap` here would wake
+  // every threadMap consumer per character (the whole reason draft text lives
+  // outside threadMap in the first place).
+  composeEditWatermark.set(threadId, threadMap.peek().get(threadId)?.meta.updatedAt ?? '');
+}
+
+/** The composer content a persisted event represents, or `null` when the event
+ *  is not something the user's composer submitted. A deliberately CLOSED set:
+ *  a sent message, and the two question answers that can carry typed text (the
+ *  free-form answer path never emits `MessageReceived` — chat/process/run.rs
+ *  reroutes typed text straight to `UserQuestionAnswered`). Agent- and
+ *  engine-authored entries — `UserPromptInjected` above all — are NOT user
+ *  submissions and must never supersede a draft. */
+function submittedUserInput(event: StoredEvent): { text: string; imageHashes: string[] } | null {
+  if (event.type === 'MessageReceived') {
+    return { text: event.text ?? '', imageHashes: event.user_image_hashes ?? [] };
+  }
+  if (event.type === 'UserQuestionAnswered') {
+    const { answer } = event;
+    if (answer.kind === 'FreeText') return { text: answer.text, imageHashes: [] };
+    // Multi-select folds the prompt textarea's text into the answer; an
+    // options-only answer submitted no composer text at all.
+    if (answer.kind === 'MultiSelected' && answer.text) return { text: answer.text, imageHashes: [] };
+  }
+  return null;
+}
+
+function sameHashes(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((h, i) => h === b[i]);
+}
+
+/** True when this device's draft is **superseded** — the server no longer holds
+ *  it, AND its exact content (trimmed text + image hashes) went out as a
+ *  submitted user input whose server `created` is strictly newer than the
+ *  draft's edit watermark.
+ *
+ *  Content match ALONE is deliberately not enough: the user must stay free to
+ *  post the same text many times. Two independent things make a re-type safe.
+ *  Ordering covers the ordinary case — the watermark captured on the re-type
+ *  already sits at/after the earlier submission's `created`, and the comparison
+ *  is strict `>`. The server-state check covers the case ordering CANNOT see:
+ *  if a peer submitted while this device was behind, the watermark is stale and
+ *  the late event looks newer, but our own PUT then re-wrote the text
+ *  server-side — so a server that still holds our draft is proof the draft
+ *  post-dates the submission and is new work, not the thing that was sent.
+ *
+ *  Cheap by construction: the O(1) early-outs reject every thread without a
+ *  locally-authored, server-cleared draft before the event scan, so nothing
+ *  walks history on the keystroke path (never called from `updateCompose`). */
+export function draftIsSuperseded(threadId: string): boolean {
+  const draft = getDraft(threadId);
+  if (draftIsEmpty(draft)) return false;
+  const watermark = composeEditWatermark.get(threadId);
+  if (watermark === undefined) return false;
+  // A write of ours is in flight (or still inside the debounce), so what the
+  // server holds is not yet knowable — every other compose guard yields to this
+  // set for the same reason.
+  if (pendingComposePuts.has(threadId)) return false;
+  const text = draft.text.trim();
+  const onServer = serverDraft.get(threadId);
+  // Never heard from the server (e.g. the draft's PUT has only ever failed) —
+  // the draft may be unsynced work, so it is not ours to drop.
+  if (onServer === undefined) return false;
+  // The server holds a live copy of THIS draft, so our PUT landed after the
+  // submission cleared compose. Compared on text AND images, so an images-only
+  // draft (both texts empty) isn't mistaken for one the server still has.
+  const heldOnServer = onServer.text.trim() !== '' || onServer.imageHashes.length > 0;
+  if (heldOnServer && onServer.text.trim() === text && sameHashes(draft.image_hashes, onServer.imageHashes)) {
+    return false;
+  }
+  const thread = threadMap.peek().get(threadId);
+  if (!thread) return false;
+  for (const event of thread.events.values()) {
+    // Missing `created` (a backend bug `handleEvent` already warns about)
+    // cannot be ordered against the watermark — never treat it as evidence.
+    if (!event.created || event.created <= watermark) continue;
+    const submitted = submittedUserInput(event);
+    if (!submitted) continue;
+    if (submitted.text.trim() === text && sameHashes(draft.image_hashes, submitted.imageHashes)) return true;
+  }
+  return false;
+}
+
+/** Drop a draft the thread's own history proves was already submitted. Self-
+ *  guarding, so any inbound path can fire it without pre-checking; it is the
+ *  ACTIVE half of the supersede rule, for the paths that carry no compose-clear
+ *  of their own — most importantly event replay on wake / SSE reconnect, where
+ *  `loadAllThreads` runs BEFORE the missed messages arrive, so the
+ *  empty-snapshot guard had no evidence to go on yet. */
+export function clearSupersededDraft(threadId: string): void {
+  if (!draftIsSuperseded(threadId)) return;
+  clearDraft(threadId);
+  // The projection wipes `compose_selection` alongside the text it cleared, so
+  // the draft's dropdown picks died with it. Dropping them here keeps local
+  // state from diverging — the replay path reaches this without ever passing
+  // through `setComposeSelectionFromServer`, so nothing else would.
+  clearComposeSelection(threadId);
+}
+
+/** True when this device holds UNSENT work for the thread: a non-empty draft it
+ *  locally authored, whose content has NOT since been submitted. The shared
+ *  invariant guard for every INBOUND compose EMPTY-clear path: the bulk
+ *  `loadAllThreads` empty snapshot (`stageDraftFromApi`), an empty SSE
+ *  `ThreadComposeChanged` (`applyRemoteCompose`), and the SSE `MessageReceived`
+ *  echo's clear (thread-sync). Such a draft is the user's unsent intent and must
+ *  never be blanked by an inbound echo/snapshot — only a send/discard FROM THIS
+ *  DEVICE, or the proof that the draft has already been submitted, clears it.
  *  (`upsertThread` guards the distinct NON-empty stale overwrite with the
  *  `composeEditedAt` / `composePutSettledAt` / `pendingComposePuts` timestamps,
  *  not this helper.) `composeEditedAt` is stamped by `markLocallyEdited` and
  *  never cleared, so a server-ORIGINATED draft (present but never edited here)
- *  returns false and stays clearable by a genuine remote clear. */
-export function hasLocalDraftEdit(threadId: string): boolean {
-  return composeEditedAt.has(threadId) && !draftIsEmpty(getDraft(threadId));
+ *  returns false and stays clearable by a genuine remote clear — and, without
+ *  the supersede half, a locally-authored one would have stayed UNclearable
+ *  forever, which is how a draft submitted from another device lived on here
+ *  for hours (docs/plans/2026-07-28-superseded-compose-drafts.md). */
+export function hasUnsentLocalDraft(threadId: string): boolean {
+  return composeEditedAt.has(threadId)
+    && !draftIsEmpty(getDraft(threadId))
+    && !draftIsSuperseded(threadId);
 }
 
 /** Single entry point for compose mutations from the UI. Optimistic local
@@ -237,6 +387,14 @@ export function applyRemoteCompose(
   },
 ): void {
   if (!threadMap.value.has(threadId)) return;
+  // The server just told us what it holds — record it whether or not we apply
+  // the payload locally (the empty branch below may keep a local draft). The
+  // caller already dropped our own echo and any in-flight local write, so this
+  // is a peer's report. A frame delayed past a later PUT ack of ours could
+  // still overwrite newer knowledge; that residual is accepted and self-heals
+  // (the server keeps the text, so the next snapshot re-stages it) — see
+  // `docs/code-review-priors.md` § Frontend for why the obvious guard is worse.
+  noteServerDraft(threadId, fields.text, fields.image_hashes);
   if (fields.text === '' && fields.image_hashes.length === 0 && fields.mode === null) {
     // A remote EMPTY snapshot must never clear a non-empty draft this device
     // authored — the SSE mirror of stageDraftFromApi's guard (thread-loading.ts).
@@ -246,10 +404,12 @@ export function applyRemoteCompose(
     // and lands here. Without this, that own/non-attributable empty echo blanks
     // the just-typed draft — the value='' face of drafts.spec.ts:65 (see
     // docs/plans/2026-06-28-drafts-sse-empty-clear-guard.md). Gate on
-    // hasLocalDraftEdit so a server-ORIGINATED draft (never edited here) is
-    // still clearable by a genuine peer clear; the kept draft is local-view only.
-    // The same guard covers the selection — a locally-edited draft keeps its picks.
-    if (hasLocalDraftEdit(threadId)) return;
+    // hasUnsentLocalDraft so a server-ORIGINATED draft (never edited here) is
+    // still clearable by a genuine peer clear, and so is a locally-authored one
+    // the thread's history shows was already submitted; the kept draft is
+    // local-view only. The same guard covers the selection — a draft with
+    // genuinely unsent work keeps its picks.
+    if (hasUnsentLocalDraft(threadId)) return;
     clearDraft(threadId);
     setComposeSelectionFromServer(threadId, fields.selection);
     return;
@@ -300,7 +460,13 @@ function imageHashesUnchanged(threadId: string, current: string[]): boolean {
   return prev.every((h, i) => h === current[i]);
 }
 
+/** In-flight `pushNow` calls per thread. A PUT slower than the debounce is
+ *  still running when the next one starts, so the first to finish must not
+ *  release `pendingComposePuts` on behalf of the later one. */
+const inFlightPushes = new Map<string, number>();
+
 async function pushNow(threadId: string): Promise<void> {
+  inFlightPushes.set(threadId, (inFlightPushes.get(threadId) ?? 0) + 1);
   try {
     try {
       // PUT 404s if the 250ms debounce elapses before POST /threads settles.
@@ -336,11 +502,25 @@ async function pushNow(threadId: string): Promise<void> {
       thread.meta.state === 'composing' ? draft.mode : null,
       selectionForPut,
     );
+    // Acked: the server now holds exactly what we sent. Recording it here is
+    // what keeps a draft typed while this device was behind a peer's submission
+    // from being mistaken for that submission — see `serverDraft`. A `null`
+    // wireHashes preserved the stored array, which is `draft.image_hashes` by
+    // construction (that's the condition for sending `null`).
+    noteServerDraft(threadId, draft.text, draft.image_hashes);
     if (wireHashes !== null) {
       lastSyncedImageHashes.set(threadId, wireHashes);
     }
   } finally {
-    pendingComposePuts.delete(threadId);
+    const stillRunning = (inFlightPushes.get(threadId) ?? 1) - 1;
+    if (stillRunning > 0) inFlightPushes.set(threadId, stillRunning);
+    else inFlightPushes.delete(threadId);
+    // Release ONLY when nothing newer is queued or still running. An edit made
+    // during this PUT scheduled a fresh debounce (and a slow PUT can overlap
+    // the next one outright); dropping the flag here would advertise "the
+    // server has seen our latest intent" while a later write is still pending —
+    // which is exactly what every consumer of this set reads it to mean.
+    if (stillRunning === 0 && !pendingTimers.has(threadId)) pendingComposePuts.delete(threadId);
     // Stamp the settle moment AFTER clearing pendingComposePuts: from here a
     // GET that started before this settle (its server snapshot read before our
     // PUT committed) must not clobber local compose state. See

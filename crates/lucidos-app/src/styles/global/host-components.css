@@ -432,6 +432,21 @@ html[data-theme="dark"] .split-button.open::before {
     outline: none;
 }
 
+/* Disabled-but-focusable menu row (aria-disabled, e.g. the diff-pinned Refresh
+ * collapsed into the content-header ⋯). Dimmed and hover-inert, but it stays in
+ * the roving-focus order — a `disabled` button would strand OverflowMenu's
+ * keyboard-open focus when the row is first. */
+.thread-overflow-item[aria-disabled="true"] {
+    opacity: 0.5;
+    cursor: default;
+}
+
+@media (hover: hover) {
+    .thread-overflow-item[aria-disabled="true"]:hover {
+        background: none;
+    }
+}
+
 /* Destructive overflow item (e.g. Delete draft) — red label + glyph, overriding
  * the item's default text/muted-icon colors. */
 .thread-overflow-item-danger,
@@ -498,7 +513,11 @@ html[data-theme="dark"] .split-button.open::before {
 
 .thread-info-dot-running { background: var(--accent); }
 .thread-info-dot-changes { background: var(--accent-green); }
-.thread-info-dot-waiting { background: var(--accent-yellow); }
+/* Waiting is a neutral in-between state, not a caution — --accent-notable, not
+   --accent-yellow. (The drawer row's own dot is .progress-dot-waiting, a pulsing
+   --text-secondary; this one only ever appears in the Info popover, beside the
+   word "Waiting".) */
+.thread-info-dot-waiting { background: var(--accent-notable); }
 .thread-info-dot-failed { background: var(--accent-red); }
 
 /* Saved pin (PinThreadButton): the icon is already filled (PinIcon filled) —

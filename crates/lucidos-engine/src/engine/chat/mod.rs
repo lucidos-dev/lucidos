@@ -5,7 +5,7 @@ mod process_cc;
 mod process_helpers;
 mod recovery;
 mod recursion_guard;
-mod rerun;
+pub(crate) mod rerun;
 mod spawn;
 mod title;
 

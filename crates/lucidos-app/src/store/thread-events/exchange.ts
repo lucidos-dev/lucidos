@@ -14,6 +14,18 @@ export type Exchange = {
    *  non-divider exchanges and on divider exchanges that have neither
    *  progression nor a matching answer yet. */
   questionOvertaken?: boolean;
+  /** True once the fold handed this exchange's running turn to a LATER
+   *  exchange — a `ChildThreadCompleted` card or a question / permission
+   *  divider took over the request-id redirect, so every remaining event of
+   *  the turn groups there instead. A `Thinking` marker still pending here can
+   *  therefore never be resolved by its own exchange, and rendering finalizes
+   *  it instead of shimmering forever (see `exchangeSteps` /
+   *  `exchangeResponseEvents`). Cleared if the exchange takes the continuation
+   *  back (a queued follow-up whose `UserPromptInjected` is absorbed, an
+   *  answered divider re-anchored to its resolution point). Only Thinking
+   *  markers are stale — a pending TOOL step can still be resolved by a result
+   *  that re-routes back by tool id. */
+  continuationMoved?: boolean;
   /** Mutation counter for the incremental grouping cache. The cached fold
    *  mutates Exchange objects IN PLACE on later appends (steps push,
    *  questionOvertaken flip, absorb re-anchor), so a memo comparing
@@ -261,6 +273,11 @@ const STATIC_MODEL_LABELS: Record<string, string> = Object.fromEntries([
   ['gpt-5.2-codex', 'GPT-5.2 Codex'],
   ['gpt-5.3-codex-spark', 'Codex Spark'],
   ['claude-opus-4-1', 'Opus 4.1'],
+  // The Claude Code picker stamps the 1M Opus variants without the `@default`
+  // alias (e.g. `claude-opus-5[1m]`), which the registry-backed labels don't
+  // cover — map them so coding-agent exchanges don't render the bare id.
+  ['claude-opus-5[1m]', 'Opus 5 (1M)'],
+  ['claude-opus-4-8[1m]', 'Opus 4.8 (1M)'],
   ['claude-haiku-4-5-20251001', 'Haiku 4.5'],
   ['claude-haiku-4-5@20251001', 'Haiku 4.5'],
   ['opus', 'Opus 4.6'],
@@ -414,10 +431,21 @@ export function fullCommandForCCTool(name: string, args: unknown): string | unde
       if (!Array.isArray(todos) || todos.length === 0) return undefined;
       const MARKERS: Record<string, string> = { completed: '[x]', in_progress: '[~]', pending: '[ ]' };
       return todos.map((t) => {
-        const { content, activeForm, status } = t as { content?: string; activeForm?: string; status?: string };
+        const { content, activeForm, status } = (t ?? {}) as { content?: string; activeForm?: string; status?: string };
         const marker = MARKERS[status ?? ''] ?? '[?]';
         const text = (status === 'in_progress' && activeForm) ? activeForm : (content ?? '');
         return `${marker} ${text}`;
+      }).join('\n');
+    }
+    // Codex's plan tool (both protocols normalize to {items: [{text, completed}]}
+    // — see runtime/codex_parse.rs + codex_app_server_parse.rs). Same marker
+    // list as CC's TodoWrite so the two backends' plan steps read alike.
+    case 'todo_list': {
+      const items = a.items;
+      if (!Array.isArray(items) || items.length === 0) return undefined;
+      return items.map((t) => {
+        const { text, completed } = (t ?? {}) as { text?: string; completed?: boolean };
+        return `${completed ? '[x]' : '[ ]'} ${text ?? ''}`;
       }).join('\n');
     }
     default: return undefined;

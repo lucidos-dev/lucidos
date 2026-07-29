@@ -5,9 +5,10 @@ workspace data lives on your filesystem and in a local PostgreSQL database that
 you control. This document explains what is stored locally, when data leaves
 your machine and why, and — importantly — that Lucidos collects **no telemetry**.
 
-> **Pre-1.0.** Lucidos is currently on the **0.9.x** line. Behaviour can change
-> before 1.0; this document describes the current release. If a change affects
-> what leaves your machine, we'll call it out in the [CHANGELOG](CHANGELOG.md).
+> **Pre-1.0.** Lucidos is pre-1.0 — the newest `v*` tag is the current
+> version. Behaviour can change before 1.0; this document describes the
+> current release. If a change affects what leaves your machine, we'll call it
+> out in the [CHANGELOG](CHANGELOG.md).
 
 ## TL;DR
 

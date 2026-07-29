@@ -17,6 +17,7 @@ _run_install() {
     fi
     # Some installers (rustup, brew on Apple Silicon) put binaries in dirs
     # not yet in this shell's PATH; source common shims so the verify works.
+    # shellcheck disable=SC1091 # rustup generates $HOME/.cargo/env on the host; not in this repo
     [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
     [ -x "/opt/homebrew/bin/brew" ] && eval "$(/opt/homebrew/bin/brew shellenv)"
     [ -x "/usr/local/bin/brew" ] && eval "$(/usr/local/bin/brew shellenv)"
@@ -63,6 +64,7 @@ _check_or_install() {
 check_prereqs() {
     if [[ "$OSTYPE" != "darwin"* ]]; then
         # Linux/Windows: no auto-install, but warn on missing required tools.
+        local t
         for t in cargo sccache cmake docker node; do
             command -v "$t" >/dev/null 2>&1 || echo "Warning: '$t' not found in PATH." >&2
         done
@@ -70,6 +72,7 @@ check_prereqs() {
     fi
 
     # Homebrew bootstraps everything else.
+    # shellcheck disable=SC2016 # the $(curl …) is part of the install command string, run later by bash -c
     _check_or_install brew    "Homebrew package manager" \
         '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"' required
 

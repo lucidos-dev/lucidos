@@ -55,6 +55,18 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   threads recover via Continue, and an Apply button on a failed turn's diff
   would over-claim (same reasoning as ADR 0001). `coding_agent_has_diff`
   keeps the Diff button visible meanwhile.
+- **Recovery marks a question-parked thread's pending change `incomplete`
+  BEFORE the preserve guard — deliberate, not a bypass.** In
+  `recover_orphaned_worktrees` (agent_recovery/recovery.rs), the
+  `mark_pending_change_incomplete` re-emit for an actively-running branch runs
+  before the `thread_has_unanswered_question` preserve `continue`. That is
+  conservative by design: the pending row was populated mid-turn (per-commit
+  emits) and the user never confirmed it, so Apply must require explicit
+  confirmation whether or not the thread is parked on a question. The
+  re-emitted `ChangeProposed` is not in the preserve predicate's terminal
+  exclusion list, so the card stays answerable; the flag self-heals to
+  `incomplete: false` at the resumed session's next clean idle. Re-flag only
+  if the re-emit starts landing an event from the predicate's exclusion list.
 - **Trigger threads run one indexed events-table lookup per persisted
   event** (the `is_top_level` latest-start query in
   `event_bus_projection_thread.rs`). Indexed, `LIMIT 1`, accepted cost.
@@ -111,8 +123,110 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   and the lifecycle docs already accept that merged/abandoned inputs can
   produce fewer Results than inputs. Emitting per-queued-input failures
   would double-fail turns the engine has already classified.
+- **`xhigh` and GPT-5.6-scoped `max` ARE valid codex reasoning efforts.** A
+  reviewer may flag that `codex_menu_options.json` exceeds the sample config's
+  documented minimal/low/medium/high vocabulary. Verified live via app-server
+  `model/list`: codex-cli 0.144.4 reports `[low, medium, high, xhigh, max]` for
+  GPT-5.6 Sol/Terra/Luna, while GPT-5.5/5.4/5.4-mini stop at `xhigh` (the older
+  0.142.5 probe likewise established `xhigh`). The menu carries that exact
+  model matrix and `validate_codex_effort` enforces it in both drivers. Re-flag
+  only with a reproduced rejection on a current Codex.
+  (`runtime/codex.rs`, `runtime/codex_menu_options.json`.)
+- **The app-server plan mapper's fresh `plan_<n>` ids do NOT fragment the
+  timeline vs the exec tracker's stable item id.** A reviewer may claim exec's
+  reused `todo_list` item id renders "one evolving card" while the app-server's
+  `plan_seq` ids render one card per revision. Both render identically: every
+  `CodingAgentToolCalled` unconditionally pushes a NEW step
+  (`exchange-render.ts` `pushStep`); the `tool_use_id` is used only to pair the
+  matching result onto the first unresolved step. One step per plan revision is
+  also exactly how CC's TodoWrite renders (each call is a fresh tool_use_id).
+  Unique ids are strictly safer for result pairing. Re-flag only if step
+  grouping starts keying dedup on `tool_use_id`.
+  (`runtime/codex_app_server_parse.rs`, `store/thread-events/exchange-render.ts`.)
+- **Per-manager `reject_path_traversal` wrappers are deliberate, not DRY drift.**
+  A reviewer may flag that `core/apps.rs` and `core/artifacts.rs` each carry a
+  private `reject_path_traversal` with the same message, and that
+  `commit_data_paths_added/removed` in `core/mod.rs` inline the same check —
+  proposing one shared `Result`-returning guard. The consolidation point is the
+  *predicate*: `core::is_path_traversal` is the single canonical guard (its doc
+  says so), and every site funnels through it. The thin wrappers differ by the
+  error type their layer needs (`std::io::Error` for apps, `git2::Error` for the
+  git-commit helpers); a shared wrapper would force `map_err` gymnastics at half
+  the call sites for a 4-line saving. Re-flag only if a wrapper stops delegating
+  to `is_path_traversal` (rule drift), or the message needs to change in
+  lockstep and copies have actually diverged.
+  (`core/mod.rs`, `core/apps.rs`, `core/artifacts.rs`.)
+
+- **The staged-resource resolvers (`LUCIDOS_CLI_BIN`, `LUCIDOS_SDK_DIR`,
+  `LUCIDOS_SYSTEM_KNOWHOW_DIR`) deliberately do NOT share an env-or-fallback
+  kernel, and `resolve_system_knowhow_dir` hardcodes the `"system-knowhow"`
+  basename.** Reviewers flag both: (1) "third/fourth bespoke
+  env-var-else-fallback resolver — extract a shared `resolve_staged_dir`" — but
+  the three implement deliberately *different* missing-resource policies (CLI:
+  sibling-walk + fail-fast at spawn; SDK: log + serve a stub; system-knowhow:
+  warn + None), and whether those policies should converge is the
+  separately-tracked silent-degrade-vs-fail-fast question
+  (`hardenproj-20260702-sdk-stub-silent-degrade`) — a shared kernel now would
+  force-fit divergent contracts. (2) "use `SYSTEM_KNOWHOW_PREFIX` instead of
+  the literal" — the `system-knowhow` name is a stable cross-layer contract
+  hardcoded equally in shell staging scripts (`RESOURCE_NAMES`,
+  `stage_runtime_assemble`), env-pair emitters, docs, and knowhow ids; a
+  Rust-side constant covers none of those, so it wouldn't reduce the real
+  rename surface. Re-flag only if the policies converge (then extract the
+  kernel) or a same-language duplicate pair actually diverges.
+  (`core/system_knowhow.rs`, `runtime/lucidos_cli.rs`, `api/sdk.rs`.)
+
+- **The "never leave the thread `running`" settle backstop belongs at the
+  CALLER of `run_direct_agent`, not inside it.** Reviewers see per-caller settle
+  logic (today `agent_recovery::continue_recovery`, driven from the spawn
+  consumer) and propose hoisting it into `run_direct_agent` so every caller
+  inherits the floor. It cannot go there: `run_direct_agent` also returns `Err`
+  when its spawn guard rejects the call because a **live** session already owns
+  the thread (`AGENT_ALREADY_RUNNING_ERROR`). At that point the caller owns
+  nothing and the `running` projection is TRUE — it belongs to the turn that won
+  the race — so a settle inside the callee would emit a terminal against a
+  working session. Only the caller knows whether it owns the turn. For the same
+  reason any caller-side backstop must carve that error out (the `Nothing` arm in
+  `continue_recovery`); re-flag only if the guard stops returning `Err` for a
+  live-session collision. (`agent_session/run_session/run.rs`,
+  `agent_recovery/helpers.rs`, `engine_impl/construction.rs`.)
+
+- **`STALE_RESUME_ERROR` is returned to the caller rather than retried inside
+  `run_session`, and that is not a missing abstraction.** Three callers each
+  implement their own stale-resume retry (chat, the merge/apply Tier-2 arm, the
+  spawn consumer's continuation) and it looks like copy-paste begging for a
+  shared internal retry. The retry *input* is what differs and it is
+  caller-specific: chat re-sends the user's message, the continuation re-sends
+  `CONTINUE_RESUME_USER_MESSAGE`, the merge path escalates to a fresh Tier-3
+  merge session — each with its own reconstruction/prompt shape. A callee-side
+  retry would have to guess. What IS shared is the decision, and that is already
+  factored out per caller-family. Re-flag only if two callers' retry inputs
+  converge. (`agent_session/run_session/run.rs`, `chat/process_cc.rs`,
+  `claude_code/merge_session.rs`.)
 
 ## Frontend
+
+- **`serverDraft` letting an inbound compose report overwrite a newer PUT ack is
+  the accepted, self-healing trade-off — the alternative re-breaks the bug it was
+  added for.** A reviewer (Codex flagged this P1) may note that
+  `applyRemoteCompose` records every `ThreadComposeChanged` payload as the
+  server's current compose state, and that a delayed frame could therefore
+  overwrite a newer PUT acknowledgement, briefly making a *superseded draft* look
+  clearable when the server actually still holds it. Three reasons it stands:
+  (1) The frame is already filtered — our own echo (`origin_device_id`) and any
+  in-flight local write (`pendingComposePuts`) are dropped before
+  `applyRemoteCompose`, so this needs an SSE frame delayed past a *separate*
+  successful PUT round-trip, in conjunction with the user re-typing the exact
+  submitted text against a stale watermark. (2) It is transient, not data loss:
+  the server still holds the text, so the next thread-summary snapshot re-stages
+  it into the composer via `stageDraftFromApi`. (3) The obvious "fix" — refusing
+  to let an EMPTY report downgrade a non-empty ack — makes a genuine peer clear
+  invisible until the next snapshot, which is exactly the ghost-draft bug
+  `docs/plans/2026-07-28-superseded-compose-drafts.md` exists to fix. The
+  principled fix is a server-stamped compose version on `ThreadComposeChanged`
+  plus the PUT response, so the two reports can be ordered; re-flag with that
+  design, not with the ordering suspicion alone.
+  (`store/actions/compose.ts` `serverDraft` / `applyRemoteCompose`.)
 
 - **`initiateEngineRestart` dismissing the `engine-new-version` switch toast on
   a spawn-FAILURE path is intentional; the badge is the recovery affordance.** A
@@ -280,6 +394,15 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `refreshThreadEvents` toasts user-visible failures itself after retrying.
   The justifying comments at the call sites are the carve-out contract
   (`.claude/rules/frontend.md` § best-effort telemetry).
+- **The heartbeat's `invoke('heartbeat').catch(() => {})` (useStartup, main.tsx)
+  is a local no-op, not a swallowed IPC failure.** Since the tauri 2.11 ACL
+  regression, `invoke` itself (`utils/tauri.ts`) records every outcome through
+  `utils/ipcHealth`, which writes durable `[Client/ipc]` lines to engine.log —
+  first failure immediately, then rate-limited, plus a recovery line. The signal
+  is taken at the one chokepoint precisely so call sites need not each report;
+  the same holds for the `console.warn`-only handlers in
+  `store/actions/native-push.ts`. Re-flag only if `invoke` stops feeding
+  `recordIpcOutcome`. (ADR 0028.)
 - **`clearStalePendingMessages` bumps inside its mutation guard** — when the
   filter removes nothing, nothing was mutated, so no bump is owed.
 - **`appFilters` / `repoFilters` / `triggerFilters` returning `[]` until
@@ -417,7 +540,106 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   (`components/layout/MobileAppHeader.tsx`, `components/layout/ConnectionStatus.tsx`,
   `styles/mobile.css` `.mobile-header-title` / `.mobile-content-title`.)
 
+- **A few CSS custom properties are referenced but never defined — that is the
+  point; they carry a `var()` fallback.** A scan for "undefined custom property"
+  flags `--border-subtle` (`chat/response.css` `.resume-note-body`, `steps.css`)
+  and `--accent-contrast` (`pages.css`) as broken references. They are not: every
+  use passes a second argument — `var(--border-subtle, var(--border-color))`,
+  `var(--border-subtle, var(--bg-tertiary))`, `var(--accent-contrast, #fff)` — so
+  the property is an OPTIONAL override hook with a working default, and CSS
+  resolves it to the fallback when the token is absent. Two more that look
+  undefined for different reasons: `--toast-accent` is declared per-type inline
+  (`.toast-warning { --toast-accent: … }`), so a line-anchored `^\s*--x:` grep
+  misses it, and `--user-ui-scale` / `--app-height` / `--thread-depth` are set
+  from JS at runtime. Re-flag only a `var(--x)` with NO second argument whose
+  token is absent from every `:root`/theme block and never assigned from JS.
+
+- **`path_is_in_cc_worktree` deliberately exists in THREE copies (bash, gateway,
+  engine) — do not "extract the duplicate".** A reviewer will flag the same 8-line
+  predicate in `scripts/lib/workspace.sh`, `crates/lucidos-gateway/src/stack.rs`, and
+  `crates/lucidos-engine/src/paths.rs` as a DRY violation. There is no shared home: one
+  copy is bash, and the gateway crate has NO dependency on the engine crate (check
+  `crates/lucidos-gateway/Cargo.toml` — the two are independent binaries by design), so
+  sharing would mean adding a workspace member crate for one function. Each copy carries a
+  doc comment naming the other two. Re-flag only if a shared crate already exists for
+  another reason, or if the three implementations have actually diverged in behaviour —
+  they are pinned by unit tests on each side (`stack::tests::detects_coding_agent_worktree_paths`,
+  `paths::tests::flags_coding_agent_worktree_paths`, and
+  `workspace_test.sh::test_worktree_predicate_classifies_paths`). See ADR 0021.
+
+- **The System page's "Client" row shows a build id, not a version — and the engine's
+  CalVer must NOT be baked into the bundle to "fix" that.** A reviewer will see
+  `Client 1ba1c823d933` next to `Engine 2026.07.27.1` and read it as an unfinished
+  row, or will find that `crates/lucidos-app/vite.config.ts` once had an
+  `engineVersionPlugin` (removed) and conclude this reverted the `addWatchFile` fix in
+  e337cc980. Neither holds. The web client has no version of its own: the only thing
+  identifying it is `CLIENT_BUILD_ID`, which is also the exact value the refresh badge
+  compares against the served `sw.js` build id, so the row and the badge agree by
+  construction. Baking the engine's VERSION in instead produced a value frozen at
+  bundle-build time that drifted on every engine-only Apply (nothing rebuilds the
+  frontend when only `VERSION` changes), showing two disagreeing numbers no reload
+  could reconcile. Re-baking on each bump is worse, not better: every engine-only
+  change would then emit a byte-different bundle → new `sw.js` BUILD_ID → a "refresh
+  to sync" toast whose whole payload is a version string, destroying the property that
+  a pure engine-only *Switch* surfaces nothing (`store/actions/connection.ts`). And
+  e337cc980's `addWatchFile` fed `resolveClientVersion`'s "(latest: X)" comparison,
+  which was itself deleted later as a phantom-update source — so the plugin had no
+  remaining consumer but this one display row. Tauri keeps a real Client version (a
+  versioned shell with a real updater). Pinned by
+  `components/settings/clientVersionSource.test.ts`; re-flag only if the web client
+  gains a genuine version of its own.
+
 ## Scripts (bash)
+
+- **`dev-runtime.md` / `build-release.md` list scripts in `paths:` that their
+  bodies never name — that over-match is deliberate.** Reviewers flag that
+  `dev-runtime.md` matches `scripts/lib/{sleep,preflight,host_load_guard*,webkit_reaper*}.sh`
+  and `scripts/lib/{sigterm_contract_test,wait_for_engine_shutdown_test}.sh`
+  while its prose never mentions them — so a session editing one of those loads
+  ~9.5k of rules that don't describe it. That is the chosen trade. The two rules
+  are the ONLY ones matching anything under `scripts/`, so a path dropped from
+  both gets **no rule at all**, and a silently-absent rule is indistinguishable
+  from a rule that doesn't exist (the exact risk the split was warned about).
+  Those libs are dev/e2e process infrastructure — supervisors, teardown
+  contracts, host-load and WebKit reaping — living in the same lifecycle world
+  the file's gateway/e2e sections describe, so the loose match is the safer
+  side of the trade. Also do NOT re-derive "the lists should be `scripts/**`":
+  a catch-all on either file defeats the split, since a build-script edit would
+  again pull all 58.6k. Re-flag only if a third rule starts covering `scripts/`,
+  or if one of those libs grows a home in another rule file.
+  (`.claude/rules/dev-runtime.md`, `.claude/rules/build-release.md`, CLAUDE.md
+  § rules index.)
+
+- **Under `set -e`, a short-circuited `[ cond ] && action` does NOT exit the
+  script — but `x="$(cmd)"` DOES.** These two look equally innocent and are not.
+  Bash exempts "any command executed in a `&&`/`||` list except the command
+  following the final `&&`", so when `[ "$rc" -ne 0 ] && overall_rc=$rc` takes
+  the false branch the list returns 1 and execution continues — the idiom is
+  safe at the end of a loop body, an `if` branch, or a top-level line (verified
+  empirically; it is used throughout `scripts/lib/e2e.sh` and
+  `scripts/e2e-browser.sh`). It is unsafe only as the LAST statement of a
+  *function*, where the 1 becomes the function's return value. By contrast a
+  bare assignment from a command substitution takes the substitution's exit
+  status and IS subject to errexit: `set -e; x="$(exit 3)"` exits 3 on the spot.
+  So a helper whose last command can fail (a `find`, a `grep`, an `awk`) must
+  end `|| true` before its output is captured that way — see
+  `_first_build_input_newer_than` in `scripts/lib/e2e.sh`, where a transient
+  `find` error would otherwise abort the whole e2e run rather than just
+  rebuilding. Flag the assignment form; don't flag the `&&` form.
+
+- **`VAR=x some_function` does NOT leave `VAR` set after the function returns —
+  so a test that asserts on `$VAR` afterwards can only ever pass.** A variable
+  assignment prefixed to a *function* call is scoped to that call in bash's
+  default (non-POSIX) mode and restored on return, unlike the same prefix on an
+  external command. `HOST_LOAD_SAMPLER_PID="" HOST_LOAD_GUARD_DISABLE=1
+  start_host_load_sampler` followed by `[ -n "$HOST_LOAD_SAMPLER_PID" ]` therefore
+  reads empty even when the function really did spawn a sampler and assign the
+  pid — a vacuous assertion that reports "not started" for both outcomes
+  (verified empirically on bash 3.2). Assert on a side effect the function writes
+  outside its own scope instead — a pidfile, a marker, a log line. Flag this shape
+  in tests; the production call sites are unaffected because they read the
+  variable *inside* the same call. (`scripts/lib/host_load_guard_test.sh`
+  § `test_sampler_disabled_with_the_guard`.)
 
 - **A single-quoted `trap` body that contains a double-quoted command path
   runs the command correctly — the quotes are not literal.**
@@ -440,6 +662,30 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   tty → it hangs" has conflated stdin with stdout. The only invocation that
   makes fd 1 a non-tty is an explicit redirect (`curl … | sh > file`), which is
   not the documented path. (`install.sh`, `scripts/web-dev.sh` tail.)
+
+## CI workflows
+
+- **`front-door`'s payload gate on `push: rc/**` racing the RC publication is
+  the chosen design, not an oversight.** Reviewers flag that the job fetches
+  `https://lucidos.dev/rc/install.sh` the moment the rc branch is pushed, while
+  the RC copy is published by a separate, asynchronous step — so an ordering
+  skew reds a perfectly good release candidate. The mechanism is real; the
+  conclusion isn't. Three reasons it stays: (1) the race is inherent to the
+  requirement "check the RC payloads on every `rc/**` push", not to any one
+  assertion — with the baked-version check removed, an unpublished route still
+  soft-404s and rung 1 still reds at the HTML sniff; (2) fail-closed is the only
+  correct posture for a gate, since a gate that cannot see its artifact must not
+  pass, and the diagnosis names the likely cause verbatim ("the site publisher
+  has not published this RC's installer yet"); (3) the leg is independent — it
+  reds alone, and `smoke` / `dmg-verify` / `tarball-smoke` are unaffected. The
+  "trigger after publication" alternative IS what the *production* front door
+  does (a publisher-fired `workflow_dispatch` after `SitePublished`); the RC
+  gate deliberately runs earlier so nothing reaches the real path unchecked.
+  Re-flag only with new evidence that the publisher cannot publish before the
+  rc push — in which case the fix is a bounded poll for the matching baked
+  version, NOT dropping the assertion.
+  (`.github/workflows/install-smoke.yml` § front-door, `scripts/release.sh`
+  § `print_rc_gate_handoff`.)
 
 ## Plugins & triggers (ADR 0019)
 
@@ -514,6 +760,81 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `<button>` after a tap. Re-flag only with evidence the *value button's* ring is
   actually visible behind the modal AND is what a user reported. (`components/
   shared/scaleModalState.ts`, `styles/settings/toggle.css`.)
+
+- **`thread_has_unactuated_continuation` defaults to `false` (= emit anyway) on a
+  DB error — deliberately.** Reviewers flag that a transient DB failure on this
+  guard query lets `resume_pending_switches` emit a fresh `ContinuationRequested`
+  while the startup orphan re-dispatch separately drives an older unactuated one —
+  two event ids for one thread past the per-EVENT idempotency set. That trade-off
+  is chosen: the alternative (skip the emit on error) can silently strand a
+  user's auto-resume, which is the exact zombie bug the mechanism exists to fix.
+  The double-actuation corner needs a transient DB failure precisely on the guard
+  query AND a scan-vs-commit timing race, and is bounded downstream by the
+  per-thread spawn coalescer (`cc_spawn_coalesce.rs`) and `run_direct_agent`'s
+  single-lock "already running for this thread" guard — worst case is one refused
+  duplicate spawn attempt, never two live `--resume` subprocesses. Re-flag only if
+  one of those downstream guards is removed or the default flips.
+  (`crates/lucidos-engine/src/engine/agent_session/spawn_dispatcher.rs`,
+  `crates/lucidos-engine/src/engine/engine_version.rs`.)
+
+- **The Notifications "Unread" tab has no inline `failed`-state error surface —
+  deliberately.** Reviewers flag that `NotificationsView` renders
+  `unreadNotifications` for the "Unread" tab, and `loadUnreadNotifications` never
+  sets `'loading'` or `'failed'` (it applies in place so the bell badge never
+  blinks to 0 on a reload), so a *total* cold-start outage — every unread load
+  failing from app-start through panel-open — leaves the Unread tab on a
+  delay-gated skeleton forever instead of a `<LoadableError>`. That is chosen:
+  the unread set is a best-effort poll (`.claude/rules/frontend.md` §
+  "Carve-out: best-effort telemetry") whose failure IS surfaced — the debounced
+  connection dot and the "Unread count is stale — couldn't reach the engine after
+  3 tries" toast (`unreadLoadFailures`) — just not inline in the tab. A skeleton
+  is the least-bad inline option: a blank panel looks broken, and rendering "No
+  unread notifications" on an outage would be a FALSE empty (violates "failed must
+  look different from empty"). Any single successful load heals it permanently,
+  and reconnect / resume / any SSE all retry. The single-source design (Unread tab
+  == badge source) is the whole point — routing the tab back through the
+  `failed`-capable `notifications` browse fetch would reintroduce the badge/list
+  drift this fixed. Re-flag only if the badge stops deriving from
+  `unreadNotifications`, or if `loadUnreadNotifications` gains a surfaced failure
+  state that the view could read without blinking the badge.
+  (`crates/lucidos-app/src/components/notifications/NotificationsView.tsx`,
+  `crates/lucidos-app/src/store/actions/notifications.ts`.)
+
+- **Only the `data/` writable root is width-checked; the git-common-dir root is
+  not — deliberately.** Reviewers notice the asymmetry in
+  `codex::sandbox_writable_roots`: the resolved `data/` path goes through
+  `widens_past_the_workspace` (which refuses `data -> .` / `data -> /`, so a
+  symlink can relocate the sandbox hole but never widen it), while the git
+  common dir is pushed straight on. The guard is absent there because the case
+  is unreachable, not because it was forgotten: the git root comes from `git
+  rev-parse --git-common-dir`, which always answers with a `.git` directory
+  belonging to the worktree's own repository. For it to contain the workspace,
+  the workspace would have to live *inside* `<repo>/.git/` — not a layout the
+  engine can produce. Adding a guard for it would be unreachable defensive code
+  on a security-sensitive path, where an unreachable branch is strictly worse
+  than none (it reads as a real case and invites someone to "fix" it). Both
+  roots ARE canonicalized, which is the property the seatbelt actually needs —
+  that one is load-bearing and covered by
+  `the_git_root_is_canonicalized_too_not_just_the_data_root`. Re-flag only if
+  the git root ever starts coming from somewhere other than git's own
+  resolution (e.g. a config-supplied path).
+  (`crates/lucidos-engine/src/runtime/codex.rs`.)
+
+- **`TriggerRunHistory.created_at` is DB-clock on purpose, and its
+  fail-open case is accepted.** A reviewer who has just read the clock-skew
+  fix in `triggers/run_history.rs` will notice that `last_run` is carefully
+  engine-clock while `created_at` is plain `events.created`, and flag the
+  `SlotPredatesTrigger` check as failing open under the very skew the fix
+  addresses. That is correct and known: `TriggerCreated` carries no
+  engine-clock timestamp in its payload, so there is nothing else to read.
+  The consequence is bounded — a brand-new trigger fires *once* for a slot it
+  never existed for, which is exactly the behavior that predates the check —
+  and it can never produce a double-fire, because that is guarded by
+  `last_run`. Making it exact means adding an engine-clock field to the
+  `TriggerCreated` payload, which would only help triggers created after the
+  change. Re-flag only with a proposal that also covers legacy rows, or if
+  `last_run` ever starts feeding on a DB-clock value again.
+  (`crates/lucidos-engine/src/triggers/run_history.rs`.)
 
 ## Settled architecture questions
 

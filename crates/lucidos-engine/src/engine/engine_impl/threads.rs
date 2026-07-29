@@ -23,6 +23,50 @@ impl LucidosEngine {
         self.cancel_rebuild.store(true, Ordering::SeqCst);
     }
 
+    /// Tell this thread's handle that the agentic loop just took `n` injected
+    /// prompts off the channel, so a blocking tool stops treating them as
+    /// unread. No-op once the thread is deregistered.
+    ///
+    /// `generation` is the caller's own registration ([`ThreadGuard::generation`])
+    /// and is load-bearing, for the same reason `ThreadGuard::drop` checks it:
+    /// `register_thread_queued` force-evicts a turn stuck for 60 s and installs
+    /// a NEW handle under the same thread_id while the old loop is still
+    /// unwinding. A bare thread_id lookup would then let the old loop's drain
+    /// decrement the new turn's counter — hiding a genuinely unread follow-up
+    /// and putting `bash_output(wait_secs=…)` back to blocking through it. The
+    /// old loop's prompts belong to a handle that no longer exists; dropping
+    /// the decrement on the floor is exactly right.
+    ///
+    /// See [`ThreadHandle::pending_injections`].
+    pub fn note_injections_drained(&self, thread_id: Uuid, generation: u64, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(handle) = self
+            .active_threads
+            .lock()
+            .unwrap()
+            .get(&thread_id)
+            .filter(|h| h.generation == generation)
+        {
+            handle.injections_drained(n);
+        }
+    }
+
+    /// The `injection_notify` + unread-count pair for a thread, for a tool that
+    /// wants to stop blocking when the user says something. `None` once the
+    /// thread is deregistered.
+    pub fn injection_wakeup(
+        &self,
+        thread_id: Uuid,
+    ) -> Option<(Arc<tokio::sync::Notify>, Arc<std::sync::atomic::AtomicUsize>)> {
+        self.active_threads
+            .lock()
+            .unwrap()
+            .get(&thread_id)
+            .map(|h| (h.injection_notify.clone(), h.pending_injections.clone()))
+    }
+
     /// Register a new active thread (sync, no queuing). Used by callers that
     /// know the thread is free (e.g., CC tool-spawned threads with unique IDs).
     pub fn register_thread(
@@ -39,12 +83,7 @@ impl LucidosEngine {
         let mut threads = self.active_threads.lock().unwrap();
         threads.insert(
             thread_id,
-            ThreadHandle {
-                token: token.clone(),
-                injection_tx,
-                generation: gen,
-                cancel_actor: Arc::new(std::sync::Mutex::new(None)),
-            },
+            ThreadHandle::new(token.clone(), injection_tx, gen),
         );
         let guard = ThreadGuard {
             active_threads: self.active_threads.clone(),

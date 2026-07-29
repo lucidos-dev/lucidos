@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { getExchanges, getLabel, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
-import { exchangeResponseEvents, exchangeResponseText, exchangeStatus, exchangeSteps, exchangeUserChannel, exchangeUserMessage, isEmptyContinuedExchange, type ThreadEvent } from '../thread-events';
+import { exchangeResponseEvents, exchangeResponseText, exchangeStatus, exchangeSteps, exchangeUserChannel, exchangeUserMessage, isEmptyContinuedExchange, resumeEngineNote, type ThreadEvent } from '../thread-events';
 import { getEventToggleState } from '../event-rendering';
 
 beforeEach(resetSeqCounter);
@@ -724,6 +724,94 @@ describe('Flow: Edge cases', () => {
 
     const exchanges = getExchanges(map, id);
     expect(exchangeStatus(exchanges[0], '', true)).toBe('done');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Post-restart reminder: only when the thread still needs the user
+//
+// A question-parked thread survives a restart with no abort (the engine's
+// preserve guard). Answering it resumes the turn that asked — so the timeline
+// must read exactly as it would have without the restart: no "Continued the
+// response" boundary and no "Reminded the model …" engine note under a card the
+// user already answered. A genuinely interrupted response is the opposite case:
+// it still needs the user to click Continue, and that resume keeps its boundary
+// AND its side-effect reminder.
+// ---------------------------------------------------------------------------
+describe('Flow: post-restart resume reminder', () => {
+  it('question answered after restart → no boundary, no reminder, reply under the card', () => {
+    const { map, id } = makeThread();
+
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'ask test user q', channel: 'chat', event_id: 'mr-1' },
+      { type: 'ToolCalled', name: 'ask_user_question', args: {}, request_event_id: 'mr-1', event_id: 'call-1' },
+      {
+        type: 'UserQuestionAsked',
+        tool_use_id: 'toolu-1#q0',
+        question: 'Which test option would you like to choose?',
+        options: [
+          { id: 'opt-0', label: 'Option A' },
+          { id: 'opt-1', label: 'Option B' },
+        ],
+      },
+      // --- engine restart here: no abort is emitted, the card stays live ---
+      { type: 'UserQuestionAnswered', tool_use_id: 'toolu-1#q0', answer: { kind: 'Selected', option_id: 'opt-0' } },
+      {
+        type: 'ToolResult',
+        name: 'ask_user_question',
+        result: '{"Which test option would you like to choose?":"Option A"}',
+        tool_called_event_id: 'call-1',
+        request_event_id: 'mr-1',
+      },
+      // The resumed turn continues the ORIGINAL request — no ContinuationStarted,
+      // no engine-note UserPromptInjected.
+      { type: 'TextStreamed', text: 'You selected **Option A**.', request_event_id: 'mr-1' },
+      { type: 'ResponseGenerated', text: 'You selected **Option A**.', request_event_id: 'mr-1' },
+    ] as Array<ThreadEvent & { created?: string; event_id?: string }>);
+
+    const exchanges = getExchanges(map, id);
+    expect(exchanges.map(e => e.userEvent.type)).not.toContain('ContinuationStarted');
+    expect(exchanges.every(e => resumeEngineNote(e) === null)).toBe(true);
+
+    // The reply groups under the question card, exactly as an uninterrupted
+    // answer would (the divider owns its post-answer continuation).
+    const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    expect(divider).toBeDefined();
+    expect(exchangeResponseText(divider)).toContain('Option A');
+    expect(exchangeStatus(divider, '', true)).toBe('done');
+  });
+
+  it('genuinely interrupted response revived by Continue → boundary AND reminder', () => {
+    const { map, id } = makeThread();
+
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'ping me', channel: 'chat', event_id: 'mr-2' },
+      { type: 'ToolCalled', name: 'send_notification', args: {}, request_event_id: 'mr-2' },
+      { type: 'ToolResult', name: 'send_notification', result: 'ok', request_event_id: 'mr-2' },
+      { type: 'ResponseAborted', request_event_id: 'mr-2', cause: 'recovery_after_restart' },
+      // The user clicked Continue: the resume opens its own boundary and the
+      // engine note tells them what the model was told about the aborted run.
+      { type: 'ContinuationStarted', actor: { kind: 'device', device_id: 'd-1', label: 'My iPhone' }, event_id: 'cs-1' },
+      {
+        type: 'UserPromptInjected',
+        mode: 'engine',
+        text: '[Engine note — this is a rerun]\n'
+          + 'The interrupted run performed the following actions before the abort:\n'
+          + '- send_notification(Ping) → ok',
+        request_event_id: 'cs-1',
+      },
+      { type: 'TextStreamed', text: 'Already pinged you.', request_event_id: 'cs-1' },
+      { type: 'ResponseGenerated', text: 'Already pinged you.', request_event_id: 'cs-1' },
+    ] as Array<ThreadEvent & { created?: string; event_id?: string }>);
+
+    const exchanges = getExchanges(map, id);
+    const resume = exchanges.find(e => e.userEvent.type === 'ContinuationStarted')!;
+    expect(resume).toBeDefined();
+    expect(exchangeUserMessage(resume)).toBe('Continued the response');
+    const note = resumeEngineNote(resume);
+    expect(note).not.toBeNull();
+    expect(note!.toolCount).toBe(1);
+    expect(note!.text).toContain('send_notification');
   });
 });
 

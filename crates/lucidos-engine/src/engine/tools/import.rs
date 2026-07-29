@@ -273,7 +273,7 @@ impl LucidosEngine {
                             if let Err(e) = std::fs::create_dir_all(parent) {
                                 return Ok(format!(
                                     "Error: failed to create parent dir {}: {}",
-                                    parent.display(),
+                                    crate::core::home_path::abbreviate(parent),
                                     e
                                 ));
                             }

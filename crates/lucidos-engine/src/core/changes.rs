@@ -107,6 +107,32 @@ pub async fn drop_live_thread_changes(
         .collect())
 }
 
+/// A pending change with nothing in it: its branch's commits cancelled out, so
+/// `reconcile_emptied_pending_change` re-synced the row to zero files.
+///
+/// Applying one can only push no-op commits onto `main` and — for an unhardened
+/// Lucidos-source change — burn a whole harden-at-apply session on an empty
+/// diff. `Discard` is the meaningful resolution, so Apply is refused: the UI
+/// disables the button, `guard_change_action` 409s the per-change endpoint, and
+/// `drop_empty_changes` keeps them out of Apply All (which calls
+/// `engine.apply_change` directly and would otherwise bypass the gate).
+///
+/// Scoped to `pending` on purpose. An `applied` row legitimately reads zero
+/// files in old data, and re-applying it must stay the idempotent `Noop`.
+pub fn is_empty_pending_change(change: &Change) -> bool {
+    change.status == "pending" && change.file_count == 0
+}
+
+/// Return the subset of `changes` that Apply All may act on — everything except
+/// the empty pending ones. Discard All deliberately does NOT filter: discarding
+/// is exactly how an empty change is resolved.
+pub fn drop_empty_changes(changes: Vec<Change>) -> Vec<Change> {
+    changes
+        .into_iter()
+        .filter(|c| !is_empty_pending_change(c))
+        .collect()
+}
+
 /// Set `thread_active` on each pending Change by batch-loading thread run-state.
 /// Applied changes are left alone (their thread state no longer gates Apply).
 /// Single batch query, no N+1 — the serialize-time companion to
@@ -322,5 +348,40 @@ mod tests {
             .expect("empty no-op");
 
         teardown_test_db(&db).await;
+    }
+
+    /// Apply All must not do what the per-change Apply button refuses. A
+    /// pending change reconciled to zero files (its branch's commits cancelled
+    /// out) is dropped from the batch; everything else survives.
+    #[test]
+    fn drop_empty_changes_removes_only_empty_pending_rows() {
+        let mut normal = make_change(None);
+        normal.file_count = 2;
+
+        let mut emptied = make_change(None);
+        emptied.file_count = 0;
+
+        // An `applied` row legitimately reads zero files in old data, and
+        // re-applying it must stay the idempotent Noop rather than a refusal.
+        let mut applied_zero = make_change(None);
+        applied_zero.file_count = 0;
+        applied_zero.status = "applied".into();
+
+        let (normal_id, applied_id) = (normal.id, applied_zero.id);
+        let kept = drop_empty_changes(vec![normal, emptied, applied_zero]);
+        let kept_ids: Vec<_> = kept.iter().map(|c| c.id).collect();
+        assert_eq!(kept_ids, vec![normal_id, applied_id]);
+    }
+
+    #[test]
+    fn is_empty_pending_change_is_scoped_to_pending() {
+        let mut c = make_change(None);
+        c.file_count = 0;
+        assert!(is_empty_pending_change(&c));
+        c.status = "discarded".into();
+        assert!(
+            !is_empty_pending_change(&c),
+            "only a pending change can be refused an Apply"
+        );
     }
 }

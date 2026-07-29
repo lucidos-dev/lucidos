@@ -178,7 +178,7 @@ impl LucidosEngine {
                                                 channel: Some(
                                                     crate::engine::thread_events::EventChannel::ClaudeCode,
                                                 ),
-                                                actor: continue_actor,
+                                                actor: continue_actor.clone(),
                                                 ..crate::engine::thread_events::EventMeta::NONE
                                             },
                                         },
@@ -186,6 +186,26 @@ impl LucidosEngine {
                                     )
                                     .await;
                             }
+
+                            // Re-attach an in-flight conflict-resolution duty.
+                            // A stray-killed merge session's completion hands
+                            // off instead of aborting (see
+                            // `ConflictResolutionCleanupAction::HandOff`), so
+                            // the pending change's `MergeConflictDetected` is
+                            // still unpaired — the resumed session must carry
+                            // `conflict_change_id` (and run in the merge
+                            // worktree), or the merge duty is silently dropped
+                            // and the apply the user is watching never
+                            // resolves.
+                            let conflict_duty = engine
+                                .resolve_continue_conflict_duty(
+                                    thread_id,
+                                    continue_reason.as_deref(),
+                                )
+                                .await;
+                            let conflict_change_id = conflict_duty.as_ref().map(|(c, _)| c.id);
+                            let conflict_worktree =
+                                conflict_duty.as_ref().map(|(_, pair)| pair.clone());
 
                             // Resolve the latest Claude Code session id from the events
                             // table so `--resume` lands on the prior conversation.
@@ -209,7 +229,7 @@ impl LucidosEngine {
                             // iteration. Continue is fundamentally a Claude
                             // Code session resurrection, not a new user
                             // message.
-                            let result = engine
+                            let mut result = engine
                                 .run_direct_agent(
                                     request_id,
                                     thread_id,
@@ -218,8 +238,8 @@ impl LucidosEngine {
                                     event_id,
                                     None,
                                     &cancel_token,
-                                    None,
-                                    None,
+                                    conflict_change_id,
+                                    conflict_worktree.clone(),
                                     None,
                                     None,
                                     resume_sid,
@@ -229,13 +249,148 @@ impl LucidosEngine {
                                     None,
                                 )
                                 .await;
-                            if let Err(e) = result {
+
+                            // What to do next is decided by the pure
+                            // `continue_recovery` (see its doc for why the retry
+                            // is mandatory and one-shot); this block only
+                            // actuates it.
+                            use crate::engine::agent_recovery::ContinueRecovery;
+                            let mut retried = false;
+                            let err_text = |r: &Result<_, Box<dyn std::error::Error + Send + Sync>>| {
+                                r.as_ref().err().map(|e| e.to_string())
+                            };
+
+                            if crate::engine::agent_recovery::continue_recovery(
+                                err_text(&result).as_deref(),
+                                retried,
+                            ) == ContinueRecovery::RetryFresh
+                            {
+                                crate::log!(
+                                    "[SpawnConsumer] Stale resume on continuation thread={} — retrying with a fresh session",
+                                    thread_id
+                                );
+                                retried = true;
+                                let retry_text =
+                                    crate::engine::agent_recovery::continue_retry_input(
+                                        engine.pool(),
+                                        thread_id,
+                                    )
+                                    .await;
+                                result = engine
+                                    .run_direct_agent(
+                                        request_id,
+                                        thread_id,
+                                        &retry_text,
+                                        None,
+                                        event_id,
+                                        None,
+                                        &cancel_token,
+                                        conflict_change_id,
+                                        conflict_worktree.clone(),
+                                        None,
+                                        None,
+                                        // No sid — the one we had is dead.
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                    )
+                                    .await;
+                            }
+
+                            let final_err = err_text(&result);
+                            if crate::engine::agent_recovery::continue_recovery(
+                                final_err.as_deref(),
+                                retried,
+                            ) == ContinueRecovery::Settle
+                            {
+                                let e = final_err.as_deref().unwrap_or_default();
                                 crate::log!(
                                     "[SpawnConsumer] Continue thread={} event={} failed: {}",
                                     thread_id,
                                     event_id,
                                     e
                                 );
+                                // Fail-loud backstop for a re-attached duty:
+                                // the resumed session died before its
+                                // completion could settle the merge (spawn
+                                // failure, DB error, missing merge worktree
+                                // state). The hand-off deliberately skipped
+                                // the failure emits, so without this the
+                                // apply dangles forever — pending change,
+                                // open pairing, no toast, an Apply-All batch
+                                // member that never resolves. Re-check the
+                                // pairing first: run_direct_agent can also
+                                // fail AFTER its completion already applied
+                                // or aborted, and those paths closed the
+                                // pairing themselves.
+                                if let Some((change, wt)) = conflict_duty {
+                                    let still_open = engine
+                                        .changes()
+                                        .conflict_pairing_open(thread_id, change.id)
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            crate::log!(
+                                                "[SpawnConsumer] pairing re-check failed for change {}: {} — leaving duty as-is",
+                                                change.id,
+                                                e
+                                            );
+                                            false
+                                        });
+                                    if still_open {
+                                        engine
+                                            .close_stranded_conflict_duty(
+                                                thread_id,
+                                                &change,
+                                                "continuation failed before settling the merge",
+                                                Some(wt.0.as_path()),
+                                            )
+                                            .await;
+                                    }
+                                }
+
+                                // Zombie-`running` backstop. A continuation is
+                                // engine-driven: nothing else is watching it. The
+                                // in-memory watchdogs only scan live
+                                // `agent_sessions`, and
+                                // `settle_orphaned_running_coding_agent_threads`
+                                // runs only at boot, so a `running` projection
+                                // left behind here survives until the user clicks
+                                // Stop. Safe to run for EVERY settling error, not
+                                // just the ones known to skip their own terminal:
+                                // `settle_stuck_running_thread` re-checks
+                                // `running` first, so it no-ops whenever a
+                                // terminal already landed.
+                                //
+                                // Actor: the device that triggered the
+                                // continuation (Switch / Continue), so the chip
+                                // reads "You" rather than "⚙ System". The cause is
+                                // `StaleSettle`, NOT `EngineShutdown`, so this can
+                                // never be mistaken for a switch teardown by
+                                // `switch_was_user_initiated`.
+                                let settle_actor = continue_actor.clone().unwrap_or_else(
+                                    crate::engine::thread_events::MessageOrigin::system,
+                                );
+                                match crate::engine::claude_code::settle_stuck_running_thread(
+                                    engine.pool(),
+                                    &engine.event_bus,
+                                    thread_id,
+                                    Some(settle_actor),
+                                )
+                                .await
+                                {
+                                    Ok(true) => crate::log!(
+                                        "[SpawnConsumer] Settled thread {} left `running` by a failed continuation",
+                                        thread_id
+                                    ),
+                                    Ok(false) => {}
+                                    Err(e) => crate::log!(
+                                        "[SpawnConsumer] Failed to settle thread {} after a failed continuation: {}",
+                                        thread_id,
+                                        e
+                                    ),
+                                }
                             }
                         }
                     }
@@ -245,10 +400,183 @@ impl LucidosEngine {
         });
     }
 
+    /// Try to re-attach an in-flight conflict-resolution duty to a `Continue`
+    /// spawn: the pending change whose `MergeConflictDetected` pairing is
+    /// still open, plus the worktree the resumed merge runs in — the
+    /// temp-worktree shape from the change row when recorded and still on
+    /// disk, else the thread's own worktree for the change branch (mirroring
+    /// `run_merge_session_tier2`).
+    ///
+    /// Gated on the continuation being recovery-shaped
+    /// (`continue_should_open_resume_exchange`): a recovery resumes the
+    /// interrupted merge turn itself, so the duty rides along. An
+    /// `answered_after_idle` continuation is a DIFFERENT interaction —
+    /// binding a (possibly stranded) open pairing to it would let an
+    /// unrelated question-answer turn end `Generated` and silently ff-merge
+    /// the change without a fresh Apply click.
+    ///
+    /// A duty that exists but can no longer be carried (no worktree anywhere)
+    /// is closed loudly here rather than dropped — see
+    /// `close_stranded_conflict_duty`.
+    async fn resolve_continue_conflict_duty(
+        &self,
+        thread_id: Uuid,
+        continue_reason: Option<&str>,
+    ) -> Option<(crate::core::changes::Change, (PathBuf, String))> {
+        if !crate::engine::agent_recovery::continue_should_open_resume_exchange(continue_reason) {
+            return None;
+        }
+        let change = match self
+            .changes()
+            .pending_conflict_change_for_thread(thread_id)
+            .await
+        {
+            Ok(Some(c)) => c,
+            Ok(None) => return None,
+            Err(e) => {
+                crate::log!(
+                    "[SpawnConsumer] Continue thread={}: conflict-duty lookup failed: {} — resuming without re-attaching the merge",
+                    thread_id,
+                    e
+                );
+                return None;
+            }
+        };
+        // Temp-worktree shape (Tier 3) only when the recorded path is still a
+        // LIVE worktree (git-aware check, not a bare is_dir — a pruned admin
+        // entry with the directory left behind would hand CC a cwd whose git
+        // commands resolve to the enclosing repo). A dead one falls through
+        // to the branch lookup instead.
+        let recorded = match (&change.merge_worktree_path, &change.merge_temp_branch) {
+            (Some(wt), Some(tb)) => {
+                let p = PathBuf::from(wt);
+                if crate::engine::git_ops::is_live_worktree_at(&p).await {
+                    Some((p, tb.clone()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let worktree = match recorded {
+            Some(pair) => Some(pair),
+            None => crate::engine::git_ops::find_worktree_for_branch(
+                std::path::Path::new(&change.repo_root),
+                &change.branch_name,
+            )
+            .await
+            .map(|p| (p, change.branch_name.clone())),
+        };
+        match worktree {
+            Some(pair) => {
+                crate::log!(
+                    "[SpawnConsumer] Continue thread={} re-attaching conflict resolution for change {} (branch {})",
+                    thread_id,
+                    change.id,
+                    change.branch_name
+                );
+                Some((change, pair))
+            }
+            None => {
+                self.close_stranded_conflict_duty(
+                    thread_id,
+                    &change,
+                    "merge worktree no longer exists",
+                    None,
+                )
+                .await;
+                None
+            }
+        }
+    }
+
+    /// Fail-loud backstop for a conflict-resolution duty that can no longer
+    /// be carried by a continuation: abort any in-progress merge, then emit
+    /// the closing pair (`MergeResolutionCleared` + `ChangeApplyFailed`) the
+    /// hand-off deliberately deferred — stamped with the parked apply actor —
+    /// so the apply resolves with a visible failure instead of dangling as an
+    /// eternally-"applying" pending change.
+    async fn close_stranded_conflict_duty(
+        &self,
+        thread_id: Uuid,
+        change: &crate::core::changes::Change,
+        why: &str,
+        merge_worktree: Option<&std::path::Path>,
+    ) {
+        crate::log!(
+            "[SpawnConsumer] Closing stranded conflict resolution for change {} ({}) — emitting the failure the hand-off deferred",
+            change.id,
+            why
+        );
+        if let Some(wt) = merge_worktree {
+            let _ = crate::engine::git_ops::git_cmd(&["merge", "--abort"], wt).await;
+        }
+        // The MergeResolutionCleared below nulls the row's merge columns —
+        // the startup stale-merge cleanup keys on them, so any recorded
+        // Tier-3 temp state must be removed NOW or the temp worktree +
+        // branch leak with no pointer left anywhere (the completion Abort
+        // arm deletes them for the same reason). These delete only what the
+        // merge attempt created (the temp pair recorded by
+        // MergeResolutionStarted — never the thread worktree/branch), and
+        // every outcome is logged so a refused deletion is triageable
+        // (rust.md failure-path-cleanup rule). The extra merge --abort is a
+        // harmless no-op when this is the same path as `merge_worktree`.
+        if let (Some(wt), Some(tb)) = (&change.merge_worktree_path, &change.merge_temp_branch) {
+            let repo = std::path::Path::new(&change.repo_root);
+            let _ = crate::engine::git_ops::git_cmd(
+                &["merge", "--abort"],
+                std::path::Path::new(wt),
+            )
+            .await;
+            match crate::engine::git_ops::git_cmd(&["worktree", "remove", "--force", wt], repo)
+                .await
+            {
+                Ok(_) => crate::log!(
+                    "[SpawnConsumer] Removed stranded temp merge worktree {}",
+                    wt
+                ),
+                Err(e) => crate::log!(
+                    "[SpawnConsumer] Failed to remove stranded temp merge worktree {}: {} — needs manual cleanup (merge columns are cleared below)",
+                    wt,
+                    e
+                ),
+            }
+            match crate::engine::git_ops::git_cmd(&["branch", "-D", tb], repo).await {
+                Ok(_) => crate::log!("[SpawnConsumer] Deleted stranded temp branch {}", tb),
+                Err(e) => crate::log!(
+                    "[SpawnConsumer] Failed to delete stranded temp branch {}: {}",
+                    tb,
+                    e
+                ),
+            }
+        }
+        let actor = self.pending_apply_actors.take(change.id);
+        let tid = change.thread_id.unwrap_or(thread_id);
+        self.emit_merge_resolution_cleared(
+            tid,
+            change.id,
+            "[SpawnConsumer] MergeResolutionCleared (stranded duty)",
+        )
+        .await;
+        self.emit_apply_failed(
+            tid,
+            change.id,
+            "Conflict resolution could not resume after recovery — merge aborted. The change is still pending; try applying again.",
+            actor,
+        )
+        .await;
+    }
+
+    // Boot wiring with ONE call site (`main.rs`), and no two parameters share a
+    // type — so the argument-swap mistake this lint guards against is a compile
+    // error here, not a runtime bug. Bundling them into a params struct would
+    // buy nothing the type checker isn't already enforcing.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         workspace_path: PathBuf,
         database_url: &str,
         llm: Arc<dyn LlmProvider>,
+        web_search: Arc<crate::llm::WebSearchChain>,
         vertex_project_id: String,
         vertex_location: crate::llm::vertex::LocationHandle,
         vertex_token_cache: Option<crate::llm::vertex::TokenCache>,
@@ -435,19 +763,16 @@ impl LucidosEngine {
         let python_runtime = PythonRuntime::new(workspace_path.clone())?;
         let app_manager = Arc::new(AppManager::new(&workspace_path)?);
 
-        // The long pole on a first-ever open: this downloads the embedding model
-        // (hundreds of MB) that powers vector memory, before HTTP binds. Narrate
-        // it on the boot splash. A FETCH failure (offline / HF blocked — the
-        // packaged first-run case) must NOT kill the boot: the engine comes up
-        // with memory features degraded (every embed errors descriptively — see
-        // `memory::EmbedderSlot`) and `spawn_embedder_retry_if_degraded`
-        // installs the model in the background once the network allows. Any
-        // OTHER init error (corrupt cached model, bad config) stays fatal — a
-        // real bug must fail loudly, not boot a silently memory-less engine.
-        crate::boot_report::report(crate::boot_report::DOWNLOADING_MEMORY_MODEL);
-        let embedder = crate::memory::embedder_slot::slot_from_init(
-            crate::memory::FastEmbedProvider::new(),
-        )?;
+        // The embedding model that powers vector memory is a multi-hundred-MB
+        // HuggingFace download on a cold cache (and a non-trivial ONNX load even
+        // when warm), so it must NEVER block boot — a workspace should open
+        // immediately regardless of the model. Construction fills the slot EMPTY;
+        // `spawn_embedder_load` (from `main.rs`, once the engine is assembled)
+        // loads the model in a background task and installs it live once it
+        // lands. Until then every embed errors descriptively and consumers
+        // degrade (memory tools report it, thread search → text-only, context
+        // build skips recall — see `memory::EmbedderSlot`).
+        let embedder = crate::memory::embedder_slot::EmbedderSlot::empty();
 
         let browser_runtime = BrowserRuntime::new(workspace_path.clone(), pool.clone());
 
@@ -515,20 +840,10 @@ impl LucidosEngine {
             }
         };
 
-        // Gated on memory_index because it owns the schema; without it
-        // memory_entries may not exist. Skipped on a degraded (empty-slot)
-        // boot — every batch would just error EMBEDDER_UNAVAILABLE; the
-        // background retry runs the same sweep after installing the model.
-        if let Some(index) = memory_index.clone() {
-            if embedder.is_ready() {
-                let embedder = embedder.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = crate::memory::reembed::reembed_stale(&index, embedder).await {
-                        log!(@Memory, "Re-embed task failed: {}", e);
-                    }
-                });
-            }
-        }
+        // The startup re-embed sweep is NOT run here: the slot boots empty (the
+        // model loads in the background), so every batch would just error
+        // EMBEDDER_UNAVAILABLE. `spawn_embedder_load` runs the same sweep once it
+        // installs the model.
 
         // Load user profile from artifacts, or use empty if doesn't exist
         let profile_path = workspace_path
@@ -568,14 +883,22 @@ impl LucidosEngine {
 
         let repo_root = git_ops::main_worktree().await;
 
-        let system_knowhow_dir = {
-            let candidate = repo_root.join("system-knowhow");
-            if candidate.exists() {
-                Some(candidate)
-            } else {
-                None
-            }
-        };
+        // Resolve the engine-shipped `system-knowhow/` reference set. In a packaged
+        // build the launcher stages it as the 7th resource and points
+        // LUCIDOS_SYSTEM_KNOWHOW_DIR at it; dev/e2e leave the env var unset and fall
+        // back to the source checkout's `<repo_root>/system-knowhow`. A set-but-missing
+        // env var (mis-staged bundle) resolves to unavailable with a loud warning
+        // rather than a bogus repo-root fallback. See
+        // docs/plans/2026-07-07-package-system-knowhow-resource.md.
+        let (system_knowhow_dir, system_knowhow_warning) =
+            crate::core::resolve_system_knowhow_dir(
+                std::env::var("LUCIDOS_SYSTEM_KNOWHOW_DIR").ok().as_deref(),
+                &repo_root,
+                crate::runtime::is_packaged(),
+            );
+        if let Some(warning) = &system_knowhow_warning {
+            log!("{}", warning);
+        }
 
         // Register the Lucidos repo so it appears in the Files view without manual
         // setup. Its id is derived from the repo's root-commit SHA (read from
@@ -738,6 +1061,10 @@ impl LucidosEngine {
         // stored on `Self.llm` and its writes are seen by every read site.
         let llm_handle: Arc<std::sync::RwLock<Arc<dyn LlmProvider>>> =
             Arc::new(std::sync::RwLock::new(llm));
+        // Same treatment for the search chain: one handle, shared with the
+        // subscriber, so a credential change reaches every read site.
+        let web_search_handle: Arc<std::sync::RwLock<Arc<crate::llm::WebSearchChain>>> =
+            Arc::new(std::sync::RwLock::new(web_search));
 
         // Inputs the runtime credential subscriber needs to rebuild a provider
         // identical to a fresh boot. Env-stable and mirror `main.rs`; the shared
@@ -757,6 +1084,11 @@ impl LucidosEngine {
             boot_without_provider: crate::llm::boot_without_provider_enabled(),
         };
 
+        // Kept out of the ctx move below: the engine holds its own handle to the
+        // same shared map so the context trimmer can read each model's declared
+        // context window.
+        let engine_model_registry = model_registry.clone();
+
         spawn_vertex_region_subscriber(event_bus.subscribe(), vertex_location.clone());
         spawn_models_registry_subscriber(event_bus.subscribe(), model_registry, pool.clone());
 
@@ -768,6 +1100,7 @@ impl LucidosEngine {
             spawn_provider_credential_subscriber(
                 event_bus.subscribe(),
                 llm_handle.clone(),
+                web_search_handle.clone(),
                 pool.clone(),
                 provider_build_ctx,
             );
@@ -809,12 +1142,14 @@ impl LucidosEngine {
             // subscriber spawned above (built before this struct so both sides
             // hold the same lock).
             llm: llm_handle,
+            web_search: web_search_handle,
             embedder,
             memory_index,
             extractor,
             vertex_project_id,
             vertex_location,
             vertex_token_cache,
+            model_registry: engine_model_registry,
             openai_api_key,
             rebuilding_memory: AtomicBool::new(false),
             cancel_rebuild: AtomicBool::new(false),
@@ -823,6 +1158,7 @@ impl LucidosEngine {
             build_state: std::sync::RwLock::new(crate::engine::engine_version::BuildState::Idle),
             update_check: std::sync::Mutex::new(Default::default()),
             source_behind_cache: std::sync::Mutex::new(Default::default()),
+            disk_direction_cache: std::sync::Mutex::new(Default::default()),
             self_heal_state: std::sync::Mutex::new(Default::default()),
             build_task: std::sync::Mutex::new(None),
             build_generation: std::sync::atomic::AtomicU64::new(0),
@@ -830,6 +1166,7 @@ impl LucidosEngine {
             served_frontend_source: std::sync::OnceLock::new(),
             frontend_refresh_generation: std::sync::atomic::AtomicU64::new(0),
             frontend_refresh_task: std::sync::Mutex::new(None),
+            frontend_worktree_pin_warned: std::sync::atomic::AtomicBool::new(false),
             restart_actor: std::sync::Mutex::new(None),
             pending_switch_resumes: std::sync::Mutex::new(Vec::new()),
             active_threads: Arc::new(std::sync::Mutex::new(HashMap::new())),

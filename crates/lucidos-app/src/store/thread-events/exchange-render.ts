@@ -1,6 +1,6 @@
 import { SESSION_END_REASONS } from '../../generated/thread-lifecycle';
 import { isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
-import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserImageHashes, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
+import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserImageHashes, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
 import { toolUseIdOf } from './exchange-grouping';
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step } from '../types';
@@ -23,10 +23,16 @@ function resolveLastPendingStep(
 }
 
 /** Force ALL pending steps to completed.
- *  Called after a completion event so spinners don't persist on finished exchanges. */
-function resolvePendingSteps(steps: { success: boolean | null }[]): void {
+ *  Called after a completion event so spinners don't persist on finished exchanges.
+ *  Optional `pred` narrows which pending steps to resolve (mirrors
+ *  `resolveLastPendingStep`) — used to finalize ONLY the dead 'Thinking' markers
+ *  of a handed-off exchange while its tool steps keep spinning. */
+function resolvePendingSteps(
+  steps: { success: boolean | null; description?: string }[],
+  pred?: (s: { description?: string }) => boolean,
+): void {
   for (const step of steps) {
-    if (step.success === null) step.success = true;
+    if (step.success === null && (!pred || pred(step))) step.success = true;
   }
 }
 
@@ -274,7 +280,10 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
         break;
     }
   }
+  // See `exchangeResponseEvents` for why a handed-off exchange finalizes only
+  // its Thinking markers.
   if (isComplete || threadIdle) resolvePendingSteps(steps);
+  else if (exchange.continuationMoved) resolvePendingSteps(steps, isThinking);
   return steps;
 }
 
@@ -572,9 +581,18 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
   // a non-last exchange can still be the one the agentic loop is actively
   // processing, so we DON'T resolve purely on `!isLast` — wait for the
   // exchange's terminator OR for the thread to go idle.
-  if (isComplete || threadIdle) {
-    const stepEvents = events.filter(e => e.type === 'step') as { success: boolean | null }[];
-    resolvePendingSteps(stepEvents);
+  //
+  // The turn ending is not the only way a spinner strands: when the fold hands
+  // a RUNNING turn to a later exchange (`Exchange.continuationMoved` — a child
+  // completion card / divider took the redirect), the LLM's next output lands
+  // there, so a Thinking marker pending here is already dead. Finalize just
+  // those — a pending TOOL step is still owed a result that re-routes back by
+  // tool id (the `ask_user_question` spinner that must keep running while the
+  // card is on screen).
+  const finalizeAll = isComplete || threadIdle;
+  if (finalizeAll || exchange.continuationMoved) {
+    const stepEvents = events.filter(e => e.type === 'step') as { success: boolean | null; description?: string }[];
+    resolvePendingSteps(stepEvents, finalizeAll ? undefined : isThinking);
     // Strip trailing Thinking steps — noise from CC processing notifications
     // (e.g., post-ChangeApplied) without producing output. Keep at least one
     // event so canceled/aborted exchanges still show .response-content.
@@ -889,6 +907,35 @@ export function queuedFollowupRun(
     queuedOrder,
     queuedIndices,
   };
+}
+
+/** A queued (uningested) chat follow-up: its retract id + message text. */
+export interface QueuedMessage {
+  /** The client `event_id` (== events-table PK) — the `message_id` the
+   *  `/chat/queued-message/remove` endpoint retracts by. */
+  id: string;
+  text: string;
+}
+
+/** The thread's queued (un-injected) chat follow-ups, in FIFO order — the set
+ *  a user Stop should retract and return to compose (see
+ *  `store/actions/chat.ts::cancelCurrentExchange`). Derived from the same
+ *  `queuedFollowupRun` the UI renders "Queued" bubbles from, so what Stop
+ *  clears is exactly what the user saw queued. An exchange with no `_eventId`
+ *  (legacy row / synthetic boundary) can't be retracted by id and is skipped. */
+export function queuedMessagesFromExchanges(
+  exchanges: Exchange[],
+  threadBusy: boolean,
+  threadIsCC = false,
+): QueuedMessage[] {
+  const { queuedOrder } = queuedFollowupRun(exchanges, threadBusy, threadIsCC);
+  const out: QueuedMessage[] = [];
+  for (const idx of queuedOrder) {
+    const id = exchanges[idx].userEvent._eventId;
+    if (!id) continue;
+    out.push({ id, text: exchangeUserMessage(exchanges[idx]) });
+  }
+  return out;
 }
 
 /** Index of the exchange the agent is actively working on — i.e. the one that

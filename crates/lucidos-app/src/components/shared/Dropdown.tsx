@@ -39,6 +39,12 @@ interface DropdownProps {
    *  coding-agent pickers) — there, marking it just competes with the arrow-key
    *  `.focused` highlight and tells the user nothing useful. */
   markCurrent?: boolean;
+  /** Fired every time the menu opens (click, Enter/Space, arrow key, typeahead,
+   *  or a freeText focus), never on close. For an option list that can go stale
+   *  or fail to load: refresh — or retry — it from the user's own gesture,
+   *  instead of leaving a dead list on screen. Must be cheap and idempotent;
+   *  loaders that single-flight (`loadRepositories`, `loadApps`) are the fit. */
+  onOpen?: () => void;
 }
 
 /** Filter options by a case-insensitive label substring. Empty query → the full
@@ -88,6 +94,7 @@ export function Dropdown({
   freeText,
   restoreFocusOnSelect = true,
   markCurrent = true,
+  onOpen,
 }: DropdownProps) {
   // Anchor element when open, null when closed. `useAnchoredPosition` reacts
   // to anchor changes via its effect deps — no separate `open` flag needed.
@@ -199,9 +206,17 @@ export function Dropdown({
     return false;
   }
 
-  function openDropdown() {
+  /** Single door into the open state — every open path goes through here so
+   *  `onOpen` can't be missed by one of them. */
+  function showMenu() {
     if (!ref.current) return;
     setAnchor(ref.current);
+    onOpen?.();
+  }
+
+  function openDropdown() {
+    if (!ref.current) return;
+    showMenu();
     const currentIdx = options.findIndex((o) => o.value === value);
     // Seed at the saved value, or — when missing/stale or pointing at a
     // disabled row (stale scope that collides with a section header after
@@ -284,21 +299,21 @@ export function Dropdown({
             value={draft}
             disabled={disabled}
             placeholder={placeholder}
-            onFocus={() => { if (!disabled && ref.current) { setFilter(''); setAnchor(ref.current); } }}
+            onFocus={() => { if (!disabled) { setFilter(''); showMenu(); } }}
             onBlur={() => commit()}
             onInput={(e) => {
               const v = (e.target as HTMLInputElement).value;
               setDraftValue(v);
               setFilter(v);
               setFocusedIndex(-1);
-              if (!open && ref.current) setAnchor(ref.current);
+              if (!open) showMenu();
             }}
             onKeyDown={handleKeyDown}
           />
           <span class="dropdown-chevron" onClick={() => {
             if (disabled) return;
             if (open) closeDropdown();
-            else if (ref.current) setAnchor(ref.current);
+            else showMenu();
           }}>{open ? '▴' : '▾'}</span>
         </div>
       ) : (

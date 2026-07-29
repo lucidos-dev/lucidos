@@ -39,11 +39,25 @@ fn main() {
     let build_id = compute_build_id(project_root, manifest_dir);
     println!("cargo:rustc-env=ENGINE_BUILD_ID={build_id}");
 
+    // VERSION is gitignored, so it never arrives via checkout — it is generated
+    // here. Every early return below MUST leave a VERSION on disk, because the
+    // crate `include_str!`s it (src/api/history.rs). Guarantee it up front so no
+    // later early-return path (git unavailable, unchanged source, etc.) can ship
+    // a build with a missing VERSION file. This is what broke the Linux tarball
+    // CI jobs: git returns None inside the ubuntu container (dubious ownership /
+    // shallow checkout), the git-None branch returned before writing VERSION, and
+    // the crate failed to compile with "couldn't read ../../VERSION".
+    if !version_file.exists() {
+        let fallback = format!("{}.0\n", chrono_date_today());
+        fs::write(&version_file, &fallback).expect("Failed to create default VERSION");
+    }
+
     // Get current git HEAD commit
     let current_head = match git_head(project_root) {
         Some(h) => h,
         None => {
             // No git available (e.g. shipped install) — assume clean release.
+            // VERSION already ensured above.
             println!("cargo:rustc-env=LUCIDOS_RELEASE_DIRTY=false");
             return;
         }

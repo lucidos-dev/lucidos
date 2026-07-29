@@ -547,8 +547,13 @@ pub(crate) fn read_text_from_zip(
     use std::io::Read as _;
     crate::core::plugins::validate_archive_entry_path(inner_path)
         .map_err(|e| format!("rejected zip entry '{}': {}", inner_path, e))?;
-    let file = std::fs::File::open(archive_path)
-        .map_err(|e| format!("open archive {}: {}", archive_path.display(), e))?;
+    let file = std::fs::File::open(archive_path).map_err(|e| {
+        format!(
+            "open archive {}: {}",
+            crate::core::home_path::abbreviate(archive_path),
+            e
+        )
+    })?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("read archive: {}", e))?;
     let mut entry = zip
         .by_name(inner_path)
@@ -582,6 +587,17 @@ pub(crate) fn archive_entry_unsupported_message(inner_path: &str) -> Option<Stri
         inner_path
     ))
 }
+
+/// Tool-result text the agentic loop substitutes for an `[IMAGE_CONTENT:…]`
+/// sentinel once it has lifted the bytes into a real LLM image block. The
+/// image itself is a sibling block in the same message, hence "below".
+///
+/// Only the tools that show the model an image it *explicitly asked for*
+/// (`view_image`, `read_file` on an image file) produce this — ambient captures
+/// (`capture_app`, `browser_screenshot`) go through a different branch. That
+/// distinction is what the context trimmer keys off to decide which images stay
+/// in vision for the whole turn; see `context::trim_context_if_needed`.
+pub(crate) const EXPLICIT_IMAGE_RESULT_TEXT: &str = "[Image file displayed to you below]";
 
 /// Parse a `[IMAGE_CONTENT:type]\n<base64>` sentinel produced by `read_file` for image files.
 /// Returns `(media_type, base64_data)` if matched, `None` otherwise. Single source of truth

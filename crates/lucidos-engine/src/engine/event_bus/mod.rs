@@ -25,6 +25,34 @@ use crate::engine::thread_lifecycle::{self, ArchiveState, ThreadType};
 /// `coding_agent_proposed` column (and `is_blocking` clause 3) instead.
 pub(super) const STATUS_FROM_PROPOSED_CHANGE: &str = "'idle'";
 
+/// Wrap a `status` target so a `'failed'` verdict already on the row survives.
+///
+/// `'failed'` is a *terminal verdict* about the turn (`ResponseFailed`, or a
+/// `ResponseAborted` whose cause maps to failed). Only a real start event —
+/// `MessageReceived`, `CodingAgentUserMessageSent`, `UserPromptInjected`,
+/// `CodingAgentPromptSent`, `ContinuationRequested`, … — may clear it, because
+/// only those mean new work was actually requested. Every event that merely
+/// *closes out* the failed turn has to leave the verdict alone, or the red
+/// error dot disappears from the thread list while the failure still stands.
+///
+/// This matters far more for coding agents than for the Lucidos Agent, which
+/// is why the two channels visibly disagreed before this was applied
+/// uniformly. A chat turn's loop emits nothing after its own terminator, so
+/// its verdict is never touched. A coding-agent turn emits three more things:
+/// the subprocess's trailing drain output (`external_terminal_emitted`
+/// suppresses the duplicate terminal, not the activity stream),
+/// `CodingAgentIdled`, and `SessionEnded` — each of which used to write a
+/// status and, between them, walked an interrupted thread back to `'idle'`.
+///
+/// Not expressible in the coarse `StatusRule::ConditionalCc` model that
+/// `thread_lifecycle::status_transitions()` publishes, so the contract table
+/// stays as-is and this guard lives in the projection SQL — see the note on
+/// `CodingAgentIdled` there. The `terminal_events_never_set_running`
+/// invariant is unaffected.
+pub(super) fn preserving_failed(target: &str) -> String {
+    format!("CASE WHEN status = 'failed' THEN 'failed' ELSE {target} END")
+}
+
 /// SET fragment that clears every CC-state column on `thread_summaries` —
 /// used identically by `ChangeApplied`, `ChangeDiscarded`, and `ThreadArchived`
 /// since the user-facing proposal lifecycle ends in all three. Add new

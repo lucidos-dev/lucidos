@@ -503,6 +503,16 @@ fn valid_provider(p: &str) -> bool {
 const PROVIDER_ERR: &str =
     "Provider must be one of: vertex, anthropic, openai, openrouter, local";
 
+const CONTEXT_WINDOW_ERR: &str =
+    "context_window must be a positive number of tokens (omit it to infer from the model id)";
+
+/// A declared context window must be positive — a zero or negative value would
+/// produce a zero (or, once cast, an enormous) trim budget. Absent is fine: the
+/// engine falls back to the id-shape guess.
+fn valid_context_window(w: Option<i32>) -> bool {
+    w.is_none_or(|w| w > 0)
+}
+
 /// GET /api/v1/models — the full registry (enabled + disabled). The chat picker
 /// filters to `enabled`; the Settings → Models manager shows all.
 pub(super) async fn list_models(
@@ -537,9 +547,21 @@ pub(super) async fn create_model(
     if !valid_provider(&request.provider) {
         return ApiResult::err(PROVIDER_ERR);
     }
+    if !valid_context_window(request.context_window) {
+        return ApiResult::err(CONTEXT_WINDOW_ERR);
+    }
     // User models sort after the builtins by default.
     let sort_order = request.sort_order.unwrap_or(1000);
-    match ModelStore::create(&state.pool, id, label, &request.provider, sort_order).await {
+    match ModelStore::create(
+        &state.pool,
+        id,
+        label,
+        &request.provider,
+        sort_order,
+        request.context_window,
+    )
+    .await
+    {
         Ok(model) => {
             state
                 .engine
@@ -559,8 +581,9 @@ pub(super) async fn create_model(
     }
 }
 
-/// PUT /api/v1/models?id= — edit a model. Builtins are disable-only: only the
-/// `enabled` flag is applied. User models update any provided field.
+/// PUT /api/v1/models?id= — edit a model. Builtins keep their identity (id,
+/// label, provider, sort_order) but accept `enabled` and `context_window`.
+/// User models update any provided field.
 pub(super) async fn update_model(
     State(state): State<AppState>,
     Query(query): Query<ModelIdQuery>,
@@ -574,11 +597,27 @@ pub(super) async fn update_model(
     };
 
     let result = if existing.is_builtin() {
-        // Builtins keep their identity — only the enable toggle is honored.
-        match request.enabled {
-            Some(enabled) => ModelStore::set_enabled(&state.pool, &existing.id, enabled).await,
-            None => Ok(true),
+        // Builtins keep their IDENTITY — label / provider / sort_order are
+        // engine-owned. `context_window` is not identity: it's a factual
+        // property of the model that the vendor can raise, and whose seeded
+        // value can simply be wrong. Refusing it would strand a builtin on a
+        // bad window with no way to correct it (and would silently no-op the
+        // documented `lucidos models update --id z-ai/glm-5.2 --context-window`).
+        let enabled = request.enabled.unwrap_or(existing.enabled);
+        let context_window = request.context_window.unwrap_or(existing.context_window);
+        if !valid_context_window(context_window) {
+            return ApiResult::err(CONTEXT_WINDOW_ERR);
         }
+        ModelStore::update(
+            &state.pool,
+            &existing.id,
+            &existing.label,
+            &existing.provider,
+            existing.sort_order,
+            enabled,
+            context_window,
+        )
+        .await
     } else {
         let label = request.label.unwrap_or_else(|| existing.label.clone());
         let provider = request.provider.unwrap_or_else(|| existing.provider.clone());
@@ -587,7 +626,22 @@ pub(super) async fn update_model(
         }
         let sort_order = request.sort_order.unwrap_or(existing.sort_order);
         let enabled = request.enabled.unwrap_or(existing.enabled);
-        ModelStore::update(&state.pool, &existing.id, &label, &provider, sort_order, enabled).await
+        // Absent keeps the stored window; an explicit `null` clears it back to
+        // the id-shape fallback (see `UpdateModelRequest::context_window`).
+        let context_window = request.context_window.unwrap_or(existing.context_window);
+        if !valid_context_window(context_window) {
+            return ApiResult::err(CONTEXT_WINDOW_ERR);
+        }
+        ModelStore::update(
+            &state.pool,
+            &existing.id,
+            &label,
+            &provider,
+            sort_order,
+            enabled,
+            context_window,
+        )
+        .await
     };
 
     match result {

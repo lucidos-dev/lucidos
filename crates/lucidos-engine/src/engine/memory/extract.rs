@@ -315,6 +315,25 @@ impl LucidosEngine {
 
         let verbose = !self.rebuilding_memory.load(Ordering::SeqCst);
 
+        // The embedding model loads in the background (see `memory::EmbedderSlot`).
+        // While it isn't ready, embedding these facts would fail and the item
+        // would be dropped at the `embed_batch` step below anyway — so skip the
+        // costly LLM fact-extraction entirely rather than burn a call whose
+        // result we'd discard. Items created during this window are NOT
+        // auto-indexed once the model lands (the post-install `reembed_stale`
+        // sweep only re-embeds EXISTING rows); a manual memory rebuild recovers
+        // them. See docs/known-gaps.md § "Memory created during the model-load
+        // window isn't auto-indexed".
+        if !self.embedder.is_ready() {
+            if verbose {
+                log!(
+                    @Memory,
+                    "Embedding model not ready yet — skipping memory indexing (recovered by a rebuild)"
+                );
+            }
+            return false;
+        }
+
         // For artifacts, skip fallback when extraction returns nothing — content
         // probably has no facts (e.g., CSV exports, data files).
         let is_artifact = matches!(source, MemorySource::Artifact { .. });

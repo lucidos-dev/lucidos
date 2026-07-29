@@ -1,8 +1,8 @@
-import { connectionStatus, dismissToast, showToast, toasts, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS } from '../store';
+import { connectionStatus, dismissToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS } from '../store';
 import { checkHealth, API_BASE } from '../../api/client';
 import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearForcedRetries } from './thread-loading';
-import { refreshChangesState, clearRestartInFlight, RESTART_LS_KEY, RESTART_TOAST_KEY, RESTART_SWAP_MESSAGE } from './chat-changes';
+import { refreshChangesState, clearRestartInFlight, RESTART_LS_KEY, RESTART_TOAST_KEY } from './chat-changes';
 import { loadUnreadNotifications } from './notifications';
 import { isNewerVersion } from '../../utils/version';
 import { syncClientUpdateFromBuild } from './client-update';
@@ -235,18 +235,10 @@ export async function checkConnection(): Promise<boolean> {
     consecutiveFailures = 0;
   }
 
-  // Advance the in-flight restart status toast from the build phase to the swap
-  // phase the moment the old engine actually goes unreachable: the rebuild
-  // finished and the engine is being killed + respawned. Guarded on the current
-  // toast message so we only re-render the toast on the transition, not on every
-  // poll the engine stays down. showDuringRestart keeps it past the central
-  // suppression; the spinner persists until reconnect dismisses the toast.
-  if (engineRestarting.value && !healthOk) {
-    const current = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
-    if (current && current.message !== RESTART_SWAP_MESSAGE) {
-      showToast(RESTART_SWAP_MESSAGE, 'info', { key: RESTART_TOAST_KEY, showDuringRestart: true, spinning: true });
-    }
-  }
+  // The in-flight restart status toast (initiateEngineRestart / restoreRestartToast)
+  // shows a single stable message for the whole window — there is no build→swap
+  // phase transition to advance here anymore. It stays up with its spinner via
+  // showDuringRestart until reconnect (started_at change) dismisses it below.
 
   // When disconnected, require multiple consecutive successes before showing connected.
   // Prevents red→green flicker when the engine flaps during restarts.
@@ -376,7 +368,7 @@ export async function checkConnection(): Promise<boolean> {
       // restartRequired), so an optimistic clear is safe.
       restartRequired.value = false;
       engineVersionReady.value = false;
-      dismissToast('restart-required');
+      dismissToast(RESTART_TOAST_KEY);
       // Plain, benign confirmation with NO action. The client Refresh prompt is
       // owned SOLELY by the honest client-staleness check
       // (syncClientUpdateFromBuild below). The switched-to engine now serves its

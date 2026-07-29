@@ -21,6 +21,22 @@ pub struct App {
     pub icon: Option<String>,
 }
 
+/// Defence-in-depth: API handlers validate app ids at the boundary
+/// (`is_valid_id` in `api/apps.rs`), but `AppManager` is also reached from LLM
+/// tool handlers (`engine/tools/apps.rs` passes the model-provided `id`
+/// straight through). A `..` segment or absolute path would let the joined
+/// path escape `data/apps/` — mirror of the guard in
+/// `ArtifactManager::write_artifact`.
+fn reject_path_traversal(p: &str) -> Result<(), std::io::Error> {
+    if super::is_path_traversal(p) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Path traversal not allowed: {}", p),
+        ));
+    }
+    Ok(())
+}
+
 pub struct AppManager {
     apps_path: PathBuf,
     repo: Mutex<Repository>,
@@ -132,6 +148,7 @@ impl AppManager {
 
     /// Get a specific app by ID.
     pub fn get_app(&self, app_id: &str) -> Result<App, std::io::Error> {
+        reject_path_traversal(app_id)?;
         let app_dir = self.apps_path.join(app_id);
         if !app_dir.exists() {
             return Err(std::io::Error::new(
@@ -148,6 +165,9 @@ impl AppManager {
     /// honest "would this id appear in the list?" check used to decide
     /// AppCreated vs AppUpdated when the raw file tools touch an app.
     pub fn app_exists(&self, app_id: &str) -> bool {
+        if reject_path_traversal(app_id).is_err() {
+            return false;
+        }
         self.apps_path.join(app_id).join("manifest.json").exists()
     }
 
@@ -165,6 +185,7 @@ impl AppManager {
         description: &str,
         html_content: &str,
     ) -> Result<(PathBuf, String), Box<dyn std::error::Error + Send + Sync>> {
+        reject_path_traversal(app_id)?;
         let app_dir = self.apps_path.join(app_id);
         std::fs::create_dir_all(&app_dir)?;
 
@@ -194,6 +215,7 @@ impl AppManager {
         &self,
         app_id: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        reject_path_traversal(app_id)?;
         let app_dir = self.apps_path.join(app_id);
         if !app_dir.exists() {
             return Err(format!("App not found: {}", app_id).into());
@@ -218,6 +240,7 @@ impl AppManager {
         name: &str,
         description: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        reject_path_traversal(app_id)?;
         let manifest_path = self.apps_path.join(app_id).join("manifest.json");
         if !manifest_path.exists() {
             return Err(format!("App not found: {}", app_id).into());
@@ -245,6 +268,7 @@ impl AppManager {
         &self,
         app_id: &str,
     ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        reject_path_traversal(app_id)?;
         let app_dir = self.apps_path.join(app_id);
         if !app_dir.exists() {
             return Err(format!("App not found: {}", app_id).into());
@@ -289,6 +313,7 @@ impl AppManager {
         app_id: &str,
         files: &[(String, String)],
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        reject_path_traversal(app_id)?;
         let app_dir = self.apps_path.join(app_id);
         if !app_dir.exists() {
             return Err(format!("App not found: {}", app_id).into());
@@ -349,6 +374,7 @@ impl AppManager {
         app_path: &str,
         message: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        reject_path_traversal(app_path)?;
         let full_path = self.apps_path.join(app_path);
         std::fs::remove_file(&full_path)?;
 
@@ -437,6 +463,24 @@ mod tests {
         let result = manager.write_app_source("test-app", &files);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid filename"));
+    }
+
+    /// The app id itself must also be traversal-guarded: `create_app` is
+    /// reached from the LLM tool handler with a model-provided id, and an
+    /// unchecked `../…` id would create (or, via delete_app, remove) files
+    /// outside `data/apps/`.
+    #[test]
+    fn path_validation_rejects_traversal_in_app_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = AppManager::new(tmp.path()).unwrap();
+
+        let result = manager.create_app("../escaped", "Evil", "", "<html></html>");
+        assert!(result.is_err());
+        assert!(!tmp.path().join("data/escaped").exists());
+
+        assert!(manager.delete_app("../..").is_err());
+        assert!(manager.get_app("../..").is_err());
+        assert!(!manager.app_exists("../.."));
     }
 
     #[test]

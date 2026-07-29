@@ -23,7 +23,7 @@ impl CodingAgentChangeOps for LucidosEngine {
     async fn live_session_info(&self, thread_id: Uuid) -> Option<LiveSessionInfo> {
         let guard = self.agent_sessions.lock().await;
         guard.get(&thread_id).and_then(|s| {
-            if s.process_exited {
+            if !s.is_live() {
                 return None;
             }
             Some(LiveSessionInfo {

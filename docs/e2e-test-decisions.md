@@ -66,6 +66,15 @@ Rust's module system doesn't allow both `tests/api.rs` and `tests/api/v1/mod.rs`
 ### Separate `lucidos-e2e` crate
 API tests live in their own workspace member crate, not in `lucidos-engine`'s `tests/`. This keeps `cargo test -p lucidos-engine` from compiling them (so it stays fast and infra-free) and removes the need for `#[ignore]` on tests that require a running workspace. Run via `./scripts/e2e-api.sh` or the umbrella `./scripts/e2e.sh`.
 
+### The e2e database is rebuilt from zero, never truncated
+`reset_e2e_database` (`scripts/lib/e2e.sh`) **drops and recreates** the workspace database, so the engine's next boot runs the entire sqlx migration chain against an empty database — seeds included. It used to `TRUNCATE` every table *except* `_sqlx_migrations`, and that one exclusion was the whole problem: seed data lives inside migrations, the surviving `_sqlx_migrations` rows told sqlx they were already applied, so their seed `INSERT`s never re-ran. Any table whose only content comes from a migration seed was therefore permanently empty in e2e. `models` was the casualty — 0 rows where a real workspace has 26 — so `llm::model_registry::load_from_db` built an empty map, `RoutingProvider` silently fell back to `prefix_heuristic` for every model, and nothing derived from the registry (provider routing, per-model `context_window`) was testable in e2e at all. The database was also genuinely long-lived rather than reset: the bootstrap migration in `lucidos_e2e-test` carried an `installed_on` six weeks old.
+
+**The reset therefore owns the engine lifecycle.** Postgres refuses to drop a database with open connections, and migrations, `EventStore::init_schema()` and the pgvector setup all run exactly once — at engine boot (`engine/engine_impl/construction.rs`). So `reset_e2e_database` stops the engine (SIGUSR1, which also ends the supervisor's restart loop), recreates the database, and starts the engine again; on return the workspace is running on a fresh database. Call it **instead of** `ensure_workspace_running`, never before it — booting first would waste a boot against the stale database. It asserts the outcome (`_sqlx_migrations` absent) rather than trusting psql's exit code, which is 0 even for a refused `DROP` unless `ON_ERROR_STOP` is set.
+
+**Cost is the engine restart, not the migrations.** The full 157-file chain applies in ~0.2 s, which is why there is no template database (`CREATE DATABASE … TEMPLATE …`) — it would add a second mechanism with its own staleness rules to save nothing. Each reset costs one engine boot instead, so `build_e2e_engine_once` builds the SDK + engine **once per script invocation** and later restarts only locate that binary: recompiling between Playwright projects would swap the binary out from under a running suite.
+
+This also **replaced** `purge_orphan_migrations`, which dropped the public schema when `_sqlx_migrations` referenced a migration file that no longer existed (abandoned CC branches left orphan rows and sqlx then refused to start with `VersionMissing`). Every resetting run now starts from an empty database, so that case can't arise. It survives only on the paths that deliberately *don't* reset — `--no-reset` and `e2e-ios.sh`, which both attach to whatever database is already there. On those, the developer has explicitly asked to keep it and silently wiping their schema was the wrong answer anyway; the engine's `VersionMissing` names the problem, and running once without `--no-reset` fixes it.
+
 ### Single-writer lock on the e2e workspace
 Every e2e entry point (`e2e.sh`, `e2e-browser.sh`, `e2e-api.sh`) acquires `~/workspaces/e2e-test/.lucidos/e2e.lock` (PID + `$LUCIDOS_THREAD_ID` + worktree path + start time) before starting the workspace or any browser. A second invocation while the lock is held (owner PID alive) exits 1 with a message naming the holder. The lock exists because two CC sessions running Playwright concurrently against the shared workspace race on browser processes — on 2026-04-19 a WebKit GPU child leaked to 28 GB and OOM-rebooted a 32 GB Mac.
 
@@ -245,7 +254,7 @@ was the longest-running mobile-webkit flake (six sessions of compose-draft clobb
 fixes — see `docs/plans/2026-06-27-mobile-webkit-shard-contention.md` and
 `docs/plans/2026-06-28-drafts-sse-empty-clear-guard.md`). After all four inbound
 draft-clear paths were guarded (`stageDraftFromApi`, `applyRemoteCompose`, the
-`MessageReceived` echo — all gated on `hasLocalDraftEdit`), it still surfaced once
+`MessageReceived` echo — all gated on `hasUnsentLocalDraft`), it still surfaced once
 on the 2026-06-28 nightly as a **retry-recovered flake** — but with a *different
 shape* than the value='' clobber: the restore assertion **timed out** (the textarea
 hadn't hydrated within 5s, then recovered on the fresh-context retry).
@@ -273,6 +282,55 @@ failed PUT). This ends the multi-session "which face is it?" guessing: a future
 occurrence self-diagnoses in the failure message instead of needing a fresh blind
 investigation. Do **not** re-tighten this assertion back to a short explicit timeout —
 that is the exact change that re-introduces the flake.
+
+#### Never select a thread row by POSITION — the drawer is not yours alone
+
+The 2026-07-26 nightly then hit `drafts.spec.ts:65` again — first attempt, **five of
+five** full runs, always ~35.5s — and the instrumentation above reported
+**NOT-STORED**. That verdict was **wrong**, and chasing it would have been a seventh
+blind fix in the compose-draft code. A trace of a reproduced failure (2026-07-29)
+shows the compose PUT going out on schedule and being accepted:
+`PUT /threads/<id>/compose {"text":"thread draft text",…} → 204`. The draft was
+stored. The test was looking at a **different thread**.
+
+The mechanism, and the rule it forces:
+
+1. `clearAllThreads()` truncates the `thread_summaries` **projection** — behind the
+   engine's back. It does not stop anything the engine still considers live.
+2. A coding-agent session started by an EARLIER spec can still be running.
+   `coding-agent-question.spec.ts` (mobile-webkit nav chunk 2) answers a CC question;
+   the engine dispatches a **Continue** spawn (`--resume` in a fresh worktree) and the
+   spec ends immediately on its UI assertion. The real Claude Code subprocess keeps
+   working for ~45s.
+3. When that session's next event lands — inside the *next chunk's* test — the
+   projection's `INSERT … ON CONFLICT DO UPDATE` **re-creates** the row that
+   `clearAllThreads()` deleted, with `last_activity = NOW()` and no `first_message`.
+   It renders as "Untitled Thread" and sorts **above** the row the running test just
+   created.
+4. `drafts.spec.ts:65` navigated back with
+   `clickVisibleElement(page, '.thread-row:not(.compose-draft-row)')` — *the first
+   visible real row*. It clicked the foreign thread, found an empty textarea, and its
+   classifier then queried `compose_text` for **that** thread — `''` → "NOT-STORED".
+
+So: **a test that means "the thread I created" must select it by id**, via
+`clickThreadRow(page, threadId)` / `threadRowFor(threadId)` (`e2e/helpers.ts`), which
+key on the `data-flip-id` the drawer already stamps per row. `REAL_THREAD_ROW` with a
+positional `.first()` is only safe where the test genuinely means "any real row" (or
+scopes further with `hasText`). A test asserting on a thread it hasn't identified can
+report a perfectly healthy product as broken — which is exactly what happened here.
+
+Corollary for diagnostics: **assert identity before value.** The restore step now
+asserts the restored prompt's `data-thread-id` matches the thread it typed into
+*before* asserting the draft text, so a wrong-thread landing fails as a wrong-thread
+landing instead of masquerading as data loss.
+
+Why it looked webkit-only: mobile-webkit is the only project that splits its run into
+a nav phase and a CC phase and shards each into fresh-browser chunks. That split
+removes the four CC-destination spec files (14 tests) that otherwise sit between
+`coding-agent-question.spec.ts` and `drafts.spec.ts`, so on webkit `drafts:65` runs
+~40s after the leaked Continue spawn — inside its window. chromium and mobile run one
+unsharded alphabetical pass, where those tests (each spawning its own CC subprocess)
+push `drafts:65` well past it. Nothing about WebKit itself was involved.
 
 #### WebKit RSS reaper — host-resource safety net (distinct from the test-suite self-heal)
 
@@ -382,6 +440,120 @@ work on unconditionally. `scripts/lib/host_load_guard.sh` is the missing guard.
   float-compare exactness at the `1.5`/`1.0` boundary; and empty/zero/non-numeric
   `ncpu` failing open with no divide-by-zero.
 
+### Mid-run host saturation is classified, never mistaken for a product failure
+
+The launch gate above only knows about the instant it fired. On 2026-07-26 it
+passed on a quiet host, and then external macOS daemons (an MDM agent plus
+`mdmclient` / `mobileassetd` / `managedcorespotlight` — the periodic management
+sweep of an MDM-managed corporate fleet) pinned the box at load **83–227 for ~40
+minutes MID-RUN**. The browsers starved, and the resulting mobile-webkit timeouts
+were indistinguishable — in the log — from real product failures. A human had to
+notice the host was busy and re-run.
+
+So `host_load_guard.sh` also samples **throughout** the run:
+
+- **`start_host_load_sampler`** — a background loop (same shape as the WebKit
+  reaper's: pidfile, SIGTERM-safe, kills its in-flight `sleep`) appending
+  `<epoch> <load1>` every `HOST_LOAD_POLL_SECS`. Started by `e2e-browser.sh` next
+  to the reaper; truncates any previous run's samples at start.
+- **`report_host_load_saturation RUN_RC`** — drains the samples at the end.
+  **Always** prints a one-line summary (peak load, peak ratio, samples over cap,
+  longest sustained stretch) so triage has the evidence either way. Prints a loud
+  banner **only** when the run FAILED *and* the host was over the cap for at least
+  `HOST_LOAD_SUSTAINED_MIN_SECS` (default 120) contiguously.
+- **One threshold, not two.** Saturation is judged against the same
+  `HOST_LOAD_MAX_RATIO` the launch gate uses, through the same reader/compare
+  helpers. `HOST_LOAD_SUSTAINED_MIN_SECS` is a *duration*, not a second
+  threshold — it exists so an isolated spike (a heavy chunk, the release build's
+  tail) can't be blamed for a failing run.
+- **No retry, no swallowed exit code.** The reporter always returns 0 and the
+  caller exits with its own code; a saturated run still fails. The banner says
+  those failures are not trustworthy evidence and to re-run on an idle host — it
+  does not make them disappear. Auto-retrying the suite was considered and
+  rejected: it converts an honest "we can't tell" into an expensive guess.
+- **Wiring.** `e2e-browser.sh` funnels all three of its exit paths (full webkit,
+  caller-pinned project, the per-project loop) through one `finish` helper that
+  stops the sampler, reports, then exits with the run's own code.
+  `stop_e2e_background_guards` (`scripts/lib/e2e.sh`) stops the reaper and the
+  sampler together and is called from every teardown, so an abnormal exit can't
+  orphan either loop.
+- **Test.** `scripts/lib/host_load_guard_test.sh` covers: the sampler records and
+  stops cleanly (and leaves the samples for the report); a start truncates a
+  crashed predecessor's samples; failed + sustained → banner quantifying peak and
+  duration; failed + a 30s spike → **no** banner; a green run → never a banner;
+  raising `HOST_LOAD_MAX_RATIO` suppresses the banner (proving the shared cap);
+  and no samples / garbage samples / unreadable core count all fail open.
+
+### Failure traces survive the whole run — one `--output` dir per invocation
+
+`trace: 'retain-on-failure'` + `screenshot: 'only-on-failure'` are the only evidence
+an *unattended* nightly failure leaves behind, and they were being destroyed before
+anyone could read them. (Playwright calls these "output artifacts"; they are NOT
+Lucidos *artifacts* — they're ephemeral gitignored test output, so this section says
+traces/screenshots and the script names its variables `output`.) Playwright deletes its output dir at the **start** of every
+`playwright test` invocation (`createRemoveOutputDirsTask`), and the default is the
+whole `test-results/` tree — but one suite run makes many invocations: one per
+project (`mobile-webkit`, `chromium`, `mobile`) plus one per mobile-webkit chunk. The
+chunks already had per-chunk `--output` dirs; the per-project passes did not, so the
+`chromium` pass wiped every webkit chunk's traces and the `mobile` pass then wiped
+chromium's. Only the LAST project's survived. A targeted repro run afterwards
+(`-f <spec>`) defaulted to `test-results` too, so triaging destroyed what was left.
+
+`scripts/e2e-browser.sh` now wipes **one root once**, up front, and gives every
+invocation its own subdir under it (`set_output_dir`) — nothing is wiped mid-run:
+
+- Full run → `test-results/full/<project>` and `test-results/full/<project>-<phase>-<n>`,
+  with the whole `test-results/` tree cleared once before the first project.
+- Targeted run (`-f`, or any `--` passthrough) → `test-results/targeted/…`, and it
+  clears **only** that root, so a preceding full run's evidence — usually the very
+  thing you're reproducing against — stays intact.
+- A caller-supplied `--output` is detected and never overridden.
+
+There is no `--preserve-output-dir` CLI flag to reach for (the runner option exists
+but is internal), so per-invocation `--output` is the only lever.
+
+### The harness may not report a status it does not have
+
+A test harness has one job beyond running tests: telling the truth about what it
+ran. The 2026-07-26 nightly exposed a case where it could not. `e2e-browser.sh`
+prints a per-project exit-code table at the end of a full run, and the LAST
+project's cell was always blank — including on a run where `mobile` had two real
+failures. The umbrella exit code was computed independently and stayed correct, so
+nothing was masked, but a signal that is silently blank on every run is not a
+signal.
+
+**Root cause: a leaked loop variable.** The project loop is
+`for i in "${!PROJECTS[@]}"` and recorded results with `PROJECT_RCS[$i]=$rc`. Its
+body calls `reset_e2e_database` → `ensure_workspace_running`, whose frontend
+readiness poll was `for i in {1..30}` with **`i` not declared `local`**. Bash
+function locals are opt-in, so that counter overwrote the caller's index: every
+iteration after the first wrote its result to the poll count's slot (typically 1)
+instead of its own, so `chromium`'s entry was overwritten by `mobile`'s and index 2
+was never created. `for` re-assigns `i` from the word list at the top of each
+iteration, which is why the loop itself still visited all three projects.
+
+Three changes, because one of them alone would leave the class open:
+
+1. **`local i`** in `ensure_workspace_running` — the actual fix — plus every other
+   loop variable that leaked from a lib on the same call path (`cleanup_e2e_worktrees`,
+   `start_engine`, `_start_postgres_container`, `resolve_workspace`,
+   `running_frontend_workspaces_in_project`, `cleanup_stale_sleep_locks`,
+   `check_prereqs`). The invariant — *every loop variable in a sourced lib function
+   is `local`* — is **enforced, not asserted**: `test_no_sourced_lib_leaks_a_loop_variable`
+   (`scripts/lib/e2e_test.sh`) scans all eight libs `scripts/lib/e2e.sh` pulls in and
+   fails on a new leak, and plants a leaky fixture to prove the scan isn't vacuous.
+   `_` is exempt — bash reassigns it after every simple command, so no caller can
+   rely on it.
+2. **`PROJECT_RCS+=("$rc")`** instead of an indexed write — appending in lockstep
+   with `PROJECTS` cannot produce a hole, so a future leak in any lib function on
+   that call path can't corrupt the table.
+3. **`report_project_exit_codes`** (`scripts/lib/e2e.sh`) — an entry whose rc is
+   empty or non-numeric prints `UNKNOWN (harness bug)` and **forces the umbrella
+   exit code non-zero**. A run whose per-project status is unknown must not report
+   green. It lives in the lib rather than inline in `e2e-browser.sh` precisely so
+   it is unit-testable (`scripts/lib/e2e_test.sh`) — a guard against harness bugs
+   with no test of its own is the same bet that produced the bug.
+
 ## Test Coverage
 
 ### Browser E2E (16 tests)
@@ -401,19 +573,25 @@ work on unconditionally. `scripts/lib/host_load_guard.sh` is the missing guard.
 
 ## Running the Tests
 
-```bash
-# Start the e2e workspace
-./scripts/web-dev.sh -w ~/workspaces/e2e-test -b
+Each script builds the engine + SDK and boots its own session-scoped engine for the
+disposable `e2e-test` workspace, then tears it down — there is no separate start
+step, and `web-dev.sh` must not be used to pre-start one (it launches the
+machine-global gateway; refused from a coding-agent worktree — ADR 0021).
 
+```bash
 # Browser E2E tests
 ./scripts/e2e-browser.sh
 
-# HTTP API tests (also boots the e2e workspace)
+# HTTP API tests
 ./scripts/e2e-api.sh
 
-# Both back-to-back (what the nightly pipeline runs)
+# Everything back-to-back (what the nightly pipeline runs)
 ./scripts/e2e.sh
 
 # With visible browser (debugging)
 ./scripts/e2e-browser.sh -h
 ```
+
+Failure traces + screenshots land under `crates/lucidos-app/test-results/full/…`
+(or `…/targeted/…` for a filtered run) — see the per-invocation `--output`
+subsection above.

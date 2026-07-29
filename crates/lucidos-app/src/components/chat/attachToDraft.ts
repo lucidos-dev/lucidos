@@ -16,8 +16,31 @@ import { generateUuid } from '../../utils/uuid';
 
 const PLUGIN_EXT = '.lucidos-plugin';
 
-export async function attachImageToActiveDraft(file: File): Promise<void> {
+export async function attachImageToActiveDraft(source: File): Promise<void> {
   const threadId = ensureFocusedComposeThread();
+
+  // Snapshot the bytes into an in-memory File before any await. A File handed
+  // to us by a paste or drop is often backed by the system clipboard/pasteboard
+  // rather than memory, and that backing is only reliably readable during the
+  // synchronous event turn. macOS Universal Clipboard (an image copied on an
+  // iPhone, pasted on the Mac) is the sharp case: the File's bytes live behind
+  // a promised pasteboard resource that the browser releases once the paste
+  // event returns — the `await awaitThreadStarted` gap below is enough for that
+  // to happen, after which BOTH the `<img>` preview and the upload `fetch` fail
+  // with a cryptic "Failed to fetch" (a broken thumbnail plus the error toast
+  // the user sees). `arrayBuffer()` is invoked here, still inside the event
+  // turn, so everything downstream works off a stable copy. A regular in-memory
+  // File (photo picker, camera capture) round-trips through this as a cheap
+  // no-op copy.
+  let file: File;
+  try {
+    const bytes = await source.arrayBuffer();
+    file = new File([bytes], source.name || 'pasted-image', { type: source.type });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    showToast(`Image upload failed: could not read the image (${reason})`, 'error');
+    return;
+  }
 
   // Show the preview immediately, then upload in the background. The blob
   // URL is handed off twice: first to the pending entry (preview while

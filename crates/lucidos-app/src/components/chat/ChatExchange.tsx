@@ -574,6 +574,8 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
  *     exchange (covers the fresh-objects case where identities differ).
  *   - `questionOvertaken` — divider exchange flips this when the agent
  *     ignored a question; renders differently.
+ *   - `continuationMoved` — the turn was handed to a later exchange, which
+ *     finalizes this one's pending Thinking marker.
  *
  *  All other props are primitives or strings — Object.is per field. When
  *  every field matches we return `true` to skip the re-render entirely.
@@ -600,6 +602,7 @@ function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   const b = next.exchange;
   if (a.userSeq !== b.userSeq) return false;
   if (a.questionOvertaken !== b.questionOvertaken) return false;
+  if (a.continuationMoved !== b.continuationMoved) return false;
   if (a.steps.length !== b.steps.length) return false;
   const aLast = a.steps[a.steps.length - 1]?.seq;
   const bLast = b.steps[b.steps.length - 1]?.seq;

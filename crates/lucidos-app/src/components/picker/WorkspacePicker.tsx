@@ -23,6 +23,7 @@ import { Overlay } from '../shared/Overlay';
 import { LoadingFade } from '../shared/LoadingFade';
 import { SkeletonProvider, SkText, SkBlock } from '../shared/Skeleton';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
+import { useTooltip } from '../../hooks/useTooltip';
 import { dismissBootSplash } from '../../utils/bootSplash';
 import { isTauri } from '../../utils/platform';
 import { applyAppBadge } from '../../store/actions/app-badge';
@@ -239,6 +240,11 @@ function PickerSkeleton({ rows = 3 }: { rows?: number }) {
 }
 
 export function WorkspacePicker() {
+  // The picker is its own render root (`main.tsx` renders EITHER <WorkspacePicker/>
+  // OR <App/>), so it must install the global tooltip system itself — App.tsx's
+  // call never runs here, and without it every `data-tooltip` below is inert.
+  useTooltip();
+
   const workspaces = useSignal<Loadable<WorkspaceStatus[]>>({ status: 'not-loaded' });
   const busy = useSignal(false);
   const error = useSignal<string | null>(null);
@@ -632,7 +638,7 @@ export function WorkspacePicker() {
           <button
             class="ws-picker-net-btn"
             disabled={busy.value}
-            title="Network access"
+            data-tooltip="Network access"
             aria-label="Network access"
             aria-haspopup="dialog"
             aria-expanded={networkOpen.value}
@@ -708,7 +714,7 @@ export function WorkspacePicker() {
                       <button
                         type="button"
                         class="ws-picker-net-detected"
-                        title="Use this address"
+                        data-tooltip="Use this address"
                         onClick={fillDetectedTailscaleIp}
                       >
                         {networkConfig.value.detected_tailscale_ip}
@@ -760,7 +766,7 @@ export function WorkspacePicker() {
               <button
                 class={`ws-picker-reload${gatewayStatus.value.update_available ? ' has-update' : ''}${reloading.value ? ' is-reloading' : ''}`}
                 disabled={busy.value || reloading.value}
-                title={
+                data-tooltip={
                   reloading.value
                     ? 'Reloading gateway…'
                     : gatewayStatus.value.update_available
@@ -874,12 +880,20 @@ export function WorkspacePicker() {
                         }
                       }}
                     >
-                      <span class={`ws-picker-dot ws-picker-dot-${state}`} title={w.last_error || STATE_LABEL[state]} />
+                      {/* aria-label mirrors data-tooltip (same pattern as the unread badge
+                          below): the dot is the ONLY surface for `last_error`, and
+                          data-tooltip is hover-only, so without this the error text is
+                          unreachable by assistive tech. */}
+                      <span
+                        class={`ws-picker-dot ws-picker-dot-${state}`}
+                        data-tooltip={w.last_error || STATE_LABEL[state]}
+                        aria-label={w.last_error || STATE_LABEL[state]}
+                      />
                       <span class="ws-picker-name">{w.name}</span>
                       {typeof w.unread_count === 'number' && w.unread_count > 0 && (
                         <span
                           class="ws-picker-badge"
-                          title={`${w.unread_count} unread`}
+                          data-tooltip={`${w.unread_count} unread`}
                           aria-label={`${w.unread_count} unread notifications`}
                         >
                           {w.unread_count > 99 ? '99+' : w.unread_count}
@@ -891,7 +905,7 @@ export function WorkspacePicker() {
                             <button
                               class="ws-picker-icon ws-picker-icon-play ws-picker-icon-stop"
                               disabled={busy.value}
-                              title="Stop"
+                              data-tooltip="Stop"
                               aria-label={`Stop ${w.name}`}
                               aria-haspopup="dialog"
                               aria-expanded={stopConfirmId.value === w.id}
@@ -941,7 +955,7 @@ export function WorkspacePicker() {
                           <button
                             class="ws-picker-icon ws-picker-icon-play"
                             disabled={busy.value}
-                            title={state === 'unhealthy' ? 'Retry' : 'Start'}
+                            data-tooltip={state === 'unhealthy' ? 'Retry' : 'Start'}
                             aria-label={`${state === 'unhealthy' ? 'Retry' : 'Start'} ${w.name}`}
                             onClick={(e) => {
                               e.stopPropagation();
@@ -953,7 +967,7 @@ export function WorkspacePicker() {
                           <button
                             class="ws-picker-icon ws-picker-icon-more"
                             disabled={busy.value}
-                            title="More"
+                            data-tooltip="More"
                             aria-label={`More actions for ${w.name}`}
                             aria-haspopup="menu"
                             aria-expanded={menuOpenId.value === w.id}

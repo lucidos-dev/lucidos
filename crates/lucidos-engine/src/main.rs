@@ -529,16 +529,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         model_registry: model_registry.clone(),
         boot_without_provider,
     };
-    let llm: Arc<dyn lucidos_engine::llm::LlmProvider> =
-        match build_active_provider(boot_pool.as_ref(), &provider_ctx).await? {
-            ProviderBuildOutcome::Install(provider, selection) => {
-                log!("[Startup] LLM provider installed: {:?}", selection);
-                provider
-            }
-            ProviderBuildOutcome::FailFast => {
-                panic!("No LLM provider configured. Set VERTEX_PROJECT_ID (Claude/Gemini via Vertex), configure an OpenAI / Anthropic / OpenRouter credential (Settings → Models → Providers) or OPENAI_API_KEY / LUCIDOS_OPENROUTER_API_KEY, set a local OpenAI-compatible base URL (Settings → Models → Providers or LUCIDOS_LOCAL_BASE_URL), LUCIDOS_BOOT_WITHOUT_PROVIDER=1 (boot into provider onboarding), or LUCIDOS_MODEL=mock (for testing).");
-            }
-        };
+    let (llm, web_search) = match build_active_provider(boot_pool.as_ref(), &provider_ctx).await? {
+        ProviderBuildOutcome::Install {
+            llm,
+            web_search,
+            selection,
+        } => {
+            log!("[Startup] LLM provider installed: {:?}", selection);
+            (llm, web_search)
+        }
+        ProviderBuildOutcome::FailFast => {
+            panic!("No LLM provider configured. Set VERTEX_PROJECT_ID (Claude/Gemini via Vertex), configure an OpenAI / Anthropic / OpenRouter credential (Settings → Models → Providers) or OPENAI_API_KEY / LUCIDOS_OPENROUTER_API_KEY, set a local OpenAI-compatible base URL (Settings → Models → Providers or LUCIDOS_LOCAL_BASE_URL), LUCIDOS_BOOT_WITHOUT_PROVIDER=1 (boot into provider onboarding), or LUCIDOS_MODEL=mock (for testing).");
+        }
+    };
     drop(boot_pool);
 
     // Create engine with pgvector for embeddings
@@ -546,6 +549,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         workspace_path.clone(),
         &database_url,
         llm,
+        web_search,
         project_id,
         vertex_region,
         vertex_token_cache,
@@ -578,13 +582,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared_engine.set_self_arc(&shared_engine);
     shared_engine.start_parent_callback_listener();
     shared_engine.start_apply_all_driver();
-    // A first boot whose embedding-model download failed (offline packaged
-    // install) came up with memory degraded — keep retrying in the background
-    // and install the model without a restart. No-op on a normal boot.
-    shared_engine.spawn_embedder_retry_if_degraded();
+    // The slot boots empty — load the embedding model in the background (tries
+    // immediately, backs off on a fetch failure) and install it live once it
+    // lands, so boot never waits on the multi-hundred-MB model download/load.
+    shared_engine.spawn_embedder_load();
 
-    // Construction is done (migrations + embedder); the recovery sweeps below run
-    // before the HTTP server binds, so narrate them on the boot splash.
+    // Construction is done (migrations only — the embedding model loads in the
+    // background); the recovery sweeps below run before the HTTP server binds, so
+    // narrate them on the boot splash.
     lucidos_engine::boot_report::report(lucidos_engine::boot_report::RECOVERING);
 
     // Acquire the engine startup lease BEFORE any reset/recovery below. A respawn
@@ -791,7 +796,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // recovers threads wedged by the now-removed bg-bash propose-gate (whose
     // only escape used to be a 5-minute nudge or a manual seed-change POST),
     // and is a general safety net for any missed idle-proposal. Steady-state
-    // it's a no-op — `should_propose_change_at_idle` already fires for every
+    // it's a no-op — `may_touch_change_state_at_idle` already fires for every
     // clean idle — so it only does work on the restart that lands this change
     // (and any future anomaly). See the function docstring for the per-thread
     // eligibility checks.
@@ -801,6 +806,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         shared_engine.workspace_path(),
     )
     .await;
+
+    // The mirror of the sweep above: a pending change that still EXISTS but
+    // whose branch diff has since gone empty. Its card keeps advertising files
+    // (and a restart) that the Diff button no longer shows. The live idle path
+    // reconciles these as they happen; this catches rows that went stale while
+    // no session was running. Runs after the two sweeps above so it sees the
+    // rows they may have just created/refreshed, and before the HTTP server so
+    // the first SSE payload is already honest.
+    lucidos_engine::engine::agent_recovery::reconcile_emptied_changes_on_startup(&shared_engine)
+        .await;
 
     // Re-deliver parent-resume wakes lost to the restart (ADR 0011, B1). The
     // in-memory ParentCallback channel was recreated empty above, so any blocking
@@ -856,11 +871,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared_engine.start_spawn_request_consumer(spawn_request_rx);
 
     // Auto-resume the coding-agent threads recovery flagged for a user-initiated
-    // Switch to new version. Emitted HERE — after the dispatcher subscribed above —
-    // because recovery ran before the dispatcher existed, so a ContinuationRequested
-    // emitted during recovery would be missed. Crash-interrupted threads were NOT
-    // queued (they keep the manual Continue affordance), so this never re-runs work
-    // that may have crashed the engine.
+    // Switch to new version. Emitted HERE — after `SpawnDispatcher::spawn()` above,
+    // which opens its broadcast subscription SYNCHRONOUSLY before returning, so
+    // these emits are buffered even while the dispatcher's startup backfill is
+    // still running (recovery ran before the dispatcher existed, so the emit can't
+    // happen inside recovery; and a subscription acquired only after the backfill
+    // would race these emits — the lost-ContinuationRequested zombie bug). The
+    // dispatcher's startup orphan re-dispatch is the durable floor if an emit is
+    // ever lost anyway. Crash-interrupted threads were NOT queued (they keep the
+    // manual Continue affordance), so this never re-runs work that may have
+    // crashed the engine.
     shared_engine.resume_pending_switches().await;
 
     // Start the external watchdog. Scans agent_sessions every 30 s from
@@ -889,6 +909,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // "Nothing running". Subscribe before the API server (the chat handler that
     // acquires user slots) comes alive.
     shared_engine.thread_queue.spawn_settle_subscriber();
+
+    // Chat parity of `resume_pending_switches` above: auto-resume the chat /
+    // trigger threads a user-initiated Switch to new version interrupted. Same
+    // cause gate as the coding-agent half (a device-attributed EngineShutdown
+    // teardown abort), so a crash still falls back to the manual Continue.
+    //
+    // Deliberately LATER than the coding-agent drain. A coding-agent resume only
+    // needs the spawn dispatcher subscribed; a chat resume re-enters the agentic
+    // loop directly and immediately reads as `running`, so it must come after
+    // `spawn_settle_subscriber()` above or that status change never reconciles a
+    // Thread Queue slot. It must also follow `recover_orphan_tool_calls` (far
+    // above), or the re-entered turn rebuilds an unpaired `tool_use` block and the
+    // provider rejects the call.
+    shared_engine.resume_pending_chat_switches().await;
 
     // Use the engine's shared pool for scheduler
     let pool = shared_engine.pool().clone();

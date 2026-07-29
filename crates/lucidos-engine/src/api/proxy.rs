@@ -162,13 +162,25 @@ pub fn filter_request_headers(headers: &HeaderMap) -> HeaderMap {
 /// stop that page from issuing a simple POST to localhost / the gateway. Since
 /// `/proxy/*` resolves credentials and can trigger upstream side effects, reject
 /// browser requests that are not same-origin before any credential lookup.
+///
+/// `Sec-Fetch-Site` is the authoritative signal when present. It is a browser-set
+/// [forbidden header](https://developer.mozilla.org/en-US/docs/Glossary/Forbidden_header_name)
+/// that page JavaScript cannot set or forge, so it alone decides — no host
+/// reconstruction needed. This is what lets a same-origin app fetch through even
+/// when there's no usable `Host` to compare `Origin` against, e.g. the
+/// direct-to-engine HTTP/2 PWA (HTTP/2 carries the authority in the `:authority`
+/// pseudo-header, so there's no `Host` header at all). Every current browser
+/// sends Fetch Metadata (Chrome 76+, Firefox 90+, Safari 16.4+).
+///
+/// A browser old enough to omit Fetch Metadata still sends `Origin`; it falls
+/// back to the legacy `Origin == Host` comparison. That fallback only holds
+/// **direct-to-engine**, where `Host` is the real client authority — behind the
+/// gateway `Host` is the internal upstream address (reqwest rewrites it on the
+/// forward hop) and no `x-forwarded-host` is injected, so a no-Fetch-Metadata
+/// browser fronted by the gateway is deliberately unsupported for credentialed
+/// proxy routes (an accepted, shrinking-population limitation — see
+/// `docs/plans/2026-07-22-credentialed-proxy-sec-fetch-authoritative.md`).
 fn browser_proxy_request_allowed(headers: &HeaderMap) -> bool {
-    let host = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok());
-
-    // Non-browser clients generally omit fetch metadata and Origin. Allow them;
-    // the engine/gateway bind topology is their protection boundary.
     let sec_fetch_site = headers
         .get("sec-fetch-site")
         .and_then(|v| v.to_str().ok())
@@ -177,26 +189,26 @@ fn browser_proxy_request_allowed(headers: &HeaderMap) -> bool {
         .get(axum::http::header::ORIGIN)
         .and_then(|v| v.to_str().ok());
 
-    if sec_fetch_site.is_none() && origin.is_none() {
-        return true;
-    }
-
+    // Sec-Fetch-Site present → it decides, unforgeably. `same-origin` / `none`
+    // are safe; `same-site` / `cross-site` are foreign pages → reject.
     if let Some(site) = sec_fetch_site.as_deref() {
-        if !matches!(site, "same-origin" | "none") {
-            return false;
-        }
+        return matches!(site, "same-origin" | "none");
     }
 
-    if let Some(origin) = origin {
-        let Some(host) = host else {
-            return false;
-        };
-        if !origin_authority_matches_host(origin, host) {
-            return false;
-        }
-    }
-
-    true
+    // No Sec-Fetch metadata. Either a non-browser client (also no Origin) — allow,
+    // the engine/gateway bind topology is its protection boundary — or a legacy
+    // pre-Fetch-Metadata browser that still sends `Origin`. Those are HTTP/1.1, so
+    // a plain `Host` header is present; fall back to the same-origin comparison.
+    let Some(origin) = origin else {
+        return true;
+    };
+    let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    origin_authority_matches_host(origin, host)
 }
 
 fn origin_authority_matches_host(origin: &str, host: &str) -> bool {
@@ -539,6 +551,18 @@ fn resolve_redirect_location(current_url: &str, location: &str) -> Option<reqwes
     base.join(location).ok()
 }
 
+/// A resolved proxy target. `apis.json` entries build their auth layers per
+/// request from `config.auth`; a builtin model-provider target carries its
+/// base URL + pre-built auth layers (sourced from the engine's own provider
+/// credentials — see [`crate::api::proxy_builtin`]).
+enum ResolvedProxy {
+    Config(ProxyConfig),
+    Builtin {
+        base_url: String,
+        layers: Vec<Arc<dyn crate::api::proxy_auth_layer::AuthLayer>>,
+    },
+}
+
 async fn proxy_handle_inner(
     state: AppState,
     name: String,
@@ -555,8 +579,20 @@ async fn proxy_handle_inner(
         )
             .into_response();
     }
-    let config = match resolve_proxy_target(&state.workspace_path, &name).await {
-        Ok(c) => c,
+    // `apis.json` is resolved first, so an entry with the same name overrides
+    // the builtin. A builtin model-provider proxy (openai/openrouter/anthropic/
+    // vertex/local) fills the 404 gap when no entry exists.
+    let resolved = match resolve_proxy_target(&state.workspace_path, &name).await {
+        Ok(config) => ResolvedProxy::Config(config),
+        Err((StatusCode::NOT_FOUND, generic)) => {
+            match crate::api::proxy_builtin::resolve_builtin_provider(&state.engine, &name).await {
+                Ok(Some((base_url, layers))) => ResolvedProxy::Builtin { base_url, layers },
+                // Not a builtin either — the original "not configured" 404.
+                Ok(None) => return (StatusCode::NOT_FOUND, generic).into_response(),
+                // A recognized builtin whose credential/config is absent.
+                Err((status, msg)) => return (status, msg).into_response(),
+            }
+        }
         Err((status, msg)) => return (status, msg).into_response(),
     };
 
@@ -570,9 +606,16 @@ async fn proxy_handle_inner(
         }
     };
 
-    match dispatch_proxy_request(&state.engine, &name, &config, method, path, query, headers, body)
-        .await
-    {
+    let result = match resolved {
+        ResolvedProxy::Config(config) => {
+            dispatch_proxy_request(&state.engine, &name, &config, method, path, query, headers, body)
+                .await
+        }
+        ResolvedProxy::Builtin { base_url, layers } => {
+            dispatch_with_layers(&name, &base_url, layers, method, path, query, headers, body).await
+        }
+    };
+    match result {
         Ok(resp) => resp,
         Err((status, msg)) => (status, msg).into_response(),
     }
@@ -599,16 +642,54 @@ pub async fn dispatch_proxy_request(
     // every credential and re-instantiating WASM signers would be wasted
     // work.
     let layers = build_pipeline_layers(engine, name, config).await?;
+    dispatch_with_layers(name, &config.base_url, layers, method, path, query, headers, body).await
+}
 
-    let (response, outcome) =
-        forward_with_redirects(name, &config.base_url, &layers, &method, &path, query.as_deref(), &headers, &body).await?;
+/// Forward through a pre-built layer pipeline (with same-host redirect
+/// re-signing) and drive the one-shot 401 invalidate-and-retry. Shared by the
+/// `apis.json` path ([`dispatch_proxy_request`], which builds `layers` from a
+/// `ProxyConfig`) and the builtin-provider path
+/// ([`crate::api::proxy_builtin::resolve_builtin_provider`], which builds
+/// `layers` from the engine's own model-provider credentials) so the forward +
+/// redirect + retry semantics stay identical for both.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dispatch_with_layers(
+    name: &str,
+    base_url: &str,
+    layers: Vec<Arc<dyn crate::api::proxy_auth_layer::AuthLayer>>,
+    method: Method,
+    path: String,
+    query: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, (StatusCode, String)> {
+    let (response, outcome) = forward_with_redirects(
+        name,
+        base_url,
+        &layers,
+        &method,
+        &path,
+        query.as_deref(),
+        &headers,
+        &body,
+    )
+    .await?;
 
     if !crate::api::proxy_pipeline::pipeline_should_retry(&layers, &outcome, response.status()) {
         return Ok(response);
     }
     crate::api::proxy_pipeline::pipeline_invalidate_for_retry(&layers, &outcome).await;
-    let (response, _) =
-        forward_with_redirects(name, &config.base_url, &layers, &method, &path, query.as_deref(), &headers, &body).await?;
+    let (response, _) = forward_with_redirects(
+        name,
+        base_url,
+        &layers,
+        &method,
+        &path,
+        query.as_deref(),
+        &headers,
+        &body,
+    )
+    .await?;
     Ok(response)
 }
 

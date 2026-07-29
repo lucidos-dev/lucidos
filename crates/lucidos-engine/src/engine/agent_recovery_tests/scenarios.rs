@@ -968,6 +968,97 @@ fn continue_resume_exchange_gate_opens_for_user_continue_and_auto_recovery() {
         );
 }
 
+/// THE 2026-07-29 WEDGE REGRESSION GUARD (thread `cb503361`). A stale resume on
+/// a continuation MUST produce a retry. `run_session` bails on a stale resume
+/// without emitting a terminal — on purpose, so the projection stays `running`
+/// across the retry window rather than flashing "Aborted" — which is only safe
+/// if a retry follows. When the SpawnConsumer merely logged the error instead,
+/// the thread sat at `running` with no live subprocess for 8 minutes: the
+/// stale-resume arm also drops the `agent_sessions` entry, and that map is the
+/// only thing `ExternalWatchdog` scans.
+#[test]
+fn stale_resume_on_a_continuation_retries_fresh() {
+    use super::{continue_recovery, ContinueRecovery};
+    assert_eq!(
+        continue_recovery(
+            Some(crate::engine::claude_code::STALE_RESUME_ERROR),
+            false
+        ),
+        ContinueRecovery::RetryFresh
+    );
+}
+
+/// The retry is ONE-SHOT: a second stale resume settles instead of retrying
+/// again, so an engine-driven continuation can never loop. (Unreachable in
+/// practice — the retry passes no resume sid and `is_stale_resume_signal`
+/// requires one — but crash-safety is a floor here, not an inference.)
+#[test]
+fn a_second_stale_resume_settles_instead_of_looping() {
+    use super::{continue_recovery, ContinueRecovery};
+    assert_eq!(
+        continue_recovery(Some(crate::engine::claude_code::STALE_RESUME_ERROR), true),
+        ContinueRecovery::Settle
+    );
+}
+
+/// Every other error settles, before AND after the retry is spent. This is the
+/// zombie-`running` floor: a continuation is engine-driven, so if it dies
+/// without a terminal nothing else will ever clear the projection — the
+/// watchdogs scan only live `agent_sessions` and the boot sweep has long since
+/// run.
+#[test]
+fn any_other_continuation_error_settles_the_thread() {
+    use super::{continue_recovery, ContinueRecovery};
+    for retried in [false, true] {
+        for err in [
+            "Failed to start the coding agent: No such file or directory",
+            "pool timed out while waiting for an open connection",
+            "",
+        ] {
+            assert_eq!(
+                continue_recovery(Some(err), retried),
+                ContinueRecovery::Settle,
+                "error {err:?} (retried={retried}) must settle — an unsettled `running` thread is only clearable by a user click"
+            );
+        }
+    }
+}
+
+/// The one error that must NOT settle. The spawn guard rejects a continuation
+/// that raced a user message, because a LIVE session already owns the thread —
+/// so this continuation owns nothing and the `running` projection is TRUE. A
+/// settle here emits a terminal against a working session, which is the same
+/// lying projection as the wedge, pointed the other way. Reachable in practice:
+/// the consumer dispatches off an event subscriber holding no lock on the
+/// thread, so a user message and an auto-resume can both arrive at once.
+#[test]
+fn losing_the_race_to_a_live_session_never_settles_it() {
+    use super::{continue_recovery, ContinueRecovery};
+    for retried in [false, true] {
+        assert_eq!(
+            continue_recovery(
+                Some(crate::engine::claude_code::AGENT_ALREADY_RUNNING_ERROR),
+                retried
+            ),
+            ContinueRecovery::Nothing,
+            "the winning session owns the turn and will emit its own terminal"
+        );
+    }
+}
+
+/// A continuation that ran normally needs nothing: the run loop already emitted
+/// its own terminal. Settling here would double-terminal a healthy turn.
+#[test]
+fn a_successful_continuation_needs_no_recovery() {
+    use super::{continue_recovery, ContinueRecovery};
+    assert_eq!(continue_recovery(None, false), ContinueRecovery::Nothing);
+    assert_eq!(
+        continue_recovery(None, true),
+        ContinueRecovery::Nothing,
+        "a retry that SUCCEEDED must not be settled on top of its own terminal"
+    );
+}
+
 /// Most idles carry no reason — make sure that case still round-trips
 /// without leaking a `"reason": null` into the wire payload (the
 /// `skip_serializing_if = "Option::is_none"` attribute owns this).

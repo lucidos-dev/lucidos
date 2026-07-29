@@ -2,9 +2,16 @@ import { describe, it, expect } from 'vitest';
 import { availableReasoningLevels, clampReasoningEffort } from '../models';
 
 describe('availableReasoningLevels', () => {
-  it('drops max for OpenAI models (collapses with xhigh)', () => {
+  it('drops max for pre-5.6 OpenAI models (collapses with xhigh)', () => {
     const values = availableReasoningLevels('gpt-5.4').map(l => l.value);
     expect(values).toEqual(['none', 'low', 'medium', 'high', 'xhigh']);
+  });
+
+  it('exposes full set (incl max) for the GPT-5.6 family', () => {
+    for (const model of ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
+      const values = availableReasoningLevels(model).map(l => l.value);
+      expect(values).toEqual(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
+    }
   });
 
   it('exposes full set for Opus 4.7', () => {
@@ -39,8 +46,13 @@ describe('clampReasoningEffort', () => {
     expect(clampReasoningEffort('xhigh', 'claude-opus-4-6')).toBe('max');
   });
 
-  it('snaps max to xhigh on OpenAI', () => {
+  it('snaps max to xhigh on pre-5.6 OpenAI', () => {
     expect(clampReasoningEffort('max', 'gpt-5.4')).toBe('xhigh');
+  });
+
+  it('keeps max on the GPT-5.6 family', () => {
+    expect(clampReasoningEffort('max', 'gpt-5.6-sol')).toBe('max');
+    expect(clampReasoningEffort('max', 'gpt-5.6-luna')).toBe('max');
   });
 
   it('snaps xhigh to max on Gemini (ties break toward higher effort)', () => {

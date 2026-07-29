@@ -1,5 +1,8 @@
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
+// One signal-name table for the whole engine — shared with `TaskOutcome`, which
+// renders the same names for the bash tools. See `format_exit_status`.
+use crate::core::shell::signal_name;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
@@ -24,6 +27,10 @@ pub struct CcMenuOption {
     pub value: String,
     pub label: String,
     pub description: String,
+    /// Optional model compatibility metadata used by Codex reasoning efforts.
+    /// Claude Code and universally supported Codex options leave it absent.
+    #[serde(default)]
+    pub supported_models: Option<Vec<String>>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -550,40 +557,6 @@ fn format_user_input(input: &AgentInput, session_id: Option<&str>) -> String {
     line
 }
 
-/// Decode a `child.wait()` result into a debuggable string. `{:?}` on
-/// `ExitStatus` prints `unix_wait_status(36608)` — useless without
-/// manual decoding when a session-ending CC death lands in production
-/// logs. Three cases worth distinguishing:
-///
-/// * `exit=N` — clean exit with code `N` below the signal-convention
-///   range. Most CC sessions end here (exit 0 / 1 / SDK-specific codes).
-/// * `exit=N (probable SIGNAME)` — Node.js convention. A child that
-///   installs a signal handler typically re-exits with `128 + signum`
-///   after running cleanup. The hint converts the cryptic 143/137 codes
-///   the Lucidos engine sees from Claude Code into "SIGTERM" / "SIGKILL"
-///   at log-read time so future "who killed CC?" investigations don't
-///   require manual arithmetic.
-/// * `signal=NAME (N)` / `signal=N` — kernel delivered the signal as
-///   cause-of-death directly (no handler ran). Distinct from the
-///   exit=128+N path because the child never got to clean up.
-///
-/// `signal_name` is the bridge: keeps the named-signal table tiny
-/// (Node.js and the macOS Jetsam stack between them cover the common
-/// values we care about) and falls through to bare numbers for anything
-/// we haven't mapped, so the log never silently drops information.
-fn signal_name(sig: i32) -> Option<&'static str> {
-    match sig {
-        1 => Some("SIGHUP"),
-        2 => Some("SIGINT"),
-        3 => Some("SIGQUIT"),
-        6 => Some("SIGABRT"),
-        9 => Some("SIGKILL"),
-        13 => Some("SIGPIPE"),
-        15 => Some("SIGTERM"),
-        _ => None,
-    }
-}
-
 /// True when an exit status indicates the process was killed by a signal —
 /// either delivered directly by the kernel (`status.signal()` is set) or via
 /// the Node.js `128 + signum` convention (a handler caught the signal, ran
@@ -604,6 +577,30 @@ pub(crate) fn exit_indicates_signal_kill(_status: &std::process::ExitStatus) -> 
     false
 }
 
+/// Decode a `child.wait()` result into a debuggable string. `{:?}` on
+/// `ExitStatus` prints `unix_wait_status(36608)` — useless without
+/// manual decoding when a session-ending CC death lands in production
+/// logs. Three cases worth distinguishing:
+///
+/// * `exit=N` — clean exit with code `N` below the signal-convention
+///   range. Most CC sessions end here (exit 0 / 1 / SDK-specific codes).
+/// * `exit=N (probable SIGNAME)` — Node.js convention. A child that
+///   installs a signal handler typically re-exits with `128 + signum`
+///   after running cleanup. The hint converts the cryptic 143/137 codes
+///   the Lucidos engine sees from Claude Code into "SIGTERM" / "SIGKILL"
+///   at log-read time so future "who killed CC?" investigations don't
+///   require manual arithmetic.
+/// * `signal=NAME (N)` / `signal=N` — kernel delivered the signal as
+///   cause-of-death directly (no handler ran). Distinct from the
+///   exit=128+N path because the child never got to clean up.
+///
+/// `signal_name` is the bridge: it keeps the named-signal table tiny
+/// (Node.js and the macOS Jetsam stack between them cover the common
+/// values we care about) and falls through to bare numbers for anything
+/// we haven't mapped, so the log never silently drops information. It
+/// lives in `core::shell` next to `TaskOutcome`, which renders the same
+/// names (and decodes the same `128 + signum` range) for the bash tools
+/// — one table, so the two can't drift.
 pub(crate) fn format_exit_status(
     wait_result: &std::io::Result<std::process::ExitStatus>,
 ) -> String {

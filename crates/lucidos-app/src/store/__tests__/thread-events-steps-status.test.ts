@@ -584,6 +584,21 @@ describe('tool description from event', () => {
     expect(fullCommandForCCTool('TodoWrite', {})).toBeUndefined();
   });
 
+  it('fullCommandForCCTool formats Codex todo_list as a checkbox list (TodoWrite parity)', () => {
+    // Both Codex protocols normalize the plan tool to {items: [{text, completed}]}
+    // (exec emits it natively; app-server maps turn/plan/updated onto it).
+    const items = [
+      { text: 'Map the code', completed: true },
+      { text: 'Fix the bug', completed: false },
+    ];
+    expect(fullCommandForCCTool('todo_list', { items })).toBe(
+      '[x] Map the code\n[ ] Fix the bug',
+    );
+    expect(fullCommandForCCTool('todo_list', { items: [] })).toBeUndefined();
+    expect(fullCommandForCCTool('todo_list', { items: 'nope' })).toBeUndefined();
+    expect(fullCommandForCCTool('todo_list', {})).toBeUndefined();
+  });
+
   it('exchangeResponseEvents stamps full path on CodingAgentToolCalled steps for hover tooltip', () => {
     // Rust describe_cc_tool() shows only basename(file_path); the full path is
     // preserved on the step so the UI can show it on mouseover.

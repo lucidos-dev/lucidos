@@ -4,12 +4,39 @@
 //! `CARGO_MANIFEST_DIR`, so a project rename after build doesn't strand
 //! script-spawns and asset reads at a path that no longer exists.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const REPO_MARKER: &str = "scripts/web-dev.sh";
+
+/// Does `path` lie inside a coding-agent worktree — one of the
+/// `<workspace>/.lucidos/worktrees/<thread>/` copies the engine creates per
+/// coding-agent thread?
+///
+/// A worktree is a throwaway checkout pinned to one commit, so anything
+/// long-lived resolving into one is frozen at that commit. Used to explain a
+/// stranded frontend Apply: when the served `dist/` sits in a worktree, the
+/// build-watch is republishing a DIFFERENT directory and the served client can
+/// never advance (the 2026-07-26 incident — see
+/// `docs/plans/2026-07-26-worktree-pinned-stack-guard.md`).
+///
+/// Mirrors the gateway's `stack::path_is_in_cc_worktree` and the bash
+/// `path_is_in_cc_worktree` in `scripts/lib/workspace.sh` — keep the three in
+/// step. A pure path test on purpose: it must stay correct for an orphaned
+/// worktree whose directory is already gone. Matches the ADJACENT `.lucidos` +
+/// `worktrees` component pair, so `~/worktrees/lucidos` and
+/// `.lucidos/served-frontend` are not caught.
+pub fn path_is_in_cc_worktree(path: &Path) -> bool {
+    let comps: Vec<_> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    comps
+        .windows(2)
+        .any(|w| w[0] == ".lucidos" && w[1] == "worktrees")
+}
 
 /// Resolve the Lucidos repo root from the running binary's path.
 /// Cached for the process lifetime; called from polled handlers (`health`).
@@ -25,17 +52,33 @@ fn compute_repo_root() -> Result<PathBuf, String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("Cannot resolve current executable path: {e}"))?;
 
-    for ancestor in exe.ancestors() {
-        if ancestor.join(REPO_MARKER).exists() {
-            return Ok(ancestor.to_path_buf());
-        }
-    }
+    repo_root_above(&exe).ok_or_else(|| {
+        format!(
+            "No Lucidos repo root above current executable ({}); \
+             expected an ancestor containing {REPO_MARKER}",
+            exe.display()
+        )
+    })
+}
 
-    Err(format!(
-        "No Lucidos repo root above current executable ({}); \
-         expected an ancestor containing {REPO_MARKER}",
-        exe.display()
-    ))
+/// The Lucidos repo root above `exe`, or `None` when there isn't one.
+///
+/// Walks ancestors rather than counting `..` hops, so it is independent of HOW
+/// DEEP the binary sits under the checkout. That is load-bearing, not
+/// incidental: the dev launcher publishes the engine to
+/// `target/<profile>/launch/<variant>/lucidos-engine` (ADR 0022), two levels
+/// deeper than the historical `target/<profile>/`, and every dev-mode resource
+/// lookup (`scripts/`, `system-knowhow/`, the SDK bundle) resolves through here.
+/// Split out from [`compute_repo_root`] so the depth-independence is testable
+/// without touching `current_exe()`.
+///
+/// The gateway has a hand-synced copy (`crates/lucidos-gateway/src/build_id.rs`
+/// `repo_root_from`) — ADR 0014 §1 keeps it free of any dependency on the
+/// engine. Keep the two in step.
+pub(crate) fn repo_root_above(exe: &Path) -> Option<PathBuf> {
+    exe.ancestors()
+        .find(|a| a.join(REPO_MARKER).exists())
+        .map(Path::to_path_buf)
 }
 
 /// Best-effort repo root: falls back to compile-time `CARGO_MANIFEST_DIR`
@@ -71,6 +114,40 @@ mod tests {
             "resolved repo root {} does not contain {REPO_MARKER}",
             root.display()
         );
+    }
+
+    /// The checkout is found by WALKING ancestors, at any depth — the dev
+    /// launcher publishes the engine two levels deeper than the historical
+    /// `target/<profile>/` (ADR 0022), and every dev-mode resource lookup
+    /// (`scripts/`, `system-knowhow/`, the SDK bundle) hangs off this. A
+    /// fixed-hop-count resolver would silently stop finding the checkout — which
+    /// is exactly how the SDK bundle fell back to its stub.
+    #[test]
+    fn repo_root_above_is_independent_of_binary_depth() {
+        let dir = std::env::temp_dir().join(format!(
+            "lucidos-reporoot-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::write(dir.join(REPO_MARKER), "#!/bin/bash\n").unwrap();
+
+        for rel in [
+            "target/debug/lucidos-engine",
+            "target/debug/launch/plain/lucidos-engine",
+            "target/release/launch/e2e-test-hooks/lucidos-engine",
+            "target/debug/deps/lucidos_engine-abc123",
+        ] {
+            assert_eq!(
+                repo_root_above(&dir.join(rel)).as_deref(),
+                Some(dir.as_path()),
+                "repo root must resolve from {rel}"
+            );
+        }
+        assert_eq!(repo_root_above(Path::new("/tmp/elsewhere/lucidos-engine")), None);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -127,4 +204,41 @@ mod tests {
              Got docker-compose.dev.yml:\n{yml}"
         );
     }
+
+    /// Regression cover for the 2026-07-26 incident: the engine served a `dist/`
+    /// inside an orphaned coding-agent worktree, so the build-watch republished a
+    /// different directory and every frontend Apply silently did nothing.
+    #[test]
+    fn flags_coding_agent_worktree_paths() {
+        for p in [
+            "/w/dev/.lucidos/worktrees/thread-abc",
+            "/w/dev/.lucidos/worktrees/thread-abc/crates/lucidos-app/dist",
+        ] {
+            assert!(path_is_in_cc_worktree(Path::new(p)), "{p}");
+        }
+    }
+
+    /// Must not fire on a real checkout, on a directory merely NAMED `worktrees`,
+    /// or on the engine's own `.lucidos/served-frontend` snapshot dir.
+    #[test]
+    fn leaves_other_paths_alone() {
+        for p in [
+            "/Users/me/projects/lucidos/crates/lucidos-app/dist",
+            "/Users/me/worktrees/lucidos/crates/lucidos-app/dist",
+            "/w/dev/.lucidos/served-frontend/0",
+            "/w/dev/.lucidos/cache/worktrees/thread-abc",
+        ] {
+            assert!(!path_is_in_cc_worktree(Path::new(p)), "{p}");
+        }
+    }
+
+    /// Pure path test — an orphaned worktree is often already deleted, which is
+    /// exactly when the stranded-Apply explanation is still needed.
+    #[test]
+    fn does_not_require_the_path_to_exist() {
+        assert!(path_is_in_cc_worktree(Path::new(
+            "/gone/.lucidos/worktrees/thread-x/crates"
+        )));
+    }
+
 }

@@ -29,6 +29,11 @@ pub struct Model {
     /// [`SOURCE_BUILTIN`] or [`SOURCE_USER`].
     pub source: String,
     pub enabled: bool,
+    /// Declared context window in tokens. `None` = not declared, so
+    /// `engine::context::context_window_from_prefix` decides from the id shape.
+    /// Only worth setting for ids the prefix map gets wrong — every OpenRouter /
+    /// Gemini / local model, which otherwise takes the 200k fallback.
+    pub context_window: Option<i32>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -38,7 +43,8 @@ impl Model {
     }
 }
 
-/// Raw DB row: (id, label, provider, sort_order, source, enabled, created_at).
+/// Raw DB row: (id, label, provider, sort_order, source, enabled,
+/// context_window, created_at).
 type ModelRow = (
     String,
     String,
@@ -46,13 +52,15 @@ type ModelRow = (
     i32,
     String,
     bool,
+    Option<i32>,
     chrono::DateTime<chrono::Utc>,
 );
 
-const SELECT_COLS: &str = "id, label, provider, sort_order, source, enabled, created_at";
+const SELECT_COLS: &str =
+    "id, label, provider, sort_order, source, enabled, context_window, created_at";
 
 fn row_to_model(row: ModelRow) -> Model {
-    let (id, label, provider, sort_order, source, enabled, created_at) = row;
+    let (id, label, provider, sort_order, source, enabled, context_window, created_at) = row;
     Model {
         id,
         label,
@@ -60,6 +68,7 @@ fn row_to_model(row: ModelRow) -> Model {
         sort_order,
         source,
         enabled,
+        context_window,
         created_at,
     }
 }
@@ -96,23 +105,28 @@ impl ModelStore {
         label: &str,
         provider: &str,
         sort_order: i32,
+        context_window: Option<i32>,
     ) -> Result<Model, sqlx::Error> {
         let row: ModelRow = sqlx::query_as(&format!(
-            "INSERT INTO models (id, label, provider, sort_order, source, enabled) \
-             VALUES ($1, $2, $3, $4, '{SOURCE_USER}', TRUE) \
+            "INSERT INTO models (id, label, provider, sort_order, source, enabled, context_window) \
+             VALUES ($1, $2, $3, $4, '{SOURCE_USER}', TRUE, $5) \
              RETURNING {SELECT_COLS}"
         ))
         .bind(id)
         .bind(label)
         .bind(provider)
         .bind(sort_order)
+        .bind(context_window)
         .fetch_one(pool)
         .await?;
         Ok(row_to_model(row))
     }
 
     /// Update the editable fields of a user model (never `source` or `id`).
-    /// Returns whether a row existed.
+    /// `context_window` is written as given — `None` clears the declaration and
+    /// hands the model back to the prefix-map fallback, so the caller must
+    /// resolve "field absent from the request" to the existing value before
+    /// calling. Returns whether a row existed.
     pub async fn update(
         pool: &PgPool,
         id: &str,
@@ -120,16 +134,18 @@ impl ModelStore {
         provider: &str,
         sort_order: i32,
         enabled: bool,
+        context_window: Option<i32>,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             "UPDATE models SET label = $2, provider = $3, sort_order = $4, enabled = $5, \
-             updated_at = NOW() WHERE id = $1",
+             context_window = $6, updated_at = NOW() WHERE id = $1",
         )
         .bind(id)
         .bind(label)
         .bind(provider)
         .bind(sort_order)
         .bind(enabled)
+        .bind(context_window)
         .execute(pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -180,13 +196,25 @@ mod tests {
             models.iter().any(|m| m.id == "claude-opus-4-8@default" && m.provider == "vertex"),
             "existing Vertex builtins must be seeded"
         );
-        // Ordered by sort_order — Fable 5 (0) sorts before Opus 4.8 (10).
+        assert!(
+            models.iter().any(|m| m.id == "claude-opus-5@default"
+                && m.provider == "vertex"
+                && m.is_builtin()
+                && m.enabled),
+            "Opus 5 builtin must be seeded on the vertex provider, enabled"
+        );
+        // Ordered by sort_order — Fable 5 (0) sorts before Opus 5 (5) before
+        // Opus 4.8 (10).
         let fable = models.iter().position(|m| m.id == "claude-fable-5").unwrap();
+        let opus5 = models
+            .iter()
+            .position(|m| m.id == "claude-opus-5@default")
+            .unwrap();
         let opus = models
             .iter()
             .position(|m| m.id == "claude-opus-4-8@default")
             .unwrap();
-        assert!(fable < opus, "sort_order must drive display order");
+        assert!(fable < opus5 && opus5 < opus, "sort_order must drive display order");
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -210,16 +238,18 @@ mod tests {
     async fn create_update_delete_user_model_round_trips() {
         let (pool, db_name) = setup_test_db().await;
 
-        let created = ModelStore::create(&pool, "my-model", "My Model", "anthropic", 99)
+        let created = ModelStore::create(&pool, "my-model", "My Model", "anthropic", 99, None)
             .await
             .unwrap();
         assert_eq!(created.source, SOURCE_USER);
         assert!(created.enabled);
         assert!(!created.is_builtin());
 
-        assert!(ModelStore::update(&pool, "my-model", "Renamed", "vertex", 5, false)
-            .await
-            .unwrap());
+        assert!(
+            ModelStore::update(&pool, "my-model", "Renamed", "vertex", 5, false, None)
+                .await
+                .unwrap()
+        );
         let fetched = ModelStore::get(&pool, "my-model").await.unwrap().unwrap();
         assert_eq!(fetched.label, "Renamed");
         assert_eq!(fetched.provider, "vertex");
@@ -229,6 +259,148 @@ mod tests {
 
         assert!(ModelStore::delete(&pool, "my-model").await.unwrap());
         assert!(ModelStore::get(&pool, "my-model").await.unwrap().is_none());
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A user model can declare its real context window, change it, and clear it
+    /// back to the prefix-map fallback. This is the storage half of the kimi-k3
+    /// fix: without a declared window the trim budget assumed 200k on a
+    /// 1,048,576-token model.
+    #[tokio::test]
+    async fn context_window_round_trips_and_clears() {
+        let (pool, db_name) = setup_test_db().await;
+
+        // Absent on create → NULL (fall back to the prefix map).
+        let created = ModelStore::create(&pool, "ctx-model", "Ctx", "openrouter", 99, None)
+            .await
+            .unwrap();
+        assert_eq!(created.context_window, None);
+
+        // Declared on create.
+        let declared = ModelStore::create(
+            &pool,
+            "moonshotai/kimi-k3",
+            "Kimi K3",
+            "openrouter",
+            100,
+            Some(1_048_576),
+        )
+        .await
+        .unwrap();
+        assert_eq!(declared.context_window, Some(1_048_576));
+        // …and survives a re-read, not just the RETURNING row.
+        let reread = ModelStore::get(&pool, "moonshotai/kimi-k3")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reread.context_window, Some(1_048_576));
+
+        // Update sets it.
+        assert!(ModelStore::update(
+            &pool,
+            "ctx-model",
+            "Ctx",
+            "openrouter",
+            99,
+            true,
+            Some(262_144)
+        )
+        .await
+        .unwrap());
+        let fetched = ModelStore::get(&pool, "ctx-model").await.unwrap().unwrap();
+        assert_eq!(fetched.context_window, Some(262_144));
+
+        // …and `None` clears it back to the fallback.
+        assert!(
+            ModelStore::update(&pool, "ctx-model", "Ctx", "openrouter", 99, true, None)
+                .await
+                .unwrap()
+        );
+        let cleared = ModelStore::get(&pool, "ctx-model").await.unwrap().unwrap();
+        assert_eq!(cleared.context_window, None);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Builtins declare the window of the request Lucidos actually makes — which
+    /// is not always the model's theoretical maximum.
+    ///
+    /// The distinction is load-bearing for Claude. Current Claude models
+    /// advertise 1M, but Lucidos only requests 1M mode for its own `[1m]` id
+    /// suffix (`parse_context_suffix` → `is_1m` → the `context-1m-2025-08-07`
+    /// beta in `build_claude_request`). A bare id sends no such beta, so its
+    /// real budget is the 200k the prefix map already infers — declaring 1M
+    /// there would let the packer build a prompt the API rejects.
+    #[tokio::test]
+    async fn migration_declares_context_window_on_verified_builtins() {
+        let (pool, db_name) = setup_test_db().await;
+
+        let expected: &[(&str, i32)] = &[
+            // OpenRouter / Vertex-Gemini — no context opt-in, full window applies.
+            ("z-ai/glm-5.2", 1_048_576),
+            ("gemini-3.1-pro-preview", 1_048_576),
+            ("gemini-3.5-flash", 1_048_576),
+            ("gemini-3-flash-preview", 1_048_576),
+            // Claude `[1m]` rows — these DO request 1M mode.
+            ("claude-fable-5[1m]", 1_000_000),
+            ("claude-opus-5@default[1m]", 1_000_000),
+            ("claude-opus-4-8@default[1m]", 1_000_000),
+            ("claude-opus-4-7[1m]", 1_000_000),
+            ("claude-opus-4-6[1m]", 1_000_000),
+            ("claude-sonnet-4-6[1m]", 1_000_000),
+            // OpenAI — no context opt-in either; the 400k guess understates these.
+            ("gpt-5.5-pro", 1_050_000),
+            ("gpt-5.5", 1_050_000),
+            ("gpt-5.6-sol", 1_050_000),
+            ("gpt-5.6-terra", 1_050_000),
+            ("gpt-5.6-luna", 1_050_000),
+        ];
+
+        for (id, window) in expected {
+            let m = ModelStore::get(&pool, id).await.unwrap().unwrap();
+            assert_eq!(
+                m.context_window,
+                Some(*window),
+                "{id} must declare its real {window}-token window"
+            );
+        }
+
+        // Bare Claude ids stay undeclared so they keep tracking the prefix map's
+        // 200k — which is correct, because the request carries no 1M beta.
+        // Declaring 1M here is the dangerous direction: the packer would exceed
+        // the API mode the request actually selected.
+        for id in [
+            "claude-fable-5",
+            "claude-opus-5@default",
+            "claude-opus-4-8@default",
+            "claude-opus-4-7",
+            "claude-sonnet-4-6",
+        ] {
+            let m = ModelStore::get(&pool, id).await.unwrap().unwrap();
+            assert_eq!(
+                m.context_window, None,
+                "{id} sends no 1M beta — it must stay on the prefix map's 200k"
+            );
+        }
+
+        // Unverified windows — an over-declared window is worse than the
+        // fallback (rejected request vs. trimming early).
+        for id in [
+            "claude-opus-4-5@20251101",
+            "gpt-5.4",
+            "gpt-5.3-codex",
+            "gpt-5.3-codex-spark",
+            "gpt-5.2-codex",
+        ] {
+            let m = ModelStore::get(&pool, id).await.unwrap().unwrap();
+            assert_eq!(
+                m.context_window, None,
+                "{id} has no verified window — it must fall back to the prefix map"
+            );
+        }
 
         pool.close().await;
         teardown_test_db(&db_name).await;
@@ -254,7 +426,7 @@ mod tests {
         // Colliding with a seeded builtin id must fail (unique PK violation) so
         // the API can return a clear "already exists" rather than silently
         // overwriting a builtin.
-        let result = ModelStore::create(&pool, "claude-fable-5", "Dupe", "anthropic", 1).await;
+        let result = ModelStore::create(&pool, "claude-fable-5", "Dupe", "anthropic", 1, None).await;
         assert!(result.is_err(), "duplicate id must error");
         pool.close().await;
         teardown_test_db(&db_name).await;

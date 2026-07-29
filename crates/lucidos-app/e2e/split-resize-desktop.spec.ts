@@ -38,6 +38,45 @@ async function drawerWidth(page: Page): Promise<number> {
   return page.evaluate(() => document.querySelector('.thread-drawer')!.getBoundingClientRect().width);
 }
 
+/** Viewport x of a point on the thread side of the desktop header that
+ *  `AppHeader.isInteractive()` treats as a plain GAP — the empty run between the
+ *  leading icon cluster and the centered brand label's visible children.
+ *
+ *  Derived, not hardcoded, and that is the point. This used to be a literal
+ *  `x: 200`, which silently stopped being a gap once the brand label's text grew
+ *  left over it: `isInteractive` gates out the label's visible children (they
+ *  open the control panel), so the dblclick was ignored, the pane never moved,
+ *  and the failure surfaced as an *animation* timeout in a test about animation
+ *  — pointing at the wrong subsystem entirely. Reading the live geometry keeps
+ *  the point valid as the header evolves, and if the gap ever really does close
+ *  the explicit width check below says so instead.
+ *
+ *  Scoped to `.desktop-header`: `MobileAppHeader` renders FIRST and carries
+ *  copies of these classes, so an unscoped `querySelector` returns the hidden
+ *  mobile one (the 0x0-rect trap in .claude/rules/frontend.md). */
+async function threadHeaderGapX(page: Page): Promise<number> {
+  const gap = await page.evaluate(() => {
+    const header = document.querySelector('.desktop-header');
+    if (!header) return null;
+    // Whichever leading icon host is currently the visible one (the pair
+    // crossfades on data-thread-drawer-open, so the other has no box).
+    const leadingRight = ['.collapsed-thread-actions', '.thread-nav-group']
+      .map((sel) => header.querySelector(sel)?.getBoundingClientRect())
+      .reduce((max, r) => (r && r.width > 0 ? Math.max(max, r.right) : max), 0);
+    const brandText = header.querySelector('.pane-header-title')?.getBoundingClientRect();
+    if (!brandText || brandText.width === 0) return null;
+    return { from: leadingRight, to: brandText.left };
+  });
+  expect(gap, 'desktop header: leading cluster / brand label not laid out').not.toBeNull();
+  expect(
+    gap!.to - gap!.from,
+    `no non-interactive gap left on the thread header (leading cluster ends at `
+      + `${gap!.from.toFixed(1)}, brand text starts at ${gap!.to.toFixed(1)}) — `
+      + `header dblclick has nowhere left to land`,
+  ).toBeGreaterThan(16);
+  return (gap!.from + gap!.to) / 2;
+}
+
 /** openThreadDrawer returns as soon as the drawer has ANY width, but the
  *  open animates over var(--duration-slow) — grabbing the divider mid-slide
  *  reads a stale bounding box and the drag silently misses it. Wait for the
@@ -228,12 +267,14 @@ test.describe('Split layout — free drag with deferred snap', () => {
     const startWidth = await threadPaneWidth(page); // ~512 at ratio 0.4 / 1280
     expect(startWidth).toBeLessThan(700);
 
-    // x=200 lands on a non-interactive header gap on the thread side — past the
-    // collapsed-thread-actions (~8–124px, 3 buttons) and left of the centered
-    // brand text (the brand-label is an absolutely-centered pointer-events:none
-    // box that passes the click through) — so onHeaderDblClick maximizes the
-    // thread pane.
-    await page.locator('.app-header').dblclick({ position: { x: 200, y: 20 } });
+    // Land on a real non-interactive gap on the thread side, so
+    // onHeaderDblClick actually maximizes the thread pane (see
+    // threadHeaderGapX — a hardcoded x silently drifted onto the brand text).
+    const header = page.locator('.app-header');
+    const headerBox = await header.boundingBox();
+    if (!headerBox) throw new Error('.app-header not visible');
+    const gapX = await threadHeaderGapX(page);
+    await header.dblclick({ position: { x: gapX - headerBox.x, y: 20 } });
 
     // The pane width must pass through an intermediate value during the
     // transition. With the bug it snaps straight to full width and this never

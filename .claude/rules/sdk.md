@@ -1,5 +1,5 @@
 ---
-globs:
+paths:
   - "packages/lucidos-sdk/**/*.ts"
   - "packages/lucidos-sdk/**/*.mjs"
 ---

@@ -20,8 +20,24 @@ pub(crate) fn cc_settings_path_for_workspace(workspace_root: &Path) -> PathBuf {
 /// permission server. Value is in seconds.
 const HOOK_TIMEOUT_SECONDS: u64 = 86_400;
 
+/// Default model for NEW Claude Code sessions, written into the `--settings`
+/// file as CC's durable `model` default. Mirrors the chat default
+/// (`core::DEFAULT_CHAT_MODEL`), but the two are deliberately independent knobs
+/// (CC has its own picker + backend), so this is a distinct constant rather than
+/// a reference. CC's `model` setting is the LOWEST-priority model source, so:
+///   - a per-thread pick (`--model <value>` on spawn) still overrides it, and
+///   - a RESUMED session keeps its own stored model (settings `model` only
+///     seeds fresh sessions) — the reason this lives in settings, not an
+///     `ANTHROPIC_MODEL` env that would also retarget resumed sessions.
+///
+/// Vertex id form (`@default`), matching the CC `/model` picker's Opus 5 entry
+/// in `runtime/cc_menu_options.json` so it round-trips through
+/// `normalize_cc_model_id`.
+const CC_DEFAULT_MODEL: &str = "claude-opus-5@default";
+
 pub(crate) fn build_cc_settings_json() -> String {
     serde_json::json!({
+        "model": CC_DEFAULT_MODEL,
         "hooks": {
             "PreToolUse": [
                 {
@@ -89,6 +105,20 @@ pub(crate) async fn write_cc_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_sets_default_model_for_new_sessions() {
+        // The `model` key makes Opus 5 the durable default for NEW CC sessions.
+        // It is CC's lowest-priority model source, so a per-thread `--model`
+        // pick still overrides it and a resumed session keeps its own model.
+        let json = build_cc_settings_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["model"], "claude-opus-5@default",
+            "cc-settings.json must pin the default CC model to Opus 5"
+        );
+        assert_eq!(parsed["model"], CC_DEFAULT_MODEL);
+    }
 
     #[test]
     fn json_registers_pretooluse_hook_for_askuserquestion() {

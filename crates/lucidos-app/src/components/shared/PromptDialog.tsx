@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'preact/hooks';
 import { promptState } from '../../store/store';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from './Overlay';
+import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 
 function close(value: string | null) {
   const state = promptState.peek();
@@ -88,10 +89,12 @@ export function PromptDialog() {
     >
         {state.title && <h2 class="confirm-title">{state.title}</h2>}
         <p class="confirm-message">{state.message}</p>
+        {/* The answer is free-form natural language (the dialog is driven by the
+            LLM's ask-the-user payload), so both branches are prose fields. */}
         {state.multiline ? (
-          <textarea class="prompt-input prompt-textarea" placeholder={state.placeholder} rows={4} />
+          <textarea class="prompt-input prompt-textarea" placeholder={state.placeholder} rows={4} {...PROSE_TEXT_ATTRS} />
         ) : (
-          <input type="text" class="prompt-input" placeholder={state.placeholder} />
+          <input type="text" class="prompt-input" placeholder={state.placeholder} {...PROSE_TEXT_ATTRS} />
         )}
         <div class="confirm-actions">
           <div class="confirm-actions-right">

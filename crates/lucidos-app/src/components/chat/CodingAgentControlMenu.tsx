@@ -13,6 +13,7 @@ import { isTextInput } from '../../utils/dom';
 import { errorDetail } from '../../utils/errorDetail';
 import { focusIfNeeded } from './promptFocus';
 import { Overlay } from '../shared/Overlay';
+import { availableReasoningOptions, reconcileReasoningEffort } from './codingAgentOptions';
 
 // Signal for PromptInput to request opening the menu with a filter
 // Set to a string (the filter text) to open, consumed by the component
@@ -93,6 +94,16 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   const menuLabel = isClaudeCode ? 'Claude Code' : 'Codex';
   const effectiveBuiltinCommands = isClaudeCode ? builtinCommands.value : [];
   const effectiveSkillCommands = isClaudeCode ? skillCommands.value : [];
+  const effectiveModel = pendingModel ?? currentModel.value;
+  const selectedReasoningEffort = pendingReasoningEffort ?? currentReasoningEffort.value;
+  const reasoningOptions = controlCommands.value
+    .find(command => command.subtype === 'set_reasoning_effort')
+    ?.params[0]?.options ?? [];
+  const effectiveReasoningEffort = reconcileReasoningEffort(
+    selectedReasoningEffort,
+    effectiveModel,
+    reasoningOptions,
+  ) as CodingAgentReasoningEffort | null;
 
   function clearRetryTimer() {
     if (retryTimerRef.current !== null) {
@@ -341,13 +352,29 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
    *  When a live session accepts the control, loadCommands() clears pending on
    *  the next refresh. */
   async function selectOption(cmd: CodingAgentCommandDef, value: string, label: string) {
+    let reconciledEffort: CodingAgentReasoningEffort | null = null;
+    let effortChanged = false;
     if (cmd.subtype === 'set_model') {
       const next = value === 'default' ? null : value as CodingAgentModelValue;
+      reconciledEffort = reconcileReasoningEffort(
+        selectedReasoningEffort,
+        value,
+        reasoningOptions,
+      ) as CodingAgentReasoningEffort | null;
+      effortChanged = selectedReasoningEffort !== null
+        && reconciledEffort !== selectedReasoningEffort;
       // Compose → per-draft override (persisted via the debounced compose PUT),
       // or the PENDING slot before a draft exists; active thread → the global
       // pending signal. Never leaks across drafts and never writes a global from compose.
-      if (inCompose) updateComposeSelection(composeThreadId ?? null, { ccModel: next });
-      else codingAgentPendingModel.value = next;
+      if (inCompose) {
+        updateComposeSelection(composeThreadId ?? null, {
+          ccModel: next,
+          ...(effortChanged ? { ccReasoningEffort: reconciledEffort } : {}),
+        });
+      } else {
+        codingAgentPendingModel.value = next;
+        if (effortChanged) codingAgentPendingReasoningEffort.value = reconciledEffort;
+      }
     } else if (cmd.subtype === 'set_reasoning_effort') {
       const next = value as CodingAgentReasoningEffort;
       if (inCompose) updateComposeSelection(composeThreadId ?? null, { ccReasoningEffort: next });
@@ -362,7 +389,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     sending.value = true;
     const request: Record<string, string> = { subtype: cmd.subtype, [cmd.params[0].key]: value };
     const result = await sendCodingAgentControl(threadId, request);
-    sending.value = false;
+    let reconciliationResult: 'ok' | 'pending' | 'error' | null = null;
     if (result === 'ok') {
       if (cmd.subtype === 'set_model') {
         currentModel.value = value as CodingAgentModelValue;
@@ -370,7 +397,21 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
         currentReasoningEffort.value = value as CodingAgentReasoningEffort;
       }
     }
-    if (result !== 'error') {
+    // Keep the live runtime pair coherent too. The control channel preserves
+    // request order, so the model lands before the compatible effort. If the
+    // session exits between requests, the pending signal above carries the
+    // reconciled value into the next spawn/follow-up instead.
+    if (result === 'ok' && effortChanged && reconciledEffort !== null) {
+      reconciliationResult = await sendCodingAgentControl(threadId, {
+        subtype: 'set_reasoning_effort',
+        effort: reconciledEffort,
+      });
+      if (reconciliationResult === 'ok') {
+        currentReasoningEffort.value = reconciledEffort;
+      }
+    }
+    sending.value = false;
+    if (result !== 'error' && reconciliationResult !== 'error') {
       showToast(`${cmd.label}: ${label}`, 'success');
     }
     close();
@@ -380,8 +421,8 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
    *  Uses backend-returned per-thread values or pending overrides. No cross-thread leaking. */
   function currentValueLabel(subtype: string): string | null {
     const values: Record<string, string | null> = {
-      set_model: pendingModel ?? currentModel.value,
-      set_reasoning_effort: pendingReasoningEffort ?? currentReasoningEffort.value,
+      set_model: effectiveModel,
+      set_reasoning_effort: effectiveReasoningEffort,
     };
     const val = values[subtype];
     if (!val) return null;
@@ -433,7 +474,11 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     ...filteredSkills.map(sc => ({ type: 'slash' as const, name: sc })),
   ] : [];
 
-  const optionItems = hasOptions ? cmd.params[0].options! : [];
+  const optionItems = hasOptions
+    ? (cmd.subtype === 'set_reasoning_effort'
+      ? availableReasoningOptions(cmd.params[0].options!, effectiveModel)
+      : cmd.params[0].options!)
+    : [];
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
@@ -551,11 +596,9 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
               {(() => {
                 const isModelCmd = cmd.subtype === 'set_model';
                 const isEffortCmd = cmd.subtype === 'set_reasoning_effort';
-                const effectiveModel = pendingModel ?? currentModel.value;
-                const effectiveEffort = pendingReasoningEffort ?? currentReasoningEffort.value;
-                return cmd.params[0].options!.map((opt, i) => {
+                return optionItems.map((opt, i) => {
                 const isCurrent = (isModelCmd && opt.value !== 'default' && opt.value === effectiveModel)
-                  || (isEffortCmd && opt.value === effectiveEffort);
+                  || (isEffortCmd && opt.value === effectiveReasoningEffort);
                 const defaultLabel = isModelCmd && opt.value === 'default' ? currentValueLabel('set_model') : null;
                 const desc = defaultLabel
                   ? `${opt.description} (currently ${defaultLabel})`

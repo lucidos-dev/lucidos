@@ -648,10 +648,13 @@ describe('CC waiting_for_user_answer: trailing Thinking cleanup in non-last exch
     const e3Events = exchangeResponseEvents(exchanges[2], 0, /* isLast */ false, threadIdle);
     expect(e3Events.filter(isPendingThinking)).toHaveLength(0);
 
-    // Sanity: with the pre-fix threadIdle (idle only), E3's Thinking was
-    // stranded. Proves the test exercises the new branch and isn't passing
-    // because the bug never existed.
-    const e3WithoutFix = exchangeResponseEvents(exchanges[2], 0, /* isLast */ false, /* threadIdle */ false);
-    expect(e3WithoutFix.filter(isPendingThinking).length).toBeGreaterThan(0);
+    // E3 is stranded for a reason the fold can see without any thread-level
+    // signal: raising E4's question handed the turn to it, so E3 carries
+    // `continuationMoved` and its marker is finalized even while the thread is
+    // still reported as running. Quiescence remains the cleanup for exchanges
+    // the fold does NOT mark (E2 above).
+    expect(exchanges[2].continuationMoved).toBe(true);
+    const e3WhileRunning = exchangeResponseEvents(exchanges[2], 0, /* isLast */ false, /* threadIdle */ false);
+    expect(e3WhileRunning.filter(isPendingThinking)).toHaveLength(0);
   });
 });

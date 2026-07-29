@@ -21,7 +21,7 @@ Implementation reconnaissance found the premise mostly stale:
   documented, individually tested function — `classify_result` (precedence
   explicitly documented and pinned by 25 tests in
   `lifecycle_tests/classify.rs`), `idle_action`, `terminate_decision`,
-  `should_propose_change_at_idle`, `terminal_clears_user_hit_stop`,
+  `may_touch_change_state_at_idle`, `terminal_clears_user_hit_stop`,
   `should_auto_commit_on_cleanup`, `stop_terminal_kind`,
   `classify_session_end_action`, `safety_net_action`, `watchdog_gate`.
 - The chat agentic loop does **not** duplicate these: it has no subprocess

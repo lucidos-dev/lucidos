@@ -25,10 +25,18 @@ re-run until every phase is clean.
    Covers lib, bins, tests, and examples — catches `dead_code` / `unused`
    that a release-only build misses.
 
-2. **Clippy, deny warnings, all targets, all features:**
+2. **ShellCheck + clippy, deny warnings, all targets, all features:**
    ```sh
-   cargo clippy --release --all-targets --all-features -- -D warnings
+   make lint
    ```
+   `make lint` IS the canonical lint gate: `lint-shell` (ShellCheck over every
+   tracked `*.sh`) then `lint-rust` (clippy). The clippy flag list lives in
+   exactly one place — `CLIPPY_FLAGS` in the `Makefile`, where each flag is
+   justified inline. This skill and `/harden` Phase 4.5 — the gate that runs
+   per change — both *call* `make lint` rather than restating the flags, so it cannot mean
+   two different things in two places (it used to: this skill and the Makefile
+   disagreed until 2026-07-26). Never paste a literal `cargo clippy --…` here —
+   not even in prose. Change the Makefile.
 
 3. **Frontend type check:**
    ```sh
@@ -76,8 +84,7 @@ nearly reported PASSED on a failing run.
   directly:
 
   ```sh
-  cargo clippy --release --all-targets --all-features -- -D warnings \
-    > /tmp/clippy.log 2>&1; echo "EXIT: $?"
+  make lint > /tmp/clippy.log 2>&1; echo "EXIT: $?"
   grep -cE "^(error|warning)" /tmp/clippy.log
   ```
 
@@ -118,8 +125,11 @@ game to remove and re-fix:
 
 - **`#[allow(clippy::too_many_arguments)]`** on internal helpers that
   legitimately need that many parameters (event constructors, runtime
-  spawn helpers). The refactor cost outweighs the lint value. Each
-  occurrence stays in place; the justification is the function's role.
+  spawn helpers, `LucidosEngine::new`'s boot wiring). The refactor cost
+  outweighs the lint value. Each occurrence stays in place; the
+  justification is the function's role — and the strongest form of it,
+  which `LucidosEngine::new` carries, is that no two parameters share a
+  type, so the argument swap the lint guards against cannot compile.
 - **`#[allow(dead_code)]`** on test scaffolding (`scenario_tests.rs`,
   `plugins.rs` test helpers) and intentionally-unused dispatcher
   variants (`spawn_dispatcher.rs`). One-line comment required at each
@@ -177,7 +187,7 @@ warning or returned non-zero).
 
 For each phase, report:
 
-- Phase name (`cargo build`, `clippy`, `tsc`, `vite build`, `eslint`).
+- Phase name (`cargo build`, `make lint`, `tsc`, `vite build`, `eslint`).
 - Exit code.
 - Number of warnings emitted (must be 0).
 - Number of errors (must be 0).

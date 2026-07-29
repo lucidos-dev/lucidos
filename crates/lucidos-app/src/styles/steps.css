@@ -1,22 +1,3 @@
-.steps-toggle {
-    background: none;
-    border: none;
-    color: var(--text-secondary);
-    cursor: pointer;
-    font-size: var(--font-size-sm);
-    font-family: var(--font-ui);
-    padding: 0.25rem 0;
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
-}
-
-@media (hover: hover) {
-    .steps-toggle:hover {
-        color: var(--accent);
-    }
-}
-
 .step {
     padding: 0.25rem 0.5rem;
     font-size: var(--font-size-sm);
@@ -54,8 +35,10 @@
     font-size: 0.85em;
 }
 
+/* Trimmed = content was cut to fit the budget. A neutral marker, not a
+   caution — nothing is wrong, so --accent-notable rather than --accent-yellow. */
 .step-context.trimmed {
-    color: var(--accent-yellow);
+    color: var(--accent-notable);
 }
 
 
@@ -150,7 +133,7 @@
    wraps the trailing/middle "…" or "..." emitted by Rust `describe_tool` /
    `describe_cc_tool`. */
 .ellipsis-marker {
-    color: var(--accent-yellow);
+    color: var(--accent-notable);
     font-weight: 600;
     letter-spacing: 0.05em;
     padding: 0 0.125rem;
@@ -179,7 +162,7 @@
 }
 
 .inline-step .step-context.trimmed {
-    color: var(--accent-yellow);
+    color: var(--accent-notable);
 }
 
 /* Context section viewer — used inside StepDetailModal's Context tab to
@@ -470,7 +453,7 @@
 }
 
 .context-budget-trimmed {
-    color: var(--accent-yellow);
+    color: var(--accent-notable);
     text-transform: uppercase;
     letter-spacing: 0.05em;
     font-size: var(--font-size-xs);

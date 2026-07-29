@@ -235,7 +235,10 @@ export function AppHeader() {
             header segment (drawer / thread / content) — the visual cue for which
             pane is focused. One box per pane, each STATICALLY positioned over its
             own segment; a focus shift CROSSFADES (the outgoing pane's wash eases
-            out, the incoming pane's eases in) rather than sliding. First children
+            out, the incoming pane's eases in) rather than sliding. Each box rises
+            past the header's top edge by --titlebar-inset so the focused pane is
+            painted through the reclaimed macOS title-bar band to the very top of
+            the window (0px, hence no-op, off the macOS Tauri build). First children
             so DOM order keeps them under every header control. Positioned +
             revealed entirely from CSS via :root[data-focused-pane] (shell.css);
             desktop-only. */}

@@ -23,15 +23,52 @@
 #   scripts/lib/webkit_reaper.sh — reaps a single over-RSS browser process
 # Neither measures SYSTEM LOAD; this one does.
 #
+# ── The second half: MID-RUN saturation, classified not hidden ──────────────
+# Gating only at launch leaves the run blind to a host that goes bad AFTERWARDS.
+# On 2026-07-26 an external macOS daemon burst (an MDM agent plus mdmclient /
+# mobileassetd / managedcorespotlight — the periodic management sweep of an
+# MDM-managed corporate fleet) pinned the host at load 83–227 for ~40 MINUTES
+# mid-run.
+# The launch gate had already passed on an idle host, so the browser suite ran on
+# into starvation and produced mobile-webkit timeouts that read exactly like
+# product failures; a human had to notice and re-run.
+#
+# So the guard also SAMPLES throughout the run:
+#   start_host_load_sampler      — background loop appending "<epoch> <load1>"
+#   stop_host_load_sampler       — idempotent teardown
+#   report_host_load_saturation  — drains the samples at the end, always prints a
+#                                  one-line peak/over-cap summary, and when the
+#                                  run FAILED and the host was sustainedly over
+#                                  the SAME cap, prints a loud banner saying the
+#                                  timeouts are not trustworthy evidence.
+#
+# Deliberately NOT an auto-retry, and it never touches the exit code: a run that
+# failed still fails. The point is honest classification — telling the operator
+# that these particular failures cannot be read as product defects — not hiding
+# them. Same measurement seams, same HOST_LOAD_MAX_RATIO cap, same
+# _host_load_over_ratio compare as the launch gate; there is exactly one
+# saturation threshold in this file.
+#
 # Knobs (all optional; sane defaults):
 #   HOST_LOAD_MAX_RATIO       load1/ncpu ratio we tolerate before backing off
-#                             (default 1.5 — load up to 1.5× core count is fine)
-#   HOST_LOAD_POLL_SECS       seconds between polls while over-ratio (default 15)
+#                             (default 1.5 — load up to 1.5× core count is fine).
+#                             The mid-run sampler classifies against this SAME cap.
+#   HOST_LOAD_POLL_SECS       seconds between polls while over-ratio (default 15).
+#                             Also the mid-run sampling interval.
 #   HOST_LOAD_MAX_WAIT_SECS   total seconds to wait before refusing (default 300)
-#   HOST_LOAD_GUARD_DISABLE   =1 → no-op that logs it's disabled and returns 0
-#                             (escape hatch for CI where load is meaningless)
+#   HOST_LOAD_SUSTAINED_MIN_SECS
+#                             longest contiguous over-cap stretch that counts as
+#                             "sustained" for the mid-run banner (default 120).
+#                             Not a second threshold — a duration, so a brief
+#                             spike (the engine's own release-build tail, one
+#                             heavy chunk) can't be blamed for a failing run.
+#   HOST_LOAD_GUARD_DISABLE   =1 → no-op that logs it's disabled and returns 0;
+#                             also suppresses the mid-run sampler (escape hatch
+#                             for CI where load is meaningless)
 #   HOST_LOAD_OVERRIDE        test hook: force the 1-min load reading
 #   HOST_NCPU_OVERRIDE        test hook: force the core count
+#   HOST_LOAD_SAMPLES_FILE    override the mid-run samples path (tests)
+#   HOST_LOAD_SAMPLER_PIDFILE override the sampler pidfile location (tests)
 #
 # Exit code: HOST_LOAD_SATURATED_EXIT (75, the EX_TEMPFAIL sysexits convention) —
 # returned by wait_for_host_load when the host is still saturated after the wait
@@ -40,10 +77,11 @@
 # Fail-open by design: if the guard cannot MEASURE the host (unknown OS,
 # unreadable load, ncpu empty/zero/non-numeric) it logs and returns 0. A guard
 # that can't measure must never block or crash the suite — the same posture as the
-# reaper's "no ps → warn and don't start".
+# reaper's "no ps → warn and don't start". The mid-run half inherits it: no
+# samples, no core count, or a nonsense cap means no banner, never a crash.
 #
-# Sourced by scripts/lib/e2e.sh; invoked by scripts/e2e-browser.sh right before
-# the Playwright browser swarm spawns.
+# Sourced by scripts/lib/e2e.sh; invoked by scripts/e2e-browser.sh — the gate
+# right before the Playwright browser swarm spawns, the sampler around it.
 
 # Distinct exit code for "host still saturated, refusing to launch". Overridable
 # for tests, but 75 (EX_TEMPFAIL) is the contract the nightly orchestrator keys on.
@@ -121,14 +159,22 @@ _host_load_over_ratio() {
 # ── the guard ───────────────────────────────────────────────────────────────
 # wait_for_host_load — the entry point. Returns 0 to proceed, or
 # HOST_LOAD_SATURATED_EXIT (75) when the host stays over-ratio past the wait cap.
+# _host_load_guard_disabled — true when the escape hatch is set. One reader for
+# the launch gate, the sampler, and the report, so "disabled" can never mean
+# different things to different halves of the guard.
+_host_load_guard_disabled() {
+    case "${HOST_LOAD_GUARD_DISABLE:-}" in
+        1|yes|true|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 wait_for_host_load() {
     # Escape hatch: disabled → no-op, proceed.
-    case "${HOST_LOAD_GUARD_DISABLE:-}" in
-        1|yes|true|on)
-            echo "[host-load] guard disabled via HOST_LOAD_GUARD_DISABLE — proceeding"
-            return 0
-            ;;
-    esac
+    if _host_load_guard_disabled; then
+        echo "[host-load] guard disabled via HOST_LOAD_GUARD_DISABLE — proceeding"
+        return 0
+    fi
 
     local cap poll max_wait ncpu load1 ratio cap_disp waited
     cap="${HOST_LOAD_MAX_RATIO:-1.5}"
@@ -183,4 +229,221 @@ wait_for_host_load() {
     ratio="$(_host_load_ratio "$load1" "$ncpu")"
     echo "[host-load] host still saturated after ${max_wait}s (load ${load1} / ${ncpu} cores = ${ratio}x > ${cap_disp}x cap) — refusing to launch to avoid wedging the machine" >&2
     return "$HOST_LOAD_SATURATED_EXIT"
+}
+
+# ── the mid-run sampler ─────────────────────────────────────────────────────
+# wait_for_host_load only knows about the instant it fired. Everything below
+# watches the REST of the run, so a host that goes bad after launch is classified
+# instead of masquerading as product failure. See the header for the incident.
+
+# In-memory handle to the running sampler loop (set by start_host_load_sampler).
+HOST_LOAD_SAMPLER_PID="${HOST_LOAD_SAMPLER_PID:-}"
+
+# Where the samples land. Under the e2e workspace's .lucidos/ (ephemeral runtime
+# state, mirroring the reaper's pidfile) so a crashed run leaves nothing tracked.
+_host_load_samples_file() {
+    printf '%s' "${HOST_LOAD_SAMPLES_FILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-load-samples}"
+}
+
+_host_load_sampler_pidfile() {
+    printf '%s' "${HOST_LOAD_SAMPLER_PIDFILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-load-sampler.pid}"
+}
+
+# _host_load_sampler_loop INTERVAL FILE — append "<epoch> <load1>" every INTERVAL
+# seconds. Mirrors the reaper's loop, including killing the in-flight `sleep` on
+# SIGTERM so nothing is left reparented to init. Every step is failure-tolerant:
+# the sampler is observability, and must never be able to fail the run it watches.
+_host_load_sampler_loop() {
+    local interval="$1" file="$2"
+    local sleep_pid="" load1
+    trap '[ -n "$sleep_pid" ] && kill "$sleep_pid" 2>/dev/null; exit 0' TERM INT
+    while :; do
+        load1="$(_host_load_read_load1 || true)"
+        if [ -n "$load1" ]; then
+            printf '%s %s\n' "$(date +%s)" "$load1" >> "$file" 2>/dev/null || true
+        fi
+        sleep "$interval" &
+        sleep_pid=$!
+        wait "$sleep_pid" 2>/dev/null || true
+        sleep_pid=""
+    done
+}
+
+# start_host_load_sampler — begin sampling. Idempotent; a no-op when the guard is
+# disabled or the samples file isn't writable. Truncates any previous run's
+# samples so a crashed predecessor can't be blamed on this run.
+start_host_load_sampler() {
+    # Already sampling for THIS run → nothing to do (and don't reap our own loop
+    # below). Checked before the disable branch so the escape hatch can't be
+    # flipped mid-run into killing a live sampler.
+    if [ -n "${HOST_LOAD_SAMPLER_PID:-}" ] && kill -0 "$HOST_LOAD_SAMPLER_PID" 2>/dev/null; then
+        return 0
+    fi
+
+    # Reap a predecessor. The loop is `disown`ed, so a SIGKILLed e2e-browser.sh
+    # leaves it appending forever; two samplers interleaving into one file would
+    # make the report describe a run that never happened. stop_ reads the pidfile,
+    # so it finds an orphan from a previous process. Runs BEFORE the disable
+    # branch: a disabled run must not leave one alive either.
+    stop_host_load_sampler
+
+    local file
+    file="$(_host_load_samples_file)"
+
+    if _host_load_guard_disabled; then
+        # Drop any samples a crashed predecessor left, so the report can't
+        # attribute another run's saturation to this one.
+        rm -f "$file" 2>/dev/null || true
+        echo "[host-load] mid-run sampler disabled via HOST_LOAD_GUARD_DISABLE"
+        return 0
+    fi
+
+    local interval pidfile
+    interval="${HOST_LOAD_POLL_SECS:-15}"
+    case "$interval" in ''|*[!0-9]*|0) interval=15 ;; esac
+
+    mkdir -p "$(dirname "$file")" 2>/dev/null || true
+    if ! : > "$file" 2>/dev/null; then
+        echo "[host-load] cannot write ${file} — mid-run sampling off for this run"
+        return 0
+    fi
+
+    _host_load_sampler_loop "$interval" "$file" &
+    HOST_LOAD_SAMPLER_PID=$!
+    disown "$HOST_LOAD_SAMPLER_PID" 2>/dev/null || true
+
+    pidfile="$(_host_load_sampler_pidfile)"
+    echo "$HOST_LOAD_SAMPLER_PID" > "$pidfile" 2>/dev/null || true
+
+    echo "[host-load] mid-run sampler started (pid=${HOST_LOAD_SAMPLER_PID}, every ${interval}s → ${file})"
+}
+
+# stop_host_load_sampler — terminate the loop. Idempotent and safe in an EXIT
+# trap. Reads the pidfile as a fallback so a parent script can reap a sampler
+# started by a child. Deliberately LEAVES the samples file: the report drains it.
+stop_host_load_sampler() {
+    local pid pidfile
+    pidfile="$(_host_load_sampler_pidfile)"
+    pid="${HOST_LOAD_SAMPLER_PID:-}"
+    if [ -z "$pid" ] && [ -f "$pidfile" ]; then
+        pid="$(cat "$pidfile" 2>/dev/null)"
+    fi
+
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
+
+    rm -f "$pidfile" 2>/dev/null || true
+    HOST_LOAD_SAMPLER_PID=""
+}
+
+# _host_load_summarize_samples FILE NCPU CAP — print
+# "<sustained_secs> <peak_load> <peak_ratio> <over_samples> <total_samples>".
+# `sustained_secs` is the LONGEST contiguous stretch of over-cap samples, so an
+# isolated spike scores near zero however high it was. Exits 1 (→ no report) on
+# unusable inputs or an empty/garbage sample set — fail open, same as the gate.
+_host_load_summarize_samples() {
+    awk -v ncpu="$2" -v cap="$3" '
+        BEGIN {
+            if (ncpu !~ /^[0-9]+(\.[0-9]+)?$/ || ncpu + 0 <= 0) exit 1
+            if (cap  !~ /^[0-9]+(\.[0-9]+)?$/) exit 1
+            peak = 0; n = 0; over = 0; in_run = 0; run_start = 0; sustained = 0
+        }
+        {
+            if ($1 !~ /^[0-9]+$/) next
+            if ($2 !~ /^[0-9]+(\.[0-9]+)?$/) next
+            ts = $1 + 0; l = $2 + 0
+            n++
+            if (l > peak) peak = l
+            if (l / ncpu > cap) {
+                over++
+                if (!in_run) { in_run = 1; run_start = ts }
+                if (ts - run_start > sustained) sustained = ts - run_start
+            } else {
+                in_run = 0
+            }
+        }
+        END {
+            if (n == 0) exit 1
+            printf "%d %.2f %.2f %d %d\n", sustained, peak, peak / ncpu, over, n
+        }
+    ' "$1"
+}
+
+# report_host_load_saturation RUN_RC — drain the samples and classify the run.
+#
+# ALWAYS prints a one-line load summary when there are samples (cheap, and it is
+# the evidence a later triage needs). Prints the loud banner ONLY when the run
+# FAILED and the host was over the cap for at least HOST_LOAD_SUSTAINED_MIN_SECS
+# contiguously — a green run needs no excuse, and a brief spike is not one.
+#
+# ALWAYS returns 0. It reports; it does not decide. The caller exits with its own
+# code, so a saturated run still fails — the banner says the failures are not
+# trustworthy evidence, it does not make them go away.
+report_host_load_saturation() {
+    local run_rc="${1:-0}"
+    case "$run_rc" in ''|*[!0-9]*) run_rc=1 ;; esac
+
+    local file ncpu cap cap_disp min_secs stats
+    file="$(_host_load_samples_file)"
+    [ -f "$file" ] || return 0
+
+    # Disabled guard → never classify. Whatever is in the file was not sampled
+    # for this run (start_host_load_sampler removed its own), and reporting it
+    # would be the exact mis-attribution this whole mechanism exists to prevent.
+    if _host_load_guard_disabled; then
+        rm -f "$file" 2>/dev/null || true
+        return 0
+    fi
+
+    ncpu="$(_host_load_read_ncpu)"
+    case "$ncpu" in
+        ''|*[!0-9]*|0)
+            echo "[host-load] core count unreadable — cannot classify mid-run host load"
+            rm -f "$file" 2>/dev/null || true
+            return 0
+            ;;
+    esac
+
+    cap="${HOST_LOAD_MAX_RATIO:-1.5}"
+    min_secs="${HOST_LOAD_SUSTAINED_MIN_SECS:-120}"
+    case "$min_secs" in ''|*[!0-9]*) min_secs=120 ;; esac
+
+    if ! stats="$(_host_load_summarize_samples "$file" "$ncpu" "$cap")"; then
+        rm -f "$file" 2>/dev/null || true
+        return 0
+    fi
+    rm -f "$file" 2>/dev/null || true
+
+    local sustained peak peak_ratio over total
+    read -r sustained peak peak_ratio over total <<< "$stats"
+    cap_disp="$(awk -v c="$cap" 'BEGIN { if (c ~ /^[0-9]+(\.[0-9]+)?$/) printf "%.2f", c; else printf "%s", c }')"
+
+    echo ""
+    echo "[host-load] mid-run host load: peak ${peak} on ${ncpu} cores (${peak_ratio}x), ${over}/${total} samples over the ${cap_disp}x cap, longest sustained stretch ${sustained}s"
+
+    [ "$run_rc" -ne 0 ] || return 0
+    [ "$over" -gt 0 ] || return 0
+    [ "$sustained" -ge "$min_secs" ] || return 0
+
+    local mins
+    mins="$(awk -v s="$sustained" 'BEGIN { printf "%.0f", s / 60 }')"
+
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════════════════╗"
+    echo "║  HOST WAS SATURATED MID-RUN — THIS RUN'S FAILURES ARE NOT TRUSTWORTHY    ║"
+    echo "╚══════════════════════════════════════════════════════════════════════════╝"
+    echo "  peak load ${peak} on ${ncpu} cores = ${peak_ratio}x, against a ${cap_disp}x cap;"
+    echo "  sustained above that cap for ${mins} min (${over} of ${total} samples over cap)."
+    echo ""
+    echo "  Timeouts and browser wedges under that load are starvation, not product"
+    echo "  defects — an external daemon burst did exactly this to the 2026-07-26"
+    echo "  nightly (load 83-227 for ~40 min mid-run, bogus mobile-webkit timeouts)."
+    echo "  RE-RUN ON AN IDLE HOST before treating any failure here as real."
+    echo ""
+    echo "  The exit code is unchanged (${run_rc}) — this is classification, not"
+    echo "  suppression, and the suite has NOT been retried."
+    echo ""
+    return 0
 }

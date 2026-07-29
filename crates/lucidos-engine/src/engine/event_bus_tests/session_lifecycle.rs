@@ -791,3 +791,284 @@ async fn session_started_locks_coding_agent_backend_in_projection() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+// ---------------------------------------------------------------------------
+// ContinuationStarted is a channel-agnostic resume boundary
+//
+// It shares a projection arm with SessionStarted, but unlike SessionStarted it
+// is emitted on the chat and trigger paths too (`chat/rerun.rs`'s
+// `emit_resume_anchor`, reached from `POST /api/v1/threads/:id/continue`). The
+// arm used to hardcode `is_coding_agent = TRUE, source = $2`, so one Continue
+// click permanently relabeled a chat thread a coding-agent thread — and the
+// next click then took the coding-agent branch of `continue_thread`. These
+// tests pin both directions of the channel gate.
+// ---------------------------------------------------------------------------
+
+/// Emit the resume boundary `emit_resume_anchor` writes, on `channel`.
+fn continuation_started(thread_id: Uuid, channel: EventChannel) -> BusEvent {
+    BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ContinuationStarted {
+            branch: String::new(),
+            origin: None,
+            reason: None,
+        },
+        meta: EventMeta {
+            channel: Some(channel),
+            ..EventMeta::NONE
+        },
+    }
+}
+
+async fn read_thread_type(pool: &PgPool, thread_id: Uuid) -> (String, bool) {
+    sqlx::query_as("SELECT source, is_coding_agent FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn chat_continuation_started_does_not_flip_thread_to_coding_agent() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: "what's the weather".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    bus.emit(continuation_started(thread_id, EventChannel::Chat))
+        .await
+        .unwrap();
+
+    let (source, is_coding_agent) = read_thread_type(&pool, thread_id).await;
+    assert_eq!(
+        source, "chat",
+        "a chat Continue must not rewrite the thread's channel"
+    );
+    assert!(
+        !is_coding_agent,
+        "clicking Continue on a chat thread must not relabel it a coding-agent thread"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn trigger_continuation_started_keeps_trigger_source_and_flag_false() {
+    // `continue_chat` maps the abort's persisted channel back to EventChannel,
+    // so a trigger thread's Continue carries `Trigger`, not `Chat`.
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::TriggerStarted {
+            trigger_id: "morning-report".into(),
+            trigger_name: Some("Morning report".into()),
+            prompt: None,
+            invocation: None,
+            origin: None,
+            go_to_review: false,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Trigger),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    bus.emit(continuation_started(thread_id, EventChannel::Trigger))
+        .await
+        .unwrap();
+
+    let (source, is_coding_agent) = read_thread_type(&pool, thread_id).await;
+    assert_eq!(source, "trigger", "a trigger Continue keeps the channel");
+    assert!(
+        !is_coding_agent,
+        "clicking Continue on a trigger thread must not relabel it a coding-agent thread"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn coding_agent_continuation_started_keeps_is_coding_agent_true() {
+    // The mirror of the two above: the real coding-agent resume must not
+    // regress. SessionStarted stamps the identity; the ClaudeCode-channel
+    // ContinuationStarted that follows a `--resume` keeps it.
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            session_id: "s".into(),
+            branch: "claude-code/test".into(),
+            repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    let (source, is_coding_agent) = read_thread_type(&pool, thread_id).await;
+    assert_eq!(source, "claude_code");
+    assert!(
+        is_coding_agent,
+        "SessionStarted is inherently a coding-agent event"
+    );
+
+    bus.emit(continuation_started(thread_id, EventChannel::ClaudeCode))
+        .await
+        .unwrap();
+
+    let (source, is_coding_agent) = read_thread_type(&pool, thread_id).await;
+    assert_eq!(source, "claude_code", "resume keeps the channel");
+    assert!(
+        is_coding_agent,
+        "a coding-agent resume must keep the thread a coding-agent thread"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn chat_channel_continuation_started_never_clears_is_coding_agent() {
+    // The flag is monotone in this arm: no ordering of events can downgrade a
+    // coding-agent thread. Repairing rows already corrupted by the old
+    // hardcoded TRUE is the migration's job, not the projection's — a
+    // projection that could clear the flag would fight the recovery sweeps.
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            session_id: "s".into(),
+            branch: "claude-code/test".into(),
+            repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    bus.emit(continuation_started(thread_id, EventChannel::Chat))
+        .await
+        .unwrap();
+
+    let (source, is_coding_agent) = read_thread_type(&pool, thread_id).await;
+    assert!(
+        is_coding_agent,
+        "a non-coding-agent event must never clear the flag"
+    );
+    assert_eq!(
+        source, "claude_code",
+        "a non-coding-agent event must never rewrite an established channel"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn chat_continuation_started_preserves_the_stored_draft() {
+    // The arm wipes the compose fields because a coding-agent session start
+    // consumes the thread's prompt. A chat Continue consumes nothing — the
+    // user clicked Continue, they did not send — so the draft must survive.
+    // (It also must, because this arm emits no `compose_cleared_broadcast`:
+    // a silent clear leaves every peer device showing a ghost draft.)
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: "what's the weather".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    sqlx::query("UPDATE thread_summaries SET compose_text = $2 WHERE thread_id = $1")
+        .bind(thread_id)
+        .bind("half-typed follow-up")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    bus.emit(continuation_started(thread_id, EventChannel::Chat))
+        .await
+        .unwrap();
+
+    let compose_text: String =
+        sqlx::query_scalar("SELECT compose_text FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        compose_text, "half-typed follow-up",
+        "a chat Continue must not wipe the user's draft"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

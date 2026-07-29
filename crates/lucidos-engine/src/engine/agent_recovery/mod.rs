@@ -14,6 +14,17 @@ mod recovery;
 
 pub use has_diff::*;
 pub use helpers::*;
+// `recovery`'s free predicates stay in that file next to the recovery pass
+// that documents them; re-export the ones the teardown emit + its tests share
+// (`engine_impl/shutdown.rs`), so both sides of the preserve/resume contract
+// key on one definition.
+pub(crate) use recovery::{thread_has_unanswered_question, unanswered_question_exists_sql};
+// The switch-vs-crash fingerprint, shared with the chat resume gate
+// (`chat::recovery::switch_resume_candidates`) so the coding-agent and chat
+// halves of the auto-resume contract cannot drift apart.
+pub(crate) use recovery::{SWITCH_TEARDOWN_ABORT_SQL, THREAD_START_EVENTS_SQL};
+#[cfg(test)]
+pub(crate) use recovery::switch_was_user_initiated;
 
 #[cfg(test)]
 #[path = "../agent_recovery_tests/scenarios.rs"]

@@ -755,10 +755,19 @@ mod switch_classification {
     }
 
     async fn abort_with(bus: &EventBus, thread_id: Uuid, actor: Option<MessageOrigin>) {
+        abort_with_cause(bus, thread_id, actor, AbortCause::EngineShutdown).await;
+    }
+
+    async fn abort_with_cause(
+        bus: &EventBus,
+        thread_id: Uuid,
+        actor: Option<MessageOrigin>,
+        cause: AbortCause,
+    ) {
         crate::engine::thread_events::emit_response_aborted(
             bus,
             thread_id,
-            AbortCause::EngineShutdown,
+            cause,
             String::new(),
             vec![],
             None,
@@ -857,6 +866,39 @@ mod switch_classification {
             !switch_was_user_initiated(&pool, thread_id).await,
             "a device abort older than the latest start has been consumed by a prior resume → no re-resume"
         );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The device actor alone is NOT the switch fingerprint — the cause matters.
+    /// `AbortCause::StaleSettle` deliberately carries the actor of the user
+    /// button that exposed the stuck row (Stop / Apply / Discard / Archive /
+    /// Interrupt, via `claude_code::settle_stuck_running_thread`), so a
+    /// device-actor-only predicate would read a user *Stop* as a *Switch to new
+    /// version* and auto-resume work the user just told the engine to abandon.
+    #[tokio::test]
+    async fn device_attributed_non_shutdown_abort_is_not_a_switch() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+
+        for cause in [
+            AbortCause::StaleSettle,
+            AbortCause::SafetyNet,
+            AbortCause::ProcessKilled,
+            AbortCause::RecoveryAfterRestart,
+        ] {
+            let thread_id = Uuid::new_v4();
+            seed_cc_start(&bus, thread_id).await;
+            tick().await;
+            abort_with_cause(&bus, thread_id, Some(device_actor()), cause).await;
+
+            assert!(
+                !switch_was_user_initiated(&pool, thread_id).await,
+                "{cause:?} is not an engine-shutdown teardown — it must never auto-resume, \
+                 even when a user button supplied the device actor"
+            );
+        }
 
         pool.close().await;
         teardown_test_db(&db_name).await;

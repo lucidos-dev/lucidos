@@ -282,5 +282,17 @@ printf '%s' "$VAPID" | tr -d ' \t\n' | grep -q '"public_key":"' \
     || fail "push/vapid-key missing public_key: $VAPID"
 log "PASS: VAPID public key served"
 
+# 8e. The engine-shipped system-knowhow reference set is staged (Resources/
+# system-knowhow) AND resolved by the engine (LUCIDOS_SYSTEM_KNOWHOW_DIR). A
+# mis-staged or unresolved dir makes load_knowhow('system-knowhow/…') and
+# GET /api/v1/knowhow silently degrade — the exact packaged regression this
+# resource was added to fix.
+[ -f "$APP/Contents/Resources/system-knowhow/glossary.md" ] \
+    || fail "Resources/system-knowhow/glossary.md missing — system-knowhow not staged into the bundle"
+KNOWHOW="$(curl -s "$BASE/$SLUG/api/v1/knowhow")"
+printf '%s' "$KNOWHOW" | grep -q 'system-knowhow/' \
+    || fail "GET /api/v1/knowhow lists no system-knowhow/ id — LUCIDOS_SYSTEM_KNOWHOW_DIR unresolved in the packaged engine"
+log "PASS: system-knowhow staged + resolved (Resources/system-knowhow + /api/v1/knowhow)"
+
 PASSED=1
 # cleanup (EXIT trap) stops the service, verifies a clean shutdown, and reports.

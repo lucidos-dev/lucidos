@@ -161,12 +161,10 @@ fn reset_per_turn_flags_clears_all_flags() {
 /// original change's `ChangeApplied` leaves it orphaned.
 #[test]
 fn conflict_session_never_proposes_change_at_idle() {
-    // wt_has_changes=true (the merge result IS files), not external,
-    // not shutdown, conflict session: must refuse — even on a Generated
-    // terminal, because the merge result is the original change.
+    // Not external, not shutdown, conflict session: must refuse — even on a
+    // Generated terminal, because the merge result is the original change.
     assert!(
-        !should_propose_change_at_idle(
-            true,
+        !may_touch_change_state_at_idle(
             false,
             false,
             true,
@@ -176,37 +174,33 @@ fn conflict_session_never_proposes_change_at_idle() {
     );
 }
 
-/// Normal sessions with worktree changes that ended Generated do propose —
-/// that's what makes the Apply button appear. Anchor-test for the happy
-/// path.
+/// Normal sessions that ended Generated may write change state — that's what
+/// makes the Apply button appear. Anchor-test for the happy path.
 #[test]
-fn normal_session_with_changes_proposes_at_idle() {
+fn normal_generated_session_may_touch_change_state() {
     assert!(
-        should_propose_change_at_idle(
-            true,
+        may_touch_change_state_at_idle(
             false,
             false,
             false,
             &Some(TerminalKind::Generated)
         ),
-        "normal Generated session with changes must propose so Apply button surfaces"
+        "normal Generated session must reach the propose/reconcile branch"
     );
 }
 
-/// A `Generated` idle with worktree changes proposes immediately even
-/// though a background bash task may still be running. This is the
-/// deliberate reversal of the old bg-bash propose-gate: the 5-minute
-/// wait that gate imposed was worse than the rare wasted re-harden it
-/// prevented. Correctness is covered by harden-at-apply (un-hardened
-/// changes re-run `/harden` before they can merge); app/external changes
-/// skip `/harden` and accept the risk. The gate no longer takes a
-/// bg-bash parameter at all — this anchors that the propose decision is
-/// blind to background bash.
+/// A `Generated` idle proposes immediately even though a background bash task
+/// may still be running. This is the deliberate reversal of the old bg-bash
+/// propose-gate: the 5-minute wait that gate imposed was worse than the rare
+/// wasted re-harden it prevented. Correctness is covered by harden-at-apply
+/// (un-hardened changes re-run `/harden` before they can merge); app/external
+/// changes skip `/harden` and accept the risk. The gate no longer takes a
+/// bg-bash parameter at all — this anchors that the decision is blind to
+/// background bash.
 #[test]
 fn generated_proposes_regardless_of_background_bash() {
     assert!(
-        should_propose_change_at_idle(
-            true,
+        may_touch_change_state_at_idle(
             false,
             false,
             false,
@@ -217,25 +211,32 @@ fn generated_proposes_regardless_of_background_bash() {
     );
 }
 
+/// The gate takes NO "does the branch have a diff" input, and that omission is
+/// load-bearing rather than an oversight. Folding it in (the old
+/// `should_propose_change_at_idle`) made the empty-diff arm unreachable, so a
+/// branch whose commits cancelled out never reconciled its pending change and
+/// the card kept advertising files the live Diff didn't show (change
+/// `2cc8391f`). A clean Generated idle must pass this gate either way; the
+/// caller then routes on the file list — propose when non-empty, reconcile the
+/// existing pending row to zero when empty.
 #[test]
-fn empty_worktree_does_not_propose() {
+fn gate_is_blind_to_whether_the_branch_has_a_diff() {
+    let clean_idle = may_touch_change_state_at_idle(
+        false,
+        false,
+        false,
+        &Some(TerminalKind::Generated),
+    );
     assert!(
-        !should_propose_change_at_idle(
-            false,
-            false,
-            false,
-            false,
-            &Some(TerminalKind::Generated)
-        ),
-        "no point proposing when the worktree has no changes"
+        clean_idle,
+        "an empty-diff Generated idle must still reach the reconcile arm"
     );
 }
 
 #[test]
 fn external_repo_does_not_propose() {
     assert!(
-        !should_propose_change_at_idle(
-            true,
+        !may_touch_change_state_at_idle(
             true,
             false,
             false,
@@ -248,8 +249,7 @@ fn external_repo_does_not_propose() {
 #[test]
 fn shutdown_does_not_propose() {
     assert!(
-        !should_propose_change_at_idle(
-            true,
+        !may_touch_change_state_at_idle(
             false,
             true,
             false,
@@ -267,8 +267,7 @@ fn shutdown_does_not_propose() {
 #[test]
 fn failed_terminal_does_not_propose_at_idle() {
     assert!(
-        !should_propose_change_at_idle(
-            true,
+        !may_touch_change_state_at_idle(
             false,
             false,
             false,
@@ -286,8 +285,7 @@ fn failed_terminal_does_not_propose_at_idle() {
 fn canceled_terminal_does_not_propose_at_idle() {
     use crate::engine::thread_events::CancelCause;
     assert!(
-        !should_propose_change_at_idle(
-            true,
+        !may_touch_change_state_at_idle(
             false,
             false,
             false,
@@ -305,8 +303,7 @@ fn canceled_terminal_does_not_propose_at_idle() {
 fn aborted_terminal_does_not_propose_at_idle() {
     use crate::engine::thread_events::AbortCause;
     assert!(
-        !should_propose_change_at_idle(
-            true,
+        !may_touch_change_state_at_idle(
             false,
             false,
             false,
@@ -327,7 +324,7 @@ fn aborted_terminal_does_not_propose_at_idle() {
 #[test]
 fn no_terminal_kind_does_not_propose_at_idle() {
     assert!(
-        !should_propose_change_at_idle(true, false, false, false, &None),
+        !may_touch_change_state_at_idle(false, false, false, &None),
         "None terminal (silent resume / safety-net abort) must NOT auto-propose"
     );
 }

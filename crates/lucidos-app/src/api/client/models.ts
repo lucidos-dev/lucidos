@@ -12,6 +12,7 @@ export function createModel(body: {
   label: string;
   provider: string;
   sort_order?: number;
+  context_window?: number;
 }): Promise<ApiResult> {
   return json(`${API}/models`, {
     method: 'POST',
@@ -22,7 +23,15 @@ export function createModel(body: {
 
 export function updateModel(
   id: string,
-  body: { label?: string; provider?: string; sort_order?: number; enabled?: boolean }
+  // `context_window: null` CLEARS the declared window (back to inferring from
+  // the model id); omitting the key leaves the stored value alone.
+  body: {
+    label?: string;
+    provider?: string;
+    sort_order?: number;
+    enabled?: boolean;
+    context_window?: number | null;
+  }
 ): Promise<ApiResult> {
   return json(`${API}/models?id=${encodeURIComponent(id)}`, {
     method: 'PUT',

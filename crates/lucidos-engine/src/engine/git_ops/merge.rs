@@ -594,7 +594,7 @@ async fn primary_worktree_head(repo_root: &Path) -> Option<String> {
 }
 
 /// `true` if `git_ref` resolves to a commit in `repo_root`.
-async fn git_ref_exists(repo_root: &Path, git_ref: &str) -> bool {
+pub(crate) async fn git_ref_exists(repo_root: &Path, git_ref: &str) -> bool {
     git_cmd(&["rev-parse", "--verify", "--quiet", git_ref], repo_root)
         .await
         .map(|o| o.status.success())

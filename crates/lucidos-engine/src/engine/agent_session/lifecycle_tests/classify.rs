@@ -117,7 +117,7 @@ fn shutdown_wins_over_cc_error() {
 /// and `CodingAgentIdled { has_changes: true }` — the UI then shows a
 /// silent "completed" turn even though the user got nothing back. Routing
 /// through `Failed` surfaces the red dot in the UI and (via
-/// `should_propose_change_at_idle`) refuses to auto-propose the partial
+/// `may_touch_change_state_at_idle`) refuses to auto-propose the partial
 /// worktree state for Apply.
 #[test]
 fn empty_text_classifies_as_failed_with_empty_response_error() {
@@ -251,26 +251,34 @@ fn silent_resume_drops_empty_text_too() {
 fn empty_text_failed_does_not_propose() {
     let (terminal, _) = classify_result(false, false, false, false, None, true);
     assert!(
-        !should_propose_change_at_idle(true, false, false, false, &terminal),
+        !may_touch_change_state_at_idle(false, false, false, &terminal),
         "empty-text Failed (OOM / SIGTERM) must NOT auto-propose — half-assed"
     );
 }
 
-/// Empty Result on a resumed turn with no error AND no tool calls → real
-/// stale-resume signal (a dead session produces an immediate empty answer with
-/// zero activity). The run-loop retries with a fresh spawn, REUSING the
-/// worktree (it no longer deletes it).
+/// The maximally stale-looking turn: resumed, the backend did NOT confirm the
+/// attach, empty output, zero activity, no error. Every other stale-resume test
+/// flips exactly one field of this baseline, so each asserts one gate.
+fn stale_baseline() -> StaleResumeInputs {
+    StaleResumeInputs {
+        has_resume_session: true,
+        resume_attach_confirmed: false,
+        result_text_empty: true,
+        buffered_text_empty: true,
+        no_prior_results_this_turn: true,
+        no_tool_calls_this_turn: true,
+        user_message_present: true,
+        cc_error: false,
+    }
+}
+
+/// Empty Result on a resumed turn with no error AND no tool calls AND no
+/// confirmed attach → real stale-resume signal (a dead session produces an
+/// immediate empty answer with zero activity). The run-loop retries with a
+/// fresh spawn, REUSING the worktree (it no longer deletes it).
 #[test]
 fn empty_result_on_resume_with_no_error_is_stale_resume() {
-    assert!(is_stale_resume_signal(
-        true,  // has_resume_session
-        true,  // result_text_empty
-        true,  // buffered_text_empty
-        true,  // no_prior_results_this_turn
-        true,  // no_tool_calls_this_turn
-        true,  // user_message_present
-        false, // cc_error
-    ));
+    assert!(is_stale_resume_signal(stale_baseline()));
 }
 
 /// Empty Result on a resumed turn WITH a CC-reported error → real
@@ -278,15 +286,10 @@ fn empty_result_on_resume_with_no_error_is_stale_resume() {
 /// network drop would trigger a spurious fresh-spawn retry.
 #[test]
 fn empty_result_on_resume_with_cc_error_is_not_stale_resume() {
-    assert!(!is_stale_resume_signal(
-        true,  // has_resume_session
-        true,  // result_text_empty
-        true,  // buffered_text_empty
-        true,  // no_prior_results_this_turn
-        true,  // no_tool_calls_this_turn
-        true,  // user_message_present
-        true,  // cc_error
-    ));
+    assert!(!is_stale_resume_signal(StaleResumeInputs {
+        cc_error: true,
+        ..stale_baseline()
+    }));
 }
 
 /// THE FABLE FALSE-POSITIVE REGRESSION GUARD (2026-07-02). A terse model
@@ -299,24 +302,51 @@ fn empty_result_on_resume_with_cc_error_is_not_stale_resume() {
 /// (2x quota burn).
 #[test]
 fn empty_result_on_resume_but_made_tool_calls_is_not_stale_resume() {
-    assert!(!is_stale_resume_signal(
-        true,  // has_resume_session
-        true,  // result_text_empty  (Fable: no assistant text)
-        true,  // buffered_text_empty
-        true,  // no_prior_results_this_turn
-        false, // no_tool_calls_this_turn → a tool call happened → ALIVE
-        true,  // user_message_present
-        false, // cc_error
-    ));
+    assert!(!is_stale_resume_signal(StaleResumeInputs {
+        // a tool call happened → ALIVE
+        no_tool_calls_this_turn: false,
+        ..stale_baseline()
+    }));
+}
+
+/// THE SWITCH-RESUME FALSE-POSITIVE REGRESSION GUARD (2026-07-29, thread
+/// `cb503361`). The backend reported back the SAME session id we asked to
+/// `--resume`, which proves the conversation is live — so NO amount of empty
+/// output may call it stale. Here the turn is empty and inactive purely because
+/// `claude --print --resume` emitted a `result` for its own synthetic
+/// `Continue from where you left off.` / `No response requested.` turn (injected
+/// to close a tool_use the switch teardown interrupted) before reading our
+/// stdin. Without this gate the healthy Opus-5 session was cancelled 10 ms after
+/// Init and the thread wedged at `running` for 8 minutes.
+#[test]
+fn confirmed_attach_is_never_stale_resume() {
+    assert!(!is_stale_resume_signal(StaleResumeInputs {
+        resume_attach_confirmed: true,
+        ..stale_baseline()
+    }));
+}
+
+/// The complement of the guard above: the backend reported a DIFFERENT session
+/// id than the one we asked to resume (CC silently started a fresh conversation
+/// / Codex fell back to `thread/start`). There is no structural proof of life,
+/// so the empty-echo heuristic still governs and this IS stale. Keeps the
+/// `dev/bf997e21` CLAUDE_CONFIG_DIR-relocation recovery working.
+#[test]
+fn unconfirmed_attach_still_falls_back_to_the_empty_echo_heuristic() {
+    assert!(is_stale_resume_signal(StaleResumeInputs {
+        resume_attach_confirmed: false,
+        ..stale_baseline()
+    }));
 }
 
 /// Non-resumed turn never qualifies (the retry path only makes sense
 /// when the dead session id actually came from a prior CodingAgentIdled).
 #[test]
 fn fresh_session_is_never_stale_resume() {
-    assert!(!is_stale_resume_signal(
-        false, true, true, true, true, true, false
-    ));
+    assert!(!is_stale_resume_signal(StaleResumeInputs {
+        has_resume_session: false,
+        ..stale_baseline()
+    }));
 }
 
 /// CC's EXPLICIT session-not-found error IS a definitive stale-resume signal —
@@ -549,19 +579,23 @@ fn conflict_resolution_cleanup_only_applies_clean_generated_turns() {
     use crate::engine::thread_events::{AbortCause, CancelCause};
 
     assert_eq!(
-        conflict_resolution_cleanup_action(false, &Some(TerminalKind::Generated)),
+        conflict_resolution_cleanup_action(false, &Some(TerminalKind::Generated), false),
         ConflictResolutionCleanupAction::Apply,
         "a clean generated merge-fix turn is the only path that may land the apply"
     );
     assert_eq!(
-        conflict_resolution_cleanup_action(true, &Some(TerminalKind::Generated)),
+        conflict_resolution_cleanup_action(true, &Some(TerminalKind::Generated), false),
         ConflictResolutionCleanupAction::Abort {
             message: "Conflict resolution incomplete — merge aborted. The change is still pending; try applying again.",
         },
         "unmerged paths must keep the original change pending even after a generated turn"
     );
     assert_eq!(
-        conflict_resolution_cleanup_action(false, &Some(TerminalKind::Canceled(CancelCause::UserStop))),
+        conflict_resolution_cleanup_action(
+            false,
+            &Some(TerminalKind::Canceled(CancelCause::UserStop)),
+            false
+        ),
         ConflictResolutionCleanupAction::Abort {
             message: "Conflict resolution canceled — merge aborted. The change is still pending; try applying again.",
         },
@@ -575,13 +609,93 @@ fn conflict_resolution_cleanup_only_applies_clean_generated_turns() {
         None,
     ] {
         assert_eq!(
-            conflict_resolution_cleanup_action(false, &terminal),
+            conflict_resolution_cleanup_action(false, &terminal, false),
             ConflictResolutionCleanupAction::Abort {
                 message: "Conflict resolution did not finish cleanly — merge aborted. The change is still pending; try applying again.",
             },
             "non-generated terminal {terminal:?} must keep the original change pending"
         );
     }
+}
+
+/// A pending auto-recovery continuation transfers the merge duty instead of
+/// aborting — for interrupted turns, regardless of leftover unmerged files (a
+/// stray-killed merge turn is EXPECTED to leave conflicts behind for the
+/// continuation to finish). The 2026-07-10 incident: a stray SIGTERM 84ms
+/// after the merge-session spawn aborted the apply and raced destructive git
+/// cleanup against the continuation that was already resuming the same turn.
+///
+/// Two outcomes still beat the hand-off:
+/// - a clean `Generated` turn with the merge fully committed applies on the
+///   spot (an external-watchdog false positive racing a natural end must not
+///   defer finished work to a fragile `--resume`);
+/// - a user cancel aborts (Stop means "don't land this merge").
+#[test]
+fn conflict_resolution_hands_off_when_continuation_pending() {
+    use crate::engine::thread_events::{AbortCause, CancelCause};
+
+    for (has_unmerged, terminal) in [
+        (true, None),
+        (false, None),
+        (
+            true,
+            Some(TerminalKind::Failed {
+                error: "killed".to_string(),
+            }),
+        ),
+        (false, Some(TerminalKind::Aborted(AbortCause::SafetyNet))),
+        // Generated with unmerged files left behind: the turn didn't finish
+        // the merge — the continuation picks it up.
+        (true, Some(TerminalKind::Generated)),
+    ] {
+        assert_eq!(
+            conflict_resolution_cleanup_action(has_unmerged, &terminal, true),
+            ConflictResolutionCleanupAction::HandOff,
+            "continuation_pending must hand off (has_unmerged={has_unmerged}, terminal {terminal:?})"
+        );
+    }
+
+    assert_eq!(
+        conflict_resolution_cleanup_action(false, &Some(TerminalKind::Generated), true),
+        ConflictResolutionCleanupAction::Apply,
+        "a committed merge with a clean Generated end applies immediately — \
+         never deferred to the continuation (watchdog false-positive race)"
+    );
+    assert_eq!(
+        conflict_resolution_cleanup_action(
+            false,
+            &Some(TerminalKind::Canceled(CancelCause::UserStop)),
+            true
+        ),
+        ConflictResolutionCleanupAction::Abort {
+            message: "Conflict resolution canceled — merge aborted. The change is still pending; try applying again.",
+        },
+        "a user Stop aborts even with a continuation pending"
+    );
+}
+
+/// Abort cleanup deletes only what the merge attempt created: the temp
+/// worktree + temp branch of the Tier-3 shape, and only when this session
+/// actually ran on that temp branch. A Tier-2 merge (no `merge_temp_branch`)
+/// ran in the thread's own worktree on the real change branch — deleting
+/// those would destroy the user's committed work. And a STALE recorded temp
+/// branch (a pruned-temp re-attach put the session on the change branch
+/// while the row still carries the dead attempt's columns) must not condemn
+/// the thread worktree the session actually ran in.
+#[test]
+fn conflict_abort_deletes_only_temp_merge_state() {
+    assert!(conflict_abort_deletes_temp_state(
+        Some("merge-tmp/x"),
+        "merge-tmp/x"
+    ));
+    assert!(!conflict_abort_deletes_temp_state(
+        Some("merge-tmp/x"),
+        "claude-code/20260707-abc"
+    ));
+    assert!(!conflict_abort_deletes_temp_state(
+        None,
+        "claude-code/20260707-abc"
+    ));
 }
 
 /// Only "no text AND no images" counts as silent — image-only turns are

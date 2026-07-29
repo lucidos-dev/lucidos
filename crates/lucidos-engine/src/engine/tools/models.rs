@@ -42,11 +42,20 @@ impl LucidosEngine {
         }
         let mut out = format!("{} models in the registry:\n", models.len());
         for m in &models {
+            // Surface the declared context window so the agent can see which
+            // models are still relying on the id-shape guess — that fallback
+            // gives every OpenRouter / Gemini / local id 200k regardless of its
+            // real window, which silently shrinks the context budget.
+            let window = match m.context_window {
+                Some(w) => format!("{w} tokens"),
+                None => "inferred from id".to_string(),
+            };
             out.push_str(&format!(
-                "- {} — \"{}\" | provider: {} | {} | {}\n",
+                "- {} — \"{}\" | provider: {} | context window: {} | {} | {}\n",
                 m.id,
                 m.label,
                 m.provider,
+                window,
                 if m.enabled { "enabled" } else { "disabled" },
                 if m.is_builtin() { "builtin" } else { "user" },
             ));
@@ -76,9 +85,30 @@ impl LucidosEngine {
             ));
         }
         // User models sort after builtins by default (matches the HTTP create).
-        let sort_order = args["sort_order"].as_i64().map(|n| n as i32).unwrap_or(1000);
+        // `try_from`, never `as` — a wrapping cast turns an out-of-range i64
+        // into an unrelated in-range value that then passes validation and gets
+        // stored (e.g. 2^32 + 5000 wraps to 5000).
+        let sort_order = match args["sort_order"].as_i64().map(i32::try_from) {
+            Some(Ok(n)) => n,
+            Some(Err(_)) => return Ok("Error: sort_order is out of range.".to_string()),
+            None => 1000,
+        };
+        // Omitted → infer from the id. A non-positive value is rejected rather
+        // than stored: it would produce a zero context budget (trimming
+        // everything) or, cast from a negative, an enormous one.
+        let context_window = match args["context_window"].as_i64().map(i32::try_from) {
+            Some(Ok(n)) if n > 0 => Some(n),
+            None => None,
+            _ => {
+                return Ok(
+                    "Error: context_window must be a positive number of tokens that fits in a 32-bit integer (omit it to infer from the model id)."
+                        .to_string(),
+                )
+            }
+        };
 
-        match ModelStore::create(&self.pool, id, label, provider, sort_order).await {
+        match ModelStore::create(&self.pool, id, label, provider, sort_order, context_window).await
+        {
             Ok(model) => {
                 self.event_bus
                     .emit(BusEvent::System(SystemEvent::ModelCreated {

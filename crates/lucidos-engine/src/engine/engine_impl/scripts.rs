@@ -248,15 +248,14 @@ impl LucidosEngine {
         let stdout = sanitize_for_jsonb(&String::from_utf8_lossy(&output.stdout));
         let stderr = sanitize_for_jsonb(&String::from_utf8_lossy(&output.stderr));
 
-        if output.status.success() {
+        // Typed for the same reason as the bash tools: `code().unwrap_or(-1)`
+        // reported a script killed by SIGSEGV as "exit -1", a number that reads
+        // like an ordinary status. `describe()` names the signal instead.
+        let outcome = crate::core::shell::TaskOutcome::from_status(output.status);
+        if outcome.is_success() {
             Ok(stdout)
         } else {
-            Err(format!(
-                "Shell script error (exit {}):\n{}",
-                output.status.code().unwrap_or(-1),
-                stderr
-            )
-            .into())
+            Err(format!("Shell script error ({}):\n{}", outcome.describe(), stderr).into())
         }
     }
 
@@ -294,20 +293,22 @@ impl LucidosEngine {
     }
 }
 
-/// Spawn `/bin/sh <script>` in `workspace_dir` with `env_vars`, waiting up to
-/// `timeout` for it to finish. `kill_on_drop(true)` is the load-bearing part:
-/// on timeout the `wait_with_output` future is dropped, taking the owned child
-/// with it, and the OS sends SIGKILL — so a hung scheduled script can't leak an
-/// orphaned process. Mirrors `execute_bash_tool` (tools/bash.rs).
+/// Spawn the script under the engine's `pipefail` shell (see `core::shell`) in
+/// `workspace_dir` with `env_vars`, waiting up to `timeout` for it to finish.
+/// `kill_on_drop(true)` is the load-bearing part: on timeout the
+/// `wait_with_output` future is dropped, taking the owned child with it, and
+/// the OS sends SIGKILL — so a hung scheduled script can't leak an orphaned
+/// process. Mirrors `execute_bash_tool` (tools/bash.rs), including the
+/// pipefail guarantee: a `… | tee log` inside a trigger script would otherwise
+/// report the last stage's status and hide the real failure.
 async fn run_shell_script_with_timeout(
     script_path: &std::path::Path,
     workspace_dir: &std::path::Path,
     env_vars: &[(String, String)],
     timeout: std::time::Duration,
 ) -> Result<std::process::Output, Box<dyn std::error::Error + Send + Sync>> {
-    let mut cmd = tokio::process::Command::new("/bin/sh");
-    cmd.arg(script_path)
-        .current_dir(workspace_dir)
+    let mut cmd = crate::core::shell::command_shell().script(script_path);
+    cmd.current_dir(workspace_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

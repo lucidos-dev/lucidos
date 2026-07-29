@@ -13,7 +13,7 @@ REPO_ROOT=$(git -C "$CLAUDE_PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null)
 [ -z "$REPO_ROOT" ] && exit 0
 
 # Find what would be pushed (commits ahead of upstream)
-UNPUSHED=$(git -C "$REPO_ROOT" log @{u}..HEAD --oneline 2>/dev/null)
+UNPUSHED=$(git -C "$REPO_ROOT" log '@{u}..HEAD' --oneline 2>/dev/null)
 if [ -z "$UNPUSHED" ]; then
   # Nothing to push — allow it (push will be a no-op anyway)
   exit 0

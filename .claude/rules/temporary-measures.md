@@ -1,16 +1,6 @@
----
-globs:
-  - "crates/**/*.rs"
-  - "crates/lucidos-app/src/**/*.css"
-  - "crates/lucidos-engine/src/api/*.css"
-  - "crates/lucidos-app/src/**/*.ts"
-  - "crates/lucidos-app/src/**/*.tsx"
-  - "packages/lucidos-sdk/**/*.ts"
-  - "system-knowhow/**/*.md"
-  - "docs/temporary-measures.md"
----
-
 # Temporary measures
+
+**Always loaded** (no `paths:` frontmatter): the inclusion test has to be applied whenever a temporary measure is introduced, which is a judgment made before any particular file is touched.
 
 A **temporary measure** is anything in the codebase that is *meant to end* and
 carries a *concrete condition for when* — a workaround until upstream fixes X, a
@@ -41,7 +31,11 @@ The registry has four typed sections; a temporary measure is one of:
    shape the agent tends to emit). The honest reason it exists is "the model keeps
    getting it wrong," not "the design needs it." The test: *would we still want
    this if the model were perfect?* No → it's a tolerance measure. (This category
-   absorbed the retired `model-tolerance-measures.md`.)
+   absorbed the retired `model-tolerance-measures.md`.) **"The model" means the
+   weakest model in the *model registry*, not the newest.** Chat routes across
+   Anthropic, OpenAI, OpenRouter, and local endpoints, so a new flagship is not
+   evidence a crutch is removable, and enabling another model can make one more
+   load-bearing — see `docs/temporary-measures.md` § 2 for the sampling rule.
 3. **Feature flags & sunset deprecations** — flags / kill-switches awaiting
    cleanup, and back-compat shims/aliases that carry a **concrete** removal
    condition (NOT permanent back-compat).

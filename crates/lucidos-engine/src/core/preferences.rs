@@ -30,7 +30,7 @@ pub const PREF_CODING_AGENT_CODEX_PATH: &str = "coding_agent_codex_path";
 
 /// Default chat model when neither user preference nor `LUCIDOS_MODEL` env is set.
 /// Mirrored on the frontend in `crates/lucidos-app/src/store/models.ts`.
-pub const DEFAULT_CHAT_MODEL: &str = "claude-opus-4-8@default";
+pub const DEFAULT_CHAT_MODEL: &str = "claude-opus-5@default";
 
 // Vertex AI configuration
 pub const PREF_VERTEX_REGION: &str = "vertex_region";

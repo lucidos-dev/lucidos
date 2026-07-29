@@ -31,7 +31,9 @@ for IDE integrations; its surface has moved between codex releases.
    `LUCIDOS_CODEX_PROTOCOL`.** Default **`app-server`**
    (`runtime/codex_app_server.rs`); `exec` (`runtime/codex.rs`) stays fully
    wired as the escape hatch. Both share `CodexConfig`, the sandbox profile
-   (`workspace-write`, network on, shared git dir writable), the `lucidos`
+   (`workspace-write`, network on, and `CodexConfig.sandbox_writable_roots`
+   — the shared git dir plus the workspace's `data/` tree; see ADR 0004 §4's
+   2026-07-26 update), the `lucidos`
    MCP server (`ask_user_question`), and the Codex thread id — the two
    protocols read the same on-disk rollout, so an existing thread resumes
    fine after a flip.

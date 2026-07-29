@@ -65,9 +65,12 @@ export function App() {
 
   // Mount only the visible layout. Dual-mounting fanned every signal write out
   // to two ThreadDrawer + ThreadPane + ContentPane subtrees — the inactive one
-  // still ran subscriptions, render, and FLIP layout reads on 100+ rows. Safe
-  // to gate once: viewportIsMobile only flips on window resize, which never
-  // fires in an iOS PWA.
+  // still ran subscriptions, render, and FLIP layout reads on 100+ rows. Gating
+  // on viewportIsMobile keeps one subtree alive. The signal self-corrects on
+  // real viewport changes (rotation / wake / resize — see utils/viewport.ts), so
+  // a wrong initial read on an iOS PWA cold launch or landscape start re-mounts
+  // into the correct layout instead of stranding a portrait phone in the desktop
+  // split. A genuine breakpoint crossing is rare, so the per-render cost is ~0.
   const mobile = viewportIsMobile.value;
   // Reclaimed macOS title-bar band: drags the window and double-click-zooms it.
   // Drag/zoom go through always-allowed app commands (useWindowDragRegion), since

@@ -1,5 +1,6 @@
 use super::super::LucidosEngine;
 use super::ToolOutcome;
+use crate::core::shell::{command_shell, TaskOutcome};
 use crate::core::{redact_postgres_secrets, sanitize_for_jsonb};
 use crate::engine::event_bus::BusEvent;
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
@@ -16,6 +17,23 @@ const MAX_OUTPUT_BYTES: usize = 100 * 1024; // 100 KB
 fn finalize_stream(bytes: &[u8]) -> String {
     let sanitized = sanitize_for_jsonb(&String::from_utf8_lossy(bytes));
     truncate_output(&sanitized, MAX_OUTPUT_BYTES)
+}
+
+/// Same, but keeps the END of an oversized stream instead of the start.
+/// A `bash_output` drain is a *window* on a still-running task: the newest
+/// lines are the ones that say where the build got to and which one failed,
+/// and head-truncation would throw away precisely those. Now that
+/// `wait_secs` blocks for its full budget a single drain can span two
+/// minutes of a chatty build, so a window CAN exceed the cap — before the
+/// fix each drain returned a few hundred bytes and this never bit.
+///
+/// `already_dropped` is output the registry's own buffer cap discarded
+/// before we ever saw it. It has to be folded into the marker: reporting
+/// only what this function trims would state a byte count *lower* than the
+/// true loss, and a truncation marker that understates reads as a bound.
+fn finalize_drain(text: &str, already_dropped: usize) -> String {
+    let sanitized = sanitize_for_jsonb(text);
+    truncate_output_tail(&sanitized, MAX_OUTPUT_BYTES, already_dropped)
 }
 
 impl LucidosEngine {
@@ -37,9 +55,10 @@ impl LucidosEngine {
 
         let env_vars = self.build_script_env_vars(Some(thread_id)).await;
 
-        let mut cmd = tokio::process::Command::new("/bin/sh");
-        cmd.args(["-c", command])
-            .current_dir(self.workspace_path())
+        // `pipefail` shell — see `core::shell`. A `cmd | tee log` would
+        // otherwise report tee's 0 and hide the real failure.
+        let mut cmd = command_shell().command(command);
+        cmd.current_dir(self.workspace_path())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -83,7 +102,10 @@ impl LucidosEngine {
 
         let stdout = finalize_stream(&output.stdout);
         let stderr = finalize_stream(&output.stderr);
-        let exit_code = output.status.code().unwrap_or(-1);
+        // Typed, so a signal death can't be flattened into a bare number. The
+        // old `status.code().unwrap_or(-1)` reported a SIGSEGV as `-1`, which
+        // reads like an ordinary exit code.
+        let outcome = TaskOutcome::from_status(output.status);
 
         let mut response = String::new();
 
@@ -98,15 +120,15 @@ impl LucidosEngine {
             response.push_str(&format!("[stderr]\n{}", stderr));
         }
 
-        if !output.status.success() {
+        if !outcome.is_success() {
             if !response.is_empty() {
                 response.push_str("\n\n");
             }
-            response.push_str(&format!("[exit code: {}]", exit_code));
+            response.push_str(&format!("[{}]", outcome.describe()));
         }
 
         if response.is_empty() {
-            response = format!("[exit code: {}]", exit_code);
+            response = format!("[{}]", outcome.describe());
         }
 
         Ok(response)
@@ -223,15 +245,29 @@ impl LucidosEngine {
                 let s = safe_command.as_str();
                 s[..s.floor_char_boundary(200)].to_string()
             };
-            let exit_code = task.exit_code;
+            // A finished task always has an outcome (the watchdog writes it in
+            // the same locked block as `finished_at`). Defend anyway rather
+            // than unwrapping: `Unknown` is the honest reading, and it renders
+            // as words, not as a `0`.
+            let outcome = task.outcome.unwrap_or(TaskOutcome::Unknown);
             let timed_out = task.timed_out;
             let killed = task.killed;
+            // The whole retained buffer, plus everything the buffer cap cut
+            // from it over the task's life — so the marker counts real loss
+            // and not just what the 100 KB tail cap trimmed here.
+            let (stdout_all, stdout_dropped) = task.stdout.all();
+            let (stderr_all, stderr_dropped) = task.stderr.all();
             let event = ThreadEvent::BackgroundBashCompleted {
                 task_id: task_id.clone(),
                 command: cmd_prefix.clone(),
-                exit_code,
-                stdout: finalize_stream(&task.stdout),
-                stderr: finalize_stream(&task.stderr),
+                exit_code: outcome.exit_code(),
+                signal: outcome.signal(),
+                // Tail, not head — `bash_output` falls back to this payload
+                // once the task is evicted, and the drain path it must agree
+                // with keeps the tail. For a 40-minute build the last lines
+                // are the failure; the first are `Compiling serde`.
+                stdout: finalize_drain(&stdout_all, stdout_dropped),
+                stderr: finalize_drain(&stderr_all, stderr_dropped),
                 started_at: task.started_at,
                 finished_at: task.finished_at.unwrap_or_else(chrono::Utc::now),
                 timed_out,
@@ -259,7 +295,7 @@ impl LucidosEngine {
             };
             if let Some(tx) = msg_tx {
                 let wake_text =
-                    format_bash_wake_text(&task_id, &cmd_prefix, exit_code, killed, timed_out);
+                    format_bash_wake_text(&task_id, &cmd_prefix, outcome, killed, timed_out);
                 // `AgentInputKind::User` so `run_session` emits the standard
                 // `CodingAgentPromptSent` audit row — that's the frontend's
                 // exchange-starter for CC's resumed work. `BackgroundBashCompleted`
@@ -295,13 +331,18 @@ impl LucidosEngine {
     /// `BackgroundBashCompleted` event. Returns a JSON string.
     ///
     /// When `wait_secs` is provided (1..=`BASH_OUTPUT_MAX_WAIT_SECS`),
-    /// blocks server-side until new output arrives, the task finishes,
-    /// or the wait elapses. Replaces the sleep-poll antipattern where
-    /// a chat agent spawned `run_python_background` then issued a
-    /// fresh `run_python` containing `time.sleep(N)` — that burned two
-    /// tool calls per wait, doubled context, and stalled the turn.
-    /// Values above the max are clamped silently so a misprompted
-    /// agent can't pin a model turn forever.
+    /// blocks server-side for the full budget unless the task finishes
+    /// first. Replaces the sleep-poll antipattern where a chat agent
+    /// spawned `run_python_background` then issued a fresh `run_python`
+    /// containing `time.sleep(N)` — that burned two tool calls per wait,
+    /// doubled context, and stalled the turn. Values above the max are
+    /// clamped silently so a misprompted agent can't pin a model turn
+    /// forever.
+    ///
+    /// The result carries `elapsed_secs` (task runtime) and `waited_secs`
+    /// (how long THIS call actually blocked) because the model has no
+    /// clock: without them it infers elapsed time from what it *asked*
+    /// for and narrates "roughly 20 minutes in" 90 seconds into a build.
     pub(crate) async fn execute_bash_output_tool(
         &self,
         args: &serde_json::Value,
@@ -336,18 +377,66 @@ impl LucidosEngine {
         };
         let wait = std::time::Duration::from_secs(wait_secs);
 
-        if let Some(snap) = self
-            .bash_background
-            .read_output_in_memory_wait(task_id, wait)
-            .await
-        {
+        // A message from the user outranks the rest of the wait: the loop
+        // only picks injections up BETWEEN iterations, so without this the
+        // follow-up sits unread for up to two minutes while we block.
+        // Cancel is already handled a level up, in `run_tool_with_cancel`.
+        let wakeup = (!wait.is_zero())
+            .then(|| self.injection_wakeup(thread_id))
+            .flatten();
+
+        let call_started = std::time::Instant::now();
+        let snapshot = match wakeup {
+            Some((notify, pending)) => {
+                // Register the waiter BEFORE reading the counter. `enable()`
+                // is what makes this race-free: any inject() from here on
+                // wakes a registered waiter, and any that already happened is
+                // visible in `pending`. Checking first and registering second
+                // would drop an injection landing in between — and
+                // notify_waiters leaves no permit to recover it.
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                if pending.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                    // The user already spoke — typically while the LLM call
+                    // that produced THIS tool call was in flight. Don't block.
+                    self.bash_background
+                        .read_output_in_memory_wait(task_id, std::time::Duration::ZERO)
+                        .await
+                } else {
+                    tokio::select! {
+                        biased;
+                        snap = self.bash_background.read_output_in_memory_wait(task_id, wait) => snap,
+                        // The user spoke mid-wait. Drain what's there and hand
+                        // the turn back so the loop reads their message now.
+                        _ = notified => {
+                            self.bash_background
+                                .read_output_in_memory_wait(task_id, std::time::Duration::ZERO)
+                                .await
+                        }
+                    }
+                }
+            }
+            None => {
+                self.bash_background
+                    .read_output_in_memory_wait(task_id, wait)
+                    .await
+            }
+        };
+
+        if let Some(snap) = snapshot {
             return Ok(serde_json::json!({
-                "stdout": finalize_stream(snap.stdout.as_bytes()),
-                "stderr": finalize_stream(snap.stderr.as_bytes()),
-                "exit_code": snap.exit_code,
+                "stdout": finalize_drain(&snap.stdout, snap.stdout_dropped),
+                "stderr": finalize_drain(&snap.stderr, snap.stderr_dropped),
+                "exit_code": snap.outcome.and_then(|o| o.exit_code()),
+                "signal": snap.outcome.and_then(|o| o.signal()),
+                "status": snap.outcome.map(|o| o.describe()),
                 "finished": snap.finished,
                 "timed_out": snap.timed_out,
                 "killed": snap.killed,
+                "elapsed_secs": snap.elapsed_secs,
+                "waited_secs": call_started.elapsed().as_secs(),
             })
             .to_string());
         }
@@ -370,15 +459,36 @@ impl LucidosEngine {
         };
 
         match row {
-            Some((payload,)) => Ok(serde_json::json!({
-                "stdout": payload.get("stdout").cloned().unwrap_or(serde_json::Value::String(String::new())),
-                "stderr": payload.get("stderr").cloned().unwrap_or(serde_json::Value::String(String::new())),
-                "exit_code": payload.get("exit_code").cloned().unwrap_or(serde_json::Value::Null),
-                "finished": true,
-                "timed_out": payload.get("timed_out").cloned().unwrap_or(serde_json::Value::Bool(false)),
-                "killed": payload.get("killed").cloned().unwrap_or(serde_json::Value::Bool(false)),
-            })
-            .to_string()),
+            Some((payload,)) => {
+                // Rebuild the outcome from the persisted pair so this branch
+                // renders exactly what the in-memory drain rendered — the two
+                // branches are the same tool call to the LLM and must never
+                // disagree. Legacy rows have no `signal` key.
+                let outcome = TaskOutcome::from_persisted(
+                    payload.get("exit_code").and_then(|v| v.as_i64()).map(|c| c as i32),
+                    payload.get("signal").and_then(|v| v.as_i64()).map(|s| s as i32),
+                );
+                Ok(serde_json::json!({
+                    "stdout": payload.get("stdout").cloned().unwrap_or(serde_json::Value::String(String::new())),
+                    "stderr": payload.get("stderr").cloned().unwrap_or(serde_json::Value::String(String::new())),
+                    "exit_code": outcome.exit_code(),
+                    "signal": outcome.signal(),
+                    "status": outcome.describe(),
+                    "finished": true,
+                    "timed_out": payload.get("timed_out").cloned().unwrap_or(serde_json::Value::Bool(false)),
+                    "killed": payload.get("killed").cloned().unwrap_or(serde_json::Value::Bool(false)),
+                    // Same two time fields as the in-memory branch, so the LLM
+                    // never has to guess how long the task ran just because the
+                    // registry entry was evicted before it drained. `waited_secs`
+                    // is measured, not assumed zero: we land here not only for an
+                    // unknown task_id (which returns without waiting) but also
+                    // when a task we DID block on finishes and the completion
+                    // watcher evicts it before the wait reacquires the lock.
+                    "elapsed_secs": persisted_elapsed_secs(&payload),
+                    "waited_secs": call_started.elapsed().as_secs(),
+                })
+                .to_string())
+            }
             None => Err(format!("Error: unknown task_id '{}'", task_id)),
         }
     }
@@ -410,6 +520,45 @@ fn truncate_output(s: &str, max: usize) -> String {
     }
 }
 
+/// Task runtime in seconds from a persisted `BackgroundBashCompleted`
+/// payload. `null` for a legacy row that predates the timestamp pair —
+/// an honest "unknown" the LLM can read, rather than a fabricated `0`
+/// it would narrate as "the build took no time at all".
+fn persisted_elapsed_secs(payload: &serde_json::Value) -> Option<i64> {
+    let ts = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+    };
+    let (started, finished) = (ts("started_at")?, ts("finished_at")?);
+    Some((finished - started).num_seconds().max(0))
+}
+
+/// Keep the last `max` bytes rather than the first. The marker leads so the
+/// LLM sees "this is a tail" before the content, and states how much was
+/// dropped so it knows to widen the window (or read a log file) if it needs
+/// the earlier lines. `already_dropped` counts output lost upstream (the
+/// registry's buffer cap) and is added to whatever this call trims, so the
+/// figure is the total gap and never just the visible part of it.
+fn truncate_output_tail(s: &str, max: usize, already_dropped: usize) -> String {
+    if s.len() <= max && already_dropped == 0 {
+        return s.to_string();
+    }
+    let start = if s.len() > max {
+        s.ceil_char_boundary(s.len() - max)
+    } else {
+        0
+    };
+    format!(
+        "[truncated — {} earlier bytes dropped, showing the most recent {} of {} total]\n...{}",
+        already_dropped + start,
+        s.len() - start,
+        already_dropped + s.len(),
+        &s[start..]
+    )
+}
+
 /// Text the engine pushes to CC via `msg_tx` when a background task
 /// (spawned via `run_bash_background` OR `run_python_background`) completes
 /// and CC is parked waiting on it. Extracted as a free function so the
@@ -418,10 +567,21 @@ fn truncate_output(s: &str, max: usize) -> String {
 /// `BackgroundBashRegistry`).
 ///
 /// The text gives CC enough context to act without re-querying — the
-/// task_id, the command prefix it spawned, and an outcome word — but
+/// task_id, the command prefix it spawned, and an outcome phrase — but
 /// CC still calls `bash_output(task_id)` to read the actual stdout/
-/// stderr. Killed and timed-out cases get their own outcome word so
+/// stderr. Killed and timed-out cases keep their own leading word so
 /// CC knows the result isn't "exit code 0 — clean success".
+///
+/// The phrase comes from [`TaskOutcome::describe`], the same source the
+/// `bash_output` JSON and the sync `run_bash` result use, so the three
+/// LLM-facing surfaces cannot drift apart. Crucially it never invents a
+/// number: a signal death reads `killed by SIGKILL (signal 9)` and a status
+/// the engine failed to obtain reads `exit code unknown`.
+///
+/// The engine-caused endings (`bash_kill`, watchdog timeout) are reported
+/// *alongside* the real status rather than instead of it — "timed out —
+/// killed by SIGKILL (signal 9)" tells CC both that the deadline fired and
+/// how the child actually died, which the old bare "timed out" did not.
 ///
 /// "Background task" instead of "Background bash task" — the same watcher
 /// fires for python-spawned tasks (via `run_python_background`), and the
@@ -430,15 +590,14 @@ fn truncate_output(s: &str, max: usize) -> String {
 fn format_bash_wake_text(
     task_id: &str,
     cmd_prefix: &str,
-    exit_code: Option<i32>,
+    outcome: TaskOutcome,
     killed: bool,
     timed_out: bool,
 ) -> String {
-    let status = match (exit_code, killed, timed_out) {
-        (_, true, _) => "killed".to_string(),
-        (_, _, true) => "timed out".to_string(),
-        (Some(c), _, _) => format!("exit code {}", c),
-        (None, _, _) => "no exit code".to_string(),
+    let status = match (killed, timed_out) {
+        (true, _) => format!("stopped by bash_kill — {}", outcome.describe()),
+        (_, true) => format!("timed out — {}", outcome.describe()),
+        _ => outcome.describe(),
     };
     format!(
         "Background task {} finished ({}): {}\n\nUse `bash_output(\"{}\")` to read the result and continue your work.",
@@ -466,6 +625,97 @@ mod tests {
     }
 
     #[test]
+    fn truncate_output_tail_keeps_the_end_not_the_start() {
+        // A drain window is a progress view: the newest lines say where the
+        // build got to and which step failed. Head-truncating an oversized
+        // window would hand the LLM `Compiling serde` and drop the error.
+        let s = format!("{}FAILED: linker error", "noise\n".repeat(500));
+        let result = truncate_output_tail(&s, 100, 0);
+        assert!(
+            result.ends_with("FAILED: linker error"),
+            "tail truncation must keep the end: {:?}",
+            result
+        );
+        assert!(
+            result.starts_with("[truncated"),
+            "the marker leads so the LLM knows it's a tail: {:?}",
+            result
+        );
+        assert!(result.contains("earlier bytes dropped"));
+    }
+
+    #[test]
+    fn truncate_output_tail_counts_upstream_loss_too() {
+        // A full-budget wait can outrun the registry's 2 MB buffer cap, which
+        // discards unread bytes before this function ever sees them. Counting
+        // only what we trim here would report a smaller gap than really
+        // occurred — and a truncation marker that understates reads as a
+        // bound, so the LLM would trust a number that is a lie.
+        let s = "x".repeat(300);
+        let result = truncate_output_tail(&s, 100, 5_000);
+        assert!(
+            result.contains("5200 earlier bytes dropped"),
+            "marker must add upstream loss (5000) to its own trim (200): {:?}",
+            &result[..result.find('\n').unwrap_or(result.len())]
+        );
+        assert!(
+            result.contains("of 5300 total"),
+            "total must include the bytes lost upstream: {:?}",
+            &result[..result.find('\n').unwrap_or(result.len())]
+        );
+    }
+
+    #[test]
+    fn truncate_output_tail_marks_upstream_loss_even_when_it_fits() {
+        // Output that fits the cap is normally returned verbatim — but if the
+        // registry already dropped bytes, saying nothing would present a
+        // partial window as complete.
+        let result = truncate_output_tail("the tail", 100, 900);
+        assert!(
+            result.contains("900 earlier bytes dropped"),
+            "a short window after upstream loss must still be marked: {:?}",
+            result
+        );
+        assert!(result.ends_with("the tail"));
+    }
+
+    #[test]
+    fn truncate_output_tail_short_string_is_untouched() {
+        assert_eq!(truncate_output_tail("hello world", 100, 0), "hello world");
+    }
+
+    #[test]
+    fn truncate_output_tail_multibyte_boundary() {
+        // ceil_char_boundary must not split a multi-byte char — slicing by
+        // raw byte index would panic. 'é' is 2 bytes, so a 5-byte budget
+        // lands mid-char and has to round outward.
+        let s = "ééééé"; // 10 bytes in UTF-8
+        let result = truncate_output_tail(s, 5, 0);
+        assert!(result.contains("[truncated"));
+        assert!(result.ends_with("éé"), "got {:?}", result);
+    }
+
+    #[test]
+    fn persisted_elapsed_secs_reads_the_timestamp_pair() {
+        let payload = serde_json::json!({
+            "started_at": "2026-07-27T10:00:00Z",
+            "finished_at": "2026-07-27T10:41:30Z",
+        });
+        assert_eq!(persisted_elapsed_secs(&payload), Some(2490));
+    }
+
+    #[test]
+    fn persisted_elapsed_secs_is_none_for_a_legacy_row() {
+        // An honest "unknown" beats a fabricated 0 the LLM would narrate as
+        // "the build took no time at all".
+        assert_eq!(persisted_elapsed_secs(&serde_json::json!({})), None);
+        assert_eq!(
+            persisted_elapsed_secs(&serde_json::json!({"started_at": "not a date"})),
+            None
+        );
+    }
+
+    #[test]
     fn truncate_output_multibyte_boundary() {
         let s = "ééééé"; // 10 bytes in UTF-8
         let result = truncate_output(s, 5);
@@ -483,7 +733,13 @@ mod tests {
     /// this test, not in the next user incident.
     #[test]
     fn format_bash_wake_text_clean_exit_zero() {
-        let text = format_bash_wake_text("task-123", "cargo test --lib", Some(0), false, false);
+        let text = format_bash_wake_text(
+            "task-123",
+            "cargo test --lib",
+            TaskOutcome::Exited(0),
+            false,
+            false,
+        );
         assert!(text.contains("task-123"), "task_id must appear so CC can refer to it");
         assert!(text.contains("exit code 0"), "clean exit must say 'exit code 0'");
         assert!(text.contains("cargo test --lib"), "command prefix gives CC context");
@@ -495,35 +751,109 @@ mod tests {
 
     #[test]
     fn format_bash_wake_text_non_zero_exit() {
-        let text = format_bash_wake_text("t1", "npm test", Some(1), false, false);
+        let text = format_bash_wake_text("t1", "npm test", TaskOutcome::Exited(1), false, false);
         assert!(text.contains("exit code 1"));
     }
 
-    /// `killed` outranks an exit_code value: a child reaped by SIGKILL/
-    /// SIGTERM may still report an exit code, but the CC-facing semantic
-    /// is "the engine killed this" — not "the command finished with X".
+    /// The two statuses the 2026-07-26 nightly actually observed, both of
+    /// which reached the agent as "exit code 0". The summary must carry the
+    /// real number.
     #[test]
-    fn format_bash_wake_text_killed_outranks_exit_code() {
-        let text = format_bash_wake_text("t2", "sleep 30", Some(143), true, false);
-        assert!(text.contains("killed"), "killed must be the outcome word");
+    fn format_bash_wake_text_reports_the_nightly_statuses_verbatim() {
+        let clippy = format_bash_wake_text(
+            "t-clippy",
+            "cargo clippy --all-targets | tee build.log",
+            TaskOutcome::Exited(101),
+            false,
+            false,
+        );
+        assert!(clippy.contains("exit code 101"), "got: {clippy}");
+        assert!(
+            !clippy.contains("exit code 0"),
+            "the masking trap is back: {clippy}"
+        );
+
+        let e2e = format_bash_wake_text(
+            "t-e2e",
+            "./scripts/e2e.sh | tee e2e.log",
+            TaskOutcome::Exited(1),
+            false,
+            false,
+        );
+        assert!(e2e.contains("exit code 1"), "got: {e2e}");
+        assert!(!e2e.contains("exit code 0"), "the masking trap is back: {e2e}");
+    }
+
+    /// A signal death is named, never rendered as an exit code and never as
+    /// a bare number the reader can mistake for one.
+    #[test]
+    fn format_bash_wake_text_names_the_signal() {
+        let text = format_bash_wake_text("t5", "./flaky", TaskOutcome::Signaled(9), false, false);
+        assert!(
+            text.contains("killed by SIGKILL (signal 9)"),
+            "signal death must be named: {text}"
+        );
         assert!(
             !text.contains("exit code"),
-            "killed must NOT also report the exit code (would confuse CC)"
+            "a signal death has no exit code: {text}"
+        );
+
+        let segv = format_bash_wake_text("t6", "./crash", TaskOutcome::Signaled(11), false, false);
+        assert!(segv.contains("killed by SIGSEGV (signal 11)"), "got: {segv}");
+    }
+
+    /// `bash_kill` leads with the cause so CC can't read the line as a
+    /// completion, and still reports how the child actually died.
+    #[test]
+    fn format_bash_wake_text_killed_leads_with_the_cause() {
+        let text =
+            format_bash_wake_text("t2", "sleep 30", TaskOutcome::Signaled(9), true, false);
+        assert!(
+            text.contains("stopped by bash_kill"),
+            "the kill must be the leading fact: {text}"
+        );
+        assert!(
+            text.contains("SIGKILL"),
+            "and it must still say how the child died: {text}"
+        );
+        assert!(
+            !text.contains("exit code"),
+            "a SIGKILLed child has no exit code: {text}"
         );
     }
 
-    /// Timeout is the second special outcome. Same precedence reason as
-    /// killed — CC needs to know the result wasn't a real completion.
+    /// Timeout is the other engine-caused ending. Same shape: the deadline
+    /// leads, the real status follows.
     #[test]
-    fn format_bash_wake_text_timed_out() {
-        let text = format_bash_wake_text("t3", "sleep 99999", None, false, true);
-        assert!(text.contains("timed out"));
-        assert!(!text.contains("exit code"));
+    fn format_bash_wake_text_timed_out_reports_deadline_and_signal() {
+        let text =
+            format_bash_wake_text("t3", "sleep 99999", TaskOutcome::Signaled(9), false, true);
+        assert!(text.contains("timed out"), "got: {text}");
+        assert!(
+            text.contains("killed by SIGKILL (signal 9)"),
+            "the timeout summary must name the signal the watchdog used: {text}"
+        );
+        assert!(!text.contains("exit code"), "got: {text}");
     }
 
+    /// The invariant the whole change exists for: a status the engine could
+    /// not obtain says so in words. It is never `0`, never `-1`, never any
+    /// digit at all.
     #[test]
-    fn format_bash_wake_text_no_exit_code() {
-        let text = format_bash_wake_text("t4", "true", None, false, false);
-        assert!(text.contains("no exit code"));
+    fn format_bash_wake_text_unknown_status_is_words_not_a_number() {
+        let text = format_bash_wake_text("t4", "true", TaskOutcome::Unknown, false, false);
+        assert!(
+            text.contains("exit code unknown"),
+            "an unavailable status must say so: {text}"
+        );
+        let status_phrase = text
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(inside, _)| inside)
+            .expect("summary carries a parenthesised status");
+        assert!(
+            !status_phrase.chars().any(|c| c.is_ascii_digit()),
+            "unknown must not render any number, got: {status_phrase}"
+        );
     }
 }

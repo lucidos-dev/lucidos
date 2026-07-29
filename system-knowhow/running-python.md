@@ -13,7 +13,7 @@ How the chat agent runs Python in a workspace, and which mistakes are silent con
 |------|------|--------------|
 | `run_python` | Quick scripts: data prep, plotting, file conversion, one-off transforms. Returns stdout synchronously when the script finishes. | 300 s |
 | `run_python_background` | Anything that may run longer than ~30 s — backtests, model training, large data sweeps, batch downloads. Returns a `task_id` immediately; drain with `bash_output(task_id, wait_secs=…)`. | watchdog (default 1 h, max 12 h) |
-| `bash_output(task_id, wait_secs?)` | The drain tool for the two above AND for `run_bash_background`. Pass `wait_secs` to BLOCK server-side until output arrives or the task finishes. | up to 120 s per call |
+| `bash_output(task_id, wait_secs?)` | The drain tool for the two above AND for `run_bash_background`. Pass `wait_secs` to BLOCK server-side for that many seconds, or until the task finishes. | up to 120 s per call |
 | `bash_kill(task_id)` | Cancel a running background task. No-op if already finished. | — |
 
 Decision rule: if you'd reach for `time.sleep` inside `run_python`, you almost certainly want `run_python_background` plus a `bash_output(task_id, wait_secs=N)` instead. The single most common context-waster in chat threads is hand-rolling polling loops.
@@ -41,21 +41,96 @@ RIGHT (one drain call does the wait AND the read):
 run_python_background(code="result = expensive_thing(); print(result)")
 # → task_id = "abc"
 
-# Tool call 2: drain with server-side wait — returns the moment
-# new output arrives OR the task finishes OR 60 s pass.
+# Tool call 2: drain with server-side wait — blocks the full 60 s,
+# or returns early the moment the task finishes.
 bash_output(task_id="abc", wait_secs=60)
-# → { stdout: "...", finished: true, exit_code: 0 }
+# → { stdout: "...", finished: true, exit_code: 0, signal: null,
+#     status: "exit code 0", elapsed_secs: 58, waited_secs: 58 }
 ```
 
 `wait_secs` semantics:
 - Up to 120 s per call (engine clamps higher values silently).
-- Returns immediately if there's already buffered output OR the task is already finished.
-- Returns whatever is buffered on timeout with `finished: false` — the LLM can decide whether to call again.
-- Use 30–60 s for typical long-running scripts; use 0 (or omit) for a quick liveness check between other actions.
+- Blocks for the **full** duration. Only two things end a wait early: the task finishing, and the user sending a message (so their follow-up isn't stuck behind your block — read it, answer it, then drain again).
+- **New output does not wake you.** That is deliberate: anything chatty (a cargo build, `notarytool`, an npm install) emits something every few hundred milliseconds, so waking on the first byte made `wait_secs` a no-op and turned "wait two minutes" into a poll every two seconds.
+- Returns whatever accumulated on timeout with `finished: false` — decide whether to call again.
+- Use the full 120 s for anything long you're following; 30–60 s when you expect it to finish soon; 0 (or omit) for a quick liveness check between other actions.
 
 If `finished: true`, STOP polling. Subsequent calls fall back to the event store and re-return the full final stdout/stderr each time — wasted context.
 
-When the wait is genuinely unbounded — a 30-minute backtest, a sweep that might run all night, a download you can't size up front — and you've already burned a couple of `wait_secs=120` drains with no end in sight, **don't end your turn with "I'll report when it finishes"**. The engine has no way to wake you back up; the user would have to type something to drag you back. Instead, call `ask_user_question` with one option whose label is the user-perspective wake prompt — e.g. `options: ["Show results"]`, `options: ["Stop sweep"]`, `options: ["Drain now"]`. The hint/context goes in the `question` text. This is a *wake question* (see glossary): it parks the thread with a "?" status, and the user taps when they're ready, which feeds the option string back as your next signal and lets you resume.
+### Never estimate elapsed time — read it
+
+Every drain reports two clocks, and they are the only ones you have:
+
+| Field | Meaning |
+|---|---|
+| `elapsed_secs` | How long the task has been running — its total runtime once `finished`. `null` only for a task that finished long enough ago to have been evicted from a pre-timestamp record. |
+| `waited_secs` | How long **this one call** actually blocked. Well short of the `wait_secs` you asked for, with `finished: false`? The user sent a message — that cuts the wait so you can answer it. Nothing is broken. |
+
+Do not infer elapsed time from how long you *asked* to wait, or from how many
+drains you've made. A chat agent doing exactly that narrated "roughly 20 minutes
+in Apple's queue" ninety seconds into a release. Quote `elapsed_secs`, or say
+nothing about timing.
+
+### Oversized windows keep the tail
+
+A drain is capped at 100 KB per stream. When a window exceeds it you get the
+**most recent** bytes, behind a leading
+`[truncated — N earlier bytes dropped, showing the most recent M of T total]`
+marker — the failure at the end of a build log is never what gets dropped.
+
+`N` is the whole gap, not just the part the drain trimmed: a task that emits
+more than ~2 MB on one stream between two drains also outruns the engine's
+buffer, and those bytes are counted too. So a very chatty task drained on a
+long `wait_secs` can genuinely lose middle output — the marker will tell you.
+If you need all of it, have the task `tee` to a file and `read_file` that.
+
+## Deciding whether a background task succeeded
+
+`bash_output` returns three status fields. **Read `status`** — it is the one-line
+human phrase, and it is the same phrase the completion summary uses, so the two
+can never tell you different things.
+
+| Field | Meaning |
+|---|---|
+| `exit_code` | The normal exit status, and **only** that. `null` whenever there wasn't one. |
+| `signal` | The Unix signal that killed the **shell Lucidos spawned**, if one did (a watchdog timeout / `bash_kill` gives `9`). `null` otherwise — including when a signal killed a stage *inside* your pipeline, which arrives as an `exit_code` of `128 + signum`. |
+| `status` | Rendered phrase: `"exit code 101"`, `"killed by SIGKILL (signal 9)"`, `"exit code 141 (probable SIGPIPE)"`, or `"exit code unknown"`. `null` while the task is still running. |
+
+The success test is **`exit_code == 0`**, nothing weaker. Specifically:
+
+- `exit_code: null` is **never** success. It means the child died on a signal
+  (see `signal`) or the engine could not obtain a status at all. Both are
+  failures.
+- A signal death is not an exit code. A task killed by SIGKILL reports
+  `exit_code: null, signal: 9` — never `0`, never `137`, never `-1`.
+- `timed_out: true` (watchdog) and `killed: true` (`bash_kill`) mean the engine
+  ended the task. Both also carry `signal: 9`, since that is how it ended it.
+- While the task runs, all three are `null` / absent. Absence of a status is not
+  a passing status.
+
+**A failing pipeline stage is never masked by a later succeeding one.** The
+engine runs commands under `bash -o pipefail`, so `pytest … | tee run.log`
+reports pytest's status, not `tee`'s `0`. You do NOT need to write the exit code
+into a sidecar file to find out whether a piped command failed — `exit_code` is
+trustworthy on its own.
+
+Know what `pipefail` does and doesn't promise: the status is that of the
+**rightmost failing** stage, and `0` only when every stage succeeded. So
+`sh -c 'exit 42' | sh -c 'exit 7'` reports `7`, not `42`. It reliably tells you
+*that* a pipeline failed; if several stages can fail and you need to know
+*which*, run them as separate commands.
+
+One consequence worth knowing: a producer whose consumer closes the pipe early
+(`yes | head -1`, `long_output | head -20`) is killed by SIGPIPE, and the
+pipeline now reports that instead of `0`. It arrives as
+`exit_code: 141, status: "exit code 141 (probable SIGPIPE)"` — **not** as
+`signal: 13`. `signal` is set only when the shell Lucidos spawned was itself
+killed; a signal that kills a stage *inside* the pipeline comes back as the
+shell's own `128 + signum` exit code. That is a real non-zero status, not an
+engine bug. If you want to ignore it, terminate the pipeline yourself — e.g.
+`{ long_output || true; } | head -20`.
+
+When the wait is genuinely unbounded — a 30-minute backtest, a sweep that might run all night, a download you can't size up front — and several `wait_secs=120` drains have gone by with no end in sight, **don't end your turn with "I'll report when it finishes"**. (Judge "no end in sight" from the `elapsed_secs` the drains report, not from how many calls you've made.) The engine has no way to wake you back up; the user would have to type something to drag you back. Instead, call `ask_user_question` with one option whose label is the user-perspective wake prompt — e.g. `options: ["Show results"]`, `options: ["Stop sweep"]`, `options: ["Drain now"]`. The hint/context goes in the `question` text. This is a *wake question* (see glossary): it parks the thread with a "?" status, and the user taps when they're ready, which feeds the option string back as your next signal and lets you resume.
 
 ## The command guard (dangerous commands are gated)
 

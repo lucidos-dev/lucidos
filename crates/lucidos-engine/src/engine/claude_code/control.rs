@@ -8,7 +8,7 @@ impl LucidosEngine {
             .lock()
             .await
             .get(&thread_id)
-            .is_some_and(|s| !s.process_exited)
+            .is_some_and(|s| s.is_live())
     }
 
     /// Stop a running Claude Code session via the generic stop signal.
@@ -283,7 +283,7 @@ impl LucidosEngine {
     pub async fn cc_categorized_commands(&self, thread_id: Uuid) -> CcCommandsResult {
         let guard = self.agent_sessions.lock().await;
         if let Some(s) = guard.get(&thread_id) {
-            let has_active = !s.process_exited;
+            let has_active = s.is_live();
             let mut info = s.to_commands_info();
             let model = s.current_model.clone();
             let effort = s.current_reasoning_effort.clone();

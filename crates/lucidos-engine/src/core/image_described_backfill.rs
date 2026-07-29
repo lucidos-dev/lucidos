@@ -66,14 +66,29 @@ pub async fn backfill_image_described_from_legacy_payload(
     pool: &PgPool,
     event_bus: &EventBus,
 ) -> Result<usize, sqlx::Error> {
+    backfill_with_batch_size(pool, event_bus, BACKFILL_BATCH_SIZE).await
+}
+
+/// Batch size is a parameter so tests can drive multi-batch walks without
+/// inserting hundreds of rows; production always passes
+/// [`BACKFILL_BATCH_SIZE`] via the public wrapper above.
+async fn backfill_with_batch_size(
+    pool: &PgPool,
+    event_bus: &EventBus,
+    batch_size: i64,
+) -> Result<usize, sqlx::Error> {
     let mut total_inserted = 0usize;
+    // Keyset cursor over the monotonic `events.sequence` column. Skipped rows
+    // (empty description, NULL thread_id, no surviving hashes) never gain an
+    // `ImageDescribed` event, so they match the anti-join forever — a
+    // LIMIT-only walk would either re-fetch them endlessly (infinite startup
+    // loop) or, terminating on a fully-skipped batch, strand every legacy row
+    // behind them. Advancing the cursor past whatever each batch returned
+    // makes forward progress structural: the walk terminates exactly when the
+    // remaining candidate set is empty, and skipped rows can't block later
+    // ones.
+    let mut cursor: i64 = 0;
     loop {
-        let mut sources_processed = 0usize;
-        // Walk forward through the events table by source id so each batch
-        // sees a different set of legacy rows. The per-source idempotency
-        // gate (id-derived primary key) means we never need to track a
-        // batch cursor — we just need to make forward progress.
-        //
         // Anti-join `LEFT JOIN ... WHERE described.id IS NULL` skips any
         // legacy row that already has an `ImageDescribed` event attached
         // (same `source_event_id`), so a partially-completed prior run is
@@ -84,25 +99,28 @@ pub async fn backfill_image_described_from_legacy_payload(
         // never sets a `thread_id` field in the payload, so reading
         // `payload->>'thread_id'` here would always be NULL and the
         // emitted `ImageDescribed` rows would have NULL `aggregate_id`.
-        let batch: Vec<(Uuid, Option<Uuid>, Value)> = sqlx::query_as(
-            "SELECT m.id, m.thread_id, m.payload \
+        let batch: Vec<(Uuid, Option<Uuid>, Value, i64)> = sqlx::query_as(
+            "SELECT m.id, m.thread_id, m.payload, m.sequence \
              FROM events m \
              LEFT JOIN events d \
                ON d.event_type = 'ImageDescribed' \
               AND d.payload->>'source_event_id' = m.id::text \
              WHERE m.event_type = 'MessageReceived' \
                AND m.payload->>'image_description' IS NOT NULL \
+               AND m.sequence > $2 \
                AND d.id IS NULL \
-             ORDER BY m.created ASC \
+             ORDER BY m.sequence ASC \
              LIMIT $1",
         )
-        .bind(BACKFILL_BATCH_SIZE)
+        .bind(batch_size)
+        .bind(cursor)
         .fetch_all(pool)
         .await?;
-        if batch.is_empty() {
+        let Some(last) = batch.last() else {
             break;
-        }
-        for (source_id, thread_id, payload) in batch {
+        };
+        cursor = last.3;
+        for (source_id, thread_id, payload, _sequence) in batch {
             let description = match payload.get("image_description").and_then(|v| v.as_str()) {
                 Some(d) if !d.is_empty() => d.to_string(),
                 _ => continue,
@@ -128,11 +146,12 @@ pub async fn backfill_image_described_from_legacy_payload(
                         .collect()
                 })
                 .unwrap_or_default();
-            sources_processed += 1;
             if hashes.is_empty() {
                 // No surviving hashes (typically a row whose images were
                 // dropped during the base64 → blob migration). Nothing to
-                // attach an ImageDescribed to.
+                // attach an ImageDescribed to; the sequence cursor advances
+                // past the row, so the permanent skip can neither loop the
+                // walk nor strand later rows.
                 crate::log!(
                     "[ImageDescribedBackfill] source={} has image_description but no user_image_hashes — skipping",
                     source_id
@@ -175,13 +194,6 @@ pub async fn backfill_image_described_from_legacy_payload(
                     total_inserted += 1;
                 }
             }
-        }
-        if sources_processed == 0 {
-            // Defensive: empty batch was already handled by the break, but
-            // guard against an infinite loop if every row in the batch
-            // somehow had `image_description` empty (shouldn't happen given
-            // the SQL filter, but cheap insurance).
-            break;
         }
     }
     if total_inserted > 0 {
@@ -368,6 +380,94 @@ mod tests {
         );
         let count = count_image_described(&pool, source).await;
         assert_eq!(count, 1);
+        drop(pool);
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A legacy row WITH a description but NO surviving hashes matches the
+    /// SQL gate on every pass (it never gains an `ImageDescribed`), so the
+    /// walk must advance past it instead of re-fetching it — before the
+    /// sequence cursor this looped forever at startup (fixed 2026-07-07).
+    #[tokio::test]
+    async fn terminates_when_row_has_description_but_no_hashes() {
+        let (pool, db_name) = setup_test_db().await;
+        let source = Uuid::new_v4();
+        let thread = Uuid::new_v4();
+        insert_message_received(
+            &pool,
+            source,
+            thread,
+            json!({
+                "text": "images were dropped in the blob migration",
+                "user_image_hashes": [],
+                "image_description": "A description with nothing to attach to",
+            }),
+        )
+        .await
+        .unwrap();
+
+        let (bus, _cb) = EventBus::new(pool.clone());
+        let inserted = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backfill_image_described_from_legacy_payload(&pool, &bus),
+        )
+        .await
+        .expect("backfill must terminate, not loop on the hash-less row")
+        .unwrap();
+        assert_eq!(inserted, 0);
+        let count = count_image_described(&pool, source).await;
+        assert_eq!(count, 0);
+        drop(pool);
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A permanently-skipped row (hash-less) OLDER than a processable row must
+    /// not strand the later row. Drives `batch_size = 1` so the skip fills its
+    /// own batch — the shape that made the pre-cursor walk terminate on a
+    /// fully-skipped batch and silently leave every later legacy row
+    /// unbackfilled.
+    #[tokio::test]
+    async fn skipped_rows_do_not_strand_later_rows() {
+        let (pool, db_name) = setup_test_db().await;
+        let skipped_source = Uuid::new_v4();
+        let valid_source = Uuid::new_v4();
+        let thread = Uuid::new_v4();
+        insert_message_received(
+            &pool,
+            skipped_source,
+            thread,
+            json!({
+                "text": "images dropped in the blob migration",
+                "user_image_hashes": [],
+                "image_description": "orphaned description",
+            }),
+        )
+        .await
+        .unwrap();
+        insert_message_received(
+            &pool,
+            valid_source,
+            thread,
+            json!({
+                "text": "still has an image",
+                "user_image_hashes": ["kept1"],
+                "image_description": "A kept image",
+            }),
+        )
+        .await
+        .unwrap();
+
+        let (bus, _cb) = EventBus::new(pool.clone());
+        let inserted = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backfill_with_batch_size(&pool, &bus, 1),
+        )
+        .await
+        .expect("walk must terminate, not loop on the skipped batch")
+        .unwrap();
+        assert_eq!(inserted, 1, "the row behind the skip must be backfilled");
+        assert_eq!(count_image_described(&pool, skipped_source).await, 0);
+        assert_eq!(count_image_described(&pool, valid_source).await, 1);
         drop(pool);
         teardown_test_db(&db_name).await;
     }

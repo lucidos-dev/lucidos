@@ -34,6 +34,7 @@ macro_rules! log {
 }
 
 mod boot_phase;
+mod build_id;
 mod control;
 mod error;
 mod net_config;

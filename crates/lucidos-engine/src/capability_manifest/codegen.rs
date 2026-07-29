@@ -84,6 +84,11 @@ fn generate_cli_rs() -> String {
     out.push_str("// Each `cli = true` domain becomes one `clap::Subcommand` enum + one gateway-safe\n");
     out.push_str("// `dispatch_<domain>` that routes through `crate::http` (port/cert/auth handled).\n");
     out.push_str("// Wire each enum into `main.rs`'s `Command` enum + its `run()` match arm.\n");
+    out.push_str("//\n");
+    out.push_str("// Both allowed lints are inherent to the emitter, not fixable in this file:\n");
+    out.push_str("// variant names come verbatim from the manifest's operation names (a domain's\n");
+    out.push_str("// variants therefore share prefixes), and the query vector is emitted as\n");
+    out.push_str("// `Vec::new()` + one `push` per argument because most arguments are optional.\n");
     out.push_str("#![allow(clippy::enum_variant_names, clippy::vec_init_then_push)]\n\n");
     out.push_str("use crate::http::{client, send_and_print};\n");
     out.push_str("use crate::workspace::{BoxError, Workspace};\n\n");

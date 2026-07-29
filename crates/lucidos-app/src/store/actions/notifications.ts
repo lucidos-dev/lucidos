@@ -11,6 +11,7 @@ import {
 } from '../store';
 import { toFailed, setLoadingIfFresh } from '../types';
 import { savePreference } from './preferences';
+import { syncWorkspaceAppBadge } from './app-badge';
 import { revealContentPane } from './pane';
 import { pushNavState, replaceNavState } from './navigation';
 import {
@@ -18,6 +19,7 @@ import {
   getNotification,
   markNotificationRead,
   markAllNotificationsRead,
+  isTransportError,
 } from '../../api/client';
 import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { createFailureCounter } from '../../utils/failureCounter';
@@ -59,18 +61,37 @@ function invalidateUnreadLoad(): void {
 
 /** Drop one notification from the unread set — the badge falls with it. No-op
  *  on the set's contents if it isn't loaded or the row isn't in it (idempotent).
+ *  Returns whether the set was loaded, so the caller knows the local drop was
+ *  authoritative (loaded → the badge already reflects reality) vs. deferred (not
+ *  loaded → the caller must reconcile against the server; see markReadOptimistic).
  *
- *  Invalidates any in-flight load BEFORE the membership check, not after: on the
- *  §4 Row 1 auto-read path the created-reload is still in flight when the row is
- *  marked read, so the row isn't in the set yet. Without superseding that load
- *  here, it would land a beat later and re-add the just-read notification — a
- *  transient badge bump that breaks the §2 Row 1 "no bell badge" contract. */
-function removeFromUnread(id: string): void {
-  const set = unreadNotifications.value;
-  if (set.status !== 'loaded') return;
+ *  Invalidates any in-flight load FIRST — before BOTH the loaded-check and the
+ *  membership check. Two paths need this:
+ *   - §4 Row 1 auto-read: the created-reload is in flight when the row is marked
+ *     read, so the row isn't in the (loaded) set yet.
+ *   - Cold-start push deep-link: the startup `loadUnreadNotifications` is still in
+ *     flight and the set is 'not-loaded' when the deep-linked row is marked read.
+ *  In either case a load that lands a beat later would re-add the just-read
+ *  notification and strand the badge at a phantom count — and if the healing
+ *  NotificationRead SSE is dropped (flaky iOS-PWA link) the phantom sticks. The
+ *  earlier version invalidated AFTER the 'not-loaded' early return, so the
+ *  cold-start case slipped through — that is the reported badge=1 / empty-list
+ *  divergence. Superseding here (the seq bump) makes the stale load a no-op —
+ *  but on the not-loaded path it leaves NO load standing, so markReadOptimistic
+ *  issues a replacement once the read settles (an idempotent read emits no SSE
+ *  to reload from). */
+function removeFromUnread(id: string): boolean {
   invalidateUnreadLoad();
-  if (!set.data.some((n) => n.id === id)) return;
-  unreadNotifications.value = { status: 'loaded', data: set.data.filter((n) => n.id !== id) };
+  const set = unreadNotifications.value;
+  if (set.status === 'loaded' && set.data.some((n) => n.id === id)) {
+    unreadNotifications.value = { status: 'loaded', data: set.data.filter((n) => n.id !== id) };
+  }
+  // Re-assert the app-icon badge even when nothing moved locally. A tap on a
+  // push whose row this device never held (frozen page, dropped SSE) drops
+  // nothing and leaves the count at 0 — but the icon still carries the count
+  // the push wrote, so only an unconditional write reconciles it with the bell.
+  syncWorkspaceAppBadge();
+  return set.status === 'loaded';
 }
 
 /** True when the inbox browse list is loaded AND already holds this row — i.e.
@@ -140,12 +161,28 @@ export async function loadMoreNotifications(): Promise<void> {
   }
 }
 
-/** Switch between "all" and "unread" filter and reload. */
+/** Refresh whichever signal the active notifications tab renders: the bell
+ *  badge's unread set (`unreadNotifications`) for the "Unread" tab, the paginated
+ *  browse list (`notifications`) for "All". Shared by opening the view (menu
+ *  switch) and switching filters so both routes source the tab the same way and
+ *  the Unread tab can never fall back to the separately-fetched browse list.
+ *  Both loaders self-report failures via Loadable failed / showToast; `void` is
+ *  the explicit fire-and-forget marker. */
+export function refreshActiveNotificationsTab(): void {
+  if (notificationsFilter.value === 'unread') {
+    void loadUnreadNotifications();
+  } else {
+    void loadNotifications();
+  }
+}
+
+/** Switch between "all" and "unread" filter and refresh the tab's source. The
+ *  "Unread" tab renders `unreadNotifications` (the bell badge's single source),
+ *  so switching to it refreshes that set in place — badge and list stay one
+ *  array. The "All" tab renders the paginated `notifications` browse list. */
 export function setNotificationsFilter(filter: 'all' | 'unread'): void {
   notificationsFilter.value = filter;
-  // Both loaders self-report failures via Loadable failed / showToast; no
-  // outer catch needed. `void` is the explicit fire-and-forget marker.
-  void loadNotifications();
+  refreshActiveNotificationsTab();
   void savePreference('notifications_filter', filter);
 }
 
@@ -173,27 +210,39 @@ export async function loadUnreadNotifications(): Promise<void> {
     const data = await getNotifications({ limit: UNREAD_LOAD_LIMIT, filter: 'unread' });
     if (isCurrentUnread(seq)) {
       unreadNotifications.value = { status: 'loaded', data: data.notifications || [] };
+      // Server truth just landed — re-assert the app-icon badge from it, even
+      // when the count is unchanged. This is the resume path: a notification
+      // read on another device leaves 0 → 0 here, which notifies no subscriber,
+      // while the icon still shows what the push wrote.
+      syncWorkspaceAppBadge();
     }
     unreadLoadFailures.recordSuccess();
   } catch (e) {
-    // A browser-cancelled fetch (iOS PWA freeze / radio handoff) rejects with
-    // AbortError — there's no manual AbortController here, so it carries no
-    // reachability signal. Don't count it toward the escalation threshold, or a
-    // few background-resume cancellations falsely trip "Unread count is stale —
-    // couldn't reach the engine". A genuine unreachable engine fires
-    // TimeoutError / a transport TypeError, which still counts. The next resume
-    // re-syncs the badge.
-    if (isAbortError(e)) return;
+    // Transient page-lifecycle / reachability noise on an iOS PWA wake over a
+    // flaky link (freeze, radio handoff, Tailscale reconnect) surfaces here as
+    // either a browser-cancelled AbortError or a transport-layer TypeError
+    // (Safari "Load failed") — there's no manual AbortController on this path, so
+    // neither carries a definitive "engine is down" signal. Don't count them
+    // toward the escalation threshold, or a few background-resume blips falsely
+    // trip "Unread count is stale — couldn't reach the engine after 3 tries".
+    // The next resume / notification SSE re-syncs the badge, and a genuine
+    // sustained outage is owned by the debounced connection dot (connection.ts).
+    // A client-side TimeoutError (waited the full 10s window and got nothing) is
+    // the stronger "genuinely stuck" signal that still counts. Mirrors the
+    // AbortError+transport swallow in `refreshChangesState` / `refreshThreadEvents`.
+    if (isAbortError(e) || isTransportError(e)) return;
     unreadLoadFailures.recordFailure();
   }
 }
 
-/** Handle notification SSE events (NotificationCreated/Read/AllRead). Reloads
- *  the unread set so the badge tracks the server, and reloads the inbox browse
- *  list when it's open. Skips the browse reload when a notification detail is
- *  open in the panel — the user is navigating through the list and a reload with
- *  `filter: 'unread'` would remove the currently-viewed item, breaking prev/next
- *  navigation. */
+/** Handle notification SSE events (NotificationCreated/Read/AllRead). Always
+ *  reloads the unread set — the single source the bell badge, the PWA app-icon
+ *  badge, AND the "Unread" tab all project from (`unreadNotifications`) — so all
+ *  three track the server together. Reloads the paginated "All" browse list only
+ *  when it's the visible tab with no detail open: the "Unread" tab needs no
+ *  browse reload (it re-renders the just-refreshed unread set), and a browse
+ *  reload while a detail is open would drop the currently-viewed row and break
+ *  prev/next navigation. */
 export function handleNotificationSSE(): void {
   void loadUnreadNotifications();
   // Under the Tauri desktop app, wake the native dock-badge loop so the badge
@@ -202,7 +251,11 @@ export function handleNotificationSSE(): void {
   // optimistic local drop), and it covers reads from another device (their SSE
   // arrives here too). No-op off Tauri; the recompute reads the fresh aggregate.
   if (isTauri()) nudgeDockBadge();
-  if (activeMenuItem.value === 'notifications' && !viewingNotification.value) {
+  if (
+    activeMenuItem.value === 'notifications' &&
+    !viewingNotification.value &&
+    notificationsFilter.value === 'all'
+  ) {
     void loadNotifications();
   }
 }
@@ -220,11 +273,26 @@ export function resetViewDedup(): void {
 /** Mark a notification read on tap: optimistic local cache update + best-effort
  *  API call. Idempotent — safe to call on already-read rows. Dropping the row
  *  from the unread set makes the badge fall immediately; the server's
- *  NotificationRead broadcast triggers a confirming reload. */
+ *  NotificationRead broadcast triggers a confirming reload.
+ *
+ *  Cold-start reconcile: when the unread set hadn't loaded yet, `removeFromUnread`
+ *  couldn't drop the row locally AND superseded the in-flight startup load — so
+ *  there is no load left to establish the true set. An already-read (idempotent)
+ *  read emits no NotificationRead SSE either, so nothing else would reconcile it,
+ *  leaving the badge wrong (missing genuinely-unread rows) and the Unread tab
+ *  stuck loading. Issue a replacement load once the read has settled server-side
+ *  (after the POST, so it can't re-read the pre-read set). When the set WAS
+ *  loaded the local drop + the NotificationRead SSE already cover it — no extra
+ *  fetch. A failed POST skips the reconcile (engine unreachable); reconnect
+ *  (connection.ts) reloads the unread set then. */
 export function markReadOptimistic(id: string): void {
   markBrowseRowRead(id);
-  removeFromUnread(id);
-  markNotificationRead(id).catch(() => { /* row stays unread; user sees it next visit */ });
+  const setWasLoaded = removeFromUnread(id);
+  markNotificationRead(id)
+    .then(() => {
+      if (!setWasLoaded) void loadUnreadNotifications();
+    })
+    .catch(() => { /* row stays unread; user sees it next visit */ });
 }
 
 export async function viewNotification(id: string): Promise<void> {
@@ -338,11 +406,15 @@ export async function navigateAdjacentNotification(
  *  call site to hang this on. Driven by an effect on `viewingNotification` in
  *  store/effects.ts (mirrors the `lastPreviewFile` reset there). Resets the
  *  view-dedup guard so the same notification can be reopened immediately, and
- *  refreshes the inbox list when it's the active panel so a now-read row drops
- *  under the 'unread' filter (what the former modal's close handler did). */
+ *  refreshes the "All" browse list when it's the active panel so a now-read row
+ *  shows its read state. The "Unread" tab renders `unreadNotifications`, from
+ *  which the read row was already dropped optimistically (removeFromUnread), so
+ *  it needs no reload. */
 export function onNotificationDetailClosed(): void {
   resetViewDedup();
-  if (activeMenuItem.value === 'notifications') void loadNotifications();
+  if (activeMenuItem.value === 'notifications' && notificationsFilter.value === 'all') {
+    void loadNotifications();
+  }
 }
 
 export async function markAllRead(): Promise<void> {
@@ -361,6 +433,9 @@ export async function markAllRead(): Promise<void> {
     // any in-flight load first so a stale reload can't resurrect the count.
     invalidateUnreadLoad();
     unreadNotifications.value = { status: 'loaded', data: [] };
+    // Explicit re-assert: the set may already have been empty here (nothing to
+    // mark read on this device), which moves no count and notifies nobody.
+    syncWorkspaceAppBadge();
   } catch (error) {
     showToast('Failed to mark all as read: ' + errorDetail(error), 'error');
   }

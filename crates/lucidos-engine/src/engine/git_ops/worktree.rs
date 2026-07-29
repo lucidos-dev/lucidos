@@ -140,14 +140,33 @@ pub(crate) fn generate_app_branch_name(app_id: &str) -> String {
     format!("claude-code/app/{}/{}-{}", app_id, ts, suffix)
 }
 
-/// Create a sparse-checkout worktree narrowed to `data/apps/<app_id>/` on a
-/// new branch. The worktree is anchored at `workspace_root` (the workspace
-/// git, not Lucidos source). After this returns successfully, the worktree
-/// has only the app folder plus top-level files (`.gitignore`, marker file)
-/// materialised on disk.
+/// Create a sparse-checkout worktree narrowed to `data/apps/<app_id>/`. The
+/// worktree is anchored at `workspace_root` (the workspace git, not Lucidos
+/// source). After this returns successfully, the worktree has only the app
+/// folder plus top-level files (`.gitignore`, marker file) materialised on
+/// disk.
+///
+/// If `branch_name` already exists it is reused (checked out into the new
+/// worktree, preserving its commits); otherwise it is created off the
+/// default branch. Reuse is keyed purely on ref existence, not resume
+/// intent: callers pass either a freshly generated unique name
+/// (`generate_app_branch_name` — timestamp + random suffix) or a validated
+/// resume branch, so the fresh-branch-at-default-tip guarantee is
+/// caller-supplied naming discipline, and the second probe (the caller's
+/// `resolve_branch_for_resume` already checked once) makes the recreate
+/// paths self-healing. Reuse is what makes resume work: a thread's worktree
+/// dir can be torn down while its branch survives with the session's
+/// committed work — an unconditional `-b` there fails with "branch already
+/// exists" and strands the thread. (The generic spawn path expresses the
+/// same split via `reusing_branch` in `spawn_context.rs`.)
+///
+/// Returns `true` if this call created the branch (`-b`), `false` if it
+/// reused an existing one — feeds the caller's failure-cleanup decision
+/// (only a branch born here may be deleted on a failed spawn) and its log.
 ///
 /// Sequence (cone mode):
-/// 1. `git worktree add --no-checkout <wt_path> -b <branch>` off `main`.
+/// 1. `git worktree add --no-checkout --no-track <wt_path> -b <branch> <base>`
+///    (or `git worktree add --no-checkout <wt_path> <branch>` on reuse).
 /// 2. `git sparse-checkout init --cone`.
 /// 3. `git sparse-checkout set data/apps/<app_id>`.
 /// 4. `git checkout <branch>`.
@@ -159,7 +178,7 @@ pub(crate) async fn create_sparse_app_worktree(
     app_id: &str,
     branch_name: &str,
     wt_path: &Path,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let wt_str = wt_path
         .to_str()
         .ok_or_else(|| format!("non-utf8 worktree path: {}", wt_path.display()))?;
@@ -170,27 +189,40 @@ pub(crate) async fn create_sparse_app_worktree(
         let _ = git_cmd(&["worktree", "remove", "--force", wt_str], workspace_root).await;
     };
 
-    // Step 1: create the worktree on a fresh branch off the workspace
-    // git's default branch, without checking anything out. Without
+    // Step 1: create the worktree without checking anything out. Without
     // --no-checkout, git would materialise every tracked file first and
     // then sparse-checkout would prune — a pointless O(repo) copy before
-    // the prune. Use `default_local_branch` (not a hardcoded `main`) so
-    // workspaces whose default branch is `master` / `trunk` / a custom
-    // name still spawn correctly.
-    let base = default_local_branch(workspace_root).await;
-    let add = worktree_add_pruning_stale(
-        workspace_root,
-        &[
-            "worktree",
-            "add",
-            "--no-checkout",
-            wt_str,
-            "-b",
-            branch_name,
-            &base,
-        ],
-    )
-    .await?;
+    // the prune. An existing branch (resume) is checked out as-is; a fresh
+    // one is created off the workspace git's default branch — via
+    // `default_local_branch` (not a hardcoded `main`) so workspaces whose
+    // default branch is `master` / `trunk` / a custom name still spawn
+    // correctly — with `--no-track` so concurrent spawns can't race on the
+    // shared `.git/config` upstream write (same rationale as `worktree_add`).
+    let branch_exists =
+        git_ref_exists(workspace_root, &format!("refs/heads/{branch_name}")).await;
+    let add = if branch_exists {
+        worktree_add_pruning_stale(
+            workspace_root,
+            &["worktree", "add", "--no-checkout", wt_str, branch_name],
+        )
+        .await?
+    } else {
+        let base = default_local_branch(workspace_root).await;
+        worktree_add_pruning_stale(
+            workspace_root,
+            &[
+                "worktree",
+                "add",
+                "--no-checkout",
+                "--no-track",
+                wt_str,
+                "-b",
+                branch_name,
+                &base,
+            ],
+        )
+        .await?
+    };
     if !add.status.success() {
         let stderr = String::from_utf8_lossy(&add.stderr).trim().to_string();
         cleanup().await;
@@ -220,8 +252,8 @@ pub(crate) async fn create_sparse_app_worktree(
         return Err(format!("git sparse-checkout set failed: {stderr}"));
     }
 
-    // Step 4: now materialise the sparse cone on the new branch. Without
-    // this, the worktree HEAD is set but the working tree is empty.
+    // Step 4: now materialise the sparse cone on the branch. Without this,
+    // the worktree HEAD is set but the working tree is empty.
     let checkout = git_cmd(&["checkout", branch_name], wt_path).await?;
     if !checkout.status.success() {
         let stderr = String::from_utf8_lossy(&checkout.stderr).trim().to_string();
@@ -237,7 +269,7 @@ pub(crate) async fn create_sparse_app_worktree(
         );
     }
 
-    Ok(())
+    Ok(!branch_exists)
 }
 
 /// Add a git worktree, bridging git-crypt's per-worktree key lookup to the

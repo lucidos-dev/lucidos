@@ -7,6 +7,7 @@ import { viewChangeDiff } from '../../store/actions/repositories';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import type { Change } from '../../api/client';
 import { formatTimeAgo } from '../../utils/formatTime';
+import { formatFileCount } from '../../utils/formatFileCount';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
@@ -34,13 +35,34 @@ interface ChangeRowProps {
   onApply: () => void;
 }
 
+export const THREAD_ACTIVE_TIP =
+  'The coding agent is still working on this thread — wait for it to finish';
+
+/** Why Apply is unavailable for this change, or `null` when it can be applied.
+ *
+ *  Both reasons are enforced server-side too (`guard_change_action` 409s, and
+ *  Apply All filters the batch), so this is the UI mirror of one rule rather
+ *  than a second one — the single source both the per-row button and the
+ *  Apply All enablement read, so the button can't offer what the server will
+ *  reject. Discard is deliberately NOT gated on the empty case: discarding is
+ *  how the user resolves a change whose branch commits cancelled out. */
+export function applyBlockedReason(change: Change): string | null {
+  if (change.thread_active) return THREAD_ACTIVE_TIP;
+  if (change.file_count === 0) return 'This change has no file changes left — discard it';
+  return null;
+}
+
 /** Self-skeletonizing pending change row: rendered with no props inside a
  *  SkeletonProvider (`<ChangeRow />`) it draws itself as a loading placeholder
  *  via the Sk* leaves; with real props it renders normally. Props are optional
  *  only to support the skeleton call; real call sites pass them all. */
 function ChangeRow({ change, busy, threadActive, onOpen, onDiff, onDiscard, onApply }: Partial<ChangeRowProps>) {
   const sk = useSkeleton();
-  const activeTip = 'The coding agent is still working on this thread — wait for it to finish';
+  const applyBlocked = change ? applyBlockedReason(change) : null;
+  const applyTip = applyBlocked
+    ?? (change?.requires_restart
+      ? 'Engine restart required for these changes to be applied correctly. You will be prompted to restart'
+      : undefined);
   const clickable = !sk && !!change?.thread_id;
   return (
     <div
@@ -59,7 +81,7 @@ function ChangeRow({ change, busy, threadActive, onOpen, onDiff, onDiscard, onAp
         <SkText class="list-row-details" w="7rem">
           {change && (
             <>
-              {change.file_count} file{change.file_count !== 1 ? 's' : ''}
+              {formatFileCount(change.file_count)}
               {change.requires_restart && ' · Requires engine restart'}
               {!change.hardened && ' · Not hardened'}
             </>
@@ -71,10 +93,10 @@ function ChangeRow({ change, busy, threadActive, onOpen, onDiff, onDiscard, onAp
           <button class="action-btn" onClick={(e) => { e.stopPropagation(); onDiff?.(); }}>Diff</button>
         </SkBlock>
         <SkBlock w="4.25rem" h="2rem" round>
-          <button class="action-btn action-btn-danger" disabled={busy || threadActive} data-tooltip={threadActive ? activeTip : undefined} onClick={(e) => { e.stopPropagation(); onDiscard?.(); }}>Discard</button>
+          <button class="action-btn action-btn-danger" disabled={busy || threadActive} data-tooltip={threadActive ? THREAD_ACTIVE_TIP : undefined} onClick={(e) => { e.stopPropagation(); onDiscard?.(); }}>Discard</button>
         </SkBlock>
         <SkBlock w="3.75rem" h="2rem" round>
-          <button class="action-btn action-btn-confirm" disabled={busy || threadActive} data-tooltip={threadActive ? activeTip : (change?.requires_restart ? 'Engine restart required for these changes to be applied correctly. You will be prompted to restart' : undefined)} onClick={(e) => { e.stopPropagation(); onApply?.(); }}>
+          <button class="action-btn action-btn-confirm" disabled={busy || !!applyBlocked} data-tooltip={applyTip} onClick={(e) => { e.stopPropagation(); onApply?.(); }}>
             {busy ? 'Applying...' : (change?.requires_restart ? 'Apply*' : 'Apply')}
           </button>
         </SkBlock>
@@ -167,7 +189,11 @@ export function ChangesView() {
               {/* Apply/Discard All skip changes whose thread is still working
                   (server-side too); disable the buttons when none are eligible. */}
               <button class="action-btn action-btn-danger" disabled={applyAllInProgress.value || !pending.some(c => !c.thread_active)} onClick={() => void discardAllChanges()}>Discard All</button>
-              <button class="action-btn action-btn-confirm" disabled={applyAllInProgress.value || !pending.some(c => !c.thread_active)} onClick={() => void applyAllChanges()}>
+              {/* Enablement reads the same rule the per-row button and the
+                  server use, so Apply All can never light up for a batch the
+                  server would reject. Discard All keeps every pending change:
+                  discarding is how an empty one is resolved. */}
+              <button class="action-btn action-btn-confirm" disabled={applyAllInProgress.value || !pending.some(c => !applyBlockedReason(c))} onClick={() => void applyAllChanges()}>
                 {applyAllInProgress.value ? 'Applying...' : 'Apply All'}
               </button>
             </div>
@@ -205,7 +231,7 @@ export function ChangesView() {
                     {change.thread_title && <span class="list-row-label">{change.thread_title}</span>}
                     <ChangeDescription description={change.description} />
                     <span class="list-row-details">
-                      {change.file_count} file{change.file_count !== 1 ? 's' : ''}
+                      {formatFileCount(change.file_count)}
                       {change.requires_restart && ' · Requires engine restart'}
                       {change.resolved_at && ` · ${formatTimeAgo(new Date(change.resolved_at))}`}
                     </span>
@@ -222,7 +248,7 @@ export function ChangesView() {
                         }
                       }}>Revert</button>
                     ) : (
-                      <span class="list-row-details" style="font-size: 0.8rem">Reverted</span>
+                      <span class="list-row-details" style="font-size: var(--font-size-md)">Reverted</span>
                     )}
                   </div>
                 </div>

@@ -35,6 +35,32 @@ source "$SCRIPT_DIR/lib/preflight.sh"
 cd "$PROJECT_DIR"
 
 parse_dev_args "$@"
+
+# A coding-agent worktree carries a full scripts/ tree, so PROJECT_DIR above
+# resolves there when this script is invoked from one — pinning the whole stack
+# to a throwaway checkout. Assert here, after arg parsing (the mode decides the
+# scope) but before any build or process work, rather than only at the
+# LUCIDOS_STATIC_DIR choke point deeper in.
+#
+# --engine-build is exempt: it compiles the on-disk binary and `exit 0`s below,
+# before swap_ports and start_gateway, so it starts no long-lived process and
+# exports no LUCIDOS_STATIC_DIR. That is the Apply-triggered background rebuild,
+# and blocking it would break a build-only workflow that cannot pin anything.
+#
+# Otherwise scope by whether the MACHINE-GLOBAL gateway is in play: without
+# LUCIDOS_NO_GATEWAY this script runs start_gateway (and `-b` stops and relaunches
+# the running one from this checkout), so a worktree invocation is refused
+# outright and the opt-out cannot buy it. --engine-only still reaches
+# start_gateway, so it stays guarded. With LUCIDOS_NO_GATEWAY=1 it's a
+# session-scoped direct engine — what the e2e harness uses — so the opt-out applies.
+if [ -z "$ENGINE_BUILD_ONLY" ]; then
+    if [ -n "${LUCIDOS_NO_GATEWAY:-}" ]; then
+        assert_stack_not_worktree_pinned "$PROJECT_DIR" || exit 1
+    else
+        assert_stack_not_worktree_pinned "$PROJECT_DIR" gateway || exit 1
+    fi
+fi
+
 check_prereqs
 resolve_workspace
 allocate_ports "$WORKSPACE"

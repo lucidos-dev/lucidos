@@ -26,6 +26,7 @@ import {
   stagePluginUninstall,
   appUrl,
   postAppCapture,
+  retryTransientRead,
 } from '../../api/client';
 import { pushNavState } from './navigation';
 import { openPluginUninstallRequest } from './plugin-uninstall';
@@ -49,7 +50,10 @@ export function loadApps(): Promise<void> {
 async function loadAppsInner(): Promise<void> {
   setLoadingIfFresh(appsList);
   try {
-    const apps = await listAppsApi();
+    // Retry a transient rejection before flipping to `failed` — same reason as
+    // `loadRepositoriesInner`: a failed apps list is never refetched on its own,
+    // so one cancelled fetch strands every surface that reads it.
+    const apps = await retryTransientRead(() => listAppsApi());
     appsList.value = { status: 'loaded', data: apps };
 
     // Restore previously open app window on reload.

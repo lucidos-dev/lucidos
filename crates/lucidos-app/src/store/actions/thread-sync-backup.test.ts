@@ -53,7 +53,7 @@ vi.mock('./menu', () => ({
   switchMenuItem: vi.fn(),
   openSettingsSubview: vi.fn(),
 }));
-vi.mock('./navigation', () => ({ pushNavState: vi.fn() }));
+vi.mock('./navigation', () => ({ pushNavState: vi.fn(), replaceNavState: vi.fn() }));
 vi.mock('./push', () => ({ initPushSubscription: vi.fn() }));
 vi.mock('./devices', () => ({ getDeviceId: vi.fn(), toggleDevicePush: vi.fn() }));
 vi.mock('../../components/chat/scrollState', () => ({ scrollToBottom: vi.fn() }));

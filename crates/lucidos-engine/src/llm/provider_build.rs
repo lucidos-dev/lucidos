@@ -11,16 +11,18 @@
 use crate::core::{
     AuthType, CredentialStore, PreferenceStore, DEFAULT_LOCAL_BASE_URL, PREF_LOCAL_BASE_URL,
 };
+use crate::llm::web_search::{
+    AnthropicServerToolSearch, OpenAiResponsesSearch, VertexGroundingSearch, WebSearchChain,
+    WebSearchProvider,
+};
 use crate::llm::{
     resolve_bearer_key, resolve_openai_api_key, select_provider, AnthropicAuth, AnthropicProvider,
-    LlmProvider, OpenAiProvider, ProviderSelection, ProviderSelectionInputs, RoutingProvider,
-    UnconfiguredProvider, VertexProvider,
+    LlmProvider, OpenAiKeySource, OpenAiProvider, ProviderSelection, ProviderSelectionInputs,
+    RoutingProvider, UnconfiguredProvider, VertexProvider, OPENAI_DEFAULT_BASE_URL,
+    OPENROUTER_BASE_URL,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
-
-/// OpenRouter's OpenAI-compatible base URL.
-const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
 /// Credential service names that, when created/updated/deleted, change which LLM
 /// provider is installed. Vertex is env/gcloud-based (no credential) and
@@ -61,13 +63,37 @@ pub struct ProviderBuildContext {
 
 /// What [`build_active_provider`] resolved to.
 pub enum ProviderBuildOutcome {
-    /// A provider to install (Mock / Real / Unconfigured). The selection is
-    /// carried for logging.
-    Install(Arc<dyn LlmProvider>, ProviderSelection),
+    /// The providers to install. `selection` is carried for logging.
+    ///
+    /// `web_search` is built and swapped in lockstep with `llm` so adding a
+    /// provider credential in Settings enables search without an engine
+    /// restart — the same hot-swap guarantee the LLM provider already has.
+    Install {
+        llm: Arc<dyn LlmProvider>,
+        web_search: Arc<WebSearchChain>,
+        selection: ProviderSelection,
+    },
     /// No real provider and the boot-without-provider gate is off. Boot panics
     /// with the configuration message; the runtime subscriber keeps the current
     /// provider in place (never panics on a credential delete).
     FailFast,
+}
+
+/// The direct providers resolved from credentials + env, plus the web-search
+/// backends built from the same material.
+///
+/// Search backends are produced *here*, alongside the credentials they need,
+/// rather than reconstructed later from the built providers — those keep their
+/// auth private, and adding getters to hand a key back out would widen the
+/// surface a secret travels across for no benefit.
+struct DirectProviders {
+    openai: Option<OpenAiProvider>,
+    anthropic: Option<AnthropicProvider>,
+    openrouter: Option<OpenAiProvider>,
+    local: Option<OpenAiProvider>,
+    /// Search backends in chain order — Anthropic before OpenAI. Vertex is
+    /// prepended by the caller, which owns the Vertex config.
+    search_backends: Vec<Arc<dyn WebSearchProvider>>,
 }
 
 /// Resolve the direct (OpenAI-wire + Anthropic) providers from credentials +
@@ -75,63 +101,68 @@ pub enum ProviderBuildOutcome {
 /// fallbacks (`OPENAI_API_KEY`, `LUCIDOS_OPENROUTER_API_KEY`,
 /// `LUCIDOS_LOCAL_*`) and the Codex-detected OpenAI key still apply, but stored
 /// credentials and the `local_base_url` preference can't be read (so no direct
-/// Anthropic). Returns `(openai, anthropic, openrouter, local)`; each degrades
-/// to `None` on any read/build error so the engine still comes up on its other
-/// providers.
+/// Anthropic). Every field degrades to `None` / an omitted backend on any
+/// read/build error so the engine still comes up on its other providers.
 async fn resolve_direct_providers(
     pool: Option<&PgPool>,
     default_model: &str,
+    registry: &crate::llm::model_registry::ModelRegistry,
     openai_env_key: Option<String>,
     openai_codex_key: Option<String>,
-) -> (
-    Option<OpenAiProvider>,
-    Option<AnthropicProvider>,
-    Option<OpenAiProvider>,
-    Option<OpenAiProvider>,
-) {
+) -> DirectProviders {
     let Some(pool) = pool else {
         // No DB access, but the env-var + Codex fallbacks must still work.
-        let openai = build_openai_provider(None, openai_env_key, openai_codex_key, default_model);
+        let openai_key = resolve_openai_api_key(None, openai_env_key, openai_codex_key);
+        let openai = build_openai_provider(openai_key.clone(), default_model);
         let openrouter = build_openrouter_provider(
             None,
             std::env::var("LUCIDOS_OPENROUTER_API_KEY").ok(),
             default_model,
         );
         let local = build_local_provider(None, None, default_model);
-        return (openai, None, openrouter, local);
+        return DirectProviders {
+            openai,
+            anthropic: None,
+            openrouter,
+            local,
+            search_backends: openai_search_backend(openai_key, registry, default_model)
+                .into_iter()
+                .collect(),
+        };
     };
 
-    let anthropic = match CredentialStore::get(pool, "anthropic").await {
-        Ok(Some(cred)) => {
-            let auth = match cred.auth_type {
-                AuthType::ApiKey => Some(AnthropicAuth::ApiKey(cred.auth_value)),
-                AuthType::Bearer => Some(AnthropicAuth::OAuthBearer(cred.auth_value)),
-                other => {
-                    crate::log!(
-                        "[Startup] Anthropic credential auth_type {} unsupported (expected api_key or bearer) — direct Anthropic disabled",
-                        other
-                    );
-                    None
-                }
-            };
-            match auth.and_then(|a| {
-                AnthropicProvider::new(a, default_model.to_string())
-                    .map_err(|e| crate::log!("[Startup] Failed to build Anthropic provider: {}", e))
-                    .ok()
-            }) {
-                Some(p) => {
-                    crate::log!("[Startup] Direct Anthropic provider configured");
-                    Some(p)
-                }
-                None => None,
+    // Held past provider construction so the Anthropic search backend can be
+    // built from the same auth (`AnthropicProvider` keeps its copy private).
+    let anthropic_auth = match CredentialStore::get(pool, "anthropic").await {
+        Ok(Some(cred)) => match cred.auth_type {
+            AuthType::ApiKey => Some(AnthropicAuth::ApiKey(cred.auth_value)),
+            AuthType::Bearer => Some(AnthropicAuth::OAuthBearer(cred.auth_value)),
+            other => {
+                crate::log!(
+                    "[Startup] Anthropic credential auth_type {} unsupported (expected api_key or bearer) — direct Anthropic disabled",
+                    other
+                );
+                None
             }
-        }
+        },
         Ok(None) => None,
         Err(e) => {
             crate::log!("[Startup] Failed to read Anthropic credential: {}", e);
             None
         }
     };
+    let anthropic = anthropic_auth.clone().and_then(|a| {
+        match AnthropicProvider::new(a, default_model.to_string()) {
+            Ok(p) => {
+                crate::log!("[Startup] Direct Anthropic provider configured");
+                Some(p)
+            }
+            Err(e) => {
+                crate::log!("[Startup] Failed to build Anthropic provider: {}", e);
+                None
+            }
+        }
+    });
 
     // OpenAI: a stored `openai` credential wins; otherwise the env fallback.
     let openai_credential = match CredentialStore::get(pool, "openai").await {
@@ -142,12 +173,10 @@ async fn resolve_direct_providers(
             None
         }
     };
-    let openai = build_openai_provider(
-        openai_credential,
-        openai_env_key,
-        openai_codex_key,
-        default_model,
-    );
+    // Resolved once and reused: the provider needs it, and so does the OpenAI
+    // search backend.
+    let openai_key = resolve_openai_api_key(openai_credential, openai_env_key, openai_codex_key);
+    let openai = build_openai_provider(openai_key.clone(), default_model);
 
     // OpenRouter: a stored `openrouter` credential wins; otherwise the env fallback.
     let openrouter_credential = match CredentialStore::get(pool, "openrouter").await {
@@ -183,7 +212,85 @@ async fn resolve_direct_providers(
     };
     let local = build_local_provider(local_base_pref, local_key, default_model);
 
-    (openai, anthropic, openrouter, local)
+    // Chain order: Anthropic before OpenAI, because Anthropic's server tool has
+    // no per-call fee while OpenAI's Responses web search bills per call on top
+    // of the tokens the results consume.
+    let mut search_backends: Vec<Arc<dyn WebSearchProvider>> = Vec::new();
+    if let Some(auth) = anthropic_auth {
+        let model = search_model_for(
+            registry,
+            crate::llm::ProviderKind::Anthropic,
+            default_model,
+            ANTHROPIC_FALLBACK_SEARCH_MODEL,
+        );
+        match AnthropicServerToolSearch::new(auth, model) {
+            Ok(b) => search_backends.push(Arc::new(b)),
+            Err(e) => crate::log!("[Startup] Failed to build Anthropic search backend: {}", e),
+        }
+    }
+    search_backends.extend(openai_search_backend(openai_key, registry, default_model));
+
+    DirectProviders {
+        openai,
+        anthropic,
+        openrouter,
+        local,
+        search_backends,
+    }
+}
+
+/// Last-resort search model per provider, used when the configured chat model
+/// belongs to a *different* provider. Small, current, broadly-available ids —
+/// the search call is a short summary over the results, so the cheapest capable
+/// model is the right tier. `gpt-5.5` additionally satisfies OpenAI's
+/// `uses_responses_api` prefix check, which the `web_search` tool requires.
+const ANTHROPIC_FALLBACK_SEARCH_MODEL: &str = "claude-haiku-4-5";
+const OPENAI_FALLBACK_SEARCH_MODEL: &str = "gpt-5.5";
+
+/// A model id valid for `provider`, for the one-shot search call.
+///
+/// Prefers the configured chat model — it is known to work for this user and
+/// keeps search on the tier they picked — **but only when that model actually
+/// routes to `provider`**. The entire point of the chain is that search can run
+/// on a provider the user is *not* chatting with, and in that case the chat
+/// model id is meaningless to the search provider: handing OpenRouter's
+/// `z-ai/glm-5.2` to Anthropic's Messages API is a hard rejection, which would
+/// make the advertised fallback fail every time it was actually needed.
+fn search_model_for(
+    registry: &crate::llm::model_registry::ModelRegistry,
+    provider: crate::llm::ProviderKind,
+    chat_model: &str,
+    fallback: &str,
+) -> String {
+    if crate::llm::model_registry::provider_kind_for(registry, chat_model) == provider {
+        chat_model.to_string()
+    } else {
+        fallback.to_string()
+    }
+}
+
+/// The OpenAI search backend for a resolved key, or `None` when no key is
+/// configured. Shared by the DB-up and DB-down paths so both honor the
+/// `OPENAI_API_KEY` / Codex-CLI fallbacks identically.
+fn openai_search_backend(
+    resolved_key: Option<(String, OpenAiKeySource)>,
+    registry: &crate::llm::model_registry::ModelRegistry,
+    default_model: &str,
+) -> Option<Arc<dyn WebSearchProvider>> {
+    let (key, _source) = resolved_key?;
+    let model = search_model_for(
+        registry,
+        crate::llm::ProviderKind::OpenAi,
+        default_model,
+        OPENAI_FALLBACK_SEARCH_MODEL,
+    );
+    match OpenAiResponsesSearch::new(key, model, OPENAI_DEFAULT_BASE_URL) {
+        Ok(b) => Some(Arc::new(b) as Arc<dyn WebSearchProvider>),
+        Err(e) => {
+            crate::log!("[Startup] Failed to build OpenAI search backend: {}", e);
+            None
+        }
+    }
 }
 
 /// Build the active LLM provider from the current credentials/prefs + env,
@@ -204,10 +311,14 @@ pub async fn build_active_provider(
     ctx: &ProviderBuildContext,
 ) -> Result<ProviderBuildOutcome, Box<dyn std::error::Error + Send + Sync>> {
     if ctx.model_is_mock {
-        return Ok(ProviderBuildOutcome::Install(
-            Arc::new(crate::llm::mock::MockProvider::new(ctx.default_model.clone())),
-            ProviderSelection::Mock,
-        ));
+        return Ok(ProviderBuildOutcome::Install {
+            llm: Arc::new(crate::llm::mock::MockProvider::new(ctx.default_model.clone())),
+            // Mock is the E2E opt-in; there is no credential to search with, so
+            // web_search reports the unconfigured error rather than reaching the
+            // network from a test run.
+            web_search: Arc::new(WebSearchChain::empty()),
+            selection: ProviderSelection::Mock,
+        });
     }
 
     // Vertex (env/gcloud-based, not a credential). Reuse the engine's warm
@@ -234,8 +345,20 @@ pub async fn build_active_provider(
     // (apikey login), the parallel of Vertex reading the gcloud ADC file. Read
     // fresh each build (boot + credential-subscriber hot-swap); never persisted.
     let openai_codex_key = crate::llm::openai::codex_detect::load();
-    let (openai, anthropic, openrouter, local) =
-        resolve_direct_providers(pool, &ctx.default_model, openai_env_key, openai_codex_key).await;
+    let DirectProviders {
+        openai,
+        anthropic,
+        openrouter,
+        local,
+        search_backends,
+    } = resolve_direct_providers(
+        pool,
+        &ctx.default_model,
+        &ctx.model_registry,
+        openai_env_key,
+        openai_codex_key,
+    )
+    .await;
 
     let selection = select_provider(ProviderSelectionInputs {
         model_is_mock: false,
@@ -247,14 +370,58 @@ pub async fn build_active_provider(
         boot_without_provider: ctx.boot_without_provider,
     });
 
-    let provider: Arc<dyn LlmProvider> = match selection {
+    // Vertex leads the chain so an existing Vertex workspace keeps the exact
+    // search behavior it had. Built from the engine's Vertex config rather than
+    // from the `vertex` provider above, which is about to be moved into the
+    // router — and which carries the chat model, not the grounding one.
+    let mut backends: Vec<Arc<dyn WebSearchProvider>> = Vec::new();
+    if !ctx.vertex_project_id.is_empty() {
+        let cache = ctx
+            .vertex_token_cache
+            .clone()
+            .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(None)));
+        match VertexGroundingSearch::new(
+            ctx.vertex_project_id.clone(),
+            ctx.vertex_location.clone(),
+            cache,
+        ) {
+            Ok(b) => backends.push(Arc::new(b)),
+            Err(e) => crate::log!("[Startup] Failed to build Vertex search backend: {}", e),
+        }
+    }
+    backends.extend(search_backends);
+    let web_search = Arc::new(WebSearchChain::new(backends));
+    if web_search.backend_ids().is_empty() {
+        crate::log!(
+            "[Startup] No web search backend configured — web_search will report how to enable it"
+        );
+    } else {
+        // Log the model per backend: the cross-provider case silently picks a
+        // different model than the chat one, and that substitution should be
+        // visible when a search misbehaves.
+        crate::log!(
+            "[Startup] Web search backends: {}",
+            web_search
+                .backend_models()
+                .iter()
+                .map(|(id, model)| match model {
+                    Some(m) => format!("{id} ({m})"),
+                    None => id.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(" → ")
+        );
+    }
+
+    let llm: Arc<dyn LlmProvider> = match selection {
         // Unreachable: `model_is_mock` is false here, and `select_provider` only
         // returns Mock when that input is true. Guarded above regardless.
         ProviderSelection::Mock => {
-            return Ok(ProviderBuildOutcome::Install(
-                Arc::new(crate::llm::mock::MockProvider::new(ctx.default_model.clone())),
-                ProviderSelection::Mock,
-            ));
+            return Ok(ProviderBuildOutcome::Install {
+                llm: Arc::new(crate::llm::mock::MockProvider::new(ctx.default_model.clone())),
+                web_search: Arc::new(WebSearchChain::empty()),
+                selection: ProviderSelection::Mock,
+            });
         }
         ProviderSelection::Real => Arc::new(RoutingProvider::new(
             vertex,
@@ -269,21 +436,25 @@ pub async fn build_active_provider(
         ProviderSelection::FailFast => return Ok(ProviderBuildOutcome::FailFast),
     };
 
-    Ok(ProviderBuildOutcome::Install(provider, selection))
+    Ok(ProviderBuildOutcome::Install {
+        llm,
+        web_search,
+        selection,
+    })
 }
 
-/// Build the direct-OpenAI provider from a resolved key, logging where the key
-/// came from and degrading to `None` (rather than aborting) if the reqwest
-/// client can't be built. Shared by both branches of [`resolve_direct_providers`]
-/// so the DB-up and DB-down paths honor the `OPENAI_API_KEY` and Codex-CLI
-/// fallbacks identically.
+/// Build the direct-OpenAI provider from an already-resolved key, logging where
+/// the key came from and degrading to `None` (rather than aborting) if the
+/// reqwest client can't be built.
+///
+/// Takes the resolved key rather than resolving it, so the caller can hand the
+/// same key to [`openai_search_backend`] — resolving twice would risk the
+/// provider and the search backend disagreeing about which key won.
 fn build_openai_provider(
-    credential: Option<(AuthType, String)>,
-    env_key: Option<String>,
-    codex_key: Option<String>,
+    resolved_key: Option<(String, OpenAiKeySource)>,
     default_model: &str,
 ) -> Option<OpenAiProvider> {
-    match resolve_openai_api_key(credential, env_key, codex_key) {
+    match resolved_key {
         Some((key, source)) => {
             crate::log!("[Startup] OpenAI provider configured (key from {})", source);
             OpenAiProvider::new(key, default_model.to_string())
@@ -400,7 +571,15 @@ mod tests {
 
     fn install(outcome: ProviderBuildOutcome) -> (Arc<dyn LlmProvider>, ProviderSelection) {
         match outcome {
-            ProviderBuildOutcome::Install(p, s) => (p, s),
+            ProviderBuildOutcome::Install { llm, selection, .. } => (llm, selection),
+            ProviderBuildOutcome::FailFast => panic!("expected Install, got FailFast"),
+        }
+    }
+
+    /// The web-search chain from an `Install` outcome.
+    fn installed_search(outcome: ProviderBuildOutcome) -> Arc<WebSearchChain> {
+        match outcome {
+            ProviderBuildOutcome::Install { web_search, .. } => web_search,
             ProviderBuildOutcome::FailFast => panic!("expected Install, got FailFast"),
         }
     }
@@ -545,6 +724,196 @@ mod tests {
                 .contains(&crate::llm::ProviderKind::Vertex),
             "a resolved Vertex project must build + report the vertex backend"
         );
+        teardown_test_db(&db).await;
+    }
+
+    /// Web search resolves over the CONFIGURED PROVIDER SET, not the chat
+    /// model's provider.
+    ///
+    /// This is the fallback that keeps OpenRouter and local-endpoint users from
+    /// dead-ending: neither exposes a web search tool, so a chain derived from
+    /// the chat model would leave them with nothing. Chatting on an OpenRouter
+    /// model while holding an Anthropic credential must still yield a backend.
+    #[tokio::test]
+    async fn search_chain_ignores_the_chat_models_provider() {
+        let (pool, db) = setup_test_db().await;
+        let ctx = ProviderBuildContext {
+            // Routes to OpenRouter, which has no search tool of its own.
+            default_model: "z-ai/glm-5.2".to_string(),
+            ..unconfigured_ctx(true)
+        };
+        crate::core::CredentialStore::upsert(
+            &pool,
+            "anthropic",
+            "https://api.anthropic.com",
+            crate::core::AuthType::ApiKey,
+            "sk-ant-test",
+            None,
+            None,
+        )
+        .await
+        .expect("upsert anthropic credential");
+
+        let chain = installed_search(build_active_provider(Some(&pool), &ctx).await.unwrap());
+        assert!(
+            chain.backend_ids().contains(&"anthropic-server-tool"),
+            "an Anthropic credential must supply search even when chat routes elsewhere: {:?}",
+            chain.backend_ids()
+        );
+        // Presence is not enough — the backend must also be given a model
+        // Anthropic can actually serve. Handing it the OpenRouter chat model id
+        // would make every cross-provider fallback fail at the API, i.e. exactly
+        // when the fallback matters.
+        let model = chain
+            .backend_models()
+            .into_iter()
+            .find(|(id, _)| *id == "anthropic-server-tool")
+            .and_then(|(_, model)| model.map(str::to_string))
+            .expect("the Anthropic backend reports its model");
+        assert_ne!(
+            model, "z-ai/glm-5.2",
+            "the OpenRouter chat model must not be sent to Anthropic"
+        );
+        assert!(
+            model.starts_with("claude-"),
+            "the Anthropic backend needs an Anthropic model, got {model:?}"
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// The chat model IS reused when it belongs to the provider — that keeps
+    /// search on the tier the user chose in the ordinary single-provider case,
+    /// and is why this isn't just a hardcoded model everywhere.
+    #[test]
+    fn search_model_prefers_the_chat_model_when_it_matches_the_provider() {
+        let registry = crate::llm::model_registry::empty();
+        // `provider_kind_for` falls back to a prefix heuristic for ids with no
+        // registry row: `claude-*` → Vertex, `gpt-*` → OpenAI.
+        assert_eq!(
+            search_model_for(
+                &registry,
+                crate::llm::ProviderKind::OpenAi,
+                "gpt-5.6-sol",
+                OPENAI_FALLBACK_SEARCH_MODEL
+            ),
+            "gpt-5.6-sol"
+        );
+    }
+
+    /// …and is replaced when it does not. Regression for the cross-provider bug:
+    /// every backend was handed the global chat model, so an OpenRouter or
+    /// Vertex chat model was sent to Anthropic / OpenAI and rejected.
+    #[test]
+    fn search_model_falls_back_when_the_chat_model_is_another_providers() {
+        let registry = crate::llm::model_registry::empty();
+        for (provider, chat_model, expected) in [
+            (
+                crate::llm::ProviderKind::Anthropic,
+                "z-ai/glm-5.2",
+                ANTHROPIC_FALLBACK_SEARCH_MODEL,
+            ),
+            (
+                crate::llm::ProviderKind::OpenAi,
+                "claude-opus-5",
+                OPENAI_FALLBACK_SEARCH_MODEL,
+            ),
+        ] {
+            let fallback = if provider == crate::llm::ProviderKind::Anthropic {
+                ANTHROPIC_FALLBACK_SEARCH_MODEL
+            } else {
+                OPENAI_FALLBACK_SEARCH_MODEL
+            };
+            assert_eq!(
+                search_model_for(&registry, provider, chat_model, fallback),
+                expected,
+                "{chat_model} must not be sent to {provider:?}"
+            );
+        }
+    }
+
+    /// The OpenAI fallback must satisfy `uses_responses_api`, because the
+    /// `web_search` tool only exists on the Responses API — a Chat-Completions
+    /// id would make the backend dead on arrival.
+    #[test]
+    fn openai_fallback_search_model_routes_to_the_responses_api() {
+        assert!(
+            OPENAI_FALLBACK_SEARCH_MODEL.starts_with("gpt-5")
+                || OPENAI_FALLBACK_SEARCH_MODEL.contains("codex"),
+            "{OPENAI_FALLBACK_SEARCH_MODEL} must route to the Responses API"
+        );
+    }
+
+    /// Vertex leads the chain whenever it is configured, so an existing Vertex
+    /// workspace keeps the exact search behavior it had before the chain
+    /// existed. Asserts position, not set membership — ambient env may add an
+    /// OpenAI backend on a developer machine.
+    #[tokio::test]
+    async fn vertex_leads_the_chain_when_configured() {
+        let (pool, db) = setup_test_db().await;
+        let ctx = ProviderBuildContext {
+            vertex_project_id: "my-gcp-project".to_string(),
+            vertex_token_cache: Some(std::sync::Arc::new(std::sync::Mutex::new(None))),
+            ..unconfigured_ctx(true)
+        };
+        crate::core::CredentialStore::upsert(
+            &pool,
+            "anthropic",
+            "https://api.anthropic.com",
+            crate::core::AuthType::ApiKey,
+            "sk-ant-test",
+            None,
+            None,
+        )
+        .await
+        .expect("upsert anthropic credential");
+
+        let chain = installed_search(build_active_provider(Some(&pool), &ctx).await.unwrap());
+        let ids = chain.backend_ids();
+        assert_eq!(
+            ids.first(),
+            Some(&"vertex-grounding"),
+            "Vertex must lead the chain: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"anthropic-server-tool"),
+            "Anthropic must still be present as the fallback: {ids:?}"
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// No search-capable provider → an empty chain that reports how to enable
+    /// search, rather than a silently broken tool. `local` is deliberate: it is
+    /// a configured LLM provider that offers no search tool, so it proves the
+    /// chain tracks search capability rather than mere provider presence.
+    #[tokio::test]
+    async fn local_only_workspace_gets_an_empty_chain() {
+        if ambient_provider_env() {
+            // A developer machine with OPENAI_API_KEY / a Codex login would add
+            // a real backend and make this assertion meaningless.
+            return;
+        }
+        let (pool, db) = setup_test_db().await;
+        let ctx = unconfigured_ctx(true);
+        crate::core::CredentialStore::upsert(
+            &pool,
+            "local",
+            DEFAULT_LOCAL_BASE_URL,
+            crate::core::AuthType::ApiKey,
+            "local-key",
+            None,
+            None,
+        )
+        .await
+        .expect("upsert local credential");
+
+        let chain = installed_search(build_active_provider(Some(&pool), &ctx).await.unwrap());
+        assert!(
+            chain.backend_ids().is_empty(),
+            "a local-only workspace has no search-capable provider: {:?}",
+            chain.backend_ids()
+        );
+        let msg = chain.search("q", 5).await.unwrap_err().to_string();
+        assert!(msg.contains("Settings → Models → Providers"), "{msg}");
         teardown_test_db(&db).await;
     }
 }

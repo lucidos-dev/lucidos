@@ -222,7 +222,6 @@ function RepoFolderTree({ changedMap }: { changedMap: Map<string, DiffFile> }) {
     <div class="folder-tree">
       <TreeNode
         node={tree}
-        indent={0}
         isExpanded={(path) => repoExpandedFolders.value.has(path)}
         onToggle={toggleRepoFolder}
         onFileClick={(path) => openRepoFilePreview(path, changedMap.has(path) ? 'diff' : 'file')}

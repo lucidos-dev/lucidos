@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -24,48 +24,19 @@ use crate::engine::{InjectedPrompt, ThreadHandle};
 
 fn make_thread_handle() -> ThreadHandle {
     let (injection_tx, _injection_rx) = mpsc::unbounded_channel::<InjectedPrompt>();
-    ThreadHandle {
-        token: CancellationToken::new(),
-        injection_tx,
-        generation: 0,
-        cancel_actor: Arc::new(std::sync::Mutex::new(None)),
-    }
+    ThreadHandle::new(CancellationToken::new(), injection_tx, 0)
 }
 
-fn make_test_session(process_exited: bool) -> AgentSession {
-    let (msg_tx, _msg_rx) = mpsc::unbounded_channel::<AgentUserInput>();
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    AgentSession {
-        msg_tx,
-        is_waiting: !process_exited,
-        has_changes: false,
-        requires_restart: false,
-        pending_stop: None,
-        cancel_actor: None,
-        redirect_followup: false,
-        stop: Arc::new(Notify::new()),
-        interrupt: Arc::new(Notify::new()),
-        idle_notify: Arc::new(Notify::new()),
-        apply_now_in_progress: false,
-        process_exited,
-        worktree_path: None,
-        branch_name: None,
-        repo_root: None,
-        cc_session_id: None,
-        shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        external_terminal_emitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        control_tx,
-        builtin_commands: vec![],
-        skill_commands: vec![],
-        current_model: None,
-        current_reasoning_effort: None,
-        last_event_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        pending_followups: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        question_resume_pending: false,
-        tools_in_flight: Arc::new(std::sync::atomic::AtomicI32::new(0)),
-        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
-        agent_cancel: tokio_util::sync::CancellationToken::new(),
-    }
+/// Returns the receiver alongside the session: hold it (`let (s, _rx) = …`) for
+/// the test's lifetime, or the session reads as a phantom and the race-bridge
+/// correctly refuses to treat it as live. See `AgentSession::is_live`.
+fn make_test_session(
+    process_exited: bool,
+) -> (AgentSession, mpsc::UnboundedReceiver<AgentUserInput>) {
+    let (mut session, msg_rx) = AgentSession::for_test();
+    session.is_waiting = !process_exited;
+    session.process_exited = process_exited;
+    (session, msg_rx)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -81,14 +52,18 @@ async fn returns_true_when_session_populates_within_deadline() {
         .unwrap()
         .insert(thread_id, make_thread_handle());
 
-    // Simulate CC registration after 100ms — well under the 2s deadline.
+    // Simulate CC registration after 100ms — well under the 2s deadline. The
+    // receiver stays in the test body (not the spawned task) so the session is
+    // live once registered; a dropped receiver would make it a phantom, which
+    // the bridge correctly skips.
+    let (session, _msg_rx) = make_test_session(false);
     let agent_sessions_clone = agent_sessions.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
         agent_sessions_clone
             .lock()
             .await
-            .insert(thread_id, make_test_session(false));
+            .insert(thread_id, session);
     });
 
     let started = std::time::Instant::now();
@@ -195,10 +170,8 @@ async fn returns_false_when_existing_session_is_process_exited() {
         .lock()
         .unwrap()
         .insert(thread_id, make_thread_handle());
-    agent_sessions
-        .lock()
-        .await
-        .insert(thread_id, make_test_session(true));
+    let (session, _msg_rx) = make_test_session(true);
+    agent_sessions.lock().await.insert(thread_id, session);
 
     let result = wait_for_cc_session_alive(
         &agent_sessions,
@@ -221,10 +194,8 @@ async fn returns_true_immediately_when_session_already_alive() {
     let active_threads = Arc::new(std::sync::Mutex::new(HashMap::<Uuid, ThreadHandle>::new()));
     let thread_id = Uuid::new_v4();
 
-    agent_sessions
-        .lock()
-        .await
-        .insert(thread_id, make_test_session(false));
+    let (session, _msg_rx) = make_test_session(false);
+    agent_sessions.lock().await.insert(thread_id, session);
 
     let started = std::time::Instant::now();
     let result = wait_for_cc_session_alive(
@@ -295,20 +266,20 @@ use super::arm_codex_redirect;
 /// A live Codex session mid-turn: alive (`process_exited=false`), not at a turn
 /// boundary (`is_waiting=false`), with `pending_followups=1` as a normal turn
 /// has after session creation (the initial turn pre-counts its own Result).
-fn codex_in_flight_session() -> AgentSession {
-    let mut s = make_test_session(false);
+fn codex_in_flight_session() -> (AgentSession, mpsc::UnboundedReceiver<AgentUserInput>) {
+    let (mut s, msg_rx) = make_test_session(false);
     s.is_waiting = false; // turn in flight
     s.coding_agent = CodingAgent::Codex;
     s.pending_followups
         .store(1, std::sync::atomic::Ordering::Release);
-    s
+    (s, msg_rx)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn arm_redirect_fires_for_codex_mid_turn_user_followup() {
     let thread_id = Uuid::new_v4();
     let mut sessions = HashMap::new();
-    let session = codex_in_flight_session();
+    let (session, _msg_rx) = codex_in_flight_session();
     let interrupt = session.interrupt.clone();
     let pending = session.pending_followups.clone();
     sessions.insert(thread_id, session);
@@ -347,7 +318,7 @@ fn arm_redirect_keeps_warmup_turn_alive() {
     // warm-up turn's idle keeps the subprocess alive.
     let thread_id = Uuid::new_v4();
     let mut sessions = HashMap::new();
-    let session = codex_in_flight_session();
+    let (session, _msg_rx) = codex_in_flight_session();
     session
         .pending_followups
         .store(0, std::sync::atomic::Ordering::Release);
@@ -366,7 +337,7 @@ fn arm_redirect_keeps_warmup_turn_alive() {
 async fn arm_redirect_skips_claude_code_mid_turn() {
     let thread_id = Uuid::new_v4();
     let mut sessions = HashMap::new();
-    let mut session = make_test_session(false);
+    let (mut session, _msg_rx) = make_test_session(false);
     session.is_waiting = false; // CC turn in flight
     debug_assert_eq!(session.coding_agent, CodingAgent::ClaudeCode);
     let interrupt = session.interrupt.clone();
@@ -393,7 +364,7 @@ async fn arm_redirect_skips_claude_code_mid_turn() {
 fn arm_redirect_skips_idle_codex() {
     let thread_id = Uuid::new_v4();
     let mut sessions = HashMap::new();
-    let mut session = make_test_session(false); // is_waiting=true → idle, not in flight
+    let (mut session, _msg_rx) = make_test_session(false); // is_waiting=true → idle, not in flight
     session.coding_agent = CodingAgent::Codex;
     let pending = session.pending_followups.clone();
     sessions.insert(thread_id, session);
@@ -407,7 +378,8 @@ fn arm_redirect_skips_idle_codex() {
 fn arm_redirect_skips_child_wake() {
     let thread_id = Uuid::new_v4();
     let mut sessions = HashMap::new();
-    sessions.insert(thread_id, codex_in_flight_session());
+    let (session, _msg_rx) = codex_in_flight_session();
+    sessions.insert(thread_id, session);
 
     // is_user_message=false (child-wake) must never interrupt a live turn.
     assert!(arm_codex_redirect(&mut sessions, thread_id, false, &None).is_none());

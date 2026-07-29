@@ -135,6 +135,7 @@ export type AbortCause =
   | 'recovery_after_restart'
   | 'process_killed'
   | 'stale_settle'
+  | 'session_dropped'
   | 'unknown';
 
 /** Summary text for a `ResponseAborted` event. `stale_settle` (engine cleanup
@@ -332,8 +333,13 @@ export type ThreadEvent =
   // Background task lifecycle (run_bash_background / run_python_background). The
   // durable audit trail behind the bash_output / bash_kill tools; `command` is
   // the exact shell invocation. Started is paired with a later Completed.
+  // On Completed, `exit_code` and `signal` are mutually exclusive: exit_code is
+  // set only for a normal exit, signal only for a signal death (9 SIGKILL — also
+  // the watchdog timeout and bash_kill — 11 SIGSEGV, 13 SIGPIPE). Both null means
+  // the engine could not obtain a status; that is a failure, never a success.
+  // `signal` is absent on rows written before the field existed.
   | { type: 'BackgroundBashStarted'; task_id: string; command: string; timeout_secs: number; started_at: string }
-  | { type: 'BackgroundBashCompleted'; task_id: string; command: string; exit_code: number | null; stdout: string; stderr: string; started_at: string; finished_at: string; timed_out?: boolean; killed?: boolean }
+  | { type: 'BackgroundBashCompleted'; task_id: string; command: string; exit_code: number | null; signal?: number | null; stdout: string; stderr: string; started_at: string; finished_at: string; timed_out?: boolean; killed?: boolean }
   // Background Flash enrichment of a prior MessageReceived's attached images
   // (one event per attached hash, all carrying the same description text).
   // Replaces the deprecated `image_description` field on MessageReceived; new

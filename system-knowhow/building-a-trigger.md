@@ -25,8 +25,9 @@ How to guide a user from "I want this to happen automatically" to a working trig
 | "Notify me when my package ships" | Trigger (`on`), with a separate event-emitting source |
 | "When either X or Y happens, do Z" | One trigger with multiple entries in `on` — not two parallel triggers |
 | "Check this once and tell me" | Just do it now, no trigger |
+| "Remind me at 5pm today" | One-shot trigger (cron for today) — see "One-shot triggers" below |
 
-If the user only wants it to happen once, don't create a trigger.
+If the user only wants it to happen **once, right now** — a check, a lookup, a computation — just do it inline; no trigger. But if the one-off is anchored to a **future time** ("remind me at 5pm", "ping me in 20 minutes"), it is NOT an inline task: you are not running at 5pm and nothing auto-resumes you, so an inline "reminder" is silently dropped. A future-time one-off needs a **one-shot trigger** (ideally self-deleting) — see "One-shot triggers" below.
 
 ## The most important rule: `run.intent` is intent, not procedure
 
@@ -96,6 +97,8 @@ Three independent fields control the notification:
 - **`app_id`** — *which* app the notification is about. Drives the inbox modal's "Open <app>" button. Set it whenever the notification relates to a specific app (so the user can navigate from the modal to the relevant app), even when the tap routing is `{ kind: 'modal' }`.
 - **`tap`** — *what happens on tap*. Discriminated union: `{ kind: 'modal' }` (default — opens the inbox detail showing the body; use it for informational pushes too, every notification is openable) or `{ kind: 'navigate', to: NavigateUi }` (delegates to the same router `navigate_ui` uses; `to` is its arg shape). Both mark the source notification read on tap. (The passive `{ kind: 'none' }` kind was retired — `docs/plans/2026-07-02-remove-notification-tap-none.md`.)
 - **`event_id`** — *which specific event inside the linked thread* raised the notification. Optional UUID. Used by the §4 in-app matrix to silently mark-read when the user is already looking at the source event. Distinct from `tap.to.event_id` (which is the scroll-and-pulse target when the tap navigates to a thread — typically the same value).
+
+Write the **`message` as content only — never restate the `title` in it.** Every surface renders the title in its own right (the in-app toast promotes it to the heading, the inbox detail to its `<h2>`, the OS push to the banner title), so a body that opens by repeating the title shows it twice. Use a bare sentence for a single item and `"• "`-prefixed lines for a list; the toast renderer picks those up as bullets under the title. See `system-knowhow/notifications.md` §4.
 
 | Trigger says | `app_id` | `tap` | `event_id` |
 |---|---|---|---|
@@ -287,7 +290,7 @@ If you genuinely need a different trigger (different *workflow*, not a tweak of 
 
 Don't call `create_trigger` from the user's first message. Most "create a trigger for X" requests leave at least one of these unsettled — confirm before writing the trigger. Skip questions only when the user has already answered them in the same turn.
 
-1. **Recurring or one-shot?** "Notify me at 5pm today" is a one-shot — handle inline, don't create a trigger. Triggers are for things that should keep happening. If the user explicitly wants a one-shot trigger anyway (e.g. "create a test trigger that fires once in 2 min"), ask whether it should delete itself after firing — it won't on its own. Create it with `go_to_review` omitted (so the fire-thread lands in Archive, not the Current section) unless the user explicitly wants to read the run afterwards. See "One-shot triggers" below for the procedure.
+1. **Recurring or one-shot — and if one-shot, now or at a future time?** Triggers are for things that should keep happening, so a recurring need is always a trigger. A one-off splits by *when*: if it's "do this **now**" ("check X and tell me"), handle it inline — no trigger. If it's anchored to a **future time** ("remind me at 5pm today", "ping me in 20 minutes"), it CANNOT be handled inline — you are not running then and nothing auto-resumes you, so an inline reminder is silently dropped — so it needs a **one-shot trigger** (cron for that time, ideally self-deleting). Whenever you create a one-shot (a future reminder, or an explicit test like "fire once in 2 min"), ask whether it should delete itself after firing — it won't on its own. Create it with `go_to_review` omitted (so the fire-thread lands in Archive, not the Current section) unless the user explicitly wants to read the run afterwards. See "One-shot triggers" below for the procedure.
 2. **Cron or `on`?** "Every morning at 8" is cron. "When my package ships" is an event subscription. If the user names several events the same workflow should react to ("when X *or* Y happens"), they belong in one trigger with multiple `on` entries — not parallel triggers. If the event doesn't exist yet, name the work (emit the event from somewhere, then trigger on it) and confirm.
 3. **What's the run.intent in the user's voice?** One sentence the user would actually say. If you're tempted to write the procedure here, stop and put it in knowhow instead.
 4. **Should it notify, and on what?** Default is silent — `send_notification` only fires when there's something the user wants to hear about. Confirm whether a successful run should notify, and what the message should look like.
@@ -298,7 +301,7 @@ Don't ask all six in one wall — pick the ones the user's request actually leav
 
 ## One-shot triggers
 
-Most one-shot requests ("remind me at 5pm today") should be handled inline without a trigger at all. Create a one-shot trigger only when the user explicitly asks for one (testing, demo, deliberate scheduling).
+A one-off that just means "do this **now**" ("check X and tell me") should be handled inline — no trigger at all. But a one-off anchored to a **future time** ("remind me at 5pm today", "ping me in 20 minutes") is a real one-shot trigger: inline is impossible because you are not running at that time and nothing auto-resumes you, so an inline "reminder" is silently dropped. Create a one-shot trigger for any future-time one-off, and whenever the user explicitly asks for one (testing, demo, deliberate scheduling). A one-shot is just a normal trigger with a cron expression that matches a single upcoming moment; because it doesn't self-clean (below), the self-deleting variant is usually what you want.
 
 **Leave `go_to_review` at its default (false / omitted)** so the single fire-thread goes straight to Archive instead of surfacing in the Current section. A one-shot reminder/test trigger's job is done the moment it fires — its thread isn't something the user needs to read afterward. This holds **even when the trigger sends a `send_notification` and/or deletes itself**: the notification is the user-facing output, and self-deletion is still the right outcome, but the thread itself stays in Archive. Only set `go_to_review: true` if the user explicitly wants to read the run afterwards.
 

@@ -3,6 +3,7 @@ import { chatModels } from '../../store/store';
 import { Dropdown } from '../shared/Dropdown';
 import { LoadableError } from '../shared/LoadableError';
 import { setModelEnabled, deleteModel, submitNewModel, isProviderConfigured } from '../../store/actions/models';
+import { formatContextWindow } from '../../utils/formatTokens';
 
 const PROVIDERS = [
   { value: 'anthropic', label: 'Anthropic (direct)' },
@@ -22,13 +23,15 @@ export function ModelsManager() {
   const [id, setId] = useState('');
   const [label, setLabel] = useState('');
   const [provider, setProvider] = useState('anthropic');
+  const [contextWindow, setContextWindow] = useState('');
 
   async function add() {
-    const ok = await submitNewModel(id, label, provider);
+    const ok = await submitNewModel(id, label, provider, contextWindow);
     if (ok) {
       setId('');
       setLabel('');
       setProvider('anthropic');
+      setContextWindow('');
       setAdding(false);
     }
   }
@@ -55,7 +58,9 @@ export function ModelsManager() {
               </label>
               <div class="model-manager-info">
                 <div class="model-manager-name">{m.label}</div>
-                <div class="model-manager-id">{m.id}</div>
+                <div class="model-manager-id">
+                  {m.id} · {formatContextWindow(m.context_window)}
+                </div>
               </div>
               <span class="model-provider-badge">{m.provider}</span>
               {!isProviderConfigured(m.provider) && (
@@ -98,6 +103,26 @@ export function ModelsManager() {
               <div class="settings-row">
                 <span class="settings-row-label">Provider</span>
                 <Dropdown options={PROVIDERS} value={provider} onChange={setProvider} />
+              </div>
+              <div class="settings-row">
+                <span class="settings-row-label">Context window</span>
+                <input
+                  class="settings-text-input"
+                  inputMode="numeric"
+                  placeholder="1048576 — leave blank to infer from the id"
+                  value={contextWindow}
+                  onInput={(e) =>
+                    setContextWindow((e.currentTarget as HTMLInputElement).value)
+                  }
+                />
+              </div>
+              <div class="settings-row">
+                <span class="settings-row-label" />
+                <span class="list-row-details">
+                  Tokens. Left blank, the engine guesses from the model id — and it
+                  has no rule for OpenRouter, Gemini, or local models, so they are
+                  treated as 200k however large they really are.
+                </span>
               </div>
               <div class="settings-row">
                 <span class="settings-row-label" />

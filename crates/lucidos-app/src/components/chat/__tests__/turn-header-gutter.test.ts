@@ -39,6 +39,20 @@ describe('turn header gutter', () => {
     expect(declarationValue(turnCollapsed, 'padding-left')).toBe('var(--turn-body-inset)');
   });
 
+  // The panels carry the RIGHT inset in the BASE layout (mirroring the content's
+  // left inset above), so a turn sits symmetrically inside the pane. This is
+  // load-bearing for the nav focus marker: it lets both marker rules below keep
+  // their horizontal sides at 0/base — no rightward box growth — so the marker's
+  // border gets equal breathing room from both pane edges instead of sitting
+  // flush against the right one ("border is all the way to the right").
+  it('gives the panels a base right inset matching the content left inset', () => {
+    const base = inputCss.match(/\.initiator-panel\s*,\s*\.response-panel\s*\{([^}]*)\}/)?.[1] ?? '';
+    expect(base).not.toBe('');
+    expect(declarationValue(base, 'padding')).toBe(
+      'var(--turn-feed-pad-y) var(--turn-body-inset) var(--turn-feed-pad-y) 0',
+    );
+  });
+
   // The action footer (Diff/Revert on a change card) is the panel's LAST child, so
   // any padding-bottom here stacks on the panel's own bottom padding and shows up as
   // an oversized BOTTOM gap under the nav focus marker — while the panel rule below
@@ -55,13 +69,13 @@ describe('turn header gutter', () => {
   });
 
   // The nav focus marker outline hugs the panel box with a fixed outline-offset,
-  // so the gap it shows on each side equals that side's padding — and a turn's
-  // padding is not uniform (content inset var(--turn-body-inset) on the LEFT but
-  // flush RIGHT; the far larger feed padding var(--turn-feed-pad-y) TOP/BOTTOM).
-  // The rule normalizes every side to var(--turn-body-inset) and must target the
-  // CURRENT marker class (.nav-focus-stuck) on BOTH deep-link hosts (an event /
-  // resolution card lands on .initiator-panel, a change proposing-turn on
-  // .response-panel). A rename that leaves this rule on the old class names
+  // so the gap it shows on each side equals that side's padding. The horizontal
+  // sides are symmetric in the base layout (left inset on the content, right
+  // inset on the panel — pinned above), so the marker rule only normalizes the
+  // far larger feed padding var(--turn-feed-pad-y) TOP/BOTTOM. It must target
+  // the CURRENT marker class (.nav-focus-stuck) on BOTH deep-link hosts (an
+  // event / resolution card lands on .initiator-panel, a change proposing-turn
+  // on .response-panel). A rename that leaves this rule on the old class names
   // silently drops it and the padding regresses (which is exactly what happened
   // when the unified focus marker landed).
   it('gives the focus-marked panels a uniform gap on all four sides', () => {
@@ -69,13 +83,17 @@ describe('turn header gutter', () => {
       /\.initiator-panel\.nav-focus-stuck\s*,\s*\.response-panel\.nav-focus-stuck\s*\{([^}]*)\}/;
     const block = responseCss.match(re)?.[1] ?? '';
     expect(block).not.toBe('');
-    // LEFT inset already comes from the body's padding-left; the panel re-adds the
-    // same inset on TOP/RIGHT/BOTTOM (shorthand T R B L = inset inset inset 0).
+    // LEFT inset comes from the body's padding-left, RIGHT from the base panel
+    // padding; the shorthand restates them (T R B L = inset inset inset 0).
     expect(declarationValue(block, 'padding')).toBe(
       'var(--turn-body-inset) var(--turn-body-inset) var(--turn-body-inset) 0',
     );
-    // RIGHT growth is cancelled for layout so sibling turns / width don't reflow.
-    expect(declarationValue(block, 'margin-right')).toBe('calc(-1 * var(--turn-body-inset))');
+    // NO rightward box growth: a negative margin-right here pushes the marker's
+    // border into the .thread-content gutter until it sits flush against the
+    // pane's right edge while the left keeps its breathing room — the "border
+    // is all the way to the right" report. The base right inset (pinned above)
+    // makes the growth unnecessary.
+    expect(declarationValue(block, 'margin-right')).toBeUndefined();
     // The shrunk feed padding is handed back as vertical margin, so top/bottom
     // match left/right without moving the turn's content or its neighbours.
     expect(declarationValue(block, 'margin-top')).toBe(
@@ -102,13 +120,13 @@ describe('turn header gutter', () => {
   it('gives the focus-marked whole turn (.chat-exchange) a uniform gap too', () => {
     const block = getBlock(responseCss, '.chat-exchange.nav-focus-stuck');
     expect(block).not.toBe('');
-    // Same shape as the panel rule (LEFT inset from the inner content's padding-left;
-    // TOP/RIGHT/BOTTOM re-added), but NO negative margin-right — the exchange is
-    // auto-centered (.thread-content > * { margin: 0 auto }) and a negative
-    // margin-right would fight that.
-    expect(declarationValue(block, 'padding')).toBe(
-      'var(--turn-body-inset) var(--turn-body-inset) var(--turn-body-inset) 0',
-    );
+    // Horizontal sides stay 0 — both come through the panels (LEFT from the
+    // inner content's padding-left, RIGHT from the panels' base padding-right),
+    // so marking the exchange never reflows its content. Only TOP/BOTTOM are
+    // re-added (2-value shorthand = vertical inset, horizontal 0). No negative
+    // margins either — the exchange is auto-centered
+    // (.thread-content > * { margin: 0 auto }) and they would fight that.
+    expect(declarationValue(block, 'padding')).toBe('var(--turn-body-inset) 0');
     expect(declarationValue(block, 'margin-right')).toBeUndefined();
     // Feed rhythm handed back as exchange margin so content / neighbours don't move.
     expect(declarationValue(block, 'margin-top')).toBe(

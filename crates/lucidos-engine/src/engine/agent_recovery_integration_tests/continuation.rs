@@ -20,10 +20,11 @@ async fn continuation_requested_emission_classifies_as_spawn_trigger() {
     let (bus, _rx) = EventBus::new(pool.clone());
     let bus = Arc::new(bus);
     let (tx, mut spawn_rx) = tokio::sync::mpsc::unbounded_channel::<SpawnRequest>();
-    let dispatcher = SpawnDispatcher::new(pool.clone(), bus.clone(), tx);
-    let handle = tokio::spawn(async move { dispatcher.run().await });
-    // Let the run loop subscribe before producing.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let dispatcher = SpawnDispatcher::new(pool.clone(), tx);
+    // Subscribe before starting the loop — mirrors `SpawnDispatcher::spawn()`,
+    // so no settling sleep is needed before producing.
+    let rx = bus.subscribe();
+    let handle = tokio::spawn(async move { dispatcher.run(rx).await });
 
     let thread_id = Uuid::new_v4();
     // Seed SessionStarted so the lifecycle contract accepts CC events.
@@ -31,22 +32,7 @@ async fn continuation_requested_emission_classifies_as_spawn_trigger() {
         channel: Some(EventChannel::ClaudeCode),
         ..EventMeta::NONE
     };
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::SessionStarted {
-            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
-            session_id: "sid-cont".into(),
-            branch: "claude-code/cont".into(),
-            repo_id: None,
-            coding_agent_kind: Default::default(),
-            coding_agent_folder: String::new(),
-            app_id: None,
-        },
-        meta: cc_meta.clone(),
-    })
-    .await
-    .expect("session start emits")
-    .expect("event persisted");
+    crate::test_support::start_cc_session(&bus, thread_id, "claude-code/cont", None).await;
 
     // What the continue endpoint does:
     let res = bus
@@ -93,32 +79,17 @@ async fn synthetic_idled_with_engine_restart_interrupt_does_not_dispatch() {
     let (bus, _rx) = EventBus::new(pool.clone());
     let bus = Arc::new(bus);
     let (tx, _spawn_rx) = tokio::sync::mpsc::unbounded_channel::<SpawnRequest>();
-    let dispatcher = SpawnDispatcher::new(pool.clone(), bus.clone(), tx);
+    let dispatcher = SpawnDispatcher::new(pool.clone(), tx);
     let dispatch_count = dispatcher.dispatch_count.clone();
-    let handle = tokio::spawn(async move { dispatcher.run().await });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let rx = bus.subscribe();
+    let handle = tokio::spawn(async move { dispatcher.run(rx).await });
 
     let thread_id = Uuid::new_v4();
     let cc_meta = EventMeta {
         channel: Some(EventChannel::ClaudeCode),
         ..EventMeta::NONE
     };
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::SessionStarted {
-            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
-            session_id: "sid-int".into(),
-            branch: "claude-code/int".into(),
-            repo_id: None,
-            coding_agent_kind: Default::default(),
-            coding_agent_folder: String::new(),
-            app_id: None,
-        },
-        meta: cc_meta.clone(),
-    })
-    .await
-    .expect("emit succeeds")
-    .expect("persisted");
+    crate::test_support::start_cc_session(&bus, thread_id, "claude-code/int", None).await;
 
     // Simulate recovery surfacing the interrupt:
     bus.emit(BusEvent::Thread {
@@ -149,6 +120,91 @@ async fn synthetic_idled_with_engine_restart_interrupt_does_not_dispatch() {
         );
 
     handle.abort();
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The stale-resume retry of a continuation runs with NO resume sid — the one
+/// we had is dead — so the fresh subprocess starts with zero context. Its input
+/// must therefore carry the reconstructed conversation ahead of
+/// `CONTINUE_RESUME_USER_MESSAGE`, or the agent is told to "continue from where
+/// you left off" with no idea where that was. Same contract the chat path's
+/// retry has always had (`chat::process_cc`).
+#[tokio::test]
+async fn continuation_retry_input_recaps_the_thread_before_the_continue_message() {
+    use crate::engine::agent_recovery::{continue_retry_input, CONTINUE_RESUME_USER_MESSAGE};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let cc_meta = EventMeta {
+        channel: Some(EventChannel::ClaudeCode),
+        ..EventMeta::NONE
+    };
+    crate::test_support::start_cc_session(&bus, thread_id, "claude-code/retry", None).await;
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentUserMessageSent {
+            text: "fix the flaky drafts spec".into(),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        },
+        meta: cc_meta.clone(),
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("persisted");
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentTextStreamed {
+            text: "Traced it to the debounced compose PUT.".into(),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        },
+        meta: cc_meta,
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("persisted");
+
+    let input = continue_retry_input(&pool, thread_id).await;
+
+    let recap_pos = input
+        .find("fix the flaky drafts spec")
+        .expect("prior user turn must be recapped into the retry input");
+    let continue_pos = input
+        .find(CONTINUE_RESUME_USER_MESSAGE)
+        .expect("retry input must still carry the continue message");
+    assert!(
+        recap_pos < continue_pos,
+        "the recap must come FIRST so the agent reads what happened before being told to continue"
+    );
+    assert!(
+        input.contains("Traced it to the debounced compose PUT."),
+        "prior assistant turn missing from the retry input"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A thread with no reconstructable history still yields a usable retry input:
+/// the bare continue message, never an empty string. An empty stdin parks
+/// `claude --print --resume` forever waiting for input — the exact hang
+/// `CONTINUE_RESUME_USER_MESSAGE` exists to prevent.
+#[tokio::test]
+async fn continuation_retry_input_is_never_empty() {
+    use crate::engine::agent_recovery::{continue_retry_input, CONTINUE_RESUME_USER_MESSAGE};
+
+    let (pool, db_name) = setup_test_db().await;
+    let thread_id = Uuid::new_v4();
+
+    let input = continue_retry_input(&pool, thread_id).await;
+
+    assert_eq!(
+        input, CONTINUE_RESUME_USER_MESSAGE,
+        "with nothing to recap the retry input must fall back to the bare continue message"
+    );
+
     pool.close().await;
     teardown_test_db(&db_name).await;
 }

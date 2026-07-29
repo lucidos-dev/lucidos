@@ -7,17 +7,19 @@
 # DEFAULT (download) path — the curl|sh experience: no Docker, no Rust/Node, no
 # clone, no compile. It detects your platform, DOWNLOADS the prebuilt headless
 # runtime tarball (engine + gateway + frontend + relocatable PostgreSQL 18 +
-# pgvector + sdk), verifies its sha256 checksum, extracts it under an install
+# pgvector + sdk + system-knowhow), verifies its sha256 checksum, extracts it
+# under an install
 # prefix, and launches the bundled gateway (which provisions the embedded Postgres
 # and spawns the engine — the same runtime model as the macOS .app). First run is
 # seconds, not minutes.
 #
-#   NOTE — no prebuilt release is published yet. The CI matrix builds the tarballs
-#   (.github/workflows/release-tarballs.yml) but they are NOT yet attached to a
-#   GitHub Release, so the DEFAULT download will 404 today. Until releases are
-#   published, use one of:
-#     • --dev / --source        build from source (clones + compiles; today's flow)
-#     • --from-tarball <path>    install a tarball you built with scripts/build-headless.sh
+#   The tarballs are built by .github/workflows/release-tarballs.yml and attached
+#   to each published GitHub Release automatically (release: published trigger).
+#   They land ~30 min AFTER the Release is cut, so a download run started in that
+#   window can still 404 on a brand-new version. Alternatives if it does:
+#     • --version <older>       install the previous release's tarball
+#     • --dev / --source        build from source (clones + compiles)
+#     • --from-tarball <path>   install a tarball you built with scripts/build-headless.sh
 #
 # Modes:
 #   (default)              download the prebuilt tarball for the detected platform and run it
@@ -33,14 +35,32 @@
 # dash — re-exec under bash. On macOS /bin/sh IS bash, so the common `| sh`
 # path never re-execs there. This block must parse under plain POSIX sh, so it
 # uses no bashisms itself.
+# The baked fallback version lives ABOVE the re-exec guard on purpose: the guard
+# exports it so a re-fetched copy cannot resolve a DIFFERENT version than the
+# copy the user actually piped in (see the piped branch below). release.sh
+# rewrites this line in the same step that bumps RELEASE; install_test.sh and
+# version_sources_test.sh assert the two match.
+LUCIDOS_DEFAULT_VERSION="0.16.0"
+# Where a PIPED dash run re-fetches itself from. A mirror that serves this script
+# under its own domain (lucidos.dev) rewrites this line at publish time so the
+# re-fetch pulls THE SAME copy, not whatever github main happens to hold.
 LUCIDOS_INSTALL_URL="${LUCIDOS_INSTALL_URL:-https://raw.githubusercontent.com/lucidos-dev/lucidos/main/install.sh}"
 if [ -z "${BASH_VERSION:-}" ]; then
     if command -v bash >/dev/null 2>&1; then
         if [ -f "$0" ] && [ -r "$0" ]; then
-            # Started as `sh install.sh` — re-run the file under bash.
+            # Started as `sh install.sh` — re-run the file under bash. The
+            # adjacent RELEASE file (if any) still wins, so nothing is pinned.
             exec bash "$0" "$@"
         else
             # Piped (`curl … | sh`) — no file to re-run, so re-fetch under bash.
+            #
+            # Pin the version BEFORE re-fetching. Without this the re-fetched
+            # copy re-resolves its own baked default, so a user who piped a
+            # 0.16.0 installer from lucidos.dev silently installed whatever
+            # github main was baked at (0.14.0 in the wild). Only the version is
+            # carried over — an explicit LUCIDOS_VERSION / --version still wins.
+            LUCIDOS_VERSION="${LUCIDOS_VERSION:-$LUCIDOS_DEFAULT_VERSION}"
+            export LUCIDOS_VERSION
             # Capture first and fail loudly if the fetch came back empty, rather
             # than exec'ing an empty `bash -c ""` (a silent no-op exit 0).
             _lucidos_payload="$(curl -fsSL "$LUCIDOS_INSTALL_URL")" || _lucidos_payload=""
@@ -61,8 +81,8 @@ fi
 set -euo pipefail
 
 # ── configuration (all overridable via environment) ─────────────────────────
-# Download-path config (the default mode).
-LUCIDOS_DEFAULT_VERSION="0.14.0"                                # baked fallback; matches the repo-root RELEASE umbrella version. The release flow bumps this.
+# Download-path config (the default mode). LUCIDOS_DEFAULT_VERSION and
+# LUCIDOS_INSTALL_URL are set above the re-exec guard.
 LUCIDOS_VERSION="${LUCIDOS_VERSION:-}"                          # version to download; empty = resolve (RELEASE file when run from a checkout, else the baked default)
 LUCIDOS_RELEASE_BASE_URL="${LUCIDOS_RELEASE_BASE_URL:-}"       # base URL holding lucidos-<version>-<triple>.tar.gz + .sha256; empty = the GitHub Releases default
 LUCIDOS_PREFIX="${LUCIDOS_PREFIX:-$HOME/.lucidos}"             # install home; the runtime extracts to $LUCIDOS_PREFIX/runtime/<stem>/ (SHARED across instances)
@@ -142,7 +162,7 @@ installer_self_dir() {
 # from the same ref the installer came from. ONE source of truth with the build
 # scripts (no divergent os/arch map, no inlined copy that can drift).
 _source_libs() {
-    local self_dir lib_dir name base
+    local self_dir lib_dir name base first
     self_dir="$(installer_self_dir)"
     if [ -n "$self_dir" ] && [ -f "$self_dir/scripts/lib/stage_runtime.sh" ]; then
         lib_dir="$self_dir/scripts/lib"
@@ -158,6 +178,25 @@ _source_libs() {
                 || die "Could not fetch helper lib '$name' from $base. Run install.sh from a checkout of the repo, or use --dev to build from source."
             [ -s "$lib_dir/$name" ] \
                 || die "Fetched helper lib '$name' from $base is empty. Run install.sh from a checkout, or use --dev to build from source."
+            # Content sniff BEFORE the file reaches `.` (source). Neither check
+            # above can see a SOFT-404: an origin that answers an unknown path
+            # with its landing page and a 200 status makes `curl -fsSL` succeed
+            # and the non-empty test pass, and the installer then executes HTML
+            # as shell. That is exactly the 2026-07-29 clean-machine failure
+            # (ubuntu:22.04, `curl -fsSL lucidos.dev/install.sh | sh`): the
+            # Cloudflare Pages SPA fallback served the landing page for
+            # scripts/lib/*.sh, and bash died on `<!DOCTYPE html>`. Defence in
+            # depth — do NOT drop this because the publisher now uploads the
+            # libs; any wrong or hijacked origin can still soft-404. Reject when
+            # the first non-blank line opens a tag (<!DOCTYPE, <html, <?xml),
+            # and reject rather than warn: sourcing an unknown payload is the
+            # failure we are preventing.
+            first="$(awk 'NF { sub(/^[[:space:]]+/, ""); print; exit }' "$lib_dir/$name")"
+            case "$first" in
+                '<'*) die "Helper lib '$name' from $base is HTML, not shell.
+       The origin likely returned its 404/SPA fallback page with a 200 status.
+       Re-run from a checkout of the repo, or use --dev to build from source." ;;
+            esac
         done
     fi
     for name in "$@"; do

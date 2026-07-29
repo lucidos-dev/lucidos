@@ -1,58 +1,99 @@
-//! Background recovery for a degraded (empty) [`EmbedderSlot`] boot.
+//! Background loader for the embedding model (the [`EmbedderSlot`]).
 //!
-//! When the first-run embedding-model download fails (offline packaged
-//! install, HuggingFace blocked), engine construction boots with an empty
-//! slot instead of dying (see `engine_impl/construction.rs`). This task
-//! retries the model init with capped exponential backoff and installs the
-//! provider into the live slot on success — memory features come back without
-//! a restart, honoring engine statelessness (nothing here is persistent
-//! state; a restart simply re-runs the same construction decision).
+//! The embedding model is a multi-hundred-MB HuggingFace download on a cold
+//! cache (and a non-trivial ONNX load even when warm), so engine construction
+//! boots with an EMPTY slot and never waits on it (see
+//! `engine_impl/construction.rs`). This task loads the model — trying
+//! immediately, then with capped exponential backoff on a *fetch-class* failure
+//! (offline / HF blocked) — and installs the provider into the live slot on
+//! success, so memory features come online without a restart. Nothing here is
+//! persistent state (a restart simply re-runs the same load), honoring engine
+//! statelessness. A warm-cache boot loads within seconds and stays silent; only
+//! a boot the user was told is degraded announces recovery.
+//!
+//! [`EmbedderSlot`]: crate::memory::EmbedderSlot
 
 use std::sync::Arc;
 
 use crate::engine::LucidosEngine;
 use crate::memory::fastembed::{is_model_fetch_failure, FastEmbedProvider};
+// Brings the `model_id()` trait method into scope so the loader can read the
+// slot's captured id (the slot also has a private `model_id` field).
+use crate::memory::provider::EmbeddingProvider;
 
-/// Backoff schedule between attempts; the last entry repeats forever. Starts
-/// quick (a router blip on first open should heal fast) and settles at 10
-/// minutes so an offline machine isn't hammering HuggingFace.
+/// Backoff schedule between attempts AFTER the first (immediate) one; the last
+/// entry repeats forever. Starts quick (a router blip on first open should heal
+/// fast) and settles at 10 minutes so an offline machine isn't hammering
+/// HuggingFace.
 const RETRY_DELAYS_SECS: &[u64] = &[30, 60, 120, 300, 600];
 
 /// Attempt number after which the user is told (once) that memory is degraded
 /// — early enough to explain missing recall, late enough to skip transient
-/// blips that heal on the first retry.
+/// blips that heal on an early retry.
 const NOTIFY_AFTER_ATTEMPTS: u32 = 3;
 
+/// Sleep to apply BEFORE the next load attempt, given how many attempts have
+/// already completed. `None` for the first attempt (nothing done yet) so a warm
+/// cache comes online immediately; then [`RETRY_DELAYS_SECS`], clamped to its
+/// last entry, so an offline machine isn't hammering HuggingFace forever. Pure
+/// so the immediate-first + backoff schedule is unit-testable.
+fn delay_before_attempt(completed_attempts: u32) -> Option<std::time::Duration> {
+    if completed_attempts == 0 {
+        return None;
+    }
+    let idx = (completed_attempts - 1) as usize;
+    let secs = RETRY_DELAYS_SECS
+        .get(idx)
+        .copied()
+        .unwrap_or(*RETRY_DELAYS_SECS.last().expect("non-empty schedule"));
+    Some(std::time::Duration::from_secs(secs))
+}
+
 impl LucidosEngine {
-    /// Spawn the background embedder retry when the boot left the slot empty.
-    /// No-op on a normal (ready) boot. Called from `main.rs` once the engine
-    /// is assembled (the task needs the event bus for notifications).
-    pub fn spawn_embedder_retry_if_degraded(self: &Arc<Self>) {
-        if self.embedder().is_ready() {
-            return;
-        }
+    /// Spawn the background embedding-model load. Always runs (the slot boots
+    /// empty); called from `main.rs` once the engine is assembled — the task
+    /// needs the event bus for notifications and the memory index for the
+    /// post-install re-embed sweep.
+    pub fn spawn_embedder_load(self: &Arc<Self>) {
         let engine = Arc::clone(self);
+        // Build the provider for the id the slot CAPTURED at construction, not a
+        // fresh `LUCIDOS_EMBEDDING_MODEL` read: `apply_to_process_env` can change
+        // that env var after the slot resolved its id, and the slot's `model_id`
+        // (stamped on every row and used by `reembed_stale`) must match the model
+        // actually loaded. Resolving from the slot keeps the two in lockstep.
+        let model_id = engine.embedder().model_id().to_string();
         tokio::spawn(async move {
             let mut attempt: u32 = 0;
+            // Whether the user has been told memory is degraded/waiting. Gates
+            // the "Memory is ready" notification so a healthy warm-cache boot
+            // (which loads on the first attempt) stays silent — no per-boot
+            // notification noise.
+            let mut notified_degraded = false;
             loop {
-                let delay = RETRY_DELAYS_SECS
-                    .get(attempt as usize)
-                    .copied()
-                    .unwrap_or(*RETRY_DELAYS_SECS.last().expect("non-empty schedule"));
-                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                // Immediate first attempt; back off only AFTER a failure so a
+                // warm cache comes online within seconds.
+                if let Some(delay) = delay_before_attempt(attempt) {
+                    tokio::time::sleep(delay).await;
+                }
                 if engine.is_shutting_down() {
                     return;
                 }
                 attempt += 1;
-                match tokio::task::spawn_blocking(FastEmbedProvider::new).await {
+                let id = model_id.clone();
+                match tokio::task::spawn_blocking(move || FastEmbedProvider::with_model(&id)).await {
                     Ok(Ok(provider)) => {
                         engine.embedder().install(provider);
                         log!(
-                            "[Memory] Embedding model downloaded on retry #{} — memory features active",
+                            "[Memory] Embedding model loaded (attempt #{}) — memory features active",
                             attempt
                         );
-                        // The startup re-embed sweep was skipped on the degraded
-                        // boot; run it now that embeds can succeed.
+                        // Construction skipped the startup re-embed sweep (the
+                        // slot booted empty); run it now that embeds can succeed.
+                        // This only re-embeds EXISTING rows carrying a stale model
+                        // id — items dropped during the empty-slot window (no row
+                        // ever inserted, see `index_memory_inner_impl`) are
+                        // recovered by a manual memory rebuild, not here. See
+                        // docs/known-gaps.md.
                         if let Some(index) = engine.memory_index().clone() {
                             let embedder = engine.embedder().clone();
                             if let Err(e) =
@@ -61,18 +102,22 @@ impl LucidosEngine {
                                 log!(@Memory, "Re-embed task failed: {}", e);
                             }
                         }
-                        notify(
-                            &engine,
-                            "Memory is ready",
-                            "The embedding model finished downloading — memory search, \
-                             extraction, and semantic thread search are now active.",
-                        )
-                        .await;
+                        // Only announce recovery if the user was previously told
+                        // memory was degraded — a normal boot is silent.
+                        if notified_degraded {
+                            notify(
+                                &engine,
+                                "Memory is ready",
+                                "The embedding model finished downloading — memory search, \
+                                 extraction, and semantic thread search are now active.",
+                            )
+                            .await;
+                        }
                         return;
                     }
                     Ok(Err(e)) if is_model_fetch_failure(e.as_ref()) => {
                         log!(
-                            "[Memory] Embedding model retry #{} failed (fetch): {} — next attempt in the background",
+                            "[Memory] Embedding model load attempt #{} failed (fetch): {} — retrying in the background",
                             attempt,
                             e
                         );
@@ -86,11 +131,13 @@ impl LucidosEngine {
                                  check the machine's internet access if this persists.",
                             )
                             .await;
+                            notified_degraded = true;
                         }
                     }
                     Ok(Err(e)) => {
                         // Non-fetch failure (corrupt cached model, bad config):
-                        // retrying can't fix it — stop and say so loudly.
+                        // retrying can't fix it — stop and say so loudly. The
+                        // workspace stays usable; only memory is disabled.
                         log!(
                             "[Memory] Embedding model init failed with a NON-network error: {} — \
                              giving up (fix the model cache / config and restart)",
@@ -111,7 +158,7 @@ impl LucidosEngine {
                     }
                     Err(join_err) => {
                         log!(
-                            "[Memory] Embedding model retry task panicked: {} — retrying",
+                            "[Memory] Embedding model load task panicked: {} — retrying",
                             join_err
                         );
                     }
@@ -124,7 +171,7 @@ impl LucidosEngine {
 /// Notify via the engine's one notification chokepoint
 /// (`LucidosEngine::create_notification` — DB row + SSE + the OS push /
 /// native-banner fan-out). Best-effort — a failed emit only loses the
-/// notification, never the retry loop.
+/// notification, never the load loop.
 async fn notify(engine: &Arc<LucidosEngine>, title: &str, message: &str) {
     if let Err(e) = engine
         .create_notification(
@@ -139,5 +186,38 @@ async fn notify(engine: &Arc<LucidosEngine>, title: &str, message: &str) {
         .await
     {
         log!("[Memory] Failed to emit embedder notification: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The load must try IMMEDIATELY (no sleep before the first attempt) so a
+    /// warm cache comes online within seconds, then back off on failures and
+    /// clamp to the last schedule entry — the invariant that keeps boot from
+    /// paying the model download while still not hammering an offline HF.
+    #[test]
+    fn first_attempt_is_immediate_then_backs_off() {
+        assert_eq!(
+            delay_before_attempt(0),
+            None,
+            "the first attempt must not sleep"
+        );
+        assert_eq!(delay_before_attempt(1), Some(Duration::from_secs(30)));
+        assert_eq!(delay_before_attempt(2), Some(Duration::from_secs(60)));
+        assert_eq!(delay_before_attempt(3), Some(Duration::from_secs(120)));
+        // Past the schedule, repeat the last (10 min) forever.
+        let last = *RETRY_DELAYS_SECS.last().unwrap();
+        assert_eq!(
+            delay_before_attempt(RETRY_DELAYS_SECS.len() as u32),
+            Some(Duration::from_secs(last))
+        );
+        assert_eq!(
+            delay_before_attempt(999),
+            Some(Duration::from_secs(last)),
+            "backoff clamps to the last entry, never panics"
+        );
     }
 }

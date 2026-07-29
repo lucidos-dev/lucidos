@@ -802,7 +802,7 @@
     gap: 0.375rem;
     min-height: 1.75rem;
     padding: 0.25rem var(--turn-body-inset);
-    color: var(--text-muted);
+    color: var(--accent);
     cursor: pointer;
     user-select: none;
     font-size: var(--font-size-sm);
@@ -812,13 +812,19 @@
     display: none;
 }
 
+/* The ○ glyph carries its own muted color for the standalone queued bubble;
+   inside the accent-colored group header it should match the header instead. */
+.queued-message-group-summary .exchange-status-queued {
+    color: inherit;
+}
+
 .queued-message-group-label {
     font-weight: 600;
 }
 
 @media (hover: hover) {
     .queued-message-group-summary:hover {
-        color: var(--text-secondary);
+        color: var(--accent-light);
     }
 }
 
@@ -912,10 +918,19 @@ html[data-theme="dark"] .thread-status-question-badge::after {
 /* Feed-style padding on every turn — adjacent turns separate by this vertical
    rhythm alone; there is no divider line between turns (borderless feed). The
    navigation focus marker hands this back as margin when it tightens a focused
-   turn to a uniform gap (chat/response.css). */
+   turn to a uniform gap (chat/response.css).
+
+   The RIGHT inset mirrors the content's LEFT inset (which lives on the header/
+   body padding-left), so a turn's content sits symmetrically inside the pane.
+   This symmetry is load-bearing for the navigation focus marker: with content
+   flush right, the marker had to reach var(--turn-body-inset) further right
+   than left to keep a uniform content gap — jutting into .thread-content's
+   gutter until its border sat flush against the pane edge while the left kept
+   its breathing room ("border is all the way to the right"). With the inset in
+   the base layout the marker needs no horizontal box tricks at all. */
 .initiator-panel,
 .response-panel {
-    padding: var(--turn-feed-pad-y) 0;
+    padding: var(--turn-feed-pad-y) var(--turn-body-inset) var(--turn-feed-pad-y) 0;
 }
 
 .initiator-header {

@@ -674,3 +674,87 @@ async fn cancel_apply_all_with_no_batch_returns_bad_request() {
         "error must explain nothing is running: {body:?}"
     );
 }
+
+/// A pending change whose branch diff has gone empty (its commits cancelled
+/// out, so `reconcile_emptied_pending_change` re-synced the row to zero files)
+/// cannot be applied: merging it only pushes no-op commits onto main, and for
+/// an unhardened Lucidos-source change it would spend a whole harden-at-apply
+/// session on an empty diff. `Discard` is the resolution, so the row must
+/// survive the refusal untouched — the engine never resolves a change on the
+/// user's behalf.
+#[tokio::test]
+async fn apply_change_with_no_files_is_rejected_409() {
+    let client = http_client();
+    let ws = workspace_path();
+    let repo_root = ws.to_str().unwrap();
+
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+
+    let suffix = Uuid::new_v4().as_simple().to_string()[..8].to_string();
+    let branch = format!("e2e-test/empty-change-{}", suffix);
+    let thread_id = Uuid::new_v4();
+    let change_id = Uuid::new_v4();
+
+    seed_cc_thread_summary(&pool, thread_id, "idle").await;
+    seed_change_for_test(
+        &client,
+        change_id,
+        thread_id,
+        &branch,
+        repo_root,
+        "E2E reconciled-to-empty change",
+        &[],
+        false,
+        true,
+    )
+    .await;
+
+    let url = format!("{}/api/v1/changes/{}/apply", base_url(), change_id);
+    let resp = client.post(&url).send().await.expect("apply request failed");
+    assert_eq!(
+        resp.status().as_u16(),
+        409,
+        "applying a change with no file changes must be refused"
+    );
+    let body: serde_json::Value = resp.json().await.expect("response body");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no file changes"),
+        "the 409 must say why and point at Discard: {body:?}"
+    );
+
+    let row: Option<(String, i32)> =
+        sqlx::query_as("SELECT status, file_count FROM changes WHERE id = $1")
+            .bind(change_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("changes lookup");
+    assert_eq!(
+        row,
+        Some(("pending".to_string(), 0)),
+        "the refused change must stay pending for the user to discard"
+    );
+
+    // Discard is still available — it is how an empty change is resolved.
+    let discard_url = format!("{}/api/v1/changes/{}/discard", base_url(), change_id);
+    let discard = client
+        .post(&discard_url)
+        .send()
+        .await
+        .expect("discard request failed");
+    assert!(
+        discard.status().is_success(),
+        "discard must stay available on an empty change, got {}",
+        discard.status()
+    );
+
+    let _ = sqlx::query("DELETE FROM changes WHERE id = $1")
+        .bind(change_id)
+        .execute(&pool)
+        .await;
+    pool.close().await;
+}

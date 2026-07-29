@@ -7,7 +7,7 @@ fn test_config(worktree: &Path) -> CodexConfig {
         system_prompt: None,
         model: None,
         reasoning_effort: None,
-        git_common_dir: None,
+        sandbox_writable_roots: Vec::new(),
         env: vec![
             (
                 std::ffi::OsString::from("LUCIDOS_WORKSPACE"),
@@ -62,6 +62,67 @@ fn fresh_turn_command_layout() {
         "fresh turn must not resume"
     );
     assert!(!args.iter().any(|a| a == "-m"), "no model flag when unset");
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "model_reasoning_summary=\"detailed\""),
+        "codex's default summary mode emits no reasoning — the Thinking step needs this"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "project_doc_fallback_filenames=[\"CLAUDE.md\"]"),
+        "no AGENTS.md ships (ADR 0004) — CLAUDE.md fallback is the CC-parity project doc"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "project_doc_max_bytes=65536"),
+        "codex's 32KiB default would truncate Lucidos' ~29KiB CLAUDE.md soon"
+    );
+}
+
+#[test]
+fn max_effort_is_model_scoped_in_exec_driver() {
+    let config = test_config(Path::new("/tmp/wt"));
+    let cmd = build_codex_turn_command(
+        &config,
+        Some("gpt-5.6-sol"),
+        Some("max"),
+        None,
+        "go",
+        &[],
+    );
+    let args = collect_args(&cmd);
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=\"max\""),
+        "GPT-5.6 models advertise Max and must receive it; got {args:?}"
+    );
+
+    // Older models reject Max. A stale selection must be omitted so Codex
+    // applies its own default instead of failing the whole turn.
+    let cmd = build_codex_turn_command(
+        &config,
+        Some("gpt-5.5"),
+        Some("max"),
+        None,
+        "go",
+        &[],
+    );
+    let args = collect_args(&cmd);
+    assert!(
+        !args
+            .iter()
+            .any(|a| a.starts_with("model_reasoning_effort=")),
+        "Max must be omitted for pre-5.6 models"
+    );
+
+    let cmd = build_codex_turn_command(&config, None, Some("max"), None, "go", &[]);
+    let args = collect_args(&cmd);
+    assert!(
+        !args
+            .iter()
+            .any(|a| a.starts_with("model_reasoning_effort=")),
+        "Max must be omitted when the default model is unknown"
+    );
 }
 
 #[test]
@@ -177,19 +238,178 @@ fn effort_maps_to_model_reasoning_effort_config() {
 }
 
 #[test]
-fn git_common_dir_becomes_add_dir() {
-    // A linked worktree's real git dir lives under the main repo — without
-    // --add-dir the workspace-write sandbox blocks every `git commit` the
-    // agent runs.
+fn every_sandbox_writable_root_becomes_an_add_dir() {
+    // Two load-bearing holes in the workspace-write sandbox:
+    //   /repo/.git  — a linked worktree's real git dir lives under the main
+    //                 repo, so without it every in-agent `git commit` fails.
+    //   /ws/data    — `lucidos data write` lands in the PARENT workspace, which
+    //                 is outside the worktree. Without it the seatbelt returns
+    //                 EPERM (os error 1) — the 2026-07-26 nightly's Codex
+    //                 security pass lost two findings exactly this way.
     let mut config = test_config(Path::new("/tmp/wt"));
-    config.git_common_dir = Some(PathBuf::from("/repo/.git"));
+    config.sandbox_writable_roots =
+        vec![PathBuf::from("/repo/.git"), PathBuf::from("/ws/data")];
     let cmd = build_codex_turn_command(&config, None, None, None, "p", &[]);
     let args = collect_args(&cmd);
-    let idx = args
+    let dirs: Vec<&String> = args
         .iter()
-        .position(|a| a == "--add-dir")
-        .expect("--add-dir");
-    assert_eq!(args[idx + 1], "/repo/.git");
+        .enumerate()
+        .filter(|(_, a)| *a == "--add-dir")
+        .map(|(i, _)| &args[i + 1])
+        .collect();
+    assert_eq!(
+        dirs,
+        vec!["/repo/.git", "/ws/data"],
+        "exactly the configured roots, in order; an extra --add-dir is an \
+         unreviewed widening of the sandbox"
+    );
+}
+
+#[test]
+fn no_add_dir_when_there_are_no_writable_roots() {
+    let config = test_config(Path::new("/tmp/wt"));
+    assert!(config.sandbox_writable_roots.is_empty());
+    let cmd = build_codex_turn_command(&config, None, None, None, "p", &[]);
+    assert!(!collect_args(&cmd).iter().any(|a| a == "--add-dir"));
+}
+
+#[tokio::test]
+async fn writable_roots_grant_the_workspace_data_dir_and_nothing_wider() {
+    // The worktree here is not a git repo, so resolve_git_common_dir degrades
+    // to None and the data dir is the only entry — which is what lets this
+    // assert the SCOPE exactly.
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(ws.path().join("data/artifacts")).unwrap();
+    // A sibling the sandbox must NOT be able to write.
+    std::fs::create_dir_all(ws.path().join(".lucidos/worktrees/other")).unwrap();
+
+    let roots = super::super::codex::sandbox_writable_roots(
+        &ws.path().join(".lucidos/worktrees/mine"),
+        ws.path(),
+    )
+    .await;
+
+    let expected = std::fs::canonicalize(ws.path().join("data")).unwrap();
+    assert_eq!(roots, vec![expected]);
+    assert!(
+        roots[0].is_absolute(),
+        "codex resolves a relative --add-dir against the CHILD's cwd (the \
+         worktree), so a non-absolute root opens the hole in the wrong place"
+    );
+    assert!(
+        !roots.contains(&ws.path().to_path_buf()),
+        "the workspace ROOT must never be writable — it holds .lucidos/ \
+         (engine runtime, logs, gateway registry) and every sibling worktree"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn writable_roots_are_canonicalized_not_taken_verbatim() {
+    // Same `canonicalize` call that absolutizes a relative LUCIDOS_WORKSPACE
+    // (the Makefile passes `./test-workspace`, the boot fallback is
+    // `./workspace`) — asserted here through a symlink, which is testable
+    // without mutating the process-global cwd. It also covers the macOS
+    // seatbelt's own requirement: it matches on real paths, so `/var/...`
+    // must reach it as `/private/var/...`.
+    let real = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(real.path().join("data")).unwrap();
+    let link_parent = tempfile::tempdir().unwrap();
+    let link = link_parent.path().join("ws-link");
+    std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+    let roots =
+        super::super::codex::sandbox_writable_roots(&link.join("wt"), &link).await;
+
+    assert_eq!(roots, vec![std::fs::canonicalize(real.path().join("data")).unwrap()]);
+    assert_ne!(
+        roots[0],
+        link.join("data"),
+        "the verbatim, un-resolved path must not be what reaches the sandbox"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_git_root_is_canonicalized_too_not_just_the_data_root() {
+    // The sibling test above cannot cover this arm: its worktree is not a git
+    // repo, so resolve_git_common_dir degrades to None. Both roots have to be
+    // canonical for the same reason — the seatbelt matches real paths — and a
+    // git root that isn't is a silently-blocked in-agent `git commit`, which is
+    // the only reason that entry exists.
+    let real = tempfile::tempdir().unwrap();
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(real.path())
+        .status();
+    // No git on the box ⇒ nothing to assert; the degrade path is its own test.
+    let Ok(status) = init else { return };
+    if !status.success() {
+        return;
+    }
+    std::fs::create_dir_all(real.path().join("data")).unwrap();
+    let link_parent = tempfile::tempdir().unwrap();
+    let link = link_parent.path().join("ws-link");
+    std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+    // Worktree == repo root, so `git rev-parse --git-common-dir` answers with a
+    // RELATIVE `.git` — joined onto the symlinked worktree, then canonicalized.
+    let roots = super::super::codex::sandbox_writable_roots(&link, &link).await;
+
+    let git_root = std::fs::canonicalize(real.path().join(".git")).unwrap();
+    assert!(
+        roots.contains(&git_root),
+        "expected the canonical git dir {} among {roots:?}",
+        git_root.display()
+    );
+    assert!(
+        !roots.iter().any(|r| r.starts_with(&link)),
+        "no root may still carry the symlinked path the seatbelt won't match"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_data_symlink_may_relocate_the_tree_but_never_widen_it() {
+    // Resolving symlinks is required (the seatbelt matches real paths), which
+    // hands the `data` entry control over how wide the hole is. Relocation is a
+    // legitimate setup and must keep working; widening must not.
+    let ws = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let wt = ws.path().join("wt");
+
+    // Relocated: `data -> <elsewhere>` still grants exactly that tree.
+    std::os::unix::fs::symlink(elsewhere.path(), ws.path().join("data")).unwrap();
+    let roots = super::super::codex::sandbox_writable_roots(&wt, ws.path()).await;
+    assert_eq!(
+        roots,
+        vec![std::fs::canonicalize(elsewhere.path()).unwrap()],
+        "relocating data/ onto another disk is a supported layout"
+    );
+
+    // Widened: `data -> .` would grant the workspace root — .lucidos/ (engine
+    // runtime, logs, gateway registry) and every sibling worktree with it.
+    std::fs::remove_file(ws.path().join("data")).unwrap();
+    std::os::unix::fs::symlink(ws.path(), ws.path().join("data")).unwrap();
+    let roots = super::super::codex::sandbox_writable_roots(&wt, ws.path()).await;
+    assert!(
+        roots.is_empty(),
+        "a data symlink that resolves to the workspace root must be refused, \
+         not granted — that is the scope this function promises to withhold"
+    );
+}
+
+#[tokio::test]
+async fn writable_roots_skip_a_missing_data_dir_rather_than_creating_it() {
+    let ws = tempfile::tempdir().unwrap();
+    let roots =
+        super::super::codex::sandbox_writable_roots(&ws.path().join("wt"), ws.path()).await;
+    assert!(roots.is_empty());
+    assert!(
+        !ws.path().join("data").exists(),
+        "spawn must not conjure a data dir — the engine provisions it at boot, \
+         so its absence is a signal, not something to paper over"
+    );
 }
 
 #[test]
@@ -260,6 +480,44 @@ fn codex_command_definitions_shape() {
         "default sentinel must be offered"
     );
     assert!(options.iter().any(|o| o["value"] == "gpt-5.5"));
+    // The GPT-5.6 family (Sol / Terra / Luna) is offered — the model ids codex
+    // accepts for `-m`, mirroring the chat registry's gpt-5.6-* ids.
+    for value in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        assert!(
+            options.iter().any(|o| o["value"] == value),
+            "{value} must be in the codex /model picker"
+        );
+    }
+
+    let effort_options = arr[1]["params"][0]["options"]
+        .as_array()
+        .expect("effort options");
+    let max = effort_options
+        .iter()
+        .find(|o| o["value"] == "max")
+        .expect("Max must be in the Codex effort picker metadata");
+    let supported_models: std::collections::HashSet<&str> = max["supported_models"]
+        .as_array()
+        .expect("Max must declare its supported models")
+        .iter()
+        .map(|m| m.as_str().expect("model id"))
+        .collect();
+    assert_eq!(
+        supported_models,
+        std::collections::HashSet::from([
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ]),
+        "Max is supported by exactly the three GPT-5.6 Codex models"
+    );
+    assert!(
+        effort_options
+            .iter()
+            .filter(|o| o["value"] != "max")
+            .all(|o| o.get("supported_models").is_none()),
+        "low through xhigh remain universal"
+    );
 }
 
 #[test]

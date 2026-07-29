@@ -10,7 +10,7 @@ fn test_config() -> CodexConfig {
         system_prompt: Some("SYSPROMPT".into()),
         model: None,
         reasoning_effort: None,
-        git_common_dir: None,
+        sandbox_writable_roots: Vec::new(),
         env: vec![
             (
                 std::ffi::OsString::from("LUCIDOS_WORKSPACE"),
@@ -64,6 +64,20 @@ fn fresh_thread_request_shape() {
     );
     assert!(params.get("threadId").is_none());
     assert!(params.get("model").is_none(), "no model param when unset");
+    assert_eq!(
+        params["config"]["model_reasoning_summary"], "detailed",
+        "codex's default summary mode emits NO reasoning notifications (verified \
+         live on 0.142.5) — without this the Thinking step never renders"
+    );
+    assert_eq!(
+        params["config"]["project_doc_fallback_filenames"][0], "CLAUDE.md",
+        "no AGENTS.md ships (ADR 0004), so CLAUDE.md is the project doc Codex \
+         must fall back to — CC parity for the repo working agreement"
+    );
+    assert_eq!(
+        params["config"]["project_doc_max_bytes"], 65536,
+        "codex's 32KiB default would truncate Lucidos' ~29KiB CLAUDE.md soon"
+    );
 }
 
 #[test]
@@ -78,16 +92,33 @@ fn resume_thread_request_targets_the_stored_thread() {
 }
 
 #[test]
-fn git_common_dir_becomes_writable_root() {
-    // The app-server analog of the exec driver's --add-dir: without it the
-    // workspace-write sandbox blocks every `git commit` in a linked worktree.
+fn sandbox_writable_roots_reach_the_thread_request() {
+    // The app-server analog of the exec driver's --add-dir. Both entries are
+    // load-bearing: without the shared git dir the workspace-write sandbox
+    // blocks every `git commit` in a linked worktree, and without the
+    // workspace's data/ it blocks `lucidos data write` to the parent workspace
+    // (the 2026-07-26 nightly's EPERM, which lost two security findings).
     let mut config = test_config();
-    config.git_common_dir = Some(PathBuf::from("/repo/.git"));
+    config.sandbox_writable_roots =
+        vec![PathBuf::from("/repo/.git"), PathBuf::from("/ws/data")];
     let (_, params) = build_thread_request(&config, None);
     assert_eq!(
-        params["config"]["sandbox_workspace_write"]["writable_roots"][0],
-        "/repo/.git"
+        params["config"]["sandbox_workspace_write"]["writable_roots"],
+        serde_json::json!(["/repo/.git", "/ws/data"])
     );
+}
+
+#[test]
+fn writable_roots_is_omitted_when_there_are_none() {
+    // An empty list must not serialize as `writable_roots: []` — that reads as
+    // "explicitly no extra roots" to codex rather than "unset", and it is the
+    // shape the request had before the roots existed.
+    let config = test_config();
+    assert!(config.sandbox_writable_roots.is_empty());
+    let (_, params) = build_thread_request(&config, None);
+    assert!(params["config"]["sandbox_workspace_write"]
+        .get("writable_roots")
+        .is_none());
 }
 
 #[test]
@@ -134,6 +165,36 @@ fn turn_start_params_omit_empty_text_and_default_model() {
     assert_eq!(params["input"][0]["type"], "localImage");
     assert!(params.get("model").is_none());
     assert!(params.get("effort").is_none());
+}
+
+#[test]
+fn turn_start_params_scope_max_effort_to_gpt_5_6() {
+    let params = build_turn_start_params(
+        "t-1",
+        "go",
+        &[],
+        Some("gpt-5.6-luna"),
+        Some("max"),
+    );
+    assert_eq!(params["effort"], "max", "GPT-5.6 models support Max");
+
+    // Older models reject Max. A stale selection is dropped so Codex applies
+    // its own default instead of failing the whole turn.
+    let params =
+        build_turn_start_params("t-1", "go", &[], Some("gpt-5.5"), Some("max"));
+    assert!(
+        params.get("effort").is_none(),
+        "Max must be omitted for pre-5.6 models"
+    );
+
+    let params = build_turn_start_params("t-1", "go", &[], None, Some("max"));
+    assert!(
+        params.get("effort").is_none(),
+        "Max must be omitted when the default model is unknown"
+    );
+
+    let params = build_turn_start_params("t-1", "go", &[], None, Some("xhigh"));
+    assert_eq!(params["effort"], "xhigh", "vocab values still pass through");
 }
 
 #[test]

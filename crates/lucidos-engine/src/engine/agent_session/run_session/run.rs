@@ -18,9 +18,10 @@ use uuid::Uuid;
 use crate::engine::agent_session::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
 use crate::engine::agent_session::lifecycle::{
     classify_result, idle_action, is_definitive_session_not_found,
-    is_silent_resume, is_stale_resume_signal, reset_per_turn_flags,
-    should_auto_commit_on_cleanup, should_propose_change_at_idle,
-    terminal_clears_user_hit_stop, terminate_decision, watchdog_gate, IdleAction, TerminalKind,
+    is_silent_resume, is_stale_resume_signal, may_touch_change_state_at_idle,
+    reset_per_turn_flags, should_auto_commit_on_cleanup,
+    terminal_clears_user_hit_stop, terminate_decision, watchdog_gate, IdleAction, StaleResumeInputs,
+    TerminalKind,
     TerminateDecision, WatchdogGate, WATCHDOG_DIAG_LOG_THRESHOLD_MS,
     WATCHDOG_HUNG_TOOL_CEILING_MS, WATCHDOG_INACTIVITY_LIMIT_MS, WATCHDOG_TICK_INTERVAL_SECS,
 };
@@ -254,7 +255,13 @@ impl LucidosEngine {
         if recovery_worktree.is_none() {
             let guard = self.agent_sessions.lock().await;
             if let Some(session) = guard.get(&thread_id) {
-                if !session.process_exited {
+                // `is_live`, not `!process_exited`: a run future that was
+                // dropped instead of completed leaves the entry behind with
+                // that flag still false. Refusing the resume on a phantom is
+                // what wedged thread 293f96d5 on 2026-07-28 — every follow-up
+                // came back "A coding agent is already running for this
+                // thread" with no subprocess anywhere on the box.
+                if session.is_live() {
                     if session.is_waiting {
                         // Session is idle — route follow-up via msg_tx. The caller
                         // already emitted MessageReceived with the frontend UUID.
@@ -295,7 +302,9 @@ impl LucidosEngine {
                         });
                     }
                     drop(guard);
-                    return Err("A coding agent is already running for this thread. Cancel it first or wait for it to finish.".into());
+                    return Err(
+                        crate::engine::claude_code::AGENT_ALREADY_RUNNING_ERROR.into()
+                    );
                 }
                 had_dead_session = true;
             }
@@ -766,6 +775,8 @@ impl LucidosEngine {
         let shutting_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let external_terminal_emitted =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let external_continuation_requested =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut normalized_model = cc_model.clone();
         // Initial input (when has_content) produces one expected `Result` event;
         // see AgentSession.pending_followups for the full rationale.
@@ -800,6 +811,7 @@ impl LucidosEngine {
                 )),
                 shutting_down: shutting_down.clone(),
                 external_terminal_emitted: external_terminal_emitted.clone(),
+                external_continuation_requested: external_continuation_requested.clone(),
                 control_tx: agent_control_tx.clone(),
                 builtin_commands: prev_builtin,
                 skill_commands: prev_skill,
@@ -815,6 +827,22 @@ impl LucidosEngine {
             };
             sessions.insert(thread_id, session);
         }
+
+        // From here on the entry is owned by this run. The guard is the
+        // cancellation backstop: every *completion* path removes the entry
+        // itself, but a dropped future runs none of them and would leave a
+        // phantom that wedges the thread (see `entry_guard`). Declared after
+        // `msg_rx` so it drops first — irrelevant for correctness (identity is
+        // the channel, not liveness) but it keeps the reap ordered ahead of the
+        // channel close.
+        let _entry_guard = super::entry_guard::SessionEntryGuard::new(
+            self.agent_sessions.clone(),
+            thread_id,
+            msg_tx.clone(),
+            shutting_down.clone(),
+            self.event_bus.clone(),
+            self.pool.clone(),
+        );
 
         let chat_cancel = cancel_token.clone();
         let images: Vec<String> = Vec::new();
@@ -934,6 +962,14 @@ impl LucidosEngine {
         // counter is exactly "tool calls before the first Result." Prevents the
         // 2026-07-02 false stale-resume → duplicate-process bug.
         let mut tool_calls_seen: u32 = 0;
+        // The session id the backend reported at `Init` — i.e. the conversation
+        // it ACTUALLY attached to. Compared against `resume_session_id` to prove
+        // a `--resume` landed on the live conversation, which vetoes the
+        // empty-echo stale-resume heuristic outright (see `StaleResumeInputs::
+        // resume_attach_confirmed`). This is the structured signal the heuristic's
+        // temporary-measures row asks for; without it a healthy resume that says
+        // nothing is indistinguishable from a dead one.
+        let mut init_session_id: Option<String> = None;
         let mut claude_text_buf = String::new();
         let mut last_text_persisted_len: usize = 0;
         // Reasoning/thinking stream buffer (coalesced like the text buffer above).
@@ -1139,6 +1175,9 @@ impl LucidosEngine {
                     match ev {
                         AgentEvent::Init { session_id: cc_sid, model: init_model, slash_commands: cmds, skills } => {
                             log!("[AgentSession] [TIMING] Init event received: {:?}", cc_start.elapsed());
+                            // Record what the backend actually attached to before
+                            // anything else — the stale-resume veto reads it.
+                            init_session_id = Some(cc_sid.clone());
                             // Enable --resume for follow-ups and engine restart
                             let cache_update = {
                                 let mut sessions = self.agent_sessions.lock().await;
@@ -1445,8 +1484,7 @@ impl LucidosEngine {
                                 ))
                                 .or_else(|| normalized_model.clone())
                                 .unwrap_or_default();
-                            let context_window =
-                                crate::engine::context::context_window_for(&snapshot_model);
+                            let context_window = self.context_window_for(&snapshot_model);
                             // Anthropic reports `input_tokens` as the
                             // uncached portion only. `ApiUsage.input_tokens`
                             // stores the TOTAL prompt size — same convention
@@ -1575,15 +1613,45 @@ impl LucidosEngine {
                                         // store.
                                         let explicit_session_not_found = resume_session_id.is_some()
                                             && is_definitive_session_not_found(cc_error.as_deref());
-                                        if is_stale_resume_signal(
-                                            resume_session_id.is_some(),
+                                        // Did the backend attach to the conversation we
+                                        // asked for? Its Init echoes the id it actually
+                                        // opened, and a FAILED resume yields a different
+                                        // one — so a match is structural proof of life
+                                        // and vetoes the output-shape heuristic. Compared
+                                        // only when we requested a resume; a fresh spawn
+                                        // has nothing to match against.
+                                        let stale_inputs = StaleResumeInputs {
+                                            has_resume_session: resume_session_id.is_some(),
+                                            resume_attach_confirmed: resume_session_id.is_some()
+                                                && init_session_id.as_deref()
+                                                    == resume_session_id.as_deref(),
                                             result_text_empty,
                                             buffered_text_empty,
-                                            result_texts.is_empty(),
-                                            tool_calls_seen == 0,
-                                            !user_message.is_empty(),
-                                            cc_error.is_some(),
-                                        ) || explicit_session_not_found {
+                                            no_prior_results_this_turn: result_texts.is_empty(),
+                                            no_tool_calls_this_turn: tool_calls_seen == 0,
+                                            user_message_present: !user_message.is_empty(),
+                                            cc_error: cc_error.is_some(),
+                                        };
+                                        // Loud only when the veto is what saved the
+                                        // session — the turn's SHAPE said "stale" and the
+                                        // confirmed attach overruled it. That is the
+                                        // 2026-07-29 signature; logging every healthy
+                                        // resume would bury it.
+                                        if stale_inputs.resume_attach_confirmed
+                                            && is_stale_resume_signal(StaleResumeInputs {
+                                                resume_attach_confirmed: false,
+                                                ..stale_inputs
+                                            })
+                                        {
+                                            log!(
+                                                "[AgentSession] thread {} resumed sid={} and the backend confirmed the attach, but the turn looked empty — NOT a stale resume (synthetic-turn Result or a silent model)",
+                                                thread_id,
+                                                resume_session_id.as_deref().unwrap_or("")
+                                            );
+                                        }
+                                        if is_stale_resume_signal(stale_inputs)
+                                            || explicit_session_not_found
+                                        {
                                             log!("[AgentSession] Stale resume detected (empty-echo heuristic or explicit session-not-found) — aborting session to retry with a fresh spawn.");
                                             agent_cancel.cancel();
                                             // Remove from sessions map so retry can start fresh
@@ -1671,7 +1739,7 @@ impl LucidosEngine {
                                             buffered_text_empty && result_text_empty,
                                         );
                                         // Capture before the `if let Some(kind)` below moves out —
-                                        // `should_propose_change_at_idle` and the post-loop cleanup
+                                        // `may_touch_change_state_at_idle` and the post-loop cleanup
                                         // both read this to refuse half-assed work.
                                         last_terminal_kind = terminal_kind.clone();
                                         if let Some(kind) = terminal_kind {
@@ -1835,35 +1903,36 @@ impl LucidosEngine {
                                         // CC skipped /harden, hardened=false propagates to the
                                         // change record and Apply runs hardening at click time.
                                         // Background bash deliberately does NOT gate this — see
-                                        // `should_propose_change_at_idle` for the rationale and
+                                        // `may_touch_change_state_at_idle` for the rationale and
                                         // the shutdown / external-repo / conflict-session guards.
-                                        if should_propose_change_at_idle(
-                                            wt_has_changes,
+                                        //
+                                        // Gated on `may_touch_change_state_at_idle` (the propose
+                                        // gate WITHOUT its `wt_has_changes` term) so the
+                                        // empty-diff arm below is reachable: a branch whose diff
+                                        // cancelled out still has a pending row to reconcile, and
+                                        // gating the whole block on `wt_has_changes` left that row
+                                        // claiming files the branch no longer had.
+                                        if may_touch_change_state_at_idle(
                                             is_external_repo,
                                             is_shutdown,
                                             conflict_change.is_some(),
                                             &last_terminal_kind,
                                         ) {
-                                            let hardened = is_harden_marker_present(&self.pool, &repo_root, &branch_name).await;
                                             let changed_files = branch_changed_files(&repo_root, &branch_name).await;
                                             if changed_files.is_empty() {
-                                                // Branch had worktree-level dirt at idle but the committed diff
-                                                // against main is empty (commit + revert, or noise that auto-commit
-                                                // captured then a subsequent edit reverted). Leave any pending row
-                                                // for the user to resolve from Review — never auto-discard.
-                                                match self.changes().get_pending_by_branch(&branch_name).await {
-                                                    Ok(Some(stale)) => {
-                                                        log!("[AgentSession] Branch {} has no actual diff but pending change {} exists — left in Review for user to resolve", branch_name, stale.id);
-                                                    }
-                                                    Ok(None) => {
-                                                        log!("[AgentSession] Skipping proposal — branch has no changed files");
-                                                    }
-                                                    Err(e) => {
-                                                        log!("[AgentSession] get_pending_by_branch({}): {} — skipping proposal", branch_name, e);
-                                                    }
-                                                }
-                                                self.broadcast_changes_updated().await;
+                                                // No committed diff against the base (nothing was
+                                                // done, or a commit + revert cancelled out). Never
+                                                // auto-discard an existing pending row — the user
+                                                // resolves it from Review — but DO re-sync it to
+                                                // zero files so the card stops advertising work the
+                                                // branch no longer carries. No pending row → nothing
+                                                // to reconcile and nothing to propose.
+                                                self.reconcile_emptied_pending_change(thread_id, &repo_root, &branch_name).await;
                                             } else {
+                                                // Only the propose path needs the marker — the
+                                                // reconcile above re-reads it itself, and only if
+                                                // it actually has a row to correct.
+                                                let hardened = is_harden_marker_present(&self.pool, &repo_root, &branch_name).await;
                                                 let requires_restart = files_require_restart(&changed_files);
                                                 let fallback = change_description_fallback(self.pool(), thread_id, &branch_name).await;
                                                 let base = default_local_branch(&repo_root).await;
@@ -1885,7 +1954,7 @@ impl LucidosEngine {
                                                     // recovery paths stamp Engine origin
                                                     // via propose_branch_changes.
                                                     origin: None,
-                                                    // Always false now: `should_propose_change_at_idle`
+                                                    // Always false now: `may_touch_change_state_at_idle`
                                                     // refuses every non-Generated terminal, so partial
                                                     // work never reaches this point. The field stays in
                                                     // the event for backward compat with persisted rows.
@@ -2372,6 +2441,7 @@ impl LucidosEngine {
             cc_reasoning_effort,
             last_terminal_kind,
             external_terminal_emitted,
+            external_continuation_requested,
             &agent_cancel,
             emitted_terminal_event,
             watchdog_fired,

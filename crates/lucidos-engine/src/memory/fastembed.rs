@@ -109,7 +109,12 @@ impl FastEmbedProvider {
         Self::with_model(&model_id_from_env())
     }
 
-    fn with_model(id: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    /// Build a provider for an explicit model id. The background loader passes
+    /// the [`EmbedderSlot`](super::embedder_slot::EmbedderSlot)'s captured id
+    /// (rather than re-reading `LUCIDOS_EMBEDDING_MODEL`) so the loaded model
+    /// always matches the id stamped on rows — `apply_to_process_env` can change
+    /// the env var between construction and the background load.
+    pub fn with_model(id: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (model, dimensions) = resolve_model(id)?;
         let options = InitOptions::new(model).with_show_download_progress(true);
         // A failed init surfaces on the boot path (a fetch-class failure boots

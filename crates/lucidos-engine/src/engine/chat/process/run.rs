@@ -6,7 +6,9 @@
 //! them together exactly as the original single function did.
 
 use crate::core::{PreferenceStore, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY};
-use crate::engine::context::{agent_context_char_budget, trim_history_from_oldest};
+use crate::engine::context::{
+    agent_context_char_budget, tool_definitions_chars, trim_history_from_oldest,
+};
 use crate::engine::thread_events::{ActorMode, EventChannel, MessageOrigin};
 use crate::engine::types::*;
 use crate::engine::LucidosEngine;
@@ -149,7 +151,7 @@ impl LucidosEngine {
         // `ImageDescribed { model, .. }` with the actual model that produced
         // the description (the user's `model_image_description` preference, or
         // the extractor's default when the preference is empty / "default").
-        let description_handle = if let (Some(imgs), Some(ref extractor)) =
+        let mut description_handle = if let (Some(imgs), Some(ref extractor)) =
             (user_images, &self.extractor)
         {
             if !imgs.is_empty() {
@@ -334,7 +336,7 @@ impl LucidosEngine {
                 let sessions = self.agent_sessions.lock().await;
                 sessions
                     .get(&thread_id)
-                    .map(|s| !s.process_exited)
+                    .map(|s| s.is_live())
                     .unwrap_or(false)
             };
 
@@ -408,7 +410,7 @@ impl LucidosEngine {
                         let at_boundary = {
                             let sessions = self.agent_sessions.lock().await;
                             match sessions.get(&thread_id) {
-                                Some(s) => s.is_waiting || s.process_exited,
+                                Some(s) => s.is_waiting || !s.is_live(),
                                 None => true,
                             }
                         };
@@ -492,7 +494,7 @@ impl LucidosEngine {
                 let send_ok = {
                     let sessions = self.agent_sessions.lock().await;
                     if let Some(session) = sessions.get(&thread_id) {
-                        if !session.process_exited {
+                        if session.is_live() {
                             // Track the expected Result before sending. If the
                             // send fails (channel dropped between the lookup
                             // and the send), undo the increment so the
@@ -615,18 +617,15 @@ impl LucidosEngine {
                 let injected = {
                     let threads = self.active_threads.lock().unwrap();
                     if let Some(handle) = threads.get(&thread_id) {
-                        handle
-                            .injection_tx
-                            .send(crate::engine::InjectedPrompt {
-                                text: user_message.to_string(),
-                                event_id: origin_event_id,
-                                mode,
-                                spawning_event_id,
-                                images,
-                                origin: origin.clone(),
-                                kind: inject_kind,
-                            })
-                            .is_ok()
+                        handle.inject(crate::engine::InjectedPrompt {
+                            text: user_message.to_string(),
+                            event_id: origin_event_id,
+                            mode,
+                            spawning_event_id,
+                            images,
+                            origin: origin.clone(),
+                            kind: inject_kind,
+                        })
                     } else {
                         false
                     }
@@ -634,6 +633,31 @@ impl LucidosEngine {
 
                 if injected {
                     log!("[Chat] Follow-up injected into active thread {} (bypassed register_thread_queued)", thread_id);
+                    // This path returns to the HTTP caller right here, so the
+                    // injected message never reaches `run_agentic_loop`'s
+                    // post-first-call emit — the handle would just be dropped.
+                    // Detach the emit instead: without it an image that arrived
+                    // mid-turn produced no `ImageDescribed` at all, so once its
+                    // bytes aged out of context the thread held no record of
+                    // what had been shown. Spawned rather than awaited to keep
+                    // the injection response immediate.
+                    if let (Some(handle), Some(origin_id)) =
+                        (description_handle.take(), origin_event_id)
+                    {
+                        let event_store = self.event_store.clone();
+                        let bus = self.event_bus.clone();
+                        tokio::spawn(async move {
+                            crate::engine::agentic_loop::emit_image_descriptions(
+                                &event_store,
+                                &bus,
+                                thread_id,
+                                origin_id,
+                                Some(EventChannel::Chat),
+                                Some(handle),
+                            )
+                            .await;
+                        });
+                    }
                     return Ok(ProcessResult {
                         response: String::new(),
                         steps: vec![],
@@ -952,17 +976,16 @@ impl LucidosEngine {
 
         // Budget for messages = model-derived total budget minus system prompt + tool
         // definitions overhead. The budget scales with the resolved model's context
-        // window (e.g. ~1.49M chars for Opus `[1m]` vs ~288k chars for default
-        // 200k-token Claude), so Opus turns aren't trimmed back to the smaller
-        // model's limit.
+        // window (e.g. ~1.49M chars for a 1M model vs ~288k chars for default
+        // 200k-token Claude), so a big-window turn isn't trimmed back to the
+        // smaller model's limit. The window comes from the model's registry row
+        // when it declares one — the id-shape fallback has no rule for
+        // OpenRouter / Gemini / local ids and would hand them all 200k.
         let provider = self.current_provider();
         let resolved_model = model_override.unwrap_or_else(|| provider.default_model());
-        let total_budget = agent_context_char_budget(resolved_model);
-        let prompt_overhead: usize = system_prompt.len()
-            + tools
-                .iter()
-                .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len() + 100)
-                .sum::<usize>();
+        let total_budget = agent_context_char_budget(self.context_window_for(resolved_model));
+        let tool_defs_chars = tool_definitions_chars(&tools);
+        let prompt_overhead: usize = system_prompt.len() + tool_defs_chars;
         let message_budget = total_budget.saturating_sub(prompt_overhead);
 
         // `loaded_knowhow_docs` was already populated up in the follow-up
@@ -1174,10 +1197,13 @@ impl LucidosEngine {
                 reasoning_effort,
                 &cancel_token,
                 &mut injection_rx,
+
+                guard.generation(),
                 &mut terminator_emitted,
                 crate::engine::agentic_loop::ContextCaptureSeed {
                     sections: &capture_sections,
                     tools: &capture_tools,
+                    tool_defs_chars,
                     model: &capture_model,
                     capture_body,
                 },

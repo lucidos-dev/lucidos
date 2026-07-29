@@ -47,25 +47,6 @@ PY
     done
 }
 
-# Resolve a container's workspace directory.
-# Prefers the `lucidos.workspace` label (set by docker-compose.dev.yml).
-# Falls back to the bind-mount source for legacy pre-named-volume containers
-# (where the host path was <workspace>/data/postgres → strip last two segments).
-_inspect_workspace_dir() {
-    local container="$1"
-    local ws_dir
-    ws_dir=$(docker inspect --format='{{index .Config.Labels "lucidos.workspace"}}' "$container" 2>/dev/null || echo "")
-    if [ -n "$ws_dir" ]; then
-        echo "$ws_dir"
-        return
-    fi
-    local mount_src
-    mount_src=$(docker inspect --format='{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{if eq .Type "bind"}}{{.Source}}{{end}}{{end}}{{end}}' "$container" 2>/dev/null || echo "")
-    if [ -n "$mount_src" ]; then
-        echo "$(dirname "$(dirname "$mount_src")")"
-    fi
-}
-
 # Probe the engine /health endpoint for a workspace's API port. Echoes the
 # raw JSON body and returns 0 when the engine answers; returns non-zero when
 # unreachable (or no port given). This is the reachability source of truth
@@ -123,9 +104,10 @@ show_workspace_status() {
     # Load ports (API + Vite + shared PG from file when available).
     local api_port="" vite_port="" pg_port="" pg_database=""
     if [ -f "$ports_file" ]; then
+        # shellcheck disable=SC1090 # <ws>/.lucidos/ports is written at runtime by allocate_ports (lib/ports.sh)
         source "$ports_file"
-        api_port="$API_PORT"
-        vite_port="$VITE_PORT"
+        api_port="${API_PORT:-}"
+        vite_port="${VITE_PORT:-}"
         pg_port="${PG_PORT:-}"
         pg_database="${PG_DATABASE:-}"
     fi
@@ -262,9 +244,10 @@ json_workspace_status() {
     # Load ports
     local api_port="" vite_port="" pg_port=""
     if [ -f "$ports_file" ]; then
+        # shellcheck disable=SC1090 # <ws>/.lucidos/ports is written at runtime by allocate_ports (lib/ports.sh)
         source "$ports_file"
-        api_port="$API_PORT"
-        vite_port="$VITE_PORT"
+        api_port="${API_PORT:-}"
+        vite_port="${VITE_PORT:-}"
     fi
 
     # Engine running? Pidfile liveness OR a responding /health. Consumers of

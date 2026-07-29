@@ -2,24 +2,24 @@
 //!
 //! Opening a stopped/new workspace shows the gateway's "Workspace starting…"
 //! 503 splash (see [`crate::proxy::starting_page`]) until the engine answers
-//! `/api/v1/health`. On a first-ever open that window is dominated by the
-//! engine downloading its embedding model (hundreds of MB) — and the engine
-//! hasn't bound HTTP yet, so the gateway can only see `Health::Booting` for the
-//! whole wait. To make the wait legible rather than opaque, the boot is split
-//! into named phases shown on the splash:
+//! `/api/v1/health`. The engine hasn't bound HTTP yet during its own startup, so
+//! the gateway can only see `Health::Booting` for the whole wait. To make the
+//! wait legible rather than opaque, the boot is split into named phases shown on
+//! the splash:
 //!
 //!   * **gateway-observed** phases the gateway sets itself ([`ProvisioningDatabase`],
 //!     [`StartingEngine`]) — see `server.rs`;
 //!   * **engine-reported** phases the engine POSTs to
 //!     `/~/api/v1/control/workspaces/:id/boot-phase` *during its own startup*,
-//!     before its HTTP server is up ([`Migrating`], [`DownloadingMemoryModel`],
-//!     [`Recovering`]) — best-effort telemetry, see the engine's
-//!     `report_boot_phase`.
+//!     before its HTTP server is up ([`Migrating`], [`Recovering`]) —
+//!     best-effort telemetry, see the engine's `report_boot_phase`.
+//!
+//! (The embedding model is NOT a boot phase — it loads in the background and
+//! never blocks the engine's boot.)
 //!
 //! [`ProvisioningDatabase`]: BootPhase::ProvisioningDatabase
 //! [`StartingEngine`]: BootPhase::StartingEngine
 //! [`Migrating`]: BootPhase::Migrating
-//! [`DownloadingMemoryModel`]: BootPhase::DownloadingMemoryModel
 //! [`Recovering`]: BootPhase::Recovering
 
 /// One named step of a workspace's cold boot, rendered as a human label on the
@@ -32,10 +32,6 @@ pub enum BootPhase {
     StartingEngine,
     /// Engine-reported: running database migrations.
     Migrating,
-    /// Engine-reported: loading/downloading the embedding model that powers
-    /// vector memory. The long pole on a first-ever open (the model is fetched
-    /// once, then cached).
-    DownloadingMemoryModel,
     /// Engine-reported: replaying recovery sweeps (sessions, queues, changes).
     Recovering,
 }
@@ -50,7 +46,6 @@ impl BootPhase {
             "provisioning-database" => Some(Self::ProvisioningDatabase),
             "starting-engine" => Some(Self::StartingEngine),
             "migrating" => Some(Self::Migrating),
-            "downloading-memory-model" => Some(Self::DownloadingMemoryModel),
             "recovering" => Some(Self::Recovering),
             _ => None,
         }
@@ -62,7 +57,6 @@ impl BootPhase {
             Self::ProvisioningDatabase => "Provisioning database…",
             Self::StartingEngine => "Starting engine…",
             Self::Migrating => "Running migrations…",
-            Self::DownloadingMemoryModel => "Downloading memory model — first run, this can take a minute…",
             Self::Recovering => "Recovering sessions…",
         }
     }
@@ -82,7 +76,6 @@ mod tests {
             "provisioning-database",
             "starting-engine",
             "migrating",
-            "downloading-memory-model",
             "recovering",
         ] {
             let phase = BootPhase::from_wire(wire).expect("known phase parses");
@@ -94,6 +87,9 @@ mod tests {
     fn unknown_wire_value_is_none() {
         assert_eq!(BootPhase::from_wire("ready"), None);
         assert_eq!(BootPhase::from_wire(""), None);
-        assert_eq!(BootPhase::from_wire("Downloading-Memory-Model"), None);
+        // The retired memory-model phase (the engine no longer reports it — the
+        // model loads in the background) parses as unknown; the tolerant
+        // `from_wire` keeps the splash on its previous label.
+        assert_eq!(BootPhase::from_wire("downloading-memory-model"), None);
     }
 }

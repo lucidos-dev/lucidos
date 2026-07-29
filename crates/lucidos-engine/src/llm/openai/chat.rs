@@ -73,7 +73,11 @@ impl OpenAiProvider {
                         }
                     }
 
-                    if !tool_calls.is_empty() {
+                    let has_tool_calls = !tool_calls.is_empty();
+
+                    // 1. Assistant `tool_calls` message first — it owns any text
+                    //    as its `content` field.
+                    if has_tool_calls {
                         let mut assistant_msg = serde_json::json!({
                             "role": "assistant",
                             "tool_calls": tool_calls,
@@ -83,33 +87,51 @@ impl OpenAiProvider {
                                 serde_json::Value::String(text_parts.join("\n"));
                         }
                         openai_messages.push(assistant_msg);
-                    } else if !image_parts.is_empty() {
-                        // When images are present, use array-of-parts content format
-                        let mut content_parts: Vec<serde_json::Value> = Vec::new();
-                        if !text_parts.is_empty() {
-                            content_parts.push(serde_json::json!({
-                                "type": "text",
-                                "text": text_parts.join("\n"),
-                            }));
-                        }
-                        content_parts.extend(image_parts);
-                        openai_messages.push(serde_json::json!({
-                            "role": msg.role,
-                            "content": content_parts,
-                        }));
-                    } else if !text_parts.is_empty() {
-                        openai_messages.push(serde_json::json!({
-                            "role": msg.role,
-                            "content": text_parts.join("\n"),
-                        }));
                     }
 
+                    // 2. Tool-result `tool` messages MUST immediately follow the
+                    //    assistant `tool_calls` message — before any user
+                    //    text/image content — or strict providers (Moonshot/Kimi,
+                    //    OpenAI) reject with HTTP 400 "an assistant message with
+                    //    'tool_calls' must be followed by tool messages responding
+                    //    to each 'tool_call_id'". The agentic loop packs the
+                    //    ToolResult block(s) and a trailing instruction Text into
+                    //    ONE user `Message::Blocks`, so emitting the text before
+                    //    the tool messages would wedge a `user` message between the
+                    //    assistant `tool_calls` and its responses (the observed
+                    //    kimi-k3 failure — thread 85239abe).
                     for (tool_call_id, content) in tool_results {
                         openai_messages.push(serde_json::json!({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
                             "content": content,
                         }));
+                    }
+
+                    // 3. Remaining user text/image content, AFTER the tool
+                    //    messages. Skipped when this block was an assistant
+                    //    `tool_calls` message (step 1 already consumed its text).
+                    if !has_tool_calls {
+                        if !image_parts.is_empty() {
+                            // When images are present, use array-of-parts content format
+                            let mut content_parts: Vec<serde_json::Value> = Vec::new();
+                            if !text_parts.is_empty() {
+                                content_parts.push(serde_json::json!({
+                                    "type": "text",
+                                    "text": text_parts.join("\n"),
+                                }));
+                            }
+                            content_parts.extend(image_parts);
+                            openai_messages.push(serde_json::json!({
+                                "role": msg.role,
+                                "content": content_parts,
+                            }));
+                        } else if !text_parts.is_empty() {
+                            openai_messages.push(serde_json::json!({
+                                "role": msg.role,
+                                "content": text_parts.join("\n"),
+                            }));
+                        }
                     }
                 }
             }
@@ -175,10 +197,11 @@ impl OpenAiProvider {
             body["tools"] = serde_json::Value::Array(tool_defs);
         }
 
-        // Map unified reasoning_effort to OpenAI's format ("max" → "xhigh")
+        // Map unified reasoning_effort to OpenAI's per-model vocabulary
+        // (GPT-5.6 keeps "max"; earlier models map "max" → "xhigh").
         if let Some(effort) = reasoning_effort {
             body["reasoning_effort"] =
-                serde_json::Value::String(openai_reasoning_effort(effort).to_string());
+                serde_json::Value::String(openai_reasoning_effort(effort, model).to_string());
         }
 
         body
@@ -486,6 +509,70 @@ mod tests {
         assert_eq!(resp.stop_reason.as_deref(), Some("length"));
         assert_eq!(resp.input_tokens, Some(16000));
         assert_eq!(resp.output_tokens, Some(0));
+    }
+
+    /// Regression: after a tool call the agentic loop packs the ToolResult and
+    /// a trailing instruction Text into ONE user `Message::Blocks`. The
+    /// serializer must emit the `tool` message IMMEDIATELY after the assistant
+    /// `tool_calls` message — never wedge the user text between them — or strict
+    /// providers (Moonshot/Kimi, OpenAI) reject with HTTP 400 "an assistant
+    /// message with 'tool_calls' must be followed by tool messages … the
+    /// following tool_call_ids did not have response messages: load_knowhow:0".
+    /// (Observed on moonshotai/kimi-k3 via OpenRouter, thread 85239abe.)
+    #[test]
+    fn tool_result_immediately_follows_assistant_tool_calls() {
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "load_knowhow:0".to_string(),
+                    name: "load_knowhow".to_string(),
+                    input: serde_json::json!({ "id": "browser-learning/reflection" }),
+                    thought_signature: None,
+                }]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "load_knowhow:0".to_string(),
+                        content: "…knowhow body…".to_string(),
+                    },
+                    ContentBlock::Text {
+                        text: "Results above. Do NOT repeat analysis you already gave."
+                            .to_string(),
+                    },
+                ]),
+            },
+        ];
+
+        let wire = OpenAiProvider::convert_messages_chat(&messages);
+
+        // Exactly three wire messages, in order:
+        //   assistant(tool_calls) → tool(result) → user(text)
+        assert_eq!(wire.len(), 3, "expected assistant, tool, user — got {:?}", wire);
+        assert_eq!(wire[0]["role"], "assistant");
+        assert_eq!(wire[0]["tool_calls"][0]["id"], "load_knowhow:0");
+        assert_eq!(wire[1]["role"], "tool");
+        assert_eq!(wire[1]["tool_call_id"], "load_knowhow:0");
+        assert_eq!(wire[2]["role"], "user");
+        assert!(wire[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Results above"));
+
+        // The tool response must be ADJACENT to the assistant tool_calls — no
+        // `user` message wedged between (that is the Moonshot/Kimi 400).
+        let assistant_idx = wire.iter().position(|m| m["role"] == "assistant").unwrap();
+        let tool_idx = wire
+            .iter()
+            .position(|m| m["role"] == "tool" && m["tool_call_id"] == "load_knowhow:0")
+            .unwrap();
+        assert_eq!(
+            tool_idx,
+            assistant_idx + 1,
+            "tool result must immediately follow the assistant tool_calls message"
+        );
     }
 
     /// `stream_options.include_usage` must be present in the Chat

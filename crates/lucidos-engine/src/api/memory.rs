@@ -204,6 +204,20 @@ pub(super) async fn rebuild_memory(
             Json(serde_json::json!({ "status": "already_running" })),
         );
     }
+    // The embedding model loads in the background (see `memory::EmbedderSlot`). A
+    // rebuild clears entries before re-indexing, so running it before the model
+    // lands would wipe memory it can't re-index. Refuse with a clear message
+    // instead of spawning a destructive no-op (the engine-side rebuild enforces
+    // the same floor).
+    if !state.engine.embedder().is_ready() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "embedder_not_ready",
+                "error": "The embedding model is still loading — memory rebuild is unavailable until it finishes (running it now would clear memory it can't re-index). Try again once memory is active."
+            })),
+        );
+    }
     let force = params.get("force").map(|v| v == "true").unwrap_or(false);
     let re_extract_stale = params
         .get("re_extract_stale")

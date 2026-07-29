@@ -413,3 +413,110 @@ fn debug_redacts_email_account_password() {
     assert!(dbg.contains("imap.work.com"));
     assert!(dbg.contains("me@work.com"));
 }
+
+/// Accept TCP connections and never respond — models a stalled mail server
+/// (connect succeeds; the protocol greeting never arrives). Held sockets stay
+/// open so the client sees silence, not a connection reset.
+async fn stalled_listener() -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hold = tokio::spawn(async move {
+        let mut open = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            open.push(sock); // keep open, stay silent
+        }
+    });
+    (port, hold)
+}
+
+/// Minimal plain-TCP account fixture aimed at the given IMAP/SMTP endpoints
+/// (plain TCP so a stall test exercises the protocol phase, not TLS).
+fn stall_test_account(imap_port: i32, smtp_port: i32) -> EmailAccount {
+    EmailAccount {
+        id: uuid::Uuid::nil(),
+        name: "test".to_string(),
+        email_address: "me@example.com".to_string(),
+        imap_host: "127.0.0.1".to_string(),
+        imap_port,
+        smtp_host: "127.0.0.1".to_string(),
+        smtp_port,
+        username: "me@example.com".to_string(),
+        password: "pw".to_string(),
+        use_tls: false,
+        require_send_confirmation: false,
+        oauth_account_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+/// lettre's async SMTP transport applies its 60s timeout only to the TCP
+/// connect — the command phase (greeting, EHLO, AUTH, DATA) is unbounded, so a
+/// server that accepts the connection and then stalls used to hang the send
+/// forever (the frontend gave up at its own 10s with a misleading generic
+/// "request timed out" while the engine kept waiting with no log). The outer
+/// wall-clock bound in `send_email_with_timeout` is what guarantees the send
+/// resolves, with an error that names the SMTP endpoint.
+#[tokio::test]
+async fn send_email_times_out_with_descriptive_error_when_smtp_stalls() {
+    let (port, hold) = stalled_listener().await;
+    let account = stall_test_account(993, port as i32);
+
+    let started = std::time::Instant::now();
+    let err = EmailClient::send_email_with_timeout(
+        &account,
+        "to@example.com",
+        "subject",
+        "body",
+        None,
+        None,
+        None,
+        None,
+        &[],
+        std::time::Duration::from_millis(500),
+    )
+    .await
+    .expect_err("send against a stalled SMTP server must error, not hang");
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "send must resolve promptly once the bound elapses"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("timed out"), "got: {msg}");
+    // Frontend rule: errors name the entity — the SMTP endpoint here.
+    assert!(
+        msg.contains(&format!("127.0.0.1:{port}")),
+        "error must name the SMTP host:port: {msg}"
+    );
+    hold.abort();
+}
+
+/// Sibling of the SMTP bound: IMAP session setup (connect + greeting + auth)
+/// had no timeout on any phase, so email reads against a stalled server hung
+/// the calling chat turn indefinitely. (Post-auth stalls are bounded by the
+/// whole-operation `IMAP_OP_TIMEOUT` wrapper in `email_client.rs`, the same
+/// `tokio::time::timeout` mechanism verified here.)
+#[tokio::test]
+async fn imap_connect_times_out_with_descriptive_error_when_server_stalls() {
+    let (port, hold) = stalled_listener().await;
+    let account = stall_test_account(port as i32, 587);
+
+    let started = std::time::Instant::now();
+    let err = imap_connect_with_timeout(&account, None, std::time::Duration::from_millis(500))
+        .await
+        .map(|_| ())
+        .expect_err("connect against a silent IMAP server must error, not hang");
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "connect must resolve promptly once the bound elapses"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("timed out"), "got: {msg}");
+    assert!(
+        msg.contains(&format!("127.0.0.1:{port}")),
+        "error must name the IMAP host:port: {msg}"
+    );
+    hold.abort();
+}

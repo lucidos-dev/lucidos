@@ -556,8 +556,9 @@
     background: var(--accent-green);
 }
 
+/* Changed is a neutral third state alongside added/removed — not a caution. */
 .diff-strip-changed {
-    background: var(--accent-yellow);
+    background: var(--accent-notable);
 }
 
 .diff-strip-removed {
@@ -578,7 +579,7 @@
 }
 
 .diff-bg-changed {
-    background: color-mix(in srgb, var(--accent-yellow) 10%, transparent);
+    background: color-mix(in srgb, var(--accent-notable) 10%, transparent);
 }
 
 .diff-bg-removed {

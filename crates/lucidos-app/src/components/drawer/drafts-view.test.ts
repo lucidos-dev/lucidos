@@ -13,7 +13,7 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { composingThreads, draftThreadCount, draftThreads, hasDrafts } from './ThreadDrawer';
+import { composingThreads, draftThreadCount, draftThreads } from './ThreadDrawer';
 import type { ThreadState, ThreadMeta } from '../../store/thread-events';
 import { _resetComposeDraftsForTesting, setDraft, type ComposeDraft } from '../../store/composeDrafts';
 import { threadMap } from '../../store/store';
@@ -194,38 +194,6 @@ describe('composingThreads', () => {
     // (visible "Empty draft"-style row) recurs with whitespace as the title.
     const composing = makeThread('a', { state: 'composing', composeText: '   \n\t' });
     expect(composingThreads(asMap([composing]))).toEqual([]);
-  });
-});
-
-describe('hasDrafts', () => {
-  // Mirrors the `draftThreads` predicate: true iff that list would be non-empty.
-  // Drives drafts-icon visibility — see the matching draftThreads tests above.
-  it('is false with no threads at all', () => {
-    threadMap.value = new Map();
-    expect(hasDrafts.value).toBe(false);
-  });
-
-  it('is false when threads exist but none carry a draft', () => {
-    threadMap.value = asMap([
-      makeThread('a', { state: 'active' }),
-      makeThread('b', { state: 'composing' }), // ghost composing row, no content
-    ]);
-    expect(hasDrafts.value).toBe(false);
-  });
-
-  it('is true when a composing thread carries draft text', () => {
-    threadMap.value = asMap([makeThread('a', { state: 'composing', composeText: 'hi' })]);
-    expect(hasDrafts.value).toBe(true);
-  });
-
-  it('is true when an active thread carries a follow-up draft', () => {
-    threadMap.value = asMap([makeThread('a', { state: 'active', composeText: 'follow-up' })]);
-    expect(hasDrafts.value).toBe(true);
-  });
-
-  it('is false when only a discarded thread has stale compose content', () => {
-    threadMap.value = asMap([makeThread('a', { state: 'discarded', composeText: 'orphan' })]);
-    expect(hasDrafts.value).toBe(false);
   });
 });
 

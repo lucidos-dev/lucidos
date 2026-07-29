@@ -1153,6 +1153,14 @@ const MODEL_ENABLED_ARG: Arg = Arg {
     loc: ArgIn::Body,
     description: "Whether the model is enabled (shown in the picker).",
 };
+const MODEL_CONTEXT_WINDOW_ARG: Arg = Arg {
+    name: "context_window",
+    ty: ArgType::Int,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "Context window in tokens (e.g. 1048576). Set it to the window the model actually serves. Omitting it falls back to guessing from the model id (claude-* → 200k unless the id ends in [1m], gpt-5* → 400k, anything else → 200k) — that guess has no rule for OpenRouter / Gemini / local ids, so they are treated as 200k however large they really are. Guesses err low on purpose: too low only trims context early, too high makes the provider reject the request.",
+};
 
 const MODELS_OPS: &[Operation] = &[
     Operation {
@@ -1175,7 +1183,13 @@ const MODELS_OPS: &[Operation] = &[
         summary: "Register a new model in the picker.",
         method: Method::Post,
         path: "/models",
-        args: &[MODEL_ID_BODY_ARG, MODEL_LABEL_ARG, MODEL_PROVIDER_ARG, MODEL_SORT_ORDER_ARG],
+        args: &[
+            MODEL_ID_BODY_ARG,
+            MODEL_LABEL_ARG,
+            MODEL_PROVIDER_ARG,
+            MODEL_SORT_ORDER_ARG,
+            MODEL_CONTEXT_WINDOW_ARG,
+        ],
         cli_name: "add",
         sdk_name: "add",
         mutating: true,
@@ -1228,6 +1242,7 @@ const MODELS_OPS: &[Operation] = &[
             MODEL_PROVIDER_OPT_ARG,
             MODEL_SORT_ORDER_ARG,
             MODEL_ENABLED_ARG,
+            MODEL_CONTEXT_WINDOW_ARG,
         ],
         cli_name: "update",
         sdk_name: "update",

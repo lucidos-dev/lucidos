@@ -550,6 +550,255 @@ describe('groupIntoExchanges — response continuation after a mid-flight ChildT
     expect(ctc.steps.map(s => s.event.type)).not.toContain('ResponseGenerated');
     expect(exchangeStatus(divider, '', false, false, false)).toBe('done');
   });
+
+  it('re-anchors the answered divider BELOW the intervening card so the live reply renders last', () => {
+    // Real thread 8144b43e: the agent asks a question; ten minutes later a
+    // spawned sub-thread finishes and lands a ChildThreadCompleted card BELOW
+    // the still-open question; the user then answers and the agent resumes.
+    //
+    // The redirect correctly stays on the divider (the test above), but the
+    // divider was CREATED before the card, so it kept its earlier slot in the
+    // timeline. Both user-visible halves follow from that one fact while the
+    // thread is running:
+    //   1. every post-answer step rendered ABOVE the child-completion card, and
+    //   2. the stepless card — now the last exchange on a running thread —
+    //      never received the continuation it fell through to 'pending' for,
+    //      so the bottom of the thread sat frozen on "Requesting".
+    // Together they read as a stuck agent while it was in fact working, just
+    // higher up the page. Fix: re-anchor the divider to its resolution point.
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'do the release', _eventId: 'msg-1', created: '2026-07-28T13:50:05Z' } as StoredEvent],
+      [2, { type: 'ToolCalled', name: 'ask_user_question', args: {}, _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-07-28T13:56:39Z' } as StoredEvent],
+      [3, { type: 'UserQuestionAsked', tool_use_id: 'tu-1', cc_session_id: '', question: 'Re-fold onto current main?', options: [{ id: 'opt-0', label: 'Re-fold' }], channel: 'chat', created: '2026-07-28T13:56:40Z' } as StoredEvent],
+      // Sub-thread finishes while the card is on screen — a boundary lands
+      // AFTER the divider was created.
+      [4, { type: 'ChildThreadCompleted', child_thread_id: 'child-1', child_thread_title: 'Fixing Lucidos Installer Version Bug', status: 'success', summary: 'Hardening complete.', _eventId: 'ctc-1', created: '2026-07-28T14:06:50Z' } as StoredEvent],
+      [5, { type: 'UserQuestionAnswered', tool_use_id: 'tu-1', answer: { kind: 'Selected', option_id: 'opt-0' }, created: '2026-07-28T14:07:25Z' } as StoredEvent],
+      // The question-asking tool's own result pairs back to its ToolCalled.
+      [6, { type: 'ToolResult', name: 'ask_user_question', result: 'ok', tool_called_event_id: 'tc-1', request_event_id: 'msg-1', created: '2026-07-28T14:10:40Z' } as StoredEvent],
+      // Live continuation — the thread is still RUNNING (no terminal yet).
+      [7, { type: 'TextStreamed', text: 'Re-fold approved. Clearing the old worktree…', request_event_id: 'msg-1', created: '2026-07-28T14:10:40Z' } as StoredEvent],
+      [8, { type: 'ToolCalled', name: 'run_bash', args: {}, _eventId: 'tc-2', request_event_id: 'msg-1', created: '2026-07-28T14:11:09Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+
+    // The divider is re-anchored to the END — below the card that landed while
+    // it waited — so its continuation is the last thing in the timeline.
+    expect(exchanges.map(e => e.userEvent.type)).toEqual([
+      'MessageReceived',
+      'ChildThreadCompleted',
+      'UserQuestionAsked',
+    ]);
+
+    const ctc = exchanges[1];
+    const divider = exchanges[2];
+
+    // The reply still belongs to the card the user answered (3e54cacb intact).
+    const divTypes = divider.steps.map(s => s.event.type);
+    expect(divTypes).toContain('UserQuestionAnswered');
+    expect(divTypes).toContain('TextStreamed');
+    expect(divTypes).toContain('ToolCalled');
+    expect(ctc.steps.map(s => s.event.type)).not.toContain('TextStreamed');
+
+    // Half 2: the superseded card is terminal, not a phantom "Requesting"
+    // spinner — it is no longer `isLast` on a running (non-idle) thread.
+    expect(exchangeStatus(ctc, '', /*isLast*/ false, false, false, /*threadIdle*/ false, false)).toBe('done');
+    // …and the live work reads as active on the exchange that actually has it.
+    expect(exchangeStatus(divider, '', /*isLast*/ true, false, false, /*threadIdle*/ false, false)).toBe('streaming');
+  });
+
+  it('advances the redirect past an ALREADY-ANSWERED divider when a child completes mid-response', () => {
+    // Same stuck-looking thread, reached from the other ordering: the question
+    // is answered FIRST, the agent resumes, and only then does a spawned
+    // sub-thread finish. The parked-divider exception must not apply here — the
+    // turn is an ordinary in-flight response again, so this is the plain
+    // 4d193da8 case and the redirect has to advance to the card. Gating that
+    // exception on the divider's TYPE alone kept it in force forever after the
+    // answer, so the post-completion work routed back up into the answered card
+    // and the stepless card sat last on 'Requesting'.
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'go', _eventId: 'msg-1', created: '2026-07-28T10:00:00Z' } as StoredEvent],
+      [2, { type: 'ToolCalled', name: 'ask_user_question', args: {}, _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-07-28T10:00:01Z' } as StoredEvent],
+      [3, { type: 'UserQuestionAsked', tool_use_id: 'tu-1', cc_session_id: '', question: 'q?', options: [{ id: 'a', label: 'A' }], created: '2026-07-28T10:00:02Z' } as StoredEvent],
+      [4, { type: 'UserQuestionAnswered', tool_use_id: 'tu-1', answer: { kind: 'Selected', option_id: 'a' }, created: '2026-07-28T10:00:03Z' } as StoredEvent],
+      [5, { type: 'TextStreamed', text: 'spawning a sub-thread', request_event_id: 'msg-1', created: '2026-07-28T10:00:04Z' } as StoredEvent],
+      [6, { type: 'ChildThreadCompleted', child_thread_id: 'c1', status: 'success', summary: 'done', _eventId: 'ctc-1', created: '2026-07-28T10:05:00Z' } as StoredEvent],
+      [7, { type: 'ToolCalled', name: 'run_bash', args: {}, _eventId: 'tc-2', request_event_id: 'msg-1', created: '2026-07-28T10:05:01Z' } as StoredEvent],
+      [8, { type: 'TextStreamed', text: 'continuing after the child', request_event_id: 'msg-1', created: '2026-07-28T10:05:02Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map(e => e.userEvent.type)).toEqual([
+      'MessageReceived',
+      'UserQuestionAsked',
+      'ChildThreadCompleted',
+    ]);
+    const divider = exchanges[1];
+    const ctc = exchanges[2];
+
+    // Pre-completion reply stays with the answered question.
+    expect(divider.steps.map(s => s.event.type)).toContain('UserQuestionAnswered');
+    expect(divider.steps.filter(s => s.event.type === 'TextStreamed')).toHaveLength(1);
+    // The post-completion continuation groups UNDER the card, so the card is no
+    // longer a stepless last exchange spinning 'Requesting' on a running thread.
+    const ctcTypes = ctc.steps.map(s => s.event.type);
+    expect(ctcTypes).toContain('ToolCalled');
+    expect(ctcTypes).toContain('TextStreamed');
+    expect(exchangeStatus(ctc, '', /*isLast*/ true, false, false, /*threadIdle*/ false, false)).not.toBe('pending');
+  });
+
+  it('leaves a CC permission divider in place — its continuation flows to the intervening card', () => {
+    // Counterpart gate: `CodingAgentPermissionRequest` is never a reqIdRedirect
+    // target (CC events aren't request-id routed), so CC's post-grant work
+    // follows `current` into the intervening boundary. Moving the divider below
+    // that boundary would strand the card under its own continuation.
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'edit foo', _eventId: 'msg-1', created: '2026-07-28T04:00:00Z' } as StoredEvent],
+      [2, { type: 'CodingAgentPermissionRequest', request_id: 'r1', tool_use_id: 'tu', tool_name: 'Edit', input: {}, summary: 'Edit /foo', created: '2026-07-28T04:00:01Z' } as StoredEvent],
+      [3, { type: 'ChildThreadCompleted', child_thread_id: 'c1', status: 'success', summary: 'x', _eventId: 'ctc-1', created: '2026-07-28T04:00:02Z' } as StoredEvent],
+      [4, { type: 'CodingAgentPermissionResolved', request_id: 'r1', allowed: true, created: '2026-07-28T04:00:03Z' } as StoredEvent],
+      [5, { type: 'CodingAgentTextStreamed', text: 'edited', created: '2026-07-28T04:00:04Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map(e => e.userEvent.type)).toEqual([
+      'MessageReceived',
+      'CodingAgentPermissionRequest',
+      'ChildThreadCompleted',
+    ]);
+    // The grant routes back to its divider; the CC continuation stays with the
+    // boundary that is `current`.
+    expect(exchanges[1].steps.map(s => s.event.type)).toContain('CodingAgentPermissionResolved');
+    expect(exchanges[2].steps.map(s => s.event.type)).toContain('CodingAgentTextStreamed');
+  });
+});
+
+describe('continuationMoved — stale Thinking marker after a mid-flight handoff', () => {
+  // Real thread 8144b43e: the agent was mid-thought when a spawned sub-thread
+  // finished. The wake lands as a `ChildThreadCompleted` boundary and the turn's
+  // continuation moves to that card — so the `ThoughtStreamed` marker left
+  // pending in the pre-completion exchange has nothing left that can resolve it.
+  // The turn is still running (no terminal, thread not idle), so neither
+  // finalize trigger fired and an old "Thinking" row kept shimmering half a
+  // screen above the exchange the agent was actually working in.
+  const HANDOFF = new Map<number, StoredEvent>([
+    [1, { type: 'MessageReceived', text: 'do the release', _eventId: 'msg-1', created: '2026-07-28T20:14:00Z' } as StoredEvent],
+    [2, { type: 'ThoughtStreamed', text: 'planning', request_event_id: 'msg-1', created: '2026-07-28T20:14:01Z' } as StoredEvent],
+    [3, { type: 'ToolCalled', name: 'run_bash', args: {}, _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-07-28T20:14:02Z' } as StoredEvent],
+    [4, { type: 'ToolResult', name: 'run_bash', result: 'ok', tool_called_event_id: 'tc-1', request_event_id: 'msg-1', created: '2026-07-28T20:14:03Z' } as StoredEvent],
+    // The marker that strands: the LLM was re-invoked and the child completed
+    // before it produced any output.
+    [5, { type: 'ThoughtStreamed', text: 'thinking again', request_event_id: 'msg-1', created: '2026-07-28T20:14:04Z' } as StoredEvent],
+    [6, { type: 'ChildThreadCompleted', child_thread_id: 'child-1', child_thread_title: 'Fixing Duplicate Apple Notarization Submissions', status: 'canceled', summary: 'canceled', _eventId: 'ctc-1', created: '2026-07-28T20:15:03Z' } as StoredEvent],
+    // The turn keeps streaming under the card — still running, no terminal.
+    [7, { type: 'ToolCalled', name: 'run_bash', args: {}, _eventId: 'tc-2', request_event_id: 'msg-1', created: '2026-07-28T20:15:50Z' } as StoredEvent],
+    [8, { type: 'ToolResult', name: 'run_bash', result: 'ok', tool_called_event_id: 'tc-2', request_event_id: 'msg-1', created: '2026-07-28T20:15:51Z' } as StoredEvent],
+    [9, { type: 'ThoughtStreamed', text: 'still going', request_event_id: 'msg-1', created: '2026-07-28T20:15:52Z' } as StoredEvent],
+  ]);
+
+  it('drops the orphaned Thinking marker from the handed-off exchange while the turn runs on', () => {
+    const exchanges = groupIntoExchanges(HANDOFF);
+    expect(exchanges.map(e => e.userEvent.type)).toEqual(['MessageReceived', 'ChildThreadCompleted']);
+    const mr = exchanges[0];
+    expect(mr.continuationMoved).toBe(true);
+
+    // Thread is RUNNING (not idle) and the exchange has no terminal event.
+    const events = exchangeResponseEvents(mr, 0, /* isLast */ false, /* threadIdle */ false);
+    expect(events.filter(e => e.type === 'step' && e.success === null)).toHaveLength(0);
+    // The bare trailing marker is noise once it can never resolve — same
+    // treatment a completed exchange gets.
+    const last = events[events.length - 1];
+    expect(last.type === 'step' && last.description === 'Thinking').toBe(false);
+    // The summary step list agrees with the inline one.
+    expect(exchangeSteps(mr, /* isLast */ false, /* threadIdle */ false).filter(s => s.success === null)).toHaveLength(0);
+  });
+
+  it('leaves the live Thinking marker alone in the exchange that took the continuation', () => {
+    const exchanges = groupIntoExchanges(HANDOFF);
+    const ctc = exchanges[1];
+    expect(ctc.continuationMoved).toBeFalsy();
+    const events = exchangeResponseEvents(ctc, 0, /* isLast */ true, /* threadIdle */ false);
+    expect(events.filter(e => e.type === 'step' && e.success === null)).toHaveLength(1);
+    expect(exchangeStatus(ctc, '', /* isLast */ true, false, false, /* threadIdle */ false, false)).toBe('streaming');
+  });
+
+  it('keeps a pending TOOL step spinning — its result can still re-route back by tool id', () => {
+    // The `ask_user_question` shape: the call's "Executing …" spinner belongs to
+    // the MR exchange and is resolved by a ToolResult that routes back by
+    // `tool_called_event_id` long after the divider took the continuation. Only
+    // Thinking markers are stale on a handoff, never tool steps.
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'do it', _eventId: 'msg-1', created: '2026-07-28T09:00:00Z' } as StoredEvent],
+      [2, { type: 'ToolCalled', name: 'ask_user_question', args: {}, description: 'Executing ask_user_question...', _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-07-28T09:00:01Z' } as StoredEvent],
+      [3, { type: 'UserQuestionAsked', tool_use_id: 'tu-1', cc_session_id: '', question: 'q?', options: [{ id: 'a', label: 'A' }], created: '2026-07-28T09:00:02Z' } as StoredEvent],
+    ]);
+    const mr = groupIntoExchanges(events)[0];
+    expect(mr.continuationMoved).toBe(true);
+    const rendered = exchangeResponseEvents(mr, 0, /* isLast */ false, /* threadIdle */ false);
+    const pending = rendered.filter(e => e.type === 'step' && e.success === null);
+    expect(pending).toHaveLength(1);
+    expect(pending[0].type === 'step' && pending[0].description).toBe('Executing ask_user_question...');
+  });
+
+  it('does NOT mark a turn whose follow-up is still queued — the loop is still working in it', () => {
+    // Mid-flight injection: the user's follow-up lands as a stepless
+    // MessageReceived while the agent keeps streaming under the FIRST message's
+    // request id. The first exchange is non-last but very much alive, so its
+    // Thinking marker must keep shimmering.
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'first', _eventId: 'msg-1', created: '2026-07-28T09:10:00Z' } as StoredEvent],
+      [2, { type: 'ToolCalled', name: 'run_bash', args: {}, _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-07-28T09:10:01Z' } as StoredEvent],
+      [3, { type: 'ToolResult', name: 'run_bash', result: 'ok', tool_called_event_id: 'tc-1', request_event_id: 'msg-1', created: '2026-07-28T09:10:02Z' } as StoredEvent],
+      [4, { type: 'MessageReceived', text: 'second', _eventId: 'msg-2', created: '2026-07-28T09:10:03Z' } as StoredEvent],
+      [5, { type: 'ThoughtStreamed', text: 'still on the first', request_event_id: 'msg-1', created: '2026-07-28T09:10:04Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    const first = exchanges[0];
+    expect(first.continuationMoved).toBeFalsy();
+    const rendered = exchangeResponseEvents(first, 0, /* isLast */ false, /* threadIdle */ false);
+    const pending = rendered.filter(e => e.type === 'step' && e.success === null);
+    expect(pending).toHaveLength(1);
+    expect(pending[0].type === 'step' && pending[0].description).toBe('Thinking');
+  });
+
+  it('marks the exchange that actually owned the turn, not just the queued message in front of it', () => {
+    // The 194474de shape: an uningested queued follow-up is `current` when the
+    // divider is raised, so the exchange the redirect is moved OFF is the older
+    // one that owns the turn's req_id — that is the one whose markers strand.
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'first', _eventId: 'msg-1', created: '2026-07-28T09:30:00Z' } as StoredEvent],
+      [2, { type: 'ThoughtStreamed', text: 'planning', request_event_id: 'msg-1', created: '2026-07-28T09:30:01Z' } as StoredEvent],
+      // Queued follow-up lands, then the turn raises a question.
+      [3, { type: 'MessageReceived', text: 'second', _eventId: 'msg-2', created: '2026-07-28T09:30:02Z' } as StoredEvent],
+      [4, { type: 'UserQuestionAsked', tool_use_id: 'tu-1', cc_session_id: '', question: 'q?', options: [{ id: 'a', label: 'A' }], created: '2026-07-28T09:30:03Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    const first = exchanges.find(e => e.userEvent._eventId === 'msg-1')!;
+    expect(first.continuationMoved).toBe(true);
+    const rendered = exchangeResponseEvents(first, 0, /* isLast */ false, /* threadIdle */ false);
+    expect(rendered.filter(e => e.type === 'step' && e.success === null)).toHaveLength(0);
+  });
+
+  it('clears the mark when the handed-off exchange takes the continuation back', () => {
+    // A queued follow-up can be `previousCurrent` when a divider is raised (real
+    // thread 194474de), so it gets marked without ever having owned the turn.
+    // When its `UserPromptInjected` is absorbed it becomes the active turn — the
+    // mark must not survive and freeze its live spinner.
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'first', _eventId: 'msg-1', created: '2026-07-28T09:20:00Z' } as StoredEvent],
+      [2, { type: 'ToolCalled', name: 'ask_user_question', args: {}, _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-07-28T09:20:01Z' } as StoredEvent],
+      [3, { type: 'MessageReceived', text: 'second', _eventId: 'msg-2', created: '2026-07-28T09:20:02Z' } as StoredEvent],
+      [4, { type: 'UserQuestionAsked', tool_use_id: 'tu-1', cc_session_id: '', question: 'q?', options: [{ id: 'a', label: 'A' }], created: '2026-07-28T09:20:03Z' } as StoredEvent],
+      [5, { type: 'UserQuestionAnswered', tool_use_id: 'tu-1', answer: { kind: 'Selected', option_id: 'a' }, created: '2026-07-28T09:20:04Z' } as StoredEvent],
+      [6, { type: 'ToolResult', name: 'ask_user_question', result: 'a', tool_called_event_id: 'tc-1', request_event_id: 'msg-1', created: '2026-07-28T09:20:05Z' } as StoredEvent],
+      // The queued follow-up is ingested — it now owns the turn.
+      [7, { type: 'UserPromptInjected', text: 'second', mode: 'human', injected_message_id: 'msg-2', request_event_id: 'msg-1', created: '2026-07-28T09:20:06Z' } as StoredEvent],
+      [8, { type: 'ThoughtStreamed', text: 'on the follow-up now', request_event_id: 'msg-1', created: '2026-07-28T09:20:07Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    const followup = exchanges.find(e => e.userEvent._eventId === 'msg-2')!;
+    expect(followup.continuationMoved).toBeFalsy();
+    const rendered = exchangeResponseEvents(followup, 0, /* isLast */ true, /* threadIdle */ false);
+    expect(rendered.filter(e => e.type === 'step' && e.success === null)).toHaveLength(1);
+  });
 });
 
 describe('groupIntoExchanges — CodingAgentToolResult routing across permission boundaries', () => {

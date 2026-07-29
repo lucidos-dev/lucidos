@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32};
+use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -42,40 +42,19 @@ async fn seed_cc_thread(bus: &EventBus, thread_id: Uuid) {
     .expect("SessionStarted persisted");
 }
 
-fn make_session(last_event_at_ms: i64) -> AgentSession {
-    let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel::<AgentUserInput>();
-    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
-    AgentSession {
-        msg_tx,
-        is_waiting: false,
-        has_changes: false,
-        requires_restart: false,
-        pending_stop: None,
-        cancel_actor: None,
-        redirect_followup: false,
-        stop: Arc::new(tokio::sync::Notify::new()),
-        interrupt: Arc::new(tokio::sync::Notify::new()),
-        idle_notify: Arc::new(tokio::sync::Notify::new()),
-        apply_now_in_progress: false,
-        process_exited: false,
-        worktree_path: None,
-        branch_name: None,
-        repo_root: None,
-        cc_session_id: None,
-        shutting_down: Arc::new(AtomicBool::new(false)),
-        external_terminal_emitted: Arc::new(AtomicBool::new(false)),
-        control_tx,
-        builtin_commands: vec![],
-        skill_commands: vec![],
-        current_model: None,
-        current_reasoning_effort: None,
-        last_event_at: Arc::new(AtomicI64::new(last_event_at_ms)),
-        pending_followups: Arc::new(AtomicU32::new(0)),
-        question_resume_pending: false,
-        tools_in_flight: Arc::new(AtomicI32::new(0)),
-        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
-        agent_cancel: tokio_util::sync::CancellationToken::new(),
-    }
+/// Mid-turn (`is_waiting = false`) session with a given heartbeat. Returns the
+/// receiver so the caller can keep the session live — dropping it makes the
+/// session read as a phantom, which the watchdog treats as `loop_ended`.
+fn make_session(
+    last_event_at_ms: i64,
+) -> (
+    AgentSession,
+    tokio::sync::mpsc::UnboundedReceiver<AgentUserInput>,
+) {
+    let (mut session, msg_rx) = AgentSession::for_test();
+    session.is_waiting = false;
+    session.last_event_at = Arc::new(AtomicI64::new(last_event_at_ms));
+    (session, msg_rx)
 }
 
 fn stale_for(limit_ms: i64) -> i64 {
@@ -103,7 +82,7 @@ async fn tick_fires_for_stuck_session_emits_continuation_requested_and_drops_ent
     let thread_id = Uuid::new_v4();
     seed_cc_thread(&bus, thread_id).await;
     let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let session = make_session(stale_for(limit_ms));
+    let (session, _msg_rx) = make_session(stale_for(limit_ms));
     let cancel = session.agent_cancel.clone();
     sessions.lock().await.insert(thread_id, session);
 
@@ -141,7 +120,7 @@ async fn tick_leaves_healthy_session_alone() {
     seed_cc_thread(&bus, thread_id).await;
     let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     // Last event 1 s ago — far inside 10-min limit.
-    let session = make_session(now_epoch_millis() - 1000);
+    let (session, _msg_rx) = make_session(now_epoch_millis() - 1000);
     let cancel = session.agent_cancel.clone();
     sessions.lock().await.insert(thread_id, session);
 
@@ -175,7 +154,7 @@ async fn tick_recovers_exited_stale_session_when_running() {
     let thread_id = Uuid::new_v4();
     seed_cc_thread(&bus, thread_id).await; // SessionStarted → status='running'
     let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let mut session = make_session(stale_for(limit_ms));
+    let (mut session, _msg_rx) = make_session(stale_for(limit_ms));
     session.process_exited = true;
     sessions.lock().await.insert(thread_id, session);
 
@@ -211,7 +190,7 @@ async fn tick_leaves_fresh_exited_session_alone() {
     let thread_id = Uuid::new_v4();
     seed_cc_thread(&bus, thread_id).await;
     let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let mut session = make_session(now_epoch_millis() - 1000); // 1 s ago
+    let (mut session, _msg_rx) = make_session(now_epoch_millis() - 1000); // 1 s ago
     session.process_exited = true;
     sessions.lock().await.insert(thread_id, session);
 
@@ -238,7 +217,7 @@ async fn tick_recovers_hung_tool_past_ceiling_when_running() {
     let thread_id = Uuid::new_v4();
     seed_cc_thread(&bus, thread_id).await; // status='running'
     let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let session = make_session(stale_for(CEILING_MS)); // past the ceiling
+    let (session, _msg_rx) = make_session(stale_for(CEILING_MS)); // past the ceiling
     session
         .tools_in_flight
         .store(3, std::sync::atomic::Ordering::Relaxed);
@@ -279,7 +258,7 @@ async fn tick_skips_hung_tool_past_ceiling_when_not_running() {
         .expect("settle");
 
     let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let session = make_session(stale_for(CEILING_MS));
+    let (session, _msg_rx) = make_session(stale_for(CEILING_MS));
     session
         .tools_in_flight
         .store(3, std::sync::atomic::Ordering::Relaxed);
@@ -313,7 +292,7 @@ async fn tick_leaves_session_with_tool_in_flight_alone() {
     let thread_id = Uuid::new_v4();
     seed_cc_thread(&bus, thread_id).await;
     let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let session = make_session(stale_for(limit_ms));
+    let (session, _msg_rx) = make_session(stale_for(limit_ms));
     session
         .tools_in_flight
         .store(2, std::sync::atomic::Ordering::Relaxed);
@@ -340,7 +319,7 @@ async fn tick_leaves_waiting_session_alone() {
     let thread_id = Uuid::new_v4();
     seed_cc_thread(&bus, thread_id).await;
     let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let mut session = make_session(stale_for(limit_ms));
+    let (mut session, _msg_rx) = make_session(stale_for(limit_ms));
     session.is_waiting = true;
     sessions.lock().await.insert(thread_id, session);
 
@@ -375,6 +354,13 @@ async fn tick_with_empty_sessions_is_noop() {
 /// flip it, the wedged loop (when it eventually wakes) would emit a
 /// duplicate `ResponseAborted` on top of our `ContinuationRequested` — the user
 /// would see both an auto-resume AND an "Aborted" terminal.
+///
+/// `external_continuation_requested` MUST flip alongside it: it is what tells
+/// a conflict-resolution session's completion that this Skip is a RECOVERY
+/// (hand the merge duty off) rather than a restart abort / concurrent cancel
+/// (abort the merge). Without it the wedged loop's cleanup would emit
+/// `ChangeApplyFailed`, close the duty pairing, and tear down the merge
+/// worktree underneath the continuation this tick just dispatched.
 #[tokio::test]
 async fn tick_flips_external_terminal_emitted_before_dropping_stuck_session() {
     let (pool, db_name) = setup_test_db().await;
@@ -385,13 +371,18 @@ async fn tick_flips_external_terminal_emitted_before_dropping_stuck_session() {
     let thread_id = Uuid::new_v4();
     seed_cc_thread(&bus, thread_id).await;
     let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let session = make_session(stale_for(limit_ms));
+    let (session, _msg_rx) = make_session(stale_for(limit_ms));
     let flag = session.external_terminal_emitted.clone();
+    let continuation_flag = session.external_continuation_requested.clone();
     sessions.lock().await.insert(thread_id, session);
 
     assert!(
         !flag.load(std::sync::atomic::Ordering::Acquire),
         "precondition: flag starts unset"
+    );
+    assert!(
+        !continuation_flag.load(std::sync::atomic::Ordering::Acquire),
+        "precondition: continuation flag starts unset"
     );
 
     let watchdog =
@@ -401,6 +392,10 @@ async fn tick_flips_external_terminal_emitted_before_dropping_stuck_session() {
     assert!(
         flag.load(std::sync::atomic::Ordering::Acquire),
         "tick must set external_terminal_emitted=true to suppress the wedged in-loop's safety-net abort"
+    );
+    assert!(
+        continuation_flag.load(std::sync::atomic::Ordering::Acquire),
+        "tick must set external_continuation_requested=true so a conflict-resolution completion hands off instead of aborting"
     );
 
     pool.close().await;
@@ -425,10 +420,11 @@ async fn recover_stuck_skips_session_that_recovered_since_snapshot() {
 
     // Was stale when the snapshot ran…
     let snapshot_last_ms = stale_for(limit_ms);
-    let session = make_session(snapshot_last_ms);
+    let (session, _msg_rx) = make_session(snapshot_last_ms);
     let cancel = session.agent_cancel.clone();
     let last_event_at = session.last_event_at.clone();
     let external_terminal = session.external_terminal_emitted.clone();
+    let external_continuation = session.external_continuation_requested.clone();
     let idle_notify = session.idle_notify.clone();
     let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     sessions.lock().await.insert(thread_id, session);
@@ -440,6 +436,7 @@ async fn recover_stuck_skips_session_that_recovered_since_snapshot() {
         thread_id,
         elapsed_ms: 0,
         external_terminal,
+        external_continuation,
         idle_notify,
         agent_cancel: cancel.clone(),
         last_event_at,

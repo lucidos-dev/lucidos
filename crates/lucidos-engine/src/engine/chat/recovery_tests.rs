@@ -13,14 +13,38 @@
 //! query that drops the `archive_state != 'archived'` filter fails this
 //! suite immediately.
 
-use super::{ORPHAN_THREADS_SQL, ORPHAN_TOOL_CALLS_SQL};
+use super::{orphan_threads_sql, orphan_tool_calls_sql, ORPHAN_THREADS_SQL, ORPHAN_TOOL_CALLS_SQL};
 use crate::core::EventRow;
 use crate::engine::event_bus::{BusEvent, EventBus};
-use crate::engine::thread_events::{ActorMode, EventMeta, ThreadEvent};
+use crate::engine::thread_events::{ActorMode, EventMeta, QuestionOption, ThreadEvent};
 use crate::test_support::{setup_test_db, teardown_test_db};
 use serde_json::json;
 use std::time::Duration;
 use uuid::Uuid;
+
+/// Emit an unanswered `UserQuestionAsked` — the parked-on-a-question state the
+/// shared preserve guard (`unanswered_question_exists_sql`) must exclude from
+/// every restart-abort sweep. Chat channel (`EventMeta::NONE`).
+async fn emit_unanswered_question(bus: &EventBus, thread_id: Uuid, tool_use_id: &str) {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::UserQuestionAsked {
+            tool_use_id: tool_use_id.into(),
+            cc_session_id: String::new(),
+            question: "Pick one".into(),
+            options: vec![QuestionOption {
+                id: "opt-0".into(),
+                label: "A".into(),
+                description: None,
+            }],
+            worktree_path: None,
+            multi_select: false,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+}
 
 /// `ORPHAN_THREADS_SQL` uses a strict `last_activity > last_start` predicate
 /// keyed off the `created` timestamp (PG `now()`, microsecond resolution).
@@ -249,6 +273,154 @@ async fn orphan_threads_query_excludes_threads_owned_by_cc_recovery() {
 }
 
 #[tokio::test]
+async fn orphan_threads_query_skips_question_parked_thread() {
+    // The reproduced bug: a thread parked on an unanswered AskUserQuestion was
+    // swept into a `ResponseAborted` ("System — Response interrupted") on
+    // restart. For a coding-agent thread this fired even after
+    // `recover_orphaned_worktrees` deliberately preserved it (it is NOT added to
+    // `exclude_thread_ids`); for a chat thread this sweep is the only abort path
+    // it hits. The shared preserve guard (`unanswered_question_exists_sql`) baked
+    // into `orphan_threads_sql()` must drop it — while a control orphan with no
+    // pending question is still returned.
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    // Parked-on-a-question orphan: MessageReceived + TextStreamed (activity, so
+    // it qualifies as an orphan candidate) + an unanswered UserQuestionAsked.
+    let parked_id = Uuid::new_v4();
+    emit_orphan_turn(&bus, parked_id).await;
+    tick().await;
+    emit_unanswered_question(&bus, parked_id, "toolu_parked").await;
+
+    // Control: an ordinary orphan (no question) — must still be recovered.
+    let control_id = Uuid::new_v4();
+    emit_orphan_turn(&bus, control_id).await;
+
+    // Precondition: the UNGUARDED base query DOES return the parked thread, so
+    // this test can only pass because the guard in `orphan_threads_sql()` drops
+    // it (not because the fixture failed to match).
+    let base_rows: Vec<OrphanThreadRow> = sqlx::query_as(ORPHAN_THREADS_SQL)
+        .bind(Vec::<Uuid>::new())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(
+        base_rows.iter().any(|(tid, _, _, _, _)| *tid == parked_id),
+        "precondition: unguarded base query must see the parked orphan"
+    );
+
+    let rows: Vec<OrphanThreadRow> = sqlx::query_as(&orphan_threads_sql())
+        .bind(Vec::<Uuid>::new())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let returned: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
+    assert!(
+        returned.contains(&control_id),
+        "a non-question orphan must still be recovered — got {:?}",
+        returned
+    );
+    assert!(
+        !returned.contains(&parked_id),
+        "a thread parked on an unanswered question must NOT be swept — got {:?}",
+        returned
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn orphan_threads_query_recovers_answered_then_interrupted_thread() {
+    // The guard must be narrow: a thread whose question was ANSWERED and then
+    // interrupted mid-continuation (no terminal) is a genuine orphan and must
+    // still be recovered — otherwise answering-then-crashing would strand it.
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let answered_id = Uuid::new_v4();
+    emit_orphan_turn(&bus, answered_id).await;
+    tick().await;
+    emit_unanswered_question(&bus, answered_id, "toolu_answered").await;
+    tick().await;
+    bus.emit(BusEvent::Thread {
+        thread_id: answered_id,
+        event: ThreadEvent::UserQuestionAnswered {
+            tool_use_id: "toolu_answered".into(),
+            answer: crate::engine::thread_events::AnswerKind::Selected {
+                option_id: "opt-0".into(),
+            },
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    tick().await;
+    // More activity after the answer, still no terminal → a real orphan.
+    bus.emit(BusEvent::Thread {
+        thread_id: answered_id,
+        event: ThreadEvent::TextStreamed {
+            text: "resumed work".into(),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let rows: Vec<OrphanThreadRow> = sqlx::query_as(&orphan_threads_sql())
+        .bind(Vec::<Uuid>::new())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(
+        rows.iter().any(|(tid, _, _, _, _)| *tid == answered_id),
+        "an answered-then-interrupted thread is a genuine orphan and must still be recovered"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn orphan_tool_calls_query_skips_question_parked_thread() {
+    // A question-parked chat thread has a dangling `ToolCalled{ask_user_question}`
+    // (the loop emits it before blocking in `walk_question_batch`). The guard in
+    // `orphan_tool_calls_sql()` must skip the thread so the sweep never
+    // synthesizes a "[Tool execution interrupted…]" ToolResult that would poison
+    // the pending question's tool-use pair.
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let parked_id = Uuid::new_v4();
+    emit_orphan_tool_call(&bus, parked_id).await; // MessageReceived + unmatched ToolCalled
+    tick().await;
+    emit_unanswered_question(&bus, parked_id, "toolu_parked_tc").await;
+
+    let control_id = Uuid::new_v4();
+    emit_orphan_tool_call(&bus, control_id).await;
+
+    let rows: Vec<EventRow> = sqlx::query_as(&orphan_tool_calls_sql())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let returned: std::collections::HashSet<Uuid> =
+        rows.iter().filter_map(|r| r.thread_id).collect();
+    assert!(
+        returned.contains(&control_id),
+        "a non-question thread's orphan ToolCalled must still be paired — got {:?}",
+        returned
+    );
+    assert!(
+        !returned.contains(&parked_id),
+        "a question-parked thread's ToolCalled must NOT be swept — got {:?}",
+        returned
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
 async fn orphan_tool_calls_query_skips_archived_thread() {
     // Mirror the orphan-thread test for the inner-tool-layer sweep: a
     // synthetic `ToolResult` for an archived thread would bump
@@ -283,4 +455,280 @@ async fn orphan_tool_calls_query_skips_archived_thread() {
 
     pool.close().await;
     teardown_test_db(&db_name).await;
+}
+
+// -- Chat auto-resume after a user-initiated switch ---------------------------
+//
+// `switch_resume_candidates` is the chat half of the switch auto-resume (the
+// coding-agent half is `recover_orphaned_worktrees` → `enqueue_switch_resume`).
+// These tests pin the selection contract directly against the production SQL:
+// what counts as a switch, what must stay on the manual Continue affordance,
+// and the loop-breaker that stops a resume re-resuming itself forever.
+mod switch_resume {
+    use super::tick;
+    use crate::engine::chat::recovery::switch_resume_candidates;
+    use crate::engine::event_bus::{BusEvent, EventBus};
+    use crate::engine::thread_events::{
+        AbortCause, ActorMode, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+    };
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    use uuid::Uuid;
+
+    fn device_actor() -> MessageOrigin {
+        MessageOrigin::Device {
+            device_id: "dev-1".into(),
+            label: "My MacBook".into(),
+        }
+    }
+
+    /// A user turn on `channel`, which is also what creates the
+    /// `thread_summaries` row (and its `source`) via the projection.
+    async fn seed_turn(bus: &EventBus, thread_id: Uuid, channel: Option<EventChannel>) {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::MessageReceived {
+                text: "do the thing".into(),
+                user_image_hashes: vec![],
+                device_id: None,
+                device: None,
+                image_description: None,
+                parent_thread_id: None,
+                spawning_event_id: None,
+                mode: ActorMode::Human,
+                model: None,
+                reasoning_effort: None,
+                origin: None,
+            },
+            meta: EventMeta {
+                channel,
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The teardown boundary `abort_in_flight_for_restart` emits for a chat
+    /// thread on a user switch: `EngineShutdown` + the clicking device's actor.
+    async fn emit_abort(
+        bus: &EventBus,
+        thread_id: Uuid,
+        actor: Option<MessageOrigin>,
+        cause: AbortCause,
+    ) {
+        crate::engine::thread_events::emit_response_aborted(
+            bus,
+            thread_id,
+            cause,
+            "interrupted".into(),
+            vec![],
+            None,
+            None,
+            EventMeta {
+                actor,
+                ..EventMeta::NONE
+            },
+            "[test] teardown abort",
+        )
+        .await;
+    }
+
+    async fn candidates_contain(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
+        switch_resume_candidates(pool).await.contains(&thread_id)
+    }
+
+    #[tokio::test]
+    async fn device_shutdown_abort_makes_a_chat_thread_a_resume_candidate() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+
+        let thread_id = Uuid::new_v4();
+        seed_turn(&bus, thread_id, None).await;
+        tick().await;
+        emit_abort(
+            &bus,
+            thread_id,
+            Some(device_actor()),
+            AbortCause::EngineShutdown,
+        )
+        .await;
+
+        assert!(
+            candidates_contain(&pool, thread_id).await,
+            "a chat thread interrupted by a user Switch to new version must auto-resume, \
+             not wait for a manual Continue click"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Crash-safety: only the device-attributed `EngineShutdown` teardown counts.
+    /// A crash emits nothing (or a `System` abort from the recovery sweep), and a
+    /// `StaleSettle` abort carries a device actor from a user Stop/Archive button
+    /// — none of those may re-run work the user did not ask to resume.
+    #[tokio::test]
+    async fn crash_and_user_stop_shaped_aborts_are_not_candidates() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+
+        // System actor (crash recovery sweep).
+        let sys = Uuid::new_v4();
+        seed_turn(&bus, sys, None).await;
+        tick().await;
+        emit_abort(
+            &bus,
+            sys,
+            Some(MessageOrigin::system()),
+            AbortCause::EngineShutdown,
+        )
+        .await;
+
+        // Device actor but a user-button cause, not a teardown.
+        let settle = Uuid::new_v4();
+        seed_turn(&bus, settle, None).await;
+        tick().await;
+        emit_abort(
+            &bus,
+            settle,
+            Some(device_actor()),
+            AbortCause::StaleSettle,
+        )
+        .await;
+
+        // No abort at all — the shape of a question-parked thread, which the
+        // preserve guard keeps abort-free. It must never be auto-resumed;
+        // answering is what resumes it.
+        let parked = Uuid::new_v4();
+        seed_turn(&bus, parked, None).await;
+
+        let found = switch_resume_candidates(&pool).await;
+        assert!(
+            !found.contains(&sys),
+            "a system-attributed abort is the crash path → manual Continue"
+        );
+        assert!(
+            !found.contains(&settle),
+            "a StaleSettle abort carries the actor of a user Stop/Archive button, \
+             not of a switch — resuming would re-run work the user abandoned"
+        );
+        assert!(
+            !found.contains(&parked),
+            "a thread with no abort (question-parked) is not an interrupted turn"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Loop-breaker: `continue_chat` emits `ContinuationStarted`, which is in the
+    /// shared start set — so a resume that itself dies before producing anything
+    /// else falls back to the manual Continue instead of resuming forever.
+    #[tokio::test]
+    async fn an_already_resumed_thread_is_not_a_candidate_again() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+
+        let thread_id = Uuid::new_v4();
+        seed_turn(&bus, thread_id, None).await;
+        tick().await;
+        emit_abort(
+            &bus,
+            thread_id,
+            Some(device_actor()),
+            AbortCause::EngineShutdown,
+        )
+        .await;
+        assert!(candidates_contain(&pool, thread_id).await);
+
+        tick().await;
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::ContinuationStarted {
+                branch: String::new(),
+                origin: None,
+                reason: None,
+            },
+            meta: EventMeta::NONE,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            !candidates_contain(&pool, thread_id).await,
+            "the switch abort has been consumed by a resume — a second boot must not re-resume it"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Coding-agent threads are owned by `recover_orphaned_worktrees`; picking one
+    /// up here would resume it twice, and with the wrong (chat) machinery.
+    #[tokio::test]
+    async fn coding_agent_threads_are_left_to_the_worktree_recovery_pass() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+
+        let thread_id = Uuid::new_v4();
+        seed_turn(&bus, thread_id, Some(EventChannel::ClaudeCode)).await;
+        tick().await;
+        emit_abort(
+            &bus,
+            thread_id,
+            Some(device_actor()),
+            AbortCause::EngineShutdown,
+        )
+        .await;
+
+        let source: Option<String> =
+            sqlx::query_scalar("SELECT source FROM thread_summaries WHERE thread_id = $1")
+                .bind(thread_id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            source.as_deref(),
+            Some("claude_code"),
+            "fixture precondition: the thread must project as a coding-agent thread"
+        );
+
+        assert!(
+            !candidates_contain(&pool, thread_id).await,
+            "the chat pass must not claim a coding-agent thread"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Same rationale as the orphan sweep's archived filter: the user closed the
+    /// thread, and resuming it would revive the row they deliberately dismissed.
+    #[tokio::test]
+    async fn archived_threads_are_not_candidates() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+
+        let thread_id = Uuid::new_v4();
+        seed_turn(&bus, thread_id, None).await;
+        tick().await;
+        emit_abort(
+            &bus,
+            thread_id,
+            Some(device_actor()),
+            AbortCause::EngineShutdown,
+        )
+        .await;
+        assert!(candidates_contain(&pool, thread_id).await);
+
+        super::archive(&bus, thread_id).await;
+
+        assert!(
+            !candidates_contain(&pool, thread_id).await,
+            "an archived thread must not be revived by the auto-resume"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
 }

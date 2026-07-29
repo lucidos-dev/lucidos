@@ -259,27 +259,25 @@
 /* Uniform gap on ALL FOUR sides between the navigation focus marker and a turn's
    content. The marker (the .nav-focus-stuck outline, defined in
    host-components.css) hugs the panel's padding box with a fixed outline-offset,
-   so the gap it shows on each side equals the panel's padding there — and a turn's
-   padding is NOT uniform:
-     - horizontal: content is inset var(--turn-body-inset) on the LEFT
-       (.initiator-header / .response-header / body padding-left) but sits FLUSH on
-       the RIGHT — so the marker shows a left gap and no right gap;
-     - vertical: the feed-rhythm padding var(--turn-feed-pad-y) top and bottom, far
-       larger than that inset — so the marker's top/bottom gap dwarfs its sides
-       ("padding isn't the same top/bottom as left/right").
-   Normalize every side to var(--turn-body-inset):
-     - RIGHT: grow the box rightward by that inset (padding-right) and cancel it for
-       layout (negative margin-right) so the content-box width and sibling turns
-       stay put — settling the marker in / clearing it never reflows the card.
-       (LEFT already has the inset via the body's padding-left; the panel keeps
-       padding-left: 0.)
-     - TOP/BOTTOM: shrink the feed padding to the same inset and hand the removed
-       space back as margin, so the turn's content and its neighbours don't move
-       (net-zero) while the outline hugs tight. .chat-exchange establishes a block
-       formatting context (display: flow-root, below) so a first/last focused
-       panel's margin can't collapse through the exchange and shift its content.
-   The turn lives inside .thread-content's 0.75rem side padding, and the inset +
-   the marker reach stay clear of that edge (no clip, no horizontal scrollbar).
+   so the gap it shows on each side equals the panel's padding there. The sides
+   are already symmetric in the BASE layout — content is inset
+   var(--turn-body-inset) on the LEFT (.initiator-header / .response-header /
+   body padding-left) and the panels carry the matching RIGHT inset as base
+   padding (input-messages.css) — so the marker fits inside .thread-content's
+   side gutter with EQUAL breathing room on both pane edges. (It used to grow
+   the box rightward with a padding-right / negative-margin pair to compensate
+   for a flush-right feed; that pushed the border against the pane's right edge
+   while the left kept its gutter — "border is all the way to the right".)
+   Only the VERTICAL sides need normalizing: the feed-rhythm padding
+   var(--turn-feed-pad-y) top and bottom is far larger than the inset, so the
+   marker's top/bottom gap dwarfed its sides ("padding isn't the same top/bottom
+   as left/right"). Shrink the feed padding to the same inset and hand the
+   removed space back as margin, so the turn's content and its neighbours don't
+   move (net-zero) while the outline hugs tight. .chat-exchange establishes a
+   block formatting context (display: flow-root, below) so a first/last focused
+   panel's margin can't collapse through the exchange and shift its content.
+   The padding shorthand restates the horizontal sides (right inset matching the
+   base, left 0) so the four-side contract stays explicit at the marker rule.
    Scoped to the panels: this is the PANEL-level marker — a deep-link (Changes
    panel / notification) lands on the specific `.initiator-panel` or
    `.response-panel` (scrollState.ts `scrollToChangeAndPulse` / `scrollToEventAndPulse`).
@@ -290,7 +288,6 @@
     padding: var(--turn-body-inset) var(--turn-body-inset) var(--turn-body-inset) 0;
     margin-top: calc(var(--turn-feed-pad-y) - var(--turn-body-inset));
     margin-bottom: calc(var(--turn-feed-pad-y) - var(--turn-body-inset));
-    margin-right: calc(-1 * var(--turn-body-inset));
 }
 
 /* Uniform gap on ALL FOUR sides when the marker lands on a WHOLE TURN. Keyboard
@@ -301,23 +298,21 @@
    gap and the right gap collapsed to just the outline offset. This is the exchange's
    counterpart to the panel rule; it normalizes every side to var(--turn-body-inset).
 
-   The exchange has NO padding of its own — its content is the panel(s), which carry
-   the gap-defining padding. It mirrors the panel rule's shape (padding inset on
-   TOP/RIGHT/BOTTOM, LEFT already supplied by the inner content's padding-left) with
-   two differences forced by the exchange:
-     - NO negative margin-right: the exchange is auto-centered
-       (.thread-content > * { margin: 0 auto }), so a negative margin-right would
-       fight the centering. The var(--turn-body-inset) padding-right narrows the
-       content box by that inset instead (a tiny, transient reflow only while the
-       marker shows) — the trade the panel rule avoids but the exchange can't.
-     - The feed rhythm that defines TOP/BOTTOM lives on the PANEL children, not the
-       exchange — so drop the first panel's feed padding-top and the last panel's
-       feed padding-bottom (they'd stack on the exchange padding and inflate the
-       gap), and hand the removed feed rhythm back as margin on the exchange (OUTSIDE
-       its outline, so the gap stays tight) — content and neighbouring turns don't
-       move, exactly like the panel rule's vertical handling. */
+   The exchange has NO padding of its own — its content is the panel(s), which
+   carry the gap-defining padding: LEFT from the inner content's padding-left,
+   RIGHT from the panels' base padding-right (input-messages.css), so both
+   horizontal sides come through the panels and the exchange keeps its sides at
+   0 — no reflow while the marker shows, and no negative margins that would
+   fight the auto-centering (.thread-content > * { margin: 0 auto }).
+   Only the vertical sides need work: the feed rhythm that defines TOP/BOTTOM
+   lives on the PANEL children, not the exchange — so drop the first panel's
+   feed padding-top and the last panel's feed padding-bottom (they'd stack on
+   the exchange padding and inflate the gap), and hand the removed feed rhythm
+   back as margin on the exchange (OUTSIDE its outline, so the gap stays tight)
+   — content and neighbouring turns don't move, exactly like the panel rule's
+   vertical handling. */
 .chat-exchange.nav-focus-stuck {
-    padding: var(--turn-body-inset) var(--turn-body-inset) var(--turn-body-inset) 0;
+    padding: var(--turn-body-inset) 0;
     margin-top: calc(var(--turn-feed-pad-y) - var(--turn-body-inset));
     margin-bottom: calc(var(--turn-feed-pad-y) - var(--turn-body-inset));
 }
@@ -1384,9 +1379,14 @@ body:not(.is-touch) .code-block-copy-btn.copy-btn-copied {
     background: var(--bg-tertiary);
     color: var(--text-muted);
 }
+/* The four completion pills appear together in one stream, so each needs to be
+   distinguishable from the other three. Canceled is warm (--accent-orange) and
+   deliberately NOT the cool --accent-notable used for neutral markers elsewhere:
+   grey-blue would be a near-twin of the grey .child-completion-status-no-changes
+   pill right beside it — same weight, same temperature, only the glyph differing. */
 .child-completion-status-canceled {
-    background: color-mix(in srgb, var(--accent-yellow) 18%, transparent);
-    color: var(--accent-yellow);
+    background: color-mix(in srgb, var(--accent-orange) 18%, transparent);
+    color: var(--accent-orange);
 }
 .child-completion-disclosure {
     font-size: var(--font-size-md);

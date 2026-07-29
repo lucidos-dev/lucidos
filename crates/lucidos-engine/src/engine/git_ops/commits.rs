@@ -212,19 +212,45 @@ pub(crate) async fn has_branch_commits(repo_root: &Path, branch_name: &str) -> b
 /// button on an empty diff.
 ///
 /// Strips engine-injected paths — see `is_engine_injected_path` for rationale.
+///
+/// Errors are swallowed into an empty list, which is safe for every caller that
+/// only asks "is there something to propose here?" — a git hiccup then simply
+/// skips a proposal that the next idle re-tries. It is NOT safe for a caller
+/// that *writes* the empty answer somewhere durable: use
+/// [`branch_changed_files_checked`] there.
 pub(crate) async fn branch_changed_files(repo_root: &Path, branch_name: &str) -> Vec<String> {
+    branch_changed_files_checked(repo_root, branch_name)
+        .await
+        .unwrap_or_default()
+}
+
+/// [`branch_changed_files`] that distinguishes "git says the diff is empty"
+/// from "git could not answer". Fails on spawn failure, the 30s timeout, and a
+/// non-zero exit (a deleted/renamed branch ref is the common one).
+///
+/// The distinction is load-bearing for `reconcile_emptied_pending_change`,
+/// which zeroes a pending change's file list from this answer: taking a
+/// transient git failure as "no changes" would wipe the recorded file list of
+/// work still sitting on the branch.
+pub(crate) async fn branch_changed_files_checked(
+    repo_root: &Path,
+    branch_name: &str,
+) -> Result<Vec<String>, String> {
     let base = default_diff_base(repo_root).await;
     let range = format!("{}...{}", base, branch_name);
-    git_cmd(&["diff", "--name-only", &range], repo_root)
-        .await
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| !crate::engine::claude_code::is_engine_injected_path(l))
-                .map(|l| l.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+    let out = git_cmd(&["diff", "--name-only", &range], repo_root).await?;
+    if !out.status.success() {
+        return Err(format!(
+            "git diff --name-only {} failed: {}",
+            range,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !crate::engine::claude_code::is_engine_injected_path(l))
+        .map(|l| l.to_string())
+        .collect())
 }
 
 /// Check whether a branch carries authored (non-merge) commits that aren't yet

@@ -85,22 +85,92 @@ struct PanelWebview(Mutex<Option<String>>);
 /// is a harmless no-op when there's no consumer (dev / non-macOS).
 struct DockBadgeNudge(Mutex<std::sync::mpsc::Sender<()>>);
 
-/// Tracks the last JS heartbeat timestamp for WKWebView crash recovery.
-/// WKWebView's content process can be terminated by macOS under memory pressure,
-/// leaving a white screen. The JS side calls `heartbeat` every 15s; if we don't
-/// hear from it in 60s, we reload the webview.
-struct LastHeartbeat(Mutex<Instant>);
+/// Tracks the JS heartbeat for WKWebView crash recovery. WKWebView's content
+/// process can be terminated by macOS under memory pressure, leaving a white
+/// screen. The JS side calls `heartbeat` every 15s; if we don't hear from it for
+/// [`HEARTBEAT_TIMEOUT`], the watchdog reloads the webview.
+struct LastHeartbeat {
+    /// When the most recent heartbeat arrived.
+    at: Mutex<Instant>,
+    /// Monotonic count of heartbeats received. The timestamp alone cannot tell
+    /// "the page came back after my reload and then died again" from "the page
+    /// has never beaten at all", because the watchdog resets the timestamp
+    /// itself on every reload. The count can, and that distinction is what stops
+    /// a pointless reload from repeating forever.
+    count: AtomicU64,
+}
 
 /// How long the JS heartbeat may go silent before the watchdog treats the
 /// WKWebView content process as crashed and reloads it. The page heartbeats
 /// every 15s, so 60s is four missed beats.
 const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// True when the watchdog should reload the webview: the last heartbeat is older
-/// than [`HEARTBEAT_TIMEOUT`]. Pure so the threshold is unit-testable without
-/// the watchdog thread.
-fn heartbeat_expired(elapsed: std::time::Duration) -> bool {
-    elapsed > HEARTBEAT_TIMEOUT
+/// How often the watchdog re-checks. Well under [`HEARTBEAT_TIMEOUT`] so a
+/// genuine crash is caught promptly.
+const WATCHDOG_TICK: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Cap on the backoff doublings in [`reload_threshold`]: 60s << 5 ≈ 32 minutes.
+/// Bounded rather than unbounded so a page that recovers on its own (say the
+/// gateway finally comes up) is still noticed within a useful window.
+const MAX_RELOAD_BACKOFF_DOUBLINGS: u32 = 5;
+
+/// How long the heartbeat may go silent before the next reload, given how many
+/// consecutive reloads have already failed to bring it back.
+///
+/// A reload that produces no heartbeat did not fix anything, and repeating it on
+/// the base interval is how the 2.11 ACL regression turned into 6232 silent
+/// reloads (one per minute for weeks). Backing off — rather than giving up —
+/// kills the thrash while still recovering if the cause was temporary, e.g. the
+/// page failing to load because the gateway was briefly down.
+fn reload_threshold(futile_reloads: u32) -> std::time::Duration {
+    HEARTBEAT_TIMEOUT * 2u32.pow(futile_reloads.min(MAX_RELOAD_BACKOFF_DOUBLINGS))
+}
+
+/// What the watchdog decided to do on one tick.
+#[derive(Debug, PartialEq, Eq)]
+struct ReloadDecision {
+    /// The previous reload produced no heartbeat at all, so this one is very
+    /// unlikely to help either — something other than a content-process crash is
+    /// wrong (an ACL-rejected IPC bridge, for instance).
+    futile: bool,
+    /// How long the heartbeat may now go silent before the watchdog tries again.
+    next_threshold: std::time::Duration,
+}
+
+/// The watchdog's state machine, kept pure so the escalation is unit-testable
+/// without a webview or a 32-minute wall clock.
+#[derive(Debug, Default)]
+struct ReloadWatchdog {
+    /// Heartbeat count observed at the last reload; `None` before the first one,
+    /// so the first reload is never judged futile.
+    heartbeats_at_last_reload: Option<u64>,
+    /// Consecutive reloads after which the page still never beat.
+    futile_reloads: u32,
+}
+
+impl ReloadWatchdog {
+    /// One watchdog tick. `Some(..)` means reload now; the caller must then reset
+    /// the heartbeat timestamp so the next threshold is measured from the reload.
+    fn on_tick(
+        &mut self,
+        silent_for: std::time::Duration,
+        heartbeats: u64,
+    ) -> Option<ReloadDecision> {
+        if silent_for <= reload_threshold(self.futile_reloads) {
+            return None;
+        }
+        let futile = self.heartbeats_at_last_reload == Some(heartbeats);
+        self.futile_reloads = if futile {
+            self.futile_reloads.saturating_add(1)
+        } else {
+            0
+        };
+        self.heartbeats_at_last_reload = Some(heartbeats);
+        Some(ReloadDecision {
+            futile,
+            next_threshold: reload_threshold(self.futile_reloads),
+        })
+    }
 }
 
 /// Window state the app persists/restores via `tauri-plugin-window-state`.
@@ -334,9 +404,10 @@ fn new_window_url(app: &tauri::AppHandle) -> WebviewUrl {
         }
     }
     if !tauri::is_dev() {
-        if let Ok(url) =
-            format!("http://localhost:{}", desktop::engine_port()).parse::<tauri::Url>()
-        {
+        // Same builder `desktop::launch` navigates the main window with, so a New
+        // Window opened before that navigation still lands on the exact origin the
+        // gateway ACL capability was pinned to (desktop::gateway_capability).
+        if let Ok(url) = desktop::gateway_url(desktop::engine_port()).parse::<tauri::Url>() {
             return WebviewUrl::External(url);
         }
     }
@@ -847,7 +918,10 @@ fn restart_process(exe: &std::path::Path, args: &[std::ffi::OsString]) -> Result
 #[tauri::command]
 fn heartbeat(app: tauri::AppHandle) {
     let state = app.state::<LastHeartbeat>();
-    *state.0.lock().unwrap() = Instant::now();
+    *state.at.lock().unwrap() = Instant::now();
+    state
+        .count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -1191,7 +1265,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(PanelWebview(Mutex::new(None)))
         .manage(PanelContentChannel(Mutex::new(None)))
-        .manage(LastHeartbeat(Mutex::new(Instant::now())))
+        .manage(LastHeartbeat {
+            at: Mutex::new(Instant::now()),
+            count: AtomicU64::new(0),
+        })
         .manage(GeometrySaver {
             dirty: AtomicBool::new(false),
             last_change: Mutex::new(Instant::now()),
@@ -1362,28 +1439,52 @@ pub fn run() {
             }
 
             // WKWebView crash recovery watchdog: if the JS heartbeat stops
-            // arriving for >60s, the content process likely crashed (white screen).
-            // Reload the webview to recover.
+            // arriving, the content process likely crashed (white screen), so
+            // reload the webview to recover. A reload that brings back no
+            // heartbeat at all did not fix anything, so the interval backs off
+            // (see ReloadWatchdog) instead of thrashing once a minute forever —
+            // and says so, because a silent reload loop is what hid the 2.11 ACL
+            // regression for a month.
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 // Give the webview time to load before starting watchdog
                 std::thread::sleep(std::time::Duration::from_secs(30));
+                let mut watchdog = ReloadWatchdog::default();
                 loop {
-                    std::thread::sleep(std::time::Duration::from_secs(15));
-                    let elapsed = handle.state::<LastHeartbeat>().0.lock().unwrap().elapsed();
-                    if heartbeat_expired(elapsed) {
-                        if let Some(ww) = handle.get_webview_window("main") {
-                            eprintln!(
-                                "[Tauri] WKWebView heartbeat timeout ({:.0}s) — reloading",
-                                elapsed.as_secs_f64()
-                            );
-                            if let Ok(url) = ww.url() {
-                                let _ = ww.navigate(url);
-                            }
-                            // Reset heartbeat so we don't reload in a loop
-                            *handle.state::<LastHeartbeat>().0.lock().unwrap() = Instant::now();
-                        }
+                    std::thread::sleep(WATCHDOG_TICK);
+                    let Some(ww) = handle.get_webview_window("main") else {
+                        continue;
+                    };
+                    let state = handle.state::<LastHeartbeat>();
+                    let silent_for = state.at.lock().unwrap().elapsed();
+                    let heartbeats = state.count.load(std::sync::atomic::Ordering::Relaxed);
+                    let Some(decision) = watchdog.on_tick(silent_for, heartbeats) else {
+                        continue;
+                    };
+                    if decision.futile {
+                        eprintln!(
+                            "[Tauri] WKWebView heartbeat silent for {:.0}s and the page has not \
+                             beaten ONCE since the last reload ({} futile reloads) — reloading \
+                             anyway, then backing off to {:.0}s. A reload that never restores the \
+                             heartbeat means the page is running but cannot reach us: check the \
+                             engine log for [Client/ipc] lines, and check for \"not allowed by \
+                             ACL\" rejections.",
+                            silent_for.as_secs_f64(),
+                            watchdog.futile_reloads,
+                            decision.next_threshold.as_secs_f64(),
+                        );
+                    } else {
+                        eprintln!(
+                            "[Tauri] WKWebView heartbeat timeout ({:.0}s) — reloading",
+                            silent_for.as_secs_f64()
+                        );
                     }
+                    if let Ok(url) = ww.url() {
+                        let _ = ww.navigate(url);
+                    }
+                    // Reset the clock so the next threshold is measured from this
+                    // reload rather than from the last heartbeat.
+                    *state.at.lock().unwrap() = Instant::now();
                 }
             });
 
@@ -1579,13 +1680,98 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_expired_fires_only_past_the_timeout() {
-        // Below and at the threshold: not expired (15s heartbeat cadence).
-        assert!(!heartbeat_expired(Duration::from_secs(59)));
-        assert!(!heartbeat_expired(HEARTBEAT_TIMEOUT));
-        // Strictly past the 60s timeout: reload.
-        assert!(heartbeat_expired(Duration::from_secs(61)));
-        assert!(heartbeat_expired(HEARTBEAT_TIMEOUT + Duration::from_millis(1)));
+    fn the_watchdog_reloads_only_past_the_timeout() {
+        let mut watchdog = ReloadWatchdog::default();
+        // Below and at the threshold: no reload (15s heartbeat cadence).
+        assert_eq!(watchdog.on_tick(Duration::from_secs(59), 100), None);
+        assert_eq!(watchdog.on_tick(HEARTBEAT_TIMEOUT, 100), None);
+        // Strictly past the 60s timeout: reload. The first one is never "futile"
+        // — there is no earlier reload for it to have failed to improve on.
+        assert_eq!(
+            watchdog.on_tick(Duration::from_secs(61), 100),
+            Some(ReloadDecision {
+                futile: false,
+                next_threshold: HEARTBEAT_TIMEOUT,
+            })
+        );
+    }
+
+    #[test]
+    fn a_reload_that_restores_the_heartbeat_keeps_the_base_interval() {
+        let mut watchdog = ReloadWatchdog::default();
+        // Genuine content-process crash: reload, page comes back and beats, and
+        // some time later it crashes again. Each recovery keeps the fast 60s
+        // interval, because reloading is demonstrably working.
+        for beats in [10_u64, 25, 40] {
+            let decision = watchdog
+                .on_tick(HEARTBEAT_TIMEOUT + Duration::from_secs(1), beats)
+                .expect("silent past the threshold must reload");
+            assert!(!decision.futile);
+            assert_eq!(decision.next_threshold, HEARTBEAT_TIMEOUT);
+        }
+    }
+
+    #[test]
+    fn reloads_that_never_restore_the_heartbeat_back_off_instead_of_thrashing() {
+        // The 2.11 ACL regression: the page loads and runs, but `invoke` is
+        // rejected, so the count NEVER advances. Before the backoff this reloaded
+        // once a minute forever (6232 times in the field) and said nothing new.
+        let mut watchdog = ReloadWatchdog::default();
+        let mut thresholds = Vec::new();
+        for _ in 0..8 {
+            // Always just past whatever the current threshold is.
+            let silent_for = reload_threshold(watchdog.futile_reloads) + Duration::from_secs(1);
+            let decision = watchdog
+                .on_tick(silent_for, 0)
+                .expect("silent past the threshold must reload");
+            thresholds.push(decision.next_threshold);
+        }
+        // First reload is not yet futile; every one after it is, and the interval
+        // doubles until it hits the ceiling and stays there.
+        assert_eq!(
+            thresholds,
+            vec![
+                HEARTBEAT_TIMEOUT,      // 60s  — first attempt
+                HEARTBEAT_TIMEOUT * 2,  // 2m
+                HEARTBEAT_TIMEOUT * 4,  // 4m
+                HEARTBEAT_TIMEOUT * 8,  // 8m
+                HEARTBEAT_TIMEOUT * 16, // 16m
+                HEARTBEAT_TIMEOUT * 32, // 32m — ceiling
+                HEARTBEAT_TIMEOUT * 32,
+                HEARTBEAT_TIMEOUT * 32,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_backoff_resets_as_soon_as_the_page_beats_again() {
+        // Backing off must not become permanent: if the reloads were futile only
+        // because the gateway was down, the page eventually loads and beats, and
+        // full-speed crash recovery has to come straight back.
+        let mut watchdog = ReloadWatchdog::default();
+        for _ in 0..4 {
+            let silent_for = reload_threshold(watchdog.futile_reloads) + Duration::from_secs(1);
+            watchdog.on_tick(silent_for, 0);
+        }
+        assert!(watchdog.futile_reloads > 0, "expected to be backed off");
+        // One heartbeat arrives, then silence again.
+        let decision = watchdog
+            .on_tick(reload_threshold(watchdog.futile_reloads) + Duration::from_secs(1), 1)
+            .expect("silent past the threshold must reload");
+        assert!(!decision.futile);
+        assert_eq!(decision.next_threshold, HEARTBEAT_TIMEOUT);
+        assert_eq!(watchdog.futile_reloads, 0);
+    }
+
+    #[test]
+    fn the_backoff_never_stops_retrying() {
+        // Deliberately a backoff and not a give-up: the ceiling is finite, so a
+        // cause that clears itself hours later is still recovered from.
+        assert_eq!(
+            reload_threshold(u32::MAX),
+            reload_threshold(MAX_RELOAD_BACKOFF_DOUBLINGS)
+        );
+        assert!(reload_threshold(u32::MAX) <= Duration::from_secs(60 * 60));
     }
 
     #[test]
@@ -1618,5 +1804,419 @@ mod tests {
         // NOT DECORATIONS (toggling it on macOS drops the Overlay title bar).
         assert!(!flags.contains(StateFlags::VISIBLE));
         assert!(!flags.contains(StateFlags::DECORATIONS));
+    }
+}
+
+/// Regression coverage for the Tauri ACL, which is what stands between the
+/// packaged window and every one of our IPC commands.
+///
+/// These tests drive the REAL resolver — `Resolved::resolve` +
+/// `RuntimeAuthority::resolve_access`, the exact pair `Webview::on_message`
+/// consults — over the REAL artifacts (`gen/schemas/*.json`, regenerated by
+/// `tauri_build` on every build, and the runtime capability from
+/// `desktop::gateway_capability`). So they fail for the same reason the packaged
+/// app would, without needing a bundle.
+///
+/// What they cannot prove is the origin STRING the OS produces: tauri derives it
+/// from the `Origin` header WebKit puts on the `ipc://` request
+/// (`tauri/src/ipc/protocol.rs`, `parse_invoke_request`). That the header for our
+/// window really is `http://localhost:<port>` is established by code inspection
+/// plus the field evidence, not by these tests.
+#[cfg(test)]
+mod acl_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    use tauri::ipc::{Origin, RuntimeCapability};
+    use tauri::utils::acl::capability::{Capability, CapabilityFile};
+    use tauri::utils::acl::manifest::Manifest;
+    use tauri::utils::acl::resolved::Resolved;
+    use tauri::utils::platform::Target;
+
+    /// The gateway port the tests pin the capability to. Any value works — the
+    /// point is that the SAME one has to appear in the window's origin.
+    const PORT: u16 = 5252;
+
+    /// Where the packaged window ends up, and therefore the origin every IPC
+    /// request from it is judged against.
+    fn gateway_origin() -> tauri::Url {
+        desktop::gateway_url(PORT).parse().unwrap()
+    }
+
+    fn remote(url: &str) -> Origin {
+        Origin::Remote {
+            url: url.parse().unwrap(),
+        }
+    }
+
+    /// The app's ACL manifests exactly as compiled into the binary.
+    fn acl_manifests() -> BTreeMap<String, Manifest> {
+        serde_json::from_str(include_str!("../gen/schemas/acl-manifests.json"))
+            .expect("gen/schemas/acl-manifests.json is generated by tauri_build")
+    }
+
+    /// The static capabilities exactly as compiled into the binary.
+    fn static_capabilities() -> BTreeMap<String, Capability> {
+        serde_json::from_str(include_str!("../gen/schemas/capabilities.json"))
+            .expect("gen/schemas/capabilities.json is generated by tauri_build")
+    }
+
+    /// The runtime capability `desktop::launch` registers, as a plain
+    /// [`Capability`] the resolver can consume.
+    fn gateway_capability(port: u16) -> Capability {
+        match desktop::gateway_capability(port).build() {
+            CapabilityFile::Capability(c) => c,
+            _ => panic!("gateway_capability must build exactly one capability"),
+        }
+    }
+
+    /// Build the authority the packaged client runs with: the static capabilities
+    /// plus, when `gateway_port` is set, the runtime capability `desktop::launch`
+    /// registers before navigating. Passing `None` reproduces the pre-fix state.
+    fn authority(gateway_port: Option<u16>) -> tauri::ipc::RuntimeAuthority {
+        let acl = acl_manifests();
+        let mut capabilities = static_capabilities();
+        if let Some(port) = gateway_port {
+            let capability = gateway_capability(port);
+            capabilities.insert(capability.identifier.clone(), capability);
+        }
+        let resolved = Resolved::resolve(&acl, capabilities, Target::current())
+            .expect("capabilities must resolve against the app's ACL manifests");
+        tauri::runtime_authority!(acl, resolved)
+    }
+
+    /// Command names registered in `tauri::generate_handler!`, read out of this
+    /// very file so the list can never be a stale copy. Module qualifiers are
+    /// stripped: tauri registers `updater::check_app_update` under the bare
+    /// function name, which is also how the ACL keys it.
+    fn invoke_handler_commands() -> BTreeSet<String> {
+        let source = include_str!("lib.rs");
+        let (_, after) = source
+            .split_once("tauri::generate_handler![")
+            .expect("run() registers commands with tauri::generate_handler!");
+        let (block, _) = after
+            .split_once(']')
+            .expect("the generate_handler! block must be closed");
+        let commands: BTreeSet<String> = block
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| entry.rsplit("::").next().unwrap().to_string())
+            .collect();
+        // Without this, a parse that silently yielded nothing would make every
+        // "each command is allowed" assertion below pass over an empty set.
+        assert!(
+            !commands.is_empty(),
+            "parsed no commands out of the generate_handler! block"
+        );
+        commands
+    }
+
+    /// The commands one of our app permissions allows.
+    fn permission_commands(identifier: &str) -> BTreeSet<String> {
+        let file: serde_json::Value =
+            serde_json::from_str(include_str!("../permissions/app-ipc.json")).unwrap();
+        let permission = file["permission"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["identifier"] == identifier)
+            .unwrap_or_else(|| panic!("permissions/app-ipc.json defines no {identifier}"));
+        permission["commands"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Plugin commands the frontend depends on, keyed the way the ACL keys them.
+    /// `plugin:event|listen` is the load-bearing one: every `listen()` in the
+    /// frontend — native-notification taps, panel title/URL updates — goes
+    /// through it, so a denial there is silent and total.
+    const PLUGIN_COMMANDS: &[&str] = &[
+        "plugin:event|listen",
+        "plugin:event|unlisten",
+        "plugin:webview|create_webview",
+        "plugin:dialog|message",
+        "plugin:updater|check",
+        "plugin:updater|download_and_install",
+    ];
+
+    #[test]
+    fn the_app_defines_an_acl_manifest() {
+        // With no app ACL manifest, `has_app_acl_manifest` is false and app
+        // commands are unchecked on LOCAL origins — which is exactly the state
+        // that let the 2.11 remote-origin check break everything at once, because
+        // nothing had ever had to declare an app permission. Its presence is what
+        // makes every assertion below meaningful.
+        assert!(
+            acl_manifests().contains_key(tauri::utils::acl::APP_ACL_KEY),
+            "permissions/app-ipc.json must produce an app ACL manifest"
+        );
+    }
+
+    #[test]
+    fn every_invoke_handler_command_is_allowed_from_the_gateway_origin() {
+        let authority = authority(Some(PORT));
+        let origin = Origin::Remote {
+            url: gateway_origin(),
+        };
+        for command in invoke_handler_commands() {
+            // The panel reports are invoked from the previewed page, never from
+            // our own frontend, and are covered by their own test below.
+            if command.starts_with("__panel_") {
+                continue;
+            }
+            assert!(
+                authority
+                    .resolve_access(&command, "main", "main", &origin)
+                    .is_some(),
+                "`{command}` is denied on the packaged window — the ACL would reject it with \
+                 \"Command {command} not allowed by ACL\""
+            );
+        }
+    }
+
+    #[test]
+    fn declared_plugin_permissions_reach_the_gateway_origin_too() {
+        let authority = authority(Some(PORT));
+        let origin = Origin::Remote {
+            url: gateway_origin(),
+        };
+        for command in PLUGIN_COMMANDS {
+            assert!(
+                authority
+                    .resolve_access(command, "main", "main", &origin)
+                    .is_some(),
+                "plugin command `{command}` is denied on the packaged window"
+            );
+        }
+    }
+
+    #[test]
+    fn secondary_app_windows_get_the_same_access_as_main() {
+        // "New Window" builds `window-N` and points it at the main window's URL,
+        // so it lands on the gateway origin too and needs the same grants.
+        let authority = authority(Some(PORT));
+        let origin = Origin::Remote {
+            url: gateway_origin(),
+        };
+        for (window, webview) in [("window-0", "window-0"), ("window-42", "window-42")] {
+            assert!(
+                authority
+                    .resolve_access("heartbeat", window, webview, &origin)
+                    .is_some(),
+                "`heartbeat` is denied on {webview}"
+            );
+            assert!(
+                authority
+                    .resolve_access("plugin:event|listen", window, webview, &origin)
+                    .is_some(),
+                "`plugin:event|listen` is denied on {webview}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_the_gateway_capability_the_gateway_origin_is_denied() {
+        // The regression itself: static capabilities alone (`local: true`, no
+        // remote context) leave every command denied once the window leaves the
+        // Tauri asset origin. This is the state the shipped v0.16.0 is in.
+        let authority = authority(None);
+        let origin = Origin::Remote {
+            url: gateway_origin(),
+        };
+        for command in ["heartbeat", "show_native_notification", "plugin:event|listen"] {
+            assert!(
+                authority
+                    .resolve_access(command, "main", "main", &origin)
+                    .is_none(),
+                "`{command}` resolved without the gateway capability — this test no longer \
+                 reproduces the regression it guards"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gateway_capability_admits_only_the_resolved_origin() {
+        let authority = authority(Some(PORT));
+        // A different local port (another server on this machine), a foreign
+        // host, and a different scheme must all stay out: the whole point of the
+        // upstream 2.11 change is that remote content can't reach custom commands.
+        for url in [
+            "http://localhost:9999",
+            "http://127.0.0.1:5252",
+            "http://evil.example",
+            "http://localhost.evil.example:5252",
+            "https://localhost:5252",
+        ] {
+            assert!(
+                authority
+                    .resolve_access("heartbeat", "main", "main", &remote(url))
+                    .is_none(),
+                "`heartbeat` is reachable from {url} — the gateway URL pattern is too loose"
+            );
+        }
+    }
+
+    #[test]
+    fn panel_previews_get_the_three_report_commands_and_nothing_else() {
+        let authority = authority(Some(PORT));
+        // A preview webview lives INSIDE the main window and shows an arbitrary
+        // third-party page, so it is judged as (window: main, webview:
+        // url-preview-N) on that page's origin.
+        let previewed = remote("https://example.com");
+        for command in ["__panel_title_report", "__panel_url_report", "__panel_content_report"] {
+            assert!(
+                authority
+                    .resolve_access(command, "main", "url-preview-3", &previewed)
+                    .is_some(),
+                "`{command}` is denied in a panel preview — the previewed page's title/URL/text \
+                 would never reach the main window"
+            );
+        }
+        // Everything else stays out of reach of previewed content. Before 2.11
+        // (no app ACL manifest) all of these were callable from any previewed page.
+        for command in [
+            "heartbeat",
+            "restart_app",
+            "quit_lucidos",
+            "uninstall_lucidos",
+            "open_url_external",
+            "show_native_notification",
+            "get_or_create_device_id",
+            "plugin:event|listen",
+        ] {
+            assert!(
+                authority
+                    .resolve_access(command, "main", "url-preview-3", &previewed)
+                    .is_none(),
+                "`{command}` is reachable from arbitrary previewed content"
+            );
+        }
+    }
+
+    #[test]
+    fn the_app_surface_is_not_reachable_from_a_preview_on_the_gateway_origin() {
+        // Same-origin previews are the sharp edge of scoping by `windows`: if the
+        // gateway capability were window-scoped, a preview of a localhost page
+        // would inherit the main window's full grant.
+        let authority = authority(Some(PORT));
+        let origin = Origin::Remote {
+            url: gateway_origin(),
+        };
+        assert!(
+            authority
+                .resolve_access("heartbeat", "main", "url-preview-1", &origin)
+                .is_none(),
+            "a preview webview inherited the main window's app IPC grant"
+        );
+    }
+
+    #[test]
+    fn dev_keeps_working_on_the_local_origin() {
+        // Defining an app ACL manifest switches `has_app_acl_manifest` to true,
+        // which starts ACL-checking app commands on LOCAL origins too — dev
+        // (`devUrl`) and the bundled `tauri://localhost` splash included. Without
+        // `allow-app-ipc` in the default capability this would break `tauri dev`
+        // and the splash's own heartbeat.
+        let authority = authority(None);
+        for command in invoke_handler_commands() {
+            if command.starts_with("__panel_") {
+                continue;
+            }
+            assert!(
+                authority
+                    .resolve_access(&command, "main", "main", &Origin::Local)
+                    .is_some(),
+                "`{command}` is denied on the local app URL — dev and the boot splash are broken"
+            );
+        }
+        for command in PLUGIN_COMMANDS {
+            assert!(
+                authority
+                    .resolve_access(command, "main", "main", &Origin::Local)
+                    .is_some(),
+                "plugin command `{command}` is denied on the local app URL"
+            );
+        }
+    }
+
+    #[test]
+    fn app_permissions_match_the_invoke_handler() {
+        // The app ACL manifest makes an omission fatal: a command registered in
+        // `generate_handler!` but absent from permissions/app-ipc.json is denied
+        // on EVERY origin, dev included. This is the guard that turns that into a
+        // test failure instead of a shipped regression.
+        let registered = invoke_handler_commands();
+        let permitted: BTreeSet<String> = permission_commands("allow-app-ipc")
+            .union(&permission_commands("allow-panel-report"))
+            .cloned()
+            .collect();
+        let unpermitted: Vec<_> = registered.difference(&permitted).collect();
+        assert!(
+            unpermitted.is_empty(),
+            "registered with generate_handler! but not allowed by permissions/app-ipc.json: \
+             {unpermitted:?} — they would be rejected by the ACL everywhere"
+        );
+        let stale: Vec<_> = permitted.difference(&registered).collect();
+        assert!(
+            stale.is_empty(),
+            "allowed by permissions/app-ipc.json but no longer registered: {stale:?}"
+        );
+        // The split matters: the panel permission is granted to arbitrary remote
+        // content, so it must stay exactly the three report commands.
+        assert_eq!(
+            permission_commands("allow-panel-report"),
+            BTreeSet::from([
+                "__panel_title_report".to_string(),
+                "__panel_url_report".to_string(),
+                "__panel_content_report".to_string(),
+            ]),
+            "allow-panel-report is granted to ANY remote origin — keep it to the three reports"
+        );
+    }
+
+    #[test]
+    fn gateway_capability_grants_what_the_default_capability_grants() {
+        // Same frontend, one reached over http and one off the bundled assets —
+        // if the two permission lists drift, a command works in dev and dies in
+        // the packaged build (or the reverse), which is precisely the class of
+        // bug that went unnoticed for a month.
+        let default_permissions: BTreeSet<String> = static_capabilities()["default"]
+            .permissions
+            .iter()
+            .map(|p| p.identifier().get().to_string())
+            .collect();
+        let gateway_permissions: BTreeSet<String> = gateway_capability(PORT)
+            .permissions
+            .iter()
+            .map(|p| p.identifier().get().to_string())
+            .collect();
+        assert_eq!(gateway_permissions, default_permissions);
+    }
+
+    #[test]
+    fn no_capability_mixes_a_remote_context_with_window_scoping() {
+        // `windows` enables a capability on EVERY webview of the matching window,
+        // and the `url-preview-*` webviews showing third-party sites live inside
+        // the main window. Combined with a remote context that would hand our IPC
+        // surface to previewed content. Webview scoping is the only safe form.
+        let mut capabilities = static_capabilities();
+        let capability = gateway_capability(PORT);
+        capabilities.insert(capability.identifier.clone(), capability);
+        for (identifier, capability) in &capabilities {
+            if capability.remote.is_some() {
+                assert!(
+                    capability.windows.is_empty(),
+                    "capability `{identifier}` has a remote context AND window scoping"
+                );
+                assert!(
+                    !capability.webviews.is_empty(),
+                    "capability `{identifier}` has a remote context but no webview scoping, so it \
+                     applies to every webview in the app"
+                );
+            }
+        }
     }
 }

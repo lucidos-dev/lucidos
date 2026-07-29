@@ -115,7 +115,16 @@ impl AgentSessionsActiveThreads {
 #[async_trait::async_trait]
 impl ActiveThreads for AgentSessionsActiveThreads {
     async fn is_active(&self, thread_id: Uuid) -> bool {
-        self.sessions.lock().await.contains_key(&thread_id)
+        // Presence in the map is not liveness — `AgentSession::is_live` is.
+        // A phantom left by a dropped run future used to hold this `true`
+        // forever, so cleanup logged "skipping thread … — live agent session
+        // active" on every cycle for a thread whose subprocess was long gone
+        // (thread 293f96d5, 2026-07-28) and its worktree was never reclaimed.
+        self.sessions
+            .lock()
+            .await
+            .get(&thread_id)
+            .is_some_and(|s| s.is_live())
     }
 }
 

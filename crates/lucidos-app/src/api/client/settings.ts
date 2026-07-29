@@ -260,6 +260,18 @@ export async function cancelMemoryRebuild(): Promise<void> {
 }
 
 // --- Email ---
+
+/** The engine's worst-case send path is the 30s-bounded OAuth token refresh
+ *  (`bounded_http_client` in `core/oauth.rs`) followed by the 80s-bounded SMTP
+ *  send (`SMTP_SEND_TIMEOUT` in `core/email_client.rs`) = 110s. This request
+ *  timeout must stay ABOVE that sum so the engine's specific failure ("SMTP
+ *  send via host:port timed out", auth errors, no-route) reaches the toast:
+ *  `json()`'s 10s default aborted first, surfaced only a misleading generic
+ *  "request timed out" while the backend kept sending, and users retrying the
+ *  still-open modal double-sent.
+ *  Exported for the contract pin in email-send-pending.test.ts. */
+export const EMAIL_SEND_TIMEOUT_MS = 120_000;
+
 export function sendEmailConfirmed(draft: {
   to: string[];
   subject: string;
@@ -274,7 +286,7 @@ export function sendEmailConfirmed(draft: {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(draft),
-  });
+  }, EMAIL_SEND_TIMEOUT_MS);
 }
 
 // --- Backup ---

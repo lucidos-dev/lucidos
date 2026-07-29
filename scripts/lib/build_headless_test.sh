@@ -18,20 +18,23 @@ pass() { echo "  ok:   $*"; PASS=$((PASS+1)); }
 echo "test: --check validates the resource contract and exits 0"
 out="$("$BUILD_HEADLESS" --check 2>&1)"; rc=$?
 if [ $rc -eq 0 ]; then pass "--check exits 0"; else fail "--check exited $rc: $out"; fi
-for name in lucidos-engine lucidos-gateway frontend postgres sdk; do
-    echo "$out" | grep -q "$name" && pass "mentions $name" || fail "missing $name from --check: $out"
+for name in lucidos-engine lucidos-gateway frontend postgres sdk system-knowhow; do
+    if echo "$out" | grep -q "$name"; then pass "mentions $name"; else fail "missing $name from --check: $out"; fi
 done
 # The `lucidos` CLI is a distinct bundled resource — assert the space-delimited
 # standalone token so this doesn't pass merely by matching the lucidos-engine /
 # lucidos-gateway prefix (`grep -w` would: `-` is a non-word char, so `-w lucidos`
 # matches inside `lucidos-engine`).
-echo "$out" | grep -qE '(^| )lucidos( |$)' && pass "mentions the lucidos CLI" || fail "missing the lucidos CLI from --check: $out"
+if echo "$out" | grep -qE '(^| )lucidos( |$)'; then pass "mentions the lucidos CLI"; else fail "missing the lucidos CLI from --check: $out"; fi
 
 echo ""
 echo "test: --check resolves a host triple"
 out="$("$BUILD_HEADLESS" --check 2>&1)"
-echo "$out" | grep -Eq 'headless bundle for [a-z0-9_]+-(apple-darwin|unknown-linux-gnu)' \
-    && pass "--check names a resolved triple" || fail "no resolved triple in: $out"
+if echo "$out" | grep -Eq 'headless bundle for [a-z0-9_]+-(apple-darwin|unknown-linux-gnu)'; then
+    pass "--check names a resolved triple"
+else
+    fail "no resolved triple in: $out"
+fi
 
 echo ""
 echo "test: --check --triple <linux> validates the Linux contract offline"
@@ -84,7 +87,7 @@ echo ""
 echo "test: --help documents the flags"
 out="$("$BUILD_HEADLESS" --help 2>&1)"
 for token in -- --triple --out-dir --version --check; do
-    echo "$out" | grep -q -- "$token" && pass "--help documents $token" || fail "--help missing $token"
+    if echo "$out" | grep -q -- "$token"; then pass "--help documents $token"; else fail "--help missing $token"; fi
 done
 
 echo ""
@@ -100,7 +103,7 @@ fi
 echo ""
 echo "test: the shared staging lib + its test ship alongside build-headless.sh"
 for f in scripts/lib/stage_runtime.sh scripts/lib/stage_runtime_test.sh scripts/build-headless.sh; do
-    [ -f "$PROJECT_DIR/$f" ] && pass "$f exists" || fail "$f is missing"
+    if [ -f "$PROJECT_DIR/$f" ]; then pass "$f exists"; else fail "$f is missing"; fi
 done
 
 echo ""

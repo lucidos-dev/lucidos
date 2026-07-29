@@ -30,7 +30,9 @@ function getFormTitle(form: InlineForm): string {
     }
     case 'new-app': return 'New App';
     case 'credential': return form.editing ? 'Edit Credential' : 'Add Credential';
-    case 'email-confirm': return 'Confirm Email';
+    // Also the nav-history row's label (via navEntryTitle), so a sent email
+    // reads as the receipt it is rather than a confirmation still pending.
+    case 'email-confirm': return form.sentAt ? 'Email Sent' : 'Confirm Email';
     case 'plugin-install': return `Install ${form.request.plugin_name}`;
     case 'plugin-uninstall': return `Uninstall ${form.request.plugin_name}`;
   }

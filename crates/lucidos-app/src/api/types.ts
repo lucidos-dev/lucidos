@@ -158,6 +158,10 @@ export interface ModelInfo {
   sort_order: number;
   source: string;
   enabled: boolean;
+  /** Context window in tokens, or null when the engine infers it from the model
+   *  id. The id-shape fallback only knows Claude and GPT-5, so every OpenRouter
+   *  / Gemini / local model is treated as 200k until this is set. */
+  context_window: number | null;
   created_at: string;
 }
 

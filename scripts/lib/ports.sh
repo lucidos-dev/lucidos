@@ -30,37 +30,124 @@ port_is_free() {
     ! lsof -ti :"$port" -sTCP:LISTEN >/dev/null 2>&1
 }
 
+# This process and every ancestor of it, space-padded (" 123 456 ") so a
+# `case` membership test can't match a substring of a pid. Computed lazily,
+# once; a process tree doesn't change above you.
+_LUCIDOS_ANCESTOR_PIDS=""
+
+# Populate _LUCIDOS_ANCESTOR_PIDS. Assigns the global DIRECTLY instead of
+# echoing it: a `$(...)` caller would run this in a subshell and the cache
+# would be discarded every single time.
+_ensure_ancestor_pid_set() {
+    [ -n "$_LUCIDOS_ANCESTOR_PIDS" ] && return 0
+    # $$ — not $BASHPID, which macOS's bash 3.2 doesn't have — is the shell
+    # that sourced us, and it stays stable inside subshells, so every caller
+    # computes the same set.
+    local acc=" $$ " cur="$$" steps=0
+    # 64 is far past any real chain (the deepest here is ~7: test script →
+    # bash → claude → engine → supervisor → gateway → bash → launchd) and
+    # bounds the cost at one `ps` fork per level, once per process.
+    while [ "$steps" -lt 64 ]; do
+        cur=$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d '[:space:]')
+        # No parent, unreadable, or we walked off the top.
+        case "$cur" in ''|*[!0-9]*) break ;; esac
+        [ "$cur" -le 1 ] && break
+        # A repeat means `ps` gave us a cycle. Impossible in a real process
+        # tree, but a cheap guard against spinning if it ever lies.
+        case "$acc" in *" $cur "*) break ;; esac
+        acc="$acc$cur "
+        steps=$(( steps + 1 ))
+    done
+    _LUCIDOS_ANCESTOR_PIDS="$acc"
+}
+
+# The account's home as recorded in the PASSWORD DATABASE, which $HOME cannot
+# override. Empty when it can't be resolved or is the same as $HOME (so the
+# pidfile scan doesn't walk the same tree twice).
+_LUCIDOS_PASSWD_HOME=""
+_LUCIDOS_PASSWD_HOME_RESOLVED=""
+_ensure_passwd_home() {
+    [ -n "$_LUCIDOS_PASSWD_HOME_RESOLVED" ] && return 0
+    _LUCIDOS_PASSWD_HOME_RESOLVED=1
+    local user home=""
+    user=$(id -un 2>/dev/null) || return 0
+    [ -n "$user" ] || return 0
+    # Directory services first (macOS), then getent (Linux). Whichever isn't
+    # installed just yields nothing. Deliberately NOT `eval "echo ~$user"` —
+    # that would interpolate a username straight into shell code.
+    #
+    # `sed -n 's/^KEY: //p'`, not `awk '{print $2}'`: the value is the rest of
+    # the line, so a home directory containing a space would be TRUNCATED by a
+    # field split, and the scan would then walk a path that doesn't exist —
+    # the arm would silently stop protecting, which is the failure mode this
+    # whole change exists to remove.
+    home=$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p')
+    [ -n "$home" ] || home=$(getent passwd "$user" 2>/dev/null | cut -d: -f6)
+    # Must be absolute. Anything else (empty, an unexpected `dscl` line shape)
+    # means we misparsed — discard it rather than scan a bogus root.
+    case "$home" in /*) ;; *) return 0 ;; esac
+    [ "$home" = "${HOME:-}" ] && return 0
+    _LUCIDOS_PASSWD_HOME="$home"
+}
+
 # Return 0 (true) if `pid` belongs to a live Lucidos host process we must
 # never signal — the engine that spawned us, the matching frontend, or any
 # other workspace's recorded engine/frontend.
 #
-# The CC subprocess inherits LUCIDOS_HOST_PID and LUCIDOS_FRONTEND_PID from
-# the engine (see runtime/claude_code.rs build_command). Even when a test
-# script invokes ports.sh for a different workspace (e.g. e2e-test), the env
-# vars still identify the dev-workspace engine that's running the test, and
-# any port-cleanup pass refuses to kill it.
+# FOUR arms. The first two read caller-owned state and a caller can switch
+# them off; the last two cannot, which is the whole point.
 #
-# The pidfile-scan fallback catches the case where the env vars are absent
-# (manual dev script invocation, no CC chain) but other workspaces are still
-# alive. `kill -0` gates each scan match so a stale pidfile pointing at a
-# recycled PID number doesn't accidentally protect an unrelated process.
+#  1. LUCIDOS_HOST_PID / LUCIDOS_FRONTEND_PID — the CC subprocess inherits
+#     these from the engine (api/actor.rs host_protection_env_vars). Even when
+#     a test script invokes ports.sh for a different workspace (e.g. e2e-test),
+#     they still identify the dev-workspace engine that is running the test.
+#  2. A pidfile scan across every workspace under the user's home, covering the
+#     case where the env vars are absent (manual dev script invocation, no CC
+#     chain) but sibling workspaces are alive. `kill -0` gates each match so a
+#     stale pidfile naming a recycled PID can't protect an unrelated process.
+#  3. ANCESTOR — this process and everything it descends from. A process cannot
+#     unset its own parentage, so no caller can defeat this one.
+#  4. pid <= 1 — init/the kernel are never ours to signal (mirrors the same
+#     guard in webkit_reaper.sh reap_once).
+#
+# Arms 3 and 4 exist because arms 1 and 2 BOTH failed open on 2026-07-28 and
+# this library's own test suite killed the machine's live dev engine, twice:
+# the tests unset the env vars and point HOME at a mktemp dir, so the engine
+# was invisible to both arms, the cmdline matched *lucidos-engine*, and the
+# reclaim path SIGUSR1'd it. Arm 2 is scanned under the password-database home
+# as well as $HOME for the same reason — reassigning HOME must not disarm
+# protection. See ADR 0025.
 is_protected_host_pid() {
     local pid="$1"
     [ -z "$pid" ] && return 1
+    case "$pid" in *[!0-9]*) return 1 ;; esac
+
+    [ "$pid" -le 1 ] && return 0
+
     if [ -n "${LUCIDOS_HOST_PID:-}" ] && [ "$pid" = "$LUCIDOS_HOST_PID" ]; then
         return 0
     fi
     if [ -n "${LUCIDOS_FRONTEND_PID:-}" ] && [ "$pid" = "$LUCIDOS_FRONTEND_PID" ]; then
         return 0
     fi
-    local pidfile other_pid
-    for pidfile in "$HOME"/workspaces/*/.lucidos/engine.pid "$HOME"/workspaces/*/.lucidos/frontend.pid; do
-        [ -f "$pidfile" ] || continue
-        other_pid="$(cat "$pidfile" 2>/dev/null)"
-        [ -z "$other_pid" ] && continue
-        if [ "$pid" = "$other_pid" ] && kill -0 "$other_pid" 2>/dev/null; then
-            return 0
-        fi
+
+    _ensure_ancestor_pid_set
+    case "$_LUCIDOS_ANCESTOR_PIDS" in
+        *" $pid "*) return 0 ;;
+    esac
+
+    _ensure_passwd_home
+    local root pidfile other_pid
+    for root in "${HOME:-}" "$_LUCIDOS_PASSWD_HOME"; do
+        [ -n "$root" ] || continue
+        for pidfile in "$root"/workspaces/*/.lucidos/engine.pid "$root"/workspaces/*/.lucidos/frontend.pid; do
+            [ -f "$pidfile" ] || continue
+            other_pid="$(cat "$pidfile" 2>/dev/null)"
+            [ -z "$other_pid" ] && continue
+            if [ "$pid" = "$other_pid" ] && kill -0 "$other_pid" 2>/dev/null; then
+                return 0
+            fi
+        done
     done
     return 1
 }
@@ -211,20 +298,22 @@ read_lucidos_toml_vite_port() {
 
 # Try to reclaim a port held by a stale lucidos-engine — one of ours that
 # crashed or got orphaned, with no live pidfile claiming it. Returns 0 if
-# the port is free afterwards, 1 if we shouldn't touch the occupier (any
-# live other-workspace pidfile claim, env-var-protected host, or a non-
-# lucidos cmdline). Without this, allocate_ports would silently walk past
-# the registered offset every time a workspace's own crashed engine was
-# still listening, drifting the offset on each restart and persisting the
-# drift back to the registry.
+# the port is free afterwards, 1 if we shouldn't touch the occupier (an
+# ancestor of this process, any live other-workspace pidfile claim, an
+# env-var-protected host, or a non-lucidos cmdline). Without this,
+# allocate_ports would silently walk past the registered offset every time a
+# workspace's own crashed engine was still listening, drifting the offset on
+# each restart and persisting the drift back to the registry.
 _try_reclaim_stale_lucidos_on_port() {
     local port="$1"
     local pid="$2"
     [ -z "$pid" ] && return 1
 
-    # Any live pidfile claim (this workspace's own active engine/frontend,
-    # another workspace's engine/frontend, or LUCIDOS_HOST_PID/
-    # LUCIDOS_FRONTEND_PID env vars) → leave it alone.
+    # Protected → leave it alone. This gate is what stands between a port
+    # collision and a dead engine: everything below it signals, and the
+    # cmdline check below is NOT a safety net (a live host engine matches
+    # *lucidos-engine* by definition — that is how the 2026-07-28 incident
+    # got all the way to `kill -USR1`). See is_protected_host_pid, ADR 0025.
     is_protected_host_pid "$pid" && return 1
 
     # Only reclaim if the cmdline is a lucidos-engine. Vite children exit

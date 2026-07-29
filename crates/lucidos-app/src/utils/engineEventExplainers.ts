@@ -35,6 +35,8 @@ export function describeAbortCause(cause: AbortCause | undefined): string {
       return 'The Claude Code session was killed (crash, signal, or out-of-memory).';
     case 'stale_settle':
       return 'The engine cleaned up a stuck response state — no live work was running.';
+    case 'session_dropped':
+      return 'Whatever started this session was cancelled while it was still running, so the session went down with it — most often a request whose client disconnected. The work stopped where it was; start it again to continue.';
     case 'unknown':
     case undefined:
       return 'The response was interrupted by the system (cause not recorded).';

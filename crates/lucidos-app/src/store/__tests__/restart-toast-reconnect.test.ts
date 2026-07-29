@@ -148,17 +148,17 @@ describe('restart toast survives network reconnect', () => {
     expect(localStorage.getItem(RESTART_LS_KEY)).toBeNull();
   });
 
-  it('advances the restart status toast to the swap phase when the old engine goes unreachable', async () => {
+  it('keeps the in-flight restart status toast up (unchanged) when the old engine goes unreachable', async () => {
     await establishConnection();
 
-    // Restart in flight: the build-phase status toast is up (initiateEngineRestart).
+    // Restart in flight: the status toast is up (initiateEngineRestart). Its wording
+    // is stable for the whole window — there is no build→swap phase transition.
     engineRestarting.value = true;
     toasts.value = [];
     showToast('Starting new version…', 'info', { key: RESTART_TOAST_KEY, showDuringRestart: true, spinning: true });
 
-    // Build finished, old engine killed → first /health failure flips the toast
-    // to the swap phase even before the dot debounce trips (advance is gated on
-    // the raw health result, not the displayed connection status).
+    // Old engine killed → a /health failure must NOT dismiss or reword the toast;
+    // it stays with its spinner until reconnect (started_at change) clears it.
     mockCheckHealth.mockResolvedValueOnce(unreachable);
     await checkConnection();
 
@@ -168,17 +168,17 @@ describe('restart toast survives network reconnect', () => {
     expect(toast!.spinning).toBe(true);
   });
 
-  it('does not advance the restart toast on a transient blip when no restart is in flight', async () => {
+  it('does not invent a restart toast on a transient blip when no restart is in flight', async () => {
     await establishConnection();
 
-    // No restart underway — a one-off health failure must not invent a swap toast.
+    // No restart underway — a one-off health failure must not invent a progress toast.
     engineRestarting.value = false;
     toasts.value = [];
 
     mockCheckHealth.mockResolvedValueOnce(unreachable);
     await checkConnection();
 
-    expect(toasts.value.find(t => t.message === 'Starting new version…')).toBeUndefined();
+    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)).toBeUndefined();
   });
 
   it('does not set updateAvailable on engine restart when the frontend bundle is unchanged', async () => {

@@ -41,12 +41,11 @@ source "$SCRIPT_DIR/lib/e2e.sh"
 
 acquire_e2e_lock e2e || exit 1
 kill_orphan_simulator
-ensure_workspace_running
 teardown_e2e() {
-    # Belt-and-suspenders: e2e-browser.sh stops its own reaper on exit, but if it
-    # died on an untrapped signal the loop is orphaned — reap it here via the
-    # pidfile. No-op when nothing is running.
-    stop_webkit_reaper
+    # Belt-and-suspenders: e2e-browser.sh stops its own reaper and host-load
+    # sampler on exit, but if it died on an untrapped signal those loops are
+    # orphaned — reap them here via their pidfiles. No-op when nothing is running.
+    stop_e2e_background_guards
     cleanup_e2e_worktrees
     stop_e2e_workspace
     release_e2e_lock
@@ -55,6 +54,10 @@ trap teardown_e2e EXIT
 trap 'exit 130' INT TERM
 
 cleanup_e2e_worktrees
+# Recreates the workspace database from zero and boots the engine on it, so the
+# whole migration chain (seeds included) runs against an empty database. The
+# engine has to start AFTER the recreate, so the reset owns the boot — there is
+# deliberately no ensure_workspace_running before this.
 reset_e2e_database
 
 # Read by setup_e2e_session in sub-scripts to skip their own lifecycle work.
@@ -76,7 +79,9 @@ echo "════════════════════════�
 # phase ran first, so mobile-webkit would inherit hundreds of API-phase threads
 # and fail drawer-order-sensitive specs (e.g. threads.spec.ts "thread loads with
 # correct messages when clicked" picked an API thread as the first drawer row).
-# Reset here so mobile-webkit gets the clean DB it expects.
+# Reset here so mobile-webkit gets the clean DB it expects. This restarts the
+# engine (the recreated database is only migrated at boot) onto the same binary
+# the API phase ran against — build_e2e_engine_once never recompiles mid-suite.
 reset_e2e_database
 "$SCRIPT_DIR/e2e-browser.sh"
 

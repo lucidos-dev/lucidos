@@ -16,9 +16,145 @@
 #   show_banner "web"|"tauri"
 
 # Globals set by sourcing script before sourcing this file:
-#   SCRIPT_DIR, PROJECT_DIR, FRONTEND_DIR
+#   PROJECT_DIR, FRONTEND_DIR
 # Globals set by callers:
 #   SCRIPT_NAME  — basename of the calling script (for usage messages)
+
+# ── path_is_in_cc_worktree ──────────────────────────────────────────────
+# True (exit 0) when $1 lies inside a coding-agent worktree — one of the
+# `<workspace>/.lucidos/worktrees/<thread>/` copies the engine creates per
+# coding-agent thread.
+#
+# Deliberately a pure string test with no `stat`: the case this exists to catch
+# is a stack still running out of an ORPHANED worktree (pruned from git's
+# registry, directory possibly already gone), so requiring the path to exist
+# would make the guard fail open exactly when it matters most.
+path_is_in_cc_worktree() {
+    case "$1" in
+        */.lucidos/worktrees/*|*/.lucidos/worktrees) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ── assert_stack_not_worktree_pinned ────────────────────────────────────
+# Refuse to launch a long-lived stack whose checkout is a coding-agent worktree.
+# Takes the checkout dir (PROJECT_DIR); returns 0 when it's fine to proceed and
+# exits non-zero with an actionable message otherwise.
+#
+# Why this is fatal rather than auto-corrected: re-pointing the invocation at
+# "the real checkout" means GUESSING which clone is canonical (a machine can have
+# several), and silently running different code than the operator invoked is the
+# same class of surprise as the bug being prevented. So: refuse, and name the
+# command to run instead.
+#
+# Why a worktree-rooted stack is broken (the 2026-07-26 incident): a worktree is
+# a throwaway copy pinned to ONE commit, and it contains a full `scripts/` tree,
+# so `PROJECT_DIR="$(dirname "$SCRIPT_DIR")"` silently resolves there. The stack
+# then serves that commit's engine binary and `dist/` forever — the
+# checkout-level `vite build --watch` republishes the REAL checkout's `dist/`,
+# which this stack never reads, so every frontend-only Apply looks like it did
+# nothing. Worse, the gateway inherits LUCIDOS_STATIC_DIR / LUCIDOS_ENGINE_BIN
+# into every engine it spawns and can re-exec onto a worktree-built binary, so
+# the pin survives restarts and re-establishes itself.
+#
+# `LUCIDOS_ALLOW_WORKTREE_STACK=1` opts out — set by the e2e harness
+# (scripts/lib/e2e.sh), whose workspace is disposable and whose whole point is
+# exercising the checkout it was invoked from. The opt-in is deliberately an
+# explicit env var rather than a workspace-name check (`e2e-test`): a name test
+# fails OPEN if the name ever changes, and is invisible at the call site.
+#
+# `$2` = scope. **`gateway` ignores the opt-out entirely**, and that asymmetry is
+# the whole point: the danger is not "a worktree", it is a MACHINE-GLOBAL daemon
+# rooted in one. `run_gateway_supervised` traps SIGHUP/SIGINT/SIGTERM and is
+# `disown`ed precisely so the gateway outlives the launching shell, and a `-b`
+# run STOPS the existing gateway and relaunches it from the invoking checkout
+# ("Stopping existing gateway for rebuild"). So `web-dev.sh -w e2e-test -b` from a
+# coding-agent worktree — which the CC instructions used to recommend — kills the
+# user's gateway and replaces it with one pinned to a throwaway checkout, which
+# then adopts every workspace and serves them all its frozen dist/. That IS the
+# 2026-07-26 incident, and no opt-in should be able to buy it.
+#
+# The e2e harness is unaffected: `scripts/lib/e2e.sh` calls `start_engine`
+# directly (legacy direct-engine model, ADR 0014) and never starts a gateway, so
+# it only ever hits the `stack` scope, where the opt-out applies.
+assert_stack_not_worktree_pinned() {
+    local project_dir="$1"
+    local scope="${2:-stack}"
+    path_is_in_cc_worktree "$project_dir" || return 0
+    if [ "$scope" != "gateway" ] && [ "${LUCIDOS_ALLOW_WORKTREE_STACK:-}" = "1" ]; then
+        return 0
+    fi
+
+    # A linked worktree's `.git` is a FILE holding
+    # `gitdir: <main>/.git/worktrees/<name>` — so when it's still readable we can
+    # name the real checkout instead of making the operator work it out.
+    local real=""
+    if [ -f "$project_dir/.git" ]; then
+        real="$(sed -n 's/^gitdir: //p' "$project_dir/.git" 2>/dev/null \
+                | sed 's#/\.git/worktrees/.*##')"
+    fi
+    [ -n "$real" ] || real="<your lucidos checkout>"
+
+    if [ "$scope" = "gateway" ]; then
+        cat >&2 <<EOF
+
+ERROR: refusing to start the machine-global gateway from a coding-agent worktree.
+
+  checkout: $project_dir
+
+The gateway is ONE daemon per machine, disowned and signal-trapped so it outlives
+the shell that launched it — and \`-b\` stops the running one and relaunches it
+from whatever checkout invoked it. Rooted in a worktree it would outlive this
+session, adopt every workspace, and serve them all a dist/ frozen at this
+worktree's commit, while inheriting these paths into every engine it spawns. That
+is how a frontend Apply silently does nothing for hours.
+
+LUCIDOS_ALLOW_WORKTREE_STACK does NOT apply here — no test is worth replacing the
+user's gateway with a throwaway one.
+
+Start it from the real checkout:
+
+  cd $real
+  ./scripts/web-dev.sh -w <workspace> -b
+
+To exercise THIS worktree's code, run the e2e scripts — they build the engine and
+boot their own gateway-less, session-scoped engine, so no start step is needed:
+
+  ./scripts/e2e.sh                 # full API + browser
+  ./scripts/e2e-api.sh             # one suite
+
+For a deliberate gateway-less run of some OTHER workspace from here, both opt-ins
+are required (LUCIDOS_NO_GATEWAY alone still hits the worktree guard):
+
+  LUCIDOS_NO_GATEWAY=1 LUCIDOS_ALLOW_WORKTREE_STACK=1 ./scripts/web-dev.sh -w <workspace> -b
+
+EOF
+        return 1
+    fi
+
+    cat >&2 <<EOF
+
+ERROR: refusing to start a Lucidos stack from a coding-agent worktree.
+
+  checkout: $project_dir
+
+A worktree is a throwaway copy pinned to one commit. A stack launched from one
+serves that commit's engine binary and frontend dist/ forever — the shared
+\`vite build --watch\` republishes the real checkout's dist/, which this stack
+never reads, so every frontend Apply silently appears to do nothing.
+
+Start it from the real checkout instead:
+
+  cd $real
+  ./scripts/web-dev.sh -w <workspace> -b
+
+If this really is a disposable e2e / session-local stack, opt in explicitly:
+
+  LUCIDOS_ALLOW_WORKTREE_STACK=1 <your command>
+
+EOF
+    return 1
+}
 
 # ── parse_dev_args ──────────────────────────────────────────────────────
 # Parse -w, -b, -r, -h flags. Sets WORKSPACE, BUILD, RELEASE, BUILT.
@@ -34,19 +170,25 @@ parse_dev_args() {
     # separately, via the /restart control call). See
     # docs/plans/2026-07-01-new-engine-version-switch-flow.md.
     ENGINE_BUILD_ONLY=""
+    # shellcheck disable=SC2034 # read by scripts/web-dev.sh after it calls this parser
     FOLLOW_LOG=""
     # The engine serves the built dist/ DIRECTLY (ADR 0014) — `vite build --watch`
     # rebuilds it on source change; the SW caches bundled /assets/* so an iOS PWA
     # resumes instantly. BUILT stays set for back-compat with callers that read it
     # (the old `--hmr` live-dev-server path was removed — there is no Vite proxy).
+    # shellcheck disable=SC2034 # documented output of this parser, kept for back-compat callers
     BUILT="1"
     while [[ $# -gt 0 ]]; do
+        # A directive cannot sit on an individual case branch, so it goes here:
+        # FOLLOW_LOG is set below and read by scripts/web-dev.sh after this parser
+        # returns. Every other variable this case assigns has an in-file reader.
+        # shellcheck disable=SC2034
         case $1 in
             -w|--workspace) WORKSPACE="$2"; shift 2 ;;
             -b|--build) BUILD="1"; shift ;;
             -r|--release) RELEASE="1"; shift ;;
             -f|--follow) FOLLOW_LOG="1"; shift ;;
-            --built) BUILT="1"; shift ;;   # accepted for back-compat; always built now
+            --built) shift ;;   # accepted for back-compat; BUILT is already 1 (always built now)
             --engine-only) ENGINE_ONLY="1"; BUILD="1"; shift ;;
             --engine-build) ENGINE_BUILD_ONLY="1"; BUILD="1"; shift ;;
             -h|--help)
@@ -134,7 +276,8 @@ resolve_workspace() {
             local subdir_count
             subdir_count=$(find "$WORKSPACE/.lucidos" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
             if [ "$subdir_count" = "0" ]; then
-                local stash="$WORKSPACE/.lucidos.stale-$(date +%Y%m%d%H%M%S)"
+                local stash
+                stash="$WORKSPACE/.lucidos.stale-$(date +%Y%m%d%H%M%S)"
                 echo "Stashing stub $WORKSPACE/.lucidos → $(basename "$stash") so .${_old}/ migration can proceed"
                 mv "$WORKSPACE/.lucidos" "$stash"
             else
@@ -149,6 +292,7 @@ resolve_workspace() {
         # back-pointer; `git worktree repair` rewrites the gitdir file to the
         # new path. No-op if .lucidos/worktrees/ is empty.
         if [ -d "$WORKSPACE/.lucidos/worktrees" ]; then
+            local wt
             for wt in "$WORKSPACE/.lucidos/worktrees"/*/; do
                 [ -d "$wt" ] || continue
                 git -C "$wt" worktree repair >/dev/null 2>&1 || true
@@ -204,21 +348,6 @@ detect_tls() {
     local ports_file="$WORKSPACE/.lucidos/ports"
     if [ -f "$ports_file" ]; then
         echo "PROTO=$PROTO" >> "$ports_file"
-    fi
-}
-
-# ── detect_vite_tls ────────────────────────────────────────────────────
-# Detect Vite's protocol. Vite checks local .certs/ (vite.config.ts: ../../.certs),
-# which may differ from PROTO (engine TLS via env vars — present in worktrees
-# where .certs/ is gitignored). Sets VITE_PROTO. Must be called after FRONTEND_DIR.
-detect_vite_tls() {
-    local vite_cert_dir="$FRONTEND_DIR/../../.certs"
-    if [ -f "$vite_cert_dir/cert.pem" ] && [ -f "$vite_cert_dir/key.pem" ]; then
-        VITE_PROTO="https"
-    elif [ -f "$LUCIDOS_TLS_CERT" ] && [ -f "$LUCIDOS_TLS_KEY" ]; then  # Vite's config also checks these env vars
-        VITE_PROTO="https"
-    else
-        VITE_PROTO="http"
     fi
 }
 
@@ -365,11 +494,30 @@ _ensure_shared_postgres_container() {
         export LUCIDOS_PG_PORT="$PG_PORT"
     fi
 
+    # Readiness is NOT a single probe. On a FIRST run the image's entrypoint runs
+    # initdb against a TEMPORARY server (listening on the unix socket only) and
+    # then STOPS it before starting the real one. `pg_isready` answers yes during
+    # that window, so a single success races the shutdown: the very next `psql`
+    # gets "connection to server on socket ... failed: No such file or directory"
+    # and the install dies. Seen on a clean Ubuntu CI runner pulling pg18 fresh.
+    #
+    # So require the probe to succeed CONSECUTIVELY, and probe over TCP (-h) the
+    # way every real client connects — the temporary init server does not listen
+    # on TCP at all, which is exactly what makes it distinguishable. A run that
+    # briefly satisfies the probe and then drops resets the streak.
+    local ready_streak=0 ready_needed=3
     echo -n "Waiting for shared PostgreSQL"
-    for _ in {1..60}; do
-        if docker exec "$container" pg_isready -U lucidos -d postgres >/dev/null 2>&1; then
-            echo " ready!"
-            return 0
+    for _ in {1..90}; do
+        if docker exec "$container" pg_isready -U lucidos -d postgres -h 127.0.0.1 -p 5432 >/dev/null 2>&1; then
+            ready_streak=$((ready_streak + 1))
+            if [ "$ready_streak" -ge "$ready_needed" ]; then
+                echo " ready!"
+                return 0
+            fi
+        elif [ "$ready_streak" -gt 0 ]; then
+            # It answered, then stopped answering: that is the init server going
+            # away. Start the count over rather than proceeding on a stale yes.
+            ready_streak=0
         fi
         echo -n "."
         sleep 1
@@ -487,7 +635,8 @@ _start_legacy_postgres_from_volume() {
 }
 
 _ensure_legacy_postgres_running() {
-    local container="$(_legacy_pg_container)"
+    local container
+    container="$(_legacy_pg_container)"
     if ! docker inspect "$container" >/dev/null 2>&1; then
         if docker volume inspect "$(_legacy_pg_volume)" >/dev/null 2>&1; then
             _start_legacy_postgres_from_volume || return 1
@@ -516,7 +665,8 @@ _ensure_legacy_postgres_running() {
 }
 
 _legacy_pg_events_count() {
-    local container="$(_legacy_pg_container)"
+    local container
+    container="$(_legacy_pg_container)"
     docker exec "$container" psql -U lucidos -d lucidos -tAc \
         "SELECT CASE WHEN to_regclass('public.events') IS NULL THEN 0 ELSE (SELECT count(*) FROM public.events) END" \
         2>/dev/null | tr -d '[:space:]'
@@ -620,7 +770,8 @@ _migrate_workspace_postgres_to_shared_if_needed() {
     _verify_shared_pg_database "$db" || { _drop_shared_database "$db"; return 1; }
     _write_shared_pg_migration_marker "$db" "$container"
 
-    local archived="$WORKSPACE/.lucidos/shared-postgres-$db.restored-$(date +%Y%m%d%H%M%S).dump"
+    local archived
+    archived="$WORKSPACE/.lucidos/shared-postgres-$db.restored-$(date +%Y%m%d%H%M%S).dump"
     mv "$dump" "$archived" 2>/dev/null || true
     echo "Shared PostgreSQL migration verified. Legacy container/volume kept for rollback:"
     echo "  $container / lucidos-pg-data-$PG_NAME"
@@ -805,7 +956,8 @@ _migrate_postgres_volume_if_needed() {
 
     # Archive the old data dir aside (never delete — user can recover if anything
     # looks wrong after migration).
-    local archive="$WORKSPACE/data/postgres.migrated-$(date +%Y%m%d%H%M%S)"
+    local archive
+    archive="$WORKSPACE/data/postgres.migrated-$(date +%Y%m%d%H%M%S)"
     if ! mv "$pg_data_dir" "$archive"; then
         echo "WARN: copied to volume but could not archive old dir at $pg_data_dir" >&2
     else
@@ -942,7 +1094,8 @@ _restore_postgres_major_dump_if_pending() {
     [ -f "$pending" ] || return 0
 
     local container="lucidos-pg-$PG_NAME"
-    local archived="$WORKSPACE/.lucidos/pg-major-migrate.restored-$(date +%Y%m%d%H%M%S).dump"
+    local archived
+    archived="$WORKSPACE/.lucidos/pg-major-migrate.restored-$(date +%Y%m%d%H%M%S).dump"
 
     # Guard against double-apply: only restore into a pristine cluster. If the
     # event store already exists (a prior restore that completed but failed to
@@ -1023,7 +1176,7 @@ _start_postgres_container() {
     fi
 
     echo -n "Waiting for PostgreSQL"
-    for i in {1..30}; do
+    for _ in {1..30}; do
         if docker exec "lucidos-pg-$PG_NAME" pg_isready -U lucidos > /dev/null 2>&1; then
             echo " ready!"
             break
@@ -1316,66 +1469,276 @@ select_cargo_lock_holders() {
     done
 }
 
+# ── Published launch binaries (ADR 0022) ────────────────────────────────
+# `target/<profile>/lucidos-engine` is ONE output path that EVERY cargo variant
+# in the checkout uplifts to, and the last writer wins: a workspace-scope
+# `cargo test`, an e2e `--features e2e-test-hooks` build, a build whose build.rs
+# ran two commits ago. Launching from it means a workspace can run — and can
+# read back via `current_exe --build-id` — a binary that is not the one its own
+# build produced (the 2026-07-26 downgrade/toast loop; see
+# docs/plans/2026-07-27-launch-binary-published-per-variant.md).
+#
+# So a completed build PUBLISHES its outputs into
+# `target/<profile>/launch/<variant>/`, and that is what every launch path uses.
+# The directory is written only by completed builds of the same profile AND
+# feature variant, so it can neither hold another configuration's binary nor be
+# relinked mid-life by a co-located peer's build. Cargo keeps uplifting to
+# `target/<profile>/lucidos-engine`; nothing launches from it any more.
+#
+# Staying under `target/` is load-bearing: the engine resolves the checkout by
+# walking `current_exe()`'s ancestors for `scripts/web-dev.sh`
+# (`crates/lucidos-engine/src/paths.rs`), and ADR 0021's worktree refusal is a
+# pure path test on `LUCIDOS_ENGINE_BIN`. A workspace-local staging dir would
+# break the first and launder a worktree binary past the second.
+
+# Filesystem-safe component naming the cargo feature configuration the binaries
+# were built with: `plain` for a default build, else the requested features.
+# ENGINE_BUILD_FEATURES is the space-separated list the caller wants enabled on
+# `lucidos-engine` (the e2e scripts set `e2e-test-hooks` so the engine compiles
+# in the push-log stub and `GET /api/v1/_test/push-log`).
+engine_build_variant_slug() {
+    local features="${ENGINE_BUILD_FEATURES:-}" slug
+    if [ -z "$features" ]; then
+        echo "plain"
+        return 0
+    fi
+    slug="$(printf '%s' "$features" | tr ' ,' '__' | tr -cd 'A-Za-z0-9_-')"
+    # Nothing survived sanitizing (an exotic feature name): still give the build
+    # its own directory rather than a nameless one that would collide with the
+    # launch dir itself.
+    [ -n "$slug" ] || slug="custom"
+    echo "$slug"
+}
+
+# `release` when the caller asked for a release build, else `debug`.
+engine_build_profile() {
+    if [ -n "${RELEASE:-}" ]; then echo "release"; else echo "debug"; fi
+}
+
+# Directory the launch binaries for a (profile, variant) pair are published to.
+launch_bin_dir() {
+    local profile="${1:-$(engine_build_profile)}"
+    local variant="${2:-$(engine_build_variant_slug)}"
+    echo "$PROJECT_DIR/target/$profile/launch/$variant"
+}
+
+# Publish one freshly built binary. Copies into the destination directory under
+# a temp name, signs it THERE, and `mv -f`s it into place: a same-filesystem
+# rename, so the path only ever holds a COMPLETE binary and a running process
+# keeps its own inode. Any failure removes the temp file and leaves an
+# already-published binary untouched — a build must never make the launch path
+# missing or truncated (that would strand every co-located workspace behind "No
+# engine binary found"). Returns non-zero when nothing was published.
+#
+# `$3 = sign` re-signs with the stable dev identity. It runs on the TEMP file,
+# before the rename, and that ordering is load-bearing: `codesign --force`
+# rewrites its target in place, so signing the already-published path would
+# leave a peer spawning a half-rewritten binary — defeating the very atomicity
+# this function exists for. The temp name is pid-unique and nothing launches
+# from it, so it is the only mutable file in the whole publish. Signing a
+# `*.tmp.<pid>` file is safe because `sign_engine_binary` passes an explicit
+# `--identifier`, so the rebuild-stable Designated Requirement does not depend
+# on the filename.
+publish_launch_binary() {
+    local src="$1" dst="$2" sign="${3:-}"
+    [ -f "$src" ] || return 1
+    mkdir -p "$(dirname "$dst")" || return 1
+    local tmp="$dst.tmp.$$"
+    # `cp -c` clones on APFS (near-free for a ~250 MB debug binary); plain `cp`
+    # everywhere else. Never copy onto `$dst` directly — that would truncate a
+    # binary a peer engine may be about to spawn.
+    if ! { cp -c "$src" "$tmp" 2>/dev/null || cp "$src" "$tmp"; }; then
+        rm -f "$tmp"
+        return 1
+    fi
+    chmod +x "$tmp" 2>/dev/null || true
+    if [ "$sign" = "sign" ]; then
+        sign_engine_binary "$tmp"
+    fi
+    if ! mv -f "$tmp" "$dst"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+# Publish the engine + gateway + CLI from cargo's uplift dir into the launch
+# dir. Returns non-zero when the engine or the gateway could not be published.
+# The engine + gateway are signed on the way in (see publish_launch_binary);
+# the CLI is not, matching what the dev launcher has always signed.
+publish_launch_binaries() {
+    local src_dir="$1" dest_dir="$2"
+    local rc=0
+    publish_launch_binary "$src_dir/lucidos-engine" "$dest_dir/lucidos-engine" sign || rc=1
+    publish_launch_binary "$src_dir/lucidos-gateway" "$dest_dir/lucidos-gateway" sign || rc=1
+    # The `lucidos` CLI must sit NEXT TO the engine: find_lucidos_cli_dir
+    # (crates/lucidos-engine/src/runtime/lucidos_cli.rs) walks up from the
+    # engine's exe dir looking for it, and the engine prepends that dir to PATH
+    # for spawned coding-agent sessions. Non-fatal — the engine degrades to
+    # skipping the lucidos-cli skill rather than failing to boot.
+    publish_launch_binary "$src_dir/lucidos" "$dest_dir/lucidos" || true
+    return $rc
+}
+
+# Classify a published binary's baked build id against the checkout's current
+# HEAD: `current`, `stale`, or `unknown`.
+#
+# `stale` means the build did NOT produce a binary for the source that is on
+# disk now — `build.rs` stamps the id when the build script RUNS, so a build
+# that starts at commit N and finishes after an Apply moved main to N+1
+# publishes an N binary. `unknown` (no git, unreadable/empty id, a no-git
+# `src-…` id) is deliberately NOT a mismatch: the same asymmetry the engine's
+# direction guard uses, so an unresolvable id never costs a rebuild.
+published_build_state() {
+    local bin="$1"
+    local head id commit
+    head="$(git -C "$PROJECT_DIR" rev-parse --short HEAD 2>/dev/null || true)"
+    [ -n "$head" ] || { echo "unknown"; return 0; }
+    id="$("$bin" --build-id 2>/dev/null || true)"
+    [ -n "$id" ] || { echo "unknown"; return 0; }
+    # `<sha>` for a clean tree, `<sha>-<diffhash>` when engine source is dirty.
+    commit="${id%%-*}"
+    case "$commit" in
+        "" | src*) echo "unknown"; return 0 ;;
+    esac
+    # Compare as prefixes in BOTH directions: the two sides can be abbreviated
+    # to different lengths (git widens the short sha as the object count grows),
+    # and a plain `=` would then report a false mismatch and rebuild forever.
+    case "$head" in "$commit"*) echo "current"; return 0 ;; esac
+    case "$commit" in "$head"*) echo "current"; return 0 ;; esac
+    echo "stale"
+}
+
+# The cargo invocation itself. Extracted so the staleness retry below re-runs
+# exactly the same build. lucidos-cli is built alongside the engine so the
+# `lucidos` binary is published next to `lucidos-engine`; lucidos-gateway
+# (ADR 0014) is the standalone front the dev launcher spawns.
+run_engine_cargo_build() {
+    local feature_args=()
+    if [ -n "${ENGINE_BUILD_FEATURES:-}" ]; then
+        feature_args=(--features "$ENGINE_BUILD_FEATURES")
+    fi
+    if [ -n "${RELEASE:-}" ]; then
+        cargo build --locked -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli --release
+    else
+        cargo build --locked -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli
+    fi
+}
+
+# Locate already-built binaries for the no-build path. Prefers the published
+# launch dir; falls back to cargo's shared uplift path with a warning (a fresh
+# checkout, or a hand-run `cargo build`, has no published dir yet). Profile
+# order mirrors the historical behavior: a release request falls back to debug,
+# a debug request does not reach for release. Sets ENGINE_BIN + GATEWAY_BIN as a
+# pair so they can never come from different builds; returns non-zero when
+# nothing is on disk.
+locate_launch_binaries() {
+    local variant
+    variant="$(engine_build_variant_slug)"
+    local -a dirs=()
+    if [ -n "${RELEASE:-}" ]; then
+        dirs+=("$(launch_bin_dir release "$variant")" "$PROJECT_DIR/target/release")
+    fi
+    dirs+=("$(launch_bin_dir debug "$variant")" "$PROJECT_DIR/target/debug")
+
+    local dir
+    for dir in "${dirs[@]}"; do
+        # BOTH must be there. A dir holding only the engine is a half-finished
+        # build (its gateway publish failed, or someone ran `cargo build -p
+        # lucidos-engine` alone); selecting it on the engine alone would pair a
+        # fresh engine with a missing or older gateway, and the launch would die
+        # later with a much less obvious error than "run with -b".
+        { [ -f "$dir/lucidos-engine" ] && [ -f "$dir/lucidos-gateway" ]; } || continue
+        ENGINE_BIN="$dir/lucidos-engine"
+        GATEWAY_BIN="$dir/lucidos-gateway"
+        case "$dir" in
+            */launch/*) ;;
+            *)
+                echo "WARNING: no published engine binary yet — launching from cargo's shared"
+                echo "         uplift path $dir, which every build variant in this checkout"
+                echo "         writes to. Run with -b to build and publish a pinned one."
+                ;;
+        esac
+        return 0
+    done
+
+    echo "No engine binary found. Run with -b to build."
+    return 1
+}
+
 # ── build_or_find_engine ────────────────────────────────────────────────
 # Build engine (+ gateway + cli) if BUILD is set, otherwise find existing
-# binaries. Sets ENGINE_BIN and GATEWAY_BIN.
+# binaries. Sets ENGINE_BIN and GATEWAY_BIN to the PUBLISHED launch binaries
+# (see "Published launch binaries" above).
 build_or_find_engine() {
-    if [ -n "$BUILD" ]; then
-        # Clear IDE/rust-analyzer `cargo check` processes holding the shared
-        # target/ build lock. Scoped to real cargo processes — see
-        # select_cargo_lock_holders for why a raw `pgrep -f` is unsafe.
-        local check_pids
-        check_pids=$(select_cargo_lock_holders)
-        if [ -n "$check_pids" ]; then
-            echo "Killing cargo check processes to release build lock..."
-            echo "$check_pids" | xargs kill 2>/dev/null || true
-        fi
+    if [ -z "${BUILD:-}" ]; then
+        locate_launch_binaries || exit 1
+        return 0
+    fi
 
-        # Remove stale lock files (can linger after sleep/wake with no holding process)
-        rm -f "$PROJECT_DIR/target/.cargo-lock" "$PROJECT_DIR/target/debug/.cargo-lock" "$PROJECT_DIR/target/release/.cargo-lock" "$PROJECT_DIR/target/.package-cache"
+    local launch_dir uplift_dir
+    launch_dir="$(launch_bin_dir)"
+    uplift_dir="$PROJECT_DIR/target/$(engine_build_profile)"
 
-        echo ""
-        echo "Building engine..."
-        # lucidos-cli is built alongside the engine so the `lucidos` binary
-        # lands next to `lucidos-engine`. The engine adds its directory to
-        # PATH for spawned CC sessions; without the binary it skips that and
-        # the lucidos-cli skill is not installed.
-        #
-        # ENGINE_BUILD_FEATURES is a space-separated list of cargo features
-        # the caller wants enabled on `lucidos-engine`. e2e scripts set it
-        # to `e2e-test-hooks` so the engine compiles in the push-log stub
-        # and the `GET /api/v1/_test/push-log` endpoint.
-        local feature_args=()
-        if [ -n "${ENGINE_BUILD_FEATURES:-}" ]; then
-            feature_args=(--features "$ENGINE_BUILD_FEATURES")
-        fi
-        # lucidos-gateway (ADR 0014) is the standalone front the dev launcher
-        # spawns; build it alongside the engine + cli.
-        if [ -n "$RELEASE" ]; then
-            cargo build --locked -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli --release
-            ENGINE_BIN="$PROJECT_DIR/target/release/lucidos-engine"
-            GATEWAY_BIN="$PROJECT_DIR/target/release/lucidos-gateway"
-        else
-            cargo build --locked -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli
-            ENGINE_BIN="$PROJECT_DIR/target/debug/lucidos-engine"
-            GATEWAY_BIN="$PROJECT_DIR/target/debug/lucidos-gateway"
-        fi
-        # Re-sign the freshly built binaries with the stable dev identity so macOS
-        # TCC permission grants persist across rebuilds (best-effort; no-op off
-        # macOS or until ./scripts/dev-codesign-setup.sh has been run once).
+    # Clear IDE/rust-analyzer `cargo check` processes holding the shared
+    # target/ build lock. Scoped to real cargo processes — see
+    # select_cargo_lock_holders for why a raw `pgrep -f` is unsafe.
+    local check_pids
+    check_pids=$(select_cargo_lock_holders)
+    if [ -n "$check_pids" ]; then
+        echo "Killing cargo check processes to release build lock..."
+        echo "$check_pids" | xargs kill 2>/dev/null || true
+    fi
+
+    # Remove stale lock files (can linger after sleep/wake with no holding process)
+    rm -f "$PROJECT_DIR/target/.cargo-lock" "$PROJECT_DIR/target/debug/.cargo-lock" "$PROJECT_DIR/target/release/.cargo-lock" "$PROJECT_DIR/target/.package-cache"
+
+    echo ""
+    echo "Building engine..."
+    run_engine_cargo_build
+    publish_launch_binaries "$uplift_dir" "$launch_dir" || true
+
+    # Did this build actually produce a binary for the source on disk now? If
+    # HEAD moved while cargo was running, it didn't — rebuild ONCE against the
+    # source that is there now. Bounded at one retry, and a surviving mismatch
+    # only WARNS: the compile genuinely succeeded, the engine's direction guard
+    # decides whether to offer the binary, and failing here would surface a
+    # false "New engine version failed to build" and abort the Apply-triggered
+    # background rebuild for every co-located workspace.
+    local state
+    state="$(published_build_state "$launch_dir/lucidos-engine")"
+    if [ "$state" = "stale" ]; then
+        echo "Built engine is not the source now on disk (HEAD moved during the build,"
+        echo "or another build clobbered the shared uplift path) — rebuilding once..."
+        run_engine_cargo_build
+        publish_launch_binaries "$uplift_dir" "$launch_dir" || true
+        state="$(published_build_state "$launch_dir/lucidos-engine")"
+    fi
+    if [ "$state" = "stale" ]; then
+        echo "WARNING: published engine is build id" \
+            "$("$launch_dir/lucidos-engine" --build-id 2>/dev/null || echo '?')" \
+            "while HEAD is $(git -C "$PROJECT_DIR" rev-parse --short HEAD 2>/dev/null || echo '?')."
+        echo "         Something keeps rebuilding an earlier checkout state. The running"
+        echo "         engine will refuse to offer it as a new version; rebuild with -b."
+    fi
+
+    # The published pair is already signed with the stable dev identity — that
+    # happens inside publish_launch_binaries, on the temp file, BEFORE the
+    # rename, so no peer can catch a binary mid-`codesign`. Only the fallback
+    # needs signing here, because it launches cargo's uplift path directly.
+    if [ -x "$launch_dir/lucidos-engine" ] && [ -x "$launch_dir/lucidos-gateway" ]; then
+        ENGINE_BIN="$launch_dir/lucidos-engine"
+        GATEWAY_BIN="$launch_dir/lucidos-gateway"
+    else
+        echo "WARNING: could not publish the launch binaries to $launch_dir —"
+        echo "         falling back to cargo's shared uplift path $uplift_dir."
+        ENGINE_BIN="$uplift_dir/lucidos-engine"
+        GATEWAY_BIN="$uplift_dir/lucidos-gateway"
+        # Best-effort; no-op off macOS or until ./scripts/dev-codesign-setup.sh
+        # has been run once. The Designated Requirement is identifier +
+        # certificate leaf — no CDHash, no path — so macOS TCC grants persist
+        # across rebuilds and across the published/uplift path split.
         sign_engine_binary "$ENGINE_BIN"
         sign_engine_binary "$GATEWAY_BIN"
-    else
-        if [ -n "$RELEASE" ] && [ -f "$PROJECT_DIR/target/release/lucidos-engine" ]; then
-            ENGINE_BIN="$PROJECT_DIR/target/release/lucidos-engine"
-            GATEWAY_BIN="$PROJECT_DIR/target/release/lucidos-gateway"
-        elif [ -f "$PROJECT_DIR/target/debug/lucidos-engine" ]; then
-            ENGINE_BIN="$PROJECT_DIR/target/debug/lucidos-engine"
-            GATEWAY_BIN="$PROJECT_DIR/target/debug/lucidos-gateway"
-        else
-            echo "No engine binary found. Run with -b to build."
-            exit 1
-        fi
     fi
 }
 
@@ -1411,15 +1774,19 @@ PG_DATABASE=$(workspace_database_name)
 DATABASE_URL=$(workspace_database_url)
 EOF
 
-    detect_vite_tls
-
     # LUCIDOS_API_PORT here is the ENGINE's port (the legacy/direct + tauri/e2e
     # paths spawn the engine on it). start_gateway overrides LUCIDOS_API_PORT to
     # GATEWAY_PORT for the gateway process itself.
     export LUCIDOS_API_PORT="$ENGINE_PORT"
-    export DATABASE_URL="$(workspace_database_url)"
+    DATABASE_URL="$(workspace_database_url)"
+    export DATABASE_URL
     export WORKSPACE_PATH="$WORKSPACE"
     # The engine (direct) and the gateway (picker) both serve the built dist/.
+    # Guard at the choke point: every launch path funnels through here, so this
+    # is where a worktree-pinned dist/ must be refused (the entry scripts also
+    # assert earlier, for a cleaner failure before any work is done).
+    assert_stack_not_worktree_pinned "$PROJECT_DIR" || exit 1
+    # shellcheck disable=SC2153 # FRONTEND_DIR is a required input set by the sourcing script (see header)
     export LUCIDOS_STATIC_DIR="$FRONTEND_DIR/dist"
 }
 
@@ -1454,8 +1821,8 @@ enable_clamshell_prevention() {
 # Clamshell sleep is handled separately by pmset above.
 start_caffeinate() {
     [ "$(uname)" = "Darwin" ] || return 0   # macOS-only (caffeinate); no-op on Linux/CI
+    # `-w $$` ties it to this shell's lifetime, so there is no pid to track.
     caffeinate -im -w $$ &
-    CAFFEINATE_PID=$!
     enable_clamshell_prevention
 }
 
@@ -1578,7 +1945,7 @@ start_engine() {
     # startup updates ENGINE_PID rather than failing the kill -0 check.
     echo -n "Waiting for engine"
     local engine_ready=""
-    for i in {1..90}; do
+    for _ in {1..90}; do
         ENGINE_PID="$(cat "$ENGINE_PIDFILE" 2>/dev/null || true)"
         if [ -z "$ENGINE_PID" ] || ! kill -0 "$ENGINE_PID" 2>/dev/null; then
             # Supervisor is between restarts; wait one tick for the next
@@ -1689,8 +2056,7 @@ PY
 # Wait for /<slug>/api/v1/health — the engine the gateway spawned.
 wait_for_workspace_health() {
     echo -n "Waiting for workspace '$GATEWAY_WS_ID' engine"
-    local i
-    for i in $(seq 1 90); do
+    for _ in $(seq 1 90); do
         if curl -sk "$PROTO://localhost:$GATEWAY_PORT/$GATEWAY_WS_ID/api/v1/health" >/dev/null 2>&1; then
             echo " ready!"; return 0
         fi
@@ -1720,10 +2086,12 @@ start_gateway() {
     gw_log="$(gateway_log)"
 
     export LUCIDOS_API_PORT="$GATEWAY_PORT"
-    export LUCIDOS_GATEWAY_DATA="$(gateway_data_dir)"
+    LUCIDOS_GATEWAY_DATA="$(gateway_data_dir)"
+    export LUCIDOS_GATEWAY_DATA
     export LUCIDOS_GATEWAY_PG_BACKEND="docker"
     export LUCIDOS_GATEWAY_PG_PORT="$PG_PORT"
-    export LUCIDOS_GATEWAY_PG_CONTAINER="$(shared_pg_container)"
+    LUCIDOS_GATEWAY_PG_CONTAINER="$(shared_pg_container)"
+    export LUCIDOS_GATEWAY_PG_CONTAINER
     export LUCIDOS_ENGINE_BIN="$ENGINE_BIN"
     # Dev: the gateway spawns the engine NETWORK-BOUND on its port (not
     # loopback-only) so `https://localhost:$ENGINE_PORT/` reaches the app
@@ -1744,7 +2112,11 @@ start_gateway() {
     apply_dev_gateway_bind
     # The gateway serves the picker from dist/ and passes LUCIDOS_STATIC_DIR
     # through to the engines it spawns so they serve dist/ too (set by swap_ports;
-    # re-exported here for clarity).
+    # re-exported here for clarity). Asserted in `gateway` scope — the opt-out does
+    # NOT apply, because this is the machine-global daemon that outlives the shell
+    # and propagates these paths into every engine it spawns. That combination is
+    # what made the 2026-07-26 pin self-perpetuating.
+    assert_stack_not_worktree_pinned "$PROJECT_DIR" gateway || exit 1
     export LUCIDOS_STATIC_DIR="$FRONTEND_DIR/dist"
 
     # Reuse a healthy gateway already on the port (no -b restart). Ask it to
@@ -1817,8 +2189,8 @@ start_gateway() {
     done
 
     echo -n "Waiting for gateway"
-    local ready="" i
-    for i in $(seq 1 30); do
+    local ready=""
+    for _ in $(seq 1 30); do
         if curl -sk "$PROTO://localhost:$GATEWAY_PORT/~/api/v1/health" >/dev/null 2>&1; then
             echo " ready!"; ready="yes"; break
         fi
@@ -1863,6 +2235,7 @@ running_frontend_workspaces_in_project() (
     local project_real
     project_real="$(cd "$project" 2>/dev/null && pwd -P || true)"
     [ -n "$project_real" ] || return 0
+    local pidfile
     for pidfile in "$HOME"/workspaces/*/.lucidos/frontend.pid; do
         local pid ws_dir vite_cwd vite_real
         # `cat … || true` keeps a transient unreadable file from killing the
@@ -2199,7 +2572,6 @@ start_frontend_built() {
     # ownership — covers a dead/broken watch and the solo `-b` rebuild.
     if [ -n "$healthy" ] && { [ -n "$others_serving" ] || [ -z "${BUILD:-}" ]; }; then
         echo "Reusing shared frontend build-watch (PID $existing_pid) serving $FRONTEND_DIR/dist."
-        BUILD_WATCH_OWNED=""
         BUILD_WATCH_PID="$existing_pid"
     else
         if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
@@ -2221,7 +2593,6 @@ start_frontend_built() {
         # (firing its SIGTERM handler → kills the in-flight build, no orphan).
         (cd "$FRONTEND_DIR" && exec node dev-build-watch.mjs) > "$bw_log" 2>&1 &
         BUILD_WATCH_PID=$!
-        BUILD_WATCH_OWNED=1
         echo "$BUILD_WATCH_PID" > "$bw_pidfile"
 
         echo -n "Waiting for initial frontend build (log: $bw_log)"

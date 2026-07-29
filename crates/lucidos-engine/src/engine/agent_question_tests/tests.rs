@@ -161,7 +161,8 @@ async fn ensure_resume_emits_continuation_requested_when_session_exited() {
     let thread_id = Uuid::new_v4();
     seed_cc_thread(&bus, thread_id).await;
     let mut map = HashMap::new();
-    map.insert(thread_id, make_session(true));
+    let (session, _msg_rx) = make_session(true);
+    map.insert(thread_id, session);
     let sessions = Arc::new(tokio::sync::Mutex::new(map));
 
     let emitted = ensure_resume_after_answer(
@@ -192,7 +193,8 @@ async fn ensure_resume_skips_emit_when_session_is_alive() {
     let thread_id = Uuid::new_v4();
     seed_cc_thread(&bus, thread_id).await;
     let mut map = HashMap::new();
-    map.insert(thread_id, make_session(false));
+    let (session, _msg_rx) = make_session(false);
+    map.insert(thread_id, session);
     let sessions = Arc::new(tokio::sync::Mutex::new(map));
 
     let emitted = ensure_resume_after_answer(
@@ -245,7 +247,8 @@ async fn ensure_resume_skips_emit_for_canceled_answer() {
 async fn arm_question_resume_sets_flag_on_live_session() {
     let thread_id = Uuid::new_v4();
     let mut map = HashMap::new();
-    map.insert(thread_id, make_session(false)); // process_exited=false → live
+    let (session, _msg_rx) = make_session(false);
+    map.insert(thread_id, session); // process_exited=false → live
     let sessions = Arc::new(tokio::sync::Mutex::new(map));
 
     let armed = arm_question_resume_if_live(
@@ -267,7 +270,8 @@ async fn arm_question_resume_sets_flag_on_live_session() {
 async fn arm_question_resume_skips_exited_session() {
     let thread_id = Uuid::new_v4();
     let mut map = HashMap::new();
-    map.insert(thread_id, make_session(true)); // process_exited=true
+    let (session, _msg_rx) = make_session(true);
+    map.insert(thread_id, session); // process_exited=true
     let sessions = Arc::new(tokio::sync::Mutex::new(map));
 
     let armed = arm_question_resume_if_live(
@@ -304,7 +308,8 @@ async fn arm_question_resume_skips_absent_session() {
 async fn arm_question_resume_skips_canceled_even_when_live() {
     let thread_id = Uuid::new_v4();
     let mut map = HashMap::new();
-    map.insert(thread_id, make_session(false)); // live
+    let (session, _msg_rx) = make_session(false);
+    map.insert(thread_id, session); // live
     let sessions = Arc::new(tokio::sync::Mutex::new(map));
 
     let armed = arm_question_resume_if_live(&sessions, thread_id, &AnswerKind::Canceled).await;
@@ -1020,6 +1025,151 @@ async fn chat_text_streamed_orphans_active_lookup_on_chat_thread() {
             .as_deref(),
         Some(tool_use_id),
         "broad lookup still surfaces the orphan so archive can cancel-stamp"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+// ---------------------------------------------------------------------------
+// Answer-after-restart resume: no stale reminder.
+//
+// A chat thread parked on `ask_user_question` survives a restart WITHOUT an
+// abort (the preserve guard). When the user then answers, the engine re-enters
+// the dead loop. It used to do that through the manual-Continue machinery,
+// which emitted `ContinuationStarted` + an engine-note `UserPromptInjected` —
+// rendering a "Continued the response" boundary plus a "Reminded the model that
+// no actions had completed" note under a card the user had just answered. The
+// resume now continues the turn that asked, so nothing is surfaced; the
+// boundary + reminder stay reserved for a thread that genuinely still needs the
+// user to revive it (the Continue button).
+// ---------------------------------------------------------------------------
+
+/// Case 1: the question WAS answered after the restart. The resume anchors on
+/// the interrupted turn and emits no boundary — no stale reminder appears.
+#[tokio::test]
+async fn answered_after_restart_resume_emits_no_boundary_or_reminder() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let turn_id = seed_chat_thread(&bus, thread_id, "ask me about colors").await;
+    emit_ask_user_question_call(&bus, thread_id, Some(turn_id)).await;
+
+    let ask = lookup_interrupted_ask(&pool, thread_id).await;
+    let anchor = resume_anchor_for_ask(ask.as_ref(), thread_id);
+    assert_eq!(
+        anchor,
+        ChatResumeAnchor::ExistingTurn(turn_id),
+        "the resume must continue the turn that asked, not open a new one"
+    );
+
+    let anchor_event_id = crate::engine::chat::rerun::emit_resume_anchor(
+        &bus,
+        thread_id,
+        anchor,
+        "[Engine note — resumed after restart] …",
+        EventChannel::Chat,
+        None,
+    )
+    .await
+    .expect("emit_resume_anchor");
+
+    assert_eq!(
+        anchor_event_id, turn_id,
+        "resumed events must carry the original turn's request_event_id so they \
+         group under the question card, exactly as they would have without the restart"
+    );
+    assert_eq!(
+        count_events_of_type(&pool, thread_id, "ContinuationStarted").await,
+        0,
+        "an answered question needs no 'Continued the response' boundary"
+    );
+    assert_eq!(
+        count_events_of_type(&pool, thread_id, "UserPromptInjected").await,
+        0,
+        "no engine-note reminder may land under an already-answered question"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Case 2: the response was genuinely interrupted and still needs reviving —
+/// the user clicks Continue (`ChatResumeAnchor::NewBoundary`). The boundary AND
+/// its side-effect reminder must still appear: that note is how the user sees
+/// what the engine told the model about the aborted run.
+#[tokio::test]
+async fn interrupted_response_continue_still_emits_boundary_and_reminder() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    seed_chat_thread(&bus, thread_id, "write me a story").await;
+    let note = "[Engine note — this is a rerun]\n- send_notification(Ping) → ok";
+
+    let anchor_event_id = crate::engine::chat::rerun::emit_resume_anchor(
+        &bus,
+        thread_id,
+        ChatResumeAnchor::NewBoundary,
+        note,
+        EventChannel::Chat,
+        None,
+    )
+    .await
+    .expect("emit_resume_anchor");
+
+    assert_eq!(
+        count_events_of_type(&pool, thread_id, "ContinuationStarted").await,
+        1,
+        "a revived interruption still opens its own boundary"
+    );
+    let (injected_text, injected_req): (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT payload->>'text', NULLIF(payload->>'request_event_id','')::uuid \
+         FROM events WHERE aggregate_id = $1 AND event_type = 'UserPromptInjected'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("the engine-note reminder must still be persisted");
+    assert_eq!(injected_text, note, "the reminder carries the engine note");
+    assert_eq!(
+        injected_req,
+        Some(anchor_event_id),
+        "the note hangs off the boundary so it renders as that exchange's resume note"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Legacy fallback: a `ToolCalled` persisted before the loop stamped
+/// `request_event_id` has no turn to continue. Anchoring on nothing would
+/// strand the resumed events outside every exchange, so that case keeps the
+/// boundary form.
+#[tokio::test]
+async fn ask_call_without_request_event_id_falls_back_to_boundary() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    seed_chat_thread(&bus, thread_id, "ask me about colors").await;
+    emit_ask_user_question_call(&bus, thread_id, None).await;
+
+    let ask = lookup_interrupted_ask(&pool, thread_id).await;
+    assert!(
+        ask.as_ref().is_some_and(|a| a.request_event_id.is_none()),
+        "legacy row must read back with no turn anchor"
+    );
+    assert_eq!(
+        resume_anchor_for_ask(ask.as_ref(), thread_id),
+        ChatResumeAnchor::NewBoundary,
+    );
+
+    // Same fallback when the thread has no `ask_user_question` call at all.
+    assert_eq!(
+        resume_anchor_for_ask(None, thread_id),
+        ChatResumeAnchor::NewBoundary,
     );
 
     pool.close().await;

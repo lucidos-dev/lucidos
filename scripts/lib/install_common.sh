@@ -78,7 +78,7 @@ install_ca_bundle_candidates() {
 
 # install_runtime_dir <prefix> <version> <triple> — where the tarball extracts:
 # <prefix>/runtime/<stem>. The stem (headless_tarball_stem) is also the tarball's
-# own top-level dir, so `tar -C <prefix>/runtime` lands the 6 resources exactly here
+# own top-level dir, so `tar -C <prefix>/runtime` lands the 7 resources exactly here
 # — which makes the idempotency check (does <runtime>/lucidos-gateway exist?) and
 # step 4's uninstall a single, predictable path.
 install_runtime_dir() {

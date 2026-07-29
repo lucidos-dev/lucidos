@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { chatModels, configuredProviders } from '../store';
-import { chatModelOptions, isProviderConfigured } from './models';
+import { chatModelOptions, isProviderConfigured, parseContextWindow } from './models';
+import { formatContextWindow } from '../../utils/formatTokens';
 import { MODELS } from '../models';
 import { displayModelName } from '../thread-events/exchange';
 import type { ModelInfo } from '../../api/types';
@@ -13,6 +14,7 @@ function model(id: string, label: string, enabled = true, provider = 'anthropic'
     sort_order: 0,
     source: 'user',
     enabled,
+    context_window: null,
     created_at: '2026-01-01T00:00:00Z',
   };
 }
@@ -85,6 +87,40 @@ describe('isProviderConfigured', () => {
     expect(isProviderConfigured('openai')).toBe(true);
     expect(isProviderConfigured('vertex')).toBe(true);
     expect(isProviderConfigured('anthropic')).toBe(false);
+  });
+});
+
+describe('parseContextWindow', () => {
+  it('treats blank as "infer from the id"', () => {
+    expect(parseContextWindow('')).toEqual({ ok: true, value: undefined });
+    expect(parseContextWindow('   ')).toEqual({ ok: true, value: undefined });
+  });
+
+  it('accepts a positive whole number of tokens', () => {
+    expect(parseContextWindow('1048576')).toEqual({ ok: true, value: 1048576 });
+    expect(parseContextWindow(' 200000 ')).toEqual({ ok: true, value: 200000 });
+  });
+
+  it('rejects non-positive and non-integer values rather than dropping them', () => {
+    // Silently dropping a bad value would leave the model on the 200k default
+    // with no sign anything went wrong — the exact failure this field exists
+    // to prevent.
+    for (const bad of ['0', '-1', 'abc', '1.5', '1e', '']) {
+      if (bad === '') continue;
+      expect(parseContextWindow(bad).ok).toBe(false);
+    }
+  });
+});
+
+describe('formatContextWindow', () => {
+  it('says "inferred" when the row declares nothing', () => {
+    expect(formatContextWindow(null)).toBe('context window: inferred');
+  });
+
+  it('abbreviates declared windows to k', () => {
+    expect(formatContextWindow(1048576)).toBe('context window: 1049k');
+    expect(formatContextWindow(200000)).toBe('context window: 200k');
+    expect(formatContextWindow(512)).toBe('context window: 512');
   });
 });
 

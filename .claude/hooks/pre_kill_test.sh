@@ -13,13 +13,20 @@ fail() { echo "  FAIL: $*"; FAIL=$((FAIL+1)); }
 pass() { echo "  ok:   $*"; PASS=$((PASS+1)); }
 
 # Run hook with the given env vars and a Bash command. Returns exit code; if
-# it's 2, the hook blocked. Captures stderr in HOOK_STDERR.
+# it's 2, the hook blocked. Captures stderr in HOOK_STDERR and the exit code in
+# HOOK_RC.
+#
+# Assertions below read HOOK_RC, never a bare `$?`. `$?` survives exactly one
+# command: inside `if [ $? -eq 0 ]; then ... else fail "got $?"; fi` the `$?` in
+# the else branch is the *test's* status (always 1), not the hook's — so every
+# failure message reported "got 1" regardless of what the hook actually did.
 run_hook() {
     local cmd="$1"
     local payload
     payload=$(jq -n --arg cmd "$cmd" '{tool_input: {command: $cmd}}')
     HOOK_STDERR=$(echo "$payload" | "$HOOK" 2>&1 >/dev/null)
-    return $?
+    HOOK_RC=$?
+    return "$HOOK_RC"
 }
 
 # ── Blocking cases ───────────────────────────────────────────────────────
@@ -28,12 +35,11 @@ test_blocks_direct_kill_of_host_pid() {
     echo "test: blocks 'kill <LUCIDOS_HOST_PID>'"
     export LUCIDOS_HOST_PID=12345
     unset LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
-    if run_hook "kill 12345"; then
-        fail "expected block (exit 2), got 0"
-    elif [ $? -eq 2 ]; then
+    run_hook "kill 12345"
+    if [ "$HOOK_RC" -eq 2 ]; then
         pass "blocked"
     else
-        fail "expected exit 2, got $?"
+        fail "expected block (exit 2), got $HOOK_RC"
     fi
 }
 
@@ -42,7 +48,7 @@ test_blocks_kill_dash_9_of_host_pid() {
     export LUCIDOS_HOST_PID=12345
     unset LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
     run_hook "kill -9 12345"
-    if [ $? -eq 2 ]; then
+    if [ "$HOOK_RC" -eq 2 ]; then
         pass "blocked"
     else
         fail "expected exit 2"
@@ -54,7 +60,7 @@ test_blocks_kill_dash_sigkill_of_host_pid() {
     export LUCIDOS_HOST_PID=12345
     unset LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
     run_hook "kill -SIGTERM 12345"
-    if [ $? -eq 2 ]; then
+    if [ "$HOOK_RC" -eq 2 ]; then
         pass "blocked"
     else
         fail "expected exit 2"
@@ -66,7 +72,7 @@ test_blocks_kill_of_frontend_pid() {
     export LUCIDOS_FRONTEND_PID=67890
     unset LUCIDOS_HOST_PID LUCIDOS_API_PORT
     run_hook "kill 67890"
-    if [ $? -eq 2 ]; then
+    if [ "$HOOK_RC" -eq 2 ]; then
         pass "blocked"
     else
         fail "expected exit 2"
@@ -77,7 +83,7 @@ test_blocks_pkill_f_lucidos_engine() {
     echo "test: blocks 'pkill -f lucidos-engine'"
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
     run_hook "pkill -f lucidos-engine"
-    if [ $? -eq 2 ]; then
+    if [ "$HOOK_RC" -eq 2 ]; then
         pass "blocked"
     else
         fail "expected exit 2"
@@ -88,7 +94,7 @@ test_blocks_pkill_lucidos_engine() {
     echo "test: blocks 'pkill lucidos-engine'"
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
     run_hook "pkill lucidos-engine"
-    if [ $? -eq 2 ]; then
+    if [ "$HOOK_RC" -eq 2 ]; then
         pass "blocked"
     else
         fail "expected exit 2"
@@ -99,7 +105,7 @@ test_blocks_killall_lucidos_engine() {
     echo "test: blocks 'killall lucidos-engine'"
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
     run_hook "killall lucidos-engine"
-    if [ $? -eq 2 ]; then
+    if [ "$HOOK_RC" -eq 2 ]; then
         pass "blocked"
     else
         fail "expected exit 2"
@@ -111,7 +117,7 @@ test_blocks_lsof_xargs_kill_on_api_port() {
     export LUCIDOS_API_PORT=3000
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID
     run_hook "lsof -ti :3000 | xargs kill"
-    if [ $? -eq 2 ]; then
+    if [ "$HOOK_RC" -eq 2 ]; then
         pass "blocked"
     else
         fail "expected exit 2"
@@ -123,7 +129,7 @@ test_blocks_lsof_xargs_kill_dash_9_on_api_port() {
     export LUCIDOS_API_PORT=3000
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID
     run_hook "lsof -ti :3000 | xargs kill -9"
-    if [ $? -eq 2 ]; then
+    if [ "$HOOK_RC" -eq 2 ]; then
         pass "blocked"
     else
         fail "expected exit 2"
@@ -137,10 +143,10 @@ test_allows_kill_of_unrelated_pid() {
     export LUCIDOS_HOST_PID=12345
     unset LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
     run_hook "kill 99999"
-    if [ $? -eq 0 ]; then
+    if [ "$HOOK_RC" -eq 0 ]; then
         pass "allowed"
     else
-        fail "expected exit 0, got $? — stderr: $HOOK_STDERR"
+        fail "expected exit 0, got $HOOK_RC — stderr: $HOOK_STDERR"
     fi
 }
 
@@ -149,10 +155,10 @@ test_allows_bare_lsof_on_api_port() {
     export LUCIDOS_API_PORT=3000
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID
     run_hook "lsof -ti :3000"
-    if [ $? -eq 0 ]; then
+    if [ "$HOOK_RC" -eq 0 ]; then
         pass "allowed"
     else
-        fail "expected exit 0, got $? — stderr: $HOOK_STDERR"
+        fail "expected exit 0, got $HOOK_RC — stderr: $HOOK_STDERR"
     fi
 }
 
@@ -161,10 +167,10 @@ test_allows_lsof_xargs_kill_on_other_port() {
     export LUCIDOS_API_PORT=3000
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID
     run_hook "lsof -ti :5555 | xargs kill"
-    if [ $? -eq 0 ]; then
+    if [ "$HOOK_RC" -eq 0 ]; then
         pass "allowed"
     else
-        fail "expected exit 0, got $? — stderr: $HOOK_STDERR"
+        fail "expected exit 0, got $HOOK_RC — stderr: $HOOK_STDERR"
     fi
 }
 
@@ -172,10 +178,10 @@ test_allows_unrelated_bash() {
     echo "test: allows unrelated bash (ls, echo, etc.)"
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
     run_hook "echo hello && ls /tmp"
-    if [ $? -eq 0 ]; then
+    if [ "$HOOK_RC" -eq 0 ]; then
         pass "allowed"
     else
-        fail "expected exit 0, got $? — stderr: $HOOK_STDERR"
+        fail "expected exit 0, got $HOOK_RC — stderr: $HOOK_STDERR"
     fi
 }
 
@@ -183,10 +189,10 @@ test_allows_pkill_of_unrelated_process() {
     echo "test: allows 'pkill -f cargo' (not the engine)"
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
     run_hook "pkill -f cargo"
-    if [ $? -eq 0 ]; then
+    if [ "$HOOK_RC" -eq 0 ]; then
         pass "allowed"
     else
-        fail "expected exit 0, got $? — stderr: $HOOK_STDERR"
+        fail "expected exit 0, got $HOOK_RC — stderr: $HOOK_STDERR"
     fi
 }
 
@@ -194,10 +200,10 @@ test_no_env_vars_allows_kill_random_pid() {
     echo "test: with no env vars, 'kill 12345' is allowed (no host to protect)"
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
     run_hook "kill 12345"
-    if [ $? -eq 0 ]; then
+    if [ "$HOOK_RC" -eq 0 ]; then
         pass "allowed"
     else
-        fail "expected exit 0, got $? — stderr: $HOOK_STDERR"
+        fail "expected exit 0, got $HOOK_RC — stderr: $HOOK_STDERR"
     fi
 }
 
@@ -208,7 +214,7 @@ test_does_not_falsely_match_pid_substring() {
     export LUCIDOS_HOST_PID=12345
     unset LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
     run_hook "kill 123456"
-    if [ $? -eq 0 ]; then
+    if [ "$HOOK_RC" -eq 0 ]; then
         pass "allowed (no substring match)"
     else
         fail "false positive: blocked 'kill 123456' for host pid 12345 — stderr: $HOOK_STDERR"
@@ -223,7 +229,7 @@ test_allows_pkill_mention_in_quoted_string() {
     # being run. The CMD_START anchor in pre-kill.sh fixes this.
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
     run_hook "git commit -m 'docs: explain that pkill -f lucidos-engine is dangerous'"
-    if [ $? -eq 0 ]; then
+    if [ "$HOOK_RC" -eq 0 ]; then
         pass "allowed (quoted prose mention)"
     else
         fail "false positive on prose mention — stderr: $HOOK_STDERR"
@@ -234,7 +240,7 @@ test_allows_killall_mention_in_quoted_string() {
     echo "test: 'git commit -m \"... killall lucidos-engine ...\"' is allowed"
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
     run_hook "git commit -m 'docs: avoid killall lucidos-engine'"
-    if [ $? -eq 0 ]; then
+    if [ "$HOOK_RC" -eq 0 ]; then
         pass "allowed (quoted prose mention)"
     else
         fail "false positive on prose mention — stderr: $HOOK_STDERR"
@@ -246,8 +252,9 @@ test_blocks_pkill_inside_command_substitution() {
     # The model could try to wrap the kill in $(...) — CMD_START includes
     # `(` so the pattern matches at that boundary.
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
+    # shellcheck disable=SC2016 # the literal $(...) IS the payload under test — it must not expand here
     run_hook 'echo $(pkill -f lucidos-engine)'
-    if [ $? -eq 2 ]; then
+    if [ "$HOOK_RC" -eq 2 ]; then
         pass "blocked inside command substitution"
     else
         fail "expected exit 2 inside \$(...) — stderr: $HOOK_STDERR"
@@ -258,7 +265,7 @@ test_blocks_pkill_after_pipe() {
     echo "test: blocks 'true | pkill -f lucidos-engine'"
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
     run_hook "true | pkill -f lucidos-engine"
-    if [ $? -eq 2 ]; then
+    if [ "$HOOK_RC" -eq 2 ]; then
         pass "blocked after pipe"
     else
         fail "expected exit 2 after pipe — stderr: $HOOK_STDERR"
@@ -273,7 +280,7 @@ test_blocks_absolute_path_kill_of_host_pid() {
     export LUCIDOS_HOST_PID=12345
     unset LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
     run_hook "/bin/kill 12345"
-    if [ $? -eq 2 ]; then
+    if [ "$HOOK_RC" -eq 2 ]; then
         pass "blocked"
     else
         fail "expected exit 2 — /bin/kill bypassed the hook"
@@ -284,7 +291,7 @@ test_blocks_absolute_path_pkill_lucidos_engine() {
     echo "test: blocks '/usr/bin/pkill -f lucidos-engine' (path-prefixed bypass)"
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
     run_hook "/usr/bin/pkill -f lucidos-engine"
-    if [ $? -eq 2 ]; then
+    if [ "$HOOK_RC" -eq 2 ]; then
         pass "blocked"
     else
         fail "expected exit 2 — /usr/bin/pkill bypassed the hook"
@@ -298,7 +305,7 @@ test_blocks_pkill_after_newline() {
     # its own line slipped past the anchor.
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID LUCIDOS_API_PORT
     run_hook $'echo first\npkill -f lucidos-engine'
-    if [ $? -eq 2 ]; then
+    if [ "$HOOK_RC" -eq 2 ]; then
         pass "blocked after newline"
     else
         fail "expected exit 2 — newline-separated pkill bypassed the hook"

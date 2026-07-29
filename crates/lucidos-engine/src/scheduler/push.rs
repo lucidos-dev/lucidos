@@ -1043,7 +1043,7 @@ fn build_wake_payload(
 ///       "thread_id": "...",
 ///       "event_id": "...",
 ///       "app_id": "...",
-///       "tap": { "kind": "modal" | "none" | "navigate", ... },
+///       "tap": { "kind": "modal" | "navigate", ... },
 ///       "navigate": "#notification=...  (HASH form, for the Chrome SW notificationclick path)"
 ///     }
 ///   }
@@ -1083,10 +1083,9 @@ fn build_wake_payload(
 /// (no tab open). See `system-knowhow/notifications.md` §4.5.
 ///
 /// `tap` is ALWAYS encoded as part of the `data` block — the page's tap
-/// dispatcher routes on `tap.kind` (`modal` opens the inbox, `none` is
-/// passive, `navigate` deep-links). Modal-kind taps are omitted from the
-/// `navigate` URL params to keep them short (the page demotes missing `tap` to
-/// modal).
+/// dispatcher routes on `tap.kind` (`modal` opens the inbox, `navigate`
+/// deep-links). Modal-kind taps are omitted from the `navigate` URL params to
+/// keep them short (the page demotes missing `tap` to modal).
 #[allow(clippy::too_many_arguments)]
 fn build_push_payload(
     title: &str,

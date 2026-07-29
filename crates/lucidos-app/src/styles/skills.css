@@ -291,20 +291,22 @@
 .form-group textarea {
     width: 100%;
     padding: 0.625rem 0.75rem;
-    background: var(--bg-tertiary);
+    /* Matches .form-group input — crisp border-defined field, not a gray block. */
+    background: var(--bg-secondary);
     border: 1px solid var(--border-color);
     border-radius: 0.25rem;
     color: var(--text-primary);
     font-family: var(--font-ui);
     font-size: var(--font-size-md);
     outline: none;
-    transition: border-color 0.2s;
+    transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
     resize: vertical;
     min-height: 5rem;
 }
 
 .form-group textarea:focus {
     border-color: var(--accent);
+    box-shadow: var(--focus-ring);
 }
 
 .form-group textarea::placeholder {

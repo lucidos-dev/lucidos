@@ -61,17 +61,45 @@ async function runModelMutation(
   }
 }
 
+/** Parse the Add Model form's optional "Context window" field. Blank means "let
+ *  the engine infer it from the id" (`undefined`); anything non-numeric or
+ *  non-positive is a user error, not a silent fallback — a bad value would
+ *  otherwise be dropped and the model would quietly keep the 200k default. */
+export function parseContextWindow(
+  raw: string
+): { ok: true; value: number | undefined } | { ok: false; error: string } {
+  const trimmed = raw.trim();
+  if (!trimmed) return { ok: true, value: undefined };
+  const n = Number(trimmed);
+  if (!Number.isInteger(n) || n <= 0) {
+    return { ok: false, error: 'Context window must be a positive whole number of tokens' };
+  }
+  return { ok: true, value: n };
+}
+
 export async function submitNewModel(
   id: string,
   label: string,
-  provider: string
+  provider: string,
+  contextWindow: string
 ): Promise<boolean> {
   if (!id.trim() || !label.trim()) {
     showToast('Model id and label are required', 'error');
     return false;
   }
+  const parsed = parseContextWindow(contextWindow);
+  if (!parsed.ok) {
+    showToast(parsed.error, 'error');
+    return false;
+  }
   return runModelMutation(
-    () => createModel({ id: id.trim(), label: label.trim(), provider }),
+    () =>
+      createModel({
+        id: id.trim(),
+        label: label.trim(),
+        provider,
+        context_window: parsed.value,
+      }),
     'Failed to add model'
   );
 }

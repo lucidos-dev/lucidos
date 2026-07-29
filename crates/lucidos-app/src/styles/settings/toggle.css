@@ -124,9 +124,15 @@
     opacity: 0.85;
 }
 
-/* Engine-limit notice — same no-stripe rule as .exchange-error above. */
+/* Engine-limit notice — same no-stripe rule as .exchange-error above.
+   Unlike .exchange-error (a direct .chat-exchange child), this box lives INSIDE
+   a .response-panel, whose base padding-right insets turn content from the pane
+   edge (chat/input-messages.css). The notice is a full-bleed colored surface
+   flush left, so cancel that inset to keep it full-bleed right too — otherwise
+   it reads as a card that's mysteriously shy of one edge. */
 .exchange-engine-limit {
     padding: 0.75rem 1rem;
+    margin-right: calc(-1 * var(--turn-body-inset));
     background: color-mix(in srgb, var(--accent-yellow) 8%, transparent);
     color: var(--accent-yellow);
     font-size: var(--font-size-lg);

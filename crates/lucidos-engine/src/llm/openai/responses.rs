@@ -163,10 +163,11 @@ impl OpenAiProvider {
             body["tools"] = serde_json::Value::Array(tool_defs);
         }
 
-        // Map unified reasoning_effort to OpenAI's format ("max" → "xhigh")
+        // Map unified reasoning_effort to OpenAI's per-model vocabulary
+        // (GPT-5.6 keeps "max"; earlier models map "max" → "xhigh").
         if let Some(effort) = reasoning_effort {
             body["reasoning"] =
-                serde_json::json!({ "effort": openai_reasoning_effort(effort) });
+                serde_json::json!({ "effort": openai_reasoning_effort(effort, model) });
         }
 
         body

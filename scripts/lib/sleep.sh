@@ -52,6 +52,7 @@ ensure_sudoers_pmset() {
 
 # Remove lock files whose owning process has died.
 cleanup_stale_sleep_locks() {
+    local lock_file
     for lock_file in "$SLEEP_LOCK_DIR"/*; do
         [ -f "$lock_file" ] || continue
         local lock_pid

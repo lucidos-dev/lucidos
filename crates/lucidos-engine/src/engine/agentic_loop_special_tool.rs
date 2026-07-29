@@ -472,7 +472,7 @@ impl LucidosEngine {
                             } else {
                                 return Some(format!(
                                     "Error: Repository at '{}' is not registered. Use manage_repositories action='add' first.",
-                                    repo_root.display()
+                                    crate::core::home_path::abbreviate(repo_root.as_path())
                                 ));
                             }
                         }
@@ -850,8 +850,11 @@ impl LucidosEngine {
             // to pin — the seed messages were synthesized by the special-tool
             // dispatcher, not typed by a user — so pass 2 trims freely and there
             // is no current-turn image to keep.
-            let message_budget = 400_000; // ~100k tokens budget for intent sub-loops
-            trim_context_if_needed(&mut messages, message_budget, None, None);
+            // ~266k tokens at the 1.5 chars/token the budget assumes. (The old
+            // comment here said "~100k tokens" — that was the retired chars/4
+            // ratio; the value itself is unchanged.)
+            let message_budget = 400_000;
+            trim_context_if_needed(&mut messages, message_budget, None, &[]);
 
             // Call LLM with no streaming (sub-loop doesn't stream text to frontend)
             let response = provider
@@ -873,6 +876,32 @@ impl LucidosEngine {
             // Build assistant message with tool_use blocks
             let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
             if let Some(ref text) = response.content {
+                // Surface the sub-loop's narrative to the parent thread. We are
+                // past the empty-tool-calls early return above, so this response
+                // ALSO carries tool calls — meaning `text` is the connective prose
+                // the intent Director wrote to set up the call, most importantly
+                // the world-building that motivates an `ask_user_question` card.
+                // The sub-loop runs with no token-stream callback, so without this
+                // that prose is dropped and the user sees only disconnected
+                // question cards referencing lore that was never written to the
+                // chat (the "evig vinter never mentioned in the chat" bug). Emit
+                // BEFORE the ToolCalled events below so the prose renders above the
+                // card it introduces — mirroring how this loop already surfaces its
+                // ToolCalled / ToolResult events to `thread_id` with EventMeta::NONE.
+                if let Some(surface) = intent_narration_to_surface(Some(text)) {
+                    self.event_bus
+                        .emit_or_log(
+                            BusEvent::Thread {
+                                thread_id,
+                                event: ThreadEvent::TextStreamed {
+                                    text: surface.to_string(),
+                                },
+                                meta: EventMeta::NONE,
+                            },
+                            "[IntentLoop] TextStreamed",
+                        )
+                        .await;
+                }
                 assistant_blocks.push(ContentBlock::Text { text: text.clone() });
             }
             for tc in &response.tool_calls {
@@ -1015,10 +1044,36 @@ impl LucidosEngine {
     }
 }
 
+/// Decide whether an intent sub-loop LLM response carries narrative prose worth
+/// surfacing to the parent thread as a `TextStreamed` event. Returns the text to
+/// emit, or `None` for absent / whitespace-only content (a turn that is a pure
+/// tool call with no prose must not emit an empty bubble). The text is returned
+/// verbatim — the model's own paragraph breaks are preserved so it renders as
+/// markdown; only the empty-content decision is made here.
+fn intent_narration_to_surface(content: Option<&str>) -> Option<&str> {
+    content.filter(|text| !text.trim().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn intent_narration_surfaces_real_prose() {
+        // The world-building the Director writes before an ask_user_question is
+        // exactly what must reach the chat.
+        let prose = "Et evig vinterlandskap ligger over fjordriket.\n\nHvem er fienden?";
+        assert_eq!(intent_narration_to_surface(Some(prose)), Some(prose));
+    }
+
+    #[test]
+    fn intent_narration_skips_absent_and_whitespace_only() {
+        // A pure tool-call turn (no prose) must not emit an empty TextStreamed.
+        assert_eq!(intent_narration_to_surface(None), None);
+        assert_eq!(intent_narration_to_surface(Some("")), None);
+        assert_eq!(intent_narration_to_surface(Some("  \n\t  ")), None);
+    }
 
     #[test]
     fn parse_coding_agent_defaults_to_claude_code() {

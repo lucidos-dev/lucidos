@@ -104,25 +104,25 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 ## Packaged vs dev
 
 ### Gateway self-reload control is dev-only
-- **Where:** `.claude/rules/scripts.md` § "Gateway self-reload"; gateway control status `packaged` field (`crates/lucidos-gateway/src/`), `crates/lucidos-app/src/desktop.rs` (`LUCIDOS_PACKAGED=1`), `crates/lucidos-app/src/components/.../WorkspacePicker.tsx`
+- **Where:** `.claude/rules/dev-runtime.md` § "Gateway self-reload"; gateway control status `packaged` field (`crates/lucidos-gateway/src/`), `crates/lucidos-app/src/desktop.rs` (`LUCIDOS_PACKAGED=1`), `crates/lucidos-app/src/components/.../WorkspacePicker.tsx`
 - **Gap:** The workspace picker's "reload the gateway onto the rebuilt binary" control (`POST /~/api/v1/control/gateway/reload`, re-exec in place) is hidden in packaged builds.
 - **Why:** In-place re-exec onto a rebuilt on-disk binary only makes sense in dev (a CC Apply rebuilds the gateway under a running gateway). A packaged build never rebuilds in place — its updates go through the app updater + a full launchd service restart.
 - **Status:** Open by design — packaged gateway updates are delivered by the updater, not an in-place reload.
 
 ### Frontend-only in-process Apply refresh is dev-only
-- **Where:** `crates/lucidos-engine/src/engine/frontend_refresh.rs` (`refresh_served_frontend_after_rebuild` and the peer `spawn_served_frontend_sync` both early-return packaged/headless), `.claude/rules/scripts.md` § "Exception — a frontend-only Apply…" and § "Shared build-watch"
+- **Where:** `crates/lucidos-engine/src/engine/frontend_refresh.rs` (`refresh_served_frontend_after_rebuild` and the peer `spawn_served_frontend_sync` both early-return packaged/headless), `.claude/rules/dev-runtime.md` § "Exception — a frontend-only Apply…" and § "Shared build-watch"
 - **Gap:** The fast path where a pure frontend change advances the served client without an engine restart exists only in dev — both for the applying workspace (in-process re-snapshot on Apply) and for **peer** workspaces (a ~10s periodic re-snapshot of the checkout-shared `dist/` when INV-A-safe, emitting `ServedFrontendAdvanced`); packaged Applies don't get an in-process client swap.
 - **Why:** In dev the engine serves a pinned snapshot of a live `dist/` and can re-snapshot in place. Packaged serves an immutable bundled Resources directory that is already one unit — there is no live `dist/` to re-snapshot, so the refresh is a no-op there. (Packaged is also single-workspace-per-install, so the cross-workspace peer case doesn't arise.)
 - **Status:** Open by design — packaged frontend updates ship via the updater's full restart. The cross-workspace peer propagation gap (a peer serving a stale client with no badge) is **closed in dev** by the periodic sync — see `docs/plans/2026-07-03-cross-workspace-frontend-only-refresh.md`.
 
 ### No HMR anywhere; no Vite in the serving path
-- **Where:** `crates/lucidos-app/src/main.tsx` (`import.meta.hot` path inert under built serving), `.claude/rules/scripts.md` § "Frontend: the engine serves the built `dist/`", ADR 0014
+- **Where:** `crates/lucidos-app/src/main.tsx` (`import.meta.hot` path inert under built serving), `.claude/rules/dev-runtime.md` § "Frontend: the engine serves the built `dist/`", ADR 0014
 - **Gap:** There is no hot-module-replacement in the running app; a code change is picked up by a full browser refresh after the build-watch republishes `dist/`.
 - **Why:** ADR 0014 removed the live Vite dev server from the serving path — the engine serves the built `dist/` directly. The build-watch runs a fresh `vite build` per change instead of incremental HMR; the old `import.meta.hot` path is inert under built serving.
 - **Status:** Open by design — reload to pick up a change (rebuild is typically sub-second).
 
 ### The default `curl | sh` installer 404s today
-- **Where:** `install.sh` (download-and-run default), `.github/workflows/release-tarballs.yml` (artifact-only, `attach_to_release` gated off), `.claude/rules/scripts.md` § Installer "Caveat"
+- **Where:** `install.sh` (download-and-run default), `.github/workflows/release-tarballs.yml` (artifact-only, `attach_to_release` gated off), `.claude/rules/build-release.md` § Installer "Caveat"
 - **Gap:** The default installer path downloads `lucidos-<version>-<triple>.tar.gz` from GitHub Releases, but no release asset is published yet, so the download returns 404.
 - **Why:** The release workflow uploads tarballs as **workflow artifacts only** and never auto-creates a Release; attaching to a Release is behind a manual `workflow_dispatch` + tag ref + opt-in flag. Nothing has been published.
 - **Status:** Open — use `install.sh --dev` (build from source) or `install.sh --from-tarball <path>` until releases are published; the failure message points at these.
@@ -158,6 +158,12 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 - **Gap:** A residual WebContent cold-start stall can still hang a `mobile-webkit` (iOS Safari emulation) e2e page under heavy host contention.
 - **Why:** Variant 2 is intermittent and load-dependent and only reliably clears on a fresh browser context (the whole-test `retries: 1`); the RSS reaper is a safety net against host memory exhaustion, not a cure for the wedge itself.
 - **Status:** Open — mitigated via preflight health check, retry, and reaper; not deterministically fixed (browser-side).
+
+### `bash_background` unit tests are load-sensitive and flake under host contention
+- **Where:** `crates/lucidos-engine/src/engine/tools/bash_background.rs` `#[cfg(test)] mod tests` — notably `killed_task_preserves_output_written_before_kill` (:547), `drain_returns_only_new_output_each_call` (:446), `wait_zero_matches_legacy_non_blocking_drain` (:870).
+- **Gap:** These spawn real subprocesses and poll for their output within fixed windows (e.g. "task did not finish within 8s after kill"). On a saturated host they intermittently fail with `first stdout: ""` / `stdout: ""` / the 8s timeout, and *which* test fails varies per run. Observed 2026-07-26 while the machine was running continuous cargo + vite builds: 1 failure in a full-suite run, then across three consecutive module-only runs — ok, 2 failures (a different pair), ok. The same test passes reliably when run alone.
+- **Why:** The assertions are wall-clock races against real process scheduling, not logic. Under contention the child simply hasn't been scheduled to write before the deadline. Making them deterministic means restructuring around a readiness signal rather than a sleep/poll window — a change to the tested module's test harness, not to any caller.
+- **Status:** Open — unrelated to any feature work that trips it, so don't chase it from an unrelated diff. Re-run the module (or the single test) to confirm a failure is this flake before treating it as a regression; a genuine regression fails deterministically and names the same test every time.
 
 ## Mobile vs desktop
 
@@ -250,6 +256,12 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 - **Gap:** `LUCIDOS_EMBEDDING_MODEL` accepts only those two 384-dim models; any other id is rejected at startup.
 - **Why:** The resolver hardcodes the two supported models (schema/backfill assume 384-dim vectors).
 - **Status:** Open — no alternate embedding model without code + a migration for the vector dimension.
+
+### Memory created during the model-load window isn't auto-indexed
+- **Where:** `crates/lucidos-engine/src/engine/memory/extract.rs` (`index_memory_inner_impl` skips when `!self.embedder.is_ready()`), `crates/lucidos-engine/src/engine/memory/embedder_retry.rs` (post-install `reembed_stale`)
+- **Gap:** The embedding model loads in the background so boot is never blocked (see `memory::EmbedderSlot`); chat messages / artifacts created before it lands are not extracted into memory, and are not indexed automatically once it does.
+- **Why:** Indexing requires an embedding, which errors `EMBEDDER_UNAVAILABLE` while the slot is empty. The post-install `reembed_stale` sweep only re-embeds *existing* `memory_entries` rows (stale model id) — it can't create rows for items that never inserted one. On a warm cache the window is a few seconds (extraction runs post-response, so the model is almost always ready in time); on a cold cache it lasts the ~465 MB download.
+- **Status:** Open — a manual memory rebuild **run once memory is active** recovers boot-window items (a rebuild is refused while the model is still loading, since it clears entries before re-indexing — see `rebuild_memory`); a durable replay queue was out of scope for the boot-unblock change (`docs/plans/2026-07-07-background-embedding-model-load.md`).
 
 ## Coding agents
 

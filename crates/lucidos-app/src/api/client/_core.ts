@@ -7,10 +7,10 @@ import { BASE_PATH } from '../../utils/basePath';
 // `/<slug>` behind the gateway (read from the stamped `<base href>`) and `''`
 // at a legacy root.
 export const API_BASE = BASE_PATH;
-// Single source of truth for the HTTP API prefix. Every fetch in this file
-// builds onto `${API}/…` so the version is stamped exactly once.
-// See CLAUDE.md "API URL Conventions".
-export const API = `${API_BASE}/api/v1`;
+// Re-exported, not redeclared: `API` is defined next to `BASE_PATH` in
+// utils/basePath so leaf modules (utils/clientLog) can build API URLs without
+// importing this file, which pulls in the store. Still the one definition.
+export { API } from '../../utils/basePath';
 
 export class ApiError extends Error {
   constructor(
@@ -85,6 +85,44 @@ export function isTransportError(err: unknown): boolean {
     && /Load failed|Failed to fetch|NetworkError/i.test(err.message);
 }
 
+/** True for a rejection that says nothing about the request itself, so the
+ *  right response is to try again rather than to park a `Loadable` on `failed`:
+ *
+ *  - `AbortError` — the browser cancelled the fetch (an iOS PWA freezing
+ *    mid-flight, a page-lifecycle transition in the packaged WKWebView).
+ *  - `TimeoutError` — our own client-side deadline fired (a read issued while
+ *    the engine is still booting is the common one).
+ *  - a transport `TypeError` — stale connection (see `isTransportError`).
+ *
+ *  A `4xx`/`5xx` (`ApiError`), a parse error, or any other `TypeError` is a real
+ *  verdict and must surface.
+ *
+ *  Deliberately WIDER than `isAbortError` (`utils/errorDetail`): the background
+ *  paths use that narrower predicate to suppress a cancel while still escalating
+ *  a timeout. Here every non-verdict rejection is worth one more attempt. */
+export function isTransientFetchError(err: unknown): boolean {
+  if (err instanceof DOMException) {
+    return err.name === 'AbortError' || err.name === 'TimeoutError';
+  }
+  return isTransportError(err);
+}
+
+/** Run an idempotent read once more when the first attempt fails transiently.
+ *  For `Loadable`-backed loaders, where a single cancelled fetch would otherwise
+ *  stick as a visible failure until something else happens to refetch. The
+ *  second failure (or any non-transient one) propagates unchanged.
+ *
+ *  Only for reads with no caller-supplied `AbortSignal` — a deliberate cancel
+ *  would be retried with the same, already-aborted signal. */
+export async function retryTransientRead<T>(read: () => Promise<T>): Promise<T> {
+  try {
+    return await read();
+  } catch (err) {
+    if (!isTransientFetchError(err)) throw err;
+    return read();
+  }
+}
+
 /** Same as `mutatingFetch` but retries once on a transport-layer error
  *  (iOS Safari surfaces stale-connection failures as `TypeError("Load failed")`
  *  after the PWA backgrounds). Use only for endpoints whose backend handler is
@@ -136,7 +174,23 @@ async function fetchWithDefaults(url: string, init: RequestInit | undefined, tim
   const headers = { ...deviceIdHeader(), ...(init?.headers as Record<string, string> | undefined) };
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const signal = init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
-  return fetch(url, { ...init, headers, signal });
+  try {
+    return await fetch(url, { ...init, headers, signal });
+  } catch (err) {
+    // WebKit rejects an aborted fetch with its own `AbortError: Fetch is
+    // aborted` rather than the signal's `reason`, so on iOS Safari and in the
+    // packaged WKWebView a fired deadline is indistinguishable from a
+    // page-lifecycle cancel: it reads as "request cancelled" and the background
+    // paths that suppress an AbortError swallow it. Re-stamp it as the
+    // TimeoutError Chrome and Firefox already deliver, so the deadline means the
+    // same thing on every engine. A caller's own abort wins when both fired —
+    // that one was deliberate.
+    if (err instanceof DOMException && err.name === 'AbortError'
+      && timeoutSignal.aborted && !init?.signal?.aborted) {
+      throw new DOMException(`Request timed out after ${timeoutMs}ms`, 'TimeoutError');
+    }
+    throw err;
+  }
 }
 
 export async function json<T>(url: string, init?: RequestInit, timeoutMs = 10000): Promise<T> {

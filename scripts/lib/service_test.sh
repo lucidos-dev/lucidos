@@ -83,11 +83,13 @@ make_fakebin() {
     local dir os rc
     dir="$(mktemp -d)"; os="${1:-}"; rc="${2:-1}"
     if [ -n "$os" ]; then
+        # shellcheck disable=SC2016 # $1 belongs to the GENERATED stub, so it must not expand here
         { printf '#!/bin/sh\n'
           printf '[ "$1" = "-s" ] && { echo %s; exit 0; }\n' "$os"
           printf 'echo %s\n' "$os"; } > "$dir/uname"
         chmod +x "$dir/uname"
     fi
+    # shellcheck disable=SC2016 # $1 belongs to the GENERATED stub, so it must not expand here
     printf '#!/bin/sh\ncase "$1" in print) exit %s;; *) exit 0;; esac\n' "$rc" > "$dir/launchctl"
     printf '#!/bin/sh\nexit 1\n' > "$dir/systemctl"
     chmod +x "$dir/launchctl" "$dir/systemctl"
@@ -96,80 +98,80 @@ make_fakebin() {
 
 # ── PURE: identity (slug-suffixed) ────────────────────────────────────────────
 echo "test: service identity is slug-suffixed (coexists; never collides with the .app's com.lucidos.engine)"
-[ "$(service_launchd_label default)" = "com.lucidos.gateway.default" ] && pass "launchd label (default)" || fail "label: $(service_launchd_label default)"
-[ "$(service_launchd_label test)" = "com.lucidos.gateway.test" ] && pass "launchd label (test)" || fail "label: $(service_launchd_label test)"
-[ "$(service_systemd_unit_name test)" = "lucidos-gateway-test.service" ] && pass "systemd unit name" || fail "unit: $(service_systemd_unit_name test)"
+if [ "$(service_launchd_label default)" = "com.lucidos.gateway.default" ]; then pass "launchd label (default)"; else fail "label: $(service_launchd_label default)"; fi
+if [ "$(service_launchd_label test)" = "com.lucidos.gateway.test" ]; then pass "launchd label (test)"; else fail "label: $(service_launchd_label test)"; fi
+if [ "$(service_systemd_unit_name test)" = "lucidos-gateway-test.service" ]; then pass "systemd unit name"; else fail "unit: $(service_systemd_unit_name test)"; fi
 
 # ── PURE: validation ──────────────────────────────────────────────────────────
 echo ""
 echo "test: service_is_instance_name accepts slugs, rejects junk + reserved names"
 for ok_slug in default test ab-cd x1; do
-    service_is_instance_name "$ok_slug" && pass "accepts '$ok_slug'" || fail "rejected valid '$ok_slug'"
+    if service_is_instance_name "$ok_slug"; then pass "accepts '$ok_slug'"; else fail "rejected valid '$ok_slug'"; fi
 done
 for bad in "" "UP" "a b" "-x" "x-" "a_b" gateway runtime current logs; do
-    service_is_instance_name "$bad" && fail "accepted invalid '$bad'" || pass "rejects '$bad'"
+    if service_is_instance_name "$bad"; then fail "accepted invalid '$bad'"; else pass "rejects '$bad'"; fi
 done
 echo ""
 echo "test: service_is_port_number bounds"
-for ok_p in 1 5252 65535; do service_is_port_number "$ok_p" && pass "accepts $ok_p" || fail "rejected $ok_p"; done
-for bad_p in 0 65536 "" abc 52x; do service_is_port_number "$bad_p" && fail "accepted $bad_p" || pass "rejects '$bad_p'"; done
+for ok_p in 1 5252 65535; do if service_is_port_number "$ok_p"; then pass "accepts $ok_p"; else fail "rejected $ok_p"; fi; done
+for bad_p in 0 65536 "" abc 52x; do if service_is_port_number "$bad_p"; then fail "accepted $bad_p"; else pass "rejects '$bad_p'"; fi; done
 
 # ── PURE: paths ───────────────────────────────────────────────────────────────
 echo ""
 echo "test: path resolution (data dir, port file, plist, unit, logs, runtime root, health URL)"
-[ "$(service_instance_data_dir /opt/x test)" = "/opt/x/test" ] && pass "data dir = <prefix>/<slug>" || fail "data dir: $(service_instance_data_dir /opt/x test)"
-[ "$(service_instance_port_file /opt/x/test)" = "/opt/x/test/port" ] && pass "port file = <data>/port" || fail "port file: $(service_instance_port_file /opt/x/test)"
+if [ "$(service_instance_data_dir /opt/x test)" = "/opt/x/test" ]; then pass "data dir = <prefix>/<slug>"; else fail "data dir: $(service_instance_data_dir /opt/x test)"; fi
+if [ "$(service_instance_port_file /opt/x/test)" = "/opt/x/test/port" ]; then pass "port file = <data>/port"; else fail "port file: $(service_instance_port_file /opt/x/test)"; fi
 got="$(service_launchd_plist_path /Users/me test)"
-[ "$got" = "/Users/me/Library/LaunchAgents/com.lucidos.gateway.test.plist" ] && pass "plist path = $got" || fail "plist path: $got"
+if [ "$got" = "/Users/me/Library/LaunchAgents/com.lucidos.gateway.test.plist" ]; then pass "plist path = $got"; else fail "plist path: $got"; fi
 got="$(service_systemd_unit_path /home/u test)"
-[ "$got" = "/home/u/.config/systemd/user/lucidos-gateway-test.service" ] && pass "unit path (default XDG) = $got" || fail "unit path: $got"
+if [ "$got" = "/home/u/.config/systemd/user/lucidos-gateway-test.service" ]; then pass "unit path (default XDG) = $got"; else fail "unit path: $got"; fi
 got="$(service_systemd_unit_path /home/u test /home/u/.xdg)"
-[ "$got" = "/home/u/.xdg/systemd/user/lucidos-gateway-test.service" ] && pass "unit path honors XDG_CONFIG_HOME" || fail "unit path XDG: $got"
-[ "$(service_log_dir /opt/x/test)" = "/opt/x/test/logs" ] && pass "log dir = <data>/logs" || fail "log dir: $(service_log_dir /opt/x/test)"
-[ "$(service_runtime_root /opt/x)" = "/opt/x/runtime/current" ] && pass "runtime root = shared current symlink" || fail "runtime root: $(service_runtime_root /opt/x)"
-[ "$(service_health_url 5252)" = "http://localhost:5252/~/api/v1/health" ] && pass "health url (sigil namespace)" || fail "health url: $(service_health_url 5252)"
-[ "$(service_health_url 5252 https)" = "https://localhost:5252/~/api/v1/health" ] && pass "health url honors the https scheme (TLS instance)" || fail "health url https: $(service_health_url 5252 https)"
+if [ "$got" = "/home/u/.xdg/systemd/user/lucidos-gateway-test.service" ]; then pass "unit path honors XDG_CONFIG_HOME"; else fail "unit path XDG: $got"; fi
+if [ "$(service_log_dir /opt/x/test)" = "/opt/x/test/logs" ]; then pass "log dir = <data>/logs"; else fail "log dir: $(service_log_dir /opt/x/test)"; fi
+if [ "$(service_runtime_root /opt/x)" = "/opt/x/runtime/current" ]; then pass "runtime root = shared current symlink"; else fail "runtime root: $(service_runtime_root /opt/x)"; fi
+if [ "$(service_health_url 5252)" = "http://localhost:5252/~/api/v1/health" ]; then pass "health url (sigil namespace)"; else fail "health url: $(service_health_url 5252)"; fi
+if [ "$(service_health_url 5252 https)" = "https://localhost:5252/~/api/v1/health" ]; then pass "health url honors the https scheme (TLS instance)"; else fail "health url https: $(service_health_url 5252 https)"; fi
 
 # ── PURE: bind-value validation + network.toml render/parse round-trip ────────
 echo ""
 echo "test: service_is_bind_value accepts all/loopback/IPs, rejects junk"
 for ok_b in all loopback 0.0.0.0 192.168.1.7 100.64.0.1 :: ::1 fd7a:115c:a1e0::1; do
-    service_is_bind_value "$ok_b" && pass "accepts '$ok_b'" || fail "rejected valid '$ok_b'"
+    if service_is_bind_value "$ok_b"; then pass "accepts '$ok_b'"; else fail "rejected valid '$ok_b'"; fi
 done
 for bad_b in "" lan yes 256.1.1.1 1.2.3 "192.168.1.7 evil" "all;rm"; do
-    service_is_bind_value "$bad_b" && fail "accepted invalid '$bad_b'" || pass "rejects '$bad_b'"
+    if service_is_bind_value "$bad_b"; then fail "accepted invalid '$bad_b'"; else pass "rejects '$bad_b'"; fi
 done
 
 echo ""
 echo "test: network.toml render mirrors the gateway writer; bind/inherit parse back out"
 NT="$(service_render_network_toml all true)"
-has "$NT" '[gateway]' && has "$NT" 'bind = "all"' && pass "render carries [gateway] bind" || fail "render: $NT"
-has "$NT" '[engine]' && has "$NT" 'inherit = true' && pass "render carries [engine] inherit" || fail "render inherit: $NT"
-[ "$(service_network_toml_bind "$NT")" = "all" ] && pass "bind parses back out" || fail "bind parse: $(service_network_toml_bind "$NT")"
-[ "$(service_network_toml_engine_inherit "$NT")" = "true" ] && pass "inherit parses back out" || fail "inherit parse"
+if has "$NT" '[gateway]' && has "$NT" 'bind = "all"'; then pass "render carries [gateway] bind"; else fail "render: $NT"; fi
+if has "$NT" '[engine]' && has "$NT" 'inherit = true'; then pass "render carries [engine] inherit"; else fail "render inherit: $NT"; fi
+if [ "$(service_network_toml_bind "$NT")" = "all" ]; then pass "bind parses back out"; else fail "bind parse: $(service_network_toml_bind "$NT")"; fi
+if [ "$(service_network_toml_engine_inherit "$NT")" = "true" ]; then pass "inherit parses back out"; else fail "inherit parse"; fi
 NT2="$(service_render_network_toml 100.64.0.1 false)"
-[ "$(service_network_toml_bind "$NT2")" = "100.64.0.1" ] && pass "IP bind round-trips" || fail "IP bind: $(service_network_toml_bind "$NT2")"
-[ "$(service_network_toml_engine_inherit "$NT2")" = "false" ] && pass "inherit=false round-trips" || fail "inherit=false parse"
-[ "$(service_network_toml_engine_inherit "")" = "true" ] && pass "absent file defaults inherit=true" || fail "empty-contents inherit default"
+if [ "$(service_network_toml_bind "$NT2")" = "100.64.0.1" ]; then pass "IP bind round-trips"; else fail "IP bind: $(service_network_toml_bind "$NT2")"; fi
+if [ "$(service_network_toml_engine_inherit "$NT2")" = "false" ]; then pass "inherit=false round-trips"; else fail "inherit=false parse"; fi
+if [ "$(service_network_toml_engine_inherit "")" = "true" ]; then pass "absent file defaults inherit=true"; else fail "empty-contents inherit default"; fi
 
 # ── OFFLINE FS: service_write_network_toml writes + preserves inherit ─────────
 echo ""
 echo "test: service_write_network_toml writes fresh + preserves an existing inherit=false"
 NTH="$(mktemp -d)"
 service_write_network_toml "$NTH" all || fail "fresh network.toml write failed"
-[ "$(service_network_toml_bind "$(cat "$NTH/.lucidos/network.toml")")" = "all" ] && pass "fresh write records bind=all" || fail "fresh write: $(cat "$NTH/.lucidos/network.toml" 2>/dev/null)"
+if [ "$(service_network_toml_bind "$(cat "$NTH/.lucidos/network.toml")")" = "all" ]; then pass "fresh write records bind=all"; else fail "fresh write: $(cat "$NTH/.lucidos/network.toml" 2>/dev/null)"; fi
 service_render_network_toml loopback false > "$NTH/.lucidos/network.toml"
 service_write_network_toml "$NTH" 192.168.1.7 || fail "rewrite failed"
 NTC="$(cat "$NTH/.lucidos/network.toml")"
-[ "$(service_network_toml_bind "$NTC")" = "192.168.1.7" ] && pass "rewrite updates bind" || fail "rewrite bind: $NTC"
-[ "$(service_network_toml_engine_inherit "$NTC")" = "false" ] && pass "rewrite preserves inherit=false" || fail "rewrite lost inherit: $NTC"
+if [ "$(service_network_toml_bind "$NTC")" = "192.168.1.7" ]; then pass "rewrite updates bind"; else fail "rewrite bind: $NTC"; fi
+if [ "$(service_network_toml_engine_inherit "$NTC")" = "false" ]; then pass "rewrite preserves inherit=false"; else fail "rewrite lost inherit: $NTC"; fi
 rm -rf "$NTH"
 
 # ── PURE: env contract (matches spawn_gateway; shared runtime + per-instance data) ─
 echo ""
 echo "test: service_runtime_env_pairs matches the spawn_gateway env contract"
 env_block="$(service_runtime_env_pairs /opt/x/runtime/current /opt/x/test 5252)"
-check_env() { has "$env_block" "$1" && pass "env has $1" || fail "env missing $1: $env_block"; }
+check_env() { if has "$env_block" "$1"; then pass "env has $1"; else fail "env missing $1: $env_block"; fi; }
 check_env "LUCIDOS_API_PORT=5252"
 check_env "LUCIDOS_GATEWAY_DATA=/opt/x/test"
 check_env "LUCIDOS_GATEWAY_PG_BACKEND=embedded"
@@ -179,89 +181,94 @@ check_env "LUCIDOS_ENGINE_BIN=/opt/x/runtime/current/lucidos-engine"
 check_env "LUCIDOS_CLI_BIN=/opt/x/runtime/current/lucidos"
 check_env "LUCIDOS_STATIC_DIR=/opt/x/runtime/current/frontend"
 check_env "LUCIDOS_SDK_DIR=/opt/x/runtime/current/sdk"
+check_env "LUCIDOS_SYSTEM_KNOWHOW_DIR=/opt/x/runtime/current/system-knowhow"
 check_env "FASTEMBED_CACHE_DIR=/opt/x/test/fastembed"
 check_env "LUCIDOS_BOOT_WITHOUT_PROVIDER=1"
 check_env "LUCIDOS_PACKAGED=1"
 # TLS is OPT-IN: the base contract must NOT carry TLS vars (packaged posture is
 # plain http; install.sh appends service_tls_env_pairs only when both flags are
 # supplied).
-has "$env_block" "LUCIDOS_TLS_CERT" && fail "base env must not carry LUCIDOS_TLS_CERT" || pass "base env has no TLS vars (opt-in only)"
+if has "$env_block" "LUCIDOS_TLS_CERT"; then fail "base env must not carry LUCIDOS_TLS_CERT"; else pass "base env has no TLS vars (opt-in only)"; fi
 echo ""
 echo "test: service_tls_env_pairs renders the opt-in TLS pairs"
 tls_block="$(service_tls_env_pairs /p/certs/host.crt /p/certs/host.key)"
-has "$tls_block" "LUCIDOS_TLS_CERT=/p/certs/host.crt" && pass "TLS cert pair" || fail "TLS cert pair: $tls_block"
-has "$tls_block" "LUCIDOS_TLS_KEY=/p/certs/host.key" && pass "TLS key pair" || fail "TLS key pair: $tls_block"
+if has "$tls_block" "LUCIDOS_TLS_CERT=/p/certs/host.crt"; then pass "TLS cert pair"; else fail "TLS cert pair: $tls_block"; fi
+if has "$tls_block" "LUCIDOS_TLS_KEY=/p/certs/host.key"; then pass "TLS key pair"; else fail "TLS key pair: $tls_block"; fi
 
 # ── PURE: manager DECISION + compose decision ─────────────────────────────────
 echo ""
 echo "test: service_decide_manager across faked (os, launchctl, systemd-user)"
-[ "$(service_decide_manager Darwin 1 0)" = "launchd" ]      && pass "macOS + launchctl → launchd" || fail "Darwin 1 0"
-[ "$(service_decide_manager Darwin 0 0)" = "none" ]         && pass "macOS w/o launchctl → none" || fail "Darwin 0 0"
-[ "$(service_decide_manager Linux 0 1)" = "systemd-user" ]  && pass "Linux + systemd --user → systemd-user" || fail "Linux 0 1"
-[ "$(service_decide_manager Linux 0 0)" = "none" ]          && pass "Linux w/o systemd --user → none" || fail "Linux 0 0"
-[ "$(service_decide_manager PlanNine 1 1)" = "none" ]       && pass "unknown OS → none" || fail "PlanNine 1 1"
+if [ "$(service_decide_manager Darwin 1 0)" = "launchd" ]; then pass "macOS + launchctl → launchd"; else fail "Darwin 1 0"; fi
+if [ "$(service_decide_manager Darwin 0 0)" = "none" ]; then pass "macOS w/o launchctl → none"; else fail "Darwin 0 0"; fi
+if [ "$(service_decide_manager Linux 0 1)" = "systemd-user" ]; then pass "Linux + systemd --user → systemd-user"; else fail "Linux 0 1"; fi
+if [ "$(service_decide_manager Linux 0 0)" = "none" ]; then pass "Linux w/o systemd --user → none"; else fail "Linux 0 0"; fi
+if [ "$(service_decide_manager PlanNine 1 1)" = "none" ]; then pass "unknown OS → none"; else fail "PlanNine 1 1"; fi
 echo ""
 echo "test: service_compose_decision (default service; --no-service + no-manager degrade)"
-[ "$(service_compose_decision "" launchd)" = "service" ]       && pass "default + launchd → service" || fail "'' launchd"
-[ "$(service_compose_decision 1 launchd)" = "foreground" ]     && pass "--no-service → foreground" || fail "1 launchd"
-[ "$(service_compose_decision "" none)" = "foreground" ]       && pass "no manager → foreground (degrade)" || fail "'' none"
+if [ "$(service_compose_decision "" launchd)" = "service" ]; then pass "default + launchd → service"; else fail "'' launchd"; fi
+if [ "$(service_compose_decision 1 launchd)" = "foreground" ]; then pass "--no-service → foreground"; else fail "1 launchd"; fi
+if [ "$(service_compose_decision "" none)" = "foreground" ]; then pass "no manager → foreground (degrade)"; else fail "'' none"; fi
 
 # ── PURE: command-arg builders, xml escape, port candidates ──────────────────
 echo ""
 echo "test: launchctl domain/target builders + xml escape + port candidates"
-[ "$(service_launchd_domain 501)" = "gui/501" ] && pass "domain = gui/<uid>" || fail "domain"
-[ "$(service_launchd_target 501 com.lucidos.gateway.test)" = "gui/501/com.lucidos.gateway.test" ] && pass "target = gui/<uid>/<label>" || fail "target"
-[ "$(service_xml_escape '/a&b/<x>')" = "/a&amp;b/&lt;x&gt;" ] && pass "xml escape" || fail "xml escape"
+if [ "$(service_launchd_domain 501)" = "gui/501" ]; then pass "domain = gui/<uid>"; else fail "domain"; fi
+if [ "$(service_launchd_target 501 com.lucidos.gateway.test)" = "gui/501/com.lucidos.gateway.test" ]; then pass "target = gui/<uid>/<label>"; else fail "target"; fi
+if [ "$(service_xml_escape '/a&b/<x>')" = "/a&amp;b/&lt;x&gt;" ]; then pass "xml escape"; else fail "xml escape"; fi
 cand="$(service_port_candidates 5252 3)"
-[ "$cand" = "$(printf '5252\n5253\n5254')" ] && pass "port candidates ascend from base" || fail "candidates: $cand"
+if [ "$cand" = "$(printf '5252\n5253\n5254')" ]; then pass "port candidates ascend from base"; else fail "candidates: $cand"; fi
 
 # ── PURE: launchd plist content ──────────────────────────────────────────────
 echo ""
 echo "test: launchd plist embeds the gateway-only ProgramArguments, env, KeepAlive, logs"
 PL="$(service_launchd_plist com.lucidos.gateway.test /p/runtime/current/lucidos-gateway /p/test /p/test/logs/gateway.out.log /p/test/logs/gateway.err.log "$env_block")"
-has "$PL" "<string>com.lucidos.gateway.test</string>" && pass "plist has the slug-suffixed label" || fail "plist label missing"
-has "$PL" "<string>/p/runtime/current/lucidos-gateway</string>" && pass "ProgramArguments = the shared gateway binary" || fail "plist gateway path missing"
+if has "$PL" "<string>com.lucidos.gateway.test</string>"; then pass "plist has the slug-suffixed label"; else fail "plist label missing"; fi
+if has "$PL" "<string>/p/runtime/current/lucidos-gateway</string>"; then pass "ProgramArguments = the shared gateway binary"; else fail "plist gateway path missing"; fi
 n="$(printf '%s\n' "$PL" | awk '/<key>ProgramArguments<\/key>/{f=1;next} f&&/<\/array>/{f=0} f&&/<string>/{c++} END{print c+0}')"
-[ "$n" = "1" ] && pass "ProgramArguments has exactly one entry (gateway only, not per-engine)" || fail "ProgramArguments entries: $n"
-has "$PL" "<key>RunAtLoad</key>" && pass "RunAtLoad present" || fail "RunAtLoad missing"
-has "$PL" "<key>KeepAlive</key>" && pass "KeepAlive present" || fail "KeepAlive missing"
-has "$PL" "<key>LUCIDOS_API_PORT</key>" && has "$PL" "<string>5252</string>" && pass "env var rendered as key/string" || fail "env var not rendered"
-has "$PL" "<string>/p/test/logs/gateway.out.log</string>" && pass "StandardOutPath in the instance log dir" || fail "out log missing"
-has "$PL" "<string>/p/test</string>" && pass "WorkingDirectory = the instance data dir" || fail "workdir missing"
+if [ "$n" = "1" ]; then pass "ProgramArguments has exactly one entry (gateway only, not per-engine)"; else fail "ProgramArguments entries: $n"; fi
+if has "$PL" "<key>RunAtLoad</key>"; then pass "RunAtLoad present"; else fail "RunAtLoad missing"; fi
+if has "$PL" "<key>KeepAlive</key>"; then pass "KeepAlive present"; else fail "KeepAlive missing"; fi
+if has "$PL" "<key>LUCIDOS_API_PORT</key>" && has "$PL" "<string>5252</string>"; then pass "env var rendered as key/string"; else fail "env var not rendered"; fi
+if has "$PL" "<string>/p/test/logs/gateway.out.log</string>"; then pass "StandardOutPath in the instance log dir"; else fail "out log missing"; fi
+if has "$PL" "<string>/p/test</string>"; then pass "WorkingDirectory = the instance data dir"; else fail "workdir missing"; fi
 
 # ── PURE: systemd unit content ───────────────────────────────────────────────
 echo ""
 echo "test: systemd unit embeds ExecStart (gateway only), Environment, SIGUSR1, WantedBy"
 UNIT="$(service_systemd_unit /p/runtime/current/lucidos-gateway /p/test "$env_block")"
-has "$UNIT" 'ExecStart="/p/runtime/current/lucidos-gateway"' && pass "ExecStart = the shared gateway (quoted word)" || fail "ExecStart wrong"
+if has "$UNIT" 'ExecStart="/p/runtime/current/lucidos-gateway"'; then pass "ExecStart = the shared gateway (quoted word)"; else fail "ExecStart wrong"; fi
 n="$(printf '%s\n' "$UNIT" | grep -c '^ExecStart=')"
-[ "$n" = "1" ] && pass "exactly one ExecStart (gateway only)" || fail "ExecStart count: $n"
-has "$UNIT" 'Environment="LUCIDOS_API_PORT=5252"' && pass "Environment= rendered" || fail "Environment missing"
-has "$UNIT" "WorkingDirectory=/p/test" && pass "WorkingDirectory = the instance data dir" || fail "WorkingDirectory missing"
-has "$UNIT" "Restart=always" && pass "Restart=always (KeepAlive parity)" || fail "Restart missing"
-has "$UNIT" "KillSignal=SIGUSR1" && pass "KillSignal=SIGUSR1 (gateway ignores SIGTERM)" || fail "KillSignal missing"
-has "$UNIT" "KillMode=process" && pass "KillMode=process (leave engines+PG for re-adoption)" || fail "KillMode missing"
-has "$UNIT" "WantedBy=default.target" && pass "WantedBy=default.target (starts at login)" || fail "WantedBy missing"
+if [ "$n" = "1" ]; then pass "exactly one ExecStart (gateway only)"; else fail "ExecStart count: $n"; fi
+if has "$UNIT" 'Environment="LUCIDOS_API_PORT=5252"'; then pass "Environment= rendered"; else fail "Environment missing"; fi
+if has "$UNIT" "WorkingDirectory=/p/test"; then pass "WorkingDirectory = the instance data dir"; else fail "WorkingDirectory missing"; fi
+if has "$UNIT" "Restart=always"; then pass "Restart=always (KeepAlive parity)"; else fail "Restart missing"; fi
+if has "$UNIT" "KillSignal=SIGUSR1"; then pass "KillSignal=SIGUSR1 (gateway ignores SIGTERM)"; else fail "KillSignal missing"; fi
+if has "$UNIT" "KillMode=process"; then pass "KillMode=process (leave engines+PG for re-adoption)"; else fail "KillMode missing"; fi
+if has "$UNIT" "WantedBy=default.target"; then pass "WantedBy=default.target (starts at login)"; else fail "WantedBy missing"; fi
 
 # ── PURE: systemd escaping — env values round-trip through the unit parser ────
 echo ""
 echo "test: service_systemd_escape_env doubles % and backslash-escapes quotes/backslashes"
-[ "$(service_systemd_escape_env 'KEY=ab%cd')" = 'KEY=ab%%cd' ] && pass "% doubled (specifier expansion defused)" || fail "%: $(service_systemd_escape_env 'KEY=ab%cd')"
-[ "$(service_systemd_escape_env 'KEY=a"b')" = 'KEY=a\"b' ] && pass "quote escaped" || fail "quote: $(service_systemd_escape_env 'KEY=a"b')"
-[ "$(service_systemd_escape_env 'KEY=a\b')" = 'KEY=a\\b' ] && pass "backslash escaped" || fail "backslash: $(service_systemd_escape_env 'KEY=a\b')"
-[ "$(service_systemd_escape_env 'KEY=plain')" = 'KEY=plain' ] && pass "plain value untouched" || fail "plain: $(service_systemd_escape_env 'KEY=plain')"
+if [ "$(service_systemd_escape_env 'KEY=ab%cd')" = 'KEY=ab%%cd' ]; then pass "% doubled (specifier expansion defused)"; else fail "%: $(service_systemd_escape_env 'KEY=ab%cd')"; fi
+if [ "$(service_systemd_escape_env 'KEY=a"b')" = 'KEY=a\"b' ]; then
+    pass "quote escaped"
+else
+    fail "quote: $(service_systemd_escape_env 'KEY=a"b')"
+fi
+if [ "$(service_systemd_escape_env 'KEY=a\b')" = 'KEY=a\\b' ]; then pass "backslash escaped"; else fail "backslash: $(service_systemd_escape_env 'KEY=a\b')"; fi
+if [ "$(service_systemd_escape_env 'KEY=plain')" = 'KEY=plain' ]; then pass "plain value untouched"; else fail "plain: $(service_systemd_escape_env 'KEY=plain')"; fi
 echo ""
 echo "test: systemd unit escapes hostile env values, ExecStart, and WorkingDirectory"
 HOSTILE_ENV='OPENAI_API_KEY=sk-10%off"then\some'
 UNIT2="$(service_systemd_unit '/p/50% full/lucidos-gateway' '/p/50% full/test' "$HOSTILE_ENV")"
-has "$UNIT2" 'Environment="OPENAI_API_KEY=sk-10%%off\"then\\some"' && pass "hostile env value escaped in Environment=" || fail "hostile env: $UNIT2"
-has "$UNIT2" 'ExecStart="/p/50%% full/lucidos-gateway"' && pass "ExecStart %-escaped + quoted" || fail "ExecStart escape: $UNIT2"
-has "$UNIT2" 'WorkingDirectory=/p/50%% full/test' && pass "WorkingDirectory %-escaped" || fail "workdir escape: $UNIT2"
+if has "$UNIT2" 'Environment="OPENAI_API_KEY=sk-10%%off\"then\\some"'; then pass "hostile env value escaped in Environment="; else fail "hostile env: $UNIT2"; fi
+if has "$UNIT2" 'ExecStart="/p/50%% full/lucidos-gateway"'; then pass "ExecStart %-escaped + quoted"; else fail "ExecStart escape: $UNIT2"; fi
+if has "$UNIT2" 'WorkingDirectory=/p/50%% full/test'; then pass "WorkingDirectory %-escaped"; else fail "workdir escape: $UNIT2"; fi
 
 # ── PURE: uninstall purge target = the instance data dir ─────────────────────
 echo ""
 echo "test: service_uninstall_purge_targets = the instance data dir"
-[ "$(service_uninstall_purge_targets /home/u/.lucidos/test)" = "/home/u/.lucidos/test" ] && pass "purge target = <data>" || fail "purge target: $(service_uninstall_purge_targets /home/u/.lucidos/test)"
+if [ "$(service_uninstall_purge_targets /home/u/.lucidos/test)" = "/home/u/.lucidos/test" ]; then pass "purge target = <data>"; else fail "purge target: $(service_uninstall_purge_targets /home/u/.lucidos/test)"; fi
 
 # ── OFFLINE FS: service_list_instance_names lists slugs (port marker), skips runtime ─
 echo ""
@@ -270,7 +277,7 @@ LP="$(mktemp -d)"
 mkdir -p "$LP/default" "$LP/test" "$LP/runtime" "$LP/nomarker"
 : > "$LP/default/port"; : > "$LP/test/port"   # only these are registered instances
 listing="$(service_list_instance_names "$LP" | sort | tr '\n' ' ')"
-[ "$listing" = "default test " ] && pass "lists default + test, skips runtime + markerless dirs" || fail "listing: '$listing'"
+if [ "$listing" = "default test " ]; then pass "lists default + test, skips runtime + markerless dirs"; else fail "listing: '$listing'"; fi
 rm -rf "$LP"
 
 # ── PURE: effectful wrappers exist (side effects isolated in thin wrappers) ───
@@ -279,7 +286,7 @@ echo "test: effectful wrappers are defined"
 for fn in service_detect_manager service_port_in_use service_list_instance_names service_write_file \
           service_launchd_load service_launchd_unload service_systemd_load service_systemd_unload \
           service_health_wait service_stop_embedded_runtime; do
-    type "$fn" >/dev/null 2>&1 && pass "$fn defined" || fail "$fn missing"
+    if type "$fn" >/dev/null 2>&1; then pass "$fn defined"; else fail "$fn missing"; fi
 done
 
 # ── INTEGRATION: --no-service → FOREGROUND launch (no registration) ──────────
@@ -296,7 +303,7 @@ if [ $rc -eq 0 ] && has "$out" "FOREGROUND" && has "$out" "--no-service"; then
 else
     fail "expected a foreground launch (rc=$rc): $out"
 fi
-[ -z "$(ls "$FAKEHOME/Library/LaunchAgents/" 2>/dev/null)" ] && pass "no launchd plist written under --no-service" || fail "a plist was written under --no-service"
+if [ -z "$(ls "$FAKEHOME/Library/LaunchAgents/" 2>/dev/null)" ]; then pass "no launchd plist written under --no-service"; else fail "a plist was written under --no-service"; fi
 rm -rf "$PREFIX" "$FAKEHOME"
 
 # ── INTEGRATION: no service manager → graceful degrade to FOREGROUND ──────────
@@ -311,7 +318,7 @@ if [ $rc -eq 0 ] && has "$out" "No supported user service manager" && has "$out"
 else
     fail "expected a no-manager degrade to foreground (rc=$rc): $out"
 fi
-[ -z "$(ls "$FAKEHOME/Library/LaunchAgents/" 2>/dev/null)" ] && pass "no plist written on the degrade path" || fail "a plist was written on the degrade path"
+if [ -z "$(ls "$FAKEHOME/Library/LaunchAgents/" 2>/dev/null)" ]; then pass "no plist written on the degrade path"; else fail "a plist was written on the degrade path"; fi
 rm -rf "$FB" "$PREFIX" "$FAKEHOME"
 
 # ── INTEGRATION: register wiring (fake launchctl + fast health timeout) ───────
@@ -326,14 +333,17 @@ PREFIX="$(mktemp -d)"; FAKEHOME="$(mktemp -d)"; DATA="$PREFIX/reg"
 out="$(PATH="$FB:$PATH" HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA="$DATA" LUCIDOS_HEALTH_TIMEOUT=1 \
         bash "$INSTALL" --from-tarball "$TARBALL" --prefix "$PREFIX" --name reg --port 59231 2>&1)"; rc=$?
 PLIST="$FAKEHOME/Library/LaunchAgents/com.lucidos.gateway.reg.plist"
-[ -f "$PLIST" ] && pass "wrote the slug-keyed LaunchAgent plist" || fail "no plist at $PLIST: $out"
+if [ -f "$PLIST" ]; then pass "wrote the slug-keyed LaunchAgent plist"; else fail "no plist at $PLIST: $out"; fi
 if [ -f "$PLIST" ]; then
-    has "$(cat "$PLIST")" "<string>$PREFIX/runtime/current/lucidos-gateway</string>" \
-        && pass "plist ProgramArguments points at the SHARED runtime" || fail "plist not pointing at shared runtime"
-    has "$(cat "$PLIST")" "<string>59231</string>" && pass "plist carries the chosen port 59231" || fail "plist missing port"
+    if has "$(cat "$PLIST")" "<string>$PREFIX/runtime/current/lucidos-gateway</string>"; then
+        pass "plist ProgramArguments points at the SHARED runtime"
+    else
+        fail "plist not pointing at shared runtime"
+    fi
+    if has "$(cat "$PLIST")" "<string>59231</string>"; then pass "plist carries the chosen port 59231"; else fail "plist missing port"; fi
 fi
-[ -f "$DATA/port" ] && [ "$(cat "$DATA/port")" = "59231" ] && pass "recorded the instance port marker (59231)" || fail "port marker missing/wrong"
-has "$out" "did not answer" && pass "health check failed loud when no gateway came up" || fail "expected a loud health failure: $out"
+if [ -f "$DATA/port" ] && [ "$(cat "$DATA/port")" = "59231" ]; then pass "recorded the instance port marker (59231)"; else fail "port marker missing/wrong"; fi
+if has "$out" "did not answer"; then pass "health check failed loud when no gateway came up"; else fail "expected a loud health failure: $out"; fi
 rm -rf "$FB" "$PREFIX" "$FAKEHOME" "$REL"
 
 # ── INTEGRATION: --tls-cert/--tls-key bake TLS into the service env (https) ───
@@ -348,13 +358,16 @@ out="$(PATH="$FB:$PATH" HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA="$DATA" LUCIDOS_HE
         --tls-cert "$CERTS/host.crt" --tls-key "$CERTS/host.key" 2>&1)"; rc=$?
 PLIST="$FAKEHOME/Library/LaunchAgents/com.lucidos.gateway.tlsreg.plist"
 if [ -f "$PLIST" ]; then
-    has "$(cat "$PLIST")" "<key>LUCIDOS_TLS_CERT</key>" && has "$(cat "$PLIST")" "<string>$CERTS/host.crt</string>" \
-        && pass "plist carries LUCIDOS_TLS_CERT" || fail "plist missing TLS cert: $(cat "$PLIST")"
-    has "$(cat "$PLIST")" "<key>LUCIDOS_TLS_KEY</key>" && pass "plist carries LUCIDOS_TLS_KEY" || fail "plist missing TLS key"
+    if has "$(cat "$PLIST")" "<key>LUCIDOS_TLS_CERT</key>" && has "$(cat "$PLIST")" "<string>$CERTS/host.crt</string>"; then
+        pass "plist carries LUCIDOS_TLS_CERT"
+    else
+        fail "plist missing TLS cert: $(cat "$PLIST")"
+    fi
+    if has "$(cat "$PLIST")" "<key>LUCIDOS_TLS_KEY</key>"; then pass "plist carries LUCIDOS_TLS_KEY"; else fail "plist missing TLS key"; fi
 else
     fail "no plist at $PLIST: $out"
 fi
-has "$out" "https://localhost:59233" && pass "health failure message names the https URL" || fail "expected an https health URL in: $out"
+if has "$out" "https://localhost:59233"; then pass "health failure message names the https URL"; else fail "expected an https health URL in: $out"; fi
 rm -rf "$FB" "$PREFIX" "$FAKEHOME" "$REL" "$CERTS"
 
 # ── INTEGRATION: TLS flags are both-or-neither + files must exist ─────────────
@@ -365,13 +378,19 @@ PREFIX="$(mktemp -d)"; FAKEHOME="$(mktemp -d)"
 out="$(HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA='' \
         bash "$INSTALL" --from-tarball "$TARBALL" --prefix "$PREFIX" --no-launch \
         --tls-cert /tmp/only-cert.pem 2>&1)"; rc=$?
-[ $rc -ne 0 ] && has "$out" "supplied together" && pass "refused --tls-cert without --tls-key" \
-    || fail "expected a both-or-neither refusal (rc=$rc): $out"
+if [ $rc -ne 0 ] && has "$out" "supplied together"; then
+    pass "refused --tls-cert without --tls-key"
+else
+    fail "expected a both-or-neither refusal (rc=$rc): $out"
+fi
 out="$(HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA='' \
         bash "$INSTALL" --from-tarball "$TARBALL" --prefix "$PREFIX" --no-launch \
         --tls-cert /nonexistent/host.crt --tls-key /nonexistent/host.key 2>&1)"; rc=$?
-[ $rc -ne 0 ] && has "$out" "file not found" && pass "refused a missing cert file" \
-    || fail "expected a missing-file refusal (rc=$rc): $out"
+if [ $rc -ne 0 ] && has "$out" "file not found"; then
+    pass "refused a missing cert file"
+else
+    fail "expected a missing-file refusal (rc=$rc): $out"
+fi
 rm -rf "$REL" "$PREFIX" "$FAKEHOME"
 
 # ── INTEGRATION: install.sh rejects a reserved --name (slug validation wired in) ─
@@ -388,7 +407,7 @@ if [ $rc -ne 0 ] && has "$out" "reserved name"; then
 else
     fail "expected a reserved-slug refusal (rc=$rc): $out"
 fi
-[ -z "$(ls "$FAKEHOME/Library/LaunchAgents/" 2>/dev/null)" ] && pass "nothing registered for a rejected slug" || fail "a plist was written for a rejected slug"
+if [ -z "$(ls "$FAKEHOME/Library/LaunchAgents/" 2>/dev/null)" ]; then pass "nothing registered for a rejected slug"; else fail "a plist was written for a rejected slug"; fi
 rm -rf "$REL" "$PREFIX" "$FAKEHOME"
 
 # ── INTEGRATION: two instances installed via install.sh coexist ───────────────
@@ -408,17 +427,29 @@ PATH="$FB:$PATH" HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA='' LUCIDOS_HEALTH_TIMEOUT
     bash "$INSTALL" --from-tarball "$TARBALL" --prefix "$PREFIX" --name beta --port 59242 >/dev/null 2>&1 || true
 PA="$FAKEHOME/Library/LaunchAgents/com.lucidos.gateway.alpha.plist"
 PB="$FAKEHOME/Library/LaunchAgents/com.lucidos.gateway.beta.plist"
-[ -f "$PA" ] && [ -f "$PB" ] && pass "distinct slug-suffixed plists (alpha + beta)" \
-    || fail "missing a per-instance plist (alpha=$([ -f "$PA" ] && echo y || echo n) beta=$([ -f "$PB" ] && echo y || echo n))"
-[ -d "$PREFIX/alpha" ] && [ -d "$PREFIX/beta" ] && pass "distinct per-instance data dirs" \
-    || fail "missing a per-instance data dir"
+if [ -f "$PA" ] && [ -f "$PB" ]; then
+    pass "distinct slug-suffixed plists (alpha + beta)"
+else
+    fail "missing a per-instance plist (alpha=$([ -f "$PA" ] && echo y || echo n) beta=$([ -f "$PB" ] && echo y || echo n))"
+fi
+if [ -d "$PREFIX/alpha" ] && [ -d "$PREFIX/beta" ]; then
+    pass "distinct per-instance data dirs"
+else
+    fail "missing a per-instance data dir"
+fi
 pa="$(tr -d '[:space:]' < "$PREFIX/alpha/port" 2>/dev/null || true)"
 pb="$(tr -d '[:space:]' < "$PREFIX/beta/port" 2>/dev/null || true)"
-[ "$pa" = "59241" ] && [ "$pb" = "59242" ] && [ "$pa" != "$pb" ] && pass "distinct port markers (alpha=59241, beta=59242)" \
-    || fail "port markers wrong (alpha='$pa' beta='$pb')"
-runtime_trees="$(ls -d "$PREFIX"/runtime/lucidos-* 2>/dev/null | wc -l | tr -d ' ')"
-[ -L "$PREFIX/runtime/current" ] && [ "$runtime_trees" = "1" ] \
-    && pass "ONE shared runtime extracted (current symlink + single runtime tree)" || fail "expected a single shared runtime (trees=$runtime_trees)"
+if [ "$pa" = "59241" ] && [ "$pb" = "59242" ] && [ "$pa" != "$pb" ]; then
+    pass "distinct port markers (alpha=59241, beta=59242)"
+else
+    fail "port markers wrong (alpha='$pa' beta='$pb')"
+fi
+runtime_trees="$(find "$PREFIX/runtime" -maxdepth 1 -name 'lucidos-*' 2>/dev/null | wc -l | tr -d ' ')"
+if [ -L "$PREFIX/runtime/current" ] && [ "$runtime_trees" = "1" ]; then
+    pass "ONE shared runtime extracted (current symlink + single runtime tree)"
+else
+    fail "expected a single shared runtime (trees=$runtime_trees)"
+fi
 if has "$(cat "$PA")" "<string>$PREFIX/runtime/current/lucidos-gateway</string>" \
     && has "$(cat "$PB")" "<string>$PREFIX/runtime/current/lucidos-gateway</string>"; then
     pass "both instances' services point at the shared runtime gateway"
@@ -443,7 +474,7 @@ if [ $rc -ne 0 ] && has "$out" "--bind must be"; then
 else
     fail "expected a --bind refusal (rc=$rc): $out"
 fi
-[ -e "$FAKEHOME/.lucidos/network.toml" ] && fail "network.toml written despite refusal/--no-launch" || pass "no network.toml side effect on refusal"
+if [ -e "$FAKEHOME/.lucidos/network.toml" ]; then fail "network.toml written despite refusal/--no-launch"; else pass "no network.toml side effect on refusal"; fi
 
 echo ""
 echo "test: a TLS install bakes the pair into the service env and probes https"
@@ -457,7 +488,7 @@ if [ -f "$PLIST" ] && has "$(cat "$PLIST")" "<key>LUCIDOS_TLS_CERT</key>" && has
 else
     fail "TLS env missing from the plist: $(cat "$PLIST" 2>/dev/null)"
 fi
-has "$out" "https://localhost:59251" && pass "health/banner URLs use https for a TLS install" || fail "expected https URLs in output: $out"
+if has "$out" "https://localhost:59251"; then pass "health/banner URLs use https for a TLS install"; else fail "expected https URLs in output: $out"; fi
 rm -rf "$FB"
 
 echo ""
@@ -492,7 +523,7 @@ if [ $rc -eq 0 ] && has "$out" "default" && has "$out" "5252" && has "$out" "tes
 else
     fail "expected a listing of default+test (rc=$rc): $out"
 fi
-has "$out" "runtime" && fail "--list should not show the shared runtime as an instance" || pass "--list skips the shared runtime"
+if has "$out" "runtime"; then fail "--list should not show the shared runtime as an instance"; else pass "--list skips the shared runtime"; fi
 rm -rf "$FB" "$PREFIX" "$FAKEHOME"
 
 # ── INTEGRATION: uninstall --help documents --purge + data-safety ────────────
@@ -500,7 +531,7 @@ echo ""
 echo "test: uninstall.sh --help documents --name/--all/--purge and the data-safe default"
 out="$(bash "$UNINSTALL" --help 2>&1)"
 for tok in --name --all --list --purge "KEEP data"; do
-    has "$out" "$tok" && pass "uninstall --help documents '$tok'" || fail "uninstall --help missing '$tok'"
+    if has "$out" "$tok"; then pass "uninstall --help documents '$tok'"; else fail "uninstall --help missing '$tok'"; fi
 done
 
 # ── INTEGRATION: uninstall --name (no --purge) keeps data ────────────────────
@@ -578,8 +609,8 @@ if [ $rc -eq 0 ] && [ ! -e "$UNITF" ]; then
 else
     fail "expected the unit file gone (rc=$rc, present=$([ -e "$UNITF" ] && echo y || echo n)): $out"
 fi
-has "$out" "session unreachable" && pass "warned that a running service can't be stopped from here" || fail "missing the unreachable-bus warning: $out"
-[ -d "$PREFIX/test" ] && pass "instance data kept (no --purge)" || fail "data deleted without --purge"
+if has "$out" "session unreachable"; then pass "warned that a running service can't be stopped from here"; else fail "missing the unreachable-bus warning: $out"; fi
+if [ -d "$PREFIX/test" ]; then pass "instance data kept (no --purge)"; else fail "data deleted without --purge"; fi
 rm -rf "$FB" "$PREFIX" "$FAKEHOME"
 
 # ── INTEGRATION: install.sh --uninstall delegates to uninstall.sh ─────────────

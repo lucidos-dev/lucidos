@@ -104,6 +104,9 @@ mod notifications_presence_test;
 #[path = "api_support/credentials_test.rs"]
 mod credentials_test;
 
+#[path = "api_support/models_test.rs"]
+mod models_test;
+
 #[path = "api_support/backup_key_test.rs"]
 mod backup_key_test;
 

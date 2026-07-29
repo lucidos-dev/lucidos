@@ -45,6 +45,14 @@ export function normalizeBasePath(href: string): string {
  *  the picker, `''` at a legacy root. Computed once at module load. */
 export const BASE_PATH: string = normalizeBasePath(baseHref());
 
+/** Single source of truth for the HTTP API prefix — every fetch builds onto
+ *  `${API}/…` so the version is stamped exactly once. See CLAUDE.md "API URL
+ *  Conventions". It lives here, next to `BASE_PATH`, rather than in
+ *  `api/client/_core` so that leaf modules can reach the API without pulling in
+ *  the store (`_core` imports `engineRestarting`); `_core` re-exports it, so
+ *  `import { API } from './client'` keeps working everywhere. */
+export const API = `${BASE_PATH}/api/v1`;
+
 /** True when this bundle is the gateway's picker context (`<base href="/~/">`).
  *  `main.tsx` renders the picker iff this is set. */
 export const IS_PICKER: boolean = BASE_PATH === `/${SIGIL}`;

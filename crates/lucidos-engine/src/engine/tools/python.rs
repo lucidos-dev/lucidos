@@ -60,7 +60,14 @@ impl LucidosEngine {
                     if let Some(parent) = dst.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    std::fs::copy(&src, &dst)?;
+                    commit_staged_file(&src, &dst).map_err(|e| {
+                        format!(
+                            "Failed to commit staged file {} -> {}: {}",
+                            src.display(),
+                            dst.display(),
+                            e
+                        )
+                    })?;
                 }
 
                 let all_paths: Vec<String> =
@@ -125,7 +132,7 @@ impl LucidosEngine {
     ///   multi-hour backtest produces 100 MB of CSVs. Callers commit
     ///   explicitly via `run_bash_background` if they want git history.
     /// - **Reuses `BackgroundBashStarted`/`BackgroundBashCompleted` events.**
-    ///   The spawn really is `/bin/sh -c "python <script>"`, so the bash
+    ///   The spawn really is `bash -o pipefail -c "python <script>"`, so the bash
     ///   audit-trail rows are accurate; the `command` field captures the
     ///   exact python invocation. Adding parallel `BackgroundPython*`
     ///   events would duplicate the registry, the watcher, and the
@@ -179,7 +186,7 @@ impl LucidosEngine {
         if let Err(e) = std::fs::create_dir_all(&script_dir) {
             return Err(format!(
                 "Error: failed to create script staging dir {}: {}",
-                script_dir.display(),
+                crate::core::home_path::abbreviate(&script_dir),
                 e
             ));
         }
@@ -187,7 +194,7 @@ impl LucidosEngine {
         if let Err(e) = std::fs::write(&script_path, code) {
             return Err(format!(
                 "Error: failed to write script to {}: {}",
-                script_path.display(),
+                crate::core::home_path::abbreviate(&script_path),
                 e
             ));
         }
@@ -306,8 +313,51 @@ impl LucidosEngine {
     }
 }
 
-/// Shell-quote a path for safe inclusion in a `/bin/sh -c "<cmd>"` string.
-/// The background bash registry hands commands to `sh -c`, so the python
+/// Publish one staged file onto its real `data/` destination without letting
+/// the staging copy's permission bits become the destination's.
+///
+/// `std::fs::copy` copies the SOURCE's mode onto the destination, so the mode
+/// of a long-lived `data/` file would be decided by whatever the staging tree
+/// happened to carry — a `run_python` script that writes through
+/// `tempfile.mkstemp()` (0600) or `os.open(..., 0o600)` silently re-modes the
+/// real file, and the next writer (an app, another agent, a different identity)
+/// finds itself locked out of a file it could write yesterday. The mode of an
+/// existing file is that file's property, not the temp copy's.
+///
+/// - **Destination exists** → its current mode is restored after the copy.
+/// - **Destination is new** → the mode is whatever the OS gives a normally
+///   created file (`0o666 & ~umask`), obtained by creating it the ordinary way
+///   and reading the mode back, rather than by poking the process-global umask
+///   (which would briefly change it for every other thread).
+///
+/// Non-Unix targets have no POSIX mode bits, so there the copy is all there is
+/// (see the `cfg(not(unix))` twin below).
+#[cfg(unix)]
+fn commit_staged_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // Mask to the permission bits: `mode()` also carries the file-type bits
+    // (S_IFREG), which `chmod` does not accept as meaningful input.
+    const PERM_BITS: u32 = 0o7777;
+    let intended_mode = match std::fs::metadata(dst) {
+        Ok(meta) => meta.permissions().mode() & PERM_BITS,
+        Err(_) => {
+            std::fs::File::create(dst)?;
+            std::fs::metadata(dst)?.permissions().mode() & PERM_BITS
+        }
+    };
+    std::fs::copy(src, dst)?;
+    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(intended_mode))
+}
+
+/// Non-Unix twin of [`commit_staged_file`]: no POSIX mode bits to preserve.
+#[cfg(not(unix))]
+fn commit_staged_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::copy(src, dst).map(|_| ())
+}
+
+/// Shell-quote a path for safe inclusion in the `-c "<cmd>"` string the
+/// engine shell runs (see `core::shell`). The background bash registry hands
+/// commands to that shell with `-c`, so the python
 /// invocation `run_python_background` builds must be parseable by the shell
 /// even when the workspace path contains spaces or other metacharacters.
 /// Standard POSIX trick: wrap in single quotes; if the value itself contains
@@ -321,7 +371,7 @@ fn sh_quote(path: &std::path::Path) -> String {
     }
 }
 
-/// Build the `/bin/sh -c` payload `BackgroundBashRegistry::spawn` will
+/// Build the `-c` payload `BackgroundBashRegistry::spawn` will
 /// execute for a `run_python_background` call. The venv-rooted python
 /// interpreter is invoked with the staged script path; both are sh-quoted
 /// so workspace paths containing spaces don't shell-split.
@@ -334,12 +384,78 @@ fn build_python_background_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_python_background_command, sh_quote};
+    use super::{build_python_background_command, commit_staged_file, sh_quote};
+    use crate::core::shell::TaskOutcome;
     use crate::engine::tools::bash_background::BackgroundBashRegistry;
     use crate::runtime::python::PythonRuntime;
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn write_with_mode(path: &std::path::Path, contents: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, contents).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_staged_file_keeps_the_existing_destination_mode() {
+        // The regression this pins: `std::fs::copy` copies the SOURCE's mode
+        // onto the destination, so a staged file written via mkstemp (0600)
+        // would silently re-mode a 0644 data file and lock out the next writer.
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("staged.json");
+        let dst = tmp.path().join("data.json");
+        write_with_mode(&dst, "{\"old\":true}", 0o644);
+        write_with_mode(&src, "{\"new\":true}", 0o600);
+
+        commit_staged_file(&src, &dst).unwrap();
+
+        assert_eq!(mode_of(&dst), 0o644, "destination mode must survive a commit");
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "{\"new\":true}");
+        assert_eq!(mode_of(&src), 0o600, "the staged copy is left alone");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_staged_file_gives_a_new_file_a_umask_respecting_mode() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("staged.txt");
+        let dst = tmp.path().join("brand-new.txt");
+        write_with_mode(&src, "hello", 0o600);
+
+        // Oracle: the mode a plain `fs::write` gets under THIS process's umask
+        // — that's the mode a new data file should end up with, whatever the
+        // umask happens to be on the machine running the test.
+        let reference = tmp.path().join("reference.txt");
+        std::fs::write(&reference, "x").unwrap();
+        let expected = mode_of(&reference);
+
+        commit_staged_file(&src, &dst).unwrap();
+
+        assert_eq!(mode_of(&dst), expected, "a new file follows the umask");
+        // Readable restatement of the regression for the common case. Guarded,
+        // because under a restrictive umask (077) the umask-CORRECT answer is
+        // itself 0600 — an unconditional assert_ne! would fail on a hardened
+        // machine while the implementation was behaving exactly as specified.
+        // The equality above is the assertion that holds under every umask.
+        if expected != 0o600 {
+            assert_ne!(
+                mode_of(&dst),
+                0o600,
+                "a new file must not inherit the staged copy's private mode"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "hello");
+    }
 
     #[test]
     fn sh_quote_wraps_plain_path_in_single_quotes() {
@@ -427,8 +543,8 @@ mod tests {
             .await
             .expect("snapshot");
         assert_eq!(
-            snap.exit_code,
-            Some(0),
+            snap.outcome,
+            Some(TaskOutcome::Exited(0)),
             "python invocation failed: stderr={}",
             snap.stderr
         );
@@ -490,7 +606,12 @@ mod tests {
             .read_output_in_memory_wait(&task_id, std::time::Duration::ZERO)
             .await
             .expect("snapshot");
-        assert_eq!(snap.exit_code, Some(0), "stderr: {}", snap.stderr);
+        assert_eq!(
+            snap.outcome,
+            Some(TaskOutcome::Exited(0)),
+            "stderr: {}",
+            snap.stderr
+        );
         assert!(
             snap.stdout.contains("CRED_TEST=secret-value"),
             "stdout did not see CRED_TEST: {}",

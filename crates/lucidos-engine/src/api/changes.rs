@@ -189,16 +189,32 @@ async fn guard_change_action(
     action: crate::engine::thread_lifecycle::Action,
     reject_msg: &str,
 ) -> Result<(), ApiError> {
-    let row: Option<(Option<Uuid>, String)> =
-        sqlx::query_as("SELECT thread_id, status FROM changes WHERE id = $1")
+    let row: Option<(Option<Uuid>, String, i32)> =
+        sqlx::query_as("SELECT thread_id, status, file_count FROM changes WHERE id = $1")
             .bind(change_id)
             .fetch_optional(&state.pool)
             .await
             .map_err(ApiError::db)?;
+    // A pending change with no files left has nothing to apply — merging it
+    // only pushes no-op commits and can spend a harden-at-apply session on an
+    // empty diff. Refused before the thread-state gate so the message names the
+    // real reason, and only for Apply: Discard is how the user resolves one.
+    // See `core::changes::is_empty_pending_change`.
+    if let Some((_, status, file_count)) = row.as_ref() {
+        if status == "pending"
+            && *file_count == 0
+            && action == crate::engine::thread_lifecycle::Action::Apply
+        {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "This change has no file changes left — discard it instead",
+            ));
+        }
+    }
     // Unknown change id, change with no thread, or an already-resolved change:
     // defer to the engine (it returns "Change not found" or handles the
     // idempotent terminal-state retry).
-    let Some((Some(thread_id), status)) = row else {
+    let Some((Some(thread_id), status, _)) = row else {
         return Ok(());
     };
     if status != "pending" {
@@ -289,12 +305,23 @@ pub(super) async fn apply_all_changes(
     // `guard_change_action` gate, so without this it would merge a branch while
     // the coding agent is still producing commits on it — racing the session's
     // next proposal (real thread 76b4ee76).
-    let pending = crate::core::changes::drop_live_thread_changes(&state.pool, all_pending)
+    let live_filtered = crate::core::changes::drop_live_thread_changes(&state.pool, all_pending)
         .await
         .map_err(ApiError::db)?;
-    if pending.is_empty() {
+    if live_filtered.is_empty() {
         return Err(ApiError::bad_request(
             "All pending changes belong to threads that are still working — wait for them to finish, then apply.",
+        ));
+    }
+    // Also drop changes with no files left. The per-change endpoint 409s those
+    // (`guard_change_action`), and Apply All calls `engine.apply_change`
+    // directly — without this filter the bulk path would do what the button
+    // refuses, merging no-op commits and possibly spending a harden run on an
+    // empty diff.
+    let pending = crate::core::changes::drop_empty_changes(live_filtered);
+    if pending.is_empty() {
+        return Err(ApiError::bad_request(
+            "All pending changes have no file changes left — discard them instead.",
         ));
     }
     let change_ids: Vec<Uuid> = pending.iter().map(|c| c.id).collect();

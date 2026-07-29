@@ -11,7 +11,7 @@ A read-only sweep of a Lucidos workspace that reports drift between what's on di
 
 User says "audit the workspace", "check for drift", "what's stale", "is everything still using the right pattern", "scan my apps/triggers". Or after a major change to the SDK / CLI / system prompt where existing content might silently use the old shape.
 
-**Read-only.** Never edit or delete during the audit. The report proposes fixes; the user (or a follow-up session) decides what to apply.
+**Read-only.** Never edit or delete during the audit. The report proposes fixes; the user (or a follow-up session) decides what to apply. This covers *every* mutation, not just the ones the checks below name — no `rmdir`/`rm`, no writing a `.gitignore`, no `git add`/`git commit`, no `run_coding_agent`. If you catch yourself running a mutating command mid-sweep, you have left the recipe: put the fix in the report instead. Remediation, when the user asks for it, has its own rules — see § Remediation.
 
 ## Sources of truth — load these first
 
@@ -194,9 +194,21 @@ lucidos events emit WorkspaceAuditCompleted \
   --payload '{"artifact": "artifacts/audits/<dir>/report.md", "findings": <N>, "broken": <X>, "drift": <Y>, "smell": <Z>}'
 ```
 
+## Remediation — only on request, and only as child threads
+
+The sweep never fixes anything. Fixes happen in a separate step, and only when the user asks for them — either up front ("audit and fix what you can") or after reading the report ("go fix the app theming ones").
+
+When you do spawn fix work:
+
+- **Spawn child threads — omit `relation` (it defaults to `"child"`). Never pass `relation: "top"`.** A child thread reports back: when its session ends, this audit thread automatically resumes with the result, so you can confirm each fix landed, note what didn't, and update the report. The fix threads also nest under the audit in the thread drawer, and each one sitting on a pending change counts as an *attention descendant*, which bubbles the audit thread itself to the Current section — the user follows one row, not N. `relation: "top"` throws all of that away — the spawn records no parent *and* no spawning event, so nothing links the fix back to the audit that asked for it, and the report stays frozen at "suggested fix". The `"top"` wording ("for the user to follow themselves") does **not** cover audit remediation; the user asked for an audit, not for N loose threads.
+  - Only exception: a fix targeting a *different* workspace must use `relation: "top"` — child callbacks don't cross a workspace boundary and the tool refuses the combination. Say so in the report and link the thread, since it won't report back.
+- **One thread per target, spawned in parallel.** Issue the `run_coding_agent` calls in a single response; each reports back independently. Batch per app / per repo, not per finding — a thread that fixes six findings in one `index.html` beats six threads racing on the same file.
+- **A child reporting back means its session ended, not that the fix is live.** Coding-agent work lands as a pending change the user applies. Report it as "proposed", never as "applied" or "live".
+- **Fold the outcomes into the same report.** When the children have reported back, append a `## Remediation` section to the run's existing `report.md` (same timestamped directory) listing target, spawned thread link, and outcome per fix. Don't start a new report — a fresh sweep gets a fresh directory, a remediation pass does not.
+
 ## Out of scope
 
-- **No edits or deletes.** Suggested fixes only.
+- **No edits or deletes during the sweep.** Suggested fixes only; see § Remediation for the ask-first fix path.
 - **No code-style linting** — that's `cargo fmt` / `prettier`.
 - **No `.lucidos/` or `data/postgres/`** (ephemeral / event store, not user content).
 - **No per-file artifact enumeration** — structural rules only.

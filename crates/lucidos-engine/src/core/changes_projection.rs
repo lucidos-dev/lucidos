@@ -20,6 +20,13 @@ const SELECT_CHANGE: &str = "SELECT id, request_id, thread_id, branch_name, repo
      merge_worktree_path, merge_temp_branch, hardened, pre_merge_sha, \
      post_merge_sha, NULL::text AS thread_title, commits, incomplete FROM changes";
 
+/// Event types whose latest occurrence per change decides whether that
+/// change's conflict-resolution pairing is open (`MergeConflictDetected`
+/// latest) or closed (any of the others latest). Shared by the two pairing
+/// queries below so the closing set can't drift between them.
+const MERGE_PAIRING_EVENT_TYPES: &str = "'MergeConflictDetected','MergeResolutionCleared',\
+     'ChangeApplyFailed','ChangeApplied','ChangeDiscarded'";
+
 #[derive(Clone)]
 pub struct ChangesProjection {
     pool: PgPool,
@@ -311,6 +318,93 @@ impl ChangesProjection {
         .bind(thread_id)
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// The thread's in-flight conflict-resolution duty, if any: a pending
+    /// change whose latest merge-lifecycle event is an unpaired
+    /// `MergeConflictDetected` — i.e. a conflict-resolution session was
+    /// started (any tier) and no closing event (`MergeResolutionCleared`,
+    /// `ChangeApplyFailed`, `ChangeApplied`, `ChangeDiscarded`) has landed
+    /// since.
+    ///
+    /// Event-sourced on purpose: the duty survives engine restarts (for the
+    /// Tier-2 shape — the thread's own worktree; a Tier-3 temp-worktree merge
+    /// is instead torn down by the boot-time stale-merge cleanup, whose
+    /// `MergeResolutionCleared` closes the pairing) and every recovery-shaped
+    /// continuation flavor. The completion hand-off
+    /// (`ConflictResolutionCleanupAction::HandOff`) skips the failure emits
+    /// precisely so this pairing stays open for the continuation to find;
+    /// a real abort emits the closing pair, which makes this return `None`.
+    ///
+    /// When more than one pairing is open (an older one stranded by a crash),
+    /// the NEWEST wins — the continuation that just fired belongs to the most
+    /// recently started merge, and binding the oldest would ff-merge the
+    /// wrong change on a clean turn end.
+    pub async fn pending_conflict_change_for_thread(
+        &self,
+        thread_id: Uuid,
+    ) -> sqlx::Result<Option<Change>> {
+        // One query: latest merge-lifecycle event per change_id on this
+        // thread, keeping only ids whose latest is MergeConflictDetected,
+        // newest pairing first.
+        let open_ids: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT change_id FROM ( \
+                SELECT DISTINCT ON (payload->>'change_id') \
+                       payload->>'change_id' AS change_id, event_type, sequence \
+                FROM events \
+                WHERE aggregate_id = $1 \
+                  AND payload->>'change_id' IS NOT NULL \
+                  AND event_type IN ({MERGE_PAIRING_EVENT_TYPES}) \
+                ORDER BY payload->>'change_id', sequence DESC \
+             ) latest \
+             WHERE event_type = 'MergeConflictDetected' \
+             ORDER BY sequence DESC"
+        ))
+        .bind(thread_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        for id in open_ids {
+            let Ok(change_id) = Uuid::parse_str(&id) else {
+                continue;
+            };
+            if let Some(change) = self.get_by_id(change_id).await? {
+                if change.status == "pending" {
+                    return Ok(Some(change));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Change-scoped twin of [`Self::pending_conflict_change_for_thread`]:
+    /// is THIS change's conflict-resolution pairing still open (and the row
+    /// still pending)? Callers that already know the change (the Tier-2
+    /// apply result path, the Continue consumer's failure backstop) use this
+    /// instead of the thread-scoped lookup so an unrelated open pairing on
+    /// the same thread can't mislabel their change.
+    pub async fn conflict_pairing_open(
+        &self,
+        thread_id: Uuid,
+        change_id: Uuid,
+    ) -> sqlx::Result<bool> {
+        let latest: Option<String> = sqlx::query_scalar(&format!(
+            "SELECT event_type FROM events \
+             WHERE aggregate_id = $1 \
+               AND payload->>'change_id' = $2 \
+               AND event_type IN ({MERGE_PAIRING_EVENT_TYPES}) \
+             ORDER BY sequence DESC LIMIT 1"
+        ))
+        .bind(thread_id.to_string())
+        .bind(change_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        if latest.as_deref() != Some("MergeConflictDetected") {
+            return Ok(false);
+        }
+        Ok(self
+            .get_by_id(change_id)
+            .await?
+            .is_some_and(|c| c.status == "pending"))
     }
 
     /// Whether any pending change exists for the given branch.

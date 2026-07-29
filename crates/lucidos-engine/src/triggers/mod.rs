@@ -3,6 +3,7 @@ pub mod config;
 pub mod definition;
 pub mod groups;
 pub mod replay;
+pub mod run_history;
 pub mod summary;
 
 pub use config::{
@@ -14,6 +15,7 @@ pub use groups::{
     find_group_by_name_ci, replay_trigger_group_events, TriggerGroup, TriggerGroupEventRow,
 };
 pub use replay::{replay_trigger_events, TriggerEventRow};
+pub use run_history::{load_trigger_run_history, TriggerRunHistory};
 
 use std::collections::HashMap;
 

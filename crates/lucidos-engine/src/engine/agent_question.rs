@@ -13,6 +13,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::engine::agent_recovery::ANSWERED_AFTER_IDLE_REASON;
+use crate::engine::chat::rerun::ChatResumeAnchor;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{
     AnswerKind, EventChannel, EventMeta, MessageOrigin, QuestionOption, ThreadEvent,
@@ -797,7 +798,24 @@ pub async fn answer_pending_question(
     // `QuestionWaitRegistry`, gets woken below, and returns the answer as
     // a tool_result on the same turn. Skip both for chat-channel answers.
     if !should_emit_cc_resume_side_effects(original_channel) {
-        notify_and_release_waiter(engine, &tool_use_id, &answer).await;
+        let had_waiter = notify_and_release_waiter(engine, &tool_use_id, &answer).await;
+        // No live in-process loop means the engine restarted while the card was
+        // on screen (the chat `ask_user_question` blocks the loop on the wait
+        // registry; a restart drops it). Re-enter the loop so answering RESUMES
+        // the thread — the chat parity of CC's `--resume`. With a live loop the
+        // notify already woke the blocked tool, which returns the answer on the
+        // same turn. `Canceled` is a teardown sentinel (archive/stop), never a
+        // resume.
+        if !had_waiter && !matches!(answer, AnswerKind::Canceled) {
+            // Resume on the ORIGINATING channel — this branch runs for both
+            // `Chat` and `Trigger` questions (both skip CC side effects), so a
+            // restart-preserved trigger question must resume as `Trigger`, not
+            // be misclassified as chat. `answer_channel` is the persisted
+            // question's channel (Chat or Trigger here; the CC/None case took
+            // the branch below).
+            resume_chat_after_answer(engine, thread_id, &tool_use_id, answer_channel, actor.clone())
+                .await;
+        }
         return AnswerResult::Resumed;
     }
 
@@ -842,12 +860,17 @@ pub async fn answer_pending_question(
 /// was on screen — the dropped handler never reaches its own `forget`;
 /// without this, every cancel-stamped question leaked one entry until
 /// engine restart).
+///
+/// Returns whether a LIVE in-process waiter received the wake. The chat
+/// answer path uses `false` (no live loop — the process restarted while the
+/// card was on screen) to decide it must re-enter the agentic loop rather
+/// than rely on the in-memory wake.
 async fn notify_and_release_waiter(
     engine: &Arc<LucidosEngine>,
     tool_use_id: &str,
     answer: &AnswerKind,
-) {
-    engine
+) -> bool {
+    let had_waiter = engine
         .question_wait_registry
         .notify(
             tool_use_id,
@@ -857,6 +880,191 @@ async fn notify_and_release_waiter(
         )
         .await;
     engine.question_wait_registry.forget(tool_use_id).await;
+    had_waiter
+}
+
+/// The `ask_user_question` tool call a restart interrupted — the most recent
+/// one on the thread, read back out of the event store by
+/// [`lookup_interrupted_ask`].
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct InterruptedAsk {
+    /// The `ToolCalled` event id. Pairs the synthetic `ToolResult` back to the
+    /// call so the timeline (and the resume reconstruction) sees a complete
+    /// tool_use/tool_result pair instead of a dangling call.
+    #[sqlx(rename = "id")]
+    pub(crate) call_event_id: Uuid,
+    /// The `questions` array the tool was called with — `build_hook_answers`
+    /// needs it to turn persisted `option_id`s back into labels.
+    pub(crate) questions: serde_json::Value,
+    /// The asking turn's `request_event_id` — the resume anchor. `None` only on
+    /// legacy rows persisted before the loop stamped it.
+    pub(crate) request_event_id: Option<Uuid>,
+}
+
+/// Most recent `ToolCalled{ask_user_question}` on `thread_id`, or `None` when
+/// the thread has none (a coding-agent question never emits one — CC/Codex use
+/// `CodingAgentToolCalled` — and neither does a hand-seeded legacy thread).
+pub(crate) async fn lookup_interrupted_ask(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Option<InterruptedAsk> {
+    sqlx::query_as::<_, InterruptedAsk>(
+        "SELECT id, \
+                COALESCE(payload->'args'->'questions', '[]'::jsonb) AS questions, \
+                NULLIF(payload->>'request_event_id','')::uuid AS request_event_id \
+         FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ToolCalled' \
+           AND payload->>'name' = $2 \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id.to_string())
+    .bind(crate::llm::tool_names::ASK_USER_QUESTION)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| {
+        log!("[CCQuestion] ask_user_question call lookup failed for {thread_id}: {e}");
+        None
+    })
+}
+
+/// Where the answer-driven resume anchors: on the turn that asked the question
+/// (so the restart stays invisible), falling back to a fresh Continue boundary
+/// only when there is no turn to continue — a legacy `ToolCalled` with no
+/// `request_event_id`, or no `ToolCalled` at all. Without an anchor the
+/// resumed events would carry no `request_event_id` and strand outside every
+/// exchange, which is worse than a redundant boundary panel.
+pub(crate) fn resume_anchor_for_ask(
+    ask: Option<&InterruptedAsk>,
+    thread_id: Uuid,
+) -> ChatResumeAnchor {
+    match ask.and_then(|a| a.request_event_id) {
+        Some(request_event_id) => ChatResumeAnchor::ExistingTurn(request_event_id),
+        None => {
+            log!(
+                "[CCQuestion] no interrupted turn to continue for thread {} — resuming with a Continue boundary",
+                thread_id
+            );
+            ChatResumeAnchor::NewBoundary
+        }
+    }
+}
+
+/// Re-enter a chat thread's agentic loop after its `ask_user_question` was
+/// answered with NO live in-process loop — the loop died on an engine restart
+/// while the card was on screen. This is the chat parity of the coding-agent
+/// resume: CC re-fires its hook via `--resume` and reads the persisted answer;
+/// chat has no subprocess, so we reconstruct the tool pair and re-run the
+/// agentic loop as a continuation.
+///
+/// Emits the `ToolResult{ask_user_question}` the dead loop never got to emit —
+/// pairing the dangling `ToolCalled` with the REAL answer (built from the
+/// persisted sub-answers via `build_hook_answers`), so the resumed turn's
+/// reconstruction shows the answer instead of the "[tool result unavailable:
+/// orphaned]" stub — then spawns the continuation with a short engine note as
+/// the current turn (reusing `spawn_chat_resume`, shared with `continue_chat`).
+///
+/// The resume is anchored on the interrupted turn's OWN `request_event_id`
+/// ([`ChatResumeAnchor::ExistingTurn`], read off the originating
+/// `ToolCalled{ask_user_question}`), so it emits **no** `ContinuationStarted` /
+/// `UserPromptInjected` boundary: this thread was never aborted (the restart
+/// preserve guard, `agent_recovery::thread_has_unanswered_question`, is what
+/// kept the card live) and the user already did the one thing that was needed —
+/// they answered. Opening the manual-Continue boundary here mislabelled the
+/// resume as "Continued the response" and surfaced a stale "Reminded the model
+/// that no actions had completed" note under an answered card. Anchoring on the
+/// original turn makes the resumed reply group under the question card exactly
+/// as it would have without the restart. A thread that genuinely still needs
+/// user action keeps its abort + Continue button, and Continue still emits the
+/// boundary + reminder ([`ChatResumeAnchor::NewBoundary`]).
+///
+/// The multi-question walk asks one card at a time, so on a mid-batch restart
+/// only the asked-so-far sub-answers exist; `build_hook_answers` fills any
+/// not-yet-asked question with `(canceled)`, and the LLM may re-ask — an
+/// accepted degradation for that rare case (single-question asks resume cleanly).
+async fn resume_chat_after_answer(
+    engine: &Arc<LucidosEngine>,
+    thread_id: Uuid,
+    sub_tool_use_id: &str,
+    // The originating question's channel (`Chat` or `Trigger`) — stamped on the
+    // reconstructed ToolResult and the continuation so a trigger thread's resume
+    // isn't misclassified as chat.
+    channel: EventChannel,
+    actor: Option<MessageOrigin>,
+) {
+    const RESUME_NOTE: &str = "[Engine note — resumed after restart] Your \
+        ask_user_question was answered while the engine was restarting; its \
+        result is in the tool result above. Continue the turn — do not ask the \
+        same question again.";
+
+    let ask = lookup_interrupted_ask(engine.pool(), thread_id).await;
+    let anchor = resume_anchor_for_ask(ask.as_ref(), thread_id);
+
+    if let Some(InterruptedAsk {
+        call_event_id,
+        questions,
+        request_event_id,
+    }) = ask
+    {
+        // Gather the persisted sub-answers in index order (`{outer}#q{i}`), so a
+        // multi-question batch rebuilds its full answer map.
+        let outer = sub_tool_use_id
+            .rsplit_once("#q")
+            .map(|(o, _)| o)
+            .unwrap_or(sub_tool_use_id);
+        let mut answer_kinds: Vec<serde_json::Value> = Vec::new();
+        let mut i = 0usize;
+        while let Ok(Some(a)) =
+            lookup_existing_answer(engine.pool(), thread_id, &synth_question_id(outer, i)).await
+        {
+            answer_kinds.push(a);
+            i += 1;
+        }
+        let answers_map = build_hook_answers(&answer_kinds, &questions);
+        let result_str =
+            serde_json::to_string(&answers_map).unwrap_or_else(|_| answers_map.to_string());
+
+        engine
+            .event_bus
+            .emit_or_log(
+                BusEvent::Thread {
+                    thread_id,
+                    event: ThreadEvent::ToolResult {
+                        name: crate::llm::tool_names::ASK_USER_QUESTION.to_string(),
+                        result: result_str,
+                        images: vec![],
+                        success: true,
+                        // Pair with the originating ToolCalled so the frontend
+                        // groups it into the question's exchange (and the resume
+                        // reconstruction pairs the tool_use with the real answer).
+                        tool_called_event_id: Some(call_event_id),
+                    },
+                    meta: EventMeta {
+                        channel: Some(channel),
+                        // Same turn as the call it answers — a live emit carries
+                        // this too, and it keeps the pair together if the
+                        // `tool_called_event_id` route ever misses.
+                        request_event_id,
+                        ..EventMeta::NONE
+                    },
+                },
+                "[CCQuestion] ToolResult (ask_user_question resume after restart)",
+            )
+            .await;
+    }
+
+    // `spawn_chat_resume` returns a boxed `dyn Future` (its concrete return type
+    // is the type-erasure boundary that breaks the mutual-async-recursion cycle —
+    // see its doc), so a plain `.await` here is Send-safe.
+    if let Err(e) = engine
+        .spawn_chat_resume(thread_id, RESUME_NOTE.to_string(), channel, actor, anchor)
+        .await
+    {
+        log!(
+            "[CCQuestion] chat resume-after-answer failed for thread {}: {}",
+            thread_id,
+            e
+        );
+    }
 }
 
 /// Emit the empty `CodingAgentPromptSent` "resume marker" that projects to a
@@ -935,7 +1143,7 @@ async fn ensure_resume_after_answer(
         let sessions = agent_sessions.lock().await;
         sessions
             .get(&thread_id)
-            .map(|s| !s.process_exited)
+            .map(|s| s.is_live())
             .unwrap_or(false)
     };
     if has_live_subprocess {
@@ -977,7 +1185,7 @@ async fn arm_question_resume_if_live(
     }
     let mut sessions = agent_sessions.lock().await;
     match sessions.get_mut(&thread_id) {
-        Some(s) if !s.process_exited => {
+        Some(s) if s.is_live() => {
             s.question_resume_pending = true;
             true
         }
@@ -985,9 +1193,12 @@ async fn arm_question_resume_if_live(
     }
 }
 
+// `pub(crate)`: the CC seeding helpers (`seed_cc_thread`, `emit_user_question`)
+// are shared with `engine_impl/shutdown_tests.rs` — the teardown-preserve tests
+// park a thread on the same question shape this suite uses.
 #[cfg(test)]
 #[path = "agent_question_tests/common.rs"]
-mod aq_test_helpers;
+pub(crate) mod aq_test_helpers;
 
 #[cfg(test)]
 #[path = "agent_question_tests/tests.rs"]

@@ -110,6 +110,8 @@ export interface CodingAgentCommandOption {
   value: string;
   label: string;
   description: string;
+  /** When present, the option is available only for these explicit model ids. */
+  supported_models?: string[];
 }
 
 export interface CodingAgentCommandParam {
@@ -135,7 +137,7 @@ export interface CodingAgentCommandsResponse {
 }
 
 /** Model aliases mirroring the `models` list in crates/lucidos-engine/src/runtime/cc_menu_options.json. */
-export type CodingAgentModelValue = 'default' | 'claude-fable-5' | 'claude-fable-5[1m]' | 'sonnet' | 'sonnet[1m]' | 'claude-opus-4-8@default' | 'claude-opus-4-8[1m]' | 'claude-opus-4-7' | 'claude-opus-4-1' | 'opus' | 'opus[1m]' | 'haiku';
+export type CodingAgentModelValue = 'default' | 'claude-fable-5' | 'claude-fable-5[1m]' | 'sonnet' | 'sonnet[1m]' | 'claude-opus-5@default' | 'claude-opus-5[1m]' | 'claude-opus-4-8@default' | 'claude-opus-4-8[1m]' | 'claude-opus-4-7' | 'claude-opus-4-1' | 'opus' | 'opus[1m]' | 'haiku';
 
 /** Reasoning effort levels mirroring the `reasoning_efforts` list in crates/lucidos-engine/src/runtime/cc_menu_options.json. */
 export type CodingAgentReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';

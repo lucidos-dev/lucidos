@@ -207,6 +207,47 @@ export async function waitAndClick(page: Page, selector: string, text?: string, 
   await clickVisibleElement(page, selector, text);
 }
 
+/** Selector for ONE specific thread's drawer row.
+ *
+ *  Use this — never `REAL_THREAD_ROW` plus a positional `.first()` — whenever a
+ *  test means "the thread I just created". Positional row selection is unsafe in
+ *  this suite: `clearAllThreads()` truncates only the `thread_summaries`
+ *  PROJECTION, so a coding-agent session left running by an EARLIER spec
+ *  re-inserts its own row the moment its next event lands — with
+ *  `last_activity = NOW()`, which sorts it ABOVE the row this test just made.
+ *  `.first()` then clicks a foreign thread and every later assertion silently
+ *  measures the wrong one. That is the entire `drafts.spec.ts:65` "NOT-STORED"
+ *  flake (docs/plans/2026-06-27-mobile-webkit-shard-contention.md, session 8).
+ *
+ *  Keys on `data-flip-id`, which `ThreadDrawer.tsx` stamps on every row wrapper
+ *  for its FLIP animation and keyboard nav — the one stable per-thread hook the
+ *  list already carries. Rename that attribute and this must move with it. */
+export function threadRowFor(threadId: string): string {
+  return `[data-flip-id="${threadId}"] .thread-row`;
+}
+
+/** Click a SPECIFIC thread's drawer row (dual-layout safe, identity-based).
+ *  Waits for that row to render, then clicks it via `el.click()` — the same
+ *  touch-routing bypass `clickVisibleElement` uses. Never falls back to another
+ *  row: if this thread's row doesn't appear, that is itself the bug and it
+ *  throws naming the thread.
+ *
+ *  The wait is a PRECONDITION (does the row exist yet?), not the assertion a
+ *  caller is testing, so it is deliberately generous — a WebContent paint stall
+ *  must not turn "click my row" into a flake, and a row that never renders still
+ *  fails loudly and specifically here. */
+export async function clickThreadRow(page: Page, threadId: string, timeout = 10_000): Promise<void> {
+  const selector = threadRowFor(threadId);
+  try {
+    await waitForVisibleElement(page, selector, timeout);
+  } catch (err) {
+    throw new Error(`Drawer row for thread ${threadId} never became visible: ${(err as Error).message}`);
+  }
+  if (!await clickVisibleElement(page, selector)) {
+    throw new Error(`Drawer row for thread ${threadId} was not clickable`);
+  }
+}
+
 /** Click the first physically visible element matching a selector (dual-layout safe).
  *  Optionally filter by text content. Returns whether an element was clicked. */
 export async function clickVisibleElement(page: Page, selector: string, text?: string): Promise<boolean> {

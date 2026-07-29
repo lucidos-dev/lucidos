@@ -1,14 +1,15 @@
 //! Late-binding holder for the shared [`FastEmbedProvider`].
 //!
 //! The embedding model is a multi-hundred-MB HuggingFace download on a cold
-//! cache. A packaged first run that is offline (or HF-blocked) must still
-//! BOOT — a fatal `FastEmbedProvider::new()?` at construction left the
-//! workspace in a gateway respawn loop with nothing but the boot splash. So
-//! construction fills this slot when the model loads, or leaves it EMPTY on a
-//! *fetch-class* failure (`fastembed::is_model_fetch_failure`; corrupt-model
-//! errors stay fatal) and a background task retries with backoff
-//! (`LucidosEngine::spawn_embedder_retry_if_degraded`), installing the
-//! provider without a restart once the download succeeds.
+//! cache (and a non-trivial ONNX load even when warm), so it must NEVER block
+//! boot — a workspace should open immediately regardless of the model.
+//! Construction ALWAYS fills this slot [`EmbedderSlot::empty`], and the
+//! background loader (`LucidosEngine::spawn_embedder_load`) loads the model —
+//! trying immediately, then with backoff on a *fetch-class* failure
+//! (`fastembed::is_model_fetch_failure`) — and [`EmbedderSlot::install`]s the
+//! provider into the live slot without a restart once it lands. A non-fetch
+//! failure (corrupt cached model) stops retrying and disables memory with a loud
+//! notification, but never crashes boot.
 //!
 //! The slot implements [`EmbeddingProvider`] itself: while empty, every embed
 //! call returns the descriptive [`EMBEDDER_UNAVAILABLE`] error, which the
@@ -44,16 +45,8 @@ pub struct EmbedderSlot {
 }
 
 impl EmbedderSlot {
-    /// Slot holding an already-loaded provider (the normal warm-cache boot).
-    pub fn ready(provider: FastEmbedProvider) -> Arc<Self> {
-        Arc::new(Self {
-            model_id: provider.model_id().to_string(),
-            inner: RwLock::new(Some(Arc::new(provider))),
-        })
-    }
-
-    /// Empty slot — the degraded boot. Embeds error with
-    /// [`EMBEDDER_UNAVAILABLE`] until [`Self::install`] fills it.
+    /// Empty slot — the boot state. Embeds error with [`EMBEDDER_UNAVAILABLE`]
+    /// until the background loader ([`Self::install`]) fills it.
     pub fn empty() -> Arc<Self> {
         Arc::new(Self {
             model_id: model_id_from_env(),
@@ -61,7 +54,7 @@ impl EmbedderSlot {
         })
     }
 
-    /// Install a late-loaded provider (the background retry succeeding).
+    /// Install a late-loaded provider (the background loader succeeding).
     pub fn install(&self, provider: FastEmbedProvider) {
         *self.inner.write().expect("EmbedderSlot lock poisoned") = Some(Arc::new(provider));
     }
@@ -80,29 +73,6 @@ impl EmbedderSlot {
             .read()
             .expect("EmbedderSlot lock poisoned")
             .clone()
-    }
-}
-
-/// The boot decision (engine construction): a loaded provider fills the slot;
-/// a *fetch-class* init failure boots DEGRADED with an empty slot (the
-/// background retry recovers it); any other init error stays FATAL — a
-/// corrupt cached model or config bug must not boot a silently memory-less
-/// engine. Pure over the init `Result` so the three arms are unit-testable
-/// without a model download or a full engine.
-pub fn slot_from_init(
-    result: Result<FastEmbedProvider, Box<dyn std::error::Error + Send + Sync>>,
-) -> Result<Arc<EmbedderSlot>, Box<dyn std::error::Error + Send + Sync>> {
-    match result {
-        Ok(provider) => Ok(EmbedderSlot::ready(provider)),
-        Err(e) if super::fastembed::is_model_fetch_failure(e.as_ref()) => {
-            crate::log!(
-                "[Memory] Embedding model unavailable at boot (fetch failed): {} — \
-                 booting with memory features disabled; retrying in the background",
-                e
-            );
-            Ok(EmbedderSlot::empty())
-        }
-        Err(e) => Err(e),
     }
 }
 
@@ -142,34 +112,6 @@ impl EmbeddingProvider for EmbedderSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A fetch-class init failure (offline first run) must BOOT — empty slot,
-    /// not an error. This is the invariant that un-bricks a packaged install
-    /// with no network: before this, `FastEmbedProvider::new()?` killed
-    /// construction and the gateway respawn-looped on the boot splash.
-    #[test]
-    fn fetch_failure_boots_degraded() {
-        // Message shape mirrors fastembed's fetch-path wrapper + HF transport.
-        let err: Box<dyn std::error::Error + Send + Sync> =
-            "Failed to retrieve onnx/model.onnx: request error: https://huggingface.co/…: \
-             connection refused"
-                .into();
-        let slot = slot_from_init(Err(err)).expect("fetch failure must boot degraded");
-        assert!(!slot.is_ready(), "degraded boot leaves the slot empty");
-    }
-
-    /// A NON-fetch init failure (corrupt cached model, bad config) must stay
-    /// FATAL — booting a silently memory-less engine would hide a real bug.
-    #[test]
-    fn non_fetch_failure_stays_fatal() {
-        let err: Box<dyn std::error::Error + Send + Sync> =
-            "could not read model.onnx file: invalid protobuf".into();
-        let e = match slot_from_init(Err(err)) {
-            Err(e) => e,
-            Ok(_) => panic!("non-fetch init failure must stay fatal"),
-        };
-        assert!(e.to_string().contains("could not read"), "{e}");
-    }
 
     /// An empty slot must degrade DESCRIPTIVELY, never panic or return empty
     /// results as success — the no-hidden-errors contract for a first boot

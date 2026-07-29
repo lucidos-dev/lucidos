@@ -615,7 +615,7 @@ describe('restoreState suppresses transient request-backed form overlays on relo
     expect(store.panelOverlay.value).toBeNull();
   });
 
-  it('drops a stale email-confirm overlay', async () => {
+  it('drops a stale PENDING email-confirm overlay', async () => {
     const store = await restoreWithOverlay({
       type: 'form',
       form: {
@@ -630,6 +630,25 @@ describe('restoreState suppresses transient request-backed form overlays on relo
       },
     });
     expect(store.panelOverlay.value).toBeNull();
+  });
+
+  it('restores a SENT email-confirm receipt — nothing is left to resolve', async () => {
+    const form = {
+      type: 'email-confirm' as const,
+      request: {
+        to: ['someone@example.com'],
+        subject: 'Hello',
+        body: 'the body that went out',
+        account: 'work',
+        from: 'me@example.com',
+      },
+      sentAt: '2026-07-29T09:15:00.000Z',
+    };
+    const store = await restoreWithOverlay({ type: 'form', form });
+    // A receipt is a record of a completed send, not a staged request — it is a
+    // real history destination and must survive a reload. (The pending case
+    // above is the one whose engine-side draft dies with the page.)
+    expect(store.panelOverlay.value).toEqual({ type: 'form', form });
   });
 
   it('drops an engine-prompted credential request (credential form WITH a request)', async () => {

@@ -5,14 +5,49 @@ environment, the branch and PR flow, our commit conventions, and the sign-off we
 require on every contribution. Keep it open in a tab — it's meant to be concrete,
 not exhaustive.
 
-> **Pre-1.0, expect breakage.** Lucidos is currently on the **0.9.x** line.
-> Until 1.0 the public surfaces — events, the HTTP API, the JS SDK, the database
-> schema, on-disk layout — can change without notice. Pin a commit if you need
-> stability, and don't be surprised when `main` moves under you.
+> **Pre-1.0, expect breakage.** Lucidos is pre-1.0 — the newest `v*` tag is the
+> current version. Until 1.0 the public surfaces — events, the HTTP API, the JS
+> SDK, the database schema, on-disk layout — can change without notice. Pin a
+> commit if you need stability, and don't be surprised when `main` moves under
+> you.
 
 By participating you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md).
 How the project is run, and how you can grow into a maintainer, is described in
 [GOVERNANCE.md](GOVERNANCE.md).
+
+## How this repository works
+
+This repository is a **published mirror**, not the development repo. Lucidos is
+developed in a private source repository, and each release is exported here as a
+single snapshot. Three consequences are worth knowing before you write any code:
+
+- **`main` is replaced wholesale on every release.** A release is one parentless
+  commit, force-pushed to `main` and tagged `v<x.y.z>`. Successive releases share
+  no history at all — the tags are the durable record, each pointing at a
+  standalone snapshot. The published tree is also stripped: internal-only paths
+  (planning docs, the release tooling) never ship.
+- **Your PR is imported, not merged.** A maintainer squashes it onto the previous
+  release tag and ships it in the next release. The release commit carries a
+  `Co-authored-by:` trailer naming your GitHub account, and the change is ported
+  back into the source repo, so it stays in every release after that one.
+- **Your PR is then closed with a link to the release containing it.** GitHub
+  will show it as "Closed", never "Merged" — that's the mirror's mechanics, not a
+  rejection. If the closing comment says it was released as `v<x.y.z>` and links
+  that release, your change shipped.
+
+> **After a release, your fork shares no ancestor with the new `main`.** `git
+> pull` will conflict or produce a nonsense merge. Adopt the new snapshot instead
+> of merging into it, and move in-flight work onto the new tag:
+>
+> ```bash
+> # origin = your fork, upstream = this repository
+> git fetch upstream
+> git checkout main && git reset --hard upstream/main   # adopt the snapshot
+> git checkout my-branch
+> git rebase --onto main <commit-you-branched-from>     # replay your work
+> ```
+>
+> Re-forking works just as well if the branch is already shipped.
 
 ## Speak the project's language
 
@@ -52,7 +87,8 @@ alike; read the ones relevant to what you're touching.
 
 ## Branch and PR flow
 
-We develop on GitHub with a fork-and-pull-request model:
+Pull requests are wanted, and forking is deliberately enabled. Everything up to
+the landing step is the ordinary fork-and-pull-request flow:
 
 1. **Fork** the repository and clone your fork.
 2. **Branch** off `main`. Name the branch after the change, prefixed with its
@@ -64,12 +100,17 @@ We develop on GitHub with a fork-and-pull-request model:
 5. **Open a PR** against `main`. Fill in the
    [pull request template](.github/PULL_REQUEST_TEMPLATE.md) and link the issue
    it addresses.
+6. **A maintainer imports it into a release** and closes the PR with a link to
+   that release, crediting you as co-author — see
+   [How this repository works](#how-this-repository-works).
 
-> **There is no public CI.** Nothing runs your tests for you on push, and there
-> are no status checks to "wait for". Run the relevant suites locally and report
-> what you ran in the PR — a maintainer will not be able to tell green from red
-> otherwise. Releases are cut locally by maintainers via `scripts/release.sh`;
-> contributors never need to touch the release flow.
+> **CI does not run on pull requests.** The mirror has workflows, but they are
+> release gates: they fire on release candidates, version tags, and published
+> releases, never on a PR. Nothing checks your branch and there are no status
+> checks to "wait for". Run the relevant suites locally and report what you ran
+> in the PR — a maintainer will not be able to tell green from red otherwise.
+> Releases are cut locally by maintainers; contributors never need to touch the
+> release flow.
 
 ## Commit messages
 
@@ -115,11 +156,12 @@ Signed-off-by: Your Name <your.email@example.com>
 
 Use your real name and a reachable email. Every commit in a PR must carry the
 trailer; if you forget, `git rebase --signoff main` adds it to the whole branch.
-PRs with unsigned commits can't be merged.
+A PR whose commits aren't signed off can't be released.
 
 ## Tests
 
-Run the suites for the layers you touched. Because there's no CI, this is on you.
+Run the suites for the layers you touched. Because CI never sees your PR, this is
+on you.
 
 | You changed… | Run |
 |---|---|

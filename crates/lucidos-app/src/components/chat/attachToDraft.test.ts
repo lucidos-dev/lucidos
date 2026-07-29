@@ -35,9 +35,16 @@ import {
   _resetPendingUploadsForTesting,
 } from '../../store/pendingUploads';
 import { uploadThreadBlob } from '../../api/client';
+import { awaitThreadStarted } from '../../store/actions/compose';
 
 function makeFakeFile(name: string, type: string): File {
-  return { name, type } as unknown as File;
+  // `attachImageToActiveDraft` snapshots the bytes via `arrayBuffer()` before
+  // uploading (see the Universal Clipboard fix), so the fake must expose it.
+  return {
+    name,
+    type,
+    arrayBuffer: async () => new Uint8Array([0xff, 0xd8, 0xff]).buffer,
+  } as unknown as File;
 }
 
 function makeFakeFileList(files: File[]): FileList {
@@ -274,14 +281,15 @@ describe('attachImageToActiveDraft respects cancellation mid-upload', () => {
     const file = makeFakeFile('photo.png', 'image/png');
     const attachPromise = attachImageToActiveDraft(file);
 
+    // Flush microtasks so the byte snapshot (`arrayBuffer()`) resolves — the
+    // pending preview is added after it — and the awaited `awaitThreadStarted`
+    // resolves so `uploadThreadBlob` is invoked (capturing `resolveUpload`).
+    await new Promise((r) => setTimeout(r, 0));
+
     // Pending preview is rendered; user sees the image.
     const pendingForThread = pendingUploads.value.get('t-1') ?? [];
     expect(pendingForThread).toHaveLength(1);
     const localId = pendingForThread[0].localId;
-
-    // Flush microtasks so the awaited `awaitThreadStarted` resolves and
-    // `uploadThreadBlob` is invoked (capturing `resolveUpload`).
-    await new Promise((r) => setTimeout(r, 0));
     expect(uploadThreadBlob).toHaveBeenCalledTimes(1);
 
     // User clicks X on the still-uploading preview to cancel.
@@ -297,5 +305,94 @@ describe('attachImageToActiveDraft respects cancellation mid-upload', () => {
     // and the strip re-renders the image as a confirmed attachment.
     expect(getDraft('t-1').image_hashes).toEqual([]);
     expect(pendingUploads.value.get('t-1')).toBeUndefined();
+  });
+});
+
+/** Regression: an image pasted from the system clipboard (notably macOS
+ *  Universal Clipboard — copied on an iPhone, pasted on the Mac) is a File
+ *  backed by a promised pasteboard resource, readable only during the
+ *  synchronous paste-event turn. The old code read its bytes lazily — inside
+ *  `uploadThreadBlob`'s FormData serialization, AFTER `await awaitThreadStarted`
+ *  — by which point the backing was released and the upload `fetch` threw
+ *  `TypeError: Failed to fetch`. The fix snapshots the bytes into an in-memory
+ *  File up front, before that await. */
+describe('attachImageToActiveDraft snapshots clipboard bytes before the thread-start gap', () => {
+  beforeEach(() => {
+    _resetPendingUploadsForTesting();
+    _resetComposeDraftsForTesting();
+    vi.mocked(uploadThreadBlob).mockReset();
+    vi.mocked(awaitThreadStarted).mockReset();
+  });
+
+  afterEach(() => {
+    _resetPendingUploadsForTesting();
+    _resetComposeDraftsForTesting();
+    // Restore the module-mock default (immediate resolve) for other suites.
+    vi.mocked(awaitThreadStarted).mockImplementation(async () => {});
+  });
+
+  it('reads the source bytes before thread creation completes and uploads an in-memory copy', async () => {
+    // Hold thread creation open so we can observe that the byte read already
+    // happened while the pasteboard-backed File was still valid — the window
+    // during which the old code had NOT yet touched the bytes.
+    let startThread!: () => void;
+    vi.mocked(awaitThreadStarted).mockImplementation(
+      () => new Promise<void>((resolve) => { startThread = () => resolve(); }),
+    );
+
+    let uploaded: { threadId: string; file: File } | null = null;
+    vi.mocked(uploadThreadBlob).mockImplementation(async (threadId: string, file: File) => {
+      uploaded = { threadId, file };
+      return { hash: 'sha-materialized', mime: file.type, byte_size: file.size };
+    });
+
+    const bytes = new Uint8Array([0xff, 0xd8, 0xff, 0x42]);
+    let reads = 0;
+    const source = {
+      name: 'IMG_0001.jpg',
+      type: 'image/jpeg',
+      arrayBuffer: async () => { reads++; return bytes.buffer.slice(0); },
+    } as unknown as File;
+
+    const attachPromise = attachImageToActiveDraft(source);
+
+    // Let the arrayBuffer snapshot microtask settle. Thread creation is still
+    // pending (startThread not called), so the upload has NOT fired yet — but
+    // the bytes are already captured. This is the crux of the fix: the read
+    // does not wait for the async thread-start gap.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(reads, 'source bytes must be snapshotted before the thread-start gap').toBe(1);
+    expect(uploadThreadBlob).not.toHaveBeenCalled();
+
+    // Now let thread creation finish; the upload runs with the snapshot.
+    startThread();
+    await attachPromise;
+
+    expect(uploadThreadBlob).toHaveBeenCalledTimes(1);
+    expect(uploaded).not.toBeNull();
+    // The uploaded File is a fresh in-memory copy, never the clipboard-backed
+    // source object.
+    expect(uploaded!.file).not.toBe(source);
+    const uploadedBytes = new Uint8Array(await uploaded!.file.arrayBuffer());
+    expect(Array.from(uploadedBytes)).toEqual(Array.from(bytes));
+    expect(getDraft('t-1').image_hashes).toEqual(['sha-materialized']);
+  });
+
+  it('surfaces a clear error and uploads nothing when the source bytes are unreadable', async () => {
+    vi.mocked(awaitThreadStarted).mockImplementation(async () => {});
+    const source = {
+      name: 'stale.jpg',
+      type: 'image/jpeg',
+      // A pasteboard resource already released before we could read it.
+      arrayBuffer: async () => { throw new TypeError('Failed to fetch'); },
+    } as unknown as File;
+
+    await attachImageToActiveDraft(source);
+
+    expect(uploadThreadBlob).not.toHaveBeenCalled();
+    expect(getDraft('t-1').image_hashes).toEqual([]);
+    expect(pendingUploads.value.get('t-1')).toBeUndefined();
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].message).toContain('could not read the image');
   });
 });

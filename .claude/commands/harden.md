@@ -206,21 +206,34 @@ Run the test suites for the layers touched on this branch.
 
 Pick suites by `git diff main...HEAD --name-only`, applying the CLAUDE.md test-selection table:
 
-- `.rs`, `Cargo.toml`, `Cargo.lock`, `.sql` → `cargo check && cargo test -p lucidos-engine`
+- `.rs`, `Cargo.toml`, `Cargo.lock`, `.sql` → `make lint && make test`
+- `.sh`, `.shellcheckrc`, `Makefile` → `make lint`
 - `.ts`, `.tsx` → `cd crates/lucidos-app && npx tsc --noEmit && npm test`
 - CSS-only / docs-only → skip
 - Mixed → run both **in parallel**
+
+**`make lint`, not `cargo check` — this is THE per-change lint gate.** Lucidos is
+not PR-based: Apply merges the branch into `main` directly, so there is no CI
+stage between a change and `main`. `/harden` *is* that stage — it runs before
+every push (`.claude/hooks/pre-push.sh`) and synchronously at Apply when the
+marker is missing. Until 2026-07-29 this table said `cargo check`, which
+compiles but runs **no clippy lints**, so the only thing that ever ran the
+warnings-as-errors gate was the nightly — and the 2026-07-26 nightly duly found
+NINETEEN lints accumulated across three weeks of ordinary commits. `make lint`
+(ShellCheck, then clippy with `CLIPPY_FLAGS` — see the `Makefile`) strictly
+supersedes `cargo check`: same compile, plus the lint set, plus every tracked
+`*.sh`. It is the single canonical invocation; never restate its flags here.
 
 When the diff is mixed, kick the Rust and TS suites off concurrently — they're independent toolchains (cargo vs npm) with no shared state, so running them serially wastes wall-clock. Use the Bash tool's `run_in_background: true` for each, then `TaskOutput` to join. (Codex / any agent without a background-Bash + `TaskOutput` tool: run the two suites **sequentially** instead — `cargo …` then `npm …`. Parallelism is only a wall-clock optimization; sequential gives identical correctness.) Pattern:
 
 ```
 # Launch both in parallel
-Bash(cmd="cargo check && cargo test -p lucidos-engine", run_in_background=true)  → task_id A
+Bash(cmd="make lint && make test", run_in_background=true)  → task_id A
 Bash(cmd="cd crates/lucidos-app && npx tsc --noEmit && npm test", run_in_background=true)  → task_id B
 # Then TaskOutput on A and B until both finish
 ```
 
-**Never pipe the test command through `| tail` / `| head` / `| grep` to trim output.** Under zsh / bash a pipeline reports the *last* command's exit code, not cargo's — so `cargo test ... | tail` exits 0 even when a Rust test failed, and Phase 4.5 reports a false PASSED on a red run (this has actually shipped a failing nightly). Run each suite un-piped (the `run_in_background` + `TaskOutput` pattern above already preserves the real exit), or if you must trim, redirect to a log and capture `$?` first: `cargo test -p lucidos-engine > /tmp/t.log 2>&1; echo "EXIT: $?"` then read the log. A "tests pass" claim needs the real exit code AND the `test result: ok.` / `0 failed` line — see `/clean-build`'s "Reading exit codes honestly" section for the full mechanism.
+**Never pipe the test command through `| tail` / `| head` / `| grep` to trim output.** Under zsh / bash a pipeline reports the *last* command's exit code, not cargo's — so `cargo test ... | tail` exits 0 even when a Rust test failed, and Phase 4.5 reports a false PASSED on a red run (this has actually shipped a failing nightly). Run each suite un-piped (the `run_in_background` + `TaskOutput` pattern above already preserves the real exit), or if you must trim, redirect to a log and capture `$?` first: `make test > /tmp/t.log 2>&1; echo "EXIT: $?"` then read the log. A "tests pass" claim needs the real exit code AND the `test result: ok.` / `0 failed` line — see `/clean-build`'s "Reading exit codes honestly" section for the full mechanism.
 
 If everything passes, proceed to Phase 5.
 

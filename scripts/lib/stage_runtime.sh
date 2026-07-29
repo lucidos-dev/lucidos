@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# stage_runtime.sh — assemble the self-contained Lucidos runtime tree (the 6
+# stage_runtime.sh — assemble the self-contained Lucidos runtime tree (the 7
 # RESOURCE_NAMES: lucidos-engine + lucidos-gateway + lucidos (CLI) + frontend +
-# relocatable PostgreSQL 18 + pgvector + sdk) that both delivery vehicles share:
+# relocatable PostgreSQL 18 + pgvector + sdk + system-knowhow) that both delivery
+# vehicles share:
 #
 #   • build-dmg.sh        (macOS) stages into bundle-resources/, wraps it in a
 #                         .app via `cargo tauri build`, codesigns, notarizes.
@@ -176,9 +177,10 @@ stage_runtime_fetch_postgres() {
 # ── assemble (offline — unit-tested with fake inputs) ────────────────────────
 
 # stage_runtime_assemble <stage-dir> <engine-bin> <gateway-bin> <cli-bin> \
-#                        <frontend-dist> <pg-prefix> <sdk-dist>
-# Assemble the 6-resource self-contained runtime tree into a CLEAN <stage-dir>:
-#   lucidos-engine, lucidos-gateway, lucidos, frontend/, postgres/, sdk/.
+#                        <frontend-dist> <pg-prefix> <sdk-dist> <system-knowhow-dir>
+# Assemble the 7-resource self-contained runtime tree into a CLEAN <stage-dir>:
+#   lucidos-engine, lucidos-gateway, lucidos, frontend/, postgres/, sdk/,
+#   system-knowhow/.
 # Pure cp/chmod over already-built inputs (no network/toolchain), so the unit test
 # drives it with fakes. Prints <stage-dir> on success. Mirrors build-dmg.sh's step 4.
 #
@@ -186,14 +188,21 @@ stage_runtime_fetch_postgres() {
 # sibling of `lucidos-engine` (find_lucidos_cli_dir) to launch the Claude Code
 # permission-prompt MCP server (`lucidos mcp-permission-server`). Omitting it
 # breaks every coding-agent thread in the packaged build on its first tool call.
+#
+# `system-knowhow/` is the engine-shipped reference set the workspace LLM is told
+# to load (load_knowhow('system-knowhow/…'), GET /api/v1/knowhow, the data-API
+# read path). The engine finds it via LUCIDOS_SYSTEM_KNOWHOW_DIR (set by the
+# desktop/gateway launcher + install service to <resources>/system-knowhow);
+# omitting it silently degrades every packaged install to no reference docs.
 stage_runtime_assemble() {
-    local stage="$1" engine="$2" gateway="$3" cli="$4" frontend="$5" pg_prefix="$6" sdk="$7"
+    local stage="$1" engine="$2" gateway="$3" cli="$4" frontend="$5" pg_prefix="$6" sdk="$7" system_knowhow="$8"
     [ -x "$engine" ]    || { echo "ERROR: engine binary not found/executable: $engine" >&2; return 1; }
     [ -x "$gateway" ]   || { echo "ERROR: gateway binary not found/executable: $gateway" >&2; return 1; }
     [ -x "$cli" ]       || { echo "ERROR: lucidos CLI binary not found/executable: $cli" >&2; return 1; }
     [ -d "$frontend" ]  || { echo "ERROR: frontend dist not found: $frontend" >&2; return 1; }
     [ -d "$pg_prefix" ] || { echo "ERROR: postgres prefix not found: $pg_prefix" >&2; return 1; }
     [ -d "$sdk" ]       || { echo "ERROR: sdk dist not found: $sdk" >&2; return 1; }
+    [ -d "$system_knowhow" ] || { echo "ERROR: system-knowhow dir not found: $system_knowhow" >&2; return 1; }
 
     rm -rf "$stage" || return 1
     mkdir -p "$stage" || return 1
@@ -208,6 +217,9 @@ stage_runtime_assemble() {
     # The JS SDK (/api/v1/sdk.js) used by app-UI iframes; the engine finds it via
     # LUCIDOS_SDK_DIR (set by the desktop/gateway launcher to <resources>/sdk).
     cp -R "$sdk" "$stage/sdk"              || return 1
+    # The engine-shipped reference knowhow, resolved at runtime via
+    # LUCIDOS_SYSTEM_KNOWHOW_DIR (→ <resources>/system-knowhow).
+    cp -R "$system_knowhow" "$stage/system-knowhow" || return 1
 
     printf '%s\n' "$stage"
 }

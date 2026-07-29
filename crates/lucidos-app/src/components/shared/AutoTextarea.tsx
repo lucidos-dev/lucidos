@@ -1,5 +1,6 @@
 import { useRef, useEffect } from 'preact/hooks';
 import { autoResizeTextarea } from '../../utils/dom';
+import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 
 interface Props {
   value: string;
@@ -13,6 +14,8 @@ interface Props {
  * - Grows/shrinks to fit content (min 1 row)
  * - Inside a <form>: Enter submits, Shift+Enter inserts a newline
  * - Outside a <form>: Enter inserts a newline (default browser behavior)
+ * - A prose field by definition (descriptions, email bodies), so it carries
+ *   PROSE_TEXT_ATTRS. A code/config textarea uses a bare <textarea> instead.
  */
 export function AutoTextarea({ value, onInput, placeholder, required }: Props) {
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -43,6 +46,7 @@ export function AutoTextarea({ value, onInput, placeholder, required }: Props) {
       placeholder={placeholder}
       required={required}
       rows={1}
+      {...PROSE_TEXT_ATTRS}
     />
   );
 }

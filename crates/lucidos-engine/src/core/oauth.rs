@@ -427,6 +427,25 @@ impl std::fmt::Debug for TokenResponse {
     }
 }
 
+/// Bounded, shared HTTP client for the OAuth token/userinfo endpoints. A bare
+/// `reqwest::Client::new()` has NO timeout, and `refresh_oauth_if_needed` runs
+/// on the email-send path — a stalled identity provider would hang the whole
+/// send request. Same unbounded-network-op class as `SMTP_SEND_TIMEOUT` /
+/// `IMAP_OP_TIMEOUT` in `core/email*.rs`. Built once (`LazyLock`) so repeated
+/// calls reuse the connection pool and the rustls context — the repo precedent
+/// for process-wide clients (`api/proxy.rs`, `engine/http/workspace_client.rs`).
+fn bounded_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            // Only fails on TLS-backend init — where the old bare
+            // `Client::new()` would panic identically.
+            .expect("OAuth HTTP client builder")
+    });
+    &CLIENT
+}
+
 /// Exchange an authorization code for tokens.
 async fn exchange_code(
     token_url: &str,
@@ -435,7 +454,7 @@ async fn exchange_code(
     code: &str,
     redirect_uri: &str,
 ) -> Result<TokenResponse, BoxError> {
-    let client = reqwest::Client::new();
+    let client = bounded_http_client();
     let resp = client
         .post(token_url)
         .header("Accept", "application/json")
@@ -466,7 +485,7 @@ async fn refresh_access_token(
     client_secret: &str,
     refresh_token: &str,
 ) -> Result<TokenResponse, BoxError> {
-    let client = reqwest::Client::new();
+    let client = bounded_http_client();
     let resp = client
         .post(token_url)
         .header("Accept", "application/json")
@@ -812,7 +831,7 @@ async fn fetch_userinfo(
     userinfo_url: &str,
     access_token: &str,
 ) -> (Option<String>, Option<String>) {
-    let client = reqwest::Client::new();
+    let client = bounded_http_client();
     let resp = match client
         .get(userinfo_url)
         .header("Authorization", format!("Bearer {}", access_token))
