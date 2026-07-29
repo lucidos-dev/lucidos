@@ -1,0 +1,889 @@
+/* Panel content (used by Changes, Notifications, etc. inside PanelPane) */
+.panel-content {
+    padding: 0;
+}
+
+.dropdown-panel-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    /* Shares the content-pane --space-lg (1rem) horizontal gutter, so the
+       top-left segmented toggle sits directly above the .notification-item rows
+       (also --space-lg) in one vertical line — and matches every other list
+       content-pane view. See the "content-pane padding" rule in
+       .claude/rules/frontend.md. */
+    padding: var(--space-md) var(--space-lg) var(--space-sm);
+}
+
+.mark-all-read {
+    background: none;
+    border: none;
+    color: var(--accent);
+    cursor: pointer;
+    font-size: var(--font-size-xs);
+    font-family: var(--font-ui);
+}
+
+@media (hover: hover) {
+    .mark-all-read:hover:not(:disabled) {
+        text-decoration: underline;
+    }
+}
+
+.mark-all-read:disabled {
+    display: none;
+}
+
+.notification-item {
+    display: block;
+    width: 100%;
+    /* --space-lg (1rem) horizontal gutter shared across content-pane views; the
+       taller --space-md vertical is intentional for these 3-line rows (title +
+       summary + time). */
+    padding: var(--space-md) var(--space-lg);
+    border: none;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    /* Animate background-color only, never opacity: fading a text-bearing row's
+       opacity composites it to a translucent layer and drops subpixel AA, so the
+       text looks blurry mid-transition — most visible on "Mark all read" where
+       every row dims at once. The dim still applies, it just snaps instead of
+       fading. */
+    transition: background-color var(--duration-normal);
+    opacity: 0.5; /* Read notifications are greyed out (static — see above) */
+    -webkit-tap-highlight-color: rgba(88, 166, 255, 0.2);
+}
+
+@media (hover: hover) {
+    .notification-item:hover {
+        background: var(--bg-hover);
+        opacity: 0.8;
+    }
+}
+
+.notification-item:last-child {
+    border-bottom: none;
+}
+
+.notification-item.unread {
+    opacity: 1; /* Unread notifications are full opacity */
+    background: rgba(88, 166, 255, 0.05);
+    border-left: 0.1875rem solid var(--accent);
+}
+
+@media (hover: hover) {
+    .notification-item.unread:hover {
+        background: rgba(88, 166, 255, 0.1);
+    }
+}
+
+.notification-title {
+    margin-bottom: 0.25rem;
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    min-width: 0;
+}
+
+.notification-title .trigger-icon {
+    font-size: var(--font-size-lg);
+}
+
+.notification-summary {
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    line-height: 1.4;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.notification-time {
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+    margin-top: 0.375rem;
+}
+
+/* Loading more indicator at bottom of notification list */
+.dropdown-panel-loading-more {
+    padding: var(--space-sm) var(--space-lg);
+    text-align: center;
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+    font-family: var(--font-ui);
+}
+
+/* ─── Notification detail (rendered in the content pane) ─── */
+/* The pane's own .content-pane-body scrolls, so the detail lays out at natural
+   height — no nested flex:1/overflow scroll region (which had no defined height
+   outside the former modal's flex column). */
+.notification-detail {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+/* Nav row above the title: prev/next chevrons at the ends with the date
+ * centered between them. The date flexes to fill the middle so it stays centered
+ * regardless of the chevrons' fade state; align-items:center sits the single-line
+ * date vertically against the 2rem chevrons. */
+.notification-detail-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: var(--space-md) var(--space-lg) 0;
+}
+
+.notification-detail-date {
+    flex: 1;
+    text-align: center;
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+}
+
+/* Title heading below the nav row — left-aligned to share a left edge with the
+ * markdown body below it (both at 1rem horizontal padding); wraps multi-line. */
+.notification-detail-title {
+    margin: 0;
+    padding: var(--space-sm) var(--space-lg) 0;
+    font-size: var(--font-size-lg);
+    font-weight: 600;
+    line-height: 1.3;
+    color: var(--text-primary);
+    text-align: left;
+    overflow-wrap: anywhere;
+}
+
+/* Prev/next chevrons at the ends of the nav row, mirroring the thread-view
+ * scroll chevrons (.scroll-to-top / .scroll-to-bottom in chat/input-messages.css)
+ * but pointing left/right. Always rendered with a fixed slot (flex: none) so the
+ * centered date never shifts; they sit `:disabled` (greyed, no pointer events) at
+ * the first / last notification rather than fading out. */
+.notification-detail-nav {
+    flex: none;
+    width: 2rem;
+    height: 2rem;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
+    backdrop-filter: blur(0.5rem);
+    -webkit-backdrop-filter: blur(0.5rem);
+    border: 0.125rem solid var(--border-color);
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.85;
+    transition: opacity 0.2s, background-color 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.notification-detail-nav:disabled {
+    opacity: 0.3;
+    cursor: default;
+    pointer-events: none;
+}
+
+/* iOS PWA back-swipe gutter clearance. The content pane is flush to the screen
+ * edge on mobile (no .content-pane-body inset), so the default 1rem header
+ * padding put the prev chevron's left edge ~16px from the edge — inside iOS's
+ * left-edge back-swipe gesture zone, which intermittently swallowed taps on it
+ * (the "back chevron doesn't always react; works if I tap toward its centre"
+ * report). Inset both chevrons symmetrically so the whole button sits past the
+ * gutter while the date stays centred between them; max() keeps the notch
+ * safe-area inset in landscape. Mobile-only — desktop has no edge gesture. */
+@media (max-width: 768px) {
+    .notification-detail-header {
+        padding-left: max(2.25rem, env(safe-area-inset-left, 0px));
+        padding-right: max(2.25rem, env(safe-area-inset-right, 0px));
+    }
+}
+
+@media (hover: hover) {
+    .notification-detail-nav:hover {
+        opacity: 1;
+        background: var(--bg-hover);
+        color: var(--text-primary);
+        border-color: var(--text-muted);
+    }
+}
+
+/* Markdown rules inherited from .markdown-content in global.css */
+.notification-detail-body {
+    padding: var(--space-lg);
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+    line-height: 1.5;
+    min-width: 0;
+}
+
+.notification-detail-body th,
+.notification-detail-body td {
+    padding: var(--space-sm) var(--space-md);
+}
+
+.notification-detail-body a.app-link {
+    color: var(--accent);
+    text-decoration: underline dashed;
+    cursor: pointer;
+}
+
+@media (hover: hover) {
+    .notification-detail-body a.app-link:hover {
+        text-decoration: underline solid;
+    }
+}
+
+.notification-detail-actions {
+    display: flex;
+    justify-content: center;
+    gap: 0.5rem;
+    padding: var(--space-md) var(--space-lg);
+}
+
+/* Content views */
+.content-view {
+    display: none;
+}
+
+.content-view.active {
+    display: block;
+    height: 100%;
+}
+
+/* Workspace files wrapper — fills the panel so the drag-over overlay covers
+ * the whole import zone even when the file list is short. */
+.workspace-files-view {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+
+/* Files panel toolbar */
+.files-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.25rem 0.5rem;
+}
+
+.files-hint {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+/* Clickable dashed-border import box — also the panel's drop target hint.
+ * Lives in the top switcher row; margin-left:auto pins it to the top-right
+ * (the source switcher selector, when present, owns the top-left). */
+.files-import-dropzone {
+    display: inline-flex;
+    align-items: center;
+    margin-left: auto;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    border: 1px dashed var(--border-color);
+    border-radius: 0.375rem;
+    padding: 0.1875rem 0.625rem;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, background-color 0.15s;
+}
+
+@media (hover: hover) {
+    .files-import-dropzone:hover {
+        color: var(--text-primary);
+        border-color: var(--accent);
+        background: var(--bg-hover);
+    }
+}
+
+.files-toolbar-actions {
+    display: flex;
+    gap: 0.25rem;
+}
+
+.files-toolbar-btn {
+    background: none;
+    border: 1px solid var(--border-color);
+    font-size: var(--font-size-2xs);
+    font-family: var(--font-ui);
+    font-weight: 600;
+    color: var(--text-secondary);
+    cursor: pointer;
+    padding: 0.125rem 0.375rem;
+    border-radius: 0.1875rem;
+    transition: all 0.15s;
+}
+
+@media (hover: hover) {
+    .files-toolbar-btn:hover {
+        color: var(--text-primary);
+        border-color: var(--text-secondary);
+    }
+}
+
+/* --- Source switcher --- */
+
+.files-source-switcher {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem;
+}
+
+/* --- Repo view toggle --- */
+
+.repo-view-toggle {
+    display: flex;
+    gap: 0.25rem;
+}
+
+.repo-view-toggle .files-toolbar-btn.active {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+}
+
+/* --- Change selector --- */
+
+.change-selector .dropdown-label-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 12rem;
+}
+
+.change-selector-menu {
+    max-height: 20rem;
+    overflow-y: auto;
+}
+
+.dropdown-section-header {
+    padding: 0.25rem 0.5rem;
+    font-size: var(--font-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+    pointer-events: none;
+}
+
+.change-option-desc {
+    display: block;
+}
+
+.change-option-meta {
+    display: block;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+}
+
+/* --- Change badges --- */
+
+.change-badge {
+    font-size: var(--font-size-2xs);
+    font-weight: 700;
+    padding: 0 0.25rem;
+    border-radius: 0.125rem;
+    margin-left: auto;
+    flex-shrink: 0;
+}
+
+.change-badge-modified { color: var(--accent); }
+.change-badge-added { color: var(--accent-green); }
+.change-badge-deleted { color: var(--accent-red); text-decoration: line-through; }
+
+.folder-change-dot {
+    width: 0.375rem;
+    height: 0.375rem;
+    border-radius: 50%;
+    background: var(--accent);
+    margin-left: 0.25rem;
+    flex-shrink: 0;
+}
+
+/* --- Repo file preview split (changed-files sidebar + main pane) --- */
+
+/* container-type lets the sidebar respond to the split's own inline-size,
+ * not the viewport — so dragging the SplitLayout divider triggers the show/hide. */
+.repo-preview-split {
+    container-type: inline-size;
+    display: flex;
+    height: 100%;
+    min-height: 0;
+}
+
+.repo-preview-split-sidebar {
+    display: none;
+    flex: 0 0 16rem;
+    overflow-y: auto;
+    border-right: 1px solid var(--border-color);
+    background: var(--bg-secondary);
+}
+
+.repo-preview-split-main {
+    flex: 1;
+    min-width: 0;
+    overflow: auto;
+}
+
+@container (min-width: 50rem) {
+    .repo-preview-split-sidebar {
+        display: block;
+    }
+}
+
+/* Sidebar status row used while the diff Loadable is loading or failed —
+ * keeps the column mounted so the user sees the in-flight fetch / error
+ * instead of a silent collapse into the no-sidebar layout. */
+.repo-preview-sidebar-state {
+    padding: 1rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+}
+
+.repo-preview-sidebar-error {
+    color: var(--accent-red);
+}
+
+.file-item.active {
+    background: var(--bg-tertiary);
+}
+
+/* --- Diff view --- */
+
+.diff-view {
+    font-family: var(--font-mono);
+    font-size: var(--font-size-sm);
+    overflow-x: hidden;
+    overflow-y: auto;
+}
+
+.diff-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem;
+    background: var(--bg-secondary);
+    font-weight: 600;
+}
+
+.diff-hunk-header {
+    padding: 0.25rem 0.5rem;
+    color: var(--text-muted);
+    background: var(--bg-tertiary);
+}
+
+.diff-line {
+    display: flex;
+    white-space: pre-wrap;
+    line-height: 1.4;
+}
+
+.diff-line-addition {
+    background: color-mix(in srgb, var(--accent-green) 20%, transparent);
+}
+
+.diff-line-deletion {
+    background: color-mix(in srgb, var(--accent-red) 20%, transparent);
+}
+
+.diff-line-num {
+    width: 3rem;
+    text-align: right;
+    padding-right: 0.5rem;
+    color: var(--text-muted);
+    user-select: none;
+    flex-shrink: 0;
+}
+
+.diff-line-marker {
+    width: 1rem;
+    text-align: center;
+    flex-shrink: 0;
+}
+
+.diff-line-addition .diff-line-marker { color: var(--accent-green); }
+.diff-line-deletion .diff-line-marker { color: var(--accent-red); }
+.diff-line-content {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    padding-left: 1rem;
+    text-indent: -1rem;
+    position: relative;
+}
+.diff-line-content::after {
+    content: '';
+    position: absolute;
+    top: 1.4em;
+    left: 0;
+    bottom: 0;
+    width: 0.5rem;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 14'%3E%3Cpath d='M2 4L5 7L2 10' fill='none' stroke='%236e7681' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-size: 0.5rem 1.4em;
+    background-repeat: repeat-y;
+    pointer-events: none;
+}
+
+/* --- Rendered diff (markdown with change marks) --- */
+
+.rendered-diff {
+    padding: 1rem 1.25rem;
+    overflow-y: auto;
+    height: 100%;
+    /* Containing block for .diff-strip-layer absolute children. */
+    position: relative;
+}
+
+/* Overlay that paints the change strips. Strips are positioned relative to
+   .rendered-diff's padding box, so left:0 lands on the panel edge regardless
+   of the marked element's nesting depth (paragraph, blockquote, nested li). */
+.diff-strip-layer {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+}
+
+.diff-strip {
+    position: absolute;
+    left: 0;
+    width: 0.1875rem;
+    border-radius: 0 0.1875rem 0.1875rem 0;
+}
+
+.diff-strip-added {
+    background: var(--accent-green);
+}
+
+/* Changed is a neutral third state alongside added/removed — not a caution. */
+.diff-strip-changed {
+    background: var(--accent-notable);
+}
+
+.diff-strip-removed {
+    background: var(--accent-red);
+}
+
+/* Full-width background tint that paints across the merged region — covers
+   the vertical margin gaps between adjacent marked siblings (paragraphs,
+   list items) which the per-element backgrounds can't reach. */
+.diff-bg {
+    position: absolute;
+    left: 0;
+    right: 0;
+}
+
+.diff-bg-added {
+    background: color-mix(in srgb, var(--accent-green) 12%, transparent);
+}
+
+.diff-bg-changed {
+    background: color-mix(in srgb, var(--accent-notable) 10%, transparent);
+}
+
+.diff-bg-removed {
+    background: color-mix(in srgb, var(--accent-red) 10%, transparent);
+}
+
+/* Removed lines are injected inline at their original position (a top-level
+   sibling of the rendered markdown), so the change-strip overlay paints the red
+   bar/tint just like added/changed. */
+.diff-rendered-removed {
+    margin: 0.5rem 0;
+}
+
+/* The <pre> carries only the raw old-file text — it must stay transparent so the
+   red overlay tint shows through, overriding `.markdown-content pre`'s grey
+   code-block background (hence the descendant selector for specificity). */
+.diff-rendered-removed .diff-removed-lines {
+    margin: 0;
+    padding: 0.125rem 0;
+    background: none;
+    border-radius: 0;
+    font-family: var(--font-mono);
+    font-size: var(--font-size-md);
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text-secondary);
+}
+
+/* Collapsed region between hunks — the rendered diff shows only the changed
+   blocks (plus git's context lines); each run of omitted unchanged content
+   renders as this gap marker. The "Show full file" toggle renders the whole
+   document instead. */
+.diff-rendered-gap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.5rem 0;
+    color: var(--text-muted);
+    font-size: var(--font-size-xl);
+    line-height: 1;
+    letter-spacing: 0.25em;
+    user-select: none;
+}
+
+/* Element-level marker classes carry no background — the overlay layer
+   (.diff-bg) paints the tint full-width so vertical margin gaps between
+   adjacent marked siblings stay tinted instead of showing as white bands.
+   The classes themselves remain so the overlay can locate them via querySelectorAll. */
+
+/* --- Diff stats --- */
+
+.diff-stats {
+    display: inline-flex;
+    gap: 0.375rem;
+    font-family: var(--font-mono);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    flex-shrink: 0;
+}
+
+.diff-header .diff-stats {
+    margin-left: auto;
+}
+
+.diff-stat-add { color: var(--accent-green); }
+.diff-stat-del { color: var(--accent-red); }
+
+.diff-stats-total {
+    display: flex;
+    justify-content: flex-end;
+    padding: 0.375rem 0.5rem;
+}
+
+/* --- Line numbers in file preview --- */
+
+.line-numbered {
+    padding: 0;
+}
+
+.code-line {
+    display: flex;
+    line-height: 1.4;
+}
+
+.line-number {
+    width: 3rem;
+    text-align: right;
+    padding-right: 0.75rem;
+    color: var(--text-muted);
+    user-select: none;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+@media (hover: hover) {
+    .line-number:hover { color: var(--text-primary); }
+}
+
+.line-content {
+    flex: 1;
+    white-space: pre;
+}
+
+.line-selected {
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+
+.line-selected .line-number {
+    color: var(--accent);
+}
+
+/* --- Repo file content --- */
+
+/* Whole-file / file-preview content inset. Matches the rendered diff
+   (.rendered-diff above), so switching between the diff and the full file keeps
+   the same gutter. `.repo-file-rendered` wraps the rendered (markdown / csv /
+   svg) views; `.repo-file-content` is the line-numbered source view. */
+.repo-file-content {
+    overflow: auto;
+    height: 100%;
+    padding: 1rem 1.25rem;
+    box-sizing: border-box;
+}
+
+.repo-file-rendered {
+    padding: 1rem 1.25rem;
+}
+
+/* Image/media variant: a definite height so a contained image's max-height:100%
+   still fits the pane once the padding wrapper is in place. */
+.repo-file-rendered-media {
+    height: 100%;
+    box-sizing: border-box;
+}
+
+/* --- File search modal --- */
+
+/* Rendered at app root (position:fixed). The overlay div is NEVER removed from
+   the DOM — iOS Safari PWA's compositor leaves ghost pixels when a fixed-position
+   layer is removed from the layer tree. Instead we toggle .file-search-closed. */
+/* Extends .modal-overlay — top-aligned column layout for file search */
+.file-search-overlay {
+    align-items: stretch;
+    flex-direction: column;
+    justify-content: flex-start;
+    padding: calc(2rem + env(safe-area-inset-top, 0px)) 1rem 2rem;
+}
+
+.file-search-overlay.file-search-closed {
+    visibility: hidden;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.file-search-modal {
+    display: flex;
+    flex-direction: column;
+    max-height: 100%;
+    max-width: 36rem;
+    width: 100%;
+    margin: 0 auto;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    box-shadow: var(--shadow-lg);
+    overflow: hidden;
+}
+
+.file-search-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
+}
+
+.file-search-icon {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+    flex-shrink: 0;
+    color: var(--text-muted);
+}
+
+.file-search-input {
+    flex: 1;
+    background: none;
+    border: none;
+    outline: none;
+    color: var(--text-primary);
+    font-size: var(--font-size-lg);
+    font-family: var(--font-ui);
+}
+
+.file-search-input::placeholder {
+    color: var(--text-muted);
+}
+
+.file-search-close {
+    flex-shrink: 0;
+}
+
+.file-search-results {
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    max-height: 20rem;
+}
+
+.file-search-empty {
+    padding: 1.5rem;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    font-family: var(--font-ui);
+}
+
+.file-search-result {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    padding: 0.375rem 0.75rem;
+    background: none;
+    border: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: background-color var(--duration-fast);
+}
+
+.file-search-result.selected {
+    background: var(--bg-hover);
+}
+
+@media (hover: hover) {
+    .file-search-result:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.file-search-result-icon {
+    width: 1.25rem;
+    height: 1.25rem;
+    flex-shrink: 0;
+    color: var(--text-secondary);
+}
+
+@media (hover: hover) {
+    .file-search-result:hover .file-search-result-icon {
+        color: var(--text-primary);
+    }
+}
+
+.file-search-result-info {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.file-search-result-name {
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.file-search-result-path {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.file-search-source-badge {
+    font-size: var(--font-size-3xs);
+    font-weight: 700;
+    padding: 0 0.25rem;
+    border-radius: 0.125rem;
+    flex-shrink: 0;
+    color: var(--text-muted);
+    border: 1px solid var(--border-color);
+}
+
+.file-search-source-workspace { color: var(--accent); border-color: var(--accent); }
+.file-search-source-repo { color: var(--text-muted); }
+.file-search-source-change { color: var(--accent-green); border-color: var(--accent-green); }
+
+.prompt-area {
+    position: relative;
+    padding: 0 1.15rem 0.75rem 0.75rem;
+    flex-shrink: 0;
+    margin-top: auto;
+    /* Dissolve transcript content into the prompt: an opaque base plus a
+       bg-colored shadow cast UPWARD over the bottom of the scroll area, so
+       any thread content fades out as it nears the prompt instead of cutting
+       off at a hard edge. Base rule (all viewports) — mobile keeps only its
+       layout-specific overrides. Previously this lived in the mobile-only
+       @media block, so the fade rendered on iOS Safari but not on desktop
+       Chrome/Safari. Tuned gradient-dominant (small solid offset, longer blur)
+       to read as gently as the title-header fade rather than a hard bg band.
+       Its upward reach (|offset| + blur = 1rem) is --prompt-fade (base.css); the
+       transcript's bottom padding tracks that var, so keep them matched. */
+    background: var(--bg-primary);
+    box-shadow: 0 -0.375rem 0.625rem 0 var(--bg-primary);
+}

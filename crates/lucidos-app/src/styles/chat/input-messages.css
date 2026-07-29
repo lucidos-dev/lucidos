@@ -1,0 +1,1130 @@
+/* Thread toggle inside chat pane — mobile only */
+.thread-pane-toggle {
+    display: none;
+}
+
+/* ThreadDrawer inside ThreadPane — mobile only, hidden on desktop */
+.thread-pane > .thread-drawer {
+    display: none;
+}
+
+/* thread-pane-body wrapper — transparent on desktop */
+.thread-pane-body {
+    display: contents;
+}
+
+/* Wrapper for the compose destination picker (picker row + caption + hint) */
+.input-toggles-wrapper {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.25rem;
+    width: 100%;
+    padding: 0.375rem 0 0.375rem 0.125rem;
+    transition: opacity var(--duration-slow) ease;
+}
+
+/* Fade out wrapper when transitioning to a focused thread */
+.input-toggles-wrapper.fading-out {
+    opacity: 0;
+    position: absolute;
+    width: 100%;
+    pointer-events: none;
+}
+
+.compose-destination-row {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    max-width: 100%;
+}
+
+.compose-destination-row .compose-destination-picker {
+    margin-bottom: 0;
+    flex-shrink: 1;
+    min-width: 0;
+}
+
+.compose-destination-row .compose-destination-picker .dropdown-trigger {
+    min-width: 0;
+}
+
+.compose-destination-row .compose-destination-picker .dropdown-sizer > * {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Cap the menu so a long app/repo name clips (via the global
+ * .dropdown-option-label ellipsis) instead of growing the fixed-position
+ * menu past a mobile viewport. */
+.compose-destination-row .compose-destination-picker .dropdown-menu {
+    max-width: min(24rem, calc(100vw - 1rem));
+}
+
+.compose-coding-agent-chip {
+    flex-shrink: 0;
+}
+
+.compose-destination-caption {
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+.prompt-input-container {
+    width: 100%;
+    max-width: var(--content-max-width);
+    margin: 0 auto;
+    position: relative;
+}
+
+.url-context-pill {
+    padding: 0.25rem 0.625rem;
+    margin-bottom: 0.375rem;
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    border-radius: 1rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    cursor: default;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    max-width: 100%;
+}
+.url-context-pill svg {
+    flex-shrink: 0;
+    opacity: 0.7;
+}
+.url-context-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.image-preview-strip {
+    display: flex;
+    gap: 0.5rem;
+    padding: 0.5rem 0;
+    flex-wrap: wrap;
+}
+
+.image-preview-item {
+    position: relative;
+    width: 5rem;
+    height: 5rem;
+    border-radius: 0.375rem;
+    border: 1px solid var(--border-color);
+}
+
+.image-preview-thumb {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    cursor: pointer;
+    border-radius: 0.3125rem;
+    overflow: hidden;
+}
+
+/* Overlay close button for image thumbnails */
+.image-preview-remove {
+    position: absolute;
+    top: -0.375rem;
+    right: -0.375rem;
+    width: 1.5rem;
+    height: 1.5rem;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.5);
+    color: #fff;
+    padding: 0;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.image-preview-remove svg {
+    width: 0.75rem;
+    height: 0.75rem;
+}
+
+@media (hover: hover) {
+    .image-preview-remove:hover {
+        background: var(--accent-red);
+        color: white;
+        border-color: var(--accent-red);
+    }
+}
+
+/* User image thumbnails in chat exchange */
+.user-images {
+    display: flex;
+    gap: 0.375rem;
+    margin-top: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.user-image-thumb {
+    width: 5rem;
+    height: 5rem;
+    object-fit: cover;
+    border-radius: 0.25rem;
+    border: 1px solid var(--border-color);
+    cursor: pointer;
+    /* Skeleton-toned fill so the loading <img> doesn't show the dark page
+       background through it (the visible "black flash" on iOS PWA when
+       the preview re-fetches after HTTP-cache eviction). */
+    background-color: var(--bg-tertiary);
+}
+
+/* Generated image inline in response */
+.generated-image {
+    margin: 0.75rem 0;
+}
+
+.prompt-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    position: relative;
+}
+
+.prompt-row .prompt-textarea {
+    flex: 1;
+}
+
+.prompt-clear {
+    color: var(--text-muted);
+    align-self: flex-start;
+    margin-top: 0.5rem;
+    margin-right: 0.5rem;
+    flex-shrink: 0;
+}
+
+@media (max-width: 768px) {
+    .prompt-clear {
+        width: 2.25rem;
+        height: 2.25rem;
+        margin-top: 0.125rem;
+        margin-right: 0.125rem;
+        padding: 0;
+        justify-content: center;
+        -webkit-tap-highlight-color: transparent;
+    }
+
+    .prompt-clear svg {
+        width: var(--icon-size-lg);
+        height: var(--icon-size-lg);
+    }
+}
+
+.prompt-actions-row {
+    display: flex;
+    align-items: flex-end;
+    padding: 0 0.75rem 0.5rem 0.5rem;
+    /* Anchor for absolutely-positioned fade-out children. The row width is
+     * stable across cluster reflows, unlike .prompt-actions-right (which has
+     * margin-left:auto and shifts when its leftmost child leaves flow). */
+    position: relative;
+}
+
+.image-attach-anchor {
+    position: relative;
+}
+
+/* Center-align the 2.25rem image icon with the shorter action buttons:
+ * shift its visual box ~6px down so the SVG center matches the action
+ * button center. Tap area moves with it but stays inside the row's
+ * 0.5rem bottom padding. */
+.prompt-actions-row .icon-btn.header-icon {
+    transform: translateY(0.375rem);
+}
+
+.prompt-actions-right {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-left: auto;
+    /* Safety net: when the measurement-driven `is-stacked` lift can't engage
+     * (no liftable slot — e.g. a question-answer thread showing
+     * Save / Cancel / Submit), the buttons must wrap onto another row instead
+     * of overflowing the prompt row off-screen. flex-shrink (default 1) lets
+     * this group give up width under the row's auto margin when free space goes
+     * negative, so wrapping engages. `wrap-reverse` keeps the default position
+     * the BOTTOM row (the first/primary buttons stay anchored at the bottom)
+     * and lifts only the overflow UP onto a new row above — matching the
+     * `is-stacked` lift, so a button like Save isn't needlessly pushed to the
+     * top. Right-aligned via justify-content. */
+    flex-wrap: wrap-reverse;
+    justify-content: flex-end;
+}
+
+/* Stacked variant — useFitsInOneRow detected overflow, so the secondary
+ * button (the Diff button, in the banner or standalone while composing) lifts
+ * onto a sub-row directly above the primary buttons. Stays inside this column so
+ * the icons (siblings on the left of .prompt-actions-row) don't introduce a
+ * tall flex-end gap above the primary sub-row. */
+.prompt-actions-right.is-stacked {
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.5rem;
+}
+
+.prompt-actions-subrow {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.changes-bulk-actions {
+    display: flex;
+    gap: 0.5rem;
+    padding: 0.625rem 0.75rem;
+}
+
+.change-description {
+    display: block;
+    font-size: var(--font-size-sm);
+    font-weight: 400;
+}
+
+.control-menu {
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+
+.commands-btn {
+    flex-shrink: 0;
+    transition: color 0.3s ease;
+}
+
+.commands-btn svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+}
+
+.commands-btn-active {
+    color: var(--initiator-coding-agent);
+    animation: control-connect-pulse 0.6s ease-out;
+}
+
+@keyframes control-connect-pulse {
+    0% { transform: scale(1); }
+    40% { transform: scale(1.3); }
+    100% { transform: scale(1); }
+}
+
+@media (hover: hover) {
+    .commands-btn:hover:not(:disabled) {
+        color: var(--accent);
+    }
+}
+
+.control-dropdown {
+    position: absolute;
+    bottom: calc(100% + 0.375rem);
+    left: 0;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    box-shadow: var(--shadow-sm);
+    min-width: 12rem;
+    height: 20rem;
+    overflow-y: auto;
+    z-index: 100;
+}
+
+/* The Lucidos Agent picker (LucidosControlMenu) reuses the coding-agent
+   control-menu styles, but its root view holds only two rows — a fixed 20rem
+   height would leave a large empty panel. Size to content, capped so a long
+   model list still scrolls. */
+.control-dropdown-auto {
+    height: auto;
+    max-height: 20rem;
+}
+
+/* The Lucidos Agent control button renders the agent glyph as the Lucidos mark
+   (an inline SVG with its own brand gradient — no `color` tint applies). */
+.lucidos-agent-glyph {
+    display: inline-flex;
+    align-items: center;
+    line-height: 1;
+}
+
+.control-list {
+    display: flex;
+    flex-direction: column;
+    padding: 0.25rem;
+}
+
+.control-filter {
+    margin: 0.25rem;
+}
+
+.control-empty {
+    padding: 0.5rem 0.625rem;
+    font-size: var(--font-size-md);
+    color: var(--text-secondary);
+}
+
+.control-section-label {
+    padding: 0.25rem 0.625rem;
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.control-item {
+    display: block;
+    width: 100%;
+    padding: 0.375rem 0.625rem;
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: 0.25rem;
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    cursor: pointer;
+}
+
+.control-item:hover,
+.control-item-active {
+    background: var(--bg-hover);
+}
+
+.control-option {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+.control-option-label {
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.control-checkmark {
+    color: var(--accent);
+    font-size: var(--font-size-sm);
+    font-weight: 700;
+}
+
+.control-current-value {
+    color: var(--text-muted);
+    font-weight: 400;
+}
+
+.control-option-current {
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.control-option-desc {
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+}
+
+.control-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    padding: 0.5rem;
+}
+
+.control-form-title {
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.control-input {
+    padding: 0.375rem 0.5rem;
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+}
+
+.control-input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.control-form-actions {
+    display: flex;
+    gap: 0.375rem;
+    justify-content: flex-end;
+}
+
+.image-attach-menu {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    margin-bottom: 0.25rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    box-shadow: var(--shadow-md);
+    overflow: hidden;
+    z-index: var(--z-dropdown);
+    min-width: 8.75rem;
+}
+
+.image-attach-menu button,
+.image-attach-menu label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    background: none;
+    border: none;
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    font-family: var(--font-ui);
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+@media (hover: hover) {
+    .image-attach-menu button:hover,
+    .image-attach-menu label:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.image-attach-menu button svg,
+.image-attach-menu label svg {
+    color: var(--text-muted);
+    flex-shrink: 0;
+}
+
+/* Camera capture overlay */
+.camera-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.7);
+    z-index: 500;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.camera-container {
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    overflow: hidden;
+    max-width: 40rem;
+    width: 90%;
+}
+
+.camera-video {
+    width: 100%;
+    display: block;
+    background: #000;
+}
+
+.camera-controls {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+    padding: 0.75rem;
+}
+
+.camera-capture-btn {
+    width: 3rem;
+    height: 3rem;
+    border-radius: 50%;
+    border: 0.1875rem solid var(--text-primary);
+    background: none;
+    color: var(--text-primary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: opacity 0.15s;
+}
+
+@media (hover: hover) {
+    .camera-capture-btn:hover {
+        opacity: 0.8;
+    }
+}
+
+.thread-content-wrap {
+    flex: 1;
+    position: relative;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.thread-content {
+    display: none;
+    min-height: 3.75rem;
+    /* Use absolute positioning instead of height: 100% — iOS Safari (WebKit) doesn't
+       resolve percentage heights correctly when the parent's height comes from flex: 1.
+       Parent .thread-content-wrap has position: relative, so inset: 0 fills it. */
+    position: absolute;
+    inset: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overflow-anchor: none; /* manual scroll anchoring — prevent browser interference */
+    overscroll-behavior: contain;
+    /* Top/bottom padding reserves room for a first/last turn's navigation focus
+       marker (.nav-focus-stuck) so it clears the fades instead of being dissolved
+       by them: past the desktop top-fade mask (--thread-top-fade) above, and past
+       the prompt dissolve (--prompt-fade) below, each plus the marker's reach
+       (--nav-focus-reach). scroll-margin-top handles navigated MID-thread turns,
+       but the boundary turns can't be scrolled clear (already at top/bottom), so
+       the padding is what gives them room. Mobile zeroes padding-top (uses a
+       ::before header spacer) and re-sets padding-bottom in mobile.css. */
+    padding:
+        calc(var(--thread-top-fade) + var(--nav-focus-reach))
+        0.75rem
+        calc(var(--prompt-fade) + var(--nav-focus-reach));
+}
+
+.thread-content.visible {
+    display: block;
+}
+
+/* The transcript is a keyboard-focusable scroll region (tabindex=0) so Arrow/Page
+   keys scroll it. It never shows a focus outline: a whole-pane ring around the
+   entire conversation while arrow-scrolling reads as chrome, not affordance. The
+   per-turn navigation marker (.nav-focus-stuck) already shows which turn is
+   focused, so the pane itself stays borderless in both keyboard and pointer focus. */
+.thread-content:focus,
+.thread-content:focus-visible {
+    outline: none;
+}
+
+/* Constrain transcript children to the same width as the prompt below so
+   messages line up with it on wide screens. The scroll container itself
+   stays full-width to keep the scrollbar at the pane edge. */
+.thread-content > * {
+    max-width: var(--content-max-width);
+    margin-left: auto;
+    margin-right: auto;
+}
+
+/* Spinner is always visible — no opacity animation. iOS Safari drops CSS
+   animations inside scroll-snap containers after prolonged use, leaving
+   the spinner permanently at opacity:0 and the screen completely blank. */
+
+/* Clipping container for thread-view slide animation — thread slides in
+   from the bottom, clipped so it doesn't bleed over the prompt area. */
+.thread-view-clip {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* Slide the entire thread (title + content) up from below.
+   The parent .thread-view-clip clips the sliding element. */
+.thread-view.revealing {
+    animation: thread-slide-in var(--duration-slow) ease-out both;
+}
+
+@keyframes thread-slide-in {
+    from { transform: translateY(100%); }
+    to { transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .thread-view.revealing {
+        animation: none;
+    }
+}
+
+.scroll-to-top,
+.scroll-to-bottom {
+    position: absolute;
+    right: 1.125rem;
+    width: var(--scroll-chevron-size);
+    height: var(--scroll-chevron-size);
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
+    backdrop-filter: blur(0.5rem);
+    -webkit-backdrop-filter: blur(0.5rem);
+    border: 0.125rem solid var(--border-color);
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s, background-color 0.15s, color 0.15s, border-color 0.15s;
+    z-index: calc(var(--z-float) + 1);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+}
+
+.scroll-to-top { top: max(calc(env(safe-area-inset-top, 0px) + 0.75rem), calc(var(--mobile-header-height, 0rem) + 0.25rem)); }
+.scroll-to-bottom { bottom: 0.75rem; }
+
+.scroll-to-top.visible,
+.scroll-to-bottom.visible {
+    opacity: 0.85;
+    pointer-events: auto;
+}
+
+@media (min-width: 769px) {
+    /* Keep the chevrons INSIDE the centered transcript, a fixed margin in from its
+       right edge — never floating out in the gutter. The scroll container is
+       full-width but its content is capped at --content-max-width and centered
+       (.thread-content > *), so the content's right edge is `50% - --content-max-width/2`
+       from the pane's right. Add 0.75rem so the chevron's right edge sits 0.75rem
+       inside that content edge. max() floors it at 1.5rem from the pane edge on
+       narrow panes where the gutter collapses (content then fills the 0.75rem
+       .thread-content padding box, so 1.5rem keeps the same 0.75rem inset); the two
+       expressions meet exactly at the collapse width, so the inset stays constant. */
+    .scroll-to-top,
+    .scroll-to-bottom {
+        right: max(1.5rem, calc(50% - var(--content-max-width) / 2 + 0.75rem));
+    }
+
+    /* Fade the top of the transcript so messages dissolve as they scroll up
+     * under the transparent thread title header, instead of cutting off at a
+     * hard edge. Desktop only — on mobile this scroll container holds its own
+     * sticky title bar (.mobile-thread-title-row), which must not be masked.
+     * The fade height is --thread-top-fade (base.css) so the deep-link scroll
+     * clearance (.chat-exchange scroll-margin-top, chat/response.css) tracks it. */
+    .thread-content {
+        -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 var(--thread-top-fade));
+        mask-image: linear-gradient(to bottom, transparent 0, #000 var(--thread-top-fade));
+    }
+}
+
+@media (hover: hover) {
+    .scroll-to-top { top: max(var(--scroll-chevron-top), calc(env(safe-area-inset-top, 0px) + var(--scroll-chevron-top))); }
+    .scroll-to-top:hover,
+    .scroll-to-bottom:hover {
+        opacity: 1;
+        background: var(--bg-hover);
+        color: var(--text-primary);
+        border-color: var(--text-muted);
+    }
+}
+
+.artifacts-desktop {
+    padding: 0.25rem 0.5rem;
+    min-height: 6.25rem;
+}
+
+.artifacts-desktop:empty::before {
+    content: 'No files yet';
+    display: block;
+    text-align: center;
+    padding: 1.5rem;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+}
+
+.exchange-status-label {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+}
+
+.exchange-status-check {
+    color: var(--accent-green);
+    font-size: var(--font-size-md);
+    font-weight: bold;
+    margin-left: -0.1875rem;
+    vertical-align: middle;
+}
+
+.exchange-status-x {
+    color: var(--accent-red);
+    font-size: var(--font-size-md);
+    font-weight: bold;
+}
+
+.exchange-status-warning {
+    color: var(--accent-yellow);
+    font-size: var(--font-size-md);
+    font-weight: bold;
+}
+
+.exchange-status-queued {
+    color: var(--text-muted);
+    font-size: var(--font-size-md);
+}
+
+/* Terminal-but-neutral divider header: a question/permission prompt whose turn
+   ended without a response for a non-user-cancel reason (system abort, error,
+   agent raced past). Muted + glyphless — the precise turn cause (Aborted ⚠ /
+   Error ✕) is shown by the response panel + abort boundary, not here. */
+.exchange-status-dropped {
+    color: var(--text-muted);
+    font-size: var(--font-size-md);
+}
+
+.queued-message-remove {
+    width: 1.25rem;
+    height: 1.25rem;
+    padding: 0.125rem;
+    color: var(--text-muted);
+    justify-content: center;
+}
+
+.queued-message-remove svg {
+    width: 0.85rem;
+    height: 0.85rem;
+}
+
+@media (hover: hover) {
+    .queued-message-remove:hover {
+        color: var(--accent-red);
+        background: color-mix(in srgb, var(--accent-red) 12%, transparent);
+    }
+}
+
+.queued-message-group {
+    padding: 0.2rem 0 0;
+}
+
+.queued-message-group-summary {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.375rem;
+    min-height: 1.75rem;
+    padding: 0.25rem var(--turn-body-inset);
+    color: var(--accent);
+    cursor: pointer;
+    user-select: none;
+    font-size: var(--font-size-sm);
+}
+
+.queued-message-group-summary::-webkit-details-marker {
+    display: none;
+}
+
+/* The ○ glyph carries its own muted color for the standalone queued bubble;
+   inside the accent-colored group header it should match the header instead. */
+.queued-message-group-summary .exchange-status-queued {
+    color: inherit;
+}
+
+.queued-message-group-label {
+    font-weight: 600;
+}
+
+@media (hover: hover) {
+    .queued-message-group-summary:hover {
+        color: var(--accent-light);
+    }
+}
+
+.exchange-status-awaiting {
+    color: var(--text-secondary);
+    font-size: var(--font-size-md);
+    font-weight: bold;
+}
+
+.exchange-status-continued {
+    color: var(--text-secondary);
+    font-size: var(--font-size-md);
+}
+
+
+.progress-dot {
+    display: inline-block;
+    width: 0.4rem;
+    height: 0.4rem;
+    border-radius: 50%;
+}
+
+.progress-dot-waiting {
+    background: var(--text-secondary);
+    animation: progress-pulse 2s ease-in-out infinite;
+}
+
+.progress-dot-changes {
+    background: var(--text-secondary);
+}
+
+.thread-status-question-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 0.7rem;
+    height: 0.7rem;
+    border-radius: 50%;
+    background: var(--text-secondary);
+}
+
+html[data-theme="light"] .thread-status-question-badge {
+    background: var(--text-muted);
+}
+
+.thread-status-question-badge::after {
+    content: "?";
+    font-size: var(--font-size-3xs);
+    font-weight: 700;
+    line-height: 1;
+    color: var(--text-on-accent);
+}
+
+html[data-theme="dark"] .thread-status-question-badge::after {
+    color: #000;
+}
+
+.progress-dot-loading {
+    background: var(--border-color);
+    animation: progress-pulse 2s ease-in-out infinite;
+    opacity: 0.5;
+}
+
+.progress-dot-failed {
+    background: var(--accent-red);
+}
+
+@keyframes progress-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
+
+/* Shared by the header recovery dot (panels/shell.css) and the System page's
+   engine-death indicator (settings/system.css) — keyframes are global. */
+@keyframes progress-blink-red {
+    0%, 100% { background: var(--accent-red); }
+    50% { background: transparent; }
+}
+
+/* --- Initiator turn — flat, card-less (Twitter-style feed). A human message
+   renders as a right-aligned gray bubble; every other initiator (agent/engine/
+   trigger/change/child/question/permission) is a flat transcript turn: icon +
+   plain (uncolored) name over a flush body. Turns are separated by a full-width
+   hairline. Attribution lives in the route popover, opened from the actor chip,
+   the timestamp, or (for change turns) the summary line. */
+.initiator-panel {
+    font-size: var(--font-size-md);
+    line-height: 1.5;
+}
+
+/* Feed-style padding on every turn — adjacent turns separate by this vertical
+   rhythm alone; there is no divider line between turns (borderless feed). The
+   navigation focus marker hands this back as margin when it tightens a focused
+   turn to a uniform gap (chat/response.css).
+
+   The RIGHT inset mirrors the content's LEFT inset (which lives on the header/
+   body padding-left), so a turn's content sits symmetrically inside the pane.
+   This symmetry is load-bearing for the navigation focus marker: with content
+   flush right, the marker had to reach var(--turn-body-inset) further right
+   than left to keep a uniform content gap — jutting into .thread-content's
+   gutter until its border sat flush against the pane edge while the left kept
+   its breathing room ("border is all the way to the right"). With the inset in
+   the base layout the marker needs no horizontal box tricks at all. */
+.initiator-panel,
+.response-panel {
+    padding: var(--turn-feed-pad-y) var(--turn-body-inset) var(--turn-feed-pad-y) 0;
+}
+
+.initiator-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding-left: var(--turn-body-inset);
+    margin-bottom: 0.7rem;
+    min-height: 1.2rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    flex-wrap: wrap;
+}
+
+/* Both the initiator and response headers collapse the turn's body when clicked
+   — cursor: pointer is the affordance. Neither lights up the whole row on hover:
+   the hover highlight lives on the chips INSIDE the header (the actor/executor
+   chip — button.initiator-actor / .response-executor — and the timestamp/summary
+   buttons), so only the "[icon] Claude Code" chip tints, never the edge-to-edge
+   row. A full-row tint read as a heavy affordance stacked on the chip's own. */
+.initiator-header-clickable,
+.response-header-clickable {
+    cursor: pointer;
+    user-select: none;
+}
+
+.initiator-icon {
+    flex-shrink: 0;
+    font-size: var(--font-size-lg);
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+}
+/* Component icons (e.g. the Claude logo on a coding-agent question/permission
+   divider) — size + tint to match the response executor's icon. Emoji string
+   icons are unaffected. */
+.initiator-icon svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+    color: var(--initiator-coding-agent);
+}
+
+.initiator-label {
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+    min-width: 0;
+}
+
+/* Right-aligned header cluster: optional status chip (question/permission
+   resolution) + the timestamp. */
+.initiator-meta {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-shrink: 0;
+}
+.initiator-timestamp {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+/* Chromeless turns (user bubble, change events) carry no actor chip — the
+   timestamp, and for change turns the "Change applied" summary, are the
+   route-popover triggers. */
+.initiator-timestamp-button {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font: inherit;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    padding: 0;
+}
+.initiator-summary-link {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0;
+    font-family: inherit;
+    font-size: inherit;
+}
+@media (hover: hover) {
+    /* Timestamp dims to secondary; the summary keeps its reason color (green/
+       red/muted) and only gains an underline. */
+    .initiator-timestamp-button:hover {
+        color: var(--text-secondary);
+    }
+    .initiator-timestamp-button:hover,
+    .initiator-summary-link:hover {
+        text-decoration: underline;
+        text-underline-offset: 0.15rem;
+    }
+}
+
+.initiator-actor,
+.response-executor {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.125rem 0.375rem;
+    margin: -0.125rem -0.375rem;
+    min-width: 0;
+    background: transparent;
+    border: none;
+    border-radius: 0.25rem;
+    color: inherit;
+    font: inherit;
+    transition: background var(--duration-fast);
+    text-align: left;
+}
+button.initiator-actor,
+.response-executor {
+    cursor: pointer;
+}
+
+@media (hover: hover) {
+    button.initiator-actor:hover,
+    .response-executor:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.initiator-body {
+    color: var(--text-primary);
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    /* Match the LLM response body's left inset so change cards, questions, and
+       every other initiator turn line up with the response text above them. */
+    padding-left: var(--turn-body-inset);
+}
+
+/* User message → right-aligned bubble with the accent tint (the same surface as
+   a picked question answer), no border. */
+.initiator-panel-bubble .initiator-body {
+    display: flex;
+    justify-content: flex-end;
+}
+.user-bubble {
+    background: var(--picked-surface);
+    border-radius: 0.9rem;
+    padding: 0.55rem 0.85rem;
+    max-width: 85%;
+    line-height: 1.55;
+}
+.user-bubble .markdown-content p:last-child {
+    margin-bottom: 0;
+}
+
+/* Collapsed turn indicator — shown on ANY collapsed panel (initiator or
+   response) so a folded turn isn't an empty row: a muted "⋯", rendered as a
+   small accent-tinted stub bubble on the right for a user message. */
+.turn-collapsed {
+    cursor: pointer;
+    /* Match the header/body left inset so the folded "⋯" lines up with the
+       rest of the turn content instead of sitting flush against the edge. */
+    padding-left: var(--turn-body-inset);
+}
+.turn-collapsed-bubble {
+    display: flex;
+    justify-content: flex-end;
+}
+.turn-collapsed-dots {
+    color: var(--text-muted);
+    font-size: var(--font-size-xl);
+    line-height: 1;
+}
+.turn-collapsed-bubble .turn-collapsed-dots {
+    background: var(--picked-surface);
+    border-radius: 0.9rem;
+    padding: 0.1rem 0.7rem;
+}
+
+.initiator-summary {
+    font-weight: 500;
+    color: var(--text-primary);
+    text-align: left;
+    display: block;
+}
+
+.initiator-summary + .change-body,
+.initiator-summary + .markdown-content,
+.initiator-summary + .initiator-files {
+    margin-top: 0.25rem;
+}
+
+.initiator-files {
+    margin: 0;
+    padding-left: 1.25rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+}
+
+.initiator-files li {
+    margin: 0.125rem 0;
+}

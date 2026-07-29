@@ -1,0 +1,768 @@
+/*
+ * Lucidos host-chrome component CSS — HOST BUNDLE ONLY (never served to apps).
+ *
+ * These component classes are used only by the Lucidos host shell, not by app
+ * iframes: the header/filter icon-button variants, the send→cancel morph button,
+ * the custom <Dropdown> + nav-history popover, and the list-row FLIP helper.
+ *
+ * Imported by `global.css` AFTER `shared-components.css` so rules that extend a
+ * shared base class by source order (e.g. .send-cancel-morph overriding
+ * .action-btn's transition) keep winning. Deliberately NOT part of the
+ * `/api/v1/sdk-iframe.css` the engine serves to apps — apps get only the
+ * reusable layer in `shared-components.css` and use `lucidos.ui.Select`
+ * (.lucidos-select, in the engine's sdk_iframe.css) instead of .dropdown*.
+ *
+ * Keep genuinely-reusable component classes in `shared-components.css`, not here.
+ */
+
+/* ── Navigation focus marker (the "focus stick") ─────────────────────────────
+   Shared by every host navigation that lands on a specific inner element in a
+   scroll container — a chat event/change exchange, a settings item, a plugin row
+   (driven by components/shared/focusMarker.ts). Just a persistent BORDER
+   (.nav-focus-stuck) — no entrance animation. It sticks until the user takes any
+   action (scroll / keypress / click / new nav / explicit scroll), then smoothly
+   fades out via .nav-focus-fading before being removed.
+
+   The border is an `outline` with `outline-offset`, NOT a `border` or a
+   border-box box-shadow: outline is outside the box model (no layout shift — the
+   deep-link landing relies on scroll-margin staying exact), `outline-offset`
+   places it at the element's OUTER edge with a uniform gap to content (fixes the
+   "border should be at the outer edge with padding to content" report), and
+   `outline` follows `border-radius`. Its LOOK matches the shared keyboard
+   focus-ring (--focus-ring in base.css): a soft, semi-transparent accent band
+   (same 0.1875rem width + `color-mix(--accent 55%)`) rather than a solid,
+   saturated line — expressed as an outline so it keeps the box-model/forced-colors
+   properties above. Tracks --accent for theming. This per-turn marker is why the
+   `.thread-content` scroll region itself shows no focus outline (input-messages.css):
+   the marker signals focus, not a ring around the whole conversation. Always-on;
+   not applied to apps or whole-pane opens (trigger detail, file preview). */
+.nav-focus-stuck {
+    border-radius: 0.375rem;
+    outline: 0.1875rem solid color-mix(in srgb, var(--accent) 55%, transparent);
+    outline-offset: 0.1875rem;
+}
+
+/* Fade-out on dismiss. The transition lives on this modifier (not on
+   .nav-focus-stuck) so the border APPEARS instantly on landing and only the
+   removal animates: adding .nav-focus-fading is the "after-change" style that
+   carries the transition, so outline-color animates accent → transparent, then
+   focusMarker.ts removes both classes once the fade completes (NAV_FOCUS_FADE_MS
+   must match this duration). */
+.nav-focus-stuck.nav-focus-fading {
+    outline-color: transparent;
+    transition: outline-color 0.4s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    /* focusMarker.ts also skips the fade timer under reduced motion; this is the
+       CSS backstop so no outline-color transition runs. */
+    .nav-focus-stuck.nav-focus-fading {
+        transition: none;
+    }
+}
+
+/* Header-level icon buttons — 2.25rem tap target, large icons, background fills full area */
+.icon-btn.header-icon {
+    position: relative;
+    width: 2.25rem;
+    height: 2.25rem;
+    padding: 0;
+    justify-content: center;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.icon-btn.header-icon svg {
+    width: var(--icon-size-lg);
+    height: var(--icon-size-lg);
+}
+
+.icon-btn.filter-active,
+.icon-btn.view-selector-active {
+    color: var(--accent);
+    background: var(--bg-tertiary);
+    border-radius: 0.375rem;
+}
+
+@media (hover: hover) {
+    .icon-btn.filter-active:hover,
+    .icon-btn.view-selector-active:hover {
+        background: var(--bg-quaternary);
+        color: var(--accent);
+    }
+}
+
+.icon-btn.pinned {
+    color: var(--accent);
+}
+
+/* Send → Cancel morph button. Always rendered at the same JSX position
+ * across send/cancel/canceling/placeholder so Preact never unmounts the
+ * DOM node — class-driven mode changes let the .action-btn background-color
+ * transition above animate the blue→red morph. min-width fits "Cancel..."
+ * so the row doesn't jitter sideways when the label changes.
+ * morph-placeholder keeps the row height stable when nothing else fills
+ * the slot. The "hidden" mode is handled by not rendering the button at
+ * all — snap-unmount, like the sibling section buttons — so the leave
+ * path doesn't pop to the prompt frame edge. */
+.send-cancel-morph {
+    transition:
+        background-color var(--duration-emphasis),
+        color var(--duration-normal),
+        opacity var(--duration-normal);
+}
+.send-cancel-morph.morph-placeholder {
+    visibility: hidden;
+    pointer-events: none;
+}
+
+/* Round icon variant of the send/cancel morph. Replaces the old text label
+ * ("Send" / "Cancel") with a single compact circle that swaps only its glyph
+ * between the send (up-arrow) and stop (square) states — saving horizontal
+ * space on mobile while staying the .action-btn blue across both states. The
+ * padding/min-width from .action-btn are reset so the circle isn't stretched
+ * by the label-era sizing. The diameter is sized to sit at the height of the
+ * neighbouring text action buttons (Save / Diff / Apply) so the row reads as
+ * one cluster, not an oversized primary button. */
+.send-cancel-round {
+    min-width: 0;
+    width: 1.625rem;
+    height: 1.625rem;
+    padding: 0;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+.send-cancel-round svg {
+    width: 0.9375rem;
+    height: 0.9375rem;
+}
+
+/* Split button: a one-tap primary face joined to a caret that opens an upward
+ * menu of secondary actions. Reused by the change-action banner (Apply +
+ * Diff/Discard/Archive) and the prompt's multi-select answer control (Submit +
+ * Cancel). The face + caret read as a single pill: the face loses its right
+ * radius, the caret loses its left radius, and a translucent hairline divides
+ * them. See components/shared/SplitButton.tsx. */
+.split-button {
+    position: relative;
+    display: flex;
+    align-items: stretch;
+}
+
+.split-button-primary {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+}
+
+.split-button-caret {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 0;
+    padding: 0.25rem 0.4375rem;
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    border-left: 1px solid color-mix(in srgb, var(--text-on-accent) 30%, transparent);
+}
+
+.split-button-caret svg {
+    transition: transform var(--duration-normal);
+}
+
+/* Open → flip the chevron to point down (menu is above, pointing back at it). */
+.split-button-caret.open svg {
+    transform: rotate(180deg);
+}
+
+/* When expanded, the caret menu and the primary row read as ONE unit: a single
+ * slightly-translucent frosted frame with the solid .action-btn pills (Diff /
+ * Discard / Apply) stacked inside it. STEADY BASE is the load-bearing rule: the
+ * primary button is the anchor and must NOT move when the menu opens. So the
+ * frame is NOT built by growing the in-flow `.split-button` box (padding/border
+ * on open shoved the right/bottom-anchored button up-and-left — the jump). It's
+ * two OUT-OF-FLOW pieces that wrap the steady button: the menu is the
+ * rounded-top half (absolute, above), `.split-button.open::before` (below) is
+ * the rounded-bottom half (absolute, behind the pills). Both extend the same
+ * `0.375rem` beyond the button on the sides, sharing the same translucent fill
+ * and hairline border, so they fuse into one panel around an unmoved button. */
+
+/* Upper half of the frame. Extended `0.375rem` beyond the button on each side
+ * (matching the ::before below) and dropped flush onto the button's top edge (no
+ * margin) so menu + button fuse. Even padding all round → the seam gap
+ * (menu padding-bottom + the button's top edge) matches the inter-pill gap, so
+ * Diff→Discard→Apply read as one even rhythm without the button needing any
+ * top padding (which would move it). */
+.split-button-menu {
+    position: absolute;
+    bottom: 100%;
+    left: -0.375rem;
+    right: -0.375rem;
+    margin-bottom: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    padding: 0.375rem;
+    background: color-mix(in srgb, var(--bg-secondary) 86%, transparent);
+    -webkit-backdrop-filter: blur(0.625rem) saturate(1.2);
+    backdrop-filter: blur(0.625rem) saturate(1.2);
+    border: 1px solid color-mix(in srgb, var(--border-color) 80%, transparent);
+    border-bottom: none;
+    border-radius: 0.5rem 0.5rem 0 0;
+    /* Up-only shadow so the unit lifts off the chat content above without
+     * casting onto (and darkening the seam over) the primary row below. */
+    box-shadow: 0 -0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.1);
+    z-index: var(--z-dropdown);
+    animation: split-button-menu-in var(--duration-normal) ease;
+}
+
+html[data-theme="dark"] .split-button-menu {
+    box-shadow: 0 -0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.4);
+}
+
+@keyframes split-button-menu-in {
+    from { opacity: 0; transform: translateY(0.375rem); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+.split-button-menu button {
+    width: 100%;
+    text-align: center;
+}
+
+/* Lower half of the frame, drawn OUT OF FLOW so the button never moves. The
+ * `::before` is absolutely positioned and extends `0.375rem` beyond the steady
+ * button on the sides + bottom and up to the button's top edge (the seam with
+ * the menu) — giving the same translucent fill + hairline border + rounded
+ * bottom + grounding shadow as the menu, wrapped around the unmoved pills. It
+ * sits BEHIND the pills (which get `z-index: 1` below); since it adds no padding
+ * or border to the in-flow box, opening the menu changes only paint, never
+ * layout. No `backdrop-filter` here on purpose: it would make this a backdrop
+ * root and break the menu's frost (the menu floats outside this box, over the
+ * chat content), so only the menu is frosted. */
+.split-button.open::before {
+    content: "";
+    position: absolute;
+    left: -0.375rem;
+    right: -0.375rem;
+    top: 0;
+    bottom: -0.375rem;
+    background: color-mix(in srgb, var(--bg-secondary) 86%, transparent);
+    border: 1px solid color-mix(in srgb, var(--border-color) 80%, transparent);
+    border-top: none;
+    border-radius: 0 0 0.5rem 0.5rem;
+    /* Down-only shadow (mirrors the menu's up-only) so the unit grounds at the
+     * bottom without bleeding a shadow up through the translucent menu seam. */
+    box-shadow: 0 0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.1);
+}
+
+html[data-theme="dark"] .split-button.open::before {
+    box-shadow: 0 0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.4);
+}
+
+/* Lift the pills above the ::before frame backing. position+z-index don't change
+ * layout, so the steady base holds. flex:1 makes [Apply & Restart] fill the row
+ * so it + the caret span the same width as the Diff / Discard pills above. */
+.split-button.open .split-button-primary,
+.split-button.open .split-button-caret {
+    position: relative;
+    z-index: 1;
+}
+
+.split-button.open .split-button-primary {
+    flex: 1;
+}
+
+/* Shared dropdown — custom select replacement */
+.dropdown {
+    position: relative;
+    flex-shrink: 0;
+}
+
+/* The selected value reads as the legible anchor of the control in both themes:
+   the old dim (secondary) + grey glow made it look disabled/fuzzy on light, and
+   washed-out grey on dark. Primary text, no glow — crisp everywhere. Hover keeps
+   the same colour; affordance comes from the border-colour shift alone. */
+.dropdown-trigger {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    padding: 0.25rem 0.5rem;
+    cursor: pointer;
+    outline: none;
+    transition: border-color 0.2s, color 0.2s;
+    display: flex;
+    align-items: center;
+    gap: 0.3125rem;
+    white-space: nowrap;
+}
+
+@media (hover: hover) {
+    .dropdown-trigger:hover {
+        border-color: var(--text-muted);
+    }
+}
+
+.dropdown-trigger:focus-visible {
+    color: var(--text-primary);
+    /* Shared --focus-ring — matches .action-btn / .icon-btn. */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+.dropdown-trigger:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.dropdown-placeholder {
+    color: var(--text-muted);
+    opacity: 0.6;
+}
+
+.dropdown-sizer {
+    display: grid;
+    text-align: left;
+}
+
+.dropdown-sizer > * {
+    grid-area: 1 / 1;
+    visibility: hidden;
+    white-space: nowrap;
+}
+
+.dropdown-sizer > :first-child {
+    visibility: visible;
+}
+
+.dropdown-chevron {
+    /* Push the chevron to the trailing edge whenever the trigger is wider than
+     * its content (e.g. a full-width `.form-group` dropdown) — content-width
+     * triggers have no slack, so this is a no-op there. */
+    margin-left: auto;
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+}
+
+/* Default styling for `.dropdown-menu` is `position: absolute`, anchored
+ * to its `.dropdown` wrapper. The shared `Dropdown` component overrides
+ * to `position: fixed` inline (paired with viewport-coordinate `top`/`left`
+ * from `useAnchoredPosition`) so the menu escapes any `overflow: hidden`
+ * ancestor — notably `.mobile-swipe-pane` on mobile, where an
+ * `absolute`-positioned menu was clipped at the pane edge regardless of
+ * placement direction. Custom callers that use `.dropdown-menu` directly
+ * (e.g. `ChangeSelector`) inherit the legacy absolute positioning. */
+.dropdown-menu {
+    position: absolute;
+    top: calc(100% + 0.25rem);
+    left: 0;
+    min-width: 100%;
+    max-height: 18.75rem;
+    overflow-y: auto;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    z-index: var(--z-dropdown);
+}
+
+/* Overflow (⋯) menu — a sleek icon-list popover (the shared OverflowMenu shell
+ * behind ThreadOverflowMenu + DraftOverflowMenu).
+ * Portaled to <body> with `position: fixed` offsets from `useAnchoredPosition`
+ * (set inline via panelStyle), so this rule owns only the box + rows, not
+ * placement. Being a <body> child it must out-rank the header chrome
+ * (--z-control-panel) to paint above it — same as `.nav-history-menu`. */
+.thread-overflow-menu {
+    /* Shrink-to-fit on the longest row, NOT the container width. The menu is
+     * portaled to <body> and measured (offsetWidth) by useAnchoredPosition while
+     * still in normal block flow (position is only applied once `pos` is
+     * computed) — a bare `display: block` child of <body> fills the viewport
+     * width, so the measured width came back ~viewport-wide. With `align: 'end'`
+     * (right edge pinned under the ⋯ trigger) that poisons
+     * `desiredLeft = rect.right - panelWidth` to a negative value, which the
+     * clamp then strands at the left margin. On desktop the drawer is a narrow
+     * left pane so the stranded menu still landed near the trigger; on mobile the
+     * full-width row puts the ⋯ at the far right, exposing the misalignment.
+     * `max-content` makes offsetWidth equal the rendered content width. */
+    width: max-content;
+    min-width: 12rem;
+    padding: 0.25rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    box-shadow: var(--shadow-md);
+    z-index: calc(var(--z-control-panel) + 1);
+}
+
+.thread-overflow-item {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    width: 100%;
+    padding: 0.5rem 0.625rem;
+    background: none;
+    border: none;
+    border-radius: 0.375rem;
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    font-family: var(--font-ui);
+    text-align: left;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.thread-overflow-item svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+    flex-shrink: 0;
+    color: var(--text-muted);
+}
+
+@media (hover: hover) {
+    .thread-overflow-item:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.thread-overflow-item:focus-visible {
+    background: var(--bg-hover);
+    outline: none;
+}
+
+/* Disabled-but-focusable menu row (aria-disabled, e.g. the diff-pinned Refresh
+ * collapsed into the content-header ⋯). Dimmed and hover-inert, but it stays in
+ * the roving-focus order — a `disabled` button would strand OverflowMenu's
+ * keyboard-open focus when the row is first. */
+.thread-overflow-item[aria-disabled="true"] {
+    opacity: 0.5;
+    cursor: default;
+}
+
+@media (hover: hover) {
+    .thread-overflow-item[aria-disabled="true"]:hover {
+        background: none;
+    }
+}
+
+/* Destructive overflow item (e.g. Delete draft) — red label + glyph, overriding
+ * the item's default text/muted-icon colors. */
+.thread-overflow-item-danger,
+.thread-overflow-item-danger svg {
+    color: var(--accent-red);
+}
+
+.thread-overflow-divider {
+    height: 1px;
+    margin: 0.25rem 0.375rem;
+    background: var(--border-color);
+}
+
+/* Thread Info popover (ThreadOverflowMenu's Info item) — a small anchored panel
+ * of the thread's structured details, replacing the drawer row's old hover
+ * tooltip. Same box treatment as the overflow menu; the rows mirror the
+ * structured-tooltip grid (#tooltip-text.tooltip-rows) so the two read alike. */
+.thread-info-popover {
+    width: max-content;
+    min-width: 12rem;
+    padding: 0.625rem 0.75rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    box-shadow: var(--shadow-md);
+    z-index: calc(var(--z-control-panel) + 1);
+}
+
+/* `display: contents` on each row lets its label/value join the parent grid so
+ * the two columns stay aligned across every row. */
+.thread-info-rows {
+    display: grid;
+    grid-template-columns: auto auto;
+    column-gap: 1.5rem;
+    row-gap: 0.375rem;
+    white-space: nowrap;
+    font-size: var(--font-size-md);
+}
+
+.thread-info-row {
+    display: contents;
+}
+
+.thread-info-label {
+    color: var(--text-muted);
+}
+
+.thread-info-value {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    justify-self: end;
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+.thread-info-dot {
+    flex: none;
+    width: 0.4rem;
+    height: 0.4rem;
+    border-radius: 50%;
+    background: var(--text-muted);
+}
+
+.thread-info-dot-running { background: var(--accent); }
+.thread-info-dot-changes { background: var(--accent-green); }
+/* Waiting is a neutral in-between state, not a caution — --accent-notable, not
+   --accent-yellow. (The drawer row's own dot is .progress-dot-waiting, a pulsing
+   --text-secondary; this one only ever appears in the Info popover, beside the
+   word "Waiting".) */
+.thread-info-dot-waiting { background: var(--accent-notable); }
+.thread-info-dot-failed { background: var(--accent-red); }
+
+/* Saved pin (PinThreadButton): the icon is already filled (PinIcon filled) —
+ * the accent-colored filled silhouette alone signals the pinned state. No
+ * frame/background tint (the hover background still applies transiently, like
+ * every icon-btn). Shared across the drawer row + thread title headers. */
+.pin-thread-btn.active {
+    color: var(--accent);
+}
+
+/* Back/forward history popover — long-press or right-click on a nav chevron
+   (NavChevron). Reuses the .dropdown-menu surface + .dropdown-option rows;
+   constrains width so long thread / content titles ellipsize instead of shoving
+   the popover off a narrow viewport. The chevrons live in the floating
+   `.app-header` regions, whose `transform` traps a `position: fixed` child as
+   its containing block — so NavChevron portals this panel to <body> (escaping
+   the transform). Being a <body> child, it must out-rank the header chrome
+   (--z-control-panel) to paint above it; matches `.collapsed-thread-actions`. */
+.nav-history-menu {
+    min-width: 11rem;
+    max-width: min(20rem, 90vw);
+    z-index: calc(var(--z-control-panel) + 1);
+}
+
+/* History rows pair a leading type glyph (thread type for ThreadNav, content
+ * category for PanelNav) with the destination label. Scoped to the history
+ * menu so other `.dropdown-option` callers keep their plain block layout: the
+ * icon holds a fixed column and the label flexes + ellipsizes beside it. */
+.nav-history-menu .dropdown-option {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.nav-history-menu .dropdown-option .dropdown-option-label {
+    flex: 1;
+    min-width: 0;
+}
+
+/* Muted to match Search Everywhere's result icons; brand marks that paint
+ * their own color (the Lucidos gradient, the Codex accent stroke) ignore it.
+ * The Claude mark fills with `currentColor`, so it's tinted to its brand orange
+ * below — the same `--initiator-coding-agent` it wears in the chat executor
+ * chip — rather than reading as a muted gray glyph. */
+.nav-history-icon {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1rem;
+    height: 1rem;
+    color: var(--text-muted);
+}
+
+.nav-history-icon .claude-icon {
+    color: var(--initiator-coding-agent);
+}
+
+.nav-history-icon svg {
+    width: 1rem;
+    height: 1rem;
+}
+
+.dropdown-filter {
+    width: 100%;
+    padding: 0.25rem 0.5rem;
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    background: var(--bg-secondary);
+    border: none;
+    border-bottom: 1px solid var(--border-color);
+    color: var(--text-primary);
+    outline: none;
+    position: sticky;
+    top: 0;
+}
+
+.dropdown-no-results {
+    color: var(--text-muted);
+    cursor: default;
+}
+
+/* Option label sits at the primary text color so the muted second-line
+ * description and the section headers (both --text-secondary) read as
+ * de-emphasized beneath it — without this contrast every row is one flat
+ * --text-secondary and the hierarchy disappears. */
+.dropdown-option {
+    padding: 0.25rem 0.5rem;
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    color: var(--text-primary);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background-color 0.1s;
+}
+
+@media (hover: hover) {
+    .dropdown-option:hover {
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+    }
+}
+
+.dropdown-option.focused {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+}
+
+/* Current-selection marker — a small accent dot at the trailing edge, NOT a
+ * full-row color/background treatment. A blue-text (or background) active row
+ * competed with the arrow-key `.focused` row (which owns the bg-tertiary
+ * highlight): traversing showed two "special" rows and you couldn't tell which
+ * one the arrows were on. The dot reads as "this is the current one" without
+ * claiming the row highlight. `padding-right` reserves the dot's gutter so a
+ * long label ellipsizes before it instead of underlapping the dot. Only shown
+ * where the dropdown reflects a persisted current setting; transient "last
+ * used" pickers pass markCurrent={false} (no `.active` class). */
+.dropdown-option.active {
+    position: relative;
+    padding-right: 1.25rem;
+}
+
+.dropdown-option.active::after {
+    content: '';
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    width: 0.3125rem;
+    height: 0.3125rem;
+    border-radius: 50%;
+    background: var(--accent);
+}
+
+.dropdown-option.dropdown-option-header {
+    color: var(--text-secondary);
+    font-size: var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    cursor: default;
+    padding-top: 0.375rem;
+    padding-bottom: 0.125rem;
+}
+
+@media (hover: hover) {
+    .dropdown-option.dropdown-option-header:hover {
+        background: transparent;
+        color: var(--text-secondary);
+    }
+}
+
+.dropdown-option.dropdown-option-header.focused {
+    background: transparent;
+    color: var(--text-secondary);
+}
+
+/* Every option's label is wrapped (one DOM shape — see Dropdown.tsx); clip
+ * with ellipsis when a caller constrains the menu width. */
+.dropdown-option-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Optional second line under an option's label (DropdownOption.description).
+ * var(--text-secondary) matches the established option-description treatment
+ * (.control-option-desc, .question-option-desc, .change-option-desc). */
+.dropdown-option-description {
+    font-size: var(--font-size-2xs);
+    color: var(--text-secondary);
+    white-space: normal;
+    max-width: 16rem;
+}
+
+/* Error row (DropdownOption.danger) — a failed load must look different from
+ * an empty group. Danger rows skip the header class entirely (Dropdown.tsx),
+ * so no uppercase resets are needed here. */
+.dropdown-option.dropdown-option-danger {
+    color: var(--accent-red);
+    cursor: default;
+}
+
+@media (hover: hover) {
+    .dropdown-option.dropdown-option-danger:hover {
+        background: transparent;
+        color: var(--accent-red);
+    }
+}
+
+.dropdown-option.dropdown-option-danger.focused {
+    background: transparent;
+    color: var(--accent-red);
+}
+
+.dropdown-input-wrap {
+    display: flex;
+    align-items: center;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    transition: border-color var(--duration-normal);
+}
+
+.dropdown-input-wrap:focus-within {
+    /* Shared --focus-ring — matches .action-btn / .icon-btn. */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+.dropdown-input-wrap .dropdown-chevron {
+    padding: 0 0.5rem 0 0;
+    cursor: pointer;
+}
+
+/* Typed value uses primary text in both themes — the old secondary grey made it
+   look dim/disabled (matches the .dropdown-trigger treatment above). */
+.dropdown-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    padding: 0.25rem 0.5rem;
+    outline: none;
+    min-width: 0;
+}
+
+.dropdown-input::placeholder {
+    color: var(--text-muted);
+    opacity: 0.6;
+}
+
+.dropdown-input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* FLIP animation helper — disables the row's background transition while a
+   reorder animation runs. Host-only. */
+.list-row.flip-animating {
+    transition: none;
+}
+
+/* "See all statuses" shortcut sitting under a status-filter view's empty-state
+   message (thread drawer). A small gap separates it from the message; the link
+   itself is .accent-link (shared). Host-chrome only. */
+.empty-state-action {
+    margin-top: 0.5rem;
+}

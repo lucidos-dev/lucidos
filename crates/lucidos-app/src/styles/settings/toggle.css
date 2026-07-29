@@ -1,0 +1,149 @@
+/* Toggle switch */
+.toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 2.25rem;
+    height: 1.25rem;
+    cursor: pointer;
+}
+
+.toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.toggle-slider {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: var(--bg-tertiary);
+    border-radius: 1.25rem;
+    transition: background-color 0.2s;
+}
+
+.toggle-slider::before {
+    content: '';
+    position: absolute;
+    height: 0.875rem;
+    width: 0.875rem;
+    left: 0.1875rem;
+    bottom: 0.1875rem;
+    background-color: var(--text-muted);
+    border-radius: 50%;
+    transition: transform 0.2s, background-color 0.2s;
+}
+
+.toggle-switch input:checked + .toggle-slider {
+    background-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.toggle-switch input:checked + .toggle-slider::before {
+    transform: translateX(1rem);
+    background-color: var(--accent);
+}
+
+/* Keyboard focus shows our shared accent ring on the visible pill. The real
+   <input> is visually hidden (0×0, opacity 0), so a default outline would land
+   on nothing — match .action-btn / .icon-btn :focus-visible instead. */
+.toggle-switch input:focus-visible + .toggle-slider {
+    /* Transparent outline is the forced-colors fallback (box-shadow is stripped). */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+/* Disabled (e.g. a child toggle whose parent master is off) — dimmed and
+   non-interactive, but still shows its on/off position. */
+.toggle-switch-disabled {
+    cursor: not-allowed;
+}
+
+/* Neutral placeholder shown while the backing preference is still loading — a
+   dimmed pill with no knob, so the toggle mounts in its real on/off position
+   once loaded instead of animating across from a loading default on reload (see
+   `LoadableToggle`). */
+.toggle-switch-loading {
+    background-color: var(--bg-tertiary);
+    border-radius: 1.25rem;
+    opacity: 0.4;
+    cursor: default;
+}
+
+.toggle-switch input:disabled + .toggle-slider {
+    opacity: 0.4;
+}
+
+@media (max-width: 600px) {
+    .response-content table {
+        font-size: var(--font-size-xs);
+    }
+
+    .response-content th,
+    .response-content td {
+        padding: 0.25rem 0.375rem;
+    }
+
+    /* A big, solid dot IS the tap target on mobile (2.5em ≈ 40px). The old
+       trick — a 2.75em hit box with a 0.75em transparent border + padding-box
+       background-clip — kept the visible dot a tiny 1.25em, which read as "a
+       small dot with a halo (the transparent ring) around it". A solid thumb has
+       no ring and is easy to grab. box-shadow:none guards against any inherited
+       glow. */
+    .scale-modal-slider::-webkit-slider-thumb {
+        width: 2.5em;
+        height: 2.5em;
+        box-shadow: none;
+        /* Center thumb on track: -(2.5 - 0.25) / 2 */
+        margin-top: -1.125em;
+    }
+
+    .scale-modal-slider::-moz-range-thumb {
+        width: 2.5em;
+        height: 2.5em;
+        box-shadow: none;
+    }
+}
+
+/* Error notice — the red-tinted surface + red bold heading carry the emphasis.
+   No left accent bar (see .claude/rules/frontend.md — left-accent stripes on
+   cards/callouts/notices are forbidden). */
+.exchange-error {
+    padding: 0.75rem 1rem;
+    background: color-mix(in srgb, var(--accent-red) 8%, transparent);
+    color: var(--accent-red);
+    font-size: var(--font-size-lg);
+}
+.exchange-error strong {
+    display: block;
+    margin-bottom: 0.25rem;
+}
+.exchange-error p {
+    margin: 0;
+    opacity: 0.85;
+}
+
+/* Engine-limit notice — same no-stripe rule as .exchange-error above.
+   Unlike .exchange-error (a direct .chat-exchange child), this box lives INSIDE
+   a .response-panel, whose base padding-right insets turn content from the pane
+   edge (chat/input-messages.css). The notice is a full-bleed colored surface
+   flush left, so cancel that inset to keep it full-bleed right too — otherwise
+   it reads as a card that's mysteriously shy of one edge. */
+.exchange-engine-limit {
+    padding: 0.75rem 1rem;
+    margin-right: calc(-1 * var(--turn-body-inset));
+    background: color-mix(in srgb, var(--accent-yellow) 8%, transparent);
+    color: var(--accent-yellow);
+    font-size: var(--font-size-lg);
+}
+.exchange-engine-limit strong {
+    display: block;
+    margin-bottom: 0.25rem;
+}
+.exchange-engine-limit p {
+    margin: 0;
+    opacity: 0.9;
+    color: var(--text-primary);
+}
+

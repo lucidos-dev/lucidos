@@ -1,0 +1,5 @@
+# Documentation site dependencies (mkdocs-material + transclusion plugin).
+# Used by `mkdocs build --strict` locally and in .github/workflows/docs.yml.
+# Pinned for reproducible builds; bump deliberately.
+mkdocs-material==9.7.6
+mkdocs-include-markdown-plugin==7.3.0

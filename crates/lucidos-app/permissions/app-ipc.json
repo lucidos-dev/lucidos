@@ -1,0 +1,52 @@
+{
+  "permission": [
+    {
+      "identifier": "allow-app-ipc",
+      "description": "The app's own IPC surface: every command registered in `tauri::generate_handler!` except the three panel-preview report commands, which have their own permission (`allow-panel-report`) because they are invoked from an arbitrary previewed page rather than from our frontend. Granted to the app's own webviews (`main`, `window-*`) on the local app URL (dev) and on the packaged gateway origin (see capabilities/default.json and desktop::gateway_capability).\n\nThe presence of ANY app permission file is what creates the app ACL manifest (`__app-acl__`), which switches tauri's `has_app_acl_manifest` to true — so from here on EVERY app command is ACL-checked on EVERY origin, local included. A command registered in `generate_handler!` but missing from this list is denied everywhere, which is why `acl_tests::app_permissions_match_the_invoke_handler` (src/lib.rs) fails the build when the two drift.",
+      "commands": {
+        "allow": [
+          "create_panel_webview",
+          "navigate_panel_webview",
+          "close_panel_webview",
+          "set_panel_webview_bounds",
+          "hide_panel_webview",
+          "show_panel_webview",
+          "webview_go_back",
+          "webview_go_forward",
+          "webview_get_content",
+          "heartbeat",
+          "restart_app",
+          "restart_service",
+          "quit_lucidos",
+          "uninstall_lucidos",
+          "open_url_external",
+          "show_native_notification",
+          "dismiss_native_notification",
+          "nudge_dock_badge",
+          "get_native_window_active",
+          "take_pending_native_taps",
+          "check_app_update",
+          "install_app_update_and_restart",
+          "set_titlebar_color",
+          "start_window_drag",
+          "toggle_window_maximize",
+          "get_connect_info",
+          "tailscale_up",
+          "tailscale_serve",
+          "get_or_create_device_id"
+        ]
+      }
+    },
+    {
+      "identifier": "allow-panel-report",
+      "description": "The three report-back commands that the panel URL preview's injected JS calls from the PREVIEWED PAGE (see TITLE_OBSERVER_JS / URL_OBSERVER_JS / webview_get_content in src/lib.rs). Because the caller is arbitrary third-party content, the capability that grants this accepts any remote origin — so this permission is deliberately kept to the smallest possible surface and is granted ONLY on `url-preview-*` webviews (capabilities/panel-preview.json). Never add a command here that does anything other than report the previewed page's own title/URL/text back to the main window.",
+      "commands": {
+        "allow": [
+          "__panel_title_report",
+          "__panel_url_report",
+          "__panel_content_report"
+        ]
+      }
+    }
+  ]
+}

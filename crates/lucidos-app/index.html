@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en" translate="no" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-visual">
+    <meta name="google" content="notranslate">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Lucidos">
+    <meta name="theme-color" content="#07172e">
+    <title>Lucidos</title>
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+    <link rel="icon" type="image/png" sizes="48x48" href="favicon-48.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="favicon-16.png">
+    <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+    <!-- Relative ref (ADR 0014): resolves against the engine-stamped
+         `<base href="/<slug>/">`. Direct engine access serves the bundled
+         manifest as-is, so "." installs a per-workspace PWA. Gateway access on
+         port 5252 serves /<slug>/manifest.json itself and widens scope to "/",
+         so switching workspaces stays in the standalone PWA. In the picker
+         context (base "/~/") this resolves to /~/manifest.json, which the
+         gateway also re-stamps with scope "/" + start_url "/~/". -->
+    <link rel="manifest" href="manifest.json">
+    <!--
+      iOS PWA splash screens. Without exact-resolution apple-touch-startup-image
+      tags, iOS shows a white screen with the app title during WKWebView cold
+      restart (e.g. memory eviction on resume). Solid-#0d1117 PNGs make that
+      transition dark instead of white. Portrait-only — landscape PWA is rare
+      and iOS has a long-standing bug where it stretches portrait into landscape
+      anyway. Each PNG is ~700B (1-color palette).
+    -->
+    <link rel="apple-touch-startup-image" media="(device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="splash/splash-750x1334.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="splash/splash-828x1792.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 360px) and (device-height: 780px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1080x2340.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1125x2436.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1170x2532.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 393px) and (device-height: 852px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1179x2556.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1206x2622.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1242x2688.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1284x2778.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1290x2796.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1320x2868.png">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <!--
+      PWA cold-start fast path (the load-bearing smoothness fix). When the picker
+      (server-stamped <base href="/~/">) would auto-open the last workspace, do the
+      redirect HERE — in <head>, before the bundle loads and before anything
+      paints — so the picker NEVER renders a splash and there is no
+      picker→workspace cross-document reload seam (the persistent cold-start
+      jank/flicker). The browser goes straight to /<slug>/, which plays the single
+      reveal. Skipped when `?pick` is present (the in-app "Manage workspaces"
+      escape) or no workspace is remembered, so the picker still renders its list.
+      Reads the RAW device-global `lucidos-last-workspace` key (this runs before
+      workspaceStorage.install namespacing, matching how the picker writes it).
+      `location.replace` so the picker is not left in history. A since-deleted slug
+      is caught by the gateway, which 302s it to `/~/?pick` (server.rs) — `?pick`
+      then stands this redirect down, so there is no loop. Mirrors openWorkspace()
+      (`/${encodeURIComponent(id)}/`).
+
+      PRESERVES `location.search` + `location.hash` through the redirect. A push
+      tap can cold-launch the PWA in picker context with a deep link on the URL
+      (`/?notification=…&thread=…&tap=…` when the push subscription scope is the
+      gateway root). Redirecting to a bare `/<slug>/` dropped those params before
+      the app ever booted — so every such tap landed on the workspace with the
+      deep link gone (`handle_hash_location {found:false}`), turning the flaky iOS
+      push tap into a consistent failure. Carrying search+hash forward lands
+      `/<slug>/?notification=…`, which `handleHashLocation` then dispatches. (`?pick`
+      already returned above, so it can't be carried into a loop.)
+    -->
+    <script>
+      (function () {
+        try {
+          var base = document.querySelector('base');
+          if (!base || base.getAttribute('href') !== '/~/') return;
+          if (new URLSearchParams(location.search).has('pick')) return;
+          var slug = localStorage.getItem('lucidos-last-workspace');
+          // Preserve the deep link (notification/thread/tap query + any hash) so a
+          // push tap that cold-launches into the picker still reaches the workspace
+          // WITH its params, instead of a bare /<slug>/.
+          if (slug) location.replace('/' + encodeURIComponent(slug) + '/' + location.search + location.hash);
+        } catch (e) { /* fall through to the normal picker render */ }
+      })();
+    </script>
+    <!--
+      localStorage-driven FOUC. localStorage is the per-browser source of
+      truth for the user's theme/font/scale (preferences.ts mirrors every
+      change there); reading it synchronously before any stylesheet
+      evaluates makes first paint match the user's choice without a cookie
+      or DB roundtrip. These keys are PER-WORKSPACE (workspaceStorage.ts),
+      so they live under `ws:<slug>:…`. This script runs before the app
+      bundle installs the namespacing override, so it prefixes by hand via
+      `wsKey()` (slug from the stamped <base href>, mirroring basePath.ts).
+      Same-origin app iframes derive the SAME slug from their `/<slug>/…`
+      URL (sdk_prefs.rs + sdk/_storage.ts), so the parent and every app
+      iframe agree on first-paint values.
+    -->
+    <script>
+      (function() {
+        var d = document.documentElement;
+        // The workspace picker (gateway sigil surface, <base href="/~/">) is a
+        // pre-workspace page that renders standalone — preferences.ts never runs
+        // on it, so this FOUC resolve is its ONLY theme application. With no
+        // per-workspace preference to honor, it follows the OS theme when nothing
+        // is saved on this origin, instead of the app's dark default.
+        var baseEl = document.querySelector('base');
+        var isPicker = !!baseEl && baseEl.getAttribute('href') === '/~/';
+        // Per-workspace key namespacing (mirrors workspaceStorage.ts +
+        // basePath.ts). Slug from the stamped <base href="/<slug>/">; picker
+        // (/~/) and legacy root (/) → no slug → raw key (their own fallback).
+        var wsSlug = (function () {
+          var href = baseEl && baseEl.getAttribute('href');
+          if (!href) return null;
+          var seg = href.replace(/^\/+|\/+$/g, '');
+          return (seg === '' || seg === '~') ? null : seg;
+        })();
+        function wsKey(name) { return wsSlug ? 'ws:' + wsSlug + ':' + name : name; }
+        var raw = localStorage.getItem(wsKey('lucidos-theme'));
+        var fallbackTheme = isPicker ? 'system' : 'dark';
+        var theme = (raw === 'light' || raw === 'dark' || raw === 'system') ? raw : fallbackTheme;
+        var mqLight = matchMedia('(prefers-color-scheme: light)').matches;
+        var resolved = theme === 'system' ? (mqLight ? 'light' : 'dark') : theme;
+        d.setAttribute('data-theme', resolved);
+        var bg = resolved === 'light' ? '#ffffff' : '#07172e';
+        d.style.setProperty('--bg-primary', bg);
+        // Paint the boot-splash brand gradient on the document canvas during boot
+        // (solid #0a4ea8 fallback + fixed attachment). This covers TWO gaps:
+        //   1. the WKWebView white flash on iOS PWA cold-restart (what the
+        //      previous solid-`bg` inline covered), and
+        //   2. the iOS standalone bottom safe-area strip that the fixed
+        //      `inset:0` .boot-splash element leaves bare. The body gets the same
+        //      paint below: in light mode its own background otherwise wins in
+        //      that uncovered strip and shows white despite this root paint.
+        //      Same fixed-attachment-gradient technique the gateway
+        //      splash uses (crates/lucidos-gateway/src/proxy.rs `.mark`/html bg).
+        // dismissBootSplash() (src/utils/bootSplash.ts) reverts this to
+        // var(--bg-primary) once the splash is gone, so no blue lingers behind
+        // the app's own bottom safe-area inset.
+        d.style.background = '#0a4ea8 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed';
+        var FONTS = {
+          monospace: "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
+          system: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+          inter: "'Inter', system-ui, sans-serif",
+          'jetbrains-mono': "'JetBrains Mono', monospace",
+          'ibm-plex-mono': "'IBM Plex Mono', monospace",
+          'fira-code': "'Fira Code', monospace"
+        };
+        var fontKey = localStorage.getItem(wsKey('lucidos-font-family'));
+        d.style.setProperty('--font-ui', FONTS[fontKey] || FONTS.monospace);
+        // Programming ligatures, only for fonts that ship them (Fira Code);
+        // every other font gets `normal` (CSS initial → unchanged). Mirrors
+        // FONT_FEATURES in preferences.ts and the same map in api/sdk_prefs.rs.
+        var FEATURES = { 'fira-code': '"liga" 1, "calt" 1' };
+        d.style.setProperty('font-feature-settings', FEATURES[fontKey] || 'normal');
+        var scale = localStorage.getItem(wsKey('lucidos-ui-scale'));
+        if (scale) {
+          // Snap to the 12.5% grid (see UI_SCALE_STEP) so a pre-grid saved
+          // value like "115" doesn't paint at 115% for one frame before the
+          // app boots, re-clamps to 112.5%, and re-paints — visible flash.
+          var legacy = { small: 100, medium: 112.5, large: 125 };
+          var n = legacy[scale];
+          if (n === undefined) n = parseFloat(scale);
+          if (!isNaN(n)) {
+            var snapped = Math.min(200, Math.max(75, Math.round(n / 12.5) * 12.5));
+            d.style.setProperty('--user-ui-scale', snapped + '%');
+          }
+        }
+
+        // Always-on theme-flash telemetry: POST breadcrumbs to engine.log so
+        // we can grep for the transition that preceded a reported flash. The
+        // bug we're hunting (iOS WKWebView matchMedia returning a stale
+        // synchronous value at random post-FOUC moments) doesn't reproduce on
+        // demand, so the only way to catch it is to log every transition and
+        // inspect after the fact. Theme transitions fire ~3-5 times per cold
+        // load — negligible noise. window.__themeLogEvt is the same hook
+        // applyTheme() uses, kept here so both surfaces share one channel.
+        try {
+          var t0 = performance.now();
+          window.__themeLogEvt = function(label, info) {
+            var body = JSON.stringify({
+              category: 'theme',
+              message: label,
+              data: Object.assign({ tMs: Math.round(performance.now() - t0) }, info)
+            });
+            // keepalive=true so the POST survives a navigation away (pageshow
+            // breadcrumbs in particular can fire just before a route swap).
+            // Relative URL (ADR 0014): resolves against the engine-stamped
+            // `<base href="/<slug>/">` (or `/` at a legacy root), so the
+            // breadcrumb reaches this workspace's engine through the gateway —
+            // no inline prefix parsing needed.
+            fetch('api/v1/internal/client-log', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: body,
+              keepalive: true
+            }).catch(function() {});
+          };
+          window.__themeLogEvt('fouc', {
+            raw: raw, theme: theme, resolved: resolved, mqLight: mqLight
+          });
+          // pageshow fires on bfcache restore — the IIFE doesn't re-run, so
+          // re-read live values here instead of trusting the stale FOUC entry.
+          window.addEventListener('pageshow', function(e) {
+            window.__themeLogEvt('pageshow', {
+              persisted: e.persisted,
+              dataTheme: d.getAttribute('data-theme'),
+              rawNow: localStorage.getItem(wsKey('lucidos-theme')),
+              mqLightNow: matchMedia('(prefers-color-scheme: light)').matches
+            });
+          });
+        } catch (e) { /* telemetry must never break FOUC */ }
+      })();
+    </script>
+    <script>
+      (function() {
+        var t = document.documentElement.getAttribute('data-theme') || 'dark';
+        document.documentElement.style.colorScheme = t;
+        var m = document.querySelector('meta[name="theme-color"]');
+        if (m) m.setAttribute('content', t === 'light' ? '#ffffff' : '#07172e');
+      })();
+    </script>
+    <!--
+      Boot splash — inlined here (markup + style) so it paints on the FIRST
+      frame, BEFORE the JS/CSS bundle downloads. That is what makes the cold
+      launch connection-independent: on a slow link the splash shows immediately
+      instead of a black/empty #app. The SAME inline splash ships in every served
+      context (picker `/~/`, workspace `/<slug>/`, direct `/`) — the engine and
+      gateway both serve this one `index.html`.
+
+      REVEAL ONLY IN THE FINAL DOCUMENT (the load-bearing rule). The picker→
+      workspace auto-open is a full cross-document navigation (a reload). A reveal
+      animation that played in BOTH documents would build, reload, and build again
+      — the jank we hit before. So:
+        • The picker (base href `/~/`) hides the mark (the inline script below
+          tags the splash `boot-splash-reload`) so the reveal plays only in the
+          workspace. When the picker LIST renders (no remembered workspace to
+          auto-open, or an explicit `?pick`) that script also CLEARS the baked
+          "Opening your workspace…" status — on the picker you choose a workspace,
+          you don't open one — so it shows only the silent gradient cover. The
+          auto-open path (a remembered workspace) keeps the status and carries it
+          into the workspace document.
+        • The final document (workspace / direct, base href NOT `/~/`) plays the
+          per-tile reveal ONCE, then settles into a gentle breathe. So the mark
+          builds up exactly once, on a clean gradient, in the destination — never
+          a double build and never a formed→rebuild jump (the picker showed no
+          mark to jump from). hooks/useBootSplashReady.ts keeps the splash up
+          until the reveal has finished at least once (min-reveal), THEN dismisses
+          on readiness.
+
+      STATUS LINE — constant size always (incl. when invisible) so the mark never
+      shifts, and a baked default ("Opening your workspace…") shown from first
+      paint. This SAME text is baked into both documents; the auto-open path does
+      NOT override it, so the status is byte-identical across the picker→workspace
+      reload — it neither vanishes ("message that disappears immediately") nor
+      swaps wording ("opening your workspace" → "opening") at the seam. (The
+      picker-LIST render path is the exception — it clears the status, since you're
+      choosing a workspace there, not opening one; see the body script below.)
+      src/utils/bootSplash.ts updates the text; it fades the whole splash out once
+      the app is ready. The mark geometry mirrors
+      scripts/generate-brand-icons.mjs / components/shared/LucidosMark.tsx
+      verbatim; the gradient is the brand radial. z-index 2500 sits above every
+      overlay + the floating header chrome (modals 2300, toasts 2400, control
+      panel 2200; see styles/global/base.css) and is hardcoded because the bundle
+      CSS isn't loaded yet at first paint.
+    -->
+    <style>
+      .boot-splash {
+        position: fixed;
+        inset: 0;
+        z-index: 2500;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 1.5rem;
+        background: radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%);
+        /* Decorative during normal boot: the app shell loads + is interactive
+           behind it, so the splash does not intercept pointer events. The
+           guarded terminal-recovery state deliberately enables a tap below. */
+        pointer-events: none;
+      }
+      .boot-splash-mark {
+        width: min(46vmin, 15rem);
+        height: min(46vmin, 15rem);
+        /* Reveal the WHOLE mark as one compositor layer (svg-root transform +
+           opacity), then breathe. The previous reveal animated transform:scale on
+           each SVG shape (.bs-tile/.bs-spark) — iOS WebKit does NOT GPU-composite
+           SVG sub-element transforms, so they ran on the main thread and janked
+           while boot saturated it (bundle parse + initial render). Animating the
+           svg element itself composites cleanly (will-change hints the layer), so
+           the reveal stays smooth regardless of main-thread load. */
+        will-change: transform, opacity;
+        transform-origin: center;
+        animation: boot-mark-reveal 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) both,
+                   boot-mark-breathe 2.8s ease-in-out 1.3s infinite;
+      }
+      /* Picker (about to reload): hide the mark so the reveal happens ONLY in the
+         workspace. Space is reserved (visibility, not display) so the status line
+         keeps its position. */
+      .boot-splash-reload .boot-splash-mark { visibility: hidden; }
+      .boot-splash-status {
+        /* FIXED font stack — deliberately NOT var(--font-ui). The workspace
+           font preference can be a web font (Inter / JetBrains Mono / IBM Plex
+           Mono) that isn't downloaded yet at first paint, so the status text
+           would paint in a fallback and then reflow when the web font swaps —
+           visible jank on the boot splash. An all-system monospace stack paints
+           instantly with no swap, and is the same stack the gateway 503 starting
+           splash uses (crates/lucidos-gateway/src/proxy.rs `.mark-label`), so the
+           status renders identically across the picker→workspace reload seam.
+           Keep this fully in sync with that `.mark-label`: not just the font
+           stack but font-size, letter-spacing (0.01em), color (white at 0.82
+           alpha), and the 1.5rem mark↔status gap — drift on any of those makes
+           "Starting engine…" jump size/spacing at the seam.
+           Font-size is a FIXED 15px, deliberately NOT 0.9375rem: this app's
+           <html> font-size is scaled by var(--user-ui-scale) (base.css), so a
+           rem value would grow with the user's UI scale (e.g. 22.5px at 150%)
+           while the gateway splash — an isolated document with no access to the
+           scale — stays at 0.9375rem × 16px = 15px. Pinning 15px keeps the
+           status the same size as the gateway one regardless of UI scale. */
+        font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
+        font-size: 15px;
+        letter-spacing: 0.01em;
+        color: rgba(255, 255, 255, 0.82);
+        /* Constant size — reserved identically whether the text is present,
+           empty, or invisible — so the mark above it never shifts. Single line. */
+        height: 1.4em;
+        line-height: 1.4em;
+        max-width: 80vw;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        opacity: 0;
+        transition: opacity 0.3s ease;
+      }
+      .boot-splash-status.boot-splash-status-shown { opacity: 1; }
+      .boot-splash.boot-splash-stalled { pointer-events: auto; cursor: pointer; }
+      .boot-splash-leaving { animation: boot-splash-out 0.45s ease forwards; }
+      @keyframes boot-mark-reveal {
+        from { opacity: 0; transform: scale(0.86); }
+        70%  { opacity: 1; transform: scale(1.04); }
+        to   { opacity: 1; transform: scale(1); }
+      }
+      @keyframes boot-mark-breathe {
+        0%, 100% { opacity: 1; }
+        50%      { opacity: 0.84; }
+      }
+      @keyframes boot-splash-out { to { opacity: 0; visibility: hidden; } }
+      @media (prefers-reduced-motion: reduce) {
+        .boot-splash-mark { animation: none; }
+        .boot-splash-status { transition: none; }
+        .boot-splash-leaving { animation-duration: 0.15s; }
+      }
+    </style>
+</head>
+<body style="background:#0a4ea8 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed">
+    <div class="boot-splash" aria-hidden="true">
+      <svg class="boot-splash-mark" viewBox="0 0 100 100">
+        <g transform="translate(11 11) scale(0.78)" fill="#ffffff">
+          <rect x="17" y="17" width="29" height="29" rx="7" />
+          <rect x="17" y="54" width="29" height="29" rx="7" />
+          <rect x="54" y="54" width="29" height="29" rx="7" />
+          <path d="M68.5 12 C71 25 74 28.5 87 31 C74 33.5 71 37 68.5 50 C66 37 63 33.5 50 31 C63 28.5 66 25 68.5 12 Z" />
+        </g>
+      </svg>
+      <div class="boot-splash-status boot-splash-status-shown" role="status" aria-live="polite">Opening your workspace…</div>
+    </div>
+    <script>
+      // Picker context (server-stamped <base href="/~/">). Two jobs, both before
+      // first paint:
+      //   1. Hide the mark (tag `boot-splash-reload`) so the per-tile reveal plays
+      //      ONLY in the workspace document, never double-builds across the
+      //      picker→workspace auto-open navigation.
+      //   2. When the picker LIST is what renders — i.e. we are NOT auto-opening a
+      //      remembered workspace (explicit `?pick`, or none remembered: the SAME
+      //      condition the <head> redirect uses to NOT redirect) — clear the baked
+      //      "Opening your workspace…" status. On the picker you choose a
+      //      workspace, you don't open one, so that message is wrong; cleared, the
+      //      picker shows a silent gradient cover that fades into the list. The
+      //      auto-open path keeps the status (it redirects in <head> and the text
+      //      carries into the workspace document, byte-identical across the seam).
+      // See the splash comment above + hooks/useBootSplashReady.ts.
+      (function () {
+        var base = document.querySelector('base');
+        if (!base || base.getAttribute('href') !== '/~/') return;
+        var splash = document.querySelector('.boot-splash');
+        if (splash) splash.classList.add('boot-splash-reload');
+        var renderingList;
+        try {
+          renderingList = new URLSearchParams(location.search).has('pick') ||
+            !localStorage.getItem('lucidos-last-workspace');
+        } catch (e) { renderingList = true; }
+        if (renderingList && splash) {
+          var status = splash.querySelector('.boot-splash-status');
+          if (status) { status.textContent = ''; status.classList.remove('boot-splash-status-shown'); }
+        }
+      })();
+    </script>
+    <div id="app"></div>
+    <script>
+      /* lucidos-boot-watchdog-start
+         The application module normally takes ownership immediately below. If
+         its content-hashed entry is stale/missing, none of the module-owned
+         status or safety timers can run, so keep the recovery floor in this
+         classic inline script. Retry automatically once; a second failure stops
+         with a tappable action instead of reload-looping forever. */
+      (function () {
+        var RETRY_KEY = 'lucidos-boot-retry';
+        var base = document.querySelector('base');
+        var baseHref = base && base.getAttribute('href');
+        var workspaceSlug = baseHref && baseHref !== '/' && baseHref !== '/~/'
+          ? baseHref.replace(/^\/+|\/+$/g, '')
+          : null;
+        function wsKey(name) { return workspaceSlug ? 'ws:' + workspaceSlug + ':' + name : name; }
+        var timer = window.setTimeout(function () {
+          var tried = false;
+          try { tried = sessionStorage.getItem(wsKey(RETRY_KEY)) === '1'; } catch (e) {}
+          if (!tried) {
+            try { sessionStorage.setItem(wsKey(RETRY_KEY), '1'); } catch (e) {}
+            var retryUrl = new URL(location.href);
+            retryUrl.searchParams.set('_boot_retry', '1');
+            location.replace(retryUrl.toString());
+            return;
+          }
+          var splash = document.querySelector('.boot-splash');
+          var status = splash && splash.querySelector('.boot-splash-status');
+          if (status) {
+            status.textContent = 'Tap to retry';
+            status.classList.add('boot-splash-status-shown');
+          }
+          if (splash) {
+            splash.classList.add('boot-splash-stalled');
+            splash.setAttribute('aria-hidden', 'false');
+            splash.addEventListener('click', function () {
+              try { sessionStorage.removeItem(wsKey(RETRY_KEY)); } catch (e) {}
+              location.reload();
+            }, { once: true });
+          }
+        }, 15000);
+
+        window.__lucidosBootLoaded = function () {
+          window.clearTimeout(timer);
+          try { sessionStorage.removeItem(wsKey(RETRY_KEY)); } catch (e) {}
+          try {
+            var current = new URL(location.href);
+            if (current.searchParams.has('_boot_retry')) {
+              current.searchParams.delete('_boot_retry');
+              history.replaceState(history.state, '', current.toString());
+            }
+          } catch (e) {}
+          delete window.__lucidosBootLoaded;
+        };
+      })();
+      /* lucidos-boot-watchdog-end */
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+</body>
+</html>

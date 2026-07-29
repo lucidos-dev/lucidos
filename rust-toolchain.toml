@@ -1,0 +1,29 @@
+# Pin the Rust toolchain for every build, test, and lint of this repo.
+#
+# WHY. Clippy's lint set — and therefore what "clean" means — is a property of
+# the toolchain, not of the code. Without this file the clean-build gate
+# (`make lint`, run per change by `/harden` Phase 4.5) and the nightly pipeline
+# each lint against whatever rustup default happens to be installed on the
+# machine that runs them, so the gate's definition of clean drifts silently: a
+# lint introduced by a new stable turns a green branch red with no code change,
+# and a lint removed by a new stable stops catching a real defect. Flagged by
+# the 2026-07-26 nightly (CleanBuildPassed concern 4).
+#
+# Bumping the pin is a deliberate, reviewable commit: change `channel`, run
+# `make lint` + the engine suite, and fix whatever the new lint set surfaces in
+# that same change — rather than discovering it on an unrelated branch.
+#
+# `targets` is load-bearing, not decoration: signers/build-all.sh builds every
+# signer to wasm32-unknown-unknown, and rustup resolves THIS file from
+# signers/<name>/ (it walks up to the repo root). A pin without the target
+# fails that build with "can't find crate for `core`".
+#
+# `profile = "minimal"` keeps CI installs lean; the two components the repo
+# actually invokes are listed explicitly (clippy via `make lint`, rustfmt via
+# `make fmt` / `make fix`). rust-docs is deliberately not pulled in.
+
+[toolchain]
+channel = "1.94.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown"]

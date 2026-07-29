@@ -1,0 +1,81 @@
+import { panelOverlay, showToast, closeInlineForm } from '../store';
+import { ApiError, confirmPluginInstall, cancelPluginInstall } from '../../api/client';
+import { errorDetail } from '../../utils/errorDetail';
+import { pushNavState } from './navigation';
+import { revealContentPane } from './pane';
+import { focusThread } from './threads';
+import type { PluginInstallRequest } from '../types';
+import { refreshPluginCatalog } from './plugin-marketplaces';
+
+/** Open the plugin install panel for the staged install in `request`. The
+ *  panel takes over the content pane (same surface as the credential
+ *  request panel); user stays on whatever menu item they were on, and the
+ *  panel resolves via Confirm/Cancel POSTs to the engine. Reveals the content
+ *  pane — this fires from an engine SSE event, so without it a mobile user (or
+ *  a desktop user with a collapsed split) never sees the panel that just
+ *  appeared. Same shape as `openEmailConfirmRequest`. (NOT the credential-request
+ *  path: `landOnAccountsWithOverlay` additionally switches to Settings →
+ *  Accounts, which is right for a credential and wrong for everything else.) */
+export function openPluginInstallRequest(request: PluginInstallRequest): void {
+  panelOverlay.value = { type: 'form', form: { type: 'plugin-install', request } };
+  pushNavState();
+  revealContentPane();
+}
+
+/** User clicked Confirm — engine writes files into `data/`, emits
+ *  `PluginInstalled`, auto-reloads WASM modules if `auth-modules/` was
+ *  touched. Closes the panel either way (the engine pops the pending
+ *  entry up-front, so a failed confirm has no second chance — leaving
+ *  the panel open just wedges the user with disabled buttons). */
+export async function confirmPluginInstallAction(
+  installId: string,
+  pluginName: string,
+  pluginVersion: string,
+): Promise<void> {
+  try {
+    const result = await confirmPluginInstall(installId);
+    void refreshPluginCatalog();
+    // When the plugin shipped NEW `setup` instructions the engine spawns a
+    // Lucidos Agent thread to walk the user through them. Drop the user straight
+    // into it so setup happens in front of them — the thread IS the feedback, so
+    // we skip the success toast in that case (the panel already showed the setup
+    // instructions; dumping them into a toast as well was the noise we removed).
+    // The engine spawns it as a SubThread, whose queue `prepare` step eager-emits
+    // MessageReceived — on the common immediate-admit path the thread_summaries
+    // row exists before this response returns, so the thread is real and already
+    // running when we focus. Use focusThread (not …OrBootstrap): if the spawn is
+    // briefly queued (no row yet) a bootstrap fetch would 404 → "Thread not
+    // found"; focusThread just sets focus and lets the row + events stream in
+    // over SSE.
+    if (result.setup_thread_id) {
+      focusThread(result.setup_thread_id);
+    } else {
+      // No setup thread → a minimal one-line confirmation. The install panel
+      // closed and the catalog card flips to Installed/Open, so this just
+      // confirms what landed without restating files or setup steps.
+      showToast(`Installed ${pluginName} v${pluginVersion}`, 'success');
+    }
+  } catch (e) {
+    showToast(`Install failed: ${errorDetail(e)}`, 'error');
+  } finally {
+    closeInlineForm();
+  }
+}
+
+/** User clicked Cancel — engine drops the staged temp dir + emits
+ *  `PluginInstallCanceled`. Closes the panel; the LLM's tool result already
+ *  said "pending in panel" so no further confirmation is needed. */
+export async function cancelPluginInstallAction(installId: string): Promise<void> {
+  try {
+    await cancelPluginInstall(installId);
+  } catch (e) {
+    // 404/410 = entry already gone (harmless race with engine cleanup or a
+    // peer device's confirm/cancel); anything else means the temp dir likely
+    // wasn't dropped and the user — who explicitly clicked Cancel — should
+    // know it didn't take.
+    if (!(e instanceof ApiError) || (e.httpCode !== 404 && e.httpCode !== 410)) {
+      showToast(`Cancel plugin install failed: ${errorDetail(e)}`, 'error');
+    }
+  }
+  closeInlineForm();
+}

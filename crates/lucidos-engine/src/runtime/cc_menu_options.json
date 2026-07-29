@@ -1,0 +1,26 @@
+{
+  "_note": "Source of truth for Claude Code's /model and /effort pickers. Hand-maintained because CC does not expose available models programmatically (https://github.com/anthropics/claude-code/issues/12612). Updates: use the `update-lucidos-cc-models` skill — it diffs this file against `claude /model` and bumps entries to match. include_str!() baked at compile time, parsed once via LazyLock — no runtime IO cost. At most ONE entry may claim top capability: Fable 5 is the tier above Opus, so an Opus entry must not be described as 'most capable' — that contradiction shipped once (Opus 5 vs Fable 5) and is easy to reintroduce when a new model is added.",
+  "models": [
+    { "value": "default",          "label": "Default",         "description": "Use the default model for your plan" },
+    { "value": "claude-fable-5",    "label": "Fable 5",         "description": "Most powerful — tier above Opus" },
+    { "value": "claude-fable-5[1m]","label": "Fable 5 (1M)",    "description": "Fable 5 for long sessions" },
+    { "value": "sonnet",           "label": "Sonnet 4.6",      "description": "Best for everyday tasks" },
+    { "value": "sonnet[1m]",       "label": "Sonnet 4.6 (1M)", "description": "Sonnet 4.6 for long sessions" },
+    { "value": "claude-opus-5@default", "label": "Opus 5",     "description": "Latest Opus — strongest for agentic coding" },
+    { "value": "claude-opus-5[1m]",   "label": "Opus 5 (1M)",  "description": "Opus 5 for long sessions" },
+    { "value": "claude-opus-4-8@default", "label": "Opus 4.8",  "description": "Previous flagship" },
+    { "value": "claude-opus-4-8[1m]", "label": "Opus 4.8 (1M)", "description": "Opus 4.8 for long sessions" },
+    { "value": "claude-opus-4-7",  "label": "Opus 4.7",        "description": "Previous generation" },
+    { "value": "claude-opus-4-1",  "label": "Opus 4.1",        "description": "Legacy" },
+    { "value": "opus",             "label": "Opus 4.6",        "description": "CC's own alias — older generation" },
+    { "value": "opus[1m]",         "label": "Opus 4.6 (1M)",   "description": "Opus 4.6 for long sessions" },
+    { "value": "haiku",            "label": "Haiku 4.5",       "description": "Fastest for quick answers" }
+  ],
+  "reasoning_efforts": [
+    { "value": "low",    "label": "Low",        "description": "Minimal thinking · Fastest responses" },
+    { "value": "medium", "label": "Medium",     "description": "Balanced thinking · Default" },
+    { "value": "high",   "label": "High",       "description": "Deep thinking · Most thorough" },
+    { "value": "xhigh",  "label": "Extra High", "description": "Extra deep thinking · Higher than High" },
+    { "value": "max",    "label": "Max",        "description": "Maximum thinking · Extended reasoning" }
+  ]
+}

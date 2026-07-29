@@ -1,0 +1,10 @@
+{
+  "identifier": "panel-preview",
+  "description": "The panel URL preview loads ARBITRARY third-party pages (`WebviewUrl::External`), and the JS we inject into them reports the page's own title / URL / text back to the main window by invoking three commands. The caller is therefore untrusted remote content, so this capability accepts any origin — and in exchange it is the narrowest capability in the app: only the three `__panel_*_report` commands, and only on `url-preview-*` webviews.\n\n`webviews` (not `windows`) is load-bearing. A `windows: [\"main\"]` entry would enable this capability on EVERY webview of the main window, and the preview webviews live inside the main window — so the scoping would invert and the previewed page would be reachable from, and reach, the app's own surface. Keep `windows` empty here forever.\n\nBefore tauri 2.11 these calls were not ACL-checked at all (no app ACL manifest existed), which meant a previewed page could invoke ANY app command. This capability is what replaces that hole with a three-command allowlist.",
+  "local": true,
+  "remote": {
+    "urls": ["*://*"]
+  },
+  "webviews": ["url-preview-*"],
+  "permissions": ["allow-panel-report"]
+}

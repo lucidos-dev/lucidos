@@ -1,0 +1,145 @@
+/* UI scale modal — uses fixed font-size so it doesn't shift with --user-ui-scale */
+/* Extends .modal-overlay — unique: fixed font-size for scale preview, no touch panning */
+.scale-modal-overlay {
+    font-size: 16px;
+    touch-action: none;
+}
+
+/* Use em (not rem) inside the modal so sizes are relative to the overlay's fixed 16px,
+   not the root font-size which changes during preview */
+.scale-modal {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5em;
+    padding: 1.5em 2em;
+    width: 18em;
+    box-shadow: var(--shadow-md);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.75em;
+}
+
+.scale-modal-label {
+    font-size: 1.25em;
+    font-weight: 600;
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+}
+
+.scale-modal-slider {
+    width: 100%;
+    /* Tall element = large touch zone; track is rendered via pseudo-element so
+       it stays visually thin. Without this, the slider's native hit area is
+       just the 4px track plus the small thumb — unusable on iOS. */
+    height: 2.75em;
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    outline: none;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    /* Allow horizontal drag; block scroll/pinch while interacting with slider */
+    touch-action: pan-x;
+}
+
+.scale-modal-slider:focus,
+.scale-modal-slider:focus-visible {
+    outline: none;
+    box-shadow: none;
+}
+
+.scale-modal-slider::-webkit-slider-runnable-track {
+    height: 0.25em;
+    background: var(--border-color);
+    border-radius: 0.125em;
+}
+
+.scale-modal-slider::-moz-range-track {
+    height: 0.25em;
+    background: var(--border-color);
+    border-radius: 0.125em;
+    border: none;
+}
+
+.scale-modal-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 1.5em;
+    height: 1.5em;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    /* Center thumb on track: -(thumb-height - track-height) / 2 */
+    margin-top: -0.625em;
+}
+
+.scale-modal-slider::-moz-range-thumb {
+    width: 1.5em;
+    height: 1.5em;
+    border-radius: 50%;
+    background: var(--accent);
+    border: none;
+    cursor: pointer;
+}
+
+.scale-modal-range {
+    display: flex;
+    justify-content: space-between;
+    width: 100%;
+    font-size: 0.6875em;
+    color: var(--text-muted);
+}
+
+.device-current {
+    border-left: 0.125rem solid var(--accent);
+}
+
+.device-badge {
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    padding: 0.0625rem 0.375rem;
+    border-radius: 0.1875rem;
+    margin-left: 0.5rem;
+}
+
+.device-name {
+    cursor: pointer;
+    color: var(--accent);
+    border-bottom: 1px dashed var(--accent);
+    white-space: normal;
+    word-break: break-all;
+}
+
+@media (hover: hover) {
+    .device-name:hover {
+        opacity: 0.8;
+    }
+}
+
+.device-name-input {
+    background: var(--bg-primary);
+    border: 1px solid var(--accent);
+    border-radius: 0.1875rem;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-md);
+    padding: 0.375rem 0.5rem;
+    outline: none;
+    width: 100%;
+}
+
+.device-push-label {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.device-push-label.push-disabled {
+    text-decoration: line-through;
+}
+

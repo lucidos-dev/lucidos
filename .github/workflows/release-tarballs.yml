@@ -1,0 +1,268 @@
+# Build the per-platform HEADLESS runtime tarballs (the Docker-free, compile-free
+# download artifact a later install.sh lays down — step 2 of
+# docs/plans/2026-06-30-installer-step2-linux-tarball.md).
+#
+# Each matrix entry runs scripts/build-headless.sh on a NATIVE runner for its target
+# triple (the engine/gateway + pgvector are compiled natively, not cross-compiled),
+# producing lucidos-<version>-<triple>.tar.gz + a .sha256 sidecar and uploading them
+# as WORKFLOW ARTIFACTS. The macOS PG18 + pgvector recipe and the Linux one are the
+# same scripts/lib/stage_runtime.sh code; the triple selects the theseus relocatable
+# Postgres asset.
+#
+# WHAT THIS WORKFLOW DOES NOT DO — it never creates or tags a Release:
+#   • It NEVER creates a GitHub Release and NEVER cuts a tag.
+#   • On a plain tag push it ONLY uploads workflow artifacts.
+#   • The attach step only ADDS assets to a Release that ALREADY exists. It runs
+#     automatically for a PUBLISHED, non-prerelease Release (so a real release
+#     gets its Linux/macOS tarballs without a human dispatch), and on demand via
+#     workflow_dispatch with attach_to_release=true. rc-* prereleases are skipped.
+#
+# Supported pair (parent plan): macOS arm64 + Linux x86_64. macOS x86_64 and Linux
+# aarch64 are best-effort. x86_64-unknown-linux-gnu is the MUST-WORK entry;
+# fail-fast is off so a best-effort entry can fail without sinking the rest.
+#
+# GLIBC FLOOR (docs/plans/2026-07-01-linux-prod-install-audit-fixes.md): the Linux
+# entries build INSIDE an ubuntu:22.04 container, NOT on the runner image. A binary
+# compiled on the raw ubuntu-latest image (24.04, glibc 2.39) refuses to start on
+# Ubuntu 22.04 / Debian 12 / RHEL 9 ("GLIBC_2.3x not found") — i.e. on most current
+# LTS servers — and the tarball-smoke job can't see that because it builds and runs
+# on the same image. The container pins the floor at glibc 2.35 / GCC-12 libstdc++
+# durably (runner images get retired; the container tag doesn't move under us), and
+# the "Assert portability floor" step fails the build if any staged binary ever
+# references a versioned symbol above that floor.
+#
+# macOS note: CI tarballs are UNSIGNED (no Developer ID on the runner). The SIGNED
+# macOS tarball ships from the local `build-dmg.sh --emit-tarball` path; the macOS
+# entries here exist for cross-platform parity + verification, not for release.
+
+name: release-tarballs
+
+on:
+  workflow_dispatch:
+    inputs:
+      attach_to_release:
+        description: 'Also attach the tarballs to an EXISTING GitHub Release. Default off — never creates a Release.'
+        type: boolean
+        default: false
+      attach_tag:
+        description: 'Release tag to attach to (e.g. v0.15.0). Empty = use the dispatched ref, which must then BE a tag. Set it to backfill a past release from a branch carrying a CI fix the tag tree predates.'
+        type: string
+        default: ''
+  # Build artifacts on a version tag. This does NOT publish — it only uploads
+  # workflow artifacts (the attach step needs a Release to already exist).
+  push:
+    tags: ['v*']
+  # A PUBLISHED, non-prerelease GitHub Release attaches its platform tarballs
+  # automatically. This is what makes install.sh's default download path work at
+  # all: `release.sh --publish-verified` cuts the Release with the macOS DMG, and
+  # this run adds the Linux + macOS headless tarballs to it ~30 min later. The
+  # step still only ADDS assets to an existing Release — it never creates or tags
+  # one. The `rc-<version>` PRERELEASE that Phase A arms is excluded by the
+  # `prerelease == false` guard below, so the RC gate is untouched.
+  release:
+    types: [published]
+
+permissions:
+  # `contents: write` is needed ONLY by the gated attach-to-release step below;
+  # nothing writes to the repo/releases unless that opt-in step runs.
+  contents: write
+
+jobs:
+  tarball:
+    name: ${{ matrix.triple }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The MUST-WORK entry: the Linux x86_64 tarball install.sh downloads.
+          # Linux entries build inside ubuntu:22.04 → glibc 2.35 floor (see header).
+          - { runner: ubuntu-latest,    triple: x86_64-unknown-linux-gnu,  container: 'ubuntu:22.04' }
+          # Best-effort additions (parent plan):
+          - { runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu, container: 'ubuntu:22.04' }
+          # aarch64-darwin needs the macos-15 (Apple-silicon) image, not macos-14:
+          # the theseus-rs relocatable PG 18 arm64 binary is built against macOS 26
+          # libSystem (references _strchrnul), which the older macos-14 runner OS
+          # lacks — so pg_config won't even run there and staging aborts.
+          - { runner: macos-15,         triple: aarch64-apple-darwin }
+          - { runner: macos-15-intel,   triple: x86_64-apple-darwin }
+    runs-on: ${{ matrix.runner }}
+    # Empty for the macOS entries → no container, runs on the VM as before.
+    container: ${{ matrix.container }}
+    # Force bash for every `run` step. Inside the ubuntu:22.04 container GitHub
+    # otherwise invokes steps with `sh -e {0}` (dash), which does NOT support the
+    # `set -o pipefail` our steps rely on ("set: Illegal option -o pipefail",
+    # exit 2). bash ships in the ubuntu:22.04 base image and on the macOS runners,
+    # so this resolves everywhere and gives us `-o pipefail` consistently.
+    defaults:
+      run:
+        shell: bash
+    timeout-minutes: 75   # container entries pay a cold rustup + apt install on top of the build
+    steps:
+      # pgvector compiles against the relocatable PG via PGXS (needs make + a C
+      # toolchain); the engine statically vendors OpenSSL (needs perl + cc); the
+      # staging scripts need python3 (version/sha256 helpers) + curl + tar; and
+      # actions/checkout needs git INSIDE the container (this step runs before it —
+      # the container starts as root, so no sudo). macOS gets all of these from the
+      # preinstalled Xcode Command Line Tools (clang, make, xcrun) + runner image.
+      - name: Install Linux build deps (ubuntu:22.04 container)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential perl pkg-config curl ca-certificates git python3 binutils
+          git --version && python3 --version
+
+      # The ubuntu:22.04 container has no Rust toolchain (the preinstalled one lives
+      # on the runner image, outside the container). Install rustup ITSELF with no
+      # toolchain: this step runs BEFORE checkout, so rust-toolchain.toml isn't on
+      # disk yet, and installing `stable` here would download a toolchain that the
+      # pin then discards — cargo would fetch the pinned one on its first
+      # invocation anyway. `--default-toolchain none` means exactly one toolchain
+      # is ever downloaded, and it is the pinned one.
+      - name: Install rustup (container; toolchain comes from rust-toolchain.toml)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'   # install.sh requires Node 18+; 20 is the current LTS
+
+      - name: Toolchain versions
+        run: |
+          set -euo pipefail
+          # First cargo/rustc call after checkout, so this is where rustup
+          # materialises the toolchain pinned by rust-toolchain.toml — on the
+          # Linux container (which has rustup but no toolchain) and on the macOS
+          # runners (which ship a preinstalled stable that the pin overrides).
+          # Printing the active toolchain makes a pin bump visible in the log.
+          rustup show active-toolchain
+          rustc --version
+          cargo --version
+          node --version
+          npm --version
+
+      - name: Build headless tarball (${{ matrix.triple }})
+        run: |
+          set -euo pipefail
+          ./scripts/build-headless.sh --triple "${{ matrix.triple }}" --out-dir dist/headless
+          echo "--- artifacts:"
+          ls -la dist/headless
+          echo "--- checksum self-verify:"
+          ( cd dist/headless && shasum -a 256 -c ./*.tar.gz.sha256 )
+
+      # Fail the build — not the user's install — if any of OUR three staged
+      # binaries references a versioned glibc/libstdc++ symbol above the
+      # ubuntu:22.04 floor (glibc 2.35, GCC-12 libstdc++ = GLIBCXX 3.4.30 /
+      # CXXABI 1.3.13). This is the tripwire for a container-tag bump, a
+      # toolchain drift, or someone reverting the container build: the staged
+      # tree is exactly what headless_tarball_emit ships. The bundled theseus
+      # postgres/ binaries are deliberately NOT asserted — they're prebuilt
+      # upstream artifacts with their own (older) baseline, not our compile.
+      - name: Assert portability floor (glibc ≤ 2.35, Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          stage=".lucidos/headless-build/${{ matrix.triple }}/stage"
+          # ceiling_check <binary> <prefix> <ceiling> — the highest PREFIX_x.y[.z]
+          # symbol version the binary references must sort at-or-below CEILING.
+          ceiling_check() {
+            local bin="$1" prefix="$2" ceiling="$3" worst
+            worst="$(objdump -T "$bin" | grep -oE "${prefix}_[0-9]+(\.[0-9]+)*" | sort -uV | tail -1 || true)"
+            [ -n "$worst" ] || { echo "  $bin: no ${prefix}_* refs"; return 0; }
+            if printf '%s\n%s\n' "$worst" "${prefix}_${ceiling}" | sort -VC; then
+              echo "  $bin: ${prefix} ceiling OK ($worst <= ${prefix}_${ceiling})"
+            else
+              echo "::error::$bin references $worst — above the ${prefix}_${ceiling} floor; it will not start on Ubuntu 22.04-era distros. Did the build escape the ubuntu:22.04 container?"
+              return 1
+            fi
+          }
+          for name in lucidos-engine lucidos-gateway lucidos; do
+            bin="$stage/$name"
+            [ -f "$bin" ] || { echo "::error::staged binary missing: $bin"; exit 1; }
+            ceiling_check "$bin" GLIBC 2.35
+            ceiling_check "$bin" GLIBCXX 3.4.30
+            ceiling_check "$bin" CXXABI 1.3.13
+          done
+          echo "OK — all staged binaries respect the ubuntu:22.04 portability floor."
+
+      - name: Upload tarball + checksum as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lucidos-tarball-${{ matrix.triple }}
+          path: |
+            dist/headless/*.tar.gz
+            dist/headless/*.tar.gz.sha256
+          if-no-files-found: error
+
+      # ── OPTIONAL, OPT-IN ONLY — never fires automatically ──────────────────────
+      # Attach the built tarballs to an EXISTING GitHub Release. Requires BOTH a
+      # manual workflow_dispatch with attach_to_release=true AND dispatching against
+      # a tag ref (the tag names the Release to attach to). It only ADDS assets to a
+      # Release someone already cut — it never publishes one. This is the structural
+      # hook for a future release flow; it stays inert by default.
+      #
+      # Upload is done via the raw GitHub REST API (curl), NOT `gh release upload`,
+      # because the Linux matrix entries run inside the ubuntu:22.04 container which
+      # has no `gh` CLI (only the macOS runner images ship it). curl works on BOTH
+      # the container and the macOS runners.
+      - name: Attach tarballs to the existing Release
+        # Two ways in:
+        #   1. release:published, non-prerelease -> automatic (the release flow).
+        #      rc-<ver> prereleases are excluded so the RC gate never sees these.
+        #   2. workflow_dispatch with attach_to_release=true -> manual/backfill.
+        #      Target tag comes from inputs.attach_tag, else the dispatched ref
+        #      (which must then be a tag). attach_tag lets a branch carrying a CI
+        #      fix attach to an older tag whose own tree predates that fix.
+        if: >-
+          (github.event_name == 'release' && github.event.release.prerelease == false)
+          || (github.event_name == 'workflow_dispatch'
+              && inputs.attach_to_release == true
+              && (inputs.attach_tag != '' || startsWith(github.ref, 'refs/tags/')))
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.attach_tag }}
+        run: |
+          set -euo pipefail
+          # Resolve which Release to attach to: the published Release's own tag,
+          # else the explicit dispatch input, else the dispatched tag ref.
+          attach_tag="${RELEASE_TAG:-}"
+          [ -n "$attach_tag" ] || attach_tag="${INPUT_TAG:-}"
+          [ -n "$attach_tag" ] || attach_tag="${GITHUB_REF_NAME}"
+          [ -n "$attach_tag" ] || { echo "no target tag resolved" >&2; exit 1; }
+          echo "Attaching $(ls dist/headless/*.tar.gz) to existing Release ${attach_tag}"
+          api="https://api.github.com"; up="https://uploads.github.com"
+          # Look up the release id by tag.
+          rel_id=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "$api/repos/${GITHUB_REPOSITORY}/releases/tags/${attach_tag}" | \
+            python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+          echo "release id = $rel_id"
+          for f in dist/headless/*.tar.gz dist/headless/*.tar.gz.sha256; do
+            base=$(basename "$f")
+            # delete any existing asset with the same name (clobber)
+            existing=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "$api/repos/${GITHUB_REPOSITORY}/releases/$rel_id/assets" | \
+              python3 -c "import sys,json;[print(a['id']) for a in json.load(sys.stdin) if a['name']=='$base']")
+            for aid in $existing; do
+              curl -sS -X DELETE -H "Authorization: Bearer ${GH_TOKEN}" \
+                "$api/repos/${GITHUB_REPOSITORY}/releases/assets/$aid" >/dev/null
+            done
+            echo "uploading $base"
+            curl -sS --fail -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Content-Type: application/gzip" \
+              --data-binary @"$f" \
+              "$up/repos/${GITHUB_REPOSITORY}/releases/$rel_id/assets?name=$base" >/dev/null \
+              && echo "  ok $base"
+          done

@@ -1,0 +1,405 @@
+/* ===== Triggers ===== */
+
+.trigger-row .list-row-name,
+.app-row .list-row-name {
+    white-space: normal;
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+/* App and trigger rows can grow tall (description, cron/event lists); the row
+ * top-aligns its children, so pin the action buttons to the bottom edge. */
+.app-row .list-row-actions,
+.trigger-row .list-row-actions {
+    align-self: flex-end;
+}
+
+/* Change rows carry up to four actions (Thread, Diff, Discard, Apply) — too
+ * wide to sit beside the description without squeezing it into a narrow,
+ * heavily-wrapped column. Stack like apps/triggers do on mobile: the
+ * description (and details/label) span the full row width, with the actions
+ * on their own bottom-right row below. */
+.change-row {
+    flex-direction: column;
+    align-items: flex-start;
+}
+
+.change-row .list-row-info {
+    width: 100%;
+}
+
+.change-row .list-row-actions {
+    align-self: flex-end;
+}
+
+.trigger-disabled > .list-row-info {
+    opacity: 0.55;
+}
+
+.trigger-cron-list {
+    list-style: none;
+    margin: 0.125rem 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.0625rem;
+}
+
+.trigger-cron-item {
+    display: flex;
+    align-items: baseline;
+    gap: 0.375rem;
+    font-size: var(--font-size-xs);
+}
+
+.trigger-cron-desc {
+    color: var(--text-secondary);
+}
+
+.trigger-cron {
+    font-family: var(--font-ui);
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+}
+
+.trigger-enabled {
+    color: var(--accent);
+    font-weight: 500;
+    text-transform: uppercase;
+    font-size: var(--font-size-xs);
+}
+
+.trigger-paused {
+    color: var(--text-muted);
+    font-weight: 500;
+    text-transform: uppercase;
+    font-size: var(--font-size-xs);
+}
+
+.trigger-no-more-runs {
+    color: var(--text-muted);
+    font-weight: 500;
+    font-size: var(--font-size-xs);
+    font-style: italic;
+}
+
+.trigger-type-schedule,
+.trigger-type-event,
+.trigger-type-hybrid {
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    padding: 0.0625rem 0.3125rem;
+    border-radius: 0.1875rem;
+}
+
+.trigger-type-schedule {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+}
+
+.trigger-type-event,
+.trigger-type-hybrid {
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    color: var(--accent);
+}
+
+/* Last-run outcome chip on the trigger row (OK / failed). Sits inline after the
+   "Last run <time>" line so a threadless (script) trigger's health is visible at
+   a glance; absent until the trigger has run under an engine that records status. */
+.trigger-last-run {
+    display: flex;
+    align-items: baseline;
+    gap: 0.375rem;
+}
+
+.trigger-run-status {
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    padding: 0.0625rem 0.3125rem;
+    border-radius: 0.1875rem;
+}
+
+.trigger-run-status-ok {
+    background: color-mix(in srgb, var(--accent-green) 15%, transparent);
+    color: var(--accent-green);
+}
+
+.trigger-run-status-failed {
+    background: color-mix(in srgb, var(--accent-red) 15%, transparent);
+    color: var(--accent-red);
+}
+
+/* "from <plugin>" provenance chip on a plugin-installed trigger (ADR 0019). */
+.trigger-plugin-chip {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
+}
+
+.trigger-event-list {
+    list-style: none;
+    padding: 0;
+    margin: 0.125rem 0 0;
+}
+
+/* ===== Trigger groups (panel sections) ===== */
+
+.trigger-group-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+.trigger-group-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.375rem 0.5rem;
+    margin-top: 0.5rem;
+    background: var(--bg-tertiary);
+    border-radius: 0.25rem;
+    user-select: none;
+}
+
+.trigger-group-section:first-child .trigger-group-header {
+    margin-top: 0;
+}
+
+.trigger-group-header-ungrouped {
+    /* The synthetic Ungrouped header is informational only — no chevron, no
+       per-section actions. Give it a quieter background so it visually
+       reads as a separator rather than a real group. */
+    background: transparent;
+    border-radius: 0;
+    padding-left: 0.25rem;
+    margin-top: 0.75rem;
+}
+
+.trigger-group-toggle {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    text-align: left;
+    color: inherit;
+    font: inherit;
+    min-width: 0;
+}
+
+.trigger-group-chevron {
+    color: var(--text-muted);
+    font-size: var(--font-size-2xs);
+    width: 0.75rem;
+    flex-shrink: 0;
+}
+
+.trigger-group-name {
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.trigger-group-name-input {
+    font-weight: 600;
+    color: var(--text-primary);
+    background: var(--bg-primary);
+    border: 1px solid var(--accent);
+    border-radius: 0.1875rem;
+    padding: 0.125rem 0.25rem;
+    font: inherit;
+    min-width: 0;
+    flex: 1;
+}
+
+.trigger-group-count {
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    font-weight: 400;
+}
+
+.trigger-group-actions {
+    display: flex;
+    gap: 0.25rem;
+    flex-shrink: 0;
+}
+
+.trigger-add-row {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+}
+
+.trigger-add-row > .list-row-add-card {
+    flex: 1;
+}
+
+.trigger-group-create-row {
+    display: flex;
+    margin-top: 0.5rem;
+    padding: 0.375rem 0.5rem;
+    background: var(--bg-tertiary);
+    border-radius: 0.25rem;
+}
+
+.trigger-group-create-row > .trigger-group-name-input {
+    width: 100%;
+}
+
+.trigger-event-info {
+    display: flex;
+    align-items: baseline;
+    gap: 0.375rem;
+    font-size: var(--font-size-xs);
+    margin-top: 0.125rem;
+}
+
+.trigger-event-type {
+    color: var(--accent);
+    font-weight: 500;
+}
+
+.trigger-condition {
+    font-family: var(--font-ui);
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+}
+
+.trigger-subscription-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    padding: 0.5rem;
+    margin-bottom: 0.5rem;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+}
+
+.inline-form-body {
+    /* --space-lg (1rem) content-pane gutter (see .claude/rules/frontend.md). */
+    padding: var(--space-lg);
+}
+
+.form-group textarea {
+    width: 100%;
+    padding: 0.625rem 0.75rem;
+    /* Matches .form-group input — crisp border-defined field, not a gray block. */
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-md);
+    outline: none;
+    transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
+    resize: vertical;
+    min-height: 5rem;
+}
+
+.form-group textarea:focus {
+    border-color: var(--accent);
+    box-shadow: var(--focus-ring);
+}
+
+.form-group textarea::placeholder {
+    color: var(--text-muted);
+}
+
+.form-group .auto-textarea {
+    resize: none;
+    overflow: hidden;
+    min-height: 0;
+}
+
+.form-group .code-textarea {
+    min-height: 7.5rem;
+    max-height: 60vh;
+    overflow-y: auto;
+    resize: vertical;
+    white-space: pre;
+    tab-size: 2;
+    line-height: 1.4;
+}
+
+/* Single definition (a duplicate in pages.css was folded in here) — the
+   font-weight:normal matters for hints nested inside bold form labels. */
+.form-hint {
+    font-size: var(--font-size-2xs);
+    font-weight: normal;
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+}
+
+/* Removable string list in trigger form (cron expressions) */
+.removable-list {
+    list-style: none;
+    margin: 0 0 0.375rem;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.removable-list-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.25rem 0.5rem;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+}
+
+.removable-list-item-info {
+    display: flex;
+    flex-direction: column;
+    gap: 0.0625rem;
+}
+
+.cron-description {
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+}
+
+.cron-expression {
+    font-family: var(--font-ui);
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+}
+
+.removable-input-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: stretch;
+}
+
+.removable-input-row input,
+.removable-input-row .dropdown {
+    flex: 1;
+    min-width: 0;
+}
+
+.removable-input-row input.input-error {
+    border-color: var(--accent-red);
+}
+
+.form-error {
+    font-size: var(--font-size-2xs);
+    color: var(--accent-red);
+    margin-top: 0.25rem;
+}
+
+/* ===== Apps ===== */
+
+/* Clickable list rows (e.g. single-UI apps) */
+.list-row.clickable {
+    cursor: pointer;
+}

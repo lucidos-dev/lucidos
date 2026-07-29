@@ -1,0 +1,929 @@
+/* Scrollbar styling */
+::-webkit-scrollbar {
+    width: 0.5rem;
+    height: 0.5rem;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--bg-primary);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--border-color);
+    border-radius: 0.25rem;
+}
+
+::-webkit-scrollbar-corner {
+    background: var(--bg-primary);
+}
+
+@media (hover: hover) {
+    ::-webkit-scrollbar-thumb:hover {
+        background: var(--text-muted);
+    }
+}
+
+/* Crossfade out of a loading skeleton (LoadingFade.tsx). Two grid children — the
+   `.loading-fade-content` wrapper and the skeleton — share one grid cell
+   (stacked); while loading the skeleton sizes the cell, once loaded the content
+   sizes it and the skeleton goes absolute + fades out over the now-visible
+   content — a smooth exit with no blank frame and no withheld content. The
+   content is wrapped in a single element so a caller passing a fragment of N
+   siblings doesn't flatten into N direct grid children (which would all stack in
+   the one cell via the rule below — the Changes-panel double-text bug). */
+.loading-fade {
+    display: grid;
+    position: relative;
+}
+
+.loading-fade > * {
+    grid-area: 1 / 1;
+    min-width: 0;
+}
+
+.loading-fade-skeleton {
+    transition: opacity var(--duration-normal) ease;
+}
+
+.loading-fade-skeleton.loading-fade-out {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .loading-fade-skeleton {
+        transition: none;
+    }
+}
+
+/* Self-skeletonizing primitives (components/shared/Skeleton.tsx). The Sk* leaves
+   render a `.sk-bar` shimmer placeholder when inside a SkeletonProvider, so a row
+   draws itself as its own loading placeholder (mirrors the real layout by
+   construction). Reuses the global `shimmer` keyframes (drawer.css). Host-only —
+   these classes live in the host bundle and are never served to apps. */
+.sk-bar {
+    display: inline-block;
+    width: 100%;
+    height: 0.85em;
+    border-radius: 0.375rem;
+    background: linear-gradient(
+        90deg,
+        var(--bg-tertiary) 25%,
+        color-mix(in srgb, var(--accent) 18%, var(--bg-tertiary)) 50%,
+        var(--bg-tertiary) 75%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+    vertical-align: middle;
+}
+
+.sk-circle {
+    border-radius: 50%;
+}
+
+.sk-round {
+    border-radius: 0.5rem;
+}
+
+/* Full-pane self-skeletonizing run (ListSkeletonOf fill): the component pins an
+   inline pixel height to the available content-pane height and renders one extra
+   row, clipped here so the run fills the pane exactly with no void below. The
+   row spacing/inset comes from the real list's `containerClass`, so no padding
+   is added here (unlike `.list-skeleton--fill`, which had no real container). */
+.sk-fill {
+    overflow: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .sk-bar {
+        animation: none;
+    }
+}
+
+/* Confirm dialog */
+.confirm-dialog {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    padding: 1.25rem 1.5rem;
+    max-width: 27.5rem;
+    width: 90%;
+    /* Cap height so the dialog never spills past the viewport;
+       the details list scrolls inside. `--app-height` is set by
+       MobileSwipeContainer so iOS Safari shrinks correctly when the
+       keyboard opens (raw `100vh` does not). */
+    max-height: calc(var(--app-height, 100dvh) - 4rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+    display: flex;
+    flex-direction: column;
+    box-shadow: var(--shadow-md);
+}
+
+.confirm-title {
+    color: var(--text-primary);
+    font-size: var(--font-size-lg);
+    font-weight: 600;
+    margin: 0 0 0.75rem;
+}
+
+.confirm-message {
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    line-height: 1.5;
+    margin-bottom: 1.25rem;
+}
+
+/* Text input for the prompt dialog (PromptDialog) — themed to match the
+   confirm modal it shares its chrome with. */
+.prompt-input {
+    width: 100%;
+    box-sizing: border-box;
+    margin-bottom: 1.25rem;
+    padding: 0.5rem 0.625rem;
+    font-family: inherit;
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+}
+
+.prompt-input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.prompt-input::placeholder {
+    color: var(--text-secondary);
+}
+
+.prompt-textarea {
+    resize: vertical;
+    min-height: 4.5rem;
+    line-height: 1.5;
+}
+
+.toast-bullets {
+    list-style: disc;
+    padding-left: 1.25rem;
+    color: var(--text-secondary);
+}
+
+.toast-bullets li {
+    margin-bottom: 0.125rem;
+}
+
+.confirm-details {
+    margin: 0 0 1.25rem;
+    font-size: var(--font-size-md);
+    line-height: 1.5;
+    color: var(--text-secondary);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    min-height: 0;
+}
+
+.confirm-details-intro {
+    margin: 0 0 0.75rem;
+}
+
+.confirm-details-group {
+    margin-bottom: 0.75rem;
+}
+
+.confirm-details-group:last-child {
+    margin-bottom: 0;
+}
+
+.confirm-details-header {
+    color: var(--text-primary);
+    font-weight: 600;
+    margin-bottom: 0.25rem;
+}
+
+.confirm-details-list {
+    list-style: disc;
+    padding-left: 1.25rem;
+    margin: 0;
+}
+
+.confirm-details-list li {
+    margin-bottom: 0.125rem;
+}
+
+.confirm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+}
+
+.confirm-actions-right {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.confirm-btn-extra {
+    margin-right: auto;
+}
+
+.confirm-btn {
+    padding: 0.375rem 0.75rem;
+    border-radius: 0.25rem;
+    border: none;
+    font-size: var(--font-size-sm);
+    font-family: var(--font-ui);
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+.confirm-btn-cancel {
+    background: none;
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
+}
+
+@media (hover: hover) {
+    .confirm-btn-cancel:hover {
+        color: var(--text-primary);
+        border-color: var(--text-secondary);
+    }
+}
+
+.confirm-btn-ok {
+    background: var(--accent-red);
+    color: var(--text-on-accent);
+}
+
+.confirm-btn-ok-default {
+    /* Shared action-button blue (see .action-btn) so every filled blue CTA
+       tracks one token across themes. */
+    background: var(--accent-action);
+    color: var(--text-on-accent);
+}
+
+@media (hover: hover) {
+    .confirm-btn-ok:hover {
+        background: color-mix(in srgb, var(--accent-red) 80%, #fff);
+    }
+
+    .confirm-btn-ok-default:hover {
+        background: color-mix(in srgb, var(--accent-action) 80%, #fff);
+    }
+}
+
+/* Toast notifications — positioned below header. The container spans the full
+   width; each toast is then centered over the pane it was born under (desktop
+   block below). Mobile shows one pane at a time, so the full width is correct
+   there. --z-toast sits above .ui-blocking-overlay so the restart toast stays
+   visible when the dim overlay covers the header. */
+.toast-container {
+    position: fixed;
+    top: calc(2.75rem + 0.5rem + env(safe-area-inset-top, 0px));
+    left: 0;
+    right: 0;
+    z-index: var(--z-toast);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+    pointer-events: none;
+}
+
+/* Desktop: pin each toast over the pane that was focused WHEN IT APPEARED
+   (data-toast-pane, frozen on the toast in showToast) — a later focus change
+   never moves it. The container centers each toast at the viewport middle;
+   --toast-shift then nudges it to its pane's center, and max-width keeps it
+   inside that pane. Both are computed from the shared header geometry vars in
+   shell.css (--co drawer width, --ddo drawer-divider offset, --divider-x split
+   position). .toast already has position:relative (for its close-X), so `left`
+   applies directly. */
+@media (min-width: 769px) {
+    .toast {
+        left: var(--toast-shift, 0px);
+    }
+
+    /* Thread-pane geometry (center = midpoint of [drawer edge, split divider]).
+       Applies to thread-pinned toasts AND — when the content pane has collapsed
+       — to content-pinned toasts, since the thread pane is then the only
+       survivor. Using the thread geometry (not a blunt viewport center) keeps
+       the toast over the surviving pane even with the drawer still open: a
+       collapsed CONTENT pane does not hide the drawer, so --co/--ddo still
+       offset the thread pane's left edge. The collapse selector is more specific,
+       so it wins over the content rule below for that toast. */
+    .toast[data-toast-pane="thread"],
+    :root[data-content-collapsed] .toast[data-toast-pane="content"] {
+        --toast-shift: calc((var(--co) + var(--ddo) + var(--divider-x)) / 2 - 50%);
+        max-width: min(30rem, calc(var(--divider-x) - var(--co) - var(--ddo) - 2rem));
+    }
+
+    /* Content-pane geometry (center = midpoint of [divider right edge, viewport
+       right]). Applies to content-pinned toasts AND — when the thread pane has
+       collapsed — to thread-pinned toasts (content is then the only survivor;
+       collapsing the thread pane also hides the drawer, so --co → 0 and this
+       spans the full width). */
+    .toast[data-toast-pane="content"],
+    :root[data-thread-collapsed] .toast[data-toast-pane="thread"] {
+        --toast-shift: calc((var(--divider-x) + var(--divider-width) + 100%) / 2 - 50%);
+        max-width: min(30rem, calc(100% - var(--divider-x) - var(--divider-width) - 2rem));
+    }
+}
+
+.toast {
+    /* Elevated surface: in DARK mode the fill sits one step above the app
+       background (--bg-tertiary, not the near-canvas --bg-secondary) and rides
+       the deeper --shadow-md, so the toast clearly floats above the chrome
+       instead of blending into it. (Light mode inverts the bg ladder, so it
+       overrides this fill to white below — see the `html[data-theme="light"]
+       .toast` rule.) Every toast keeps this plain theme bg; the per-type rules
+       below only add a frame (the border) in the toast's own category colour, so
+       the toast pops off the page via that frame, not the fill. */
+    background: var(--bg-tertiary);
+    border: 0.15625rem solid var(--border-color);
+    border-radius: 0.375rem;
+    padding: 0.5rem 0.875rem;
+    min-height: 2.5rem;
+    /* Cap height so a long message can't grow past the viewport;
+       the body scrolls inside. `--app-height` keeps iOS Safari honest
+       when the keyboard pushes the visual viewport up. */
+    max-height: calc(var(--app-height, 100dvh) - 6rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    width: calc(100% - 2rem);
+    max-width: 30rem;
+    box-shadow: var(--shadow-md);
+    pointer-events: auto;
+    /* Entry animation. Kept in lockstep with the JS reflow (FLIP) that slides
+       the toasts BELOW a newly-inserted one down to make room — see
+       REFLOW_DURATION_MS / REFLOW_EASING in Toast.tsx. Same duration + easing so
+       the incoming toast and the push-down it causes move together instead of
+       one snapping while the other glides. The 0.26s here is the 1x default;
+       Toast.tsx overrides `animation-duration` inline so both halves also scale
+       together with the diagnostic animation-speed slider (speedMultiplier). */
+    animation: toast-in 0.26s cubic-bezier(0.22, 0, 0, 1);
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    position: relative;
+    overflow: hidden;
+}
+
+.toast-body {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    min-height: 0;
+    /* Reserve room for the absolute-positioned close-X (top-right of .toast).
+       Kept on the body, not the whole .toast, so .toast-actions sits flush
+       to the toast's natural horizontal padding on both sides. */
+    padding-right: 1.375rem;
+}
+
+/* The mini-spinner rotates via CSS transform, and at 45° its square
+   bounding box inflates by ~√2, briefly exceeding the body's height.
+   `overflow: hidden` would suppress the resulting scrollbar but also
+   clips the spinner's top edge; `overflow: visible` lets the small
+   excess bleed into the toast's 0.5rem top padding without a scrollbar.
+   These toasts are always single-line. */
+.toast-body:has(.mini-spinner) {
+    overflow: visible;
+}
+
+.toast-icon {
+    width: 1.125rem;
+    height: 1.125rem;
+    flex-shrink: 0;
+    /* Per-type category colour (set as --toast-accent on the .toast-{type}
+       ancestor below) — drives the icon AND the border so they always match. */
+    color: var(--toast-accent);
+}
+
+.toast-message {
+    flex: 1;
+    min-width: 0;
+}
+
+.toast-clickable {
+    cursor: pointer;
+    text-decoration: none;
+}
+
+@media (hover: hover) {
+    .toast-clickable:hover {
+        text-decoration: underline;
+        text-decoration-color: currentColor;
+        text-underline-offset: 0.125rem;
+    }
+}
+
+/* Linkified URLs inside a toast message (heading, section titles, bullets).
+   `overflow-wrap: anywhere` lets a long URL break within the toast instead of
+   overflowing its fixed max-width. */
+.toast-message a,
+.toast-section-title a,
+.toast-bullets a {
+    color: var(--accent);
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+    text-underline-offset: 0.125rem;
+    overflow-wrap: anywhere;
+}
+
+@media (hover: hover) {
+    .toast-message a:hover,
+    .toast-section-title a:hover,
+    .toast-bullets a:hover {
+        text-decoration-color: var(--accent);
+    }
+}
+
+.toast-bullets {
+    margin: 0.25rem 0 0;
+    font-size: var(--font-size-sm);
+    line-height: 1.4;
+}
+
+.toast-section {
+    margin-top: 0.5rem;
+}
+
+.toast-section-title {
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.toast-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+}
+
+.toast-close {
+    position: absolute;
+    top: 0.5rem;
+    /* Mirrors the Dismiss action's gap from the toast's left padding. */
+    right: 0.625rem;
+    margin: 0;
+}
+
+/* Action toasts move keyboard focus to a default button (so Enter acts on it)
+   and trap Tab within the toast. Because that focus is moved PROGRAMMATICALLY,
+   the global `.action-btn:focus-visible` / `.icon-btn:focus-visible` ring is
+   suppressed — browsers only show :focus-visible for keyboard-initiated focus —
+   so the focused button had no indicator and the user was "pressing blindly".
+   Show the ring on plain :focus for toast controls so the active button is
+   always visible, however focus arrived. Gated behind `hover: hover` (a real
+   pointer + keyboard, i.e. desktop) — on touch there is no keyboard to press
+   blindly with, and a tapped toast button would otherwise keep a lingering
+   focus ring. */
+@media (hover: hover) {
+    .toast .toast-actions .action-btn:focus,
+    .toast .toast-close:focus {
+        /* Shared --focus-ring on plain :focus (programmatic focus isn't
+           :focus-visible) so the toast's default button is always indicated. */
+        outline: 0.125rem solid transparent;
+        box-shadow: var(--focus-ring);
+    }
+}
+
+.toast-close svg {
+    width: 0.875rem;
+    height: 0.875rem;
+}
+
+/* One toast look for every type — the plain theme bg framed by the toast's own
+   CATEGORY colour (success=green, info=blue, warning=sand, error=red).
+   Each type sets --toast-accent once; the border AND the icon both read it (see
+   the `.toast-icon` rule above), so the frame and the icon always match. The fill
+   is just the theme background, inherited from the base `.toast` rule above
+   (--bg-tertiary) — no tint. Same specificity as the base `.toast` rule above —
+   border-color wins on source order (overrides only the colour of the `.toast`
+   border shorthand). Every type reads its token straight: warning used to mix
+   --accent-yellow toward --text-secondary to desaturate the old raw gold, and
+   light mode needed a further hardcoded override because that mix muddied to
+   brown. --accent-yellow is a muted sand now, so both patches are gone. */
+.toast-success { --toast-accent: var(--accent-green); }
+.toast-info    { --toast-accent: var(--accent); }
+.toast-warning { --toast-accent: var(--accent-yellow); }
+.toast-error   { --toast-accent: var(--accent-red); }
+
+/* Light-mode fill override: the bg ladder INVERTS between themes. In dark mode
+   surfaces get lighter as they rise (primary→secondary→tertiary), so the base
+   --bg-tertiary fill reads as "elevated". In light mode it inverts — tertiary
+   (#e1e4e8) is the DARKEST of the three, so that same fill renders the toast as a
+   gray slab. Elevation in light mode is toward white, so the toast sits on the
+   brightest surface (--bg-primary) and floats on its shadow + category border. */
+html[data-theme="light"] .toast { background: var(--bg-primary); }
+
+.toast-success,
+.toast-info,
+.toast-warning,
+.toast-error {
+    border-color: var(--toast-accent);
+}
+
+.mini-spinner.toast-icon {
+    width: 1rem;
+    height: 1rem;
+    --spinner-color: var(--toast-accent);
+}
+
+@keyframes toast-in {
+    from { opacity: 0; transform: translateY(-0.5rem); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes modal-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+/* Contextual drop highlights — applied to the element with data-drop-zone
+ * by the document-level dispatcher (DropZone.tsx). The matched element gets
+ * either drag-over-attach (composer/thread) or drag-over-import (files panel),
+ * and an inset dashed overlay fills it. The "attach" zone uses green to echo
+ * the send action; "import" uses the standard accent blue. */
+[data-drop-zone].drag-over-attach,
+[data-drop-zone].drag-over-import {
+    position: relative;
+}
+
+[data-drop-zone].drag-over-attach::after,
+[data-drop-zone].drag-over-import::after {
+    content: '';
+    position: absolute;
+    inset: 0.5rem;
+    border-radius: 0.5rem;
+    pointer-events: none;
+    z-index: 1000;
+}
+
+[data-drop-zone].drag-over-attach::after {
+    background: rgba(63, 185, 80, 0.08);
+    border: 0.1875rem dashed var(--accent-green);
+}
+
+[data-drop-zone].drag-over-import::after {
+    background: rgba(88, 166, 255, 0.1);
+    border: 0.1875rem dashed var(--accent);
+}
+
+[data-drop-zone].drag-over-attach::before,
+[data-drop-zone].drag-over-import::before {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    padding: 1rem 1.75rem;
+    border-radius: 0.5rem;
+    box-shadow: var(--shadow-lg);
+    font-size: var(--font-size-xl);
+    font-weight: 500;
+    pointer-events: none;
+    z-index: 1001;
+    white-space: nowrap;
+}
+
+[data-drop-zone].drag-over-attach::before {
+    content: 'Attach to message';
+}
+
+[data-drop-zone].drag-over-import::before {
+    content: 'Drop files to import';
+}
+
+/* Folder tree navigation */
+.folder-tree {
+    font-size: var(--font-size-md);
+    margin-top: 0;
+}
+
+.folder-item {
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.folder-header {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.375rem 0.5rem;
+    cursor: pointer;
+    border-radius: 0.25rem;
+    transition: background-color 0.15s;
+}
+
+@media (hover: hover) {
+    .folder-header:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.folder-arrow {
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+    width: 0.75rem;
+}
+
+.folder-icon {
+    width: 1.25rem;
+    height: 1.25rem;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+}
+
+.folder-name {
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+.folder-count {
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+/* The ONE source of tree indentation. A folder's children are nested inside its
+ * `.folder-contents`, so the DOM nesting already accumulates — the offset here is
+ * one constant unit per level, never a running total. (A per-row offset applied
+ * on top of this nesting compounds into 1, 3, 6, 10 … rem.) */
+.folder-contents {
+    margin-left: 1rem;
+}
+
+.file-item {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.3125rem 0.5rem;
+    cursor: pointer;
+    border-radius: 0.25rem;
+    transition: background-color 0.15s;
+}
+
+/* A file row inside the tree sits further right than a sibling folder row, to
+ * clear that row's disclosure arrow. Scoped to the tree so the flat changed-files
+ * list (`.file-item.repo-changed-file`) keeps the base 0.5rem gutter. */
+.tree-file-item {
+    padding-left: 1.25rem;
+}
+
+@media (hover: hover) {
+    .file-item:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.file-icon {
+    width: 1.25rem;
+    height: 1.25rem;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+}
+
+@media (hover: hover) {
+    .folder-header:hover .folder-icon,
+    .file-item:hover .file-icon {
+        color: var(--text-primary);
+    }
+}
+
+.file-name {
+    color: var(--text-secondary);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Image thumbnails - clickable to show full size */
+.image-thumbnail {
+    max-width: 18.75rem;
+    max-height: 12.5rem;
+    border-radius: 0.5rem;
+    border: 1px solid var(--border-color);
+    cursor: pointer;
+    transition: all 0.2s;
+    object-fit: cover;
+}
+
+@media (hover: hover) {
+    .image-thumbnail:hover {
+        border-color: var(--accent);
+        box-shadow: var(--shadow-sm);
+        transform: scale(1.02);
+    }
+}
+
+/* Image popup for full-size viewing */
+/* Extends .modal-overlay — darker backdrop for image viewing.
+   z-index above --z-control-panel so header buttons (which sit at 2200)
+   don't punch through the dim overlay. */
+.image-popup {
+    background: rgba(0, 0, 0, 0.9);
+    padding: 1.25rem;
+    overflow: hidden;
+    overscroll-behavior: contain;
+    z-index: calc(var(--z-control-panel) + 100);
+}
+
+.image-popup-content {
+    position: relative;
+    width: 95vw;
+    height: 95vh;
+    overflow: hidden;
+}
+
+/* The strip holds every image. Each slide's `left` is set inline to its
+   shortest signed delta from the current index (so wrap-around neighbours
+   sit adjacent on screen). The strip rests at translateX(0); a swipe commit
+   animates it by ±W in the swipe direction, then snaps back to 0 as the
+   signal updates and slides reposition. Every <img> is mounted from the
+   start, so swiping just moves the strip — no src swaps, no decode race. */
+.image-popup-strip {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    will-change: transform;
+}
+
+.image-popup-slide {
+    position: absolute;
+    top: 0;
+    /* left set inline per slide */
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.image-popup-slide img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    border-radius: 0.5rem;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    user-select: none;
+    -webkit-user-select: none;
+    transform-origin: center;
+    touch-action: none;
+    /* Pin to its own compositor layer so pinch-zoom transforms don't
+       repaint at native resolution every frame. iOS Safari is especially
+       sensitive — without this, pinch updates feel jerky because the
+       browser re-rasterizes the image bitmap on each scale change. The
+       JS path also uses translate3d() to force the GPU code path. */
+    will-change: transform;
+    -webkit-transform: translateZ(0);
+    transform: translateZ(0);
+    -webkit-backface-visibility: hidden;
+    backface-visibility: hidden;
+}
+
+.image-popup-close {
+    position: absolute;
+    top: -2.5rem;
+    right: 0;
+    background: rgba(0, 0, 0, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.5);
+    color: #fff;
+    border-radius: 50%;
+}
+
+.floating-mobile-close {
+    display: none;
+}
+
+/* Prev/Next navigation buttons in the popup. Pinned to the viewport so
+   .image-popup-content's `overflow: hidden` (needed to clip pinch-zoomed
+   images) doesn't hide them. */
+.image-popup-nav {
+    position: fixed;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 3rem;
+    height: 3rem;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.6);
+    border: 1px solid rgba(255, 255, 255, 0.5);
+    color: #fff;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1;
+    transition: background var(--duration-fast);
+}
+
+.image-popup-nav-prev {
+    left: 1.5rem;
+}
+
+.image-popup-nav-next {
+    right: 1.5rem;
+}
+
+@media (hover: hover) {
+    .image-popup-nav:hover {
+        background: rgba(0, 0, 0, 0.85);
+    }
+}
+
+.image-popup-counter {
+    position: absolute;
+    bottom: -2rem;
+    left: 50%;
+    transform: translateX(-50%);
+    color: var(--text-on-accent);
+    font-size: var(--font-size-sm);
+    background: rgba(0, 0, 0, 0.6);
+    padding: 0.1875rem 0.5rem;
+    border-radius: 0.625rem;
+    pointer-events: none;
+}
+
+.image-popup-close,
+.floating-mobile-close,
+.image-popup-nav,
+.image-popup-counter {
+    transition: opacity var(--duration-fast) ease-out;
+}
+
+/* pointer-events:none keeps the invisible buttons from eating the next tap. */
+.image-popup-content.chrome-hidden .image-popup-close,
+.image-popup-content.chrome-hidden .floating-mobile-close,
+.image-popup-content.chrome-hidden .image-popup-nav,
+.image-popup-content.chrome-hidden .image-popup-counter {
+    opacity: 0;
+    pointer-events: none;
+}
+
+@media (max-width: 600px) {
+    .image-popup {
+        padding: 0;
+        background: #000;
+    }
+
+    .image-popup-content {
+        width: 100vw;
+        height: 100vh;
+    }
+
+    .image-popup-slide img {
+        border-radius: 0;
+        box-shadow: none;
+    }
+
+    .image-popup-close {
+        display: none;
+    }
+
+    .floating-mobile-close {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: fixed;
+        top: max(3.5rem, calc(0.75rem + env(safe-area-inset-top, 0px)));
+        right: calc(0.75rem + env(safe-area-inset-right, 0px));
+        width: 3rem;
+        height: 3rem;
+        border-radius: 50%;
+        background: rgba(0, 0, 0, 0.7);
+        border: 1px solid rgba(255, 255, 255, 0.5);
+        color: #fff;
+        cursor: pointer;
+        z-index: 1;
+    }
+
+    .floating-mobile-close svg {
+        width: 1.25rem;
+        height: 1.25rem;
+    }
+
+    /* Mobile relies on swipe for navigation — chevrons would steal thumb
+       real estate without adding anything. */
+    .image-popup-nav {
+        display: none;
+    }
+
+    .image-popup-counter {
+        bottom: max(0.75rem, calc(0.5rem + env(safe-area-inset-bottom, 0px)));
+    }
+}
+
+/* ── Lucidos mark (brand glyph) ─────────────────────────────────────────────
+   The reusable inline-SVG mark (components/shared/LucidosMark.tsx). Sized via
+   the inline `width/height` the component sets from its `size` prop; these rules
+   only own layout alignment. (The boot splash no longer uses this component — it
+   is inlined in index.html so it paints before the bundle loads; see
+   utils/bootSplash.ts.) */
+.lucidos-mark {
+    display: inline-block;
+    vertical-align: middle;
+    flex-shrink: 0;
+}

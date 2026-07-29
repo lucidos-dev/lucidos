@@ -1,0 +1,24 @@
+-- Records whether the create-time web push was actually dispatched.
+--
+-- send_push_to_all_with_app suppresses the entire fan-out when any device
+-- has a visible Lucidos tab (cross-device push suppression — see push.rs).
+-- When suppressed, NO device received an OS banner for this notification.
+--
+-- The cross-device mark_read fan-out exists to replace those OS banners with
+-- a "✓ Read on another device" marker (same tag → OS swaps in place). When
+-- no banner exists to replace, the SW's mandatory showNotification call
+-- (Safari revokes after 3 silent pushes) creates a NEW banner instead — the
+-- "Read on another device" storm.
+--
+-- Gating mark_read fan-out on push_dispatched=true kills the storm: if the
+-- original was never dispatched, there's nothing to mark read.
+--
+-- Default-false (no backfill) is deliberate. Pre-existing rows are
+-- indistinguishable post-hoc — we don't know whether their push went out or
+-- was suppressed by any_visible. Backfilling all to true would recreate the
+-- storm for the pre-existing suppressed subset; leaving them false means
+-- pre-existing real OS banners aren't auto-cleaned cross-device on read
+-- (the user swipes them once). Transient one-time gap, bounded to
+-- pre-upgrade rows; new rows behave correctly.
+ALTER TABLE notifications
+    ADD COLUMN push_dispatched BOOLEAN NOT NULL DEFAULT false;
