@@ -893,6 +893,22 @@ fn files_require_restart_for_engine_bundled_iframe_assets() {
     ]));
 }
 
+/// The app document is the exception to "frontend files never restart": the
+/// gateway `include_str!`s it and lifts the boot-splash stylesheet + mark out at
+/// compile time (crates/lucidos-gateway/src/proxy.rs), so a running gateway
+/// serves the splash it was BUILT with. Without the rebuild its splash and the
+/// app's would drift apart, which is the whole thing sharing the file prevents.
+#[test]
+fn files_require_restart_for_the_gateway_bundled_app_document() {
+    assert!(files_require_restart(&[
+        "crates/lucidos-app/index.html".into()
+    ]));
+    // Other frontend HTML is still frontend-only.
+    assert!(!files_require_restart(&[
+        "crates/lucidos-app/e2e/fixture.html".into()
+    ]));
+}
+
 /// Creating an isolation branch (`-b`) must NOT write upstream-tracking config.
 /// That write — triggered by `branch.autoSetupMerge` — is the ONLY thing
 /// `git worktree add` puts in the SHARED `.git/config`, and under several

@@ -21,6 +21,9 @@
 const SPLASH_SELECTOR = '.boot-splash';
 const STATUS_SELECTOR = '.boot-splash-status';
 const LEAVING_CLASS = 'boot-splash-leaving';
+// Set by the inline handover script in index.html when the gateway boot splash
+// had already built the mark on this url, so this document skips its reveal.
+const FORMED_CLASS_SELECTOR = '.boot-splash-formed';
 
 // Matches the longest `.boot-splash-leaving` fade in index.html (0.45s); the
 // extra margin covers the reduced-motion 0.15s case too. Used as the removal
@@ -32,6 +35,13 @@ let dismissed = false;
 /** True while the inline splash is still in the DOM. */
 export function bootSplashPresent(): boolean {
   return !dismissed && document.querySelector(SPLASH_SELECTOR) !== null;
+}
+
+/** True when this document took over from the gateway boot splash with the mark
+ *  already built, so index.html tagged the splash `boot-splash-formed` and there
+ *  is no reveal animation to wait out before dismissing. */
+export function bootSplashRevealSkipped(): boolean {
+  return document.querySelector(SPLASH_SELECTOR + FORMED_CLASS_SELECTOR) !== null;
 }
 
 /** Update the status line under the mark (e.g. "Opening your workspace…",

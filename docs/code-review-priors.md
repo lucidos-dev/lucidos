@@ -491,18 +491,30 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   and `meta.updatedAt` are the SAME monotonic `thread_summaries.last_activity`
   column, so the lexicographic `<` is a valid causal-freshness test — not a
   cross-clock compare.
-- **`.boot-splash-status` uses `font-size: 15px` (px, not rem) on purpose — it
-  is NOT a violation of the "all sizes rem" rule.** The app's `<html>` font-size
-  is scaled by `var(--user-ui-scale)` (`base.css`), so a rem value would grow
-  with the user's UI scale (e.g. 22.5px at 150%). The boot splash must render the
-  status at the SAME size as the gateway "Starting engine…" splash
-  (`crates/lucidos-gateway/src/proxy.rs` `.mark-label`, `0.9375rem` × an
-  unscaled 16px root = 15px), which is an isolated document with no access to the
-  scale. Pinning a fixed 15px is the requirement — reverting it to rem
-  reintroduces the "status text jumps size across the cold-boot→workspace seam"
-  bug. The rem rule honors user scale; this is the deliberate case where scale
-  must NOT apply. Re-flag only if the gateway splash gains UI-scale awareness.
-  (`crates/lucidos-app/index.html` `.boot-splash-status`.)
+- **The whole boot-splash stylesheet is in px, not rem, on purpose. It is NOT a
+  violation of the "all sizes rem" rule.** The app's `<html>` font-size is scaled
+  by `var(--user-ui-scale)` (`base.css`, and 112.5% by default in `mobile.css`),
+  while the gateway boot splash is an isolated document at the browser default
+  with no access to that scale. One rem value therefore paints at two sizes
+  across the cold-boot→workspace seam, which the two documents cross mid-launch
+  on the SAME url: at 137.5% scale the mark was 330px in the app and 240px on the
+  gateway, and it visibly grew (plus a shifted status line) the moment the app
+  document took over. Every length in that block is pinned instead, and both
+  sides assert there is no rem in it. The rem rule honors user scale; this is the
+  deliberate case where scale must NOT apply. Re-flag only if the gateway splash
+  gains UI-scale awareness. (`crates/lucidos-app/index.html`, the block between
+  the `lucidos-boot-splash-css` markers.)
+- **The gateway splash `include_str!`s `crates/lucidos-app/index.html` and slices
+  the stylesheet + mark out of it. That cross-crate reach is the fix, not a
+  layering smell.** The splash renders when no engine is reachable, so it cannot
+  link a stylesheet; before this it carried a hand-kept copy of every value, and
+  the copies drifted (the seam bug above). Sharing the file makes the two
+  surfaces one splash by construction. `include_str!` is a build dependency, so
+  cargo rebuilds the gateway when index.html changes, and `files_require_restart`
+  lists index.html for the same reason. Re-flag only if a real shared-asset
+  pipeline appears (a build step that can inline a `.css` file into index.html at
+  first paint), which would be the cleaner home for it.
+  (`crates/lucidos-gateway/src/proxy.rs` `app_splash_css` / `app_mark_svg`.)
 
 - **Provider-settings components treat a non-`loaded` credentials Loadable as
   "not configured" — sibling-wide pattern, failure surfaced at the section

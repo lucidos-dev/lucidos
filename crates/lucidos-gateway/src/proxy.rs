@@ -240,20 +240,24 @@ fn boot_splash_response(html: String, retry_after: &'static str) -> Response {
 
 /// The brand boot splash as a self-contained HTML page: a full-screen gradient
 /// wash with the white Lucidos mark playing its reveal animation, and `label`
-/// shown beneath it. The reusable background — every boot-window surface passes
-/// its own text. The mark is the brand glyph from
-/// `crates/lucidos-app/src/components/shared/LucidosMark.tsx`; its per-tile reveal
-/// keyframes (`tile-in`/`spark-in`) are self-contained inline below so the page
-/// renders before any engine — or the app stylesheet — is reachable. The label
-/// styling matches the frontend boot splash (`crates/lucidos-app/index.html`
-/// `.boot-splash-status`) so the text does not jump across the cold-boot→workspace
-/// seam — see the `.mark-label` rule below. The 2s meta-refresh that polls for the booted
-/// engine doubles as the animation loop. The `<link rel="icon">` is an inline
-/// `data:` URI mirror of `crates/lucidos-app/public/favicon.svg` (gradient tile
-/// on a rounded square) — inlined rather than referenced because the splash must
-/// render before any engine can serve `/favicon.svg`. Geometry + gradient are the
-/// single-source values from the icon generator; keep them in sync if the brand
-/// changes there.
+/// shown beneath it. The reusable background, where every boot-window surface
+/// passes its own text.
+///
+/// **This is the app's own boot splash, rendered by the gateway.** The page is
+/// assembled from [`app_splash_css`] and [`app_mark_svg`], both lifted verbatim
+/// out of `crates/lucidos-app/index.html` at compile time, so the two surfaces
+/// are one splash rather than two copies: the user crosses from this page to the
+/// app document mid-boot, on the same url, and nothing about the mark or the
+/// status can move because nothing about them is defined twice. What this page
+/// adds is its own canvas plus four documented deviations (a wrapping status
+/// line, no breathe under the meta-refresh, a tappable escape link, its own
+/// label). It is also self-contained by necessity: it renders when no engine is
+/// reachable, so it can link nothing.
+///
+/// The `<link rel="icon">` is an inline `data:` URI mirror of
+/// `crates/lucidos-app/public/favicon.svg` (gradient tile on a rounded square),
+/// inlined for the same reason. Its geometry + gradient are the single-source
+/// values from the icon generator; keep them in sync if the brand changes there.
 ///
 /// `label` is HTML-ESCAPED before interpolation. The phase labels are static
 /// strings, but [`failed_page`]'s message arrives from the engine over the
@@ -278,54 +282,68 @@ fn splash_page_html(label: &str, refresh_secs: Option<u32>, escape: bool) -> Str
 <title>"##;
     // Split again around the tab title: the failure page must not sit in the tab
     // claiming "Starting…" while the page itself says the workspace cannot open.
-    const HEAD_C: &str = r##"</title>
+    const STYLE_OPEN: &str = r##"</title>
 <style>
+"##;
+    // Everything the shared stylesheet does NOT cover: this document's own canvas,
+    // and the four places this page deliberately differs from the app splash.
+    const GATEWAY_CSS_AND_BODY: &str = r##"
 html,body{margin:0;height:100%}
 /* Paint the gradient on the root with a solid fallback + fixed attachment so it
-covers the whole viewport — including the iOS standalone-PWA bottom safe-area /
-overscroll region, which a body-only background (sized to 100vh) leaves uncovered
-(it fell back to a different color — the lighter strip at the bottom). The solid
-#0a4ea8 fallback matches the gradient's dark end and the theme-color. */
+covers the whole viewport, the iOS standalone-PWA bottom safe-area / overscroll
+region included. The fixed `inset:0` .boot-splash element leaves that strip
+uncovered, and it then falls back to a different color (the lighter band at the
+bottom). The solid #0a4ea8 fallback matches the gradient's dark end and the
+theme-color. index.html's FOUC script paints <html> for exactly this reason. */
 html{background:#0a4ea8 radial-gradient(125% 125% at 30% 22%,#2d83e0 0%,#0a4ea8 100%) no-repeat fixed}
-body{display:flex;flex-direction:column;min-height:100vh;align-items:center;justify-content:center;
-text-align:center;color:#fff;
-/* Fixed all-system monospace stack — inlined because the splash renders before
-any engine can serve the app stylesheet, and deliberately NOT the workspace
-font preference (a web font would swap-jank). Same stack the frontend boot
-splash status uses (crates/lucidos-app/index.html `.boot-splash-status`) so the
-status renders the same across the cold-boot→workspace seam. Keep in sync. */
-font-family:ui-monospace,SFMono-Regular,'SF Mono',Menlo,'Fira Code','JetBrains Mono',Monaco,Consolas,monospace}
-.mark{width:min(46vmin,15rem);height:min(46vmin,15rem)}
-/* font-size, letter-spacing and color match the frontend boot-splash status
-(crates/lucidos-app/index.html `.boot-splash-status`) so the label does not
-change size/spacing/color across the cold-boot→workspace seam. The margin
-mirrors that splash's 1.5rem mark↔status gap (and zeros the default <p> bottom
-margin so vertical centering matches). Keep all four values in sync. */
-.mark-label{margin:1.5rem 0 0;font-size:.9375rem;letter-spacing:.01em;opacity:.82}
-/* The stalled-boot escape link (shown only past the boot budget). Matches the
-label's size/spacing, underlined so it reads as a tap target. */
-.mark-escape{display:inline-block;margin:1rem 0 0;font-size:.9375rem;letter-spacing:.01em;color:#fff;opacity:.92;text-decoration:underline;text-underline-offset:.2em}
-.lmk-tile,.lmk-spark{transform-box:fill-box;transform-origin:center}
-.lmk-tile{animation:tile-in .5s cubic-bezier(.34,1.56,.64,1) both}
-.lmk-tile-1{animation-delay:.15s}.lmk-tile-2{animation-delay:.28s}.lmk-tile-3{animation-delay:.41s}
-.lmk-spark{animation:spark-in .55s cubic-bezier(.34,1.56,.64,1) .6s both}
-@keyframes tile-in{from{opacity:0;transform:scale(.3)}60%{opacity:1;transform:scale(1.08)}to{opacity:1;transform:scale(1)}}
-@keyframes spark-in{from{opacity:0;transform:scale(0) rotate(-60deg)}70%{opacity:1;transform:scale(1.2) rotate(8deg)}to{opacity:1;transform:scale(1) rotate(0)}}
-@media (prefers-reduced-motion:reduce){.lmk-tile,.lmk-spark{animation:none}}
+/* The deviations from the shared splash stylesheet above, and nothing else.
+Every size, color, font and animation comes from there. */
+/* 1. The app's status is always one short line (nowrap + ellipsis). These labels
+are sentences (a boot phase, or the reason a workspace cannot open), so let them
+wrap rather than truncate. A one-line label still fills exactly the 1.4em box the
+app reserves, so the mark sits in the same place on both surfaces. */
+.boot-splash-status{height:auto;white-space:normal;overflow:visible;text-align:center}
+/* 2. This page reloads every couple of seconds (the meta-refresh polls for the
+booted engine) and every reload restarts its animations, so a breathe would snap
+back to full opacity each time. Overriding animation-NAME alone reuses the shared
+timing: the reveal on first paint, then the mark simply stands there. The
+workspace document, which does not reload, picks the breathe up when it takes
+over. Scoped to no-preference because these rules sit after the shared sheet and
+would otherwise put a name back on the animation it silences for reduced motion. */
+@media (prefers-reduced-motion:no-preference){
+.boot-splash-mark{animation-name:boot-mark-reveal}
+.boot-splash-formed .boot-splash-mark{animation-name:none}
+}
+/* 3. The escape link (stalled/failed pages only). Type is inherited from
+.boot-splash like every other line here, so this sets only what is its own: it
+reads brighter than the status, is underlined so it reads as a tap target, and
+takes its pointer events back. The splash is `pointer-events:none` for the app,
+where it covers a live shell; here it covers nothing and this link is the one
+action left. */
+.boot-splash-escape{pointer-events:auto;color:#fff;opacity:.92;text-decoration:underline;text-underline-offset:.2em}
 </style></head>
 <body>
-<svg class="mark" viewBox="0 0 100 100" aria-hidden="true">
-<g transform="translate(11 11) scale(0.78)" fill="#ffffff">
-<rect class="lmk-tile lmk-tile-1" x="17" y="17" width="29" height="29" rx="7"/>
-<rect class="lmk-tile lmk-tile-2" x="17" y="54" width="29" height="29" rx="7"/>
-<rect class="lmk-tile lmk-tile-3" x="54" y="54" width="29" height="29" rx="7"/>
-<path class="lmk-spark" d="M68.5 12 C71 25 74 28.5 87 31 C74 33.5 71 37 68.5 50 C66 37 63 33.5 50 31 C63 28.5 66 25 68.5 12 Z"/>
-</g>
-</svg>
-<p class="mark-label">"##;
+<div class="boot-splash">
+"##;
+    // 4. The last deviation, in markup rather than CSS: the app bakes its own
+    // status text ("Opening your workspace…"), ours is per-page.
+    const MARK_TO_LABEL: &str = r##"
+<div class="boot-splash-status boot-splash-status-shown">"##;
+    // Keep the mark built for as long as this tab is showing one. This page and
+    // the app shell are the SAME url (the meta-refresh reloads this until the
+    // engine answers, then the engine serves index.html), so with no handover
+    // every reload, and the final swap to the app, would re-play the reveal: a
+    // mark that is already standing there drops to opacity 0 and rebuilds. Read
+    // the flag to skip our own reveal, and set it for whoever comes next.
+    // index.html REMOVES it as it reads it, so it can never suppress a reveal
+    // that would not have been a rebuild. sessionStorage is per-tab and
+    // same-origin (the gateway serves both documents), which is exactly the scope
+    // of "a mark is on screen in this tab right now".
+    const HANDOVER: &str = r##"<script>try{var f=sessionStorage.getItem('lucidos-splash-mark-formed')==='1';sessionStorage.setItem('lucidos-splash-mark-formed','1');if(f){document.querySelector('.boot-splash').classList.add('boot-splash-formed')}}catch(e){}</script>"##;
     // The picker link stands down the cold-start auto-open (`?pick`), so a manual
     // tap can't loop back into the unreachable workspace.
-    const ESCAPE_LINK: &str = r##"<a class="mark-escape" href="/~/?pick">Back to workspaces</a>"##;
+    const ESCAPE_LINK: &str =
+        r##"<a class="boot-splash-escape" href="/~/?pick">Back to workspaces</a>"##;
     let escape_html = if escape { ESCAPE_LINK } else { "" };
     // Omitted entirely (not `content="0"`) when there is nothing to wait for.
     let refresh_html = match refresh_secs {
@@ -339,9 +357,51 @@ label's size/spacing, underlined so it reads as a tap target. */
         "Cannot open workspace"
     };
     let label = escape_html_text(label);
+    let css = app_splash_css();
+    let mark = app_mark_svg();
     format!(
-        "{HEAD_A}{refresh_html}{HEAD_B}{title}{HEAD_C}{label}</p>\n{escape_html}\n</body></html>"
+        "{HEAD_A}{refresh_html}{HEAD_B}{title}{STYLE_OPEN}{css}{GATEWAY_CSS_AND_BODY}{mark}\
+         {MARK_TO_LABEL}{label}</div>\n{escape_html}\n</div>\n{HANDOVER}\n</body></html>"
     )
+}
+
+/// The app document, embedded at COMPILE time. The splash must render with no
+/// engine reachable, so it cannot link the app's stylesheet; embedding the file
+/// lets this page carry the very same one inline. `include_str!` is a build
+/// dependency, so cargo rebuilds this crate whenever index.html changes, and
+/// `files_require_restart` (engine-side) treats index.html as a bundled asset for
+/// the same reason.
+const APP_INDEX_HTML: &str = include_str!("../../lucidos-app/index.html");
+
+const CSS_START: &str = "/* lucidos-boot-splash-css-start */";
+const CSS_END: &str = "/* lucidos-boot-splash-css-end */";
+const MARK_START: &str = "<!-- lucidos-boot-splash-mark-start -->";
+const MARK_END: &str = "<!-- lucidos-boot-splash-mark-end -->";
+
+/// The boot-splash stylesheet, verbatim from index.html (see its "SINGLE SOURCE
+/// FOR BOTH SPLASH SURFACES" comment). This is why the two splashes cannot
+/// drift: there is one stylesheet, and this page overrides exactly four things
+/// in it.
+///
+/// Empty if the markers ever move, which degrades to an unstyled splash rather
+/// than taking the page down. `the_app_splash_stylesheet_and_mark_are_extractable`
+/// is what actually prevents that, at build-gate time.
+fn app_splash_css() -> &'static str {
+    slice_between(APP_INDEX_HTML, CSS_START, CSS_END).unwrap_or("")
+}
+
+/// The boot-splash mark, verbatim from index.html, so both surfaces draw the
+/// same glyph with the same classes and the same reveal. Same empty-on-missing
+/// contract as [`app_splash_css`].
+fn app_mark_svg() -> &'static str {
+    slice_between(APP_INDEX_HTML, MARK_START, MARK_END).unwrap_or("")
+}
+
+/// The text between `open` and the first following `close`, excluding both.
+fn slice_between<'a>(haystack: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = haystack.find(open)? + open.len();
+    let end = haystack[start..].find(close)? + start;
+    Some(&haystack[start..end])
 }
 
 /// Escape text for interpolation into HTML element content or a quoted attribute.
@@ -395,6 +455,106 @@ mod tests {
         assert_eq!(strip_prefix("/devx/foo", "dev"), None);
         assert_eq!(strip_prefix("/other/foo", "dev"), None);
         assert_eq!(strip_prefix("/api/v1/health", "dev"), None);
+    }
+
+    /// The anchors [`app_splash_css`] / [`app_mark_svg`] slice index.html on. A
+    /// rename there would silently leave this page unstyled or markless, which
+    /// is the one failure mode of sharing the file instead of copying it. The
+    /// app side pins the same contract in `src/utils/bootSplash.test.ts`.
+    #[test]
+    fn the_app_splash_stylesheet_and_mark_are_extractable() {
+        // One pair of each marker, or the slice silently takes the wrong span.
+        for marker in [CSS_START, CSS_END, MARK_START, MARK_END] {
+            assert_eq!(APP_INDEX_HTML.matches(marker).count(), 1, "{marker}");
+        }
+        let css = app_splash_css();
+        assert!(css.contains(".boot-splash-mark"), "{css}");
+        assert!(css.contains("@keyframes boot-mark-reveal"), "{css}");
+        assert!(css.contains("@keyframes boot-mark-breathe"), "{css}");
+        let mark = app_mark_svg();
+        assert!(mark.contains(r#"<svg class="boot-splash-mark""#), "{mark}");
+        assert!(mark.contains("<rect"), "{mark}");
+        assert!(mark.contains("</svg>"), "{mark}");
+    }
+
+    /// The page renders the app's splash rather than a copy of it: same
+    /// stylesheet, same mark, same class names. Nothing about the mark's size or
+    /// the status line's placement is defined here, so nothing can drift across
+    /// the seam where this page hands over to the app document.
+    #[test]
+    fn splash_page_is_built_from_the_app_splash_not_a_copy_of_it() {
+        let html = splash_page_html("Starting engine", Some(2), true);
+        assert!(html.contains(app_splash_css()), "{html}");
+        assert!(html.contains(app_mark_svg()), "{html}");
+        assert!(html.contains(r#"<div class="boot-splash">"#), "{html}");
+        assert!(
+            html.contains(r#"<div class="boot-splash-status boot-splash-status-shown">"#),
+            "{html}"
+        );
+        // Everything below is about this page's OWN css (the tail after the
+        // shared sheet); the sheet itself is the app's to police.
+        let tail = html.split("</style>").next().unwrap_or_default();
+        let tail = tail.split("html,body{margin:0").nth(1).unwrap_or_default();
+        let tail = strip_css_comments(tail);
+        // A rem length here would ride the root font-size, which differs between
+        // the two documents (the app root is var(--user-ui-scale)); that is what
+        // made the mark grow at the seam.
+        assert!(!tail.contains("rem"), "{tail}");
+        // No type of its own either: every line on this page inherits the
+        // stack/size/spacing from `.boot-splash`. A `font-` declaration here is
+        // a second copy of a value the shared sheet already owns, and dropping
+        // the old `body{font-family:…}` without inheriting is what once left the
+        // escape link rendering in the UA serif.
+        assert!(!tail.contains("font-"), "{tail}");
+    }
+
+    /// CSS comments removed, so a comment that MENTIONS a unit is not read as a
+    /// declaration using it.
+    fn strip_css_comments(css: &str) -> String {
+        let mut out = String::new();
+        let mut rest = css;
+        while let Some(open) = rest.find("/*") {
+            out.push_str(&rest[..open]);
+            rest = match rest[open..].find("*/") {
+                Some(close) => &rest[open + close + 2..],
+                None => "",
+            };
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Every document in a boot shows the SAME standing mark: this page reloads
+    /// itself every couple of seconds and is then replaced by the app document at
+    /// the same url, so without a handover each of those would re-play the reveal
+    /// and rebuild a mark that is already on screen. The flag is set for the next
+    /// document and read to suppress our own reveal; index.html consumes it
+    /// (removing it), so it can never suppress a reveal that was not a rebuild.
+    #[test]
+    fn splash_keeps_the_mark_built_across_every_document_in_a_boot() {
+        for html in [
+            splash_page_html("Starting engine", Some(2), false),
+            splash_page_html("This is taking longer than expected.", Some(10), true),
+        ] {
+            assert!(
+                html.contains("sessionStorage.setItem('lucidos-splash-mark-formed','1')"),
+                "{html}"
+            );
+            assert!(
+                html.contains("sessionStorage.getItem('lucidos-splash-mark-formed')"),
+                "{html}"
+            );
+            assert!(
+                html.contains("classList.add('boot-splash-formed')"),
+                "{html}"
+            );
+            // Once formed, the mark stands still: the meta-refresh restarts every
+            // animation, so a breathe would snap back to full opacity each reload.
+            assert!(
+                html.contains(".boot-splash-formed .boot-splash-mark{animation-name:none}"),
+                "{html}"
+            );
+        }
     }
 
     #[test]
@@ -479,7 +639,14 @@ mod tests {
     #[test]
     fn splash_escapes_html_in_the_label() {
         let html = splash_page_html(r#"<script>alert("x")</script> & 'quoted'"#, None, false);
-        assert!(!html.contains("<script>"), "raw tag survived: {html}");
+        // The page ships exactly ONE script of its own (the mark handover), so a
+        // raw tag out of the label would show up as a second one. Counting beats
+        // a bare "contains no <script>": that only held while the page had none.
+        assert_eq!(
+            html.matches("<script>").count(),
+            1,
+            "raw tag survived: {html}"
+        );
         assert!(html.contains("&lt;script&gt;"), "{html}");
         assert!(html.contains("&amp;"), "{html}");
         assert!(html.contains("&quot;"), "{html}");

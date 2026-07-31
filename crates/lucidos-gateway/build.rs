@@ -3,6 +3,17 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Command;
 
+/// Files outside this crate that are compiled INTO the gateway binary, so they
+/// are gateway source for build-id purposes even though they live elsewhere.
+/// Repo-root-relative (the `git diff` pathspec); the rerun triggers in `main`
+/// say the same paths relative to this crate.
+///
+/// `crates/lucidos-app/index.html` is `include_str!`d by `proxy.rs`, which lifts
+/// the boot splash out of it. Leave it out and an UNCOMMITTED edit rebuilds the
+/// binary with a new splash but the same id, so the picker never offers the
+/// reload and the running gateway keeps serving the old one with no signal.
+const EMBEDDED_SOURCES: &[&str] = &["crates/lucidos-app/index.html"];
+
 /// Bake a `GATEWAY_BUILD_ID` into the binary so a running gateway can tell whether
 /// the on-disk binary it was launched from has since been rebuilt with different
 /// source (the workspace picker's "new gateway available" badge — see
@@ -12,7 +23,7 @@ use std::process::Command;
 /// raise the badge): git short SHA, plus — when the working tree has uncommitted
 /// gateway-source changes — a short hash of that diff so local edits produce a
 /// distinct id too. When git is unavailable (a shipped install built outside a
-/// repo) we fall back to a hash of the crate's own source so the id is at least
+/// repo) we fall back to a hash of the compiled-in source so the id is at least
 /// stable per build tree.
 fn main() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -28,6 +39,12 @@ fn main() {
     println!("cargo:rerun-if-changed=../../Cargo.lock");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/index");
+    // Declaring any trigger opts out of cargo's default "rerun on any change in
+    // the package", so an embedded file needs its own: rustc's own dep-info
+    // recompiles the crate when it changes, but only this brings the id along.
+    for rel in EMBEDDED_SOURCES {
+        println!("cargo:rerun-if-changed=../../{rel}");
+    }
 
     let build_id = compute_build_id(project_root, manifest_dir);
     println!("cargo:rustc-env=GATEWAY_BUILD_ID={build_id}");
@@ -42,8 +59,8 @@ fn compute_build_id(project_root: &Path, manifest_dir: &Path) -> String {
             // Clean tree (or git couldn't diff) → the commit alone identifies it.
             _ => sha,
         },
-        // No git (shipped build) → hash the crate source so it's stable per tree.
-        None => format!("src-{:016x}", hash_dir_sources(&manifest_dir.join("src"))),
+        // No git (shipped build) → hash the source so it's stable per tree.
+        None => format!("src-{:016x}", hash_build_inputs(manifest_dir, project_root)),
     }
 }
 
@@ -65,8 +82,10 @@ fn git_short_head(project_root: &Path) -> Option<String> {
 /// git fails — the caller then treats the tree as clean rather than inventing a
 /// dirty marker.
 fn gateway_diff(project_root: &Path) -> Option<String> {
+    let mut args = vec!["diff", "HEAD", "--", "crates/lucidos-gateway", "Cargo.lock"];
+    args.extend_from_slice(EMBEDDED_SOURCES);
     let out = Command::new("git")
-        .args(["diff", "HEAD", "--", "crates/lucidos-gateway", "Cargo.lock"])
+        .args(&args)
         .current_dir(project_root)
         .output()
         .ok()?;
@@ -81,10 +100,12 @@ fn hash_str(s: &str) -> u64 {
     h.finish()
 }
 
-/// Hash every file under `dir` (sorted for determinism) — the no-git fallback.
-fn hash_dir_sources(dir: &Path) -> u64 {
-    let mut entries: Vec<_> = walk(dir);
+/// Hash everything compiled into the binary: every file under the crate's `src`
+/// (sorted for determinism) plus the embedded sources. The no-git fallback.
+fn hash_build_inputs(manifest_dir: &Path, project_root: &Path) -> u64 {
+    let mut entries: Vec<_> = walk(&manifest_dir.join("src"));
     entries.sort();
+    entries.extend(EMBEDDED_SOURCES.iter().map(|rel| project_root.join(rel)));
     let mut h = DefaultHasher::new();
     for path in entries {
         if let Ok(bytes) = std::fs::read(&path) {

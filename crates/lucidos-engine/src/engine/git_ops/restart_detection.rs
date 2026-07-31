@@ -20,9 +20,16 @@ pub(crate) fn files_require_restart(files: &[String]) -> bool {
         // `web-dev.sh -b` on engine restart; without restart the previously-
         // built dist/sdk.js keeps being served.
         let is_sdk_bundle_source = f.starts_with("packages/lucidos-sdk/") && !is_test_or_doc;
-        // include_str!'d into the engine binary and served at /api/v1/sdk-iframe.*
+        // include_str!'d into a Rust binary, so the running process serves the
+        // copy it was BUILT with and a rebuild is the only way to pick up an
+        // edit: the engine's /api/v1/sdk-iframe.* assets, and the app document,
+        // whose boot-splash stylesheet + mark the gateway lifts out at compile
+        // time (crates/lucidos-gateway/src/proxy.rs). Without the restart the
+        // gateway keeps serving the previous splash while the app has the new
+        // one, which is exactly the drift sharing the file removes.
         let is_engine_bundled_asset = f == "crates/lucidos-engine/src/api/sdk_iframe.css"
-            || f == "crates/lucidos-engine/src/api/sdk_iframe_audio.js";
+            || f == "crates/lucidos-engine/src/api/sdk_iframe_audio.js"
+            || f == "crates/lucidos-app/index.html";
         (is_rust_source && !is_test_or_doc)
             || is_migration
             || is_sdk_bundle_source

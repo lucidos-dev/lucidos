@@ -14,8 +14,22 @@ import {
 
 /** How often the packaged client re-checks for an app update. The client is
  *  long-resident (the window can be closed while it stays alive in the menu bar),
- *  so a launch-only check would miss an update published mid-session. */
-const APP_UPDATE_POLL_MS = 6 * 60 * 60 * 1000; // 6h
+ *  so a launch-only check would miss an update published mid-session.
+ *
+ *  An hour, not the 6h this used to be: releases can land minutes apart, and a
+ *  client launched shortly before one spent most of a working day claiming to be
+ *  current. That is exactly what happened on 2026-07-31. A 0.18.0 client started
+ *  at 08:54, 0.18.1 was published at 09:16 and 0.18.2 at 10:22, and the next
+ *  unattended check was not due until 14:54. */
+const APP_UPDATE_POLL_MS = 60 * 60 * 1000; // 1h
+
+/** Floor between two RESUME-triggered checks. `focus` / `visibilitychange` fire
+ *  on every window switch, and each check is a network round-trip to the release
+ *  host, so an unthrottled per-resume check would hammer it to say nothing new.
+ *  Five minutes is long enough that flicking between windows costs nothing, and
+ *  short enough that coming back to a client left running resolves before the
+ *  user could notice the wait. */
+const APP_UPDATE_RESUME_MIN_INTERVAL_MS = 5 * 60 * 1000;
 
 /** ONE key for the whole packaged-update surface: the "Lucidos <v> available"
  *  offer, the live progress narration, and a failure. Keyed toasts update in
@@ -26,6 +40,12 @@ const UPDATE_TOAST_KEY = 'app-update-available';
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let installing = false;
+/** When the last check actually reached the network (`null` before the first).
+ *  Process-lifetime, deliberately NOT reset by {@link stopAppUpdateChecks}: it
+ *  records when we last asked the release host, which a remount does not undo.
+ *  Read only by {@link recheckAppUpdateOnResume}; the interval keeps its own
+ *  fixed cadence. */
+let lastCheckStartedAt: number | null = null;
 /** Unsubscribe for the progress event, or `null` when not subscribed. */
 let unlistenProgress: (() => void) | null = null;
 /** Guards the async gap in {@link subscribeToAppUpdateProgress} so remounting
@@ -103,7 +123,7 @@ export function appUpdateNarration(frame: AppUpdateRunning): AppUpdateNarration 
 /** Surface the "Lucidos <v> available → Update & restart" offer. Extracted so
  *  the cancel path can put it straight back: abandoning a download abandons the
  *  attempt, not the update, and dropping the user back to no affordance at all
- *  would strand them until the next 6h poll. */
+ *  would strand them until the next poll. */
 function offerAppUpdate(version: string): void {
   showToast(`Lucidos ${version} available`, 'info', {
     key: UPDATE_TOAST_KEY,
@@ -199,6 +219,9 @@ export async function checkForAppUpdate(): Promise<void> {
   // specific answer to "is there an update?" than a fresh poll would — re-running
   // one here would overwrite the live narration with a stale offer.
   if (appUpdateProgress.value) return;
+  // Stamped after the guards, never before: a call that returned without asking
+  // the release host anything must not make the resume throttle think it did.
+  lastCheckStartedAt = Date.now();
   let version: string | null;
   try {
     version = await checkAppUpdate();
@@ -223,6 +246,30 @@ export async function checkForAppUpdate(): Promise<void> {
   }
   if (!version) return;
   offerAppUpdate(version);
+}
+
+/** Re-check for a packaged update because the user came BACK to the client
+ *  (window focus / `visibilitychange` / `pageshow`), throttled to at most one
+ *  network round-trip per {@link APP_UPDATE_RESUME_MIN_INTERVAL_MS}.
+ *
+ *  Every other update surface already reconciles on resume (the service worker,
+ *  the frontend `BUILD_ID`, the engine build state, the unread set); the packaged
+ *  updater was the one that did not, so a client left running past a release kept
+ *  reporting itself current until the interval came round. That is what stranded a
+ *  0.18.0 client on 2026-07-31 for six hours with 0.18.2 already published.
+ *
+ *  Deliberately does NOT restart the interval: the two are independent safety
+ *  nets, and rescheduling on every window switch would let a busy user's timer
+ *  never fire at all. */
+export async function recheckAppUpdateOnResume(): Promise<void> {
+  if (!isTauri()) return;
+  if (
+    lastCheckStartedAt !== null &&
+    Date.now() - lastCheckStartedAt < APP_UPDATE_RESUME_MIN_INTERVAL_MS
+  ) {
+    return;
+  }
+  await checkForAppUpdate();
 }
 
 /** The newer packaged version available to install, or `null`. Single derivation
@@ -282,10 +329,14 @@ export async function installAppUpdate(): Promise<void> {
  *  The immediate check runs on EVERY call, not just the first. The client process
  *  is long-resident while the workspace app remounts (reload, workspace switch,
  *  restart-reconnect), and the previous "return early if the timer exists" guard
- *  meant only the very first mount of a process ever checked — with a 6h interval
- *  behind it, an update published mid-session stayed invisible until the app was
- *  fully quit. Only the TIMER and the SUBSCRIPTION are idempotent, so remounting
- *  cannot stack intervals or listeners. */
+ *  meant only the very first mount of a process ever checked. With an hours-long
+ *  interval behind it, an update published mid-session stayed invisible until the
+ *  app was fully quit. Only the TIMER and the SUBSCRIPTION are idempotent, so
+ *  remounting cannot stack intervals or listeners.
+ *
+ *  The third net is {@link recheckAppUpdateOnResume}, wired to window focus in
+ *  `hooks/useStartup.ts`: a client that neither remounts nor waits out the
+ *  interval still notices a release the moment the user comes back to it. */
 export function startAppUpdateChecks(): void {
   if (!isTauri()) return;
   void subscribeToAppUpdateProgress();

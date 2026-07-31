@@ -61,6 +61,21 @@ function tsFiles(dir: string): string[] {
 const STORAGE_API = /\b(localStorage|sessionStorage)\.(getItem|setItem|removeItem|clear|key|length)\b/;
 const STORAGE_API_G = new RegExp(STORAGE_API, 'g');
 
+/**
+ * Boot-script keys that describe THIS TAB, not this workspace, so namespacing
+ * them by workspace would be wrong rather than merely unnecessary. Distinct from
+ * `GLOBAL_KEYS` (the app realm's localStorage picker allowlist): nothing outside
+ * the inline boot scripts and the gateway splash ever reads these.
+ *
+ *  - `lucidos-splash-mark-formed`: the gateway boot splash hands the workspace
+ *    document a "the mark is already built and standing on screen" flag
+ *    (crates/lucidos-gateway/src/proxy.rs), so the reveal is not replayed at the
+ *    swap. It states what the tab last PAINTED, which is true whichever
+ *    workspace the next document belongs to, and index.html removes it as it
+ *    reads it, so it cannot outlive that one navigation.
+ */
+const BOOT_TAB_KEYS: ReadonlySet<string> = new Set(['lucidos-splash-mark-formed']);
+
 describe('no raw browser storage outside the sanctioned wrappers', () => {
   it('SDK source touches storage ONLY through _storage.ts (separate realm)', () => {
     const offenders: string[] = [];
@@ -100,6 +115,7 @@ describe('no raw browser storage outside the sanctioned wrappers', () => {
       if (arg.startsWith('wsKey(')) continue; // namespaced by hand — OK
       const lit = arg.match(/^['"]([^'"]+)['"]/);
       if (lit && GLOBAL_KEYS.has(lit[1])) continue; // cross-workspace picker key — OK raw
+      if (lit && BOOT_TAB_KEYS.has(lit[1])) continue; // per-TAB state, OK raw
       bad.push(lit ? lit[1] : m[0]);
     }
     expect(

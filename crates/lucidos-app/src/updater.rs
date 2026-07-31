@@ -3,8 +3,10 @@
 //! A packaged build surfaces updates INSIDE the workspace UI — not a native
 //! launch dialog, not the picker. Most users have a single workspace and auto-open
 //! straight into it, so the web app (running in the packaged Tauri client) polls
-//! [`check_app_update`] on startup + on an interval and shows an in-app
-//! "Update & restart" toast. The toast's action calls
+//! [`check_app_update`] on startup, on an interval, and whenever the window comes
+//! back to the foreground, and shows an in-app "Update & restart" toast. The three
+//! nets and their throttling live in
+//! `crates/lucidos-app/src/store/actions/app-update.ts`. The toast's action calls
 //! [`install_app_update_and_restart`], which installs the new signed bundle and
 //! restarts the WHOLE stack onto the new version — the launchd background service
 //! (gateway + per-workspace engines + embedded Postgres) AND the GUI client —

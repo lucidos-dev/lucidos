@@ -17,7 +17,7 @@ import { loadAllThreads, loadFilterFacets } from '../store/actions/thread-loadin
 import { refreshPushSubscription, recoverServiceWorker } from '../store/actions/push';
 import { setupNativePushTapRouting } from '../store/actions/native-push';
 import { startDevicePresenceTracking } from '../store/actions/device-presence';
-import { startAppUpdateChecks, stopAppUpdateChecks } from '../store/actions/app-update';
+import { startAppUpdateChecks, stopAppUpdateChecks, recheckAppUpdateOnResume } from '../store/actions/app-update';
 import { startEngineUpdateChecks, stopEngineUpdateChecks, checkEngineVersion } from '../store/actions/engine-update';
 import { startScrollVisibilityHandler } from '../components/chat/scrollState';
 import { isTauri } from '../utils/platform';
@@ -487,6 +487,12 @@ export function useStartup(): void {
       // isn't replayed on reconnect), so re-poll authoritatively on resume — shows
       // 'ready' if the build finished while away, never a stale spin.
       void checkEngineVersion();
+      // Same reconciliation for the PACKAGED app release, which this handler used
+      // to be the only update surface to skip: a desktop client is long-resident
+      // and rarely remounts, so without a resume check it kept reporting itself
+      // current for the whole poll interval after a release. Throttled inside
+      // (window focus fires constantly); a no-op outside the Tauri client.
+      void recheckAppUpdateOnResume();
       // Probe the SW for liveness too — a wedged SW won't accept update()
       // either, so resume is the natural moment to detect and recover.
       checkSwHealth().catch(() => { /* best-effort recovery; next probe retries */ });

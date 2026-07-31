@@ -1,7 +1,12 @@
 import { useEffect } from 'preact/hooks';
 import { effect } from '@preact/signals';
 import { connectionStatus, threadsLoaded } from '../store/store';
-import { bootSplashPresent, dismissBootSplash, setBootStatus } from '../utils/bootSplash';
+import {
+  bootSplashPresent,
+  bootSplashRevealSkipped,
+  dismissBootSplash,
+  setBootStatus,
+} from '../utils/bootSplash';
 import { WORKSPACE_ID } from '../utils/basePath';
 import type { ConnectionStatus } from '../store/types';
 
@@ -26,6 +31,19 @@ export const STATUS_DELAY_MS = 3_000;
  *  began at first paint). `performance.now()` is time-since-navigation-start. */
 function msSinceLoad(): number {
   return typeof performance !== 'undefined' ? performance.now() : BOOT_SPLASH_MIN_REVEAL_MS;
+}
+
+/** How much longer to hold a ready splash so its reveal can finish. Pure so the
+ *  floor is testable without the DOM.
+ *
+ *  `revealSkipped` is the gateway handover (`boot-splash-formed`): the gateway
+ *  boot splash already built the mark on this url, so this document plays no
+ *  reveal and there is nothing to wait for. Holding the floor there would park a
+ *  fully built mark on screen for another second at the end of a cold boot that
+ *  was already slow, which is the opposite of what the floor is for. */
+export function remainingRevealMs(elapsedMs: number, revealSkipped: boolean): number {
+  if (revealSkipped) return 0;
+  return Math.max(0, BOOT_SPLASH_MIN_REVEAL_MS - elapsedMs);
 }
 
 /** The workspace is "ready" — and the boot splash may fade — once the engine
@@ -124,7 +142,7 @@ export function useBootSplashReady(): void {
       if (!isWorkspaceReady(connectionStatus.value, threadsLoaded.value)) return;
       dismissArmed = true;
       // Let the reveal finish at least once before dismissing.
-      const remaining = Math.max(0, BOOT_SPLASH_MIN_REVEAL_MS - msSinceLoad());
+      const remaining = remainingRevealMs(msSinceLoad(), bootSplashRevealSkipped());
       if (remaining === 0) finish();
       else revealTimer = window.setTimeout(finish, remaining);
     });

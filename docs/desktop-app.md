@@ -398,11 +398,17 @@ the running client.
 **How an update is surfaced + applied.** Detection lives in
 `crates/lucidos-app/src/updater.rs` (three Tauri commands, packaged-only):
 `check_app_update` (checks the endpoint, returns the new version or none),
-`install_app_update_and_restart`, and `cancel_app_update`. The web app — running inside the packaged Tauri
-client — polls `check_app_update` on startup AND on an interval (the client is
-long-resident: the window can be closed while it stays alive in the menu bar, so a
-launch-only check would miss a mid-session Release) and, when an update exists,
-shows an **in-app "Update & restart" toast inside the workspace**
+`install_app_update_and_restart`, and `cancel_app_update`. The web app (running
+inside the packaged Tauri client) polls `check_app_update` from **three
+independent nets**: on every mount, hourly on an interval, and whenever the window
+comes back to the foreground (throttled to one check per five minutes, since
+`focus` fires on every window switch). All three exist because the client is
+long-resident and rarely remounts: the window can be closed while it stays alive in
+the menu bar, so a launch-only check misses a mid-session Release, and a client
+left running with no resume net went on reporting itself current for the whole
+interval after one (the 2026-07-31 case: a 0.18.0 client checked at launch while
+0.18.0 still was the latest, then sat through 0.18.1 and 0.18.2). When an update
+exists it shows an **in-app "Update & restart" toast inside the workspace**
 (`crates/lucidos-app/src/store/actions/app-update.ts`). This is deliberate: most
 users have a single workspace and auto-open straight into it, rarely seeing the
 picker — so the message lives in the workspace, not the picker, and not a native

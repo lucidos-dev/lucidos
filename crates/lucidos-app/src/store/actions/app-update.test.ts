@@ -41,9 +41,15 @@ const {
   appUpdateNarration,
   checkForAppUpdate,
   installAppUpdate,
+  recheckAppUpdateOnResume,
   startAppUpdateChecks,
   stopAppUpdateChecks,
 } = await import('./app-update');
+
+/** Mirrors `APP_UPDATE_RESUME_MIN_INTERVAL_MS` in the module under test. Kept as
+ *  a literal rather than exported: the constant is an internal tuning knob, and a
+ *  test that reads it back could not fail if it were changed by accident. */
+const RESUME_THROTTLE_MS = 5 * 60 * 1000;
 
 /** Push a frame through the REAL subscription wiring — the handler is whatever
  *  `startAppUpdateChecks` registered, so these tests exercise the actual path an
@@ -230,7 +236,7 @@ describe('update progress narration', () => {
   });
 
   // Nothing was written to disk, so the update is still there to install —
-  // leaving the user with no affordance would strand them until the next 6h poll.
+  // leaving the user with no affordance would strand them until the next poll.
   it('re-offers the update after a cancel', () => {
     startAppUpdateChecks();
     emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 1, total: 2 });
@@ -374,10 +380,98 @@ describe('checkForAppUpdate', () => {
   });
 });
 
+describe('recheckAppUpdateOnResume', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Put the module's "last checked" stamp at the current fake time, the way a
+   *  startup or interval check would, so each case starts from a known baseline
+   *  instead of inheriting whatever an earlier test left behind. */
+  async function justChecked(): Promise<void> {
+    mocks.checkAppUpdate.mockResolvedValue(null);
+    await checkForAppUpdate();
+    mocks.checkAppUpdate.mockClear();
+    mocks.showToast.mockClear();
+  }
+
+  // The 2026-07-31 stranding, in miniature: a 0.18.0 client checked at launch
+  // while 0.18.0 still WAS the latest, then sat there. Two newer releases were
+  // published, and with no resume check and an hours-long interval the client
+  // went on reporting itself current all morning.
+  it('surfaces a release published while the client sat idle', async () => {
+    await justChecked();
+    mocks.checkAppUpdate.mockResolvedValue('0.18.2');
+    vi.advanceTimersByTime(RESUME_THROTTLE_MS);
+    await recheckAppUpdateOnResume();
+    expect(mocks.checkAppUpdate).toHaveBeenCalledTimes(1);
+    expect(lastToast().message).toBe('Lucidos 0.18.2 available');
+  });
+
+  // Window focus and visibilitychange fire on every alt-tab, and each check is a
+  // network round-trip to the release host.
+  it('collapses a flurry of window switches into no extra checks', async () => {
+    await justChecked();
+    vi.advanceTimersByTime(60 * 1000);
+    await recheckAppUpdateOnResume();
+    await recheckAppUpdateOnResume();
+    await recheckAppUpdateOnResume();
+    expect(mocks.checkAppUpdate).not.toHaveBeenCalled();
+  });
+
+  it('checks again once the throttle window has passed', async () => {
+    await justChecked();
+    vi.advanceTimersByTime(RESUME_THROTTLE_MS - 1);
+    await recheckAppUpdateOnResume();
+    expect(mocks.checkAppUpdate).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    await recheckAppUpdateOnResume();
+    expect(mocks.checkAppUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  // A resume that DID reach the host restarts the throttle; one that was
+  // suppressed must not, or a single suppressed resume would push the next real
+  // check out by another window every time the user switched away.
+  it('restarts the throttle from the check, not from the attempt', async () => {
+    await justChecked();
+    vi.advanceTimersByTime(RESUME_THROTTLE_MS);
+    await recheckAppUpdateOnResume();
+    expect(mocks.checkAppUpdate).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(RESUME_THROTTLE_MS - 1);
+    await recheckAppUpdateOnResume();
+    expect(mocks.checkAppUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  // The suppression guard runs before the stamp, so a resume landing mid-install
+  // must not count as a check and defer the next real one.
+  it('does not consume the throttle when a run is already in flight', async () => {
+    await justChecked();
+    vi.advanceTimersByTime(RESUME_THROTTLE_MS);
+    storeSignals.appUpdateProgress.value = { version: '0.18.2', phase: 'installing' };
+    await recheckAppUpdateOnResume();
+    expect(mocks.checkAppUpdate).not.toHaveBeenCalled();
+
+    storeSignals.appUpdateProgress.value = null;
+    await recheckAppUpdateOnResume();
+    expect(mocks.checkAppUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it('stays a no-op outside the Tauri client', async () => {
+    await justChecked();
+    mocks.isTauri.mockReturnValue(false);
+    vi.advanceTimersByTime(RESUME_THROTTLE_MS);
+    await recheckAppUpdateOnResume();
+    expect(mocks.checkAppUpdate).not.toHaveBeenCalled();
+  });
+});
+
 describe('startAppUpdateChecks', () => {
   // The regression this exists to prevent: the old guard returned early when a
   // timer already existed, so only the FIRST workspace mount of a client process
-  // ever checked. With a 6h interval behind it, an update published mid-session
+  // ever checked. With an hours-long interval behind it, an update published mid-session
   // stayed invisible until the app was fully quit and relaunched.
   it('re-checks on every mount, not just the first of a client process', async () => {
     mocks.checkAppUpdate.mockResolvedValue(null);

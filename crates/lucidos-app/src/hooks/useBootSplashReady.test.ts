@@ -1,5 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { isWorkspaceReady, delayedBootStatus, startDelayedBootStatus, STATUS_DELAY_MS } from './useBootSplashReady';
+import {
+  isWorkspaceReady,
+  delayedBootStatus,
+  remainingRevealMs,
+  startDelayedBootStatus,
+  BOOT_SPLASH_MIN_REVEAL_MS,
+  STATUS_DELAY_MS,
+} from './useBootSplashReady';
 import { connectionStatus } from '../store/store';
 import { setBootStatus } from '../utils/bootSplash';
 
@@ -7,6 +14,7 @@ import { setBootStatus } from '../utils/bootSplash';
 vi.mock('../utils/bootSplash', () => ({
   setBootStatus: vi.fn(),
   bootSplashPresent: vi.fn(() => true),
+  bootSplashRevealSkipped: vi.fn(() => false),
   dismissBootSplash: vi.fn(),
 }));
 
@@ -49,6 +57,23 @@ describe('delayedBootStatus', () => {
 
   it('keeps "Connecting…" behind the gateway (which lazy-starts the engine)', () => {
     expect(delayedBootStatus('disconnected', false)).toBe('Connecting…');
+  });
+});
+
+describe('remainingRevealMs', () => {
+  it('holds the splash for the rest of the reveal when it is still playing', () => {
+    expect(remainingRevealMs(200, false)).toBe(BOOT_SPLASH_MIN_REVEAL_MS - 200);
+  });
+
+  it('holds nothing once the reveal has already had its time', () => {
+    expect(remainingRevealMs(BOOT_SPLASH_MIN_REVEAL_MS + 500, false)).toBe(0);
+  });
+
+  // The gateway handover: the mark was built on the gateway splash and this
+  // document only carries it, so there is no reveal to wait out. Holding the
+  // floor would add a second of formed-mark stare to an already slow cold boot.
+  it('holds nothing when the mark arrived already formed from the gateway splash', () => {
+    expect(remainingRevealMs(0, true)).toBe(0);
   });
 });
 

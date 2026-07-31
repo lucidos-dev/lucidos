@@ -131,8 +131,9 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
   }, []);
 
   /** Update now if one is known, otherwise re-check on demand. The on-demand
-   *  path matters because the automatic check is a 6h poll: without it the only
-   *  way to ask "is there something newer?" was to quit and relaunch. */
+   *  path matters because the automatic checks are periodic (an hourly poll, plus
+   *  mount and window-resume rechecks): without it the only way to ask "is there
+   *  something newer?" right now was to quit and relaunch. */
   const handleAppUpdate = useCallback(async () => {
     if (packagedUpdateVersion()) {
       await installAppUpdate();
@@ -298,7 +299,7 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
           )}
           {/* The PERSISTENT route to a packaged update. The in-app toast is
               transient and dismissable, so it cannot be the only way to reach
-              one — dismissing it used to strand the user until the next 6h poll
+              one. Dismissing it used to strand the user until the next poll
               (or a full quit-and-relaunch). Once a run starts, the same live
               phase the toast narrates replaces the offer here. */}
           {updateNarration ? (

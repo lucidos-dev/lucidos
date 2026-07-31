@@ -304,6 +304,59 @@ describe('index.html inline boot splash', () => {
     expect(html).toMatch(/\.boot-splash-status\s*\{[^}]*white-space:\s*nowrap/);
   });
 
+  it('pins the splash geometry in px so it cannot ride the UI scale', () => {
+    // This document's <html> font-size is var(--user-ui-scale) (base.css, and
+    // 112.5% by default on mobile.css), so ANY rem length here resolves to a
+    // different pixel size than the same value on the gateway splash, which is
+    // an isolated document at the browser default. That is what made the mark
+    // grow and the status slide down at the cold-boot to workspace seam.
+    expect(html).toMatch(/\.boot-splash-mark\s*\{[^}]*width:\s*min\(46vmin,\s*240px\)/);
+    expect(html).toMatch(/\.boot-splash-mark\s*\{[^}]*height:\s*min\(46vmin,\s*240px\)/);
+    expect(html).toMatch(/\.boot-splash\s*\{[^}]*gap:\s*24px/);
+    // Type is declared once on the container, so every line on either surface
+    // (the status here, the gateway's escape link) inherits the same size and
+    // stack. The stack must never be var(--font-ui): a not-yet-downloaded web
+    // font would swap and reflow the splash.
+    expect(html).toMatch(/\.boot-splash\s*\{[^}]*font-size:\s*15px/);
+    expect(html).toMatch(/\.boot-splash\s*\{[^}]*font-family:\s*ui-monospace/);
+    expect(html).not.toMatch(/\.boot-splash[^{]*\{[^}]*font-family:\s*var\(--font-ui\)/);
+    // No rem in any DECLARATION of the splash stylesheet (comments stripped:
+    // they name the rem values these px replaced, and must keep doing so).
+    const splashCss = (html.match(/<style>([\s\S]*?)<\/style>/)?.[1] ?? '').replace(
+      /\/\*[\s\S]*?\*\//g,
+      '',
+    );
+    expect(splashCss).toContain('.boot-splash');
+    expect(splashCss).not.toMatch(/\d\s*rem/);
+  });
+
+  it('keeps the markers the gateway splash lifts this stylesheet and mark out by', () => {
+    // The gateway serves its own boot splash on the same url this document
+    // loads at, and it is THIS splash: proxy.rs `include_str!`s this file and
+    // slices between these markers, so neither surface can drift from the
+    // other. Losing a marker unstyles (or empties) the gateway splash, so both
+    // sides pin them; the Rust half is `the_app_splash_stylesheet_and_mark_are_extractable`.
+    for (const marker of [
+      '/* lucidos-boot-splash-css-start */',
+      '/* lucidos-boot-splash-css-end */',
+      '<!-- lucidos-boot-splash-mark-start -->',
+      '<!-- lucidos-boot-splash-mark-end -->',
+    ]) {
+      expect(html.split(marker).length - 1, marker).toBe(1);
+    }
+    // The slices must be in the right order and carry the real content.
+    const css = html.split('/* lucidos-boot-splash-css-start */')[1]?.split(
+      '/* lucidos-boot-splash-css-end */',
+    )[0];
+    expect(css).toContain('.boot-splash-mark');
+    expect(css).toContain('@keyframes boot-mark-reveal');
+    const mark = html.split('<!-- lucidos-boot-splash-mark-start -->')[1]?.split(
+      '<!-- lucidos-boot-splash-mark-end -->',
+    )[0];
+    expect(mark).toContain('<svg class="boot-splash-mark"');
+    expect(mark).toContain('</svg>');
+  });
+
   it('redirects to the last workspace in <head>, before the bundle, to skip the picker render', () => {
     // The eager redirect must run from an inline <head> script BEFORE the module
     // bundle, so the picker never paints (no picker→workspace reload seam).
@@ -316,6 +369,56 @@ describe('index.html inline boot splash', () => {
     expect(html).toContain("has('pick')");
     // Only on the picker context (stamped base href), never inside a workspace.
     expect(html).toContain("getAttribute('href') !== '/~/'");
+  });
+
+  describe('gateway handover (boot-splash-formed)', () => {
+    // The gateway 503 splash and this document share one url, so the mark the
+    // gateway already built is on screen when this document takes over. The
+    // handover flag is what stops it from being torn down and rebuilt.
+    function runHandover(flag: string | null) {
+      const source = html
+        .split('<script>')
+        .find((block: string) => block.includes('lucidos-splash-mark-formed'))
+        ?.split('</script>')[0];
+      if (!source) throw new Error('inline splash handover script not found');
+      const values = new Map<string, string>();
+      if (flag !== null) values.set('lucidos-splash-mark-formed', flag);
+      const storage = {
+        getItem: (key: string) => values.get(key) ?? null,
+        removeItem: (key: string) => values.delete(key),
+      };
+      const classes = new Set<string>();
+      const splash = { classList: { add: (name: string) => classes.add(name) } };
+      new Function('document', 'sessionStorage', source)(
+        { querySelector: () => splash },
+        storage,
+      );
+      return { classes, values };
+    }
+
+    it('skips the reveal when the gateway splash already built the mark', () => {
+      const { classes } = runHandover('1');
+      expect(classes.has('boot-splash-formed')).toBe(true);
+    });
+
+    it('consumes the flag so it can only ever suppress that one rebuild', () => {
+      const { values } = runHandover('1');
+      expect(values.has('lucidos-splash-mark-formed')).toBe(false);
+    });
+
+    it('plays the reveal normally when no gateway splash preceded this document', () => {
+      const { classes } = runHandover(null);
+      expect(classes.size).toBe(0);
+    });
+
+    it('settles straight into the breathe, and stays still under reduced motion', () => {
+      expect(html).toMatch(
+        /\.boot-splash-formed\s+\.boot-splash-mark\s*\{[^}]*animation:\s*boot-mark-breathe/,
+      );
+      expect(html).toMatch(
+        /@media \(prefers-reduced-motion: reduce\)\s*\{[\s\S]*?\.boot-splash-formed\s+\.boot-splash-mark\s*\{\s*animation:\s*none/,
+      );
+    });
   });
 
   it('plays the mark reveal in the final doc but hides the mark in the picker', () => {
