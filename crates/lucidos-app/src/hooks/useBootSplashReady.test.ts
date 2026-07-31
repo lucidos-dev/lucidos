@@ -15,7 +15,7 @@ import { revealBootEscape, setBootStatus } from '../utils/bootSplash';
 vi.mock('../utils/bootSplash', () => ({
   setBootStatus: vi.fn(),
   bootSplashPresent: vi.fn(() => true),
-  bootSplashRevealSkipped: vi.fn(() => false),
+  bootSplashPlaysNoReveal: vi.fn(() => false),
   dismissBootSplash: vi.fn(),
   revealBootEscape: vi.fn(() => true),
 }));
@@ -98,11 +98,16 @@ describe('remainingRevealMs', () => {
     expect(remainingRevealMs(BOOT_SPLASH_MIN_REVEAL_MS + 500, false)).toBe(0);
   });
 
-  // The gateway handover: the mark was built on the gateway splash and this
-  // document only carries it, so there is no reveal to wait out. Holding the
-  // floor would add a second of formed-mark stare to an already slow cold boot.
-  it('holds nothing when the mark arrived already formed from the gateway splash', () => {
-    expect(remainingRevealMs(0, true)).toBe(0);
+  // A document that plays no reveal has nothing for the floor to protect: the
+  // gateway handover (the mark was already built and is standing on screen) and
+  // a notification tap (no mark at all). Holding the floor would add a second of
+  // formed-mark stare to an already slow cold boot, and made every tap read as a
+  // relaunch. Which documents qualify is `bootSplashPlaysNoReveal`'s job, tested
+  // against the real class names in utils/bootSplash.test.ts.
+  it('holds nothing when this document plays no reveal, however early it is ready', () => {
+    for (const elapsed of [0, 100, BOOT_SPLASH_MIN_REVEAL_MS - 1]) {
+      expect(remainingRevealMs(elapsed, true)).toBe(0);
+    }
   });
 });
 

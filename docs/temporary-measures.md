@@ -216,6 +216,57 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   `docs/plans/2026-07-30-user-facing-docs-audit.md` and previously deferred in
   `docs/plans/2026-07-29-front-door-origin-and-rc-gate.md`)
 
+### Cross-document notification-tap reload on iOS
+
+- **Added:** 2026-07-31 (the cross-document navigate URL itself landed 2026-05-31,
+  §4.5 seventh iteration; this row registers it and its new page-side cover)
+- **Lives in:** `crates/lucidos-engine/src/scheduler/push.rs` (`navigate_url_ios`,
+  the query-string URL put on `notification.navigate`) and, page-side, the
+  **deep-link branch** of the `boot-splash-quiet` script in
+  `crates/lucidos-app/index.html` (the `?notification=` detection, NOT the cover
+  it turns on).
+- **Scope note (2026-07-31, same day):** the *quiet boot cover* itself is
+  **permanent** and is NOT part of this measure. It has a second trigger with no
+  end date: a user-requested refresh (`refreshClient` stamps
+  `lucidos-splash-quiet`), which is a continuation of the session for exactly the
+  same reason a tap is. So this row tracks only the notification-tap TRIGGER and
+  the engine-side URL that forces it. The cover, its stylesheet rules, and the
+  `boot-splash-quiet` arm of `bootSplashPlaysNoReveal()` all outlive it.
+- **Impermanent because:** A push tap should hand the deep link to the PWA window
+  that is already open. Instead the engine deliberately emits a **cross-document**
+  query URL, so every tap tears the running document down and boots a new one.
+  That is not a design preference: it is the only channel WebKit applies. Safari
+  implements neither `launchQueue` nor `launch_handler: focus-existing`, and it
+  will not apply a same-document (hash) navigate to an open window (it just
+  focuses it, and the deep link silently no-ops, which is the bug the seventh
+  iteration fixed). So the reload is a workaround for an upstream gap, and the
+  page-side detection that recognizes such a load exists only to serve it: once a
+  tap no longer reloads, there is no notification-tap document left to recognize.
+  Measured cost of the gap on the reporting iPhone: a full document boot, 335-1132
+  ms of bundle load before any app code runs, on every single notification the
+  user opens.
+- **Removal / resolution condition:** When WebKit ships a reload-free channel for
+  a push tap into an open window, i.e. **either** `launch_handler:
+  focus-existing` + `window.launchQueue` (feature-detect `'launchQueue' in
+  window` on a real installed PWA, not in a desktop simulator) **or** a declarative
+  `notification.navigate` that Safari applies same-document to an already-open
+  window. Verify on-device that a tap routes the deep link with no new document
+  (`[Client/lifecycle] startup` emits nothing for the tap, and
+  `[Client/deeplink] handle_hash_location` still reports `found:true`). Then
+  switch `navigate_url_ios` to the reload-free form and delete **only the
+  deep-link trigger**: the `if (!quiet) { … }` URL-detection block in the inline
+  script (leaving the `lucidos-splash-quiet` flag read that precedes it), the
+  deep-link cases in the `notification tap (boot-splash-quiet)` suite in
+  `bootSplash.test.ts`, and the §4.5 wording that documents the reload as
+  unavoidable. **Keep everything else**, per the scope note above: the cover, its
+  stylesheet rules (including the light-theme foreground and reduced-motion
+  restatements), the refresh trigger, and `bootSplashPlaysNoReveal()` in both its
+  arms. Deleting the cover with the trigger would silently restore the cold-launch
+  animation on every refresh, which no upstream fix has anything to do with.
+- **Status:** active
+- **Investigation:** n/a (the cause is known and upstream; nothing is being
+  chased here, only waited on)
+
 ---
 
 ## 2. Model-tolerance measures

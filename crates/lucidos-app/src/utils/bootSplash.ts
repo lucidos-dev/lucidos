@@ -24,6 +24,13 @@ const LEAVING_CLASS = 'boot-splash-leaving';
 // Set by the inline handover script in index.html when the gateway boot splash
 // had already built the mark on this url, so this document skips its reveal.
 const FORMED_CLASS_SELECTOR = '.boot-splash-formed';
+// Set by the inline quiet-cover script in index.html on a document whose load
+// CONTINUES a session rather than starting one, which carries no mark at all.
+// Two triggers: a user-requested refresh (permanent) and a notification-tap
+// deep link (whose URL form is the temporary half, tracked at
+// docs/temporary-measures.md § "Cross-document notification-tap reload on iOS").
+// The cover itself is permanent either way: do NOT delete it with that measure.
+const QUIET_CLASS_SELECTOR = '.boot-splash-quiet';
 
 // Matches the longest `.boot-splash-leaving` fade in index.html (0.45s); the
 // extra margin covers the reduced-motion 0.15s case too. Used as the removal
@@ -37,11 +44,26 @@ export function bootSplashPresent(): boolean {
   return !dismissed && document.querySelector(SPLASH_SELECTOR) !== null;
 }
 
-/** True when this document took over from the gateway boot splash with the mark
- *  already built, so index.html tagged the splash `boot-splash-formed` and there
- *  is no reveal animation to wait out before dismissing. */
-export function bootSplashRevealSkipped(): boolean {
-  return document.querySelector(SPLASH_SELECTOR + FORMED_CLASS_SELECTOR) !== null;
+/** True when this document plays no mark reveal, so `useBootSplashReady` has no
+ *  min-reveal floor to hold before dismissing. Two documents qualify, both
+ *  decided by an inline script in index.html before first paint:
+ *
+ *  - `boot-splash-formed` (gateway handover): the mark was already built by the
+ *    gateway boot splash on this url and is standing on screen, so this document
+ *    only carries it.
+ *  - `boot-splash-quiet` (a refresh, or a notification tap): the document
+ *    carries no mark at all. See QUIET_CLASS_SELECTOR above.
+ *
+ *  Both arms are permanent.
+ *
+ *  One predicate rather than two exported halves, because the caller only ever
+ *  wants the disjunction, and a caller-side `a() || b()` is what a unit test
+ *  cannot reach through the module mock. */
+export function bootSplashPlaysNoReveal(): boolean {
+  return (
+    document.querySelector(SPLASH_SELECTOR + FORMED_CLASS_SELECTOR) !== null ||
+    document.querySelector(SPLASH_SELECTOR + QUIET_CLASS_SELECTOR) !== null
+  );
 }
 
 /** Update the status line under the mark (e.g. "Opening your workspace…",

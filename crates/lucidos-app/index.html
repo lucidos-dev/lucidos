@@ -105,14 +105,28 @@
         // per-workspace preference to honor, it follows the OS theme when nothing
         // is saved on this origin, instead of the app's dark default.
         var baseEl = document.querySelector('base');
-        var isPicker = !!baseEl && baseEl.getAttribute('href') === '/~/';
+        // The base href, reduced to a path. An ABSOLUTE value is supported
+        // (normalizeBasePath in basePath.ts tolerates it explicitly) and the app
+        // derives everything from its PATHNAME, so both readers below must too:
+        // slash-stripping the whole URL would yield a slug like `https:/host/myws`
+        // (making every `ws:myws:` key the app wrote invisible here) and would
+        // fail the picker comparison. All three wsKey derivations in this document
+        // run this same normalization; they must not disagree.
+        var basePathHref = (function () {
+          var href = baseEl && baseEl.getAttribute('href');
+          if (!href) return null;
+          if (/^https?:\/\//i.test(href)) {
+            try { href = new URL(href).pathname; } catch (e) { /* keep the raw value */ }
+          }
+          return href;
+        })();
+        var isPicker = basePathHref === '/~/';
         // Per-workspace key namespacing (mirrors workspaceStorage.ts +
         // basePath.ts). Slug from the stamped <base href="/<slug>/">; picker
         // (/~/) and legacy root (/) → no slug → raw key (their own fallback).
         var wsSlug = (function () {
-          var href = baseEl && baseEl.getAttribute('href');
-          if (!href) return null;
-          var seg = href.replace(/^\/+|\/+$/g, '');
+          if (!basePathHref) return null;
+          var seg = basePathHref.replace(/^\/+|\/+$/g, '');
           return (seg === '' || seg === '~') ? null : seg;
         })();
         function wsKey(name) { return wsSlug ? 'ws:' + wsSlug + ':' + name : name; }
@@ -360,6 +374,46 @@
       .boot-splash-formed .boot-splash-mark {
         animation: boot-mark-breathe 2.8s ease-in-out infinite;
       }
+      /* A notification-tap document (see the deep-link script in the body).
+         WebKit gives no reload-free channel for a push tap, so the tap arrives
+         as a full cross-document load of `?notification=…` and this splash is
+         what the user stares at. But that load is the CONTINUATION of a session
+         the user was already in, not a launch, so it gets no launch ceremony:
+         no mark, no status, and the app's own flat --bg-primary instead of the
+         brand gradient, so the cover reads as the app redrawing rather than
+         relaunching. hooks/useBootSplashReady.ts additionally skips the
+         min-reveal floor here, since there is no reveal to wait out. The
+         gradient is dropped on the splash AND on both canvas layers (the body
+         script), because a fixed inset:0 element does not reach the iOS
+         standalone bottom safe-area strip. Only the DELAYED status survives
+         (utils/bootSplash.ts writes it past STATUS_DELAY_MS): quiet is not
+         silent, and a genuinely stuck tap still has to say so. */
+      .boot-splash-quiet {
+        background: var(--bg-primary, #07172e);
+      }
+      .boot-splash-quiet .boot-splash-mark { display: none; }
+      /* Both foregrounds on this splash are hardcoded white, which is right on
+         the brand gradient and wrong on a quiet cover: in light theme
+         --bg-primary is #ffffff, so the delayed status ("Connecting…",
+         "Workspace not started") and the watchdog's escape link ("Start this
+         workspace", the ONLY way out of a stopped direct-port workspace) would
+         both be white on white. That would make "quiet, but not silent"
+         literally false for a light-theme user, at exactly the moment boot has
+         given up. Keyed on data-theme, which the FOUC script resolves before
+         first paint, so it holds even when the bundle CSS never loads, which is
+         precisely the case the escape link exists for. Values mirror
+         --text-primary in styles/global/base.css; px/hex only, per the no-rem
+         rule above. */
+      [data-theme="light"] .boot-splash-quiet .boot-splash-status {
+        color: rgba(31, 35, 40, 0.82);
+      }
+      [data-theme="light"] .boot-splash-quiet .boot-splash-escape { color: #1f2328; }
+      /* Nothing branded to fade out, so the cover leaves faster than a launch
+         splash does. Two-class specificity (0,2,0), which is what lets it beat
+         the `animation` shorthand on .boot-splash-leaving below, and is also why
+         the reduced-motion block has to restate it: a media query adds no
+         specificity, so the plain 0.15s rule in there would lose to this one. */
+      .boot-splash-quiet.boot-splash-leaving { animation-duration: 0.2s; }
       .boot-splash-status {
         /* Type is inherited from .boot-splash (one declaration for both
            surfaces); this rule owns only what is the status line's own. The
@@ -410,7 +464,8 @@
         .boot-splash-mark,
         .boot-splash-formed .boot-splash-mark { animation: none; }
         .boot-splash-status { transition: none; }
-        .boot-splash-leaving { animation-duration: 0.15s; }
+        .boot-splash-leaving,
+        .boot-splash-quiet.boot-splash-leaving { animation-duration: 0.15s; }
       }
       /* lucidos-boot-splash-css-end */
     </style>
@@ -490,6 +545,139 @@
         }
       })();
     </script>
+    <script>
+      // Quiet the splash, before first paint, for a reload that CONTINUES a
+      // session rather than starting one.
+      //
+      // Two documents qualify, and the shared rule is the point: the user was
+      // already in the app one moment ago, so a full brand launch is a lie about
+      // what just happened.
+      //
+      //   1. A REFRESH the user asked for (`lucidos-splash-quiet`, a one-shot
+      //      sessionStorage flag stamped by `refreshClient` in hooks/sw-update.ts,
+      //      the single refresh funnel: the control-panel button, the "New version
+      //      available" toast, the applied-change / reconnect toasts, the recovery
+      //      "Reload page" buttons, the stale-chunk auto-reload). The user watched
+      //      the screen dim under UiBlockingOverlay and is waiting for the SAME
+      //      workspace to come back. This trigger is PERMANENT.
+      //   2. A NOTIFICATION TAP (`?notification=…` on the URL). TEMPORARY MEASURE
+      //      (docs/temporary-measures.md § "Cross-document notification-tap reload
+      //      on iOS (and its quiet boot cover)"): a push tap on an installed iOS
+      //      PWA cannot reach an already-open window without a full cross-document
+      //      load, because WebKit implements neither launchQueue nor
+      //      `launch_handler: focus-existing` nor a same-document declarative
+      //      navigate, and every reload-free variant tried so far silently dropped
+      //      the deep link (system-knowhow/notifications.md §4.5). So the reload IS
+      //      the navigation, and this splash is what the user stares at on the way
+      //      through. Only this trigger goes away when WebKit gives us a better
+      //      channel; the cover itself stays for (1).
+      //
+      // Either way the document gets no launch ceremony: `boot-splash-quiet` drops
+      // the mark and the gradient (see the stylesheet), the baked "Opening your
+      // workspace…" is cleared, and both canvas layers are repainted flat so the
+      // iOS bottom safe-area strip (which a fixed inset:0 element never reaches)
+      // matches the cover. Paired with hooks/useBootSplashReady.ts, which skips the
+      // min-reveal floor when there is no reveal to wait out. The DELAYED status
+      // still writes here past STATUS_DELAY_MS, so a genuinely stuck load is quiet
+      // but not silent.
+      //
+      // The flag is consumed as it is read (like the gateway handover flag above),
+      // so a refresh whose reload never happened can quiet at most ONE later load.
+      //
+      // The deep-link gate mirrors `handleHashLocation`
+      // (store/actions/hash-deeplink-router.ts) branch for branch, and that
+      // precision is load-bearing three times over:
+      //   • A bare `#thread=<uuid>` is the cross-workspace landing channel, which
+      //     the router checks FIRST (THREAD_HASH_RE, store/actions/cross-workspace.ts)
+      //     and which wins even when a notification param is also present. That hop
+      //     goes through the gateway and can lazy-start a stopped engine, so
+      //     "Opening your workspace…" is true there: it stays a launch.
+      //   • The router reads the notification id with the HASH winning over the query
+      //     (its `get` is `hash ?? query`), so a present-but-empty hash value beats a
+      //     good query one.
+      //   • It dispatches on the VALUE being non-empty (`hasDeepLinkParams` is
+      //     `!!notification`), not on the key existing. So `?notification=` and a bare
+      //     `thread=`/`event=` pair both stay launches: quieting a document that then
+      //     routes nothing would drop the mark and the reveal floor for a real cold
+      //     start.
+      // Reads `location` and never writes it: consuming the deep link belongs to
+      // handleHashLocation alone.
+      (function () {
+        // Per-workspace key, by hand. `refreshClient` writes through the app's
+        // namespacing override (utils/workspaceStorage.ts), whose prototype patch
+        // ALSO covers sessionStorage, so the flag lands at `ws:<slug>:…`. This
+        // script runs before that override exists, so it must build the same
+        // prefix itself or it would read a key nobody writes, and the cover would
+        // silently never appear behind the gateway. Mirrors the boot watchdog's
+        // own wsKey below (and basePath.ts): picker (`/~/`) and legacy root (`/`)
+        // have no slug and stay raw, exactly as the override no-ops there.
+        var bootBase = document.querySelector('base');
+        var bootBaseHref = bootBase && bootBase.getAttribute('href');
+        // Absolute base href: normalize to its pathname first, as the FOUC copy
+        // above and basePath.ts do. See that comment for why.
+        if (bootBaseHref && /^https?:\/\//i.test(bootBaseHref)) {
+          try { bootBaseHref = new URL(bootBaseHref).pathname; } catch (e) { /* keep the raw value */ }
+        }
+        // Strip THEN compare, matching the FOUC copy: comparing the raw href
+        // against '/' and '/~/' first would call a slash-less `~` a workspace
+        // slug and namespace under `ws:~:`, where basePath.ts derives null.
+        var bootSlug = (function () {
+          if (!bootBaseHref) return null;
+          var seg = bootBaseHref.replace(/^\/+|\/+$/g, '');
+          return (seg === '' || seg === '~') ? null : seg;
+        })();
+        function wsKey(name) { return bootSlug ? 'ws:' + bootSlug + ':' + name : name; }
+        // Consume the refresh flag FIRST and unconditionally, so it cannot survive
+        // a load that then declines to quiet for some other reason.
+        var quiet;
+        try {
+          quiet = sessionStorage.getItem(wsKey('lucidos-splash-quiet')) === '1';
+          sessionStorage.removeItem(wsKey('lucidos-splash-quiet'));
+        } catch (e) { quiet = false; }
+        if (!quiet) {
+          try {
+            if (/^#thread=[0-9a-f-]+$/.test(location.hash)) return;
+            var hashParams = location.hash.charAt(0) === '#'
+              ? new URLSearchParams(location.hash.slice(1))
+              : new URLSearchParams();
+            var notification = hashParams.get('notification');
+            if (notification === null) {
+              notification = new URLSearchParams(location.search).get('notification');
+            }
+            quiet = !!notification;
+          } catch (e) { quiet = false; }
+        }
+        if (!quiet) return;
+        var splash = document.querySelector('.boot-splash');
+        // The gateway handover WINS, and this is the one case where a deep-link
+        // document is not a continuation of a live session. A tap on a stopped
+        // workspace is lazy-started by the gateway, which serves its own boot
+        // splash on this exact url (query intact, meta-refreshed) until the engine
+        // answers, so by the time this document loads the user has been watching a
+        // fully built mark for seconds and the script above tagged it
+        // `boot-splash-formed` to keep it standing. Quieting that would hide the
+        // mark mid-boot with `display: none` and snap the gradient to flat in one
+        // frame, which is precisely the seam jump the handover exists to prevent.
+        // Bail BEFORE the canvas repaint below, or the mark keeps standing on a
+        // flattened background. (Same reasoning as the `#thread=` stand-down: a hop
+        // that can lazy-start an engine really is a launch.)
+        if (splash && splash.classList.contains('boot-splash-formed')) return;
+        if (splash) {
+          splash.classList.add('boot-splash-quiet');
+          var status = splash.querySelector('.boot-splash-status');
+          if (status) { status.textContent = ''; status.classList.remove('boot-splash-status-shown'); }
+        }
+        // The flat colour the FOUC script above already resolved for this theme.
+        // Recomputed from data-theme when that script could not run (a browser
+        // refusing localStorage throws out of it), so the canvas can never keep the
+        // gradient while the cover on top of it is flat.
+        var d = document.documentElement;
+        var bg = d.style.getPropertyValue('--bg-primary') ||
+          (d.getAttribute('data-theme') === 'light' ? '#ffffff' : '#07172e');
+        d.style.background = bg;
+        if (document.body) document.body.style.background = bg;
+      })();
+    </script>
     <div id="app"></div>
     <script>
       /* lucidos-boot-watchdog-start
@@ -503,9 +691,20 @@
         var RETRY_PARAM = '_boot_retry';
         var base = document.querySelector('base');
         var baseHref = base && base.getAttribute('href');
-        var workspaceSlug = baseHref && baseHref !== '/' && baseHref !== '/~/'
-          ? baseHref.replace(/^\/+|\/+$/g, '')
-          : null;
+        // Slug only: `baseHref` itself stays raw, because revealGatewayEscape
+        // below keys on its mere PRESENCE ("direct" is exactly "no base
+        // element"). Absolute base href normalized to its pathname, as the two
+        // wsKey copies above do; see the FOUC one for why.
+        var slugHref = baseHref;
+        if (slugHref && /^https?:\/\//i.test(slugHref)) {
+          try { slugHref = new URL(slugHref).pathname; } catch (e) { /* keep the raw value */ }
+        }
+        // Strip THEN compare, matching the two copies above (see the FOUC one).
+        var workspaceSlug = (function () {
+          if (!slugHref) return null;
+          var seg = slugHref.replace(/^\/+|\/+$/g, '');
+          return (seg === '' || seg === '~') ? null : seg;
+        })();
         function wsKey(name) { return workspaceSlug ? 'ws:' + workspaceSlug + ':' + name : name; }
         var recovered = false;
 

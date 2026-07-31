@@ -1,4 +1,10 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import {
+  hasDeepLinkParams,
+  parseDeepLinkFromUrl,
+} from '../store/actions/notification-deeplink';
+import { THREAD_HASH_RE } from '../store/actions/cross-workspace';
+import { normalizeBasePath } from './basePath';
 // @ts-expect-error — Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 // @ts-expect-error — same
@@ -13,7 +19,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // no Preact tree). The test-setup stub document returns null for querySelector,
 // so we install a richer fake just for these tests.
 
-function installFakeSplash(present: boolean) {
+function installFakeSplash(present: boolean, initialClasses: string[] = []) {
   const statusClasses = new Set<string>();
   const statusEl = {
     textContent: '',
@@ -21,7 +27,7 @@ function installFakeSplash(present: boolean) {
   };
   const listeners: Record<string, Array<() => void>> = {};
   let removed = false;
-  const classes = new Set<string>();
+  const classes = new Set<string>(initialClasses);
   const splashEl = {
     classList: { add: (c: string) => classes.add(c), contains: (c: string) => classes.has(c) },
     addEventListener: (type: string, fn: () => void) => { (listeners[type] ??= []).push(fn); },
@@ -33,6 +39,11 @@ function installFakeSplash(present: boolean) {
     if (!present) return null;
     if (sel === '.boot-splash') return splashEl;
     if (sel.includes('.boot-splash-status')) return statusEl;
+    // Compound state selectors (`.boot-splash.boot-splash-quiet`) resolve only
+    // when the document actually carries that class, which is how the
+    // controller's state predicates read the inline script's decision.
+    const state = /^\.boot-splash\.(boot-splash-[a-z-]+)$/.exec(sel);
+    if (state) return classes.has(state[1]) ? splashEl : null;
     return null;
   };
   return {
@@ -148,6 +159,24 @@ describe('bootSplash controller', () => {
     fake.fireAnimationEnd();
     // Reverted once the splash node is actually removed.
     expect(doc.documentElement.style.background).toBe('');
+  });
+
+  // The one thing a quiet cover or a gateway handover changes for the controller:
+  // there is no reveal to hold a floor for. This is the predicate the hook calls,
+  // so both no-reveal documents and the launch case are pinned here against the
+  // real class names the inline scripts set.
+  it('reports both no-reveal documents, and a plain launch as playing one', async () => {
+    for (const cls of ['boot-splash-quiet', 'boot-splash-formed']) {
+      fake?.restore();
+      fake = installFakeSplash(true, [cls]);
+      const c = await freshController();
+      expect(c.bootSplashPlaysNoReveal(), cls).toBe(true);
+    }
+
+    fake.restore();
+    fake = installFakeSplash(true);
+    const launch = await freshController();
+    expect(launch.bootSplashPlaysNoReveal()).toBe(false);
   });
 
   it('dismiss reverts the root background immediately when the splash node is already gone', async () => {
@@ -635,6 +664,22 @@ describe('index.html inline boot splash', () => {
     expect(splashCss).not.toMatch(/\d\s*rem/);
   });
 
+  // Three inline scripts in this document derive the per-workspace key prefix by
+  // hand (the FOUC theme/font/scale reader, the quiet-cover flag, the boot
+  // watchdog's retry marker) because each runs before the app's storage override
+  // exists. They read keys the APP writes, so a copy that normalizes differently
+  // reads a key nobody wrote and fails silently. An absolute `<base href>` is the
+  // case that splits them: `basePath.ts` takes its pathname, a naive slash-strip
+  // does not. Count the guard instead of trusting three prose comments.
+  it('normalizes an absolute base href in every hand-rolled key derivation', () => {
+    const guards = html.match(/if\s*\(.*?\/\^https\?:\\\/\\\/\/i\.test\(/g) ?? [];
+    expect(guards.length, 'one absolute-base guard per wsKey derivation').toBe(3);
+    expect(html.match(/function wsKey\(/g)?.length).toBe(3);
+    // And each strips THEN compares, so a slash-less `~` is null everywhere
+    // rather than a `ws:~:` namespace in two copies and null in the third.
+    expect(html.match(/\(seg === '' \|\| seg === '~'\) \? null : seg/g)?.length).toBe(3);
+  });
+
   it('keeps the markers the gateway splash lifts this stylesheet and mark out by', () => {
     // The gateway serves its own boot splash on the same url this document
     // loads at, and it is THIS splash: proxy.rs `include_str!`s this file and
@@ -726,6 +771,305 @@ describe('index.html inline boot splash', () => {
     });
   });
 
+  describe('notification tap (boot-splash-quiet)', () => {
+    // A push tap on an installed iOS PWA arrives as a full cross-document load of
+    // `?notification=…` (WebKit offers no reload-free channel), so this splash is
+    // on screen for every tap. It is a navigation inside a session the user was
+    // already in, not a launch, so the document drops the launch ceremony.
+    const source = html
+      .split('<script>')
+      .find((block: string) => block.includes("classList.add('boot-splash-quiet')"))
+      ?.split('</script>')[0];
+
+    /** Run the inline deep-link script against a URL, with a fake document whose
+     *  canvas layers start on the brand gradient (as the real ones do). */
+    function runQuietBoot(
+      url: string,
+      opts: {
+        bgVar?: string;
+        theme?: string;
+        formed?: boolean;
+        refreshed?: boolean;
+        /** `<base href>`: a `/<slug>/` workspace behind the gateway namespaces the
+         *  flag key; null (direct engine) leaves it raw. */
+        base?: string | null;
+      } = {},
+    ) {
+      if (!source) throw new Error('inline deep-link quiet script not found');
+      const parsed = new URL(url);
+      const GRADIENT = '#145eb9 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed';
+      // `formed` is the gateway handover script (which runs earlier in the body)
+      // having already tagged this document.
+      const classes = new Set<string>(opts.formed ? ['boot-splash-formed'] : []);
+      const statusClasses = new Set<string>(['boot-splash-status-shown']);
+      const status = {
+        textContent: 'Opening your workspace…',
+        classList: { remove: (name: string) => statusClasses.delete(name) },
+      };
+      const splash = {
+        classList: {
+          add: (name: string) => classes.add(name),
+          contains: (name: string) => classes.has(name),
+        },
+        querySelector: () => status,
+      };
+      const documentElement = {
+        style: {
+          background: GRADIENT,
+          getPropertyValue: (key: string) =>
+            key === '--bg-primary' ? (opts.bgVar ?? '#07172e') : '',
+        },
+        getAttribute: (key: string) => (key === 'data-theme' ? (opts.theme ?? 'dark') : null),
+      };
+      const body = { style: { background: GRADIENT } };
+      // `refreshed` is the one-shot flag `refreshClient` stamps before reloading,
+      // stored under the SAME per-workspace key the app's storage override writes.
+      // The expected key is built from the REAL `normalizeBasePath`, not a copy of
+      // it, so this pins the inline script against the app's actual contract
+      // (`WORKSPACE_ID` is `normalizeBasePath(baseHref).slice(1)`, and
+      // workspaceStorage prefixes `ws:<id>:`).
+      const basePath = opts.base == null ? '' : normalizeBasePath(opts.base);
+      const slug = basePath === '' || basePath === '/~' ? null : basePath.slice(1);
+      const flagKey = slug ? `ws:${slug}:lucidos-splash-quiet` : 'lucidos-splash-quiet';
+      const stored = new Map<string, string>();
+      if (opts.refreshed) stored.set(flagKey, '1');
+      const sessionStorage = {
+        getItem: (key: string) => stored.get(key) ?? null,
+        removeItem: (key: string) => stored.delete(key),
+      };
+      const base = opts.base == null ? null : { getAttribute: () => opts.base };
+      new Function('document', 'location', 'sessionStorage', source)(
+        {
+          querySelector: (sel: string) => (sel === 'base' ? base : splash),
+          documentElement,
+          body,
+        },
+        { search: parsed.search, hash: parsed.hash },
+        sessionStorage,
+      );
+      return {
+        quiet: classes.has('boot-splash-quiet'),
+        status,
+        statusShown: () => statusClasses.has('boot-splash-status-shown'),
+        rootBackground: () => documentElement.style.background,
+        bodyBackground: () => body.style.background,
+        flagLeft: () => stored.has(flagKey),
+        /** Anything left in storage, so a read of the WRONG key is visible as a
+         *  flag that was never consumed rather than as a silent non-quiet. */
+        leftoverKeys: () => [...stored.keys()],
+        gradient: GRADIENT,
+      };
+    }
+
+    it('quiets the splash and flattens both canvas layers on a tap', () => {
+      const boot = runQuietBoot('https://host/myws/?notification=n1&thread=t1&tap=%7B%7D');
+      expect(boot.quiet).toBe(true);
+      // "Opening your workspace…" is a launch message; this is a navigation.
+      expect(boot.status.textContent).toBe('');
+      expect(boot.statusShown()).toBe(false);
+      // A fixed inset:0 cover never reaches the iOS standalone bottom safe-area
+      // strip, so leaving the gradient on either canvas layer would show a blue
+      // band under a flat cover.
+      expect(boot.rootBackground()).toBe('#07172e');
+      expect(boot.bodyBackground()).toBe('#07172e');
+    });
+
+    it('reads the deep link out of the hash as well as the query', () => {
+      expect(runQuietBoot('https://host/myws/#notification=n1&thread=t1').quiet).toBe(true);
+    });
+
+    // The other continuation: a refresh the user asked for. `refreshClient` stamps
+    // the flag before reloading, so the next document knows it is coming back to
+    // the same session rather than opening one, with no deep link on the URL.
+    it('quiets a user-requested refresh, which carries no deep link at all', () => {
+      const boot = runQuietBoot('https://host/myws/', { refreshed: true });
+      expect(boot.quiet).toBe(true);
+      expect(boot.status.textContent).toBe('');
+      expect(boot.rootBackground()).toBe('#07172e');
+      expect(boot.bodyBackground()).toBe('#07172e');
+    });
+
+    // One-shot, exactly like the gateway handover flag: a refresh whose reload
+    // never happened must not quiet every load for the rest of the session.
+    it('consumes the refresh flag as it reads it', () => {
+      expect(runQuietBoot('https://host/myws/', { refreshed: true }).flagLeft()).toBe(false);
+      // And a second load with no flag is a normal launch again.
+      expect(runQuietBoot('https://host/myws/').quiet).toBe(false);
+    });
+
+    // `refreshClient` writes through the app's storage override, whose prototype
+    // patch covers sessionStorage too, so behind the gateway the flag lands at
+    // `ws:<slug>:…`. This script runs before that override exists and must build
+    // the same key by hand. Reading the raw key instead would leave the written
+    // one untouched and the cover would never appear in a real workspace, which
+    // is invisible in a direct-engine test where both keys are the same string.
+    it('reads the flag under the SAME per-workspace key the app writes', () => {
+      const boot = runQuietBoot('https://host/myws/', { refreshed: true, base: '/myws/' });
+      expect(boot.quiet).toBe(true);
+      expect(boot.leftoverKeys()).toEqual([]);
+      // Picker and legacy root have no slug, so the override no-ops and so does this.
+      for (const base of ['/~/', '/', null]) {
+        expect(runQuietBoot('https://host/', { refreshed: true, base }).quiet, String(base))
+          .toBe(true);
+      }
+      // An ABSOLUTE base href is a supported value (normalizeBasePath tolerates
+      // it), and the app namespaces off its PATHNAME. Stripping slashes off the
+      // whole URL would look for `ws:https:/host/myws:…` and find nothing.
+      const abs = runQuietBoot('https://host/myws/', {
+        refreshed: true,
+        base: 'https://host/myws/',
+      });
+      expect(abs.quiet).toBe(true);
+      expect(abs.leftoverKeys()).toEqual([]);
+    });
+
+    // The flag is consumed BEFORE any other gate, so a refresh that lands on a
+    // URL the deep-link branch would bail out of cannot leave it behind.
+    it('consumes the flag even on a URL the deep-link gate would return early on', () => {
+      const boot = runQuietBoot(
+        'https://host/myws/#thread=1e6a2f14-0000-4000-8000-000000000000',
+        { refreshed: true },
+      );
+      expect(boot.flagLeft()).toBe(false);
+      // A refresh is a refresh: the landing hash does not un-quiet it.
+      expect(boot.quiet).toBe(true);
+    });
+
+    // The detection is a hand-written mirror of the page-side router's gate, in a
+    // classic inline script that cannot import it. Pin the two together directly:
+    // a document that goes quiet but then behaves like a cold launch (or the
+    // reverse) is the drift this catches. The oracle is the router's REAL branch
+    // order, `THREAD_HASH_RE` first and `hasDeepLinkParams` second (see
+    // handleHashLocation), not the deep-link gate alone.
+    const routerDispatchesDeepLink = (url: string) =>
+      !THREAD_HASH_RE.test(new URL(url).hash) &&
+      hasDeepLinkParams(parseDeepLinkFromUrl(new URL(url)));
+
+    it('goes quiet exactly when the page-side router would dispatch a deep link', () => {
+      for (const url of [
+        'https://host/myws/?notification=n1',
+        'https://host/myws/?notification=n1&thread=t1&event=e1&tap=%7B%22kind%22%3A%22modal%22%7D',
+        'https://host/myws/#notification=n1&thread=t1',
+        // A bare thread/event pair resolves to noop page-side, so it is a launch.
+        'https://host/myws/?thread=t1&event=e1',
+        // Present but EMPTY: the router dispatches on the value, not the key, so a
+        // key-presence check here would quiet a document that then routes nothing.
+        'https://host/myws/?notification=',
+        'https://host/myws/#notification=',
+        // The router's `get` is `hash ?? query`, so an empty hash value beats a good
+        // query one. Mirroring key-presence alone gets this pair backwards.
+        'https://host/myws/?notification=n1#notification=',
+        'https://host/myws/?notification=#notification=n1',
+        // The cross-workspace landing channel keeps the launch splash: that hop
+        // can lazy-start a stopped engine, where "Opening your workspace…" is true.
+        'https://host/myws/#thread=1e6a2f14-0000-4000-8000-000000000000',
+        // And it wins over a notification param when both are on the URL, because
+        // the router checks it first. Nothing emits this shape today; the point is
+        // that the mirror follows the router's branch ORDER, not a subset of its
+        // conditions.
+        'https://host/myws/?notification=n1#thread=1e6a2f14-0000-4000-8000-000000000000',
+        'https://host/myws/',
+        'https://host/myws/?_boot_retry=1',
+      ]) {
+        expect(runQuietBoot(url).quiet, url).toBe(routerDispatchesDeepLink(url));
+      }
+    });
+
+    // The one deep-link document that is NOT a continuation of a live session:
+    // a tap on a stopped workspace, which the gateway lazy-starts while serving
+    // its own boot splash on this exact url (query intact, meta-refreshed). By
+    // the time this document loads the user has watched a fully built mark for
+    // seconds, and the handover script kept it standing. Quieting it there would
+    // `display: none` that mark and snap the gradient flat in one frame, the
+    // exact seam jump the handover was built to prevent.
+    it('stands down when the gateway handed over a mark that is already standing', () => {
+      // Both triggers lose to the handover: a refresh during an engine restart
+      // crosses the same gateway splash as a tap on a stopped workspace does.
+      for (const opts of [
+        { formed: true },
+        { formed: true, refreshed: true },
+      ]) {
+        const boot = runQuietBoot('https://host/myws/?notification=n1&thread=t1', opts);
+        expect(boot.quiet, JSON.stringify(opts)).toBe(false);
+        // And it must bail BEFORE the canvas repaint, or the standing mark is left
+        // on a flattened background.
+        expect(boot.rootBackground()).toBe(boot.gradient);
+        expect(boot.bodyBackground()).toBe(boot.gradient);
+        expect(boot.statusShown()).toBe(true);
+        // The flag is still spent, so it cannot quiet a later load.
+        expect(boot.flagLeft()).toBe(false);
+      }
+    });
+
+    it('leaves a launch document completely alone', () => {
+      const boot = runQuietBoot('https://host/myws/');
+      expect(boot.quiet).toBe(false);
+      expect(boot.status.textContent).toBe('Opening your workspace…');
+      expect(boot.statusShown()).toBe(true);
+      expect(boot.rootBackground()).toBe(boot.gradient);
+      expect(boot.bodyBackground()).toBe(boot.gradient);
+    });
+
+    it('follows the resolved theme, and falls back to it when the FOUC script could not run', () => {
+      // Normal case: the FOUC script above already resolved --bg-primary.
+      expect(runQuietBoot('https://host/?notification=n1', { bgVar: '#ffffff' }).rootBackground())
+        .toBe('#ffffff');
+      // A browser that refuses localStorage throws that script out entirely, so
+      // the variable is unset. The canvas must still not keep the gradient under
+      // a flat cover.
+      expect(
+        runQuietBoot('https://host/?notification=n1', { bgVar: '', theme: 'light' }).rootBackground(),
+      ).toBe('#ffffff');
+      expect(
+        runQuietBoot('https://host/?notification=n1', { bgVar: '', theme: 'dark' }).rootBackground(),
+      ).toBe('#07172e');
+    });
+
+    // Consuming the deep link belongs to handleHashLocation alone. A stray
+    // location/history write here would strip the params before the router ever
+    // sees them, which is exactly how a tap "goes nowhere".
+    it('reads the URL and never writes it', () => {
+      expect(source).toBeTruthy();
+      expect(source).not.toMatch(/location\.(replace|assign|reload)|location\.href\s*=|history\./);
+    });
+
+    it('drops the mark and the gradient, and leaves faster than a launch splash', () => {
+      expect(html).toMatch(/\.boot-splash-quiet\s*\{[^}]*background:\s*var\(--bg-primary/);
+      expect(html).toMatch(/\.boot-splash-quiet\s+\.boot-splash-mark\s*\{[^}]*display:\s*none/);
+      expect(html).toMatch(
+        /\.boot-splash-quiet\.boot-splash-leaving\s*\{[^}]*animation-duration:\s*0\.2s/,
+      );
+    });
+
+    // The splash's foregrounds are hardcoded white because the brand gradient is
+    // always behind them. The quiet cover is the APP background instead, which is
+    // #ffffff in light theme, so without a theme-aware colour the delayed status
+    // and the watchdog's escape link ("Start this workspace", the only way out of
+    // a stopped direct-port workspace) would be white on white at exactly the
+    // moment boot has given up.
+    it('keeps the status and the escape legible on a light-theme quiet cover', () => {
+      expect(html).toMatch(
+        /\[data-theme="light"\]\s+\.boot-splash-quiet\s+\.boot-splash-status\s*\{[^}]*color:/,
+      );
+      expect(html).toMatch(
+        /\[data-theme="light"\]\s+\.boot-splash-quiet\s+\.boot-splash-escape\s*\{[^}]*color:/,
+      );
+    });
+
+    // The quiet fade needs two-class specificity to beat the `animation`
+    // shorthand on `.boot-splash-leaving`, and a media query adds none. So
+    // without restating the quiet selector inside the reduced-motion block, the
+    // 0.2s rule silently outranks the 0.15s an accessibility preference asked
+    // for. Pin the restatement, not just the plain rule.
+    it('does not let the quiet fade outrank prefers-reduced-motion', () => {
+      const reduced = /@media \(prefers-reduced-motion: reduce\)\s*\{([\s\S]*?)\n {6}\}/.exec(html)?.[1];
+      expect(reduced).toBeTruthy();
+      expect(reduced).toMatch(
+        /\.boot-splash-leaving,\s*\.boot-splash-quiet\.boot-splash-leaving\s*\{[^}]*animation-duration:\s*0\.15s/,
+      );
+    });
+  });
+
   it('plays the mark reveal in the final doc but hides the mark in the picker', () => {
     // The whole-mark reveal animation exists and is applied to the mark — the
     // per-tile reveal (bs-tile / boot-tile-in) was dropped because iOS WebKit
@@ -734,8 +1078,11 @@ describe('index.html inline boot splash', () => {
     expect(html).toContain('@keyframes boot-mark-reveal');
     expect(html).toMatch(/\.boot-splash-mark\s*\{[^}]*animation:\s*boot-mark-reveal/);
     // …and the picker (boot-splash-reload) hides the mark so the reveal happens
-    // only in the workspace document, set by the inline base-href check.
+    // only in the workspace document, set by the inline base-href check in the
+    // body script that adds the class. (The FOUC script detects the picker too,
+    // for its theme fallback, but off the NORMALIZED base path rather than the
+    // raw attribute; see the absolute-base-href test above.)
     expect(html).toMatch(/\.boot-splash-reload\s+\.boot-splash-mark\s*\{[^}]*visibility:\s*hidden/);
-    expect(html).toContain("getAttribute('href') === '/~/'");
+    expect(html).toContain("getAttribute('href') !== '/~/'");
   });
 });

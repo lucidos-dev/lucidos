@@ -181,9 +181,37 @@ export function isRunningServedBuild(servedBuildId: string | null): boolean {
     && servedBuildId === CLIENT_BUILD_ID;
 }
 
+/** One-shot flag telling the NEXT document that its load is a refresh the user
+ *  asked for, not a launch, so the inline script in index.html paints the quiet
+ *  cover instead of the brand splash (mark, "Opening your workspace…", gradient,
+ *  1200ms min-reveal floor). Same shape as the gateway's
+ *  `lucidos-splash-mark-formed` handover: written before the reload, consumed as
+ *  it is read, so a refresh whose reload never happened can quiet at most one
+ *  later load.
+ *
+ *  Stamped here rather than at each caller because `refreshClient` is the single
+ *  funnel every refresh goes through, and a caller that forgot the flag would
+ *  silently get the launch animation back.
+ *
+ *  Best-effort: a browser refusing sessionStorage (private mode / opaque origin)
+ *  just gets today's brand splash, which is cosmetic and self-corrects on the
+ *  next load. No toast, per the telemetry carve-out in `.claude/rules/frontend.md`
+ *  (no user intent rides on this line, and the refresh itself still happens). */
+function markSplashQuiet(): void {
+  try {
+    sessionStorage.setItem('lucidos-splash-quiet', '1');
+  } catch {
+    /* storage unavailable: the refresh proceeds, just with the launch splash */
+  }
+}
+
 /** Refresh the client, picking up a newer build if there is one — the single
  *  refresh path for the whole app (control panel, applied-change / reconnect /
  *  update toasts, recovery "Reload" buttons).
+ *
+ *  Marks the next document as a continuation (see `markSplashQuiet`), so the
+ *  reload lands on a quiet cover rather than replaying the cold-launch brand
+ *  animation over a session the user never left.
  *
  *  Blocks the UI for the (brief) reload window: it flips `clientRefreshing`,
  *  which raises the same UiBlockingOverlay an engine restart uses, so the screen
@@ -217,6 +245,7 @@ export function refreshClient(): void {
   // Block the UI immediately — before any async SW work — so the screen locks
   // the instant the refresh is requested, mirroring an engine restart.
   clientRefreshing.value = true;
+  markSplashQuiet();
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
     window.location.reload();
     return;

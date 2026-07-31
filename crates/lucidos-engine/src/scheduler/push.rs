@@ -923,6 +923,16 @@ fn build_navigate_params(
 /// resume via `parseDeepLinkFromUrl` (which reads query params). See
 /// `system-knowhow/notifications.md` §4.5.
 ///
+/// TEMPORARY MEASURE (`docs/temporary-measures.md` § "Cross-document
+/// notification-tap reload on iOS"). Choosing a cross-document URL is what makes
+/// every iOS tap reload the PWA. It is the only channel WebKit actually applies
+/// today, not a preference: `launchQueue` / `launch_handler: focus-existing` are
+/// unimplemented and a same-document navigate is ignored. When WebKit ships a
+/// reload-free channel this function changes shape and the page-side `?notification=`
+/// DETECTION in `crates/lucidos-app/index.html` comes out with it. The quiet boot
+/// cover that detection turns on does NOT: it also serves a user-requested
+/// refresh, which no upstream fix affects.
+///
 /// `scope_url` is the concrete service-worker scope captured by the page at
 /// subscription time, e.g. `https://host/dev/`. When it is present we emit an
 /// absolute URL (`https://host/dev/?notification=...`) instead of relying on

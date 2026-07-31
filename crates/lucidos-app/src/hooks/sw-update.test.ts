@@ -199,6 +199,7 @@ describe('refreshClient', () => {
   const originalNavigator = globalThis.navigator;
   const originalLocation = (globalThis as { location?: unknown }).location;
   const originalCaches = (globalThis as { caches?: unknown }).caches;
+  const originalSessionStorage = (globalThis as { sessionStorage?: unknown }).sessionStorage;
   let reload: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
@@ -215,6 +216,14 @@ describe('refreshClient', () => {
       delete (globalThis as { caches?: unknown }).caches;
     } else {
       Object.defineProperty(globalThis, 'caches', { value: originalCaches, configurable: true });
+    }
+    if (originalSessionStorage === undefined) {
+      delete (globalThis as { sessionStorage?: unknown }).sessionStorage;
+    } else {
+      Object.defineProperty(globalThis, 'sessionStorage', {
+        value: originalSessionStorage,
+        configurable: true,
+      });
     }
   });
 
@@ -237,6 +246,36 @@ describe('refreshClient', () => {
   it('reloads immediately when service workers are unavailable', () => {
     stubNavigator(undefined);
     refreshClient();
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  // A refresh is a continuation of the session the user is already in, so the
+  // next document must paint the quiet cover instead of replaying the cold-launch
+  // brand animation. The flag has to be stamped SYNCHRONOUSLY here: the no-SW
+  // branch reloads on the very next line, and the fast path reloads a microtask
+  // later, so a deferred write would lose the race with its own reload.
+  it('marks the next document as a refresh before any reload can happen', () => {
+    const setItem = vi.fn();
+    Object.defineProperty(globalThis, 'sessionStorage', {
+      value: { setItem, getItem: () => null, removeItem: () => {} },
+      configurable: true,
+    });
+    stubNavigator(undefined);
+    refreshClient();
+    expect(setItem).toHaveBeenCalledWith('lucidos-splash-quiet', '1');
+    // Stamped before the reload, not after it.
+    expect(setItem.mock.invocationCallOrder[0]).toBeLessThan(reload.mock.invocationCallOrder[0]);
+  });
+
+  // Storage can be refused (private mode / opaque origin). Losing the cover is
+  // cosmetic; losing the refresh is not.
+  it('still refreshes when sessionStorage refuses the flag', () => {
+    Object.defineProperty(globalThis, 'sessionStorage', {
+      value: { setItem: () => { throw new Error('denied'); } },
+      configurable: true,
+    });
+    stubNavigator(undefined);
+    expect(() => refreshClient()).not.toThrow();
     expect(reload).toHaveBeenCalledTimes(1);
   });
 

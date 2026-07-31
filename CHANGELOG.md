@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.18.5 — 2026-07-31
+
+### Changed
+
+- **A refresh or a notification tap no longer replays the cold-launch animation.** Both loads continue a session the user was in one moment ago, but each arrives as a full document load, so the app answered with the brand launch: the mark building itself, "Opening your workspace…", the gradient, and a 1200ms minimum reveal before anything could dismiss it. Tapping a push on an installed iOS PWA got that treatment every single time, because WebKit implements neither `launchQueue` nor `launch_handler: focus-existing` nor a same-document declarative navigate, leaving a cross-document reload as the only channel that actually carries the deep link. Those documents now paint a quiet cover instead: no mark, no launch ceremony, the app's own flat background rather than the brand gradient, and no reveal floor to wait out, so the reload reads as the app redrawing rather than relaunching. Quiet is not silent, the delayed status still writes, so a genuinely stuck load says so. Three cases deliberately stay launches because each really can be one: the cross-workspace `#thread=` landing hop and a gateway handover can both lazy-start a stopped engine, and a deep link whose value is empty routes nothing at all. The gate mirrors the hash router branch for branch, so what the cover believes and what the app then routes cannot disagree. The cover carries its own light-theme foregrounds, since the delayed status and the escape link out of a stopped workspace are hardcoded white and would otherwise be white on white at exactly the moment boot has given up. The flat repaint reaches both canvas layers, because a fixed inset:0 element never covers the iOS standalone bottom safe-area strip. Reduced motion is honoured on the shorter fade.
+
+### Fixed
+
+- **The pre-paint scripts now read an absolute base href the way the rest of the app does.** `normalizeBasePath` explicitly tolerates a `<base href>` that is a full URL and reduces it to its pathname, but the inline scripts that run before the bundle exists (the anti-FOUC theme resolver and the boot watchdog) each slash-stripped the raw attribute instead. Against an absolute value that yields a slug like `https:/host/myws`, so every per-workspace key the app wrote under `ws:myws:` was invisible to them: the saved theme was not found and first paint used the fallback until the bundle loaded and corrected it, and the boot watchdog namespaced its one-shot retry marker somewhere the app never looks. The same raw comparison also failed to recognise the picker context, whose own no-preference behaviour then did not apply. All three derivations in the document now normalize first and strip second, which is also what keeps a slash-less `~` from being taken for a workspace slug.
 ## v0.18.4 — 2026-07-31
 
 ### Fixed
